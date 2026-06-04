@@ -59,6 +59,8 @@ pub enum Op {
     ValueBin { dst: Reg, op: u8, a: Reg, b: Reg },
     /// `dst = (key in obj)` — own-property / array-index membership.
     HasProp { dst: Reg, key: Reg, obj: Reg },
+    /// `dst = delete obj[key]` — removes own property `key`, yielding `true`.
+    DeleteProp { dst: Reg, obj: Reg, key: Reg },
     /// Tags the object in `obj` with `class_id` (for `instanceof`).
     SetClassTag { obj: Reg, class_id: u32 },
     /// Defines accessor `key` on `obj` with `getter`/`setter` closure registers
@@ -412,6 +414,16 @@ fn run_frame(
                     None => false,
                 };
                 regs[*dst as usize] = NanBox::boolean(present);
+            }
+            Op::DeleteProp { dst, obj, key } => {
+                let removed = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
+                    Some(h) => {
+                        let k = ctx.realm.to_display_string(regs[*key as usize]);
+                        ctx.realm.delete_property(h, &k)
+                    }
+                    None => true,
+                };
+                regs[*dst as usize] = NanBox::boolean(removed);
             }
             Op::SetClassTag { obj, class_id } => {
                 if let Some(h) = regs[*obj as usize].as_handle().map(Handle::from_raw) {
@@ -2555,11 +2567,7 @@ impl Compiler {
                 left, right, body, ..
             } => {
                 use crate::ast::ForLeft;
-                let ForLeft::Decl {
-                    target: BindingTarget::Ident(Ident { name, .. }),
-                    ..
-                } = left
-                else {
+                let ForLeft::Decl { target, .. } = left else {
                     return Err(CompileError::Unsupported("for-of binding"));
                 };
                 self.scopes.push(alloc::collections::BTreeMap::new());
@@ -2571,7 +2579,6 @@ impl Compiler {
                     dst: i,
                     value: NanBox::number(0.0),
                 });
-                let elem = self.declare(name); // the loop variable
                 let top = self.ops.len();
                 let cond = self.alloc();
                 self.ops.push(Op::Lt {
@@ -2586,7 +2593,8 @@ impl Compiler {
                     arr,
                     index: i,
                 });
-                self.write_var(elem, cur);
+                // The loop variable — an identifier or a destructuring pattern.
+                self.bind_pattern(target, cur)?;
                 self.enter_loop();
                 self.stmt(body)?;
                 let cont = self.ops.len(); // `continue` advances the index
@@ -2696,6 +2704,24 @@ impl Compiler {
                 }
             }
             Expr::Unary { op, argument, .. } => {
+                // `delete obj.k` / `delete obj[k]` removes an own property.
+                if matches!(op, UnaryOp::Delete) {
+                    if let Expr::Member {
+                        object, property, ..
+                    } = &**argument
+                    {
+                        let obj = self.expr(object)?;
+                        let key = match property {
+                            PropertyKey::Computed(e) => self.expr(e)?,
+                            _ => self.constant_str(&static_key(property)?),
+                        };
+                        let dst = self.alloc();
+                        self.ops.push(Op::DeleteProp { dst, obj, key });
+                        return Ok(dst);
+                    }
+                    // `delete` of a non-reference is a no-op that yields `true`.
+                    return self.constant(NanBox::boolean(true));
+                }
                 // `typeof x` must not throw for an undefined identifier.
                 if matches!(op, UnaryOp::Typeof)
                     && let Expr::Ident(id) = &**argument
@@ -2957,34 +2983,50 @@ impl Compiler {
                     op,
                     AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign
                 ) {
-                    let Expr::Ident(id) = &**target else {
-                        return Err(CompileError::Unsupported("logical assign to member"));
+                    // `cond(cur)` decides whether the assignment fires.
+                    let cond = |this: &mut Self, cur: Reg| -> Result<Reg, CompileError> {
+                        Ok(match op {
+                            AssignOp::AndAssign => cur,
+                            AssignOp::OrAssign => {
+                                let n = this.alloc();
+                                this.ops.push(Op::Not { dst: n, a: cur });
+                                n
+                            }
+                            _ => {
+                                let nn = this.emit_not_nullish(cur)?;
+                                let g = this.alloc();
+                                this.ops.push(Op::Not { dst: g, a: nn });
+                                g
+                            }
+                        })
                     };
-                    let b = self
-                        .lookup(&id.name)
-                        .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
-                    let cur = self.read_var(b);
-                    // Whether to perform the assignment.
-                    let cond = match op {
-                        AssignOp::AndAssign => cur,
-                        AssignOp::OrAssign => {
-                            let n = self.alloc();
-                            self.ops.push(Op::Not { dst: n, a: cur });
-                            n
+                    match &**target {
+                        Expr::Ident(id) => {
+                            let b = self
+                                .lookup(&id.name)
+                                .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                            let cur = self.read_var(b);
+                            let c = cond(self, cur)?;
+                            let jf = self.emit_jump_if_false(c);
+                            let v = self.expr(value)?;
+                            self.write_var(b, v);
+                            self.patch(jf);
+                            return Ok(self.read_var(b));
                         }
-                        _ => {
-                            // `??=`: assign when the current value is nullish.
-                            let nn = self.emit_not_nullish(cur)?;
-                            let g = self.alloc();
-                            self.ops.push(Op::Not { dst: g, a: nn });
-                            g
+                        Expr::Member {
+                            object, property, ..
+                        } => {
+                            let obj = self.expr(object)?;
+                            let cur = self.member_read(obj, property)?;
+                            let c = cond(self, cur)?;
+                            let jf = self.emit_jump_if_false(c);
+                            let v = self.expr(value)?;
+                            self.member_write(obj, property, v)?;
+                            self.patch(jf);
+                            return self.member_read(obj, property);
                         }
-                    };
-                    let jf = self.emit_jump_if_false(cond);
-                    let v = self.expr(value)?;
-                    self.write_var(b, v);
-                    self.patch(jf);
-                    return Ok(self.read_var(b));
+                        _ => return Err(CompileError::Unsupported("logical assign target")),
+                    }
                 }
                 let compound = !matches!(op, AssignOp::Assign);
                 match &**target {
@@ -3454,6 +3496,30 @@ impl Compiler {
             }
         }
         Ok(dst)
+    }
+
+    /// Writes `src` to `obj.key` / `obj[i]` (the mirror of `member_read`).
+    fn member_write(
+        &mut self,
+        obj: Reg,
+        property: &PropertyKey,
+        src: Reg,
+    ) -> Result<(), CompileError> {
+        match property {
+            PropertyKey::Computed(e) => {
+                let index = self.expr(e)?;
+                self.ops.push(Op::SetElem {
+                    arr: obj,
+                    index,
+                    src,
+                });
+            }
+            _ => {
+                let key = static_key(property)?;
+                self.ops.push(Op::SetProp { obj, key, src });
+            }
+        }
+        Ok(())
     }
 
     /// Emits a `JumpIfFalse` with a placeholder target; returns its index.
@@ -4069,6 +4135,45 @@ mod tests {
         );
         // String .length on the bytecode path.
         assert_eq!(bc("'hello'.length"), "5");
+    }
+
+    #[test]
+    fn bytecode_delete_and_member_logical_assign() {
+        // delete on object/array members.
+        assert_eq!(
+            bc("let o = { a: 1, b: 2 }; delete o.a; '' + ('a' in o) + ',' + o.b"),
+            "false,2"
+        );
+        assert_eq!(
+            bc("let o = { x: 1 }; let r = delete o.x; '' + r + ',' + ('x' in o)"),
+            "true,false"
+        );
+        // computed delete.
+        assert_eq!(
+            bc("let o = { k: 5 }; let key = 'k'; delete o[key]; 'k' in o"),
+            "false"
+        );
+        // Logical assignment to a member.
+        assert_eq!(bc("let o = { a: 0 }; o.a ||= 7; o.a"), "7");
+        assert_eq!(bc("let o = { a: 3 }; o.a &&= 9; o.a"), "9");
+        assert_eq!(
+            bc("let o = {}; o.cache ??= 'computed'; o.cache"),
+            "computed"
+        );
+        // ??= only assigns when nullish (memoization pattern).
+        assert_eq!(bc("let c = { v: 5 }; c.v ??= 99; c.v"), "5");
+        // for-of with array destructuring.
+        assert_eq!(
+            bc("let s = 0; for (const [a, b] of [[1, 2], [3, 4]]) { s += a * b; } s"),
+            "14"
+        );
+        // for-of with object destructuring.
+        assert_eq!(
+            bc(
+                "let names = ''; for (const { name } of [{ name: 'a' }, { name: 'b' }]) { names += name; } names"
+            ),
+            "ab"
+        );
     }
 
     #[test]
