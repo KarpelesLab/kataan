@@ -1500,6 +1500,17 @@ impl<'a> Interp<'a> {
             }
             proto = p.proto();
         }
+        // Engine-thrown errors carry a `name` but may lack the prototype link;
+        // match them against the built-in error constructors by name (an error
+        // is `instanceof` its own type and `instanceof Error`).
+        if let Value::Object(o) = value
+            && let Value::Str(lname) = o.get("name")
+            && is_error_name(&lname)
+            && let Value::Str(rname) = target_proto.get("name")
+            && (*rname == *lname || rname.as_ref() == "Error")
+        {
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -1840,6 +1851,21 @@ impl<'a> Interp<'a> {
 /// Builds a thrown error value (an object with `name` + `message`) so that a
 /// `catch` clause can read `e.message` / `e.name`. (These objects are not yet
 /// linked to the `Error` prototype, so `instanceof Error` is not supported.)
+/// Whether `name` is a built-in error type (used for `instanceof` matching of
+/// engine-thrown errors).
+fn is_error_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Error"
+            | "TypeError"
+            | "RangeError"
+            | "SyntaxError"
+            | "ReferenceError"
+            | "EvalError"
+            | "URIError"
+    )
+}
+
 pub(super) fn make_error<'a>(name: &'static str, message: impl Into<String>) -> Value<'a> {
     let obj = Obj::object();
     obj.set("name", Value::str(name));

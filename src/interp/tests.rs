@@ -939,6 +939,23 @@ fn bytecode_vm_try_catch_throw() {
         eval_bc("let r = ''; try { let n = 5; n(); } catch (e) { r = e.name; } r"),
         "TypeError"
     );
+    // Engine-thrown errors match their type (and Error) via instanceof.
+    assert_eq!(
+        eval_bc(
+            "let r = '';
+             try { null.x; } catch (e) {
+               r = (e instanceof TypeError) + ',' + (e instanceof Error) + ',' + (e instanceof RangeError);
+             }
+             r"
+        ),
+        "true,true,false"
+    );
+    assert_eq!(
+        eval(
+            "try { undefinedThing; } catch (e) { '' + (e instanceof ReferenceError) + (e instanceof Error); }"
+        ),
+        "truetrue"
+    );
     // A throw from a called function unwinds to the caller's handler.
     assert_eq!(
         eval_bc(
