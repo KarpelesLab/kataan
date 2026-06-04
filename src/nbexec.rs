@@ -149,9 +149,19 @@ const N_REGEXP: u16 = 26;
 const N_MATH_POW: u16 = 28;
 const N_MATH_SIGN: u16 = 29;
 const N_MATH_TRUNC: u16 = 30;
+const N_OBJECT_FROM_ENTRIES: u16 = 34;
 const N_PARSE_FLOAT: u16 = 31;
 const N_IS_NAN: u16 = 32;
 const N_IS_FINITE: u16 = 33;
+// Error constructors (id − N_ERROR_BASE indexes ERROR_NAMES).
+const N_ERROR_BASE: u16 = 40;
+const ERROR_NAMES: [&str; 5] = [
+    "Error",
+    "TypeError",
+    "RangeError",
+    "SyntaxError",
+    "ReferenceError",
+];
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
@@ -228,6 +238,11 @@ impl<'a> Interp<'a> {
         let regexp_ctor = self.realm.new_native(N_REGEXP);
         self.current
             .declare("RegExp", NanBox::handle(regexp_ctor.to_raw()));
+        // The `Error` family — native constructors producing `{ name, message }`.
+        for (i, name) in ERROR_NAMES.iter().enumerate() {
+            let ctor = self.realm.new_native(N_ERROR_BASE + i as u16);
+            self.current.declare(name, NanBox::handle(ctor.to_raw()));
+        }
         install_namespace(
             self,
             "JSON",
@@ -241,6 +256,7 @@ impl<'a> Interp<'a> {
                 ("values", N_OBJECT_VALUES),
                 ("assign", N_OBJECT_ASSIGN),
                 ("entries", N_OBJECT_ENTRIES),
+                ("fromEntries", N_OBJECT_FROM_ENTRIES),
             ],
         );
         install_namespace(
@@ -402,27 +418,45 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_array(pairs).to_raw())
             }
             N_ARRAY_FROM => {
-                let items: Vec<NanBox> = match arg(0).as_handle().map(Handle::from_raw) {
-                    Some(h) if self.realm.is_array(h) => self
-                        .realm
-                        .array_elements(h)
-                        .map(<[_]>::to_vec)
-                        .unwrap_or_default(),
-                    Some(h) => match self.realm.string_value(h) {
-                        Some(s) => {
-                            let chars: Vec<char> = s.chars().collect();
-                            chars
-                                .iter()
-                                .map(|c| self.new_str(&String::from(*c)))
-                                .collect()
-                        }
-                        None => Vec::new(),
-                    },
-                    None => Vec::new(),
+                // Iterable → array (arrays, strings, Sets, Maps), with an
+                // optional map callback applied to each element.
+                let items = self.iterate_values(arg(0)).unwrap_or_default();
+                let items = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                    items
+                } else {
+                    let f = arg(1);
+                    let mut out = Vec::with_capacity(items.len());
+                    for (i, e) in items.iter().enumerate() {
+                        out.push(self.call(f, &[*e, NanBox::number(i as f64)])?);
+                    }
+                    out
                 };
                 NanBox::handle(self.realm.new_array(items).to_raw())
             }
             N_ARRAY_OF => NanBox::handle(self.realm.new_array(args.to_vec()).to_raw()),
+            N_OBJECT_FROM_ENTRIES => {
+                let obj = self.realm.new_object();
+                if let Some(pairs) = arg(0)
+                    .as_handle()
+                    .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
+                    .map(<[_]>::to_vec)
+                {
+                    for pair in pairs {
+                        if let Some(kv) = pair
+                            .as_handle()
+                            .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
+                            .map(<[_]>::to_vec)
+                        {
+                            let k = self.realm.to_display_string(
+                                kv.first().copied().unwrap_or(NanBox::undefined()),
+                            );
+                            let v = kv.get(1).copied().unwrap_or(NanBox::undefined());
+                            self.realm.set_property(obj, &k, v);
+                        }
+                    }
+                }
+                NanBox::handle(obj.to_raw())
+            }
             #[cfg(feature = "std")]
             N_MATH_FLOOR => NanBox::number(self.realm.to_number(arg(0)).floor()),
             #[cfg(feature = "std")]
@@ -465,6 +499,10 @@ impl<'a> Interp<'a> {
             }
             N_IS_NAN => NanBox::boolean(self.realm.to_number(arg(0)).is_nan()),
             N_IS_FINITE => NanBox::boolean(self.realm.to_number(arg(0)).is_finite()),
+            // `Error(msg)` called without `new` builds the same object.
+            id if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) => {
+                self.make_error(id, args.first().copied())
+            }
             _ => return Err(ExecError::NotCallable),
         })
     }
@@ -1030,6 +1068,10 @@ impl<'a> Interp<'a> {
             let r = self.realm.new_regexp(&pat, &flags);
             return Ok(NanBox::handle(r.to_raw()));
         }
+        // `new Error(message)` and friends → `{ name, message }`.
+        if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
+            return Ok(self.make_error(id, args.first().copied()));
+        }
         let is_set = match id {
             N_SET => true,
             N_MAP => false,
@@ -1060,6 +1102,23 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(NanBox::handle(handle.to_raw()))
+    }
+
+    /// Builds an error object `{ name, message }` for the constructor `id`.
+    fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
+        let name = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
+        let obj = self.realm.new_object();
+        let name_v = self.new_str(name);
+        self.realm.set_property(obj, "name", name_v);
+        let msg = match message {
+            Some(m) if !matches!(m.unpack(), Unpacked::Undefined) => {
+                let s = self.realm.to_display_string(m);
+                self.new_str(&s)
+            }
+            _ => self.new_str(""),
+        };
+        self.realm.set_property(obj, "message", msg);
+        NanBox::handle(obj.to_raw())
     }
 
     /// Registers a class and allocates a class value capturing the current scope.
@@ -1303,6 +1362,40 @@ impl<'a> Interp<'a> {
         // --- `Date.now()` static ---
         if self.realm.native_at(handle) == Some(N_DATE) && method == "now" {
             return Ok(Some(NanBox::number(now_ms())));
+        }
+        // --- `Number.*` / `String.*` statics (on the constructor) ---
+        match self.realm.native_at(handle) {
+            Some(N_NUMBER) => {
+                match method {
+                    "isInteger" => {
+                        let is_int = arg(0)
+                            .as_number()
+                            .is_some_and(|n| n.is_finite() && (n as i64) as f64 == n);
+                        return Ok(Some(NanBox::boolean(is_int)));
+                    }
+                    "isFinite" => {
+                        return Ok(Some(NanBox::boolean(
+                            arg(0).as_number().is_some_and(f64::is_finite),
+                        )));
+                    }
+                    "isNaN" => {
+                        return Ok(Some(NanBox::boolean(
+                            arg(0).as_number().is_some_and(f64::is_nan),
+                        )));
+                    }
+                    "parseFloat" => return Ok(Some(self.call_native(N_PARSE_FLOAT, args)?)),
+                    "parseInt" => return Ok(Some(self.call_native(N_PARSE_INT, args)?)),
+                    _ => {}
+                };
+            }
+            Some(N_STRING) if method == "fromCharCode" => {
+                let s: String = args
+                    .iter()
+                    .filter_map(|a| char::from_u32(self.realm.to_number(*a) as u32))
+                    .collect();
+                return Ok(Some(self.new_str(&s)));
+            }
+            _ => {}
         }
         // --- Date instance methods ---
         if let Some(ms) = self.realm.date_at(handle) {
@@ -2329,6 +2422,21 @@ impl<'a> Interp<'a> {
                     last = self.eval(e)?;
                 }
                 Ok(last)
+            }
+            // A tagged template: `tag(stringsArray, ...interpolatedValues)`.
+            Expr::TaggedTemplate { tag, quasi, .. } => {
+                let tagf = self.eval(tag)?;
+                let strings: Vec<NanBox> = quasi
+                    .quasis
+                    .iter()
+                    .map(|q| self.new_str(q.cooked.as_deref().unwrap_or("")))
+                    .collect();
+                let strings_arr = NanBox::handle(self.realm.new_array(strings).to_raw());
+                let mut args = alloc::vec![strings_arr];
+                for e in &quasi.expressions {
+                    args.push(self.eval(e)?);
+                }
+                self.call(tagf, &args)
             }
             Expr::This(_) => Ok(self.this_val),
             Expr::Await { argument, .. } => {

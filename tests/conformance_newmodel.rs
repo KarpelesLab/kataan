@@ -79,10 +79,10 @@ fn new_model_conformance_coverage() {
     );
     // Ratchet: the new model runs at least this many full real-world fixtures.
     // Raise as coverage grows; never let it regress. (Remaining gaps: labeled
-    // statements [language], regex-backed String methods [regexp], and a couple
-    // of error/edge semantics [advanced, vm_features].)
+    // statements [language] and regex-backed String methods / match `.index`
+    // [regexp].)
     assert!(
-        passed >= 5,
+        passed >= 7,
         "new-model conformance regressed: only {passed} fixtures pass"
     );
 }
