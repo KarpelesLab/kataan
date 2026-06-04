@@ -117,6 +117,10 @@ const N_MATH_ROUND: u16 = 14;
 const N_MATH_SQRT: u16 = 15;
 const N_MAP: u16 = 16;
 const N_SET: u16 = 17;
+const N_OBJECT_ASSIGN: u16 = 18;
+const N_OBJECT_ENTRIES: u16 = 19;
+const N_ARRAY_FROM: u16 = 20;
+const N_ARRAY_OF: u16 = 21;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib.
@@ -174,9 +178,22 @@ impl<'a> Interp<'a> {
         install_namespace(
             self,
             "Object",
-            &[("keys", N_OBJECT_KEYS), ("values", N_OBJECT_VALUES)],
+            &[
+                ("keys", N_OBJECT_KEYS),
+                ("values", N_OBJECT_VALUES),
+                ("assign", N_OBJECT_ASSIGN),
+                ("entries", N_OBJECT_ENTRIES),
+            ],
         );
-        install_namespace(self, "Array", &[("isArray", N_ARRAY_IS_ARRAY)]);
+        install_namespace(
+            self,
+            "Array",
+            &[
+                ("isArray", N_ARRAY_IS_ARRAY),
+                ("from", N_ARRAY_FROM),
+                ("of", N_ARRAY_OF),
+            ],
+        );
         for (name, id) in [
             ("String", N_STRING),
             ("Number", N_NUMBER),
@@ -274,6 +291,60 @@ impl<'a> Interp<'a> {
                     .as_handle()
                     .is_some_and(|raw| self.realm.is_array(Handle::from_raw(raw))),
             ),
+            N_OBJECT_ASSIGN => {
+                let target = arg(0);
+                if let Some(t) = target.as_handle().map(Handle::from_raw) {
+                    for src in &args[1.min(args.len())..] {
+                        if let Some(sh) = src.as_handle().map(Handle::from_raw) {
+                            for k in self.realm.object_keys(sh).unwrap_or_default() {
+                                let v = self
+                                    .realm
+                                    .get_property(sh, &k)
+                                    .unwrap_or(NanBox::undefined());
+                                self.realm.set_property(t, &k, v);
+                            }
+                        }
+                    }
+                }
+                target
+            }
+            N_OBJECT_ENTRIES => {
+                let mut pairs = Vec::new();
+                if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
+                    for k in self.realm.object_keys(h).unwrap_or_default() {
+                        let v = self
+                            .realm
+                            .get_property(h, &k)
+                            .unwrap_or(NanBox::undefined());
+                        let key = self.new_str(&k);
+                        let pair = self.realm.new_array(alloc::vec![key, v]);
+                        pairs.push(NanBox::handle(pair.to_raw()));
+                    }
+                }
+                NanBox::handle(self.realm.new_array(pairs).to_raw())
+            }
+            N_ARRAY_FROM => {
+                let items: Vec<NanBox> = match arg(0).as_handle().map(Handle::from_raw) {
+                    Some(h) if self.realm.is_array(h) => self
+                        .realm
+                        .array_elements(h)
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_default(),
+                    Some(h) => match self.realm.string_value(h) {
+                        Some(s) => {
+                            let chars: Vec<char> = s.chars().collect();
+                            chars
+                                .iter()
+                                .map(|c| self.new_str(&String::from(*c)))
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+                NanBox::handle(self.realm.new_array(items).to_raw())
+            }
+            N_ARRAY_OF => NanBox::handle(self.realm.new_array(args.to_vec()).to_raw()),
             #[cfg(feature = "std")]
             N_MATH_FLOOR => NanBox::number(self.realm.to_number(arg(0)).floor()),
             #[cfg(feature = "std")]
@@ -640,11 +711,25 @@ impl<'a> Interp<'a> {
         method: &str,
         args: &[NanBox],
     ) -> Result<Option<NanBox>, ExecError> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+
+        // --- number methods (the receiver is an immediate, not a handle) ---
+        if let Some(n) = recv.as_number() {
+            return Ok(match method {
+                "toString" => Some(self.new_str(&self.realm.to_display_string(recv))),
+                #[cfg(feature = "std")]
+                "toFixed" => {
+                    let digits = self.realm.to_number(arg(0)) as usize;
+                    Some(self.new_str(&alloc::format!("{n:.digits$}")))
+                }
+                _ => None,
+            });
+        }
+
         let Some(raw) = recv.as_handle() else {
             return Ok(None);
         };
-        let handle = crate::heap::Handle::from_raw(raw);
-        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+        let handle = Handle::from_raw(raw);
 
         // --- string methods ---
         if let Some(s) = self.realm.string_value(handle) {
@@ -1985,6 +2070,35 @@ mod tests {
                  let o = new C(); o.a + o.b + o.c"),
             "6"
         );
+    }
+
+    #[test]
+    fn object_array_statics_and_number_methods() {
+        // Object.assign / entries.
+        assert_eq!(
+            run("let t = Object.assign({}, { a: 1 }, { b: 2 }); t.a + t.b"),
+            "3"
+        );
+        assert_eq!(
+            run("Object.entries({ a: 1, b: 2 }).map(e => e[0] + '=' + e[1]).join(',')"),
+            "a=1,b=2"
+        );
+        // Array.from (string / array) and Array.of.
+        assert_eq!(run("Array.from('abc').join('-')"), "a-b-c");
+        assert_eq!(
+            run("Array.from([1, 2, 3]).map(x => x * 2).join(',')"),
+            "2,4,6"
+        );
+        assert_eq!(run("Array.of(1, 2, 3).join(',')"), "1,2,3");
+        // Number methods.
+        assert_eq!(run("(255).toString()"), "255");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn number_tofixed() {
+        assert_eq!(run("(3.14159).toFixed(2)"), "3.14");
+        assert_eq!(run("(1).toFixed(3)"), "1.000");
     }
 
     #[test]
