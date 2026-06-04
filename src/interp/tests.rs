@@ -1140,12 +1140,66 @@ fn bytecode_vm_loops() {
 
 #[test]
 fn bytecode_vm_falls_back_on_unsupported() {
-    // A generator is still outside the bytecode compiler's subset (it needs
-    // suspendable frames), so it is reported as unsupported and the caller falls
-    // back to the tree-walker.
-    let program = Parser::parse_program("function* g() { yield 1; } [...g()]").unwrap();
+    // An `async` function is still outside the bytecode compiler's subset
+    // (`await` needs the async driver), so it is reported as unsupported and the
+    // caller falls back to the tree-walker.
+    let program = Parser::parse_program("async function f() { return 1; } f()").unwrap();
     let mut interp = Interp::new();
     assert!(interp.eval_via_bytecode(&program.body).is_err());
+}
+
+#[test]
+fn bytecode_vm_generators() {
+    // A finite generator via spread and for-of.
+    assert_eq!(
+        eval_bc("function* g() { yield 1; yield 2; yield 3; } [...g()].join(',')"),
+        "1,2,3"
+    );
+    assert_eq!(
+        eval_bc(
+            "function* g() { yield 'a'; yield 'b'; } let s = ''; for (const x of g()) s += x; s"
+        ),
+        "ab"
+    );
+    // Manual next() with the iterator-result protocol.
+    assert_eq!(
+        eval_bc(
+            "function* g() { yield 10; yield 20; }
+             let it = g();
+             let a = it.next(); let b = it.next(); let c = it.next();
+             a.value + ',' + b.value + ',' + c.value + ',' + c.done"
+        ),
+        "10,20,undefined,true"
+    );
+    // A generator with a loop (lazy production).
+    assert_eq!(
+        eval_bc(
+            "function* range(n) { let i = 0; while (i < n) { yield i; i += 1; } }
+             [...range(5)].reduce((a, b) => a + b, 0)"
+        ),
+        "10"
+    );
+    // Bidirectional communication: the value passed to next() flows into yield.
+    assert_eq!(
+        eval_bc(
+            "function* echo() { let x = yield 0; yield x; yield x * 2; }
+             let it = echo();
+             it.next(); // prime
+             '' + it.next(5).value + ',' + it.next().value"
+        ),
+        "5,10"
+    );
+    // An infinite generator is fine when driven manually.
+    assert_eq!(
+        eval_bc(
+            "function* nat() { let i = 0; while (true) { yield i; i += 1; } }
+             let it = nat();
+             let sum = 0;
+             for (let k = 0; k < 5; k += 1) sum += it.next().value;
+             sum"
+        ),
+        "10"
+    );
 }
 
 #[test]

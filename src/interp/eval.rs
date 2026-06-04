@@ -1716,6 +1716,28 @@ impl<'a> Interp<'a> {
         key: &str,
         args: Vec<Value<'a>>,
     ) -> Completion<'a, Value<'a>> {
+        // Generator protocol: `gen.next(v)` / `gen.return(v)` / `gen.throw(e)`.
+        if let Value::Object(o) = &obj
+            && let Some(state) = o.generator()
+        {
+            match key {
+                "next" => {
+                    let send = args.into_iter().next().unwrap_or(Value::Undefined);
+                    let (value, done) = self.generator_resume(&state, send)?;
+                    return Ok(iter_result(value, done));
+                }
+                "return" => {
+                    state.borrow_mut().done = true;
+                    let v = args.into_iter().next().unwrap_or(Value::Undefined);
+                    return Ok(iter_result(v, true));
+                }
+                "throw" => {
+                    state.borrow_mut().done = true;
+                    return Err(args.into_iter().next().unwrap_or(Value::Undefined));
+                }
+                _ => {}
+            }
+        }
         // `Array.from(items, mapFn)` is intercepted so the map callback can run
         // (the underlying native can't call back into the evaluator).
         if key == "from"
@@ -1916,6 +1938,14 @@ fn json_indent<'a>(space: Option<&Value<'a>>) -> Option<String> {
         Some(Value::Str(s)) if !s.is_empty() => Some(s.chars().take(10).collect()),
         _ => None,
     }
+}
+
+/// Builds an iterator-result object `{ value, done }`.
+fn iter_result<'a>(value: Value<'a>, done: bool) -> Value<'a> {
+    let obj = Obj::object();
+    obj.set("value", value);
+    obj.set("done", Value::Bool(done));
+    Value::Object(obj)
 }
 
 /// Whether `name` is a built-in error type (used for `instanceof` matching of

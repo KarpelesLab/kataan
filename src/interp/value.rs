@@ -83,6 +83,8 @@ pub struct Obj<'a> {
     /// For functions produced by `Function.prototype.bind`: the bound target,
     /// `this`, and leading arguments.
     bound: RefCell<Option<Rc<BoundFn<'a>>>>,
+    /// For generator objects: the suspended generator state.
+    generator: RefCell<Option<Rc<RefCell<super::vm::GeneratorState<'a>>>>>,
 }
 
 /// A compiled (bytecode) function value: the module it lives in, the index of
@@ -139,6 +141,7 @@ impl<'a> Obj<'a> {
             promise: RefCell::new(None),
             bytecode: RefCell::new(None),
             bound: RefCell::new(None),
+            generator: RefCell::new(None),
         })
     }
 
@@ -155,6 +158,7 @@ impl<'a> Obj<'a> {
             promise: RefCell::new(None),
             bytecode: RefCell::new(None),
             bound: RefCell::new(None),
+            generator: RefCell::new(None),
         })
     }
 
@@ -171,6 +175,7 @@ impl<'a> Obj<'a> {
             promise: RefCell::new(None),
             bytecode: RefCell::new(None),
             bound: RefCell::new(None),
+            generator: RefCell::new(None),
         })
     }
 
@@ -190,6 +195,7 @@ impl<'a> Obj<'a> {
             promise: RefCell::new(None),
             bytecode: RefCell::new(None),
             bound: RefCell::new(None),
+            generator: RefCell::new(None),
         })
     }
 
@@ -230,6 +236,17 @@ impl<'a> Obj<'a> {
     /// Marks this object as a bound function (`fn.bind(…)`).
     pub fn set_bound_fn(&self, f: Rc<BoundFn<'a>>) {
         *self.bound.borrow_mut() = Some(f);
+    }
+
+    /// Marks this object as a generator carrying `state`.
+    pub(crate) fn set_generator(&self, state: Rc<RefCell<super::vm::GeneratorState<'a>>>) {
+        *self.generator.borrow_mut() = Some(state);
+    }
+
+    /// The generator state this object wraps, if it is a generator.
+    #[must_use]
+    pub(crate) fn generator(&self) -> Option<Rc<RefCell<super::vm::GeneratorState<'a>>>> {
+        self.generator.borrow().clone()
     }
 
     /// The bound-function record this object wraps, if any.

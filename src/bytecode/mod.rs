@@ -341,6 +341,9 @@ pub struct Chunk {
     /// Whether the last parameter is a rest parameter (`...rest`): arguments
     /// beyond the fixed ones are collected into an array in its register.
     pub has_rest: bool,
+    /// Whether this chunk is a generator function body (calling it produces a
+    /// generator object rather than running the body).
+    pub is_generator: bool,
     /// The constant pool.
     pub constants: Vec<Const>,
     /// The instructions.
@@ -356,6 +359,7 @@ impl Chunk {
             register_count: 0,
             param_count: 0,
             has_rest: false,
+            is_generator: false,
             constants: Vec::new(),
             code: Vec::new(),
         }

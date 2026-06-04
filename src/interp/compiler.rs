@@ -1172,14 +1172,15 @@ impl Compiler {
 
     /// Compiles a function declaration and binds it as a global.
     fn compile_function_decl(&mut self, func: &Function) -> Result<(), CompileError> {
-        if func.is_async || func.is_generator {
-            return Err(CompileError::unsupported("async/generator function"));
+        if func.is_async {
+            return Err(CompileError::unsupported("async function"));
         }
         let Some(id) = &func.id else {
             return Err(CompileError::unsupported("anonymous function declaration"));
         };
         let (chunk_idx, upvalues) =
             self.compile_function(&func.params, FnBody::Block(&func.body), &id.name)?;
+        self.module[chunk_idx].is_generator = func.is_generator;
         // Hoisted function declarations are bound before later locals exist, so
         // a declaration that captures an enclosing variable can't build its
         // closure here — fall back to the tree-walker.
@@ -1787,15 +1788,34 @@ impl Compiler {
                 self.call(callee, arguments)
             }
             Expr::Class(class) => self.compile_class(class),
+            // `yield expr` — `yield*` (delegation) isn't compiled yet.
+            Expr::Yield {
+                argument,
+                delegate: false,
+                ..
+            } => {
+                let value = match argument {
+                    Some(e) => self.expr(e)?,
+                    None => {
+                        let r = self.reg();
+                        self.emit(Op::LoadUndefined { dst: r });
+                        r
+                    }
+                };
+                let dst = self.reg();
+                self.emit(Op::Yield { value, dst });
+                Ok(dst)
+            }
             Expr::Function(func) => {
-                if func.is_async || func.is_generator {
-                    return Err(CompileError::unsupported("async/generator function"));
+                if func.is_async {
+                    return Err(CompileError::unsupported("async function"));
                 }
                 let (idx, upvalues) = self.compile_function(
                     &func.params,
                     FnBody::Block(&func.body),
                     func.id.as_ref().map_or("<anonymous>", |id| &id.name),
                 )?;
+                self.module[idx].is_generator = func.is_generator;
                 Ok(self.emit_closure(idx, &upvalues))
             }
             Expr::Arrow(arrow) => self.arrow(arrow),

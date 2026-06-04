@@ -63,6 +63,19 @@ impl<'a> Interp<'a> {
         args: Vec<Value<'a>>,
     ) -> Completion<'a, Value<'a>> {
         let captures = func.captures.clone();
+        // Calling a generator function produces a generator object holding a
+        // *suspended* frame (the body runs on `next()`).
+        if func.module.chunks[func.chunk as usize].is_generator {
+            let frame = make_frame(&func.module, func.chunk, this, args, captures);
+            let obj = Obj::object();
+            obj.set_generator(Rc::new(core::cell::RefCell::new(GeneratorState {
+                frame,
+                done: false,
+                pending_dst: 0,
+                started: false,
+            })));
+            return Ok(Value::Object(obj));
+        }
         self.run_chunk(&func.module, func.chunk, this, args, &captures)
     }
 
@@ -176,16 +189,34 @@ impl<'a> Interp<'a> {
                     }
                     Op::IterValues { dst, src } => {
                         let v = regs[*src as usize].clone();
-                        let iterable = matches!(&v, Value::Str(_))
-                            || matches!(&v, Value::Object(o) if o.is_array() || o.as_collection().is_some());
-                        if !iterable {
-                            return Err(super::eval::make_error(
-                                "TypeError",
-                                alloc::format!("{} is not iterable", v.to_js_string()),
-                            ));
-                        }
-                        let mut items = Vec::new();
-                        super::builtins::iterate_into(&v, &mut items);
+                        // A generator is driven to exhaustion (finite generators
+                        // only — an infinite one would not terminate here).
+                        let items = if let Value::Object(o) = &v
+                            && let Some(state) = o.generator()
+                        {
+                            let mut items = Vec::new();
+                            loop {
+                                let (value, done) =
+                                    self.generator_resume(&state, Value::Undefined)?;
+                                if done {
+                                    break;
+                                }
+                                items.push(value);
+                            }
+                            items
+                        } else {
+                            let iterable = matches!(&v, Value::Str(_))
+                                || matches!(&v, Value::Object(o) if o.is_array() || o.as_collection().is_some());
+                            if !iterable {
+                                return Err(super::eval::make_error(
+                                    "TypeError",
+                                    alloc::format!("{} is not iterable", v.to_js_string()),
+                                ));
+                            }
+                            let mut items = Vec::new();
+                            super::builtins::iterate_into(&v, &mut items);
+                            items
+                        };
                         regs[*dst as usize] = Value::Object(Obj::array(items));
                     }
                     Op::IterKeys { dst, src } => {
@@ -363,7 +394,7 @@ impl<'a> Interp<'a> {
 
 /// A suspendable execution frame. Normal functions run one to completion;
 /// generators keep their frame across `next()` calls.
-pub(super) struct Frame<'a> {
+pub(crate) struct Frame<'a> {
     pub module: Rc<Module>,
     pub chunk: u32,
     pub captures: Vec<Value<'a>>,
@@ -377,6 +408,74 @@ pub(super) struct Frame<'a> {
 pub(super) enum FrameStep<'a> {
     Return(Value<'a>),
     Yield { value: Value<'a>, dst: Reg },
+}
+
+/// The state of a generator: its suspended frame, whether it has finished, and
+/// the register the next `next(v)` value should be written to on resume.
+pub(crate) struct GeneratorState<'a> {
+    pub frame: Frame<'a>,
+    pub done: bool,
+    pub pending_dst: Reg,
+    pub started: bool,
+}
+
+impl<'a> Interp<'a> {
+    /// Advances a generator by one step: writes `send` into the resume register
+    /// (after the first call), runs the frame to its next yield/return, and
+    /// returns `(value, done)`.
+    pub(super) fn generator_resume(
+        &mut self,
+        state: &Rc<core::cell::RefCell<GeneratorState<'a>>>,
+        send: Value<'a>,
+    ) -> Completion<'a, (Value<'a>, bool)> {
+        {
+            let mut s = state.borrow_mut();
+            if s.done {
+                return Ok((Value::Undefined, true));
+            }
+            if s.started {
+                let dst = s.pending_dst as usize;
+                if dst < s.frame.regs.len() {
+                    s.frame.regs[dst] = send;
+                }
+            }
+            s.started = true;
+        }
+        // Run the frame (released the borrow so `self` calls can re-enter).
+        let mut frame = {
+            let mut s = state.borrow_mut();
+            core::mem::replace(&mut s.frame, empty_frame())
+        };
+        let outcome = self.run_frame(&mut frame);
+        let mut s = state.borrow_mut();
+        s.frame = frame;
+        match outcome {
+            Ok(FrameStep::Yield { value, dst }) => {
+                s.pending_dst = dst;
+                Ok((value, false))
+            }
+            Ok(FrameStep::Return(value)) => {
+                s.done = true;
+                Ok((value, true))
+            }
+            Err(e) => {
+                s.done = true;
+                Err(e)
+            }
+        }
+    }
+}
+
+/// A placeholder frame used while a generator's real frame is borrowed out.
+fn empty_frame<'a>() -> Frame<'a> {
+    Frame {
+        module: Rc::new(Module { chunks: Vec::new() }),
+        chunk: 0,
+        captures: Vec::new(),
+        regs: Vec::new(),
+        pc: 0,
+        handlers: Vec::new(),
+    }
 }
 
 /// Builds a fresh frame for `chunk`, binding `this` (register 0), the
