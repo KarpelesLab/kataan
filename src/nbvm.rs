@@ -14,13 +14,13 @@
 //! It also carries the **bytecode-VM fold**: an AST → bytecode `compile_and_run`
 //! that lowers a growing JavaScript subset (arithmetic, control flow,
 //! arrays/objects, `for`/`do-while` loops, compound assignment and `++`/`--`,
-//! functions with recursion via a per-activation register window, and native
-//! `console.log`/`Math.*` calls) onto these ops, with no tree-walking — and it
-//! agrees with the tree-walker output for output (a cross-engine parity test).
-//! Closures, exceptions, and first-class function values arrive with later
-//! slices; the point is that every value flowing through it is a single 64-bit
-//! word and every object is a GC-managed heap node, exactly as the production VM
-//! will work.
+//! functions with recursion via a per-activation register window, `try`/`catch`/
+//! `throw` exceptions that unwind across calls, and native `console.log`/`Math.*`
+//! calls) onto these ops, with no tree-walking — and it agrees with the
+//! tree-walker on output (a cross-engine parity test). Closures and first-class
+//! function values arrive with later slices; the point is that every value
+//! flowing through it is a single 64-bit word and every object is a GC-managed
+//! heap node, exactly as the production VM will work.
 //!
 //! Pure, safe `alloc`-only Rust.
 
@@ -90,6 +90,14 @@ pub enum Op {
         native: u16,
         args: Vec<Reg>,
     },
+    /// Installs an exception handler: on a throw, control jumps to `target` with
+    /// the thrown value placed in register `reg`.
+    PushHandler { target: usize, reg: Reg },
+    /// Removes the most recently installed handler (a try block completed).
+    PopHandler,
+    /// Throws the value in `src` (caught by the nearest handler, else unwinds
+    /// the call stack).
+    Throw { src: Reg },
     /// Halt, yielding the value in `src`.
     Return { src: Reg },
 }
@@ -166,12 +174,14 @@ fn call(ctx: &mut Ctx, funcs: &[FnProto], id: usize, args: &[NanBox]) -> Result<
 }
 
 /// Why execution stopped abnormally.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum VmError {
     /// An arithmetic op saw a non-number operand (this toy VM has no coercion).
     NotANumber,
     /// A property op was used on a non-object operand.
     NotAnObject,
+    /// An uncaught `throw` propagating out of the call stack (the thrown value).
+    Thrown(NanBox),
 }
 
 /// Runs `program` with a register file of `register_count` slots (initialized to
@@ -198,6 +208,8 @@ fn run_frame(
     regs: &mut [NanBox],
 ) -> Result<Option<NanBox>, VmError> {
     let mut pc = 0;
+    // Active exception handlers: `(catch_pc, catch_reg)`, innermost last.
+    let mut handlers: Vec<(usize, Reg)> = Vec::new();
 
     let num = |v: NanBox| v.as_number().ok_or(VmError::NotANumber);
     // A register holding an object: recover its heap handle from the boxed value
@@ -295,12 +307,37 @@ fn run_frame(
             }
             Op::Call { dst, func, args } => {
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                let ret = call(ctx, funcs, *func as usize, &argv)?;
-                regs[*dst as usize] = ret;
+                // A throw from the callee is caught by this frame's nearest
+                // handler, else it keeps unwinding.
+                match call(ctx, funcs, *func as usize, &argv) {
+                    Ok(ret) => regs[*dst as usize] = ret,
+                    Err(VmError::Thrown(v)) => match handlers.pop() {
+                        Some((target, reg)) => {
+                            regs[reg as usize] = v;
+                            pc = target;
+                        }
+                        None => return Err(VmError::Thrown(v)),
+                    },
+                    Err(other) => return Err(other),
+                }
             }
             Op::CallNative { dst, native, args } => {
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
                 regs[*dst as usize] = call_native(ctx, *native, &argv);
+            }
+            Op::PushHandler { target, reg } => handlers.push((*target, *reg)),
+            Op::PopHandler => {
+                handlers.pop();
+            }
+            Op::Throw { src } => {
+                let v = regs[*src as usize];
+                match handlers.pop() {
+                    Some((target, reg)) => {
+                        regs[reg as usize] = v;
+                        pc = target;
+                    }
+                    None => return Err(VmError::Thrown(v)),
+                }
             }
             Op::Return { src } => return Ok(Some(regs[*src as usize])),
         }
@@ -525,6 +562,55 @@ impl Compiler {
                     None => self.constant(NanBox::undefined())?,
                 };
                 self.ops.push(Op::Return { src });
+                Ok(None)
+            }
+            Stmt::Throw { argument, .. } => {
+                let src = self.expr(argument)?;
+                self.ops.push(Op::Throw { src });
+                Ok(None)
+            }
+            Stmt::Try {
+                block,
+                handler,
+                finalizer,
+                ..
+            } => {
+                if finalizer.is_some() {
+                    return Err(CompileError::Unsupported("finally"));
+                }
+                let Some(catch) = handler else {
+                    return Err(CompileError::Unsupported("try without catch"));
+                };
+                // The register the thrown value lands in (and the catch binding,
+                // if any, names it).
+                let catch_reg = self.alloc();
+                let push = self.ops.len();
+                self.ops.push(Op::PushHandler {
+                    target: 0,
+                    reg: catch_reg,
+                });
+                // try body
+                self.scopes.push(alloc::collections::BTreeMap::new());
+                for s in block {
+                    self.stmt(s)?;
+                }
+                self.scopes.pop();
+                self.ops.push(Op::PopHandler);
+                let jend = self.emit_jump();
+                // catch entry
+                self.patch(push);
+                self.scopes.push(alloc::collections::BTreeMap::new());
+                if let Some(BindingTarget::Ident(Ident { name, .. })) = &catch.param {
+                    self.scopes
+                        .last_mut()
+                        .expect("a scope")
+                        .insert(String::from(&**name), catch_reg);
+                }
+                for s in &catch.body {
+                    self.stmt(s)?;
+                }
+                self.scopes.pop();
+                self.patch(jend);
                 Ok(None)
             }
             Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
@@ -961,10 +1047,12 @@ impl Compiler {
         self.patch_to(idx, target);
     }
 
-    /// Backpatches the jump at `idx` to land at `target`.
+    /// Backpatches the jump (or handler) at `idx` to land at `target`.
     fn patch_to(&mut self, idx: usize, target: usize) {
         match &mut self.ops[idx] {
-            Op::JumpIfFalse { target: t, .. } | Op::Jump { target: t } => *t = target,
+            Op::JumpIfFalse { target: t, .. }
+            | Op::Jump { target: t }
+            | Op::PushHandler { target: t, .. } => *t = target,
             _ => unreachable!("patch a non-jump"),
         }
     }
@@ -1037,6 +1125,36 @@ mod tests {
         let mut realm = Realm::new();
         let (_, output) = compile_run_output(&mut realm, &program).expect("compile+run");
         output
+    }
+
+    #[test]
+    fn bytecode_exceptions() {
+        // throw caught by the local catch, binding the thrown value.
+        assert_eq!(
+            bc("let r = 'none'; try { throw 'boom'; } catch (e) { r = 'caught:' + e; } r"),
+            "caught:boom"
+        );
+        // No throw: the catch body is skipped.
+        assert_eq!(bc("let r = 0; try { r = 1; } catch (e) { r = 99; } r"), "1");
+        // A throw inside a called function unwinds to the caller's catch.
+        assert_eq!(
+            bc(
+                "function boom() { throw 'x'; } let r = 'ok'; try { boom(); r = 'no'; } catch (e) { r = 'got:' + e; } r"
+            ),
+            "got:x"
+        );
+        // catch without a binding.
+        assert_eq!(
+            bc("let r = 'a'; try { throw 1; } catch { r = 'b'; } r"),
+            "b"
+        );
+        // Conditional throw in a loop; the loop continues after catching.
+        assert_eq!(
+            bc(
+                "let s = 0; for (let i = 0; i < 5; i++) { try { if (i === 2) { throw 0; } s += i; } catch (e) { s += 100; } } s"
+            ),
+            "108"
+        );
     }
 
     #[test]
