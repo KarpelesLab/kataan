@@ -361,6 +361,16 @@ fn more_array_methods() {
     assert_eq!(eval("[1, 2, 3].at(-1)"), "3");
     assert_eq!(eval("[5, 6, 7].findIndex(x => x === 6)"), "1");
     assert_eq!(eval("let a = [1, 2]; a.unshift(0); a.join(',')"), "0,1,2");
+    assert_eq!(
+        eval("[1, 2, 3].flatMap(x => [x, -x]).join(',')"),
+        "1,-1,2,-2,3,-3"
+    );
+    assert_eq!(eval("[1, 2, 3, 4].some(x => x > 3)"), "true");
+    assert_eq!(eval("[1, 2, 3, 4].every(x => x > 0)"), "true");
+    assert_eq!(eval("[1, 2, 3, 4].every(x => x > 2)"), "false");
+    assert_eq!(eval("[1, 2, 3, 4, 5].findLast(x => x % 2 === 1)"), "5");
+    assert_eq!(eval("[1, 2, 3, 4, 5].findLastIndex(x => x % 2 === 0)"), "3");
+    assert_eq!(eval("[1, 2, 3].findLast(x => x > 9)"), "undefined");
 }
 
 #[test]

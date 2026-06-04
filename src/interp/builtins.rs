@@ -941,7 +941,8 @@ impl<'a> Interp<'a> {
                 }
                 Value::Number(v.len() as f64)
             }
-            "map" | "filter" | "forEach" | "find" | "findIndex" | "some" | "every" => {
+            "map" | "filter" | "forEach" | "find" | "findIndex" | "some" | "every" | "flatMap"
+            | "findLast" | "findLastIndex" => {
                 return self.array_iter_method(arr, name, args).map(Some);
             }
             "reduce" => {
@@ -1001,6 +1002,9 @@ impl<'a> Interp<'a> {
         let callback = arg(args, 0);
         let snapshot: Vec<Value<'a>> = arr.elements().expect("array").borrow().clone();
         let mut out: Vec<Value<'a>> = Vec::new();
+        // `findLast`/`findLastIndex` cannot short-circuit; track the latest hit.
+        let mut last_found = Value::Undefined;
+        let mut last_index = -1.0;
         for (i, item) in snapshot.iter().enumerate() {
             let call_args = alloc::vec![
                 item.clone(),
@@ -1010,6 +1014,13 @@ impl<'a> Interp<'a> {
             let r = self.call_with_this(callback.clone(), Value::Undefined, call_args)?;
             match name {
                 "map" => out.push(r),
+                "flatMap" => match r {
+                    // One level of flattening, per the spec.
+                    Value::Object(o) if o.is_array() => {
+                        out.extend(o.elements().expect("array").borrow().iter().cloned());
+                    }
+                    other => out.push(other),
+                },
                 "filter" => {
                     if r.to_boolean() {
                         out.push(item.clone());
@@ -1026,6 +1037,16 @@ impl<'a> Interp<'a> {
                         return Ok(Value::Number(i as f64));
                     }
                 }
+                "findLast" => {
+                    if r.to_boolean() {
+                        last_found = item.clone();
+                    }
+                }
+                "findLastIndex" => {
+                    if r.to_boolean() {
+                        last_index = i as f64;
+                    }
+                }
                 "some" => {
                     if r.to_boolean() {
                         return Ok(Value::Bool(true));
@@ -1040,9 +1061,11 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(match name {
-            "map" | "filter" => Value::Object(Obj::array(out)),
+            "map" | "filter" | "flatMap" => Value::Object(Obj::array(out)),
             "find" => Value::Undefined,
             "findIndex" => Value::Number(-1.0),
+            "findLast" => last_found,
+            "findLastIndex" => Value::Number(last_index),
             "some" => Value::Bool(false),
             "every" => Value::Bool(true),
             _ => Value::Undefined, // forEach
