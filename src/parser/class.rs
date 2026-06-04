@@ -234,7 +234,7 @@ impl<'src> Parser<'src> {
         self.expect(TokenKind::LParen)?;
         let params = self.parse_params()?;
         self.expect(TokenKind::RParen)?;
-        let body = self.parse_block_body()?;
+        let body = self.in_function_context(is_generator, is_async, Self::parse_block_body)?;
         Ok(Function {
             id: None,
             params,

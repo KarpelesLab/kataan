@@ -50,7 +50,7 @@ impl<'src> Parser<'src> {
         self.expect(TokenKind::LParen)?;
         let params = self.parse_params()?;
         self.expect(TokenKind::RParen)?;
-        let body = self.parse_block_body()?;
+        let body = self.in_function_context(is_generator, is_async, Self::parse_block_body)?;
         Ok(Function {
             id,
             params,
@@ -165,11 +165,16 @@ impl<'src> Parser<'src> {
         };
 
         self.expect(TokenKind::Arrow)?;
-        let body = if self.at(TokenKind::LBrace) {
-            ArrowBody::Block(self.parse_block_body()?)
-        } else {
-            ArrowBody::Expr(Box::new(self.parse_assignment()?))
-        };
+        // An arrow is never a generator; an async arrow enables `await`, and a
+        // plain arrow inherits `await` from the enclosing context.
+        let body_async = is_async || self.in_async;
+        let body = self.in_function_context(false, body_async, |p| {
+            if p.at(TokenKind::LBrace) {
+                Ok(ArrowBody::Block(p.parse_block_body()?))
+            } else {
+                Ok(ArrowBody::Expr(Box::new(p.parse_assignment()?)))
+            }
+        })?;
         let span = start.to(self.prev_span());
         Ok(Expr::Arrow(Arrow {
             params,

@@ -38,6 +38,10 @@ pub struct Parser<'src> {
     /// When set, the `in` keyword is not treated as a relational operator
     /// (used inside `for`-loop headers, in a later increment).
     no_in: bool,
+    /// Whether the cursor is inside a generator body (enables `yield`).
+    in_generator: bool,
+    /// Whether the cursor is inside an async body (enables `await`).
+    in_async: bool,
 }
 
 impl<'src> Parser<'src> {
@@ -50,6 +54,8 @@ impl<'src> Parser<'src> {
             tokens,
             pos: 0,
             no_in: false,
+            in_generator: false,
+            in_async: false,
         })
     }
 
@@ -172,6 +178,9 @@ impl<'src> Parser<'src> {
     /// `AssignmentExpression` — handles arrow functions (via cover-grammar
     /// lookahead), `=`, and the compound assignments (right-associative).
     fn parse_assignment(&mut self) -> Result<Expr> {
+        if self.in_generator && self.at(TokenKind::Keyword(Kw::Yield)) {
+            return self.parse_yield();
+        }
         if self.at_arrow_head() {
             return self.parse_arrow();
         }
@@ -426,6 +435,15 @@ impl<'src> Parser<'src> {
 
     fn parse_unary(&mut self) -> Result<Expr> {
         let tok = self.peek_tok();
+        if self.in_async && tok.kind == TokenKind::Keyword(Kw::Await) {
+            self.bump();
+            let argument = self.parse_unary()?;
+            let span = tok.span.to(argument.span());
+            return Ok(Expr::Await {
+                argument: Box::new(argument),
+                span,
+            });
+        }
         let unary = match tok.kind {
             TokenKind::Plus => Some(UnaryOp::Plus),
             TokenKind::Minus => Some(UnaryOp::Minus),
@@ -971,6 +989,59 @@ impl<'src> Parser<'src> {
         self.no_in = true;
         let r = f(self);
         self.no_in = saved;
+        r
+    }
+
+    /// Parses a `yield` / `yield*` expression (the caller has checked we are in
+    /// a generator and the cursor is at `yield`).
+    fn parse_yield(&mut self) -> Result<Expr> {
+        let start = self.bump().span; // `yield`
+        let delegate = self.eat(TokenKind::Star);
+        // `yield*` always takes an operand; bare `yield` takes one unless a line
+        // terminator or an expression-terminating token follows.
+        let argument = if delegate || self.yield_has_argument() {
+            Some(Box::new(self.parse_assignment()?))
+        } else {
+            None
+        };
+        let span = start.to(self.prev_span());
+        Ok(Expr::Yield {
+            argument,
+            delegate,
+            span,
+        })
+    }
+
+    /// Whether a bare `yield` is followed by an operand.
+    fn yield_has_argument(&self) -> bool {
+        if self.peek_tok().newline_before {
+            return false;
+        }
+        !matches!(
+            self.peek(),
+            TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::RBrace
+                | TokenKind::Comma
+                | TokenKind::Semicolon
+                | TokenKind::Colon
+                | TokenKind::Eof
+        )
+    }
+
+    /// Runs `f` with the generator/async context set to the given values
+    /// (used when entering a function/method body), restoring them afterward.
+    pub(crate) fn in_function_context<T>(
+        &mut self,
+        is_generator: bool,
+        is_async: bool,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let saved = (self.in_generator, self.in_async);
+        self.in_generator = is_generator;
+        self.in_async = is_async;
+        let r = f(self);
+        (self.in_generator, self.in_async) = saved;
         r
     }
 }

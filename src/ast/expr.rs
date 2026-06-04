@@ -134,6 +134,17 @@ pub enum Expr {
     Arrow(Arrow),
     /// A class expression: `class { … }`.
     Class(Class),
+
+    /// A `yield` / `yield*` expression (only inside a generator).
+    Yield {
+        /// The yielded operand, if any (`yield;` has none).
+        argument: Option<Box<Expr>>,
+        /// Whether this is `yield*` (delegating).
+        delegate: bool,
+        span: Span,
+    },
+    /// An `await` expression (only inside an async function).
+    Await { argument: Box<Expr>, span: Span },
 }
 
 impl Expr {
@@ -161,7 +172,9 @@ impl Expr {
             | Expr::Logical { span, .. }
             | Expr::Conditional { span, .. }
             | Expr::Assign { span, .. }
-            | Expr::Sequence { span, .. } => *span,
+            | Expr::Sequence { span, .. }
+            | Expr::Yield { span, .. }
+            | Expr::Await { span, .. } => *span,
             Expr::Template(t) => t.span,
             Expr::Ident(id) => id.span,
             Expr::Function(f) => f.span,

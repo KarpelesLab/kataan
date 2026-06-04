@@ -195,6 +195,16 @@ fn sexpr(e: &Expr) -> String {
             format!("({kw} ({}) {body})", params(&a.params))
         }
         Expr::Class(c) => sexpr_class(c),
+        Expr::Yield {
+            argument, delegate, ..
+        } => {
+            let star = if *delegate { "*" } else { "" };
+            match argument {
+                Some(a) => format!("(yield{star} {})", sexpr(a)),
+                None => format!("(yield{star})"),
+            }
+        }
+        Expr::Await { argument, .. } => format!("(await {})", sexpr(argument)),
     }
 }
 
@@ -969,5 +979,44 @@ fn class_fields_and_private() {
     assert_eq!(
         prog("class C { [k]() {} }"),
         "(class C (method [k] () (block )))"
+    );
+}
+
+// === yield / await ======================================================
+
+#[test]
+fn yield_in_generators() {
+    assert_eq!(
+        prog("function* g() { yield 1; yield* xs; yield; }"),
+        "(fn* g () (block (expr (yield 1)) (expr (yield* xs)) (expr (yield))))"
+    );
+    assert_eq!(
+        prog("function* g() { let x = yield a; }"),
+        "(fn* g () (block (let (x (yield a)))))"
+    );
+    // Outside a generator, `yield` is not a keyword operator here (reserved →
+    // unexpected token).
+    assert!(sperr("yield 1;").contains("Yield") || sperr("yield 1;").contains("semicolon"));
+}
+
+#[test]
+fn await_in_async() {
+    assert_eq!(
+        prog("async function f() { await g(); }"),
+        "(async-fn f () (block (expr (await (call g)))))"
+    );
+    assert_eq!(sx("async () => await x"), "(async-arrow () (await x))");
+    // A plain arrow inside an async function inherits `await`.
+    assert_eq!(
+        prog("async function f() { let g = () => await x; }"),
+        "(async-fn f () (block (let (g (arrow () (await x))))))"
+    );
+}
+
+#[test]
+fn async_generator_method() {
+    assert_eq!(
+        prog("class C { async *m() { yield await x; } }"),
+        "(class C (async-*method m () (block (expr (yield (await x))))))"
     );
 }
