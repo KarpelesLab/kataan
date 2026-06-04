@@ -181,6 +181,37 @@ fn bytecode_vm_object_array_literals() {
 }
 
 #[test]
+fn bytecode_vm_method_calls() {
+    // Built-in array/string methods dispatch with the receiver as `this`.
+    assert_eq!(
+        eval_bc("[1, 2, 3, 4].map(x => x * x).join(',')"),
+        "1,4,9,16"
+    );
+    assert_eq!(eval_bc("[5, 3, 8, 1].filter(n => n > 3).length"), "2");
+    assert_eq!(eval_bc("[1, 2, 3, 4].reduce((a, b) => a + b, 0)"), "10");
+    assert_eq!(eval_bc("'Hello World'.toUpperCase()"), "HELLO WORLD");
+    assert_eq!(eval_bc("'a,b,c'.split(',').length"), "3");
+    assert_eq!(eval_bc("'  trim  '.trim()"), "trim");
+    assert_eq!(eval_bc("[3, 1, 2].sort((a, b) => a - b).join('')"), "123");
+    // A user method uses `this` correctly.
+    assert_eq!(
+        eval_bc("let o = { v: 10, get() { return this.v; } }; o.get()"),
+        "10"
+    );
+    assert_eq!(
+        eval_bc("let o = { base: 100, add(n) { return this.base + n; } }; o.add(23)"),
+        "123"
+    );
+    // Computed method name.
+    assert_eq!(eval_bc("let m = 'toUpperCase'; 'hi'[m]()"), "HI");
+    // Chained method calls.
+    assert_eq!(
+        eval_bc("'a-b-c'.split('-').map(s => s + '!').join('')"),
+        "a!b!c!"
+    );
+}
+
+#[test]
 fn bytecode_vm_loops() {
     // C-style for loop.
     assert_eq!(

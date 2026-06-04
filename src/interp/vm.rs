@@ -26,33 +26,39 @@ impl<'a> Interp<'a> {
         body: &[crate::ast::Stmt],
     ) -> Result<Completion<'a, Value<'a>>, super::compiler::CompileError> {
         let module = Rc::new(super::compiler::compile_program(body)?);
-        Ok(self.run_chunk(&module, 0, Vec::new()))
+        Ok(self.run_chunk(&module, 0, Value::Undefined, Vec::new()))
     }
 
     /// Calls a bytecode function value (dispatched from `call_with_this`).
     pub(super) fn call_bytecode_fn(
         &mut self,
         func: &Rc<BytecodeFn<'a>>,
+        this: Value<'a>,
         args: Vec<Value<'a>>,
     ) -> Completion<'a, Value<'a>> {
-        self.run_chunk(&func.module, func.chunk, args)
+        self.run_chunk(&func.module, func.chunk, this, args)
     }
 
-    /// Executes chunk `chunk_idx` of `module` with `args` bound to its leading
-    /// (parameter) registers, returning the value it returns.
+    /// Executes chunk `chunk_idx` of `module` with `this` in register 0 and
+    /// `args` bound to the parameter registers (1..), returning its value.
     fn run_chunk(
         &mut self,
         module: &Rc<Module>,
         chunk_idx: u32,
+        this: Value<'a>,
         args: Vec<Value<'a>>,
     ) -> Completion<'a, Value<'a>> {
         let chunk: &Chunk = &module.chunks[chunk_idx as usize];
         let mut regs: Vec<Value<'a>> = alloc::vec![Value::Undefined; chunk.register_count as usize];
-        // Bind arguments to the parameter registers (extras ignored, missing
-        // stay `undefined`).
+        // Register 0 holds `this`; parameters occupy registers 1.. (extras
+        // ignored, missing stay `undefined`).
+        if !regs.is_empty() {
+            regs[0] = this;
+        }
         for (i, arg) in args.into_iter().enumerate() {
-            if i < regs.len() {
-                regs[i] = arg;
+            let slot = i + 1;
+            if slot < regs.len() {
+                regs[slot] = arg;
             }
         }
         let mut pc = 0usize;
@@ -149,6 +155,20 @@ impl<'a> Interp<'a> {
                     let args: Vec<Value<'a>> = regs[base..base + *argc as usize].to_vec();
                     regs[*dst as usize] =
                         self.call_with_this(callee_val, Value::Undefined, args)?;
+                }
+
+                Op::CallMethod {
+                    dst,
+                    recv,
+                    key,
+                    args_base,
+                    argc,
+                } => {
+                    let receiver = regs[*recv as usize].clone();
+                    let key = regs[*key as usize].to_js_string();
+                    let base = *args_base as usize;
+                    let args: Vec<Value<'a>> = regs[base..base + *argc as usize].to_vec();
+                    regs[*dst as usize] = self.call_member(receiver, &key, args)?;
                 }
 
                 Op::Return { src } => return Ok(regs[*src as usize].clone()),

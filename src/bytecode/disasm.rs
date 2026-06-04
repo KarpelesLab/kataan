@@ -73,6 +73,13 @@ fn render_op(op: &Op) -> String {
             args_base,
             argc,
         } => format!("Call        r{dst}, r{callee}, r{args_base}..+{argc}"),
+        Op::CallMethod {
+            dst,
+            recv,
+            key,
+            args_base,
+            argc,
+        } => format!("CallMethod  r{dst}, r{recv}[r{key}], r{args_base}..+{argc}"),
         Op::Return { src } => format!("Return      r{src}"),
         Op::ReturnUndefined => "ReturnUndef".into(),
     }

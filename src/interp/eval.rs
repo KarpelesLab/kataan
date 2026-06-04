@@ -796,21 +796,8 @@ impl<'a> Interp<'a> {
                         return Ok(Value::Undefined);
                     }
                     let key = self.member_key(property, env)?;
-                    let member = self.get_member(&obj, &key)?;
                     let args = self.eval_arguments(arguments, env)?;
-                    if member.is_callable() {
-                        return self.call_with_this(member, obj, args);
-                    }
-                    if let Some(result) = self.call_builtin_method(&obj, &key, &args)? {
-                        return Ok(result);
-                    }
-                    if *optional && matches!(member, Value::Undefined | Value::Null) {
-                        return Ok(Value::Undefined);
-                    }
-                    return Err(make_error(
-                        "TypeError",
-                        alloc::format!("{}.{key} is not a function", obj.to_js_string()),
-                    ));
+                    return self.call_member(obj, &key, args);
                 }
                 let callee_val = self.eval_expr(callee, env)?;
                 if *optional && matches!(callee_val, Value::Undefined | Value::Null) {
@@ -1498,6 +1485,28 @@ impl<'a> Interp<'a> {
         Ok(args)
     }
 
+    /// Calls `obj.key(args)`: an own/inherited callable member is invoked with
+    /// `obj` as `this`; otherwise the built-in prototype methods (array/string/
+    /// number/collection) are tried; otherwise a TypeError is thrown.
+    pub(super) fn call_member(
+        &mut self,
+        obj: Value<'a>,
+        key: &str,
+        args: Vec<Value<'a>>,
+    ) -> Completion<'a, Value<'a>> {
+        let member = self.get_member(&obj, key)?;
+        if member.is_callable() {
+            return self.call_with_this(member, obj, args);
+        }
+        if let Some(result) = self.call_builtin_method(&obj, key, &args)? {
+            return Ok(result);
+        }
+        Err(make_error(
+            "TypeError",
+            alloc::format!("{}.{key} is not a function", obj.to_js_string()),
+        ))
+    }
+
     pub(super) fn call_with_this(
         &mut self,
         callee: Value<'a>,
@@ -1509,7 +1518,7 @@ impl<'a> Interp<'a> {
             // A bytecode function: run its chunk through the VM.
             Value::Object(o) if o.bytecode_fn().is_some() => {
                 let func = o.bytecode_fn().expect("bytecode fn");
-                self.call_bytecode_fn(&func, args)
+                self.call_bytecode_fn(&func, this, args)
             }
             // A callable constructor object (`String`, `Number`, …) delegates
             // to its backing native.

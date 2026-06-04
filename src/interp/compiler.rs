@@ -66,13 +66,18 @@ impl FnState {
     fn new(chunk_idx: usize, enclosing: Vec<String>) -> Self {
         Self {
             chunk_idx,
-            next_reg: 0,
+            // Register 0 is reserved for `this` (bound by the VM on each call);
+            // parameters and locals start at register 1.
+            next_reg: 1,
             locals: Vec::new(),
             enclosing,
             loops: Vec::new(),
         }
     }
 }
+
+/// The register holding the current function's `this` value.
+const THIS_REG: Reg = 0;
 
 /// Unresolved `break`/`continue` jump sites for one loop.
 struct LoopCtx {
@@ -497,6 +502,11 @@ impl Compiler {
                 self.emit(Op::LoadNull { dst });
                 Ok(dst)
             }
+            Expr::This(_) => {
+                let dst = self.reg();
+                self.emit(Op::Move { dst, src: THIS_REG });
+                Ok(dst)
+            }
             Expr::Ident(id) => self.read_ident(&id.name),
             Expr::Assign {
                 op, target, value, ..
@@ -861,8 +871,73 @@ impl Compiler {
         callee: &Expr,
         arguments: &[crate::ast::Argument],
     ) -> Result<Reg, CompileError> {
-        use crate::ast::Argument;
+        // A method call `obj.m(args)` / `obj[k](args)` binds `obj` as `this` and
+        // dispatches built-in prototype methods (CallMethod).
+        if let Expr::Member {
+            object,
+            property,
+            optional: false,
+            ..
+        } = callee
+        {
+            return self.method_call(object, property, arguments);
+        }
         let callee_reg = self.expr(callee)?;
+        let (args_base, argc) = self.lower_args(arguments)?;
+        let dst = self.reg();
+        self.emit(Op::Call {
+            dst,
+            callee: callee_reg,
+            args_base,
+            argc,
+        });
+        Ok(dst)
+    }
+
+    fn method_call(
+        &mut self,
+        object: &Expr,
+        property: &PropertyKey,
+        arguments: &[crate::ast::Argument],
+    ) -> Result<Reg, CompileError> {
+        let recv = self.expr(object)?;
+        // The key goes into a register (a constant for `.name`, the computed
+        // expression otherwise).
+        let key = match property {
+            PropertyKey::Ident(name) => {
+                let r = self.reg();
+                let k = self.add_const(Const::Str(name.clone().into_string()));
+                self.emit(Op::LoadConst { dst: r, k });
+                r
+            }
+            PropertyKey::Str(s) => {
+                let r = self.reg();
+                let k = self.add_const(Const::Str(s.clone().into_string()));
+                self.emit(Op::LoadConst { dst: r, k });
+                r
+            }
+            PropertyKey::Computed(expr) => self.expr(expr)?,
+            _ => return Err(CompileError::unsupported("method key")),
+        };
+        let (args_base, argc) = self.lower_args(arguments)?;
+        let dst = self.reg();
+        self.emit(Op::CallMethod {
+            dst,
+            recv,
+            key,
+            args_base,
+            argc,
+        });
+        Ok(dst)
+    }
+
+    /// Lowers call arguments into a fresh contiguous register window, returning
+    /// `(args_base, argc)`.
+    fn lower_args(
+        &mut self,
+        arguments: &[crate::ast::Argument],
+    ) -> Result<(Reg, u16), CompileError> {
+        use crate::ast::Argument;
         let mut arg_regs = Vec::new();
         for arg in arguments {
             match arg {
@@ -875,14 +950,7 @@ impl Compiler {
             let slot = self.reg();
             self.emit(Op::Move { dst: slot, src });
         }
-        let dst = self.reg();
-        self.emit(Op::Call {
-            dst,
-            callee: callee_reg,
-            args_base,
-            argc: arg_regs.len() as u16,
-        });
-        Ok(dst)
+        Ok((args_base, arg_regs.len() as u16))
     }
 }
 

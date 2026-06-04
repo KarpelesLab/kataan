@@ -181,6 +181,7 @@ mod tag {
     pub(super) const CALL: u8 = 31;
     pub(super) const RETURN: u8 = 32;
     pub(super) const RETURN_UNDEFINED: u8 = 33;
+    pub(super) const CALL_METHOD: u8 = 34;
 }
 
 fn write_op(w: &mut Writer, op: &Op) {
@@ -294,6 +295,20 @@ fn write_op(w: &mut Writer, op: &Op) {
             w.u16(*args_base);
             w.u16(*argc);
         }
+        Op::CallMethod {
+            dst,
+            recv,
+            key,
+            args_base,
+            argc,
+        } => {
+            w.raw(tag::CALL_METHOD);
+            w.u16(*dst);
+            w.u16(*recv);
+            w.u16(*key);
+            w.u16(*args_base);
+            w.u16(*argc);
+        }
         Op::Return { src } => {
             w.raw(tag::RETURN);
             w.u16(*src);
@@ -386,6 +401,13 @@ fn read_op(r: &mut Reader) -> Result<Op, BytecodeError> {
         tag::CALL => Op::Call {
             dst: r.u16()?,
             callee: r.u16()?,
+            args_base: r.u16()?,
+            argc: r.u16()?,
+        },
+        tag::CALL_METHOD => Op::CallMethod {
+            dst: r.u16()?,
+            recv: r.u16()?,
+            key: r.u16()?,
             args_base: r.u16()?,
             argc: r.u16()?,
         },

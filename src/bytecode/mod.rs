@@ -211,6 +211,15 @@ pub enum Op {
         args_base: Reg,
         argc: u16,
     },
+    /// `dst = recv[key](args…)` with `recv` bound as `this` (and built-in
+    /// prototype-method dispatch). `key` is a register holding the key value.
+    CallMethod {
+        dst: Reg,
+        recv: Reg,
+        key: Reg,
+        args_base: Reg,
+        argc: u16,
+    },
     Return {
         src: Reg,
     },
