@@ -59,6 +59,15 @@ pub enum Op {
     ValueBin { dst: Reg, op: u8, a: Reg, b: Reg },
     /// `dst = (key in obj)` — own-property / array-index membership.
     HasProp { dst: Reg, key: Reg, obj: Reg },
+    /// Tags the object in `obj` with `class_id` (for `instanceof`).
+    SetClassTag { obj: Reg, class_id: u32 },
+    /// `dst = (obj instanceof C)` — true iff `obj`'s class tag is one of `ids`
+    /// (the queried class and all its subclasses, computed at compile time).
+    InstanceOf {
+        dst: Reg,
+        obj: Reg,
+        ids: alloc::rc::Rc<[u32]>,
+    },
     /// `dst = typeof a` (a heap string).
     TypeOf { dst: Reg, a: Reg },
     /// `dst = ~a` (bitwise NOT, `i32` semantics).
@@ -371,6 +380,19 @@ fn run_frame(
                     None => false,
                 };
                 regs[*dst as usize] = NanBox::boolean(present);
+            }
+            Op::SetClassTag { obj, class_id } => {
+                if let Some(h) = regs[*obj as usize].as_handle().map(Handle::from_raw) {
+                    ctx.realm.set_class_tag(h, *class_id);
+                }
+            }
+            Op::InstanceOf { dst, obj, ids } => {
+                let yes = regs[*obj as usize]
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| ctx.realm.class_tag(h))
+                    .is_some_and(|t| ids.contains(&t));
+                regs[*dst as usize] = NanBox::boolean(yes);
             }
             Op::TypeOf { dst, a } => {
                 let t = ctx.realm.type_of_value(regs[*a as usize]);
@@ -1277,10 +1299,12 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
     let mut next_id = (decls.len() + 1) as u32;
     let mut class_map = alloc::collections::BTreeMap::new();
     let mut class_jobs: Vec<ClassJob> = Vec::new();
+    let mut class_id = 0u32;
     for s in &program.body {
         if let Stmt::Class(class) = s {
             let Some(id) = &class.id else { continue };
-            let info = scan_class(class, &mut next_id, &mut class_jobs)?;
+            let info = scan_class(class, class_id, &mut next_id, &mut class_jobs)?;
+            class_id += 1;
             class_map.insert(String::from(&*id.name), info);
         }
     }
@@ -1704,6 +1728,7 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
 /// methods and queueing them for compilation.
 fn scan_class<'a>(
     class: &'a crate::ast::Class,
+    class_id: u32,
     next_id: &mut u32,
     jobs: &mut Vec<ClassJob<'a>>,
 ) -> Result<ClassInfo, CompileError> {
@@ -1717,6 +1742,7 @@ fn scan_class<'a>(
         },
     };
     let mut info = ClassInfo {
+        class_id,
         super_name: super_name.clone(),
         ctor: None,
         methods: Vec::new(),
@@ -1803,6 +1829,8 @@ fn nearest_ctor(
 /// its instance methods as function-table ids.
 #[derive(Clone)]
 struct ClassInfo {
+    /// A unique class id (the instance's `class_tag`, for `instanceof`).
+    class_id: u32,
     /// The `extends` superclass name, if any.
     super_name: Option<String>,
     /// The constructor's function id, if the class declares one.
@@ -2514,6 +2542,34 @@ impl Compiler {
             Expr::Binary {
                 op, left, right, ..
             } => {
+                // `x instanceof Class` for a known class: true iff `x`'s class
+                // tag is the class or one of its subclasses (computed here).
+                if matches!(op, BinaryOp::Instanceof)
+                    && let Expr::Ident(cls) = &**right
+                    && self.classes.contains_key(&*cls.name)
+                {
+                    let target_name = &*cls.name;
+                    // Every class whose `extends` chain reaches the target.
+                    let mut ids: Vec<u32> = Vec::new();
+                    for (name, info) in self.classes.iter() {
+                        let mut cur = Some(name.clone());
+                        while let Some(n) = cur {
+                            if n == target_name {
+                                ids.push(info.class_id);
+                                break;
+                            }
+                            cur = self.classes.get(&n).and_then(|c| c.super_name.clone());
+                        }
+                    }
+                    let obj = self.expr(left)?;
+                    let dst = self.alloc();
+                    self.ops.push(Op::InstanceOf {
+                        dst,
+                        obj,
+                        ids: ids.into(),
+                    });
+                    return Ok(dst);
+                }
                 let a = self.expr(left)?;
                 let b = self.expr(right)?;
                 if matches!(op, BinaryOp::In) {
@@ -2845,9 +2901,13 @@ impl Compiler {
                     };
                     args.push(self.expr(e)?);
                 }
-                let _ = info;
                 let instance = self.alloc();
                 self.ops.push(Op::NewObject { dst: instance });
+                // Tag the instance with its class (for `instanceof`).
+                self.ops.push(Op::SetClassTag {
+                    obj: instance,
+                    class_id: info.class_id,
+                });
                 // Walk the `extends` chain root→derived and install each class's
                 // methods, so a derived method overrides an inherited one.
                 let mut chain: Vec<String> = Vec::new();
@@ -3625,6 +3685,31 @@ mod tests {
                 new P().sum()"
             ),
             "6"
+        );
+    }
+
+    #[test]
+    fn bytecode_instanceof() {
+        // Direct instance.
+        assert_eq!(bc("class A {} new A() instanceof A"), "true");
+        // Subclass is an instance of its base and itself.
+        assert_eq!(
+            bc("class A {} class B extends A {}
+                let b = new B(); '' + (b instanceof B) + ',' + (b instanceof A)"),
+            "true,true"
+        );
+        // A base is not an instance of its subclass.
+        assert_eq!(
+            bc("class A {} class B extends A {} new A() instanceof B"),
+            "false"
+        );
+        // Unrelated classes.
+        assert_eq!(bc("class A {} class C {} new A() instanceof C"), "false");
+        // Three-level chain.
+        assert_eq!(
+            bc("class A {} class B extends A {} class C extends B {}
+                let c = new C(); '' + (c instanceof A) + (c instanceof B) + (c instanceof C)"),
+            "truetruetrue"
         );
     }
 
