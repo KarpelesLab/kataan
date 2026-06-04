@@ -4102,6 +4102,28 @@ impl<'a> Interp<'a> {
         self.realm.to_display_string(k)
     }
 
+    /// Coerces `v` to a string, invoking a plain object's own/inherited
+    /// `toString` method when it has a callable one (else the default form).
+    fn coerce_to_string(&mut self, v: NanBox) -> Result<String, ExecError> {
+        if let Some(raw) = v.as_handle() {
+            let h = Handle::from_raw(raw);
+            if self.realm.string_value(h).is_none()
+                && !self.realm.is_array(h)
+                && self.realm.object_keys(h).is_some()
+            {
+                let ts = self.read_member(h, "toString")?;
+                if ts
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    let r = self.call_with_this(ts, v, &[])?;
+                    return Ok(self.realm.to_display_string(r));
+                }
+            }
+        }
+        Ok(self.realm.to_display_string(v))
+    }
+
     fn eval(&mut self, expr: &'a Expr) -> Result<NanBox, ExecError> {
         match expr {
             Expr::Null(_) => Ok(NanBox::null()),
@@ -4142,7 +4164,8 @@ impl<'a> Interp<'a> {
                     }
                     if let Some(e) = t.expressions.get(i) {
                         let v = self.eval(e)?;
-                        out.push_str(&self.realm.to_display_string(v));
+                        let s = self.coerce_to_string(v)?;
+                        out.push_str(&s);
                     }
                 }
                 Ok(self.new_str(&out))
@@ -6552,6 +6575,18 @@ mod tests {
         );
         assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
         assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
+    }
+
+    #[test]
+    fn template_invokes_custom_tostring() {
+        assert_eq!(
+            run("let o = { toString() { return 'custom'; } }; `val=${o}`"),
+            "val=custom"
+        );
+        // A plain object with no toString still renders the default form.
+        assert_eq!(run("`${ {a:1} }`"), "[object Object]");
+        // Arrays/numbers/booleans coerce as usual.
+        assert_eq!(run("`${[1,2,3]}-${true}-${null}`"), "1,2,3-true-null");
     }
 
     #[test]
