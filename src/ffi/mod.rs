@@ -22,7 +22,7 @@
 //!
 //! The surface here is the Phase-A seed (version + status codes + a
 //! length-convention string copy); the runtime/context/value entry points
-//! arrive with the VM in later phases (see `ROADMAP.md` §5).
+//! arrive with the VM in later phases (see `ROADMAP.md` §6).
 #![allow(unsafe_code)]
 #![allow(unreachable_pub)]
 
