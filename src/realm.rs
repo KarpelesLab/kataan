@@ -87,6 +87,46 @@ impl Realm {
         self.heap.get(handle)?.as_array()
     }
 
+    /// The length of the array at `handle`, or `None` if it is not an array.
+    #[must_use]
+    pub fn array_length(&self, handle: Handle) -> Option<usize> {
+        Some(self.heap.get(handle)?.as_array()?.len())
+    }
+
+    /// `arr[index]` — the element at `index`, or `undefined` if out of range or
+    /// the cell is not an array.
+    #[must_use]
+    pub fn get_element(&self, handle: Handle, index: usize) -> NanBox {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_array)
+            .and_then(|a| a.get(index).copied())
+            .unwrap_or(NanBox::undefined())
+    }
+
+    /// `arr[index] = value` — grows the array with `undefined` holes if `index`
+    /// is past the end (per JS). Returns `false` if the cell is not an array.
+    pub fn set_element(&mut self, handle: Handle, index: usize, value: NanBox) -> bool {
+        match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
+            Some(a) => {
+                if index >= a.len() {
+                    a.resize(index + 1, NanBox::undefined());
+                }
+                a[index] = value;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `arr.push(value)` — appends, returning the new length, or `None` if the
+    /// cell is not an array.
+    pub fn array_push(&mut self, handle: Handle, value: NanBox) -> Option<usize> {
+        let a = self.heap.get_mut(handle).and_then(Cell::as_array_mut)?;
+        a.push(value);
+        Some(a.len())
+    }
+
     /// The `typeof` string for the heap value at `handle` (`"string"`/`"object"`),
     /// or `None` if the handle is stale.
     #[must_use]
@@ -762,6 +802,34 @@ mod tests {
         assert_eq!(realm.to_int32(n(3.9)), 3);
         assert_eq!(realm.to_int32(n(4294967297.0)), 1);
         assert_eq!(realm.to_int32(n(f64::NAN)), 0);
+    }
+
+    #[test]
+    fn array_index_length_and_push() {
+        let mut realm = Realm::new();
+        let arr = realm.new_array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)]);
+        assert_eq!(realm.array_length(arr), Some(2));
+        assert_eq!(realm.get_element(arr, 0).as_number(), Some(1.0));
+        assert_eq!(realm.get_element(arr, 1).as_number(), Some(2.0));
+        // Out of range reads undefined.
+        assert!(realm.get_element(arr, 5).is_undefined());
+        // Setting past the end grows with holes.
+        assert!(realm.set_element(arr, 4, NanBox::number(9.0)));
+        assert_eq!(realm.array_length(arr), Some(5));
+        assert!(realm.get_element(arr, 3).is_undefined()); // a hole
+        assert_eq!(realm.get_element(arr, 4).as_number(), Some(9.0));
+        // Push returns the new length.
+        assert_eq!(realm.array_push(arr, NanBox::number(7.0)), Some(6));
+        assert_eq!(realm.get_element(arr, 5).as_number(), Some(7.0));
+        // join renders the array (holes empty).
+        assert_eq!(
+            realm.to_display_string(NanBox::handle(arr.to_raw())),
+            "1,2,,,9,7"
+        );
+        // Array ops on a non-array are rejected.
+        let obj = realm.new_object();
+        assert_eq!(realm.array_length(obj), None);
+        assert!(!realm.set_element(obj, 0, NanBox::number(1.0)));
     }
 
     #[test]
