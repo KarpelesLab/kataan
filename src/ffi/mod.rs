@@ -95,6 +95,99 @@ pub unsafe extern "C" fn kt_version_copy(buf: *mut c_char, len: *mut usize) -> c
     status as c_int
 }
 
+/// Evaluates a JavaScript source string and writes its result into `out`.
+///
+/// `source`/`source_len` are the UTF-8 script (not required to be
+/// NUL-terminated). The completion value is rendered as a string and copied
+/// into `out` following the in/out length convention (`*out_len` is the buffer
+/// capacity on input and the produced length on output; call with `*out_len ==
+/// 0` to query the required length).
+///
+/// Returns [`KtStatus::Ok`] on success. On a parse error or an uncaught throw,
+/// returns [`KtStatus::InvalidInput`] and writes the error message into `out`
+/// (so the caller can surface it). A caught Rust panic yields
+/// [`KtStatus::Internal`].
+///
+/// # Safety
+///
+/// `out_len` must be a valid pointer to a `usize`. If `source_len > 0`,
+/// `source` must point to at least `source_len` readable bytes. If the produced
+/// output fits, `out` must point to at least `*out_len` writable bytes.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_eval(
+    source: *const c_char,
+    source_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if out_len.is_null() || (source.is_null() && source_len != 0) {
+            return KtStatus::NullPointer;
+        }
+        // SAFETY: caller guarantees `source` covers `source_len` bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(source as *const u8, source_len) };
+        let Ok(src) = core::str::from_utf8(bytes) else {
+            return KtStatus::InvalidInput;
+        };
+        let (text, ok) = match eval_to_string(src) {
+            Ok(value) => (value, true),
+            Err(message) => (message, false),
+        };
+        // SAFETY: `out_len` is non-null (checked) and `out` honors the
+        // length convention.
+        match unsafe { copy_out(text.as_bytes(), out, out_len) } {
+            KtStatus::Ok if !ok => KtStatus::InvalidInput,
+            other => other,
+        }
+    }));
+    match outcome {
+        Ok(status) => status as c_int,
+        Err(_) => KtStatus::Internal as c_int,
+    }
+}
+
+/// Parses and runs `src`, returning the completion value's string on success or
+/// the thrown value's string on an uncaught throw / parse error.
+#[cfg(feature = "std")]
+fn eval_to_string(src: &str) -> Result<alloc::string::String, alloc::string::String> {
+    use crate::interp::Interp;
+    use crate::parser::Parser;
+
+    let program = Parser::parse_program(src).map_err(|e| alloc::string::ToString::to_string(&e))?;
+    let mut interp = Interp::new();
+    match interp.run(&program) {
+        Ok(value) => Ok(value.to_js_string()),
+        Err(thrown) => Err(thrown.to_js_string()),
+    }
+}
+
+/// Copies `data` into `out` per the in/out length convention.
+///
+/// # Safety
+///
+/// `out_len` must be a valid pointer to a `usize`; if `data` fits in the
+/// reported capacity, `out` must point to at least that many writable bytes.
+#[cfg(feature = "std")]
+unsafe fn copy_out(data: &[u8], out: *mut c_char, out_len: *mut usize) -> KtStatus {
+    // SAFETY: caller guarantees `out_len` is valid.
+    let cap = unsafe { *out_len };
+    unsafe { *out_len = data.len() };
+    if cap < data.len() {
+        return KtStatus::BufferTooSmall;
+    }
+    if out.is_null() {
+        return KtStatus::NullPointer;
+    }
+    // SAFETY: `out` has at least `cap >= data.len()` writable bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), out as *mut u8, data.len());
+    }
+    KtStatus::Ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +219,63 @@ mod tests {
         // NULL len pointer.
         let rc = unsafe { kt_version_copy(core::ptr::null_mut(), core::ptr::null_mut()) };
         assert_eq!(rc, KtStatus::NullPointer as i32);
+    }
+
+    #[cfg(feature = "std")]
+    fn eval_str(src: &str) -> (KtStatus, alloc::string::String) {
+        let mut len: usize = 0;
+        // Length query.
+        let rc = unsafe {
+            kt_eval(
+                src.as_ptr() as *const c_char,
+                src.len(),
+                core::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        let mut buf = alloc::vec![0i8; len];
+        let rc2 = unsafe {
+            kt_eval(
+                src.as_ptr() as *const c_char,
+                src.len(),
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        // The query returns BufferTooSmall (or the final status if len was 0).
+        let _ = rc;
+        let bytes: alloc::vec::Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+        let text = alloc::string::String::from_utf8(bytes).unwrap();
+        (
+            if rc2 == KtStatus::Ok as i32 {
+                KtStatus::Ok
+            } else {
+                KtStatus::InvalidInput
+            },
+            text,
+        )
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn eval_runs_javascript() {
+        let (status, out) = eval_str("const f = (a, b) => a * b; f(6, 7)");
+        assert_eq!(status, KtStatus::Ok);
+        assert_eq!(out, "42");
+
+        let (status, out) = eval_str("[1, 2, 3].map(x => x * x).join(',')");
+        assert_eq!(status, KtStatus::Ok);
+        assert_eq!(out, "1,4,9");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn eval_reports_throws_and_parse_errors() {
+        let (status, out) = eval_str("throw new TypeError('boom')");
+        assert_eq!(status, KtStatus::InvalidInput);
+        assert_eq!(out, "TypeError: boom");
+
+        let (status, _) = eval_str("const = =");
+        assert_eq!(status, KtStatus::InvalidInput);
     }
 }
