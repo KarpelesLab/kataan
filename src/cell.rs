@@ -39,6 +39,9 @@ pub enum Cell {
         /// The captured lexical environment.
         env: Scope,
     },
+    /// A built-in (native) function, identified by an id the interpreter maps to
+    /// a Rust implementation.
+    Native(u16),
 }
 
 impl Cell {
@@ -94,6 +97,15 @@ impl Cell {
         }
     }
 
+    /// The built-in id, if this cell is a native function.
+    #[must_use]
+    pub fn as_native(&self) -> Option<u16> {
+        match self {
+            Cell::Native(id) => Some(*id),
+            _ => None,
+        }
+    }
+
     /// The `typeof` string for this reference value (`"string"` for strings,
     /// `"function"` for functions, `"object"` for objects and arrays — JS has no
     /// array primitive type).
@@ -101,7 +113,7 @@ impl Cell {
     pub fn type_of(&self) -> &'static str {
         match self {
             Cell::Str(_) => "string",
-            Cell::Function { .. } => "function",
+            Cell::Function { .. } | Cell::Native(_) => "function",
             Cell::Object(_) | Cell::Array(_) => "object",
         }
     }
@@ -120,7 +132,8 @@ impl Trace for Cell {
             }
             // A closure keeps its captured environment's handles alive.
             Cell::Function { env, .. } => env.for_each_handle(visit),
-            Cell::Str(_) => {} // a string references no handles
+            // Strings and native functions reference no handles.
+            Cell::Str(_) | Cell::Native(_) => {}
         }
     }
 }

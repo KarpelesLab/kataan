@@ -87,6 +87,17 @@ impl Realm {
         Some((id, env.clone()))
     }
 
+    /// Allocates a built-in (native) function with the given id.
+    pub fn new_native(&mut self, id: u16) -> Handle {
+        self.heap.alloc(Cell::Native(id))
+    }
+
+    /// The native-function id at `handle`, or `None` if it is not a native.
+    #[must_use]
+    pub fn native_at(&self, handle: Handle) -> Option<u16> {
+        self.heap.get(handle)?.as_native()
+    }
+
     /// The string at `handle` as a `String`, or `None` if it is not a string
     /// (or the handle is stale).
     #[must_use]
@@ -245,7 +256,7 @@ impl Realm {
                     parts.join(",")
                 }
                 Some(Cell::Object(_)) => "[object Object]".into(),
-                Some(Cell::Function { .. }) => "function () { … }".into(),
+                Some(Cell::Function { .. } | Cell::Native(_)) => "function () { … }".into(),
                 None => "undefined".into(), // stale handle
             },
         }

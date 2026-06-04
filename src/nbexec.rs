@@ -84,15 +84,100 @@ impl Default for Interp<'_> {
     }
 }
 
+// Built-in (native) function ids.
+const N_MATH_MAX: u16 = 0;
+const N_MATH_MIN: u16 = 1;
+const N_MATH_ABS: u16 = 2;
+const N_STRING: u16 = 3;
+const N_NUMBER: u16 = 4;
+const N_BOOLEAN: u16 = 5;
+const N_PARSE_INT: u16 = 6;
+
 impl<'a> Interp<'a> {
-    /// A fresh interpreter with a single (global) scope.
+    /// A fresh interpreter with a single (global) scope and a starter stdlib.
     #[must_use]
     pub fn new() -> Self {
-        Self {
+        let mut interp = Self {
             realm: Realm::new(),
             current: Scope::root(),
             functions: Vec::new(),
+        };
+        interp.install_globals();
+        interp
+    }
+
+    /// Installs a small built-in library: the `Math` object and the global
+    /// coercion/parse functions. (A token stdlib to prove the native-call path;
+    /// the full port is the remaining migration work.)
+    fn install_globals(&mut self) {
+        let math = self.realm.new_object();
+        for (name, id) in [
+            ("max", N_MATH_MAX),
+            ("min", N_MATH_MIN),
+            ("abs", N_MATH_ABS),
+        ] {
+            let f = self.realm.new_native(id);
+            self.realm
+                .set_property(math, name, NanBox::handle(f.to_raw()));
         }
+        self.current.declare("Math", NanBox::handle(math.to_raw()));
+        for (name, id) in [
+            ("String", N_STRING),
+            ("Number", N_NUMBER),
+            ("Boolean", N_BOOLEAN),
+            ("parseInt", N_PARSE_INT),
+        ] {
+            let f = self.realm.new_native(id);
+            self.current.declare(name, NanBox::handle(f.to_raw()));
+        }
+    }
+
+    /// Invokes a built-in by id.
+    fn call_native(&mut self, id: u16, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+        Ok(match id {
+            N_MATH_MAX => {
+                let mut m = f64::NEG_INFINITY;
+                for a in args {
+                    let n = self.realm.to_number(*a);
+                    if n.is_nan() {
+                        return Ok(NanBox::number(f64::NAN));
+                    }
+                    if n > m {
+                        m = n;
+                    }
+                }
+                NanBox::number(m)
+            }
+            N_MATH_MIN => {
+                let mut m = f64::INFINITY;
+                for a in args {
+                    let n = self.realm.to_number(*a);
+                    if n.is_nan() {
+                        return Ok(NanBox::number(f64::NAN));
+                    }
+                    if n < m {
+                        m = n;
+                    }
+                }
+                NanBox::number(m)
+            }
+            N_MATH_ABS => {
+                let n = self.realm.to_number(arg(0));
+                NanBox::number(if n < 0.0 { -n } else { n })
+            }
+            N_STRING => {
+                let s = self.realm.to_display_string(arg(0));
+                NanBox::handle(self.realm.new_string(&s).to_raw())
+            }
+            N_NUMBER => NanBox::number(self.realm.to_number(arg(0))),
+            N_BOOLEAN => NanBox::boolean(arg(0).to_boolean()),
+            N_PARSE_INT => {
+                let s = self.realm.to_display_string(arg(0));
+                NanBox::number(parse_int(&s))
+            }
+            _ => return Err(ExecError::NotCallable),
+        })
     }
 
     /// The underlying realm (e.g. to render a result with `to_display_string`).
@@ -148,6 +233,10 @@ impl<'a> Interp<'a> {
             return Err(ExecError::NotCallable);
         };
         let handle = crate::heap::Handle::from_raw(raw);
+        // A built-in function dispatches directly.
+        if let Some(id) = self.realm.native_at(handle) {
+            return self.call_native(id, args);
+        }
         let Some((func_id, captured)) = self.realm.function_at(handle) else {
             return Err(ExecError::NotCallable);
         };
@@ -690,6 +779,30 @@ fn compound_op(op: AssignOp) -> Result<BinaryOp, ExecError> {
     })
 }
 
+/// A minimal `parseInt`: skips leading whitespace, reads an optional sign and
+/// the leading decimal digits, and returns `NaN` if there are none.
+fn parse_int(s: &str) -> f64 {
+    let t = s.trim_start();
+    let mut chars = t.chars().peekable();
+    let mut out = String::new();
+    if matches!(chars.peek(), Some('+' | '-')) {
+        out.push(chars.next().unwrap());
+    }
+    while let Some(c) = chars.peek() {
+        if c.is_ascii_digit() {
+            out.push(*c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    // Just a sign (or empty) → NaN.
+    if out.is_empty() || out == "+" || out == "-" {
+        return f64::NAN;
+    }
+    out.parse::<f64>().unwrap_or(f64::NAN)
+}
+
 /// A non-negative integer array index, if `n` is one.
 fn as_index(n: f64) -> Option<usize> {
     if n >= 0.0 && n <= u32::MAX as f64 && (n as u64) as f64 == n {
@@ -854,6 +967,31 @@ mod tests {
         assert_eq!(
             run("function f() { try { return 'a'; } finally { return 'b'; } } f()"),
             "b"
+        );
+    }
+
+    #[test]
+    fn builtin_functions() {
+        // Math methods (variadic).
+        assert_eq!(run("Math.max(3, 7, 2)"), "7");
+        assert_eq!(run("Math.min(3, 7, 2)"), "2");
+        assert_eq!(run("Math.abs(-5)"), "5");
+        // Coercion globals.
+        assert_eq!(run("String(42)"), "42");
+        assert_eq!(run("Number('3.5')"), "3.5");
+        assert_eq!(run("Boolean(0)"), "false");
+        assert_eq!(run("Boolean('x')"), "true");
+        assert_eq!(run("parseInt('42px')"), "42");
+        assert_eq!(run("parseInt('  -7 ')"), "-7");
+        // typeof a built-in is "function".
+        assert_eq!(run("typeof Math.max"), "function");
+        // Built-ins compose with user code.
+        assert_eq!(
+            run(
+                "function clamp(x, lo, hi) { return Math.max(lo, Math.min(x, hi)); }
+                 clamp(15, 0, 10)"
+            ),
+            "10"
         );
     }
 }
