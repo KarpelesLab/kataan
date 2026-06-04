@@ -554,8 +554,74 @@ impl Compiler {
             Expr::Arrow(arrow) => self.arrow(arrow),
             Expr::Array { elements, .. } => self.array_literal(elements),
             Expr::Object { members, .. } => self.object_literal(members),
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => self.conditional(test, consequent, alternate),
+            Expr::Template(t) => self.template(t),
             _ => Err(CompileError::unsupported("expression")),
         }
+    }
+
+    /// `test ? consequent : alternate`, producing the chosen value in `dst`.
+    fn conditional(
+        &mut self,
+        test: &Expr,
+        consequent: &Expr,
+        alternate: &Expr,
+    ) -> Result<Reg, CompileError> {
+        let dst = self.reg();
+        let cond = self.expr(test)?;
+        let jf = self.emit(Op::JumpIfFalse { cond, offset: 0 });
+        let c = self.expr(consequent)?;
+        self.emit(Op::Move { dst, src: c });
+        let jmp = self.emit(Op::Jump { offset: 0 });
+        self.patch_to_here(jf);
+        let a = self.expr(alternate)?;
+        self.emit(Op::Move { dst, src: a });
+        self.patch_to_here(jmp);
+        Ok(dst)
+    }
+
+    /// A template literal: the quasis and interpolations are concatenated with
+    /// `Add` (string coercion, since the quasis are strings).
+    fn template(&mut self, t: &crate::ast::TemplateLiteral) -> Result<Reg, CompileError> {
+        let cooked = |q: &crate::ast::TemplateElement| {
+            q.cooked
+                .as_ref()
+                .map_or(String::new(), |c| c.clone().into_string())
+        };
+        // Start with the first quasi.
+        let acc = self.reg();
+        let k0 = self.add_const(Const::Str(cooked(&t.quasis[0])));
+        self.emit(Op::LoadConst { dst: acc, k: k0 });
+        for (i, expr) in t.expressions.iter().enumerate() {
+            // acc = acc + <expr>
+            let e = self.expr(expr)?;
+            let next = self.reg();
+            self.emit(Op::Add {
+                dst: next,
+                a: acc,
+                b: e,
+            });
+            // acc = next + quasi[i+1]
+            let qreg = self.reg();
+            let kq = self.add_const(Const::Str(cooked(&t.quasis[i + 1])));
+            self.emit(Op::LoadConst { dst: qreg, k: kq });
+            let joined = self.reg();
+            self.emit(Op::Add {
+                dst: joined,
+                a: next,
+                b: qreg,
+            });
+            self.emit(Op::Move {
+                dst: acc,
+                src: joined,
+            });
+        }
+        Ok(acc)
     }
 
     fn array_literal(

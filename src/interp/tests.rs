@@ -181,6 +181,30 @@ fn bytecode_vm_object_array_literals() {
 }
 
 #[test]
+fn bytecode_vm_ternary_and_templates() {
+    // Ternary chooses a branch value.
+    assert_eq!(eval_bc("3 > 2 ? 'yes' : 'no'"), "yes");
+    assert_eq!(eval_bc("let n = 7; n % 2 === 0 ? 'even' : 'odd'"), "odd");
+    assert_eq!(eval_bc("let a = 1; let b = 2; (a > b ? a : b) * 10"), "20");
+    // Template literals interpolate and coerce.
+    assert_eq!(eval_bc("let x = 5; `value=${x}`"), "value=5");
+    assert_eq!(
+        eval_bc("let a = 2; let b = 3; `${a} + ${b} = ${a + b}`"),
+        "2 + 3 = 5"
+    );
+    assert_eq!(eval_bc("`plain text`"), "plain text");
+    assert_eq!(
+        eval_bc("let name = 'world'; `Hello, ${name}! (${name.length} chars)`"),
+        "Hello, world! (5 chars)"
+    );
+    // Ternary + template together.
+    assert_eq!(
+        eval_bc("let n = 3; `n is ${n > 0 ? 'positive' : 'non-positive'}`"),
+        "n is positive"
+    );
+}
+
+#[test]
 fn bytecode_vm_method_calls() {
     // Built-in array/string methods dispatch with the receiver as `this`.
     assert_eq!(
