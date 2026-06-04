@@ -98,6 +98,11 @@ pub mod realm;
 #[cfg(feature = "alloc")]
 pub mod json;
 
+/// The WebAssembly peer engine: lowers the numeric subset of JS functions to
+/// WebAssembly text (WAT) — a second compilation target. Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod wasm;
+
 /// A minimal register VM over the `Realm`/`NanBox` representation — the proof
 /// that the performance object model executes code. Needs `alloc`.
 #[cfg(feature = "alloc")]
