@@ -332,6 +332,12 @@ fn error_objects() {
         "caught"
     );
     assert_eq!(eval("`${new Error('x')}`"), "Error: x");
+    // instanceof works through the built-in Error hierarchy.
+    assert_eq!(eval("new TypeError('x') instanceof TypeError"), "true");
+    assert_eq!(eval("new TypeError('x') instanceof Error"), "true");
+    assert_eq!(eval("new RangeError('x') instanceof TypeError"), "false");
+    assert_eq!(eval("new Map() instanceof Map"), "true");
+    assert_eq!(eval("new Set() instanceof Set"), "true");
     // Runtime errors are catchable objects with a name and message.
     assert_eq!(eval("try { null.x; } catch (e) { e.name; }"), "TypeError");
     assert_eq!(

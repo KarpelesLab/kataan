@@ -1217,8 +1217,15 @@ impl<'a> Interp<'a> {
     fn instance_of(&self, value: &Value<'a>, ctor: &Value<'a>) -> Completion<'a, bool> {
         let target_proto = match ctor {
             Value::Class(cv) => Rc::clone(&cv.prototype),
+            // A built-in constructor object (Error, Map, …): use its
+            // `.prototype` property.
+            Value::Object(o) if o.callable().is_some() => match o.get("prototype") {
+                Value::Object(p) => p,
+                _ => return Ok(false),
+            },
             _ => {
-                return Err(Value::str(
+                return Err(make_error(
+                    "TypeError",
                     "right-hand side of 'instanceof' is not callable",
                 ));
             }

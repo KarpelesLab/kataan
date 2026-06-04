@@ -254,6 +254,11 @@ impl<'a> Obj<'a> {
         self.proto.borrow().clone()
     }
 
+    /// Sets this object's prototype.
+    pub fn set_proto(&self, proto: Option<Rc<Obj<'a>>>) {
+        *self.proto.borrow_mut() = proto;
+    }
+
     /// Looks up an *own* property only (no prototype walk).
     #[must_use]
     pub fn get_own(&self, key: &str) -> Option<Value<'a>> {

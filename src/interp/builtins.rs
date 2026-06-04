@@ -58,40 +58,49 @@ impl<'a> Interp<'a> {
 
     fn install_collections(&self) {
         // `new Map([[k, v], …])`
-        self.define_global(
-            "Map",
-            native("Map", |a| {
-                let map = Obj::collection(false);
-                if let Value::Object(init) = arg(a, 0)
-                    && let Some(elems) = init.elements()
-                {
-                    for entry in elems.borrow().iter() {
-                        if let Value::Object(pair) = entry {
-                            collection_set(&map, pair.get("0"), pair.get("1"));
-                        }
+        let map_proto = Obj::object();
+        let mp = Rc::clone(&map_proto);
+        let map = constructor_object("Map", move |a| {
+            let map = Obj::collection(false);
+            map.set_proto(Some(Rc::clone(&mp)));
+            if let Value::Object(init) = arg(a, 0)
+                && let Some(elems) = init.elements()
+            {
+                for entry in elems.borrow().iter() {
+                    if let Value::Object(pair) = entry {
+                        collection_set(&map, pair.get("0"), pair.get("1"));
                     }
                 }
-                Ok(Value::Object(map))
-            }),
-        );
+            }
+            Ok(Value::Object(map))
+        });
+        map.set("prototype", Value::Object(map_proto));
+        self.define_global("Map", Value::Object(map));
+
         // `new Set([v, …])`
-        self.define_global(
-            "Set",
-            native("Set", |a| {
-                let set = Obj::collection(true);
-                if let Value::Object(init) = arg(a, 0)
-                    && let Some(elems) = init.elements()
-                {
-                    for v in elems.borrow().iter() {
-                        collection_set(&set, v.clone(), v.clone());
-                    }
+        let set_proto = Obj::object();
+        let sp = Rc::clone(&set_proto);
+        let set = constructor_object("Set", move |a| {
+            let set = Obj::collection(true);
+            set.set_proto(Some(Rc::clone(&sp)));
+            if let Value::Object(init) = arg(a, 0)
+                && let Some(elems) = init.elements()
+            {
+                for v in elems.borrow().iter() {
+                    collection_set(&set, v.clone(), v.clone());
                 }
-                Ok(Value::Object(set))
-            }),
-        );
+            }
+            Ok(Value::Object(set))
+        });
+        set.set("prototype", Value::Object(set_proto));
+        self.define_global("Set", Value::Object(set));
     }
 
     fn install_errors(&self) {
+        // A shared `Error.prototype` so subtype instances are also
+        // `instanceof Error`.
+        let error_proto = Obj::object();
+        error_proto.set("name", Value::str("Error"));
         for name in [
             "Error",
             "TypeError",
@@ -101,20 +110,29 @@ impl<'a> Interp<'a> {
             "EvalError",
             "URIError",
         ] {
-            self.define_global(
-                name,
-                native(name, move |a| {
-                    let obj = Obj::object();
-                    obj.set("name", Value::str(name));
-                    let msg = if a.is_empty() {
-                        String::new()
-                    } else {
-                        arg(a, 0).to_js_string()
-                    };
-                    obj.set("message", Value::str(msg));
-                    Ok(Value::Object(obj))
-                }),
-            );
+            // The base `Error` uses the shared prototype directly; subtypes get
+            // their own prototype chained to it.
+            let proto = if name == "Error" {
+                Rc::clone(&error_proto)
+            } else {
+                let p = Obj::with_proto(Rc::clone(&error_proto));
+                p.set("name", Value::str(name));
+                p
+            };
+            let instance_proto = Rc::clone(&proto);
+            let ctor = constructor_object(name, move |a| {
+                let obj = Obj::with_proto(Rc::clone(&instance_proto));
+                obj.set("name", Value::str(name));
+                let msg = if a.is_empty() {
+                    String::new()
+                } else {
+                    arg(a, 0).to_js_string()
+                };
+                obj.set("message", Value::str(msg));
+                Ok(Value::Object(obj))
+            });
+            ctor.set("prototype", Value::Object(proto));
+            self.define_global(name, Value::Object(ctor));
         }
     }
 
