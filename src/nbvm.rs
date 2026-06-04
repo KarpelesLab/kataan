@@ -114,6 +114,9 @@ pub enum Op {
     /// Copies the own properties (or array elements) of `src` into object `dst`
     /// (an object-literal `...spread`).
     ObjectSpread { dst: Reg, src: Reg },
+    /// `dst = a new array of `obj`'s enumerable keys` (own property names, or
+    /// array index strings) — for `for-in`.
+    EnumKeys { dst: Reg, obj: Reg },
     /// `dst = arr.length` (array length or string character count).
     ArrayLen { dst: Reg, arr: Reg },
     /// `dst = coll.size` (a `Map`/`Set`'s entry count).
@@ -568,6 +571,24 @@ fn run_frame(
                         ctx.realm.set_property(handle, &ks, regs[*src as usize]);
                     }
                 }
+            }
+            Op::EnumKeys { dst, obj } => {
+                let h = object_handle(regs[*obj as usize])?;
+                let keys: Vec<NanBox> = if let Some(len) = ctx.realm.array_length(h) {
+                    (0..len)
+                        .map(|i| {
+                            NanBox::handle(ctx.realm.new_string(&alloc::format!("{i}")).to_raw())
+                        })
+                        .collect()
+                } else {
+                    ctx.realm
+                        .object_keys(h)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|k| NanBox::handle(ctx.realm.new_string(&k).to_raw()))
+                        .collect()
+                };
+                regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(keys).to_raw());
             }
             Op::ObjectSpread { dst, src } => {
                 let target = object_handle(regs[*dst as usize])?;
@@ -2162,28 +2183,31 @@ impl Compiler {
         // the incoming argument value); a captured local that's a parameter must
         // share the cell so mutations are visible.
         for (i, p) in params.iter().enumerate() {
-            let BindingTarget::Ident(Ident { name, .. }) = &p.target else {
-                return Err(CompileError::Unsupported("destructuring parameter"));
-            };
-            let b = if c.cell_names.contains(&**name) {
-                let cell = c.alloc();
-                c.ops.push(Op::NewArray { dst: cell, len: 1 });
-                let bind = Binding {
-                    reg: cell,
-                    cell: true,
-                };
-                c.write_var(bind, arg_regs[i]);
-                bind
-            } else {
-                Binding {
-                    reg: arg_regs[i],
-                    cell: false,
+            match &p.target {
+                BindingTarget::Ident(Ident { name, .. }) => {
+                    let b = if c.cell_names.contains(&**name) {
+                        let cell = c.alloc();
+                        c.ops.push(Op::NewArray { dst: cell, len: 1 });
+                        let bind = Binding {
+                            reg: cell,
+                            cell: true,
+                        };
+                        c.write_var(bind, arg_regs[i]);
+                        bind
+                    } else {
+                        Binding {
+                            reg: arg_regs[i],
+                            cell: false,
+                        }
+                    };
+                    c.scopes
+                        .last_mut()
+                        .expect("a scope")
+                        .insert(String::from(&**name), b);
                 }
-            };
-            c.scopes
-                .last_mut()
-                .expect("a scope")
-                .insert(String::from(&**name), b);
+                // A destructuring parameter binds from the incoming arg register.
+                other => c.bind_pattern(other, arg_regs[i])?,
+            }
         }
         // Captured cells arrive already boxed (the closure passes the cell).
         for (j, name) in captures.iter().enumerate() {
@@ -2262,6 +2286,109 @@ impl Compiler {
     /// declaring the names it introduces. Array/object patterns read elements/
     /// properties via `GetElem`/`GetProp` with `=`-defaults; rest patterns fall
     /// back.
+    /// Destructuring *assignment* to existing targets (`[a, b] = …`,
+    /// `({ x } = …)`) — the mirror of `bind_pattern` that writes to existing
+    /// variables / members rather than declaring.
+    fn assign_pattern(&mut self, target: &Expr, value_reg: Reg) -> Result<(), CompileError> {
+        match target {
+            Expr::Ident(id) => {
+                let b = self
+                    .lookup(&id.name)
+                    .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                self.write_var(b, value_reg);
+                Ok(())
+            }
+            Expr::Member {
+                object, property, ..
+            } => {
+                let obj = self.expr(object)?;
+                self.member_write(obj, property, value_reg)
+            }
+            Expr::Array { elements, .. } => {
+                for (i, el) in elements.iter().enumerate() {
+                    match el {
+                        ArrayElement::Item(e) => {
+                            let idx = self.constant(NanBox::number(i as f64))?;
+                            let v = self.alloc();
+                            self.ops.push(Op::GetElem {
+                                dst: v,
+                                arr: value_reg,
+                                index: idx,
+                            });
+                            self.assign_target_with_default(e, v)?;
+                        }
+                        ArrayElement::Hole => {}
+                        ArrayElement::Spread(e) => {
+                            let from = self.constant(NanBox::number(i as f64))?;
+                            let rest = self.alloc();
+                            self.ops.push(Op::ArraySliceFrom {
+                                dst: rest,
+                                src: value_reg,
+                                from,
+                            });
+                            self.assign_pattern(e, rest)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Expr::Object { members, .. } => {
+                let mut named: Vec<String> = Vec::new();
+                for m in members {
+                    match m {
+                        ObjectMember::Property { key, value, .. } => {
+                            let key = static_key(key)?;
+                            let v = self.alloc();
+                            self.ops.push(Op::GetProp {
+                                dst: v,
+                                obj: value_reg,
+                                key: key.clone(),
+                            });
+                            self.assign_target_with_default(value, v)?;
+                            named.push(key);
+                        }
+                        ObjectMember::Spread { value, .. } => {
+                            let r = self.alloc();
+                            self.ops.push(Op::ObjectRest {
+                                dst: r,
+                                src: value_reg,
+                                exclude: named.clone().into(),
+                            });
+                            self.assign_pattern(value, r)?;
+                        }
+                        ObjectMember::Accessor { .. } => {
+                            return Err(CompileError::Unsupported(
+                                "accessor in assignment pattern",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(CompileError::Unsupported("assignment pattern target")),
+        }
+    }
+
+    /// Assigns `value_reg` to `target`, applying a `=`-default when the target is
+    /// `Expr::Assign { target, value: default }` (the destructuring-default form).
+    fn assign_target_with_default(
+        &mut self,
+        target: &Expr,
+        value_reg: Reg,
+    ) -> Result<(), CompileError> {
+        if let Expr::Assign {
+            op: crate::ast::AssignOp::Assign,
+            target: inner,
+            value: default,
+            ..
+        } = target
+        {
+            self.apply_default(value_reg, Some(default))?;
+            return self.assign_pattern(inner, value_reg);
+        }
+        self.assign_pattern(target, value_reg)
+    }
+
     fn bind_pattern(&mut self, target: &BindingTarget, value_reg: Reg) -> Result<(), CompileError> {
         match target {
             BindingTarget::Ident(Ident { name, .. }) => {
@@ -2670,6 +2797,59 @@ impl Compiler {
                 self.enter_loop();
                 self.stmt(body)?;
                 let cont = self.ops.len(); // `continue` advances the index
+                let one = self.alloc();
+                self.ops.push(Op::LoadConst {
+                    dst: one,
+                    value: NanBox::number(1.0),
+                });
+                self.ops.push(Op::Add {
+                    dst: i,
+                    a: i,
+                    b: one,
+                });
+                self.ops.push(Op::Jump { target: top });
+                self.patch(jf);
+                self.exit_loop(cont);
+                self.scopes.pop();
+                Ok(None)
+            }
+            // `for (const k in obj)` — iterate the object's enumerable keys.
+            Stmt::ForIn {
+                left, right, body, ..
+            } => {
+                use crate::ast::ForLeft;
+                let ForLeft::Decl { target, .. } = left else {
+                    return Err(CompileError::Unsupported("for-in binding"));
+                };
+                self.scopes.push(alloc::collections::BTreeMap::new());
+                let obj = self.expr(right)?;
+                let arr = self.alloc();
+                self.ops.push(Op::EnumKeys { dst: arr, obj });
+                let len = self.alloc();
+                self.ops.push(Op::ArrayLen { dst: len, arr });
+                let i = self.alloc();
+                self.ops.push(Op::LoadConst {
+                    dst: i,
+                    value: NanBox::number(0.0),
+                });
+                let top = self.ops.len();
+                let cond = self.alloc();
+                self.ops.push(Op::Lt {
+                    dst: cond,
+                    a: i,
+                    b: len,
+                });
+                let jf = self.emit_jump_if_false(cond);
+                let cur = self.alloc();
+                self.ops.push(Op::GetElem {
+                    dst: cur,
+                    arr,
+                    index: i,
+                });
+                self.bind_pattern(target, cur)?;
+                self.enter_loop();
+                self.stmt(body)?;
+                let cont = self.ops.len();
                 let one = self.alloc();
                 self.ops.push(Op::LoadConst {
                     dst: one,
@@ -3162,6 +3342,12 @@ impl Compiler {
                         self.member_write(obj, property, src)?;
                         Ok(src)
                     }
+                    // Destructuring assignment (`[a, b] = …`, `({ x } = …)`).
+                    Expr::Array { .. } | Expr::Object { .. } if !compound => {
+                        let v = self.expr(value)?;
+                        self.assign_pattern(target, v)?;
+                        Ok(v)
+                    }
                     _ => Err(CompileError::Unsupported("assignment target")),
                 }
             }
@@ -3211,6 +3397,50 @@ impl Compiler {
                     };
                     let dst = self.alloc();
                     self.ops.push(Op::NewCollection { dst, is_set, seed });
+                    return Ok(dst);
+                }
+                // Built-in `Error` family → an object with `name`/`message`.
+                if self.classes.get(&*id.name).is_none()
+                    && matches!(
+                        &*id.name,
+                        "Error"
+                            | "TypeError"
+                            | "RangeError"
+                            | "SyntaxError"
+                            | "ReferenceError"
+                            | "EvalError"
+                            | "URIError"
+                    )
+                {
+                    let msg = match arguments.first() {
+                        Some(crate::ast::Argument::Item(e)) => self.expr(e)?,
+                        _ => self.constant_str(""),
+                    };
+                    let dst = self.alloc();
+                    self.ops.push(Op::NewObject { dst });
+                    let name = self.constant_str(&id.name);
+                    self.ops.push(Op::SetProp {
+                        obj: dst,
+                        key: String::from("name"),
+                        src: name,
+                    });
+                    self.ops.push(Op::SetProp {
+                        obj: dst,
+                        key: String::from("message"),
+                        src: msg,
+                    });
+                    return Ok(dst);
+                }
+                // `new Array(...items)` → an array of the arguments.
+                if &*id.name == "Array" && self.classes.get("Array").is_none() {
+                    let dst = self.alloc();
+                    self.ops.push(Op::NewArray { dst, len: 0 });
+                    for a in arguments {
+                        if let crate::ast::Argument::Item(e) = a {
+                            let v = self.expr(e)?;
+                            self.ops.push(Op::ArrayPush { arr: dst, src: v });
+                        }
+                    }
                     return Ok(dst);
                 }
                 let Some(info) = self.classes.get(&*id.name).cloned() else {
@@ -4180,6 +4410,45 @@ mod tests {
                 class C extends B { constructor() { super(); this.c = 3; } }
                 let o = new C(); o.a + o.b + o.c"),
             "6"
+        );
+    }
+
+    #[test]
+    fn bytecode_forin_builtins_and_destructuring_assign() {
+        // for-in over object keys and array indices.
+        assert_eq!(
+            bc("let o = { a: 1, b: 2, c: 3 }; let s = ''; for (const k in o) { s += k; } s"),
+            "abc"
+        );
+        assert_eq!(
+            bc("let sum = 0; for (const i in [9, 8, 7]) { sum += Number(i); } sum"),
+            "3"
+        );
+        // new Error / new Array.
+        assert_eq!(bc("new Error('boom').message"), "boom");
+        assert_eq!(bc("new TypeError('bad').name"), "TypeError");
+        assert_eq!(bc("new Array(1, 2, 3).join(',')"), "1,2,3");
+        // Destructuring assignment (existing vars): swap, rest, object.
+        assert_eq!(bc("let a = 1, b = 2; [a, b] = [b, a]; a + ',' + b"), "2,1");
+        assert_eq!(
+            bc("let h, t; [h, ...t] = [1, 2, 3, 4]; h + '|' + t.join(',')"),
+            "1|2,3,4"
+        );
+        assert_eq!(bc("let x, y; ({ x, y } = { x: 10, y: 20 }); x + y"), "30");
+        // Object destructuring assignment into members.
+        assert_eq!(
+            bc("let p = {}; ({ a: p.x, b: p.y } = { a: 3, b: 4 }); p.x * p.y"),
+            "12"
+        );
+        // Destructuring function parameters.
+        assert_eq!(
+            bc("function f({ a, b }) { return a + b; } f({ a: 3, b: 4 })"),
+            "7"
+        );
+        assert_eq!(bc("let g = ([x, y]) => x * y; g([3, 4])"), "12");
+        assert_eq!(
+            bc("[{ n: 1 }, { n: 2 }, { n: 3 }].map(({ n }) => n * 10).join(',')"),
+            "10,20,30"
         );
     }
 
