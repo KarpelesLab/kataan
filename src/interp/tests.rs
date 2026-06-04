@@ -671,6 +671,17 @@ fn json() {
         eval("let o = JSON.parse(JSON.stringify({ x: [1, 2], y: 'z' })); o.x[1] + o.y"),
         "2z"
     );
+    // Indentation via the `space` argument.
+    assert_eq!(
+        eval("JSON.stringify({ a: 1 }, null, 2)"),
+        "{\n  \"a\": 1\n}"
+    );
+    assert_eq!(eval("JSON.stringify([1, 2], null, 1)"), "[\n 1,\n 2\n]");
+    assert_eq!(eval("JSON.stringify({}, null, 2)"), "{}"); // empty stays inline
+    assert_eq!(
+        eval("JSON.stringify({ a: 1 }, null, '__').split('\\n')[1]"),
+        "__\"a\": 1"
+    );
 }
 
 #[test]

@@ -474,7 +474,15 @@ impl<'a> Interp<'a> {
         json.set(
             "stringify",
             native("stringify", |a| {
-                Ok(json_stringify(&arg(a, 0)).map_or(Value::Undefined, Value::str))
+                // The `space` argument: a number → that many spaces (max 10), a
+                // string → its first 10 chars, otherwise no indentation.
+                let indent = match arg(a, 2) {
+                    Value::Number(n) if n >= 1.0 => Some(" ".repeat((n as usize).min(10))),
+                    Value::Str(s) if !s.is_empty() => Some(s.chars().take(10).collect::<String>()),
+                    _ => None,
+                };
+                Ok(json_stringify(&arg(a, 0), indent.as_deref(), 0)
+                    .map_or(Value::Undefined, Value::str))
             }),
         );
         json.set(
@@ -1357,7 +1365,7 @@ fn object_entries<'a>(value: &Value<'a>, kind: EntryKind) -> Value<'a> {
 
 /// `JSON.stringify` for the supported value set. Returns `None` for values that
 /// serialize to nothing at the top level (`undefined`, functions).
-fn json_stringify(value: &Value<'_>) -> Option<String> {
+fn json_stringify(value: &Value<'_>, indent: Option<&str>, depth: usize) -> Option<String> {
     match value {
         Value::Undefined | Value::Function(_) | Value::Native(_) | Value::Class(_) => None,
         Value::Null => Some("null".into()),
@@ -1374,18 +1382,44 @@ fn json_stringify(value: &Value<'_>) -> Option<String> {
                 .expect("array")
                 .borrow()
                 .iter()
-                .map(|v| json_stringify(v).unwrap_or_else(|| "null".into()))
+                .map(|v| json_stringify(v, indent, depth + 1).unwrap_or_else(|| "null".into()))
                 .collect();
-            Some(format!("[{}]", parts.join(",")))
+            Some(wrap_json('[', ']', &parts, indent, depth))
         }
         Value::Object(o) => {
+            let sep = if indent.is_some() { ": " } else { ":" };
             let mut parts = Vec::new();
             for k in o.own_keys() {
-                if let Some(v) = json_stringify(&o.get(&k)) {
-                    parts.push(format!("{}:{}", json_quote(&k), v));
+                if let Some(v) = json_stringify(&o.get(&k), indent, depth + 1) {
+                    parts.push(format!("{}{sep}{v}", json_quote(&k)));
                 }
             }
-            Some(format!("{{{}}}", parts.join(",")))
+            Some(wrap_json('{', '}', &parts, indent, depth))
+        }
+    }
+}
+
+/// Joins already-serialized `parts` inside `open`/`close` brackets, applying
+/// the optional indentation (one item per line, indented by `depth`).
+fn wrap_json(
+    open: char,
+    close: char,
+    parts: &[String],
+    indent: Option<&str>,
+    depth: usize,
+) -> String {
+    if parts.is_empty() {
+        return format!("{open}{close}");
+    }
+    match indent {
+        None => format!("{open}{}{close}", parts.join(",")),
+        Some(unit) => {
+            let inner = unit.repeat(depth + 1);
+            let outer = unit.repeat(depth);
+            format!(
+                "{open}\n{inner}{}\n{outer}{close}",
+                parts.join(&format!(",\n{inner}"))
+            )
         }
     }
 }
