@@ -552,6 +552,27 @@ fn string_methods() {
 }
 
 #[test]
+fn array_object_statics() {
+    assert_eq!(eval("Array.from('abc').join('-')"), "a-b-c");
+    assert_eq!(eval("Array.from([1, 2, 3]).length"), "3");
+    assert_eq!(eval("Array.from(new Set([1, 1, 2, 3])).join(',')"), "1,2,3");
+    assert_eq!(eval("Array.of(1, 2, 3).reduce((a, b) => a + b, 0)"), "6");
+    assert_eq!(
+        eval("let o = Object.fromEntries([['a', 1], ['b', 2]]); o.a + o.b"),
+        "3"
+    );
+    assert_eq!(
+        eval("let o = Object.fromEntries(new Map([['x', 9]])); o.x"),
+        "9"
+    );
+    // Object.create sets the prototype.
+    assert_eq!(
+        eval("let proto = { greet() { return 'hi'; } }; let o = Object.create(proto); o.greet()"),
+        "hi"
+    );
+}
+
+#[test]
 fn object_statics() {
     assert_eq!(eval("Object.keys({ a: 1, b: 2 }).join(',')"), "a,b");
     assert_eq!(eval("Object.values({ a: 1, b: 2 }).join(',')"), "1,2");

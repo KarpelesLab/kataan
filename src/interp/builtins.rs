@@ -199,6 +199,29 @@ impl<'a> Interp<'a> {
             }),
         );
         object.set(
+            "fromEntries",
+            native("fromEntries", |a| {
+                let obj = Obj::object();
+                let mut entries = Vec::new();
+                iterate_into(&arg(a, 0), &mut entries);
+                for entry in entries {
+                    if let Value::Object(pair) = entry {
+                        obj.set(&pair.get("0").to_js_string(), pair.get("1"));
+                    }
+                }
+                Ok(Value::Object(obj))
+            }),
+        );
+        object.set(
+            "create",
+            native("create", |a| match arg(a, 0) {
+                Value::Object(proto) => Ok(Value::Object(Obj::with_proto(proto))),
+                _ => Ok(Value::Object(Obj::object())),
+            }),
+        );
+        // `freeze`/`isFrozen` are accepted but not yet enforced.
+        object.set("freeze", native("freeze", |a| Ok(arg(a, 0))));
+        object.set(
             "assign",
             native("assign", |a| {
                 if let Value::Object(target) = arg(a, 0) {
@@ -226,6 +249,22 @@ impl<'a> Interp<'a> {
                     matches!(arg(a, 0), Value::Object(o) if o.is_array()),
                 ))
             }),
+        );
+        // `Array.from(arrayLike)` — arrays, strings, Sets/Maps, and
+        // array-likes (objects with a `length`). The mapping-function overload
+        // is deferred (it needs the evaluator).
+        array.set(
+            "from",
+            native("from", |a| {
+                let mut out = Vec::new();
+                iterate_into(&arg(a, 0), &mut out);
+                Ok(Value::Object(Obj::array(out)))
+            }),
+        );
+        // `Array.of(...args)`.
+        array.set(
+            "of",
+            native("of", |a| Ok(Value::Object(Obj::array(a.to_vec())))),
         );
         self.define_global("Array", Value::Object(array));
     }
@@ -628,6 +667,39 @@ impl<'a> Interp<'a> {
             acc = self.call_with_this(callback.clone(), Value::Undefined, call_args)?;
         }
         Ok(acc)
+    }
+}
+
+/// Appends the iterable contents of `value` into `out` (arrays, strings,
+/// Sets/Maps, and array-likes with a numeric `length`).
+fn iterate_into<'a>(value: &Value<'a>, out: &mut Vec<Value<'a>>) {
+    match value {
+        Value::Object(o) if o.is_array() => {
+            out.extend(o.elements().expect("array").borrow().iter().cloned());
+        }
+        Value::Object(o) if o.as_collection().is_some() => {
+            let c = o.as_collection().unwrap().borrow();
+            if c.is_set {
+                out.extend(c.entries.iter().map(|(k, _)| k.clone()));
+            } else {
+                out.extend(
+                    c.entries
+                        .iter()
+                        .map(|(k, v)| Value::Object(Obj::array(alloc::vec![k.clone(), v.clone()]))),
+                );
+            }
+        }
+        Value::Str(s) => out.extend(s.chars().map(|c| Value::str(c.to_string()))),
+        // Array-like: an object with a numeric `length`.
+        Value::Object(o) => {
+            let len = o.get("length").to_number();
+            if len.is_finite() && len >= 0.0 {
+                for i in 0..len as usize {
+                    out.push(o.get(&i.to_string()));
+                }
+            }
+        }
+        _ => {}
     }
 }
 
