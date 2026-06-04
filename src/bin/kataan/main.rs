@@ -64,6 +64,14 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        ["bcrun", "-e", source] => run_eval_vm(source, "<argv>"),
+        ["bcrun", path] => match std::fs::read_to_string(path) {
+            Ok(source) => run_eval_vm(&source, path),
+            Err(e) => {
+                eprintln!("kataan: cannot read {path}: {e}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!("kataan: unrecognized arguments: {}", args.join(" "));
             eprintln!("try `kataan --help`");
@@ -130,6 +138,32 @@ fn run_eval(source: &str, origin: &str) -> ExitCode {
     match interp.run(&program) {
         Ok(value) => {
             // Print non-undefined completion values, REPL-style.
+            if !matches!(value, kataan::interp::Value::Undefined) {
+                println!("{}", value.to_js_string());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(thrown) => {
+            eprintln!("kataan: {origin}: Uncaught {}", thrown.to_js_string());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Parses and evaluates `source` through the **bytecode VM** (falling back to
+/// the tree-walker for unsupported constructs), printing the completion value.
+fn run_eval_vm(source: &str, origin: &str) -> ExitCode {
+    let program = match Parser::parse_program(source) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kataan: {origin}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut interp = Interp::new();
+    install_console(&interp);
+    match interp.run_with_vm(&program) {
+        Ok(value) => {
             if !matches!(value, kataan::interp::Value::Undefined) {
                 println!("{}", value.to_js_string());
             }
@@ -262,6 +296,7 @@ fn print_usage() {
          kataan eval -e <SOURCE>   evaluate a source string\n    \
          kataan repl               start an interactive REPL\n    \
          kataan disasm <FILE>      compile to bytecode and print the disassembly\n    \
+         kataan bcrun <FILE>       run via the bytecode VM (tree-walker fallback)\n    \
          kataan --version          print the version\n    \
          kataan --help             show this help\n\
          \n\

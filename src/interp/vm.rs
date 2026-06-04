@@ -29,6 +29,23 @@ impl<'a> Interp<'a> {
         Ok(self.run_chunk(&module, 0, Value::Undefined, Vec::new()))
     }
 
+    /// Runs a program through the bytecode VM, draining the event loop
+    /// afterward, and **falls back to the tree-walker** if the program uses a
+    /// construct the bytecode compiler does not yet support. The result is
+    /// identical either way (the two paths share value semantics); the VM is
+    /// the faster path where it applies.
+    pub fn run_with_vm(&mut self, program: &'a crate::ast::Program) -> Completion<'a, Value<'a>> {
+        match super::compiler::compile_program(&program.body) {
+            Ok(module) => {
+                let result = self.run_chunk(&Rc::new(module), 0, Value::Undefined, Vec::new());
+                self.run_event_loop();
+                result
+            }
+            // Unsupported construct → run the reference tree-walker instead.
+            Err(_) => self.run(program),
+        }
+    }
+
     /// Executes a compiled module's entry chunk. Together with
     /// [`crate::bytecode::serialize`]/[`deserialize`](crate::bytecode::deserialize)
     /// this is the export/reload path: a module can be compiled once, persisted,
