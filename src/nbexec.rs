@@ -123,6 +123,7 @@ const N_BOOLEAN: u16 = 5;
 const N_PARSE_INT: u16 = 6;
 const N_CONSOLE_LOG: u16 = 7;
 const N_JSON_STRINGIFY: u16 = 8;
+const N_JSON_PARSE: u16 = 27;
 const N_OBJECT_KEYS: u16 = 9;
 const N_OBJECT_VALUES: u16 = 10;
 const N_ARRAY_IS_ARRAY: u16 = 11;
@@ -210,7 +211,11 @@ impl<'a> Interp<'a> {
         let regexp_ctor = self.realm.new_native(N_REGEXP);
         self.current
             .declare("RegExp", NanBox::handle(regexp_ctor.to_raw()));
-        install_namespace(self, "JSON", &[("stringify", N_JSON_STRINGIFY)]);
+        install_namespace(
+            self,
+            "JSON",
+            &[("stringify", N_JSON_STRINGIFY), ("parse", N_JSON_PARSE)],
+        );
         install_namespace(
             self,
             "Object",
@@ -300,6 +305,17 @@ impl<'a> Interp<'a> {
                 Some(s) => NanBox::handle(self.realm.new_string(&s).to_raw()),
                 None => NanBox::undefined(),
             },
+            N_JSON_PARSE => {
+                let text = self.realm.to_display_string(arg(0));
+                let chars: Vec<char> = text.chars().collect();
+                let mut pos = 0;
+                let value = self.json_parse(&chars, &mut pos)?;
+                skip_ws(&chars, &mut pos);
+                if pos != chars.len() {
+                    return Err(ExecError::Throw(self.new_str("Unexpected token in JSON")));
+                }
+                value
+            }
             N_OBJECT_KEYS => {
                 let keys = arg(0)
                     .as_handle()
@@ -399,6 +415,163 @@ impl<'a> Interp<'a> {
 
     /// Serializes a value to JSON (`None` when the value is `undefined` or a
     /// function — which `JSON.stringify` omits / drops).
+    /// Recursive-descent `JSON.parse` over a char slice, advancing `pos`.
+    fn json_parse(&mut self, c: &[char], pos: &mut usize) -> Result<NanBox, ExecError> {
+        skip_ws(c, pos);
+        let err = |s: &mut Self| ExecError::Throw(s.new_str("Unexpected end of JSON input"));
+        let Some(&ch) = c.get(*pos) else {
+            return Err(err(self));
+        };
+        match ch {
+            'n' => self.json_lit(c, pos, "null", NanBox::null()),
+            't' => self.json_lit(c, pos, "true", NanBox::boolean(true)),
+            'f' => self.json_lit(c, pos, "false", NanBox::boolean(false)),
+            '"' => {
+                let s = self.json_string(c, pos)?;
+                Ok(self.new_str(&s))
+            }
+            '[' => {
+                *pos += 1;
+                let mut elems = Vec::new();
+                skip_ws(c, pos);
+                if c.get(*pos) == Some(&']') {
+                    *pos += 1;
+                    return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
+                }
+                loop {
+                    let v = self.json_parse(c, pos)?;
+                    elems.push(v);
+                    skip_ws(c, pos);
+                    match c.get(*pos) {
+                        Some(',') => *pos += 1,
+                        Some(']') => {
+                            *pos += 1;
+                            break;
+                        }
+                        _ => return Err(ExecError::Throw(self.new_str("Expected ',' or ']'"))),
+                    }
+                }
+                Ok(NanBox::handle(self.realm.new_array(elems).to_raw()))
+            }
+            '{' => {
+                *pos += 1;
+                let obj = self.realm.new_object();
+                skip_ws(c, pos);
+                if c.get(*pos) == Some(&'}') {
+                    *pos += 1;
+                    return Ok(NanBox::handle(obj.to_raw()));
+                }
+                loop {
+                    skip_ws(c, pos);
+                    if c.get(*pos) != Some(&'"') {
+                        return Err(ExecError::Throw(self.new_str("Expected property name")));
+                    }
+                    let key = self.json_string(c, pos)?;
+                    skip_ws(c, pos);
+                    if c.get(*pos) != Some(&':') {
+                        return Err(ExecError::Throw(self.new_str("Expected ':'")));
+                    }
+                    *pos += 1;
+                    let v = self.json_parse(c, pos)?;
+                    self.realm.set_property(obj, &key, v);
+                    skip_ws(c, pos);
+                    match c.get(*pos) {
+                        Some(',') => *pos += 1,
+                        Some('}') => {
+                            *pos += 1;
+                            break;
+                        }
+                        _ => return Err(ExecError::Throw(self.new_str("Expected ',' or '}'"))),
+                    }
+                }
+                Ok(NanBox::handle(obj.to_raw()))
+            }
+            '-' | '0'..='9' => {
+                let start = *pos;
+                if c.get(*pos) == Some(&'-') {
+                    *pos += 1;
+                }
+                while c
+                    .get(*pos)
+                    .is_some_and(|d| d.is_ascii_digit() || matches!(d, '.' | 'e' | 'E' | '+' | '-'))
+                {
+                    *pos += 1;
+                }
+                let text: String = c[start..*pos].iter().collect();
+                text.parse::<f64>()
+                    .map(NanBox::number)
+                    .map_err(|_| ExecError::Throw(self.new_str("Invalid number in JSON")))
+            }
+            _ => Err(ExecError::Throw(self.new_str("Unexpected token in JSON"))),
+        }
+    }
+
+    fn json_lit(
+        &mut self,
+        c: &[char],
+        pos: &mut usize,
+        word: &str,
+        value: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        if c[*pos..].iter().take(word.len()).copied().eq(word.chars()) {
+            *pos += word.len();
+            Ok(value)
+        } else {
+            Err(ExecError::Throw(self.new_str("Unexpected token in JSON")))
+        }
+    }
+
+    /// Parses a JSON string literal (the opening `"` is at `pos`), handling the
+    /// standard escapes.
+    fn json_string(&mut self, c: &[char], pos: &mut usize) -> Result<String, ExecError> {
+        *pos += 1; // opening quote
+        let mut out = String::new();
+        loop {
+            match c.get(*pos) {
+                None => {
+                    return Err(ExecError::Throw(
+                        self.new_str("Unterminated string in JSON"),
+                    ));
+                }
+                Some('"') => {
+                    *pos += 1;
+                    return Ok(out);
+                }
+                Some('\\') => {
+                    *pos += 1;
+                    match c.get(*pos) {
+                        Some('"') => out.push('"'),
+                        Some('\\') => out.push('\\'),
+                        Some('/') => out.push('/'),
+                        Some('n') => out.push('\n'),
+                        Some('t') => out.push('\t'),
+                        Some('r') => out.push('\r'),
+                        Some('b') => out.push('\u{8}'),
+                        Some('f') => out.push('\u{c}'),
+                        Some('u') => {
+                            let hex: String =
+                                c.get(*pos + 1..*pos + 5).unwrap_or(&[]).iter().collect();
+                            let code = u32::from_str_radix(&hex, 16)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .ok_or_else(|| {
+                                    ExecError::Throw(self.new_str("Invalid \\u escape in JSON"))
+                                })?;
+                            out.push(code);
+                            *pos += 4;
+                        }
+                        _ => return Err(ExecError::Throw(self.new_str("Invalid escape in JSON"))),
+                    }
+                    *pos += 1;
+                }
+                Some(&ch) => {
+                    out.push(ch);
+                    *pos += 1;
+                }
+            }
+        }
+    }
+
     fn json_stringify(&self, v: NanBox) -> Option<String> {
         match v.unpack() {
             Unpacked::Undefined => None,
@@ -2353,6 +2526,16 @@ fn json_quote(s: &str) -> String {
     out
 }
 
+/// Advances `pos` past JSON whitespace.
+fn skip_ws(c: &[char], pos: &mut usize) {
+    while c
+        .get(*pos)
+        .is_some_and(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r'))
+    {
+        *pos += 1;
+    }
+}
+
 /// The current time in milliseconds since the Unix epoch (`0.0` without `std`,
 /// which has no clock).
 fn now_ms() -> f64 {
@@ -2925,6 +3108,36 @@ mod tests {
         // A regex renders as /source/flags; typeof is object.
         assert_eq!(run("'' + /ab/gi"), "/ab/gi");
         assert_eq!(run("typeof /x/"), "object");
+    }
+
+    #[test]
+    fn json_parse() {
+        // Scalars.
+        assert_eq!(run("JSON.parse('42')"), "42");
+        assert_eq!(run("JSON.parse('true')"), "true");
+        assert_eq!(run("JSON.parse('null') === null"), "true");
+        assert_eq!(run("JSON.parse('\"hi\\\\nthere\"')"), "hi\nthere");
+        // Arrays and objects.
+        assert_eq!(run("JSON.parse('[1, 2, 3]').length"), "3");
+        assert_eq!(run("JSON.parse('[1, 2, 3]')[1]"), "2");
+        assert_eq!(run("JSON.parse('{\"a\": 1, \"b\": 2}').b"), "2");
+        // Nested.
+        assert_eq!(
+            run("JSON.parse('{\"items\": [{\"id\": 7}, {\"id\": 9}]}').items[1].id"),
+            "9"
+        );
+        // Round-trip with stringify.
+        assert_eq!(
+            run("let o = JSON.parse('{\"x\": 10, \"y\": 20}'); JSON.stringify(o)"),
+            "{\"x\":10,\"y\":20}"
+        );
+        // Negative / float numbers.
+        assert_eq!(run("JSON.parse('-3.5')"), "-3.5");
+        // Malformed input throws (caught).
+        assert_eq!(
+            run("try { JSON.parse('{bad}'); 'no'; } catch (e) { 'threw'; }"),
+            "threw"
+        );
     }
 
     #[test]
