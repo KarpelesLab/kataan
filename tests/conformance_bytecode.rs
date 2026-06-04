@@ -70,11 +70,12 @@ fn bytecode_runs_and_compiles_real_fixtures() {
 
     // Every fixture must still run correctly via the bytecode-first engine —
     // the cutover's safety net (bytecode where it compiles, tree-walker
-    // otherwise). The `compiled_fully` count is reported (above) as a coverage
-    // metric; these whole-program fixtures are comprehensive enough that each
-    // still hits some long-tail construct (Map/Set, Promise, Object statics,
-    // spread, optional chaining…) and falls back, so it isn't ratcheted yet —
-    // the smaller-program coverage lives in the `nbvm` unit tests.
+    // otherwise).
     assert_eq!(ran_ok, FIXTURES.len(), "a fixture failed to run");
-    let _ = compiled_fully;
+    // Ratchet: at least this many whole real-world programs compile fully to
+    // bytecode (no fallback). Raise as the fold widens; never let it regress.
+    assert!(
+        compiled_fully >= 1,
+        "bytecode coverage regressed: only {compiled_fully} fixtures compile fully"
+    );
 }
