@@ -15,7 +15,7 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::fmt;
 
 /// A JavaScript runtime value (interpreter era; primitives + functions).
@@ -85,6 +85,9 @@ pub struct Obj<'a> {
     bound: RefCell<Option<Rc<BoundFn<'a>>>>,
     /// For generator objects: the suspended generator state.
     generator: RefCell<Option<Rc<RefCell<super::vm::GeneratorState<'a>>>>>,
+    /// Whether the object is frozen (`Object.freeze`): property writes, adds,
+    /// and deletes are rejected.
+    frozen: Cell<bool>,
 }
 
 /// A compiled (bytecode) function value: the module it lives in, the index of
@@ -142,6 +145,7 @@ impl<'a> Obj<'a> {
             bytecode: RefCell::new(None),
             bound: RefCell::new(None),
             generator: RefCell::new(None),
+            frozen: Cell::new(false),
         })
     }
 
@@ -159,6 +163,7 @@ impl<'a> Obj<'a> {
             bytecode: RefCell::new(None),
             bound: RefCell::new(None),
             generator: RefCell::new(None),
+            frozen: Cell::new(false),
         })
     }
 
@@ -176,6 +181,7 @@ impl<'a> Obj<'a> {
             bytecode: RefCell::new(None),
             bound: RefCell::new(None),
             generator: RefCell::new(None),
+            frozen: Cell::new(false),
         })
     }
 
@@ -196,6 +202,7 @@ impl<'a> Obj<'a> {
             bytecode: RefCell::new(None),
             bound: RefCell::new(None),
             generator: RefCell::new(None),
+            frozen: Cell::new(false),
         })
     }
 
@@ -297,6 +304,9 @@ impl<'a> Obj<'a> {
     /// cleared to `undefined`. Returns `true` (deletion of an absent property is
     /// also `true`, per the spec for configurable/absent properties).
     pub fn delete_key(&self, key: &str) -> bool {
+        if self.frozen.get() {
+            return false; // a frozen object rejects deletes
+        }
         if let Some(arr) = &self.array
             && let Ok(i) = key.parse::<usize>()
         {
@@ -420,6 +430,9 @@ impl<'a> Obj<'a> {
     /// Sets a property by string key, growing the array (with holes filled by
     /// `undefined`) for in-bounds-or-beyond array indices.
     pub fn set(&self, key: &str, value: Value<'a>) {
+        if self.frozen.get() {
+            return; // a frozen object rejects writes/adds (silently)
+        }
         if let Some(arr) = &self.array {
             if let Ok(i) = key.parse::<usize>() {
                 let mut v = arr.borrow_mut();
@@ -439,6 +452,18 @@ impl<'a> Obj<'a> {
         } else {
             props.push((key.into(), value));
         }
+    }
+
+    /// Marks the object frozen (`Object.freeze`): subsequent writes, adds, and
+    /// deletes are rejected.
+    pub fn freeze(&self) {
+        self.frozen.set(true);
+    }
+
+    /// Whether the object is frozen.
+    #[must_use]
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.get()
     }
 
     /// The own enumerable string keys, in order (array indices first).

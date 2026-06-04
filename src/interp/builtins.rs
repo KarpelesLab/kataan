@@ -667,7 +667,17 @@ impl<'a> Interp<'a> {
                 Ok(arg(a, 0))
             }),
         );
-        object.set("isFrozen", native("isFrozen", |_| Ok(Value::Bool(false))));
+        object.set(
+            "isFrozen",
+            native("isFrozen", |a| {
+                Ok(Value::Bool(match arg(a, 0) {
+                    // A frozen object, or any non-object (primitives are frozen).
+                    Value::Object(o) => o.is_frozen(),
+                    Value::Undefined | Value::Null => false,
+                    _ => true,
+                }))
+            }),
+        );
         object.set(
             "values",
             native("values", |a| {
@@ -701,8 +711,15 @@ impl<'a> Interp<'a> {
                 _ => Ok(Value::Object(Obj::object())),
             }),
         );
-        // `freeze`/`isFrozen` are accepted but not yet enforced.
-        object.set("freeze", native("freeze", |a| Ok(arg(a, 0))));
+        object.set(
+            "freeze",
+            native("freeze", |a| {
+                if let Value::Object(o) = arg(a, 0) {
+                    o.freeze();
+                }
+                Ok(arg(a, 0))
+            }),
+        );
         object.set(
             "assign",
             native("assign", |a| {

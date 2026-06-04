@@ -2330,6 +2330,27 @@ fn object_statics() {
 }
 
 #[test]
+fn object_freeze() {
+    // Writes, additions, and deletions on a frozen object are rejected.
+    assert_eq!(
+        eval("let o = Object.freeze({ a: 1 }); o.a = 9; o.b = 2; delete o.a; o.a + ',' + o.b"),
+        "1,undefined"
+    );
+    assert_eq!(eval("Object.isFrozen(Object.freeze({}))"), "true");
+    assert_eq!(eval("Object.isFrozen({})"), "false");
+    // Frozen arrays reject element writes and growth.
+    assert_eq!(
+        eval("let a = Object.freeze([1, 2, 3]); a[0] = 9; a[0] + ',' + a.length"),
+        "1,3"
+    );
+    // Primitives are reported as frozen; null/undefined are not.
+    assert_eq!(eval("Object.isFrozen(42)"), "true");
+    assert_eq!(eval("Object.isFrozen('s')"), "true");
+    // freeze returns its argument.
+    assert_eq!(eval("let o = {}; Object.freeze(o) === o"), "true");
+}
+
+#[test]
 fn json() {
     assert_eq!(eval("JSON.stringify(42)"), "42");
     assert_eq!(eval("JSON.stringify('hi')"), "\"hi\"");
