@@ -1043,6 +1043,22 @@ impl<'a> Interp<'a> {
             }
             return Ok(Value::str(self.eval_expr(argument, env)?.type_of()));
         }
+        // `delete obj.prop` removes the property from its owner; deleting
+        // anything else evaluates to `true`.
+        if op == UnaryOp::Delete {
+            if let Expr::Member {
+                object, property, ..
+            } = argument
+            {
+                let obj = self.eval_expr(object, env)?;
+                let key = self.member_key(property, env)?;
+                return Ok(Value::Bool(match &obj {
+                    Value::Object(o) => o.delete_key(&key),
+                    _ => true,
+                }));
+            }
+            return Ok(Value::Bool(true));
+        }
         let v = self.eval_expr(argument, env)?;
         Ok(match op {
             UnaryOp::Plus => Value::Number(v.to_number()),
@@ -1050,8 +1066,7 @@ impl<'a> Interp<'a> {
             UnaryOp::Not => Value::Bool(!v.to_boolean()),
             UnaryOp::BitNot => Value::Number(f64::from(!v.to_int32())),
             UnaryOp::Void => Value::Undefined,
-            UnaryOp::Typeof => unreachable!("handled above"),
-            UnaryOp::Delete => Value::Bool(true), // no references to delete yet
+            UnaryOp::Typeof | UnaryOp::Delete => unreachable!("handled above"),
         })
     }
 

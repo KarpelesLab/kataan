@@ -182,6 +182,24 @@ impl<'a> Obj<'a> {
         }
     }
 
+    /// Deletes an own property (data or accessor) by `key`. Array indices are
+    /// cleared to `undefined`. Returns `true` (deletion of an absent property is
+    /// also `true`, per the spec for configurable/absent properties).
+    pub fn delete_key(&self, key: &str) -> bool {
+        if let Some(arr) = &self.array {
+            if let Ok(i) = key.parse::<usize>() {
+                let mut v = arr.borrow_mut();
+                if i < v.len() {
+                    v[i] = Value::Undefined;
+                }
+                return true;
+            }
+        }
+        self.props.borrow_mut().retain(|(k, _)| **k != *key);
+        self.accessors.borrow_mut().retain(|(k, _)| **k != *key);
+        true
+    }
+
     /// Finds an accessor for `key`, walking the prototype chain.
     #[must_use]
     pub fn find_accessor(&self, key: &str) -> Option<Accessor<'a>> {

@@ -426,6 +426,17 @@ fn sets() {
 }
 
 #[test]
+fn delete_operator() {
+    assert_eq!(
+        eval("let o = { a: 1, b: 2 }; delete o.a; o.a === undefined && o.b === 2"),
+        "true"
+    );
+    assert_eq!(eval("let o = { a: 1 }; delete o.a"), "true");
+    assert_eq!(eval("let o = { x: 1 }; delete o['x']; 'x' in o"), "false");
+    assert_eq!(eval("delete ({}).missing"), "true");
+}
+
+#[test]
 fn tagged_templates() {
     assert_eq!(
         eval("function t(s, ...v) { return s.join('|') + '#' + v.join(','); } t`a${1}b${2}c`"),
