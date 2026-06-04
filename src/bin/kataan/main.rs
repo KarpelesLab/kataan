@@ -54,6 +54,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        ["repl"] => run_repl(),
         _ => {
             eprintln!("kataan: unrecognized arguments: {}", args.join(" "));
             eprintln!("try `kataan --help`");
@@ -132,6 +133,58 @@ fn run_eval(source: &str, origin: &str) -> ExitCode {
     }
 }
 
+/// Runs a read-eval-print loop. Each entered line is parsed to an owned
+/// `Program` which is leaked to `&'static` so the persistent interpreter (and
+/// the values stored in its globals) can reference it across iterations — fine
+/// for an interactive session.
+fn run_repl() -> ExitCode {
+    use std::io::{self, BufRead, Write};
+
+    let mut interp: Interp<'static> = Interp::new();
+    install_console(&interp);
+    println!(
+        "kataan {} REPL — type JavaScript, Ctrl-D to exit",
+        kataan::VERSION
+    );
+
+    let stdin = io::stdin();
+    loop {
+        print!("> ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("kataan: read error: {e}");
+                break;
+            }
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let program = match Parser::parse_program(&line) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                continue;
+            }
+        };
+        // Leak the AST so its `&'static` borrow outlives values kept in globals.
+        let program: &'static kataan::ast::Program = Box::leak(Box::new(program));
+        match interp.run(program) {
+            Ok(value) => {
+                if !matches!(value, kataan::interp::Value::Undefined) {
+                    println!("{value:?}");
+                }
+            }
+            Err(thrown) => eprintln!("Uncaught {}", thrown.to_js_string()),
+        }
+    }
+    println!();
+    ExitCode::SUCCESS
+}
+
 /// Installs a minimal `console` global (`log`/`info`/`warn`/`error`) that
 /// prints its arguments space-separated. This is the first sliver of the host
 /// runtime; a fuller one arrives in Phase F.
@@ -174,10 +227,11 @@ fn print_usage() {
          kataan parse -e <SOURCE>  parse a source string and dump its AST\n    \
          kataan eval <FILE>        evaluate a program (prints completion value)\n    \
          kataan eval -e <SOURCE>   evaluate a source string\n    \
+         kataan repl               start an interactive REPL\n    \
          kataan --version          print the version\n    \
          kataan --help             show this help\n\
          \n\
-         A full host runtime and REPL arrive in later phases — see ROADMAP.md.",
+         A full host runtime (event loop, fetch, modules) arrives in later phases — see ROADMAP.md.",
         kataan::VERSION
     );
 }
