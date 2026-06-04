@@ -194,7 +194,10 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
 
 // --- AST → bytecode compiler (the first slice of the bytecode-VM fold) ---
 
-use crate::ast::{BinaryOp, BindingTarget, Expr, Ident, LogicalOp, Program, Stmt, UnaryOp};
+use crate::ast::{
+    ArrayElement, BinaryOp, BindingTarget, Expr, ForInit, Ident, LogicalOp, ObjectMember, Program,
+    PropertyKey, Stmt, UnaryOp,
+};
 
 /// Why compilation could not proceed.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -235,6 +238,15 @@ pub fn compile_and_run(realm: &mut Realm, program: &Program) -> Result<NanBox, C
     c.ops.push(Op::Return { src });
     let reg_count = c.next_reg as usize;
     run(realm, &c.ops, reg_count).map_err(|_| CompileError::Unsupported("runtime fault"))
+}
+
+/// The static string key of a non-computed property key.
+fn static_key(key: &PropertyKey) -> Result<String, CompileError> {
+    match key {
+        PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(String::from(&**s)),
+        PropertyKey::Number(n) => Ok(alloc::format!("{n}")),
+        _ => Err(CompileError::Unsupported("computed/private key")),
+    }
 }
 
 /// A single-pass register-allocating compiler from the AST to [`Op`]s.
@@ -330,6 +342,42 @@ impl Compiler {
                 self.stmt(body)?;
                 self.ops.push(Op::Jump { target: top });
                 self.patch(jf);
+                Ok(None)
+            }
+            Stmt::For {
+                init,
+                test,
+                update,
+                body,
+                ..
+            } => {
+                self.scopes.push(alloc::collections::BTreeMap::new());
+                match init {
+                    Some(ForInit::Var(decl)) => {
+                        self.stmt(&Stmt::Var(decl.clone()))?;
+                    }
+                    Some(ForInit::Expr(e)) => {
+                        self.expr(e)?;
+                    }
+                    None => {}
+                }
+                let top = self.ops.len();
+                let exit = match test {
+                    Some(t) => {
+                        let cond = self.expr(t)?;
+                        Some(self.emit_jump_if_false(cond))
+                    }
+                    None => None,
+                };
+                self.stmt(body)?;
+                if let Some(u) = update {
+                    self.expr(u)?;
+                }
+                self.ops.push(Op::Jump { target: top });
+                if let Some(jf) = exit {
+                    self.patch(jf);
+                }
+                self.scopes.pop();
                 Ok(None)
             }
             _ => Err(CompileError::Unsupported("statement")),
@@ -432,21 +480,88 @@ impl Compiler {
                 self.patch(jend);
                 Ok(dst)
             }
+            Expr::Array { elements, .. } => {
+                let dst = self.alloc();
+                self.ops.push(Op::NewArray {
+                    dst,
+                    len: elements.len(),
+                });
+                for (i, el) in elements.iter().enumerate() {
+                    let ArrayElement::Item(e) = el else {
+                        return Err(CompileError::Unsupported("array hole/spread"));
+                    };
+                    let v = self.expr(e)?;
+                    let idx = self.constant(NanBox::number(i as f64))?;
+                    self.ops.push(Op::SetElem {
+                        arr: dst,
+                        index: idx,
+                        src: v,
+                    });
+                }
+                Ok(dst)
+            }
+            Expr::Object { members, .. } => {
+                let dst = self.alloc();
+                self.ops.push(Op::NewObject { dst });
+                for m in members {
+                    let ObjectMember::Property { key, value, .. } = m else {
+                        return Err(CompileError::Unsupported("object member"));
+                    };
+                    let key = static_key(key)?;
+                    let v = self.expr(value)?;
+                    self.ops.push(Op::SetProp {
+                        obj: dst,
+                        key,
+                        src: v,
+                    });
+                }
+                Ok(dst)
+            }
+            Expr::Member {
+                object, property, ..
+            } => {
+                let obj = self.expr(object)?;
+                self.member_read(obj, property)
+            }
             Expr::Assign {
                 op, target, value, ..
             } => {
                 if !matches!(op, crate::ast::AssignOp::Assign) {
                     return Err(CompileError::Unsupported("compound assignment"));
                 }
-                let Expr::Ident(id) = &**target else {
-                    return Err(CompileError::Unsupported("assignment target"));
-                };
-                let v = self.expr(value)?;
-                let slot = self
-                    .lookup(&id.name)
-                    .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
-                self.ops.push(Op::Move { dst: slot, src: v });
-                Ok(slot)
+                match &**target {
+                    Expr::Ident(id) => {
+                        let v = self.expr(value)?;
+                        let slot = self
+                            .lookup(&id.name)
+                            .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                        self.ops.push(Op::Move { dst: slot, src: v });
+                        Ok(slot)
+                    }
+                    // `obj.k = v` / `arr[i] = v`.
+                    Expr::Member {
+                        object, property, ..
+                    } => {
+                        let obj = self.expr(object)?;
+                        let v = self.expr(value)?;
+                        match property {
+                            PropertyKey::Computed(e) => {
+                                let index = self.expr(e)?;
+                                self.ops.push(Op::SetElem {
+                                    arr: obj,
+                                    index,
+                                    src: v,
+                                });
+                            }
+                            _ => {
+                                let key = static_key(property)?;
+                                self.ops.push(Op::SetProp { obj, key, src: v });
+                            }
+                        }
+                        Ok(v)
+                    }
+                    _ => Err(CompileError::Unsupported("assignment target")),
+                }
             }
             _ => Err(CompileError::Unsupported("expression")),
         }
@@ -456,6 +571,31 @@ impl Compiler {
         let r = self.alloc();
         self.ops.push(Op::LoadConst { dst: r, value });
         Ok(r)
+    }
+
+    /// Compiles a member read `obj.key` / `obj[i]` (with `.length` mapped to the
+    /// array-length op).
+    fn member_read(&mut self, obj: Reg, property: &PropertyKey) -> Result<Reg, CompileError> {
+        let dst = self.alloc();
+        match property {
+            PropertyKey::Computed(e) => {
+                let index = self.expr(e)?;
+                self.ops.push(Op::GetElem {
+                    dst,
+                    arr: obj,
+                    index,
+                });
+            }
+            _ => {
+                let key = static_key(property)?;
+                if key == "length" {
+                    self.ops.push(Op::ArrayLen { dst, arr: obj });
+                } else {
+                    self.ops.push(Op::GetProp { dst, obj, key });
+                }
+            }
+        }
+        Ok(dst)
     }
 
     /// Emits a `JumpIfFalse` with a placeholder target; returns its index.
@@ -539,6 +679,30 @@ mod tests {
                 "let a = 0; let b = 1; let n = 10; while (n > 0) { let t = a + b; a = b; b = t; n = n - 1; } a"
             ),
             "55"
+        );
+    }
+
+    #[test]
+    fn bytecode_arrays_objects_and_for() {
+        // Array literal, element read, and `.length`.
+        assert_eq!(bc("let a = [10, 20, 30]; a[1]"), "20");
+        assert_eq!(bc("[1, 2, 3, 4].length"), "4");
+        // Element assignment.
+        assert_eq!(bc("let a = [0, 0, 0]; a[2] = 7; a[2]"), "7");
+        // Object literal + property read/write.
+        assert_eq!(bc("let o = { x: 1, y: 2 }; o.x + o.y"), "3");
+        assert_eq!(bc("let o = {}; o.k = 42; o.k"), "42");
+        // A C-style for loop summing an array, compiled to bytecode.
+        assert_eq!(
+            bc(
+                "let a = [3, 1, 4, 1, 5]; let s = 0; for (let i = 0; i < a.length; i = i + 1) { s = s + a[i]; } s"
+            ),
+            "14"
+        );
+        // Nested data + computed access.
+        assert_eq!(
+            bc("let grid = [[1, 2], [3, 4]]; grid[1][0] + grid[0][1]"),
+            "5"
         );
     }
 
