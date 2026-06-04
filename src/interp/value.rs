@@ -11,8 +11,11 @@
 
 use super::env::Env;
 use crate::ast::{Arrow, Function};
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::fmt;
 
 /// A JavaScript runtime value (interpreter era; primitives + functions).
@@ -32,6 +35,122 @@ pub enum Value<'a> {
     Function(Rc<Closure<'a>>),
     /// A native (Rust-implemented) function.
     Native(Rc<NativeFn<'a>>),
+    /// An ordinary object or array.
+    Object(Rc<Obj<'a>>),
+}
+
+/// An ordinary object (or array) in the interpreter-era object model: an
+/// insertion-ordered set of string-keyed properties, with an optional dense
+/// element vector for arrays. (Prototype chains, accessors, and hidden classes
+/// arrive with the real object model.)
+pub struct Obj<'a> {
+    props: RefCell<Vec<(Box<str>, Value<'a>)>>,
+    array: Option<RefCell<Vec<Value<'a>>>>,
+}
+
+impl<'a> Obj<'a> {
+    /// Creates an empty ordinary object.
+    #[must_use]
+    pub fn object() -> Rc<Obj<'a>> {
+        Rc::new(Obj {
+            props: RefCell::new(Vec::new()),
+            array: None,
+        })
+    }
+
+    /// Creates an array object from its initial elements.
+    #[must_use]
+    pub fn array(elements: Vec<Value<'a>>) -> Rc<Obj<'a>> {
+        Rc::new(Obj {
+            props: RefCell::new(Vec::new()),
+            array: Some(RefCell::new(elements)),
+        })
+    }
+
+    /// Whether this is an array.
+    #[must_use]
+    pub fn is_array(&self) -> bool {
+        self.array.is_some()
+    }
+
+    /// The array elements, if this is an array.
+    #[must_use]
+    pub fn elements(&self) -> Option<&RefCell<Vec<Value<'a>>>> {
+        self.array.as_ref()
+    }
+
+    /// Gets a property by string key, resolving array indices and `length`.
+    /// Returns `undefined` for absent properties.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Value<'a> {
+        if let Some(arr) = &self.array {
+            if key == "length" {
+                return Value::Number(arr.borrow().len() as f64);
+            }
+            if let Ok(i) = key.parse::<usize>() {
+                return arr.borrow().get(i).cloned().unwrap_or(Value::Undefined);
+            }
+        }
+        self.props
+            .borrow()
+            .iter()
+            .find(|(k, _)| **k == *key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Undefined)
+    }
+
+    /// Whether the object has an own property with `key`.
+    #[must_use]
+    pub fn has(&self, key: &str) -> bool {
+        if let Some(arr) = &self.array {
+            if key == "length" {
+                return true;
+            }
+            if let Ok(i) = key.parse::<usize>() {
+                return i < arr.borrow().len();
+            }
+        }
+        self.props.borrow().iter().any(|(k, _)| **k == *key)
+    }
+
+    /// Sets a property by string key, growing the array (with holes filled by
+    /// `undefined`) for in-bounds-or-beyond array indices.
+    pub fn set(&self, key: &str, value: Value<'a>) {
+        if let Some(arr) = &self.array {
+            if let Ok(i) = key.parse::<usize>() {
+                let mut v = arr.borrow_mut();
+                if i >= v.len() {
+                    v.resize(i + 1, Value::Undefined);
+                }
+                v[i] = value;
+                return;
+            }
+            if key == "length" {
+                return; // length assignment is not yet modeled
+            }
+        }
+        let mut props = self.props.borrow_mut();
+        if let Some(slot) = props.iter_mut().find(|(k, _)| **k == *key) {
+            slot.1 = value;
+        } else {
+            props.push((key.into(), value));
+        }
+    }
+
+    /// The own enumerable string keys, in order (array indices first).
+    #[must_use]
+    pub fn own_keys(&self) -> Vec<alloc::string::String> {
+        let mut keys = Vec::new();
+        if let Some(arr) = &self.array {
+            for i in 0..arr.borrow().len() {
+                keys.push(alloc::format!("{i}"));
+            }
+        }
+        for (k, _) in self.props.borrow().iter() {
+            keys.push(k.as_ref().into());
+        }
+        keys
+    }
 }
 
 /// A user-defined function paired with the environment it closed over.
@@ -75,6 +194,7 @@ impl<'a> Value<'a> {
             Value::Number(_) => "number",
             Value::Str(_) => "string",
             Value::Function(_) | Value::Native(_) => "function",
+            Value::Object(_) => "object",
         }
     }
 
@@ -92,7 +212,7 @@ impl<'a> Value<'a> {
             Value::Bool(b) => *b,
             Value::Number(n) => *n != 0.0 && !n.is_nan(),
             Value::Str(s) => !s.is_empty(),
-            Value::Function(_) | Value::Native(_) => true,
+            Value::Function(_) | Value::Native(_) | Value::Object(_) => true,
         }
     }
 
@@ -106,6 +226,9 @@ impl<'a> Value<'a> {
             Value::Number(n) => *n,
             Value::Str(s) => string_to_number(s),
             Value::Function(_) | Value::Native(_) => f64::NAN,
+            // ToPrimitive on an array yields its join; other objects → NaN.
+            Value::Object(o) if o.is_array() => string_to_number(&self.to_js_string()),
+            Value::Object(_) => f64::NAN,
         }
     }
 
@@ -126,6 +249,20 @@ impl<'a> Value<'a> {
                 Callable::Arrow(_) => "() => { … }".into(),
             },
             Value::Native(n) => alloc::format!("function {}() {{ [native code] }}", n.name),
+            Value::Object(o) if o.is_array() => {
+                // Array `toString` is the elements joined by ",".
+                let elems = o.elements().expect("array");
+                let parts: Vec<String> = elems
+                    .borrow()
+                    .iter()
+                    .map(|v| match v {
+                        Value::Undefined | Value::Null => String::new(),
+                        other => other.to_js_string(),
+                    })
+                    .collect();
+                parts.join(",")
+            }
+            Value::Object(_) => "[object Object]".into(),
         }
     }
 
@@ -206,6 +343,7 @@ pub fn strict_equals<'a>(a: &Value<'a>, b: &Value<'a>) -> bool {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
         (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
+        (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }

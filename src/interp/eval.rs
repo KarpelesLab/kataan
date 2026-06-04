@@ -2,9 +2,9 @@
 //!
 //! Throws are propagated through the `Err` channel of [`Completion`] as the
 //! thrown [`Value`]; non-local statement control flow (`return` / `break` /
-//! `continue`) is carried by [`Flow`]. This increment covers primitives,
-//! control flow, and functions/closures; objects, arrays, and member access
-//! arrive next.
+//! `continue`) is carried by [`Flow`]. Covers primitives, control flow,
+//! functions/closures, objects and arrays, member access, `this`/methods,
+//! destructuring, and `for-of`/`for-in`.
 
 use super::env::{Env, Scope};
 use super::value::{Callable, Closure, Value, loose_equals, strict_equals};
@@ -210,9 +210,12 @@ impl<'a> Interp<'a> {
             }
             Stmt::Class(_) => Err(Value::str("classes are not yet supported at runtime")),
             Stmt::With { .. } => Err(Value::str("`with` is not supported")),
-            Stmt::ForIn { .. } | Stmt::ForOf { .. } => {
-                Err(Value::str("for-in/of are not yet supported at runtime"))
-            }
+            Stmt::ForOf {
+                left, right, body, ..
+            } => self.eval_for_of(left, right, body, env, label),
+            Stmt::ForIn {
+                left, right, body, ..
+            } => self.eval_for_in(left, right, body, env, label),
             Stmt::Import(_) | Stmt::Export(_) => {
                 Err(Value::str("modules are not yet supported at runtime"))
             }
@@ -319,6 +322,77 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// Iterates a `for-of` loop over an array or string.
+    fn eval_for_of(
+        &mut self,
+        left: &'a crate::ast::ForLeft,
+        right: &'a Expr,
+        body: &'a Stmt,
+        env: &Env<'a>,
+        label: Option<&str>,
+    ) -> Completion<'a, Flow<'a>> {
+        let iterable = self.eval_expr(right, env)?;
+        let items: Vec<Value<'a>> = match &iterable {
+            Value::Object(o) if o.is_array() => o.elements().expect("array").borrow().clone(),
+            Value::Str(s) => s
+                .chars()
+                .map(|c| Value::str(alloc::string::String::from(c)))
+                .collect(),
+            _ => return Err(Value::str("value is not iterable (for-of)")),
+        };
+        for item in items {
+            let scope = Scope::child(env);
+            self.bind_for_left(left, item, &scope)?;
+            match self.loop_step(body, &scope, label)? {
+                LoopCtl::Next => {}
+                LoopCtl::Stop => break,
+                LoopCtl::Propagate(f) => return Ok(f),
+            }
+        }
+        Ok(Flow::Normal(Value::Undefined))
+    }
+
+    /// Iterates a `for-in` loop over an object's (or array's) enumerable keys.
+    fn eval_for_in(
+        &mut self,
+        left: &'a crate::ast::ForLeft,
+        right: &'a Expr,
+        body: &'a Stmt,
+        env: &Env<'a>,
+        label: Option<&str>,
+    ) -> Completion<'a, Flow<'a>> {
+        let target = self.eval_expr(right, env)?;
+        let keys = match &target {
+            Value::Object(o) => o.own_keys(),
+            _ => return Ok(Flow::Normal(Value::Undefined)),
+        };
+        for key in keys {
+            let scope = Scope::child(env);
+            self.bind_for_left(left, Value::str(key), &scope)?;
+            match self.loop_step(body, &scope, label)? {
+                LoopCtl::Next => {}
+                LoopCtl::Stop => break,
+                LoopCtl::Propagate(f) => return Ok(f),
+            }
+        }
+        Ok(Flow::Normal(Value::Undefined))
+    }
+
+    /// Binds the per-iteration value of a `for-in`/`for-of` head.
+    fn bind_for_left(
+        &mut self,
+        left: &'a crate::ast::ForLeft,
+        value: Value<'a>,
+        scope: &Env<'a>,
+    ) -> Completion<'a, ()> {
+        match left {
+            crate::ast::ForLeft::Decl { kind, target, .. } => {
+                self.bind_target(target, value, scope, *kind)
+            }
+            crate::ast::ForLeft::Target(e) => self.store(e, value, scope),
+        }
+    }
+
     fn eval_switch(
         &mut self,
         discriminant: &'a Expr,
@@ -392,8 +466,8 @@ impl<'a> Interp<'a> {
 
     // --- binding --------------------------------------------------------
 
-    /// Binds a declaration/catch target. Destructuring patterns are deferred to
-    /// the object/array increment.
+    /// Binds a declaration/catch target (an identifier or a destructuring
+    /// pattern), declaring with `const` immutability per `kind`.
     fn bind_target(
         &mut self,
         target: &'a BindingTarget,
@@ -401,14 +475,92 @@ impl<'a> Interp<'a> {
         scope: &Env<'a>,
         kind: VarDeclKind,
     ) -> Completion<'a, ()> {
+        self.destructure(target, value, scope, kind != VarDeclKind::Const)
+    }
+
+    /// Recursively binds `value` into `target`, which may be an identifier or
+    /// an array/object destructuring pattern.
+    fn destructure(
+        &mut self,
+        target: &'a BindingTarget,
+        value: Value<'a>,
+        scope: &Env<'a>,
+        mutable: bool,
+    ) -> Completion<'a, ()> {
+        use crate::ast::ArrayPatternElement as APE;
         match target {
             BindingTarget::Ident(id) => {
-                scope.declare(&id.name, value, kind != VarDeclKind::Const);
-                Ok(())
+                scope.declare(&id.name, value, mutable);
             }
-            BindingTarget::Array(_) | BindingTarget::Object(_) => {
-                Err(Value::str("destructuring is not yet supported at runtime"))
+            BindingTarget::Array(p) => {
+                for (i, el) in p.elements.iter().enumerate() {
+                    match el {
+                        APE::Hole => {}
+                        APE::Item {
+                            target, default, ..
+                        } => {
+                            let mut v = self.get_member(&value, &alloc::format!("{i}"))?;
+                            if matches!(v, Value::Undefined)
+                                && let Some(d) = default
+                            {
+                                v = self.eval_expr(d, scope)?;
+                            }
+                            self.destructure(target, v, scope, mutable)?;
+                        }
+                        APE::Rest { target, .. } => {
+                            let rest = self.collect_rest_from(&value, i);
+                            self.destructure(
+                                target,
+                                Value::Object(super::value::Obj::array(rest)),
+                                scope,
+                                mutable,
+                            )?;
+                            break;
+                        }
+                    }
+                }
             }
+            BindingTarget::Object(p) => {
+                let mut consumed = Vec::new();
+                for prop in &p.properties {
+                    let key = self.member_key(&prop.key, scope)?;
+                    consumed.push(key.clone());
+                    let mut v = self.get_member(&value, &key)?;
+                    if matches!(v, Value::Undefined)
+                        && let Some(d) = &prop.default
+                    {
+                        v = self.eval_expr(d, scope)?;
+                    }
+                    self.destructure(&prop.value, v, scope, mutable)?;
+                }
+                if let Some(rest) = &p.rest {
+                    let obj = super::value::Obj::object();
+                    if let Value::Object(src) = &value {
+                        for key in src.own_keys() {
+                            if !consumed.contains(&key) {
+                                obj.set(&key, src.get(&key));
+                            }
+                        }
+                    }
+                    self.destructure(rest, Value::Object(obj), scope, mutable)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Collects array elements from index `start` onward into a fresh `Vec`
+    /// (for a rest binding).
+    fn collect_rest_from(&self, value: &Value<'a>, start: usize) -> Vec<Value<'a>> {
+        match value {
+            Value::Object(o) if o.is_array() => o
+                .elements()
+                .expect("array")
+                .borrow()
+                .get(start..)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default(),
+            _ => Vec::new(),
         }
     }
 
@@ -439,7 +591,7 @@ impl<'a> Interp<'a> {
                 Some(v) => Ok(v),
                 None => Err(Value::str(alloc::format!("{} is not defined", id.name))),
             },
-            Expr::This(_) => Ok(Value::Undefined),
+            Expr::This(_) => Ok(env.get("this").unwrap_or(Value::Undefined)),
             Expr::Unary { op, argument, .. } => self.eval_unary(*op, argument, env),
             Expr::Update {
                 op,
@@ -488,19 +640,34 @@ impl<'a> Interp<'a> {
                 Ok(last)
             }
             Expr::Call {
-                callee, arguments, ..
+                callee,
+                arguments,
+                optional,
+                ..
             } => {
-                let callee_val = self.eval_expr(callee, env)?;
-                let mut args = Vec::with_capacity(arguments.len());
-                for a in arguments {
-                    match a {
-                        crate::ast::Argument::Item(e) => args.push(self.eval_expr(e, env)?),
-                        crate::ast::Argument::Spread(_) => {
-                            return Err(Value::str("spread arguments are not yet supported"));
-                        }
+                // A call on a member expression supplies `this`; otherwise the
+                // receiver is undefined.
+                let (this_val, callee_val) = if let Expr::Member {
+                    object,
+                    property,
+                    optional: member_opt,
+                    ..
+                } = &**callee
+                {
+                    let obj = self.eval_expr(object, env)?;
+                    if *member_opt && matches!(obj, Value::Undefined | Value::Null) {
+                        return Ok(Value::Undefined);
                     }
+                    let key = self.member_key(property, env)?;
+                    (obj.clone(), self.get_member(&obj, &key)?)
+                } else {
+                    (Value::Undefined, self.eval_expr(callee, env)?)
+                };
+                if *optional && matches!(callee_val, Value::Undefined | Value::Null) {
+                    return Ok(Value::Undefined);
                 }
-                self.call(callee_val, args)
+                let args = self.eval_arguments(arguments, env)?;
+                self.call_with_this(callee_val, this_val, args)
             }
             Expr::Function(f) => Ok(Value::Function(Rc::new(Closure {
                 def: Callable::Function(f),
@@ -510,12 +677,55 @@ impl<'a> Interp<'a> {
                 def: Callable::Arrow(a),
                 env: Rc::clone(env),
             }))),
-            Expr::Member { .. } | Expr::New { .. } => Err(Value::str(
-                "objects/members are not yet supported at runtime",
-            )),
-            Expr::Array { .. } | Expr::Object { .. } => Err(Value::str(
-                "array/object literals are not yet supported at runtime",
-            )),
+            Expr::Member {
+                object,
+                property,
+                optional,
+                ..
+            } => {
+                let obj = self.eval_expr(object, env)?;
+                if *optional && matches!(obj, Value::Undefined | Value::Null) {
+                    return Ok(Value::Undefined);
+                }
+                let key = self.member_key(property, env)?;
+                self.get_member(&obj, &key)
+            }
+            Expr::Array { elements, .. } => {
+                let mut items = Vec::new();
+                for el in elements {
+                    match el {
+                        crate::ast::ArrayElement::Hole => items.push(Value::Undefined),
+                        crate::ast::ArrayElement::Item(e) => items.push(self.eval_expr(e, env)?),
+                        crate::ast::ArrayElement::Spread(e) => {
+                            let v = self.eval_expr(e, env)?;
+                            self.spread_into(&v, &mut items)?;
+                        }
+                    }
+                }
+                Ok(Value::Object(super::value::Obj::array(items)))
+            }
+            Expr::Object { members, .. } => {
+                let obj = super::value::Obj::object();
+                for m in members {
+                    match m {
+                        crate::ast::ObjectMember::Property { key, value, .. } => {
+                            let k = self.member_key(key, env)?;
+                            let v = self.eval_expr(value, env)?;
+                            obj.set(&k, v);
+                        }
+                        crate::ast::ObjectMember::Spread { value, .. } => {
+                            let v = self.eval_expr(value, env)?;
+                            if let Value::Object(src) = v {
+                                for key in src.own_keys() {
+                                    obj.set(&key, src.get(&key));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Object(obj))
+            }
+            Expr::New { .. } => Err(Value::str("`new` is not yet supported at runtime")),
             Expr::Class(_) => Err(Value::str(
                 "class expressions are not yet supported at runtime",
             )),
@@ -564,20 +774,12 @@ impl<'a> Interp<'a> {
         argument: &'a Expr,
         env: &Env<'a>,
     ) -> Completion<'a, Value<'a>> {
-        let Expr::Ident(id) = argument else {
-            return Err(Value::str(
-                "invalid update target (members not yet supported)",
-            ));
-        };
-        let old = env
-            .get(&id.name)
-            .ok_or_else(|| Value::str(alloc::format!("{} is not defined", id.name)))?
-            .to_number();
+        let old = self.eval_expr(argument, env)?.to_number();
         let new = match op {
             UpdateOp::Inc => old + 1.0,
             UpdateOp::Dec => old - 1.0,
         };
-        self.assign_ident(&id.name, Value::Number(new), env)?;
+        self.store(argument, Value::Number(new), env)?;
         Ok(Value::Number(if prefix { new } else { old }))
     }
 
@@ -588,16 +790,11 @@ impl<'a> Interp<'a> {
         value: &'a Expr,
         env: &Env<'a>,
     ) -> Completion<'a, Value<'a>> {
-        let Expr::Ident(id) = target else {
-            return Err(Value::str("assignment to members is not yet supported"));
-        };
         let new = if op == AssignOp::Assign {
             self.eval_expr(value, env)?
         } else {
-            let cur = env
-                .get(&id.name)
-                .ok_or_else(|| Value::str(alloc::format!("{} is not defined", id.name)))?;
-            // Logical assignment short-circuits.
+            let cur = self.eval_expr(target, env)?;
+            // Logical assignment short-circuits (and skips the store).
             match op {
                 AssignOp::AndAssign => {
                     if !cur.to_boolean() {
@@ -623,8 +820,24 @@ impl<'a> Interp<'a> {
                 }
             }
         };
-        self.assign_ident(&id.name, new.clone(), env)?;
+        self.store(target, new.clone(), env)?;
         Ok(new)
+    }
+
+    /// Stores `value` into an assignment target — an identifier or a member
+    /// access (`obj.x` / `obj[k]`).
+    fn store(&mut self, target: &'a Expr, value: Value<'a>, env: &Env<'a>) -> Completion<'a, ()> {
+        match target {
+            Expr::Ident(id) => self.assign_ident(&id.name, value, env),
+            Expr::Member {
+                object, property, ..
+            } => {
+                let obj = self.eval_expr(object, env)?;
+                let key = self.member_key(property, env)?;
+                self.set_member(&obj, &key, value)
+            }
+            _ => Err(Value::str("invalid assignment target")),
+        }
     }
 
     fn assign_ident(&self, name: &str, value: Value<'a>, env: &Env<'a>) -> Completion<'a, ()> {
@@ -707,15 +920,116 @@ impl<'a> Interp<'a> {
         }
     }
 
+    // --- members --------------------------------------------------------
+
+    /// Resolves a [`PropertyKey`] to its string property key, evaluating a
+    /// computed key.
+    fn member_key(
+        &mut self,
+        key: &'a crate::ast::PropertyKey,
+        env: &Env<'a>,
+    ) -> Completion<'a, String> {
+        use crate::ast::PropertyKey;
+        Ok(match key {
+            PropertyKey::Ident(n) | PropertyKey::Str(n) => n.as_ref().into(),
+            PropertyKey::Private(n) => alloc::format!("#{n}"),
+            PropertyKey::Number(num) => Value::Number(*num).to_js_string(),
+            PropertyKey::Computed(e) => self.eval_expr(e, env)?.to_js_string(),
+        })
+    }
+
+    /// Reads property `key` from `obj`, boxing the few primitive cases we
+    /// support (`String.length` / string indexing) and throwing on `null` /
+    /// `undefined`.
+    fn get_member(&self, obj: &Value<'a>, key: &str) -> Completion<'a, Value<'a>> {
+        match obj {
+            Value::Object(o) => Ok(o.get(key)),
+            Value::Str(s) => Ok(if key == "length" {
+                Value::Number(s.chars().count() as f64)
+            } else if let Ok(i) = key.parse::<usize>() {
+                s.chars().nth(i).map_or(Value::Undefined, |c| {
+                    Value::str(alloc::string::String::from(c))
+                })
+            } else {
+                Value::Undefined
+            }),
+            Value::Undefined | Value::Null => Err(Value::str(alloc::format!(
+                "cannot read properties of {} (reading '{key}')",
+                obj.to_js_string()
+            ))),
+            _ => Ok(Value::Undefined),
+        }
+    }
+
+    /// Writes `value` to property `key` of `obj`.
+    fn set_member(&self, obj: &Value<'a>, key: &str, value: Value<'a>) -> Completion<'a, ()> {
+        match obj {
+            Value::Object(o) => {
+                o.set(key, value);
+                Ok(())
+            }
+            Value::Undefined | Value::Null => Err(Value::str(alloc::format!(
+                "cannot set properties of {} (setting '{key}')",
+                obj.to_js_string()
+            ))),
+            // Writes to primitives are silently ignored (sloppy mode).
+            _ => Ok(()),
+        }
+    }
+
+    /// Spreads `value`'s iterable contents into `out` (arrays and strings).
+    fn spread_into(&self, value: &Value<'a>, out: &mut Vec<Value<'a>>) -> Completion<'a, ()> {
+        match value {
+            Value::Object(o) if o.is_array() => {
+                out.extend(o.elements().expect("array").borrow().iter().cloned());
+                Ok(())
+            }
+            Value::Str(s) => {
+                out.extend(
+                    s.chars()
+                        .map(|c| Value::str(alloc::string::String::from(c))),
+                );
+                Ok(())
+            }
+            _ => Err(Value::str("value is not iterable (spread)")),
+        }
+    }
+
     // --- calls ----------------------------------------------------------
 
-    fn call(&mut self, callee: Value<'a>, args: Vec<Value<'a>>) -> Completion<'a, Value<'a>> {
+    fn eval_arguments(
+        &mut self,
+        arguments: &'a [crate::ast::Argument],
+        env: &Env<'a>,
+    ) -> Completion<'a, Vec<Value<'a>>> {
+        let mut args = Vec::with_capacity(arguments.len());
+        for a in arguments {
+            match a {
+                crate::ast::Argument::Item(e) => args.push(self.eval_expr(e, env)?),
+                crate::ast::Argument::Spread(e) => {
+                    let v = self.eval_expr(e, env)?;
+                    self.spread_into(&v, &mut args)?;
+                }
+            }
+        }
+        Ok(args)
+    }
+
+    fn call_with_this(
+        &mut self,
+        callee: Value<'a>,
+        this: Value<'a>,
+        args: Vec<Value<'a>>,
+    ) -> Completion<'a, Value<'a>> {
         match callee {
             Value::Native(n) => (n.call)(&args),
             Value::Function(closure) => {
                 let scope = Scope::child(&closure.env);
                 match closure.def {
                     Callable::Function(f) => {
+                        // Ordinary functions bind their own `this`; arrows do
+                        // not (they inherit it lexically).
+                        scope.declare("this", this, false);
                         self.bind_params(&f.params, &args, &scope)?;
                         self.hoist(&f.body, &scope);
                         match self.eval_stmts(&f.body, &scope)? {
@@ -753,20 +1067,20 @@ impl<'a> Interp<'a> {
     ) -> Completion<'a, ()> {
         for (i, p) in params.iter().enumerate() {
             if p.rest {
-                return Err(Value::str(
-                    "rest parameters need arrays (not yet supported)",
-                ));
+                // A rest parameter collects the remaining arguments into an
+                // array.
+                let rest: Vec<Value<'a>> = args.get(i..).unwrap_or(&[]).to_vec();
+                let arr = Value::Object(super::value::Obj::array(rest));
+                self.destructure(&p.target, arr, scope, true)?;
+                break;
             }
-            let BindingTarget::Ident(id) = &p.target else {
-                return Err(Value::str("destructuring parameters are not yet supported"));
-            };
             let mut v = args.get(i).cloned().unwrap_or(Value::Undefined);
             if matches!(v, Value::Undefined)
                 && let Some(d) = &p.default
             {
                 v = self.eval_expr(d, scope)?;
             }
-            scope.declare(&id.name, v, true);
+            self.destructure(&p.target, v, scope, true)?;
         }
         Ok(())
     }

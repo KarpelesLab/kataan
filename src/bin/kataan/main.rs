@@ -116,6 +116,7 @@ fn run_eval(source: &str, origin: &str) -> ExitCode {
         }
     };
     let mut interp = Interp::new();
+    install_console(&interp);
     match interp.run(&program) {
         Ok(value) => {
             // Print non-undefined completion values, REPL-style.
@@ -129,6 +130,37 @@ fn run_eval(source: &str, origin: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Installs a minimal `console` global (`log`/`info`/`warn`/`error`) that
+/// prints its arguments space-separated. This is the first sliver of the host
+/// runtime; a fuller one arrives in Phase F.
+fn install_console(interp: &Interp) {
+    use kataan::interp::{NativeFn, Obj, Value};
+    use std::rc::Rc;
+
+    let console = Obj::object();
+    for name in ["log", "info", "warn", "error"] {
+        let to_stderr = matches!(name, "warn" | "error");
+        let native = Value::Native(Rc::new(NativeFn {
+            name,
+            call: Box::new(move |args: &[Value]| {
+                let line = args
+                    .iter()
+                    .map(Value::to_js_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if to_stderr {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
+                Ok(Value::Undefined)
+            }),
+        }));
+        console.set(name, native);
+    }
+    interp.define_global("console", Value::Object(console));
 }
 
 fn print_usage() {

@@ -179,6 +179,85 @@ fn try_catch_finally() {
 }
 
 #[test]
+fn objects() {
+    assert_eq!(eval("let o = { a: 1, b: 2 }; o.a + o.b"), "3");
+    assert_eq!(eval("let o = {}; o.x = 5; o['y'] = 7; o.x + o.y"), "12");
+    assert_eq!(eval("let k = 'key'; let o = { [k]: 42 }; o.key"), "42");
+    assert_eq!(
+        eval("let o = { a: 1 }; let p = { ...o, b: 2 }; p.a + p.b"),
+        "3"
+    );
+    assert_eq!(eval("let o = { n: 0 }; o.n++; o.n += 10; o.n"), "11");
+    assert_eq!(
+        eval_throw("let o = null; o.x"),
+        "cannot read properties of null (reading 'x')"
+    );
+}
+
+#[test]
+fn arrays() {
+    assert_eq!(eval("let a = [1, 2, 3]; a.length"), "3");
+    assert_eq!(eval("let a = [10, 20, 30]; a[1]"), "20");
+    assert_eq!(eval("let a = [1, 2]; a[5] = 9; a.length"), "6");
+    assert_eq!(eval("let a = [1, ...[2, 3], 4]; a.length"), "4");
+    assert_eq!(eval("[1, 2, 3] + ''"), "1,2,3");
+    assert_eq!(
+        eval("let a = []; a[0] = 'x'; a[1] = 'y'; a[0] + a[1]"),
+        "xy"
+    );
+}
+
+#[test]
+fn methods_and_this() {
+    assert_eq!(
+        eval("let o = { x: 10, get() { return this.x; } }; o.get()"),
+        "10"
+    );
+    assert_eq!(
+        eval("let o = { v: 3, add(n) { return this.v + n; } }; o.add(4)"),
+        "7"
+    );
+    // An arrow inside a method captures the method's `this` lexically.
+    assert_eq!(
+        eval("let o = { v: 5, run() { let f = () => this.v; return f(); } }; o.run()"),
+        "5"
+    );
+}
+
+#[test]
+fn destructuring_runtime() {
+    assert_eq!(eval("let [a, b] = [1, 2]; a + b"), "3");
+    assert_eq!(eval("let [a, , c] = [1, 2, 3]; a + c"), "4");
+    assert_eq!(
+        eval("let [first, ...rest] = [1, 2, 3, 4]; rest.length"),
+        "3"
+    );
+    assert_eq!(eval("let { x, y } = { x: 7, y: 8 }; x * y"), "56");
+    assert_eq!(eval("let { a: p, b = 100 } = { a: 1 }; p + b"), "101");
+    assert_eq!(eval("function f([a, b]) { return a - b; } f([9, 4])"), "5");
+    assert_eq!(
+        eval("function g({ n }) { return n * 2; } g({ n: 21 })"),
+        "42"
+    );
+}
+
+#[test]
+fn for_of_and_for_in() {
+    assert_eq!(
+        eval("let s = 0; for (const x of [1, 2, 3, 4]) s += x; s"),
+        "10"
+    );
+    assert_eq!(
+        eval("let out = ''; for (const c of 'abc') out += c + '.'; out"),
+        "a.b.c."
+    );
+    assert_eq!(
+        eval("let o = { a: 1, b: 2, c: 3 }; let keys = ''; for (const k in o) keys += k; keys"),
+        "abc"
+    );
+}
+
+#[test]
 fn update_and_compound_assignment() {
     assert_eq!(eval("let x = 5; x++; x"), "6");
     assert_eq!(eval("let x = 5; let y = x++; `${x},${y}`"), "6,5");

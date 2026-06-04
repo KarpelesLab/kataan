@@ -877,8 +877,17 @@ impl<'src> Parser<'src> {
         };
         self.bump();
 
+        // Method shorthand `name() { … }` (getters/setters/async/generator
+        // object methods are added later).
         if self.at(TokenKind::LParen) {
-            return Err(self.err_at(start, "object methods are added in a later increment"));
+            let func = self.parse_method_tail(false, false)?;
+            let span = start.to(self.prev_span());
+            return Ok(ObjectMember::Property {
+                key: PropertyKey::Ident(name),
+                value: Box::new(Expr::Function(func)),
+                shorthand: false,
+                span,
+            });
         }
 
         if self.eat(TokenKind::Colon) {
