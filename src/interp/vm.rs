@@ -10,7 +10,7 @@ use super::Completion;
 use super::eval::Interp;
 use super::value::{BytecodeFn, Obj, Value};
 use crate::ast::BinaryOp;
-use crate::bytecode::{Chunk, Const, Module, Op};
+use crate::bytecode::{Chunk, Const, Module, Op, Reg};
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -62,137 +62,165 @@ impl<'a> Interp<'a> {
             }
         }
         let mut pc = 0usize;
+        // Installed exception handlers: `(catch_pc, error_register)`.
+        let mut handlers: Vec<(usize, Reg)> = Vec::new();
         loop {
             let op = &chunk.code[pc];
             pc += 1;
-            match op {
-                Op::LoadConst { dst, k } => {
-                    regs[*dst as usize] = match &chunk.constants[*k as usize] {
-                        Const::Number(n) => Value::Number(*n),
-                        Const::Str(s) => Value::str(s.clone()),
-                        // A function constant materializes a bytecode-function
-                        // value over the same module.
-                        Const::Func(idx) => Value::Object(make_bytecode_fn(module, *idx)),
-                    };
-                }
-                Op::LoadUndefined { dst } => regs[*dst as usize] = Value::Undefined,
-                Op::LoadNull { dst } => regs[*dst as usize] = Value::Null,
-                Op::LoadBool { dst, value } => regs[*dst as usize] = Value::Bool(*value),
-                Op::LoadInt { dst, value } => {
-                    regs[*dst as usize] = Value::Number(f64::from(*value));
-                }
-                Op::Move { dst, src } => regs[*dst as usize] = regs[*src as usize].clone(),
+            // Run one op inside a closure so a thrown `Err` (from a fallible
+            // op or an explicit `Throw`) can be caught and routed to the
+            // nearest installed handler. `Ok(Some(v))` is a `Return`.
+            let outcome: Completion<'a, Option<Value<'a>>> = (|| {
+                match op {
+                    Op::LoadConst { dst, k } => {
+                        regs[*dst as usize] = match &chunk.constants[*k as usize] {
+                            Const::Number(n) => Value::Number(*n),
+                            Const::Str(s) => Value::str(s.clone()),
+                            // A function constant materializes a bytecode-function
+                            // value over the same module.
+                            Const::Func(idx) => Value::Object(make_bytecode_fn(module, *idx)),
+                        };
+                    }
+                    Op::LoadUndefined { dst } => regs[*dst as usize] = Value::Undefined,
+                    Op::LoadNull { dst } => regs[*dst as usize] = Value::Null,
+                    Op::LoadBool { dst, value } => regs[*dst as usize] = Value::Bool(*value),
+                    Op::LoadInt { dst, value } => {
+                        regs[*dst as usize] = Value::Number(f64::from(*value));
+                    }
+                    Op::Move { dst, src } => regs[*dst as usize] = regs[*src as usize].clone(),
 
-                Op::Add { dst, a, b } => self.bin(&mut regs, BinaryOp::Add, *dst, *a, *b)?,
-                Op::Sub { dst, a, b } => self.bin(&mut regs, BinaryOp::Sub, *dst, *a, *b)?,
-                Op::Mul { dst, a, b } => self.bin(&mut regs, BinaryOp::Mul, *dst, *a, *b)?,
-                Op::Div { dst, a, b } => self.bin(&mut regs, BinaryOp::Div, *dst, *a, *b)?,
-                Op::Mod { dst, a, b } => self.bin(&mut regs, BinaryOp::Mod, *dst, *a, *b)?,
-                Op::Pow { dst, a, b } => self.bin(&mut regs, BinaryOp::Exp, *dst, *a, *b)?,
-                Op::Eq { dst, a, b } => self.bin(&mut regs, BinaryOp::EqEq, *dst, *a, *b)?,
-                Op::StrictEq { dst, a, b } => {
-                    self.bin(&mut regs, BinaryOp::EqEqEq, *dst, *a, *b)?;
-                }
-                Op::Lt { dst, a, b } => self.bin(&mut regs, BinaryOp::Lt, *dst, *a, *b)?,
-                Op::Le { dst, a, b } => self.bin(&mut regs, BinaryOp::LtEq, *dst, *a, *b)?,
-                Op::Gt { dst, a, b } => self.bin(&mut regs, BinaryOp::Gt, *dst, *a, *b)?,
-                Op::Ge { dst, a, b } => self.bin(&mut regs, BinaryOp::GtEq, *dst, *a, *b)?,
+                    Op::Add { dst, a, b } => self.bin(&mut regs, BinaryOp::Add, *dst, *a, *b)?,
+                    Op::Sub { dst, a, b } => self.bin(&mut regs, BinaryOp::Sub, *dst, *a, *b)?,
+                    Op::Mul { dst, a, b } => self.bin(&mut regs, BinaryOp::Mul, *dst, *a, *b)?,
+                    Op::Div { dst, a, b } => self.bin(&mut regs, BinaryOp::Div, *dst, *a, *b)?,
+                    Op::Mod { dst, a, b } => self.bin(&mut regs, BinaryOp::Mod, *dst, *a, *b)?,
+                    Op::Pow { dst, a, b } => self.bin(&mut regs, BinaryOp::Exp, *dst, *a, *b)?,
+                    Op::Eq { dst, a, b } => self.bin(&mut regs, BinaryOp::EqEq, *dst, *a, *b)?,
+                    Op::StrictEq { dst, a, b } => {
+                        self.bin(&mut regs, BinaryOp::EqEqEq, *dst, *a, *b)?;
+                    }
+                    Op::Lt { dst, a, b } => self.bin(&mut regs, BinaryOp::Lt, *dst, *a, *b)?,
+                    Op::Le { dst, a, b } => self.bin(&mut regs, BinaryOp::LtEq, *dst, *a, *b)?,
+                    Op::Gt { dst, a, b } => self.bin(&mut regs, BinaryOp::Gt, *dst, *a, *b)?,
+                    Op::Ge { dst, a, b } => self.bin(&mut regs, BinaryOp::GtEq, *dst, *a, *b)?,
 
-                Op::Neg { dst, src } => {
-                    regs[*dst as usize] = Value::Number(-regs[*src as usize].to_number());
-                }
-                Op::Not { dst, src } => {
-                    regs[*dst as usize] = Value::Bool(!regs[*src as usize].to_boolean());
-                }
+                    Op::Neg { dst, src } => {
+                        regs[*dst as usize] = Value::Number(-regs[*src as usize].to_number());
+                    }
+                    Op::Not { dst, src } => {
+                        regs[*dst as usize] = Value::Bool(!regs[*src as usize].to_boolean());
+                    }
 
-                Op::GetGlobal { dst, name } => {
-                    let key = const_str(chunk, *name);
-                    let value = self.global().get(&key).ok_or_else(|| {
-                        super::eval::make_error(
-                            "ReferenceError",
-                            alloc::format!("{key} is not defined"),
-                        )
-                    })?;
-                    regs[*dst as usize] = value;
-                }
-                Op::SetGlobal { name, src } => {
-                    let key = const_str(chunk, *name);
-                    self.global()
-                        .declare(&key, regs[*src as usize].clone(), true);
-                }
+                    Op::GetGlobal { dst, name } => {
+                        let key = const_str(chunk, *name);
+                        let value = self.global().get(&key).ok_or_else(|| {
+                            super::eval::make_error(
+                                "ReferenceError",
+                                alloc::format!("{key} is not defined"),
+                            )
+                        })?;
+                        regs[*dst as usize] = value;
+                    }
+                    Op::SetGlobal { name, src } => {
+                        let key = const_str(chunk, *name);
+                        self.global()
+                            .declare(&key, regs[*src as usize].clone(), true);
+                    }
 
-                Op::GetProp { dst, obj, key } => {
-                    let k = const_str(chunk, *key);
-                    let obj = regs[*obj as usize].clone();
-                    regs[*dst as usize] = self.get_member(&obj, &k)?;
-                }
-                Op::GetElem { dst, obj, index } => {
-                    let obj = regs[*obj as usize].clone();
-                    let key = regs[*index as usize].to_js_string();
-                    regs[*dst as usize] = self.get_member(&obj, &key)?;
-                }
+                    Op::GetProp { dst, obj, key } => {
+                        let k = const_str(chunk, *key);
+                        let obj = regs[*obj as usize].clone();
+                        regs[*dst as usize] = self.get_member(&obj, &k)?;
+                    }
+                    Op::GetElem { dst, obj, index } => {
+                        let obj = regs[*obj as usize].clone();
+                        let key = regs[*index as usize].to_js_string();
+                        regs[*dst as usize] = self.get_member(&obj, &key)?;
+                    }
 
-                Op::Jump { offset } => pc = apply_offset(pc, *offset),
-                Op::JumpIfFalse { cond, offset } => {
-                    if !regs[*cond as usize].to_boolean() {
-                        pc = apply_offset(pc, *offset);
+                    Op::Jump { offset } => pc = apply_offset(pc, *offset),
+                    Op::JumpIfFalse { cond, offset } => {
+                        if !regs[*cond as usize].to_boolean() {
+                            pc = apply_offset(pc, *offset);
+                        }
+                    }
+                    Op::JumpIfTrue { cond, offset } => {
+                        if regs[*cond as usize].to_boolean() {
+                            pc = apply_offset(pc, *offset);
+                        }
+                    }
+
+                    Op::Call {
+                        dst,
+                        callee,
+                        args_base,
+                        argc,
+                    } => {
+                        let callee_val = regs[*callee as usize].clone();
+                        let base = *args_base as usize;
+                        let args: Vec<Value<'a>> = regs[base..base + *argc as usize].to_vec();
+                        regs[*dst as usize] =
+                            self.call_with_this(callee_val, Value::Undefined, args)?;
+                    }
+
+                    Op::CallMethod {
+                        dst,
+                        recv,
+                        key,
+                        args_base,
+                        argc,
+                    } => {
+                        let receiver = regs[*recv as usize].clone();
+                        let key = regs[*key as usize].to_js_string();
+                        let base = *args_base as usize;
+                        let args: Vec<Value<'a>> = regs[base..base + *argc as usize].to_vec();
+                        regs[*dst as usize] = self.call_member(receiver, &key, args)?;
+                    }
+
+                    Op::Return { src } => return Ok(Some(regs[*src as usize].clone())),
+                    Op::ReturnUndefined => return Ok(Some(Value::Undefined)),
+
+                    Op::Throw { src } => return Err(regs[*src as usize].clone()),
+                    Op::PushHandler { catch, err } => {
+                        handlers.push((apply_offset(pc, *catch), *err));
+                    }
+                    Op::PopHandler => {
+                        handlers.pop();
+                    }
+
+                    Op::NewObject { dst } => {
+                        regs[*dst as usize] = Value::Object(Obj::object());
+                    }
+                    Op::NewArray { dst, len } => {
+                        regs[*dst as usize] =
+                            Value::Object(Obj::array(alloc::vec![Value::Undefined; *len as usize]));
+                    }
+                    Op::SetProp { obj, key, src } => {
+                        let k = const_str(chunk, *key);
+                        let target = regs[*obj as usize].clone();
+                        let value = regs[*src as usize].clone();
+                        self.set_member(&target, &k, value)?;
+                    }
+                    Op::SetElem { obj, index, src } => {
+                        let target = regs[*obj as usize].clone();
+                        let key = regs[*index as usize].to_js_string();
+                        let value = regs[*src as usize].clone();
+                        self.set_member(&target, &key, value)?;
                     }
                 }
-                Op::JumpIfTrue { cond, offset } => {
-                    if regs[*cond as usize].to_boolean() {
-                        pc = apply_offset(pc, *offset);
+                Ok(None)
+            })();
+            match outcome {
+                Ok(Some(value)) => return Ok(value),
+                Ok(None) => {}
+                // Unwind to the nearest installed handler; if none, propagate.
+                Err(error) => match handlers.pop() {
+                    Some((catch_pc, err_reg)) => {
+                        regs[err_reg as usize] = error;
+                        pc = catch_pc;
                     }
-                }
-
-                Op::Call {
-                    dst,
-                    callee,
-                    args_base,
-                    argc,
-                } => {
-                    let callee_val = regs[*callee as usize].clone();
-                    let base = *args_base as usize;
-                    let args: Vec<Value<'a>> = regs[base..base + *argc as usize].to_vec();
-                    regs[*dst as usize] =
-                        self.call_with_this(callee_val, Value::Undefined, args)?;
-                }
-
-                Op::CallMethod {
-                    dst,
-                    recv,
-                    key,
-                    args_base,
-                    argc,
-                } => {
-                    let receiver = regs[*recv as usize].clone();
-                    let key = regs[*key as usize].to_js_string();
-                    let base = *args_base as usize;
-                    let args: Vec<Value<'a>> = regs[base..base + *argc as usize].to_vec();
-                    regs[*dst as usize] = self.call_member(receiver, &key, args)?;
-                }
-
-                Op::Return { src } => return Ok(regs[*src as usize].clone()),
-                Op::ReturnUndefined => return Ok(Value::Undefined),
-
-                Op::NewObject { dst } => {
-                    regs[*dst as usize] = Value::Object(Obj::object());
-                }
-                Op::NewArray { dst, len } => {
-                    regs[*dst as usize] =
-                        Value::Object(Obj::array(alloc::vec![Value::Undefined; *len as usize]));
-                }
-                Op::SetProp { obj, key, src } => {
-                    let k = const_str(chunk, *key);
-                    let target = regs[*obj as usize].clone();
-                    let value = regs[*src as usize].clone();
-                    self.set_member(&target, &k, value)?;
-                }
-                Op::SetElem { obj, index, src } => {
-                    let target = regs[*obj as usize].clone();
-                    let key = regs[*index as usize].to_js_string();
-                    let value = regs[*src as usize].clone();
-                    self.set_member(&target, &key, value)?;
-                }
+                    None => return Err(error),
+                },
             }
         }
     }

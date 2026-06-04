@@ -284,6 +284,17 @@ impl Compiler {
                 body,
                 ..
             } => self.compile_for(init.as_ref(), test.as_deref(), update.as_deref(), body),
+            Stmt::Throw { argument, .. } => {
+                let src = self.expr(argument)?;
+                self.emit(Op::Throw { src });
+                Ok(None)
+            }
+            Stmt::Try {
+                block,
+                handler,
+                finalizer,
+                ..
+            } => self.compile_try(block, handler.as_ref(), finalizer.as_deref()),
             Stmt::Break { label: None, .. } => {
                 let j = self.emit(Op::Jump { offset: 0 });
                 self.add_break(j)?;
@@ -345,6 +356,58 @@ impl Compiler {
             self.patch_to_here(*j);
         }
         self.funcs.last_mut().expect("fn").locals.truncate(mark);
+        Ok(None)
+    }
+
+    /// Compiles `try { … } catch (e) { … }`. A `finally` block falls back to
+    /// the tree-walker for now (its run-on-every-path semantics need more than
+    /// a single guarded region).
+    fn compile_try(
+        &mut self,
+        block: &[Stmt],
+        handler: Option<&crate::ast::CatchClause>,
+        finalizer: Option<&[Stmt]>,
+    ) -> Result<Option<Reg>, CompileError> {
+        if finalizer.is_some() {
+            return Err(CompileError::unsupported("`finally`"));
+        }
+        let Some(handler) = handler else {
+            return Err(CompileError::unsupported("`try` without `catch`"));
+        };
+        // The register the VM drops the thrown value into on a catch.
+        let err_reg = self.reg();
+        let ph = self.emit(Op::PushHandler {
+            catch: 0,
+            err: err_reg,
+        });
+        // Guarded region.
+        let mark = self.funcs.last().expect("fn").locals.len();
+        for s in block {
+            self.stmt(s)?;
+        }
+        self.funcs.last_mut().expect("fn").locals.truncate(mark);
+        self.emit(Op::PopHandler);
+        let skip_catch = self.emit(Op::Jump { offset: 0 });
+
+        // Catch entry: patch the handler's catch offset to here.
+        let catch_pc = self.code_len();
+        let ci = self.ci();
+        self.module[ci].code[ph] = Op::PushHandler {
+            catch: (catch_pc as i64 - (ph as i64 + 1)) as i32,
+            err: err_reg,
+        };
+        // Bind the catch parameter (if any) to the error register.
+        let mark = self.funcs.last().expect("fn").locals.len();
+        if let Some(BindingTarget::Ident(id)) = &handler.param {
+            self.declare_local(id.name.clone().into_string(), err_reg);
+        } else if handler.param.is_some() {
+            return Err(CompileError::unsupported("catch binding pattern"));
+        }
+        for s in &handler.body {
+            self.stmt(s)?;
+        }
+        self.funcs.last_mut().expect("fn").locals.truncate(mark);
+        self.patch_to_here(skip_catch);
         Ok(None)
     }
 

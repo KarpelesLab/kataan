@@ -82,5 +82,8 @@ fn render_op(op: &Op) -> String {
         } => format!("CallMethod  r{dst}, r{recv}[r{key}], r{args_base}..+{argc}"),
         Op::Return { src } => format!("Return      r{src}"),
         Op::ReturnUndefined => "ReturnUndef".into(),
+        Op::Throw { src } => format!("Throw       r{src}"),
+        Op::PushHandler { catch, err } => format!("PushHandler {catch:+} -> r{err}"),
+        Op::PopHandler => "PopHandler".into(),
     }
 }

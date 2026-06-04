@@ -182,6 +182,9 @@ mod tag {
     pub(super) const RETURN: u8 = 32;
     pub(super) const RETURN_UNDEFINED: u8 = 33;
     pub(super) const CALL_METHOD: u8 = 34;
+    pub(super) const THROW: u8 = 35;
+    pub(super) const PUSH_HANDLER: u8 = 36;
+    pub(super) const POP_HANDLER: u8 = 37;
 }
 
 fn write_op(w: &mut Writer, op: &Op) {
@@ -314,6 +317,16 @@ fn write_op(w: &mut Writer, op: &Op) {
             w.u16(*src);
         }
         Op::ReturnUndefined => w.raw(tag::RETURN_UNDEFINED),
+        Op::Throw { src } => {
+            w.raw(tag::THROW);
+            w.u16(*src);
+        }
+        Op::PushHandler { catch, err } => {
+            w.raw(tag::PUSH_HANDLER);
+            w.i32(*catch);
+            w.u16(*err);
+        }
+        Op::PopHandler => w.raw(tag::POP_HANDLER),
     }
 }
 
@@ -411,6 +424,12 @@ fn read_op(r: &mut Reader) -> Result<Op, BytecodeError> {
             args_base: r.u16()?,
             argc: r.u16()?,
         },
+        tag::THROW => Op::Throw { src: r.u16()? },
+        tag::PUSH_HANDLER => Op::PushHandler {
+            catch: r.i32()?,
+            err: r.u16()?,
+        },
+        tag::POP_HANDLER => Op::PopHandler,
         tag::RETURN => Op::Return { src: r.u16()? },
         tag::RETURN_UNDEFINED => Op::ReturnUndefined,
         t => return Err(BytecodeError::BadTag(t)),

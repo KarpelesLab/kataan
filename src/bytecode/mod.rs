@@ -224,6 +224,22 @@ pub enum Op {
         src: Reg,
     },
     ReturnUndefined,
+
+    // --- exceptions ---
+    /// Throw the value in `src`.
+    Throw {
+        src: Reg,
+    },
+    /// Install an exception handler: a throw in the guarded region jumps to
+    /// `catch` (a signed offset relative to the next instruction) with the
+    /// thrown value placed in register `err`.
+    PushHandler {
+        catch: i32,
+        err: Reg,
+    },
+    /// Remove the most recently installed handler (the guarded region completed
+    /// normally).
+    PopHandler,
 }
 
 /// A unit of compiled code: a flat instruction list, a constant pool, and

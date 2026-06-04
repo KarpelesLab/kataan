@@ -181,6 +181,47 @@ fn bytecode_vm_object_array_literals() {
 }
 
 #[test]
+fn bytecode_vm_try_catch_throw() {
+    // A throw is caught and its value bound.
+    assert_eq!(
+        eval_bc("let r = 0; try { throw 'boom'; } catch (e) { r = e; } r"),
+        "boom"
+    );
+    // Catch without a binding.
+    assert_eq!(
+        eval_bc("let r = 'a'; try { throw 1; } catch { r = 'b'; } r"),
+        "b"
+    );
+    // No throw: the catch is skipped.
+    assert_eq!(
+        eval_bc("let r = 'init'; try { r = 'ok'; } catch (e) { r = 'caught'; } r"),
+        "ok"
+    );
+    // An engine-raised error (calling a non-function) is catchable.
+    assert_eq!(
+        eval_bc("let r = ''; try { let n = 5; n(); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    // A throw from a called function unwinds to the caller's handler.
+    assert_eq!(
+        eval_bc(
+            "function boom() { throw 'deep'; }
+             let r = 0; try { boom(); } catch (e) { r = e; } r"
+        ),
+        "deep"
+    );
+    // Rethrow from catch, caught by an outer try.
+    assert_eq!(
+        eval_bc(
+            "let r = 0;
+             try { try { throw 'x'; } catch (e) { throw 'y'; } } catch (e) { r = e; }
+             r"
+        ),
+        "y"
+    );
+}
+
+#[test]
 fn bytecode_vm_inequality_and_nullish() {
     assert_eq!(eval_bc("1 != 2"), "true");
     assert_eq!(eval_bc("1 != 1"), "false");
