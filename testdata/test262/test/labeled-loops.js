@@ -1,13 +1,14 @@
 /*---
-description: Labeled break exits an outer loop
+description: Labeled break and continue across nested loops
 esid: sec-labelled-statements
 ---*/
-var pairs = 0;
+var hits = [];
 outer:
 for (var i = 0; i < 3; i++) {
   for (var j = 0; j < 3; j++) {
-    if (i + j === 3) break outer;
-    pairs++;
+    if (i === 1 && j === 1) continue outer;
+    if (i === 2 && j === 0) break outer;
+    hits.push(i + "" + j);
   }
 }
-assert.sameValue(pairs, 5);
+assert.sameValue(hits.join(","), "00,01,02,10");
