@@ -493,14 +493,24 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   GC — which is also the
   gateway to the Phase-D bytecode VM. First Test262 numbers land here.
 
-- **Phase D — Bytecode VM**
+- **Phase D — Bytecode VM** 🚧 **started**
   AST→register-bytecode compiler, the interpreter loop, inline caches,
   closures/upvalues, exceptions/`try-finally`, generators/iterators, RegExp,
   collections, typed arrays, Promise + microtasks, Proxy/Reflect, JSON, Date.
   The bytecode format is position-independent (§2.2) from this phase on. Target:
-  broad Test262 coverage of the language proper.
+  broad Test262 coverage of the language proper. **Done so far:** the
+  instruction set and `Chunk`/`Module` containers (`src/bytecode/`), a
+  disassembler, and the host-native serialization codec (below). **Next:** the
+  AST→bytecode compiler and the VM execution loop.
 
 - **Phase D′ — Serializable bytecode & code cache** (`serialize` feature)
+  🚧 **started** — the container codec is in: `serialize`/`deserialize` with a
+  `KTBC` magic + version header that records the host byte order and pointer
+  width, integers written native-endian (zero-copy on a matched host;
+  read-back-through-recorded-order on a mismatched one), a deduplicated constant
+  pool, and version/magic/truncation validation. **Next:** `mmap`-able layout,
+  the on-demand byte-swap conversion path, IC-slot reset, and the
+  content-addressed store.
   Lands alongside / right after D, while the bytecode format is still malleable.
   The versioned, `mmap`-able artifact format (§2.2): export/reload, host-native
   encoding with the on-demand byte-swap conversion path, module-local atom

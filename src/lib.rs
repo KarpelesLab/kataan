@@ -35,6 +35,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod ast;
+pub mod bytecode;
 pub mod common;
 pub mod error;
 pub mod lexer;
