@@ -52,6 +52,12 @@ pub mod heap;
 #[cfg(feature = "alloc")]
 pub mod shape;
 
+/// The performance-era object: a [`shape::Shape`] paired with
+/// [`nanbox::NanBox`] value slots — composes the object-model pillars. Needs
+/// `alloc`.
+#[cfg(feature = "alloc")]
+pub mod object;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
