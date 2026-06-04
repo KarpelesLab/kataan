@@ -335,6 +335,31 @@ fn error_objects() {
 }
 
 #[test]
+fn more_array_methods() {
+    assert_eq!(eval("[3, 1, 2].sort().join(',')"), "1,2,3");
+    assert_eq!(eval("[3, 1, 2].sort((a, b) => b - a).join(',')"), "3,2,1");
+    assert_eq!(eval("[10, 1, 2].sort((a, b) => a - b).join(',')"), "1,2,10");
+    assert_eq!(eval("[1, 2, 3].reverse().join(',')"), "3,2,1");
+    assert_eq!(eval("[1, 2].concat([3, 4], 5).join(',')"), "1,2,3,4,5");
+    assert_eq!(eval("[[1, 2], [3], 4].flat().join(',')"), "1,2,3,4");
+    assert_eq!(eval("[1, 2, 3].at(-1)"), "3");
+    assert_eq!(eval("[5, 6, 7].findIndex(x => x === 6)"), "1");
+    assert_eq!(eval("let a = [1, 2]; a.unshift(0); a.join(',')"), "0,1,2");
+}
+
+#[test]
+fn more_string_number_methods() {
+    assert_eq!(eval("(3.14159).toFixed(2)"), "3.14");
+    assert_eq!(eval("(255).toString(16)"), "ff");
+    assert_eq!(eval("(5).toString(2)"), "101");
+    assert_eq!(eval("'5'.padStart(3, '0')"), "005");
+    assert_eq!(eval("'5'.padEnd(3, '.')"), "5..");
+    assert_eq!(eval("'a-b-c'.replace('-', '+')"), "a+b-c");
+    assert_eq!(eval("'a-b-c'.replaceAll('-', '+')"), "a+b+c");
+    assert_eq!(eval("'hello'.at(-1)"), "o");
+}
+
+#[test]
 fn maps() {
     assert_eq!(
         eval("let m = new Map(); m.set('a', 1); m.set('b', 2); m.get('a') + m.get('b')"),

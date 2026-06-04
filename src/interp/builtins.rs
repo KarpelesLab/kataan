@@ -289,6 +289,7 @@ impl<'a> Interp<'a> {
                 self.collection_method(o, name, args)
             }
             Value::Str(s) => Ok(string_method(s, name, args)),
+            Value::Number(n) => Ok(number_method(*n, name, args)),
             _ => Ok(None),
         }
     }
@@ -437,15 +438,113 @@ impl<'a> Interp<'a> {
                 let (start, end) = slice_bounds(args, v.len());
                 Value::Object(Obj::array(v[start..end].to_vec()))
             }
-            "map" | "filter" | "forEach" | "find" | "some" | "every" => {
+            "at" => {
+                let v = elements.borrow();
+                let n = arg(args, 0).to_number();
+                let idx = if n < 0.0 { v.len() as f64 + n } else { n };
+                if idx < 0.0 {
+                    Value::Undefined
+                } else {
+                    v.get(idx as usize).cloned().unwrap_or(Value::Undefined)
+                }
+            }
+            "concat" => {
+                let mut out = elements.borrow().clone();
+                for a in args {
+                    match a {
+                        Value::Object(o) if o.is_array() => {
+                            out.extend(o.elements().expect("array").borrow().iter().cloned());
+                        }
+                        other => out.push(other.clone()),
+                    }
+                }
+                Value::Object(Obj::array(out))
+            }
+            "reverse" => {
+                elements.borrow_mut().reverse();
+                Value::Object(Rc::clone(arr))
+            }
+            "fill" => {
+                let val = arg(args, 0);
+                for slot in elements.borrow_mut().iter_mut() {
+                    *slot = val.clone();
+                }
+                Value::Object(Rc::clone(arr))
+            }
+            "flat" => {
+                let mut out = Vec::new();
+                for v in elements.borrow().iter() {
+                    match v {
+                        Value::Object(o) if o.is_array() => {
+                            out.extend(o.elements().expect("array").borrow().iter().cloned());
+                        }
+                        other => out.push(other.clone()),
+                    }
+                }
+                Value::Object(Obj::array(out))
+            }
+            "lastIndexOf" => {
+                let needle = arg(args, 0);
+                let v = elements.borrow();
+                let idx = v
+                    .iter()
+                    .rposition(|x| super::value::strict_equals(x, &needle));
+                Value::Number(idx.map_or(-1.0, |i| i as f64))
+            }
+            "unshift" => {
+                let mut v = elements.borrow_mut();
+                for (i, a) in args.iter().enumerate() {
+                    v.insert(i, a.clone());
+                }
+                Value::Number(v.len() as f64)
+            }
+            "map" | "filter" | "forEach" | "find" | "findIndex" | "some" | "every" => {
                 return self.array_iter_method(arr, name, args).map(Some);
             }
             "reduce" => {
                 return self.array_reduce(arr, args).map(Some);
             }
+            "sort" => {
+                return self.array_sort(arr, args).map(Some);
+            }
             _ => return Ok(None),
         };
         Ok(Some(result))
+    }
+
+    /// `Array.prototype.sort`, optionally with a comparator.
+    fn array_sort(&mut self, arr: &Rc<Obj<'a>>, args: &[Value<'a>]) -> Completion<'a, Value<'a>> {
+        let mut items: Vec<Value<'a>> = arr.elements().expect("array").borrow().clone();
+        let comparator = arg(args, 0);
+        let has_cmp = comparator.is_callable();
+        // Insertion sort so the (fallible, evaluator-driven) comparator can be
+        // called without fighting the borrow checker.
+        for i in 1..items.len() {
+            let mut j = i;
+            while j > 0 {
+                let order = if has_cmp {
+                    self.call_with_this(
+                        comparator.clone(),
+                        Value::Undefined,
+                        alloc::vec![items[j - 1].clone(), items[j].clone()],
+                    )?
+                    .to_number()
+                } else {
+                    // Default order: compare by string value.
+                    let a = items[j - 1].to_js_string();
+                    let b = items[j].to_js_string();
+                    if a > b { 1.0 } else { -1.0 }
+                };
+                if order > 0.0 {
+                    items.swap(j - 1, j);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        *arr.elements().expect("array").borrow_mut() = items;
+        Ok(Value::Object(Rc::clone(arr)))
     }
 
     /// The callback-driven array methods (`map`/`filter`/`forEach`/`find`/
@@ -479,6 +578,11 @@ impl<'a> Interp<'a> {
                         return Ok(item.clone());
                     }
                 }
+                "findIndex" => {
+                    if r.to_boolean() {
+                        return Ok(Value::Number(i as f64));
+                    }
+                }
                 "some" => {
                     if r.to_boolean() {
                         return Ok(Value::Bool(true));
@@ -495,6 +599,7 @@ impl<'a> Interp<'a> {
         Ok(match name {
             "map" | "filter" => Value::Object(Obj::array(out)),
             "find" => Value::Undefined,
+            "findIndex" => Value::Number(-1.0),
             "some" => Value::Bool(false),
             "every" => Value::Bool(true),
             _ => Value::Undefined, // forEach
@@ -591,9 +696,113 @@ fn string_method<'a>(s: &str, name: &str, args: &[Value<'a>]) -> Option<Value<'a
             };
             Value::Object(Obj::array(parts))
         }
+        "at" => {
+            let n = arg(args, 0).to_number();
+            let idx = if n < 0.0 { chars.len() as f64 + n } else { n };
+            if idx < 0.0 {
+                Value::Undefined
+            } else {
+                chars
+                    .get(idx as usize)
+                    .map_or(Value::Undefined, |c| Value::str(c.to_string()))
+            }
+        }
+        "trimStart" => Value::str(s.trim_start().to_string()),
+        "trimEnd" => Value::str(s.trim_end().to_string()),
+        "concat" => {
+            let mut out = String::from(s);
+            for a in args {
+                out.push_str(&a.to_js_string());
+            }
+            Value::str(out)
+        }
+        "replace" => {
+            let from = arg(args, 0).to_js_string();
+            let to = arg(args, 1).to_js_string();
+            Value::str(s.replacen(&from, &to, 1))
+        }
+        "replaceAll" => {
+            let from = arg(args, 0).to_js_string();
+            let to = arg(args, 1).to_js_string();
+            Value::str(s.replace(&from, &to))
+        }
+        "padStart" | "padEnd" => {
+            let target = arg(args, 0).to_number() as usize;
+            let pad = if matches!(arg(args, 1), Value::Undefined) {
+                " ".to_string()
+            } else {
+                arg(args, 1).to_js_string()
+            };
+            let cur = chars.len();
+            if cur >= target || pad.is_empty() {
+                Value::str(s.to_string())
+            } else {
+                let need = target - cur;
+                let mut fill = String::new();
+                while fill.chars().count() < need {
+                    fill.push_str(&pad);
+                }
+                let fill: String = fill.chars().take(need).collect();
+                Value::str(if name == "padStart" {
+                    fill + s
+                } else {
+                    String::from(s) + &fill
+                })
+            }
+        }
+        "toString" => Value::str(s.to_string()),
         _ => return None,
     };
     Some(result)
+}
+
+/// Number prototype methods.
+fn number_method<'a>(n: f64, name: &str, args: &[Value<'a>]) -> Option<Value<'a>> {
+    let result = match name {
+        "toFixed" => {
+            let digits = arg(args, 0).to_number();
+            let d = if digits.is_finite() && digits >= 0.0 {
+                digits as usize
+            } else {
+                0
+            };
+            Value::str(alloc::format!("{n:.d$}"))
+        }
+        "toString" => {
+            let radix = arg(args, 0).to_number();
+            if radix == 10.0 || matches!(arg(args, 0), Value::Undefined) {
+                Value::str(Value::Number(n).to_js_string())
+            } else {
+                Value::str(to_radix_string(n, radix as u32))
+            }
+        }
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// Renders an integer-valued number in the given radix (2–36); fractional
+/// parts are truncated (the common `(n).toString(radix)` case).
+fn to_radix_string(n: f64, radix: u32) -> String {
+    if !(2..=36).contains(&radix) || !n.is_finite() {
+        return Value::Number(n).to_js_string();
+    }
+    let neg = n < 0.0;
+    let mut int = n.abs().trunc() as u64;
+    if int == 0 {
+        return "0".into();
+    }
+    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = Vec::new();
+    while int > 0 {
+        buf.push(digits[(int % u64::from(radix)) as usize]);
+        int /= u64::from(radix);
+    }
+    if neg {
+        buf.push(b'-');
+    }
+    buf.reverse();
+    String::from_utf8(buf).expect("ascii digits")
 }
 
 /// Resolves the `(start, end)` of a `slice(start, end)` call against `len`,
