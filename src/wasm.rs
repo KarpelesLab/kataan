@@ -7,8 +7,9 @@
 //! valid WAT that a standard assembler turns into a `.wasm` module — so a hot
 //! numeric kernel can be handed to a Wasm runtime instead of interpreted.
 //!
-//! It lowers `let`/assignment locals, arithmetic, comparisons, ternaries,
-//! `if`/`else`, `while` loops (as structured `block`/`loop`/`br_if`), and
+//! It lowers `let`/assignment locals (incl. compound `+=`/`-=`/`*=`/`/=` and
+//! `++`/`--`), arithmetic, `%`, comparisons, `Math.*`, ternaries, `if`/`else`,
+//! `while`/`for`/`do-while` loops (as structured `block`/`loop`/`br_if`), and
 //! function calls — enough for iterative numeric kernels. Both targets are
 //! produced: `compile_module` emits WAT text, and `compile_module_binary` emits
 //! a complete `.wasm` binary module (verified to instantiate and run on a real
@@ -271,6 +272,16 @@ fn emit_stmt(stmt: &Stmt, out: &mut String, depth: usize) -> Result<(), WasmErro
             out.push_str(&format!("{inner2}i32.eqz\n{inner2}br_if 1\n")); // exit when !cond
             emit_stmt(body, out, depth + 2)?;
             out.push_str(&format!("{inner2}br 0\n{inner}end\n{pad}end\n"));
+            Ok(())
+        }
+        // `do body while (cond)` → a `loop` that runs the body, then branches
+        // back while the condition holds (no exit block needed).
+        Stmt::DoWhile { test, body, .. } => {
+            let inner = "  ".repeat(depth + 1);
+            out.push_str(&format!("{pad}loop\n"));
+            emit_stmt(body, out, depth + 1)?;
+            emit_cond(test, out, depth + 1)?;
+            out.push_str(&format!("{inner}br_if 0\n{pad}end\n")); // loop back while cond
             Ok(())
         }
         _ => Err(WasmError("statement")),
@@ -787,6 +798,17 @@ fn emit_stmt_bin(
             out.push(0x0b); // end block
             Ok(())
         }
+        // `do body while (cond)` → a `loop` with a trailing `br_if 0`.
+        Stmt::DoWhile { test, body, .. } => {
+            out.push(0x03); // loop
+            out.push(0x40);
+            emit_stmt_bin(body, locals, fns, out)?;
+            emit_cond_bin(test, locals, fns, out)?;
+            out.push(0x0d); // br_if
+            leb_u(0, out); // loop back while cond
+            out.push(0x0b); // end loop
+            Ok(())
+        }
         _ => Err(WasmError("statement")),
     }
 }
@@ -1131,6 +1153,20 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_do_while_loop() {
+        // The body runs at least once; the loop branches back while the test holds.
+        let src =
+            "function countdown(n) { let s = 0; do { s += n; n -= 1; } while (n > 0); return s; }";
+        let wat = module(src);
+        assert!(wat.contains("loop"));
+        assert!(wat.contains("br_if 0"));
+        assert_well_formed(&wat);
+        let wasm = binary(src);
+        assert!(wasm.contains(&0x03) && wasm.contains(&0x0d)); // loop + br_if
+        section_ids(&wasm);
     }
 
     #[test]
