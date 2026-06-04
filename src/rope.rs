@@ -106,6 +106,37 @@ impl Rope {
     }
 }
 
+impl Drop for Node {
+    /// Dismantles a `Concat` chain iteratively. A deeply nested rope would
+    /// otherwise free recursively (each `Node` drops its child `Rc<Node>`, which
+    /// drops the next…), overflowing the stack on platforms with a small default
+    /// (e.g. Windows' 1 MB test threads) for the pathological left-/right-deep
+    /// shape that O(1) concatenation builds.
+    fn drop(&mut self) {
+        // A cheap leaf to swap into a child slot so we can take ownership of the
+        // real `Rc<Node>` without recursing through its `Drop`.
+        let sentinel = || Rc::new(Node::Leaf(Box::from("")));
+        let Node::Concat { left, right, .. } = self else {
+            return; // a leaf owns nothing recursive
+        };
+        let mut stack = alloc::vec![
+            core::mem::replace(&mut left.0, sentinel()),
+            core::mem::replace(&mut right.0, sentinel()),
+        ];
+        while let Some(rc) = stack.pop() {
+            // Only the last owner can free; otherwise just drop the `Rc` (a
+            // refcount decrement, no recursion).
+            if let Ok(mut node) = Rc::try_unwrap(rc)
+                && let Node::Concat { left, right, .. } = &mut node
+            {
+                stack.push(core::mem::replace(&mut left.0, sentinel()));
+                stack.push(core::mem::replace(&mut right.0, sentinel()));
+                // `node` now holds sentinel leaves, so its own drop is shallow.
+            }
+        }
+    }
+}
+
 impl Default for Rope {
     fn default() -> Self {
         Self::new()
@@ -195,6 +226,27 @@ mod tests {
         assert_eq!(s.len(), 10_001);
         assert!(s.starts_with("ab"));
         assert!(s.ends_with("bb"));
+    }
+
+    /// A deeply nested rope must also *drop* iteratively — a recursive free
+    /// overflows small stacks (this regressed CI on Windows' 1 MB test
+    /// threads). Run on a deliberately tiny stack to catch it everywhere.
+    #[cfg(feature = "std")]
+    #[test]
+    fn deeply_nested_rope_drops_without_overflow() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut r = Rope::leaf("a");
+                for _ in 0..100_000 {
+                    r = r.push_str("b");
+                }
+                assert_eq!(r.materialize().len(), 100_001);
+                // `r` drops here, on the 256 KB stack.
+            })
+            .expect("spawn")
+            .join()
+            .expect("the deep rope dropped without overflowing the stack");
     }
 
     #[test]
