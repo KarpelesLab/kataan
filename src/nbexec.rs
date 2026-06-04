@@ -782,8 +782,31 @@ impl<'a> Interp<'a> {
             }
             N_ARRAY_FROM => {
                 // Iterable → array (arrays, strings, Sets, Maps), with an
-                // optional map callback applied to each element.
-                let items = self.iterate_values(arg(0)).unwrap_or_default();
+                // optional map callback applied to each element. A non-iterable
+                // array-like (an object with a `length`) is read by index.
+                let items = match self.iterate_values(arg(0)) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let mut out = Vec::new();
+                        if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
+                            let len = self
+                                .realm
+                                .get_property(h, "length")
+                                .map(|v| self.realm.to_number(v))
+                                .unwrap_or(0.0)
+                                .max(0.0) as usize;
+                            for i in 0..len {
+                                let k = alloc::format!("{i}");
+                                out.push(
+                                    self.realm
+                                        .get_property(h, &k)
+                                        .unwrap_or(NanBox::undefined()),
+                                );
+                            }
+                        }
+                        out
+                    }
+                };
                 let items = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                     items
                 } else {
@@ -6466,6 +6489,22 @@ mod tests {
         assert_eq!(
             run("[0, '', null, 1, 'a'].filter(function(x){ return x; }).join(',')"),
             "1,a"
+        );
+    }
+
+    #[test]
+    fn array_from_array_like() {
+        // `{ length }` array-like with a map callback (tree-walker path).
+        assert_eq!(
+            run("Array.from({length:3}, function(_,i){ return i*i; }).join(',')"),
+            "0,1,4"
+        );
+        // Array-like with indexed props, no map fn.
+        assert_eq!(run("Array.from({length:2, 0:'a', 1:'b'}).join('-')"), "a-b");
+        // Still works for real iterables.
+        assert_eq!(
+            run("Array.from([1,2,3], function(x){ return x*2; }).join(',')"),
+            "2,4,6"
         );
     }
 

@@ -1981,7 +1981,25 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                     .chars()
                     .map(|c| NanBox::handle(ctx.realm.new_string(&String::from(c)).to_raw()))
                     .collect(),
-                _ => Vec::new(),
+                // An array-like object (a `length` + indexed properties). The map
+                // callback form is handled only by the tree-walker (call_native
+                // here can't invoke a closure).
+                Some(h) => {
+                    let len = ctx
+                        .realm
+                        .get_property(h, "length")
+                        .map(|v| ctx.realm.to_number(v))
+                        .unwrap_or(0.0)
+                        .max(0.0) as usize;
+                    (0..len)
+                        .map(|i| {
+                            ctx.realm
+                                .get_property(h, &alloc::format!("{i}"))
+                                .unwrap_or(NanBox::undefined())
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
             };
             NanBox::handle(ctx.realm.new_array(items).to_raw())
         }
