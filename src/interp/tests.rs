@@ -1276,6 +1276,19 @@ fn bytecode_vm_generators() {
         ),
         "10"
     );
+    // yield* delegates to another generator, an array, and a string.
+    assert_eq!(
+        eval_bc(
+            "function* inner() { yield 1; yield 2; }
+             function* outer() { yield 0; yield* inner(); yield* [3, 4]; yield 5; }
+             [...outer()].join(',')"
+        ),
+        "0,1,2,3,4,5"
+    );
+    assert_eq!(
+        eval_bc("function* g() { yield* 'abc'; } [...g()].join('-')"),
+        "a-b-c"
+    );
 }
 
 #[test]

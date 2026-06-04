@@ -1786,7 +1786,13 @@ impl Compiler {
                 self.call(callee, arguments)
             }
             Expr::Class(class) => self.compile_class(class),
-            // `yield expr` — `yield*` (delegation) isn't compiled yet.
+            // `yield* iterable` delegates: yield each of the iterable's values.
+            Expr::Yield {
+                argument: Some(e),
+                delegate: true,
+                ..
+            } => self.yield_delegate(e),
+            // `yield expr`.
             Expr::Yield {
                 argument,
                 delegate: false,
@@ -2437,6 +2443,58 @@ impl Compiler {
             _ => return Err(CompileError::unsupported("unary operator")),
         };
         Ok(dst)
+    }
+
+    /// Compiles `yield* iterable` as a loop that yields each of the iterable's
+    /// values (the iterable is materialized via `IterValues`, so finite ones).
+    fn yield_delegate(&mut self, iterable: &Expr) -> Result<Reg, CompileError> {
+        let src = self.expr(iterable)?;
+        let items = self.reg();
+        self.emit(Op::IterValues { dst: items, src });
+        let len = self.reg();
+        let lk = self.add_const(Const::Str(String::from("length")));
+        self.emit(Op::GetProp {
+            dst: len,
+            obj: items,
+            key: lk,
+        });
+        let idx = self.reg();
+        self.emit(Op::LoadInt { dst: idx, value: 0 });
+        let top = self.code_len();
+        let cond = self.reg();
+        self.emit(Op::Lt {
+            dst: cond,
+            a: idx,
+            b: len,
+        });
+        let exit = self.emit(Op::JumpIfFalse { cond, offset: 0 });
+        let value = self.reg();
+        self.emit(Op::GetElem {
+            dst: value,
+            obj: items,
+            index: idx,
+        });
+        let ydst = self.reg();
+        self.emit(Op::Yield { value, dst: ydst });
+        let one = self.reg();
+        self.emit(Op::LoadInt { dst: one, value: 1 });
+        let next = self.reg();
+        self.emit(Op::Add {
+            dst: next,
+            a: idx,
+            b: one,
+        });
+        self.emit(Op::Move {
+            dst: idx,
+            src: next,
+        });
+        let back = self.emit(Op::Jump { offset: 0 });
+        self.patch_jump(back, top);
+        self.patch_to_here(exit);
+        // `yield*` evaluates to the delegate's return value; we yield `undefined`.
+        let result = self.reg();
+        self.emit(Op::LoadUndefined { dst: result });
+        Ok(result)
     }
 
     /// Compiles `delete argument`. `delete obj.prop` / `delete obj[k]` removes
