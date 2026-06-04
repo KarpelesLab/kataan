@@ -403,6 +403,25 @@ fn function_apply_and_call() {
         eval_bc("function mul(a, b) { return a * b; } mul.call(null, 3, 4)"),
         "12"
     );
+    // bind: partial application and `this` binding.
+    assert_eq!(
+        eval("function greet(g, name) { return g + ', ' + name; } greet.bind(null, 'Hi')('Ada')"),
+        "Hi, Ada"
+    );
+    assert_eq!(
+        eval("const o = { v: 42, get() { return this.v; } }; o.get.bind({ v: 99 })()"),
+        "99"
+    );
+    assert_eq!(
+        eval("const add = (a, b, c) => a + b + c; add.bind(null, 1, 2)(3)"),
+        "6"
+    );
+    assert_eq!(eval("typeof (function () {}).bind(null)"), "function");
+    // bind through the bytecode VM.
+    assert_eq!(
+        eval_bc("function mul(a, b) { return a * b; } let d = mul.bind(null, 2); d(21)"),
+        "42"
+    );
 }
 
 #[test]

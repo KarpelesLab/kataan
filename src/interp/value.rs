@@ -80,6 +80,9 @@ pub struct Obj<'a> {
     promise: RefCell<Option<Rc<RefCell<super::promise::PromiseState<'a>>>>>,
     /// For bytecode functions: the compiled module + chunk + captured values.
     bytecode: RefCell<Option<Rc<BytecodeFn<'a>>>>,
+    /// For functions produced by `Function.prototype.bind`: the bound target,
+    /// `this`, and leading arguments.
+    bound: RefCell<Option<Rc<BoundFn<'a>>>>,
 }
 
 /// A compiled (bytecode) function value: the module it lives in, the index of
@@ -91,6 +94,17 @@ pub struct BytecodeFn<'a> {
     pub chunk: u32,
     /// Captured upvalue cells, addressed by capture index.
     pub captures: Vec<Value<'a>>,
+}
+
+/// A bound function (`fn.bind(thisArg, …partial)`): when called, invokes
+/// `target` with `this` and `args` prepended to the call's own arguments.
+pub struct BoundFn<'a> {
+    /// The function being bound.
+    pub target: Value<'a>,
+    /// The fixed `this` value.
+    pub this: Value<'a>,
+    /// Leading arguments prepended to each call.
+    pub args: Vec<Value<'a>>,
 }
 
 /// A getter/setter accessor property.
@@ -124,6 +138,7 @@ impl<'a> Obj<'a> {
             callable: RefCell::new(None),
             promise: RefCell::new(None),
             bytecode: RefCell::new(None),
+            bound: RefCell::new(None),
         })
     }
 
@@ -139,6 +154,7 @@ impl<'a> Obj<'a> {
             callable: RefCell::new(None),
             promise: RefCell::new(None),
             bytecode: RefCell::new(None),
+            bound: RefCell::new(None),
         })
     }
 
@@ -154,6 +170,7 @@ impl<'a> Obj<'a> {
             callable: RefCell::new(None),
             promise: RefCell::new(None),
             bytecode: RefCell::new(None),
+            bound: RefCell::new(None),
         })
     }
 
@@ -172,6 +189,7 @@ impl<'a> Obj<'a> {
             callable: RefCell::new(None),
             promise: RefCell::new(None),
             bytecode: RefCell::new(None),
+            bound: RefCell::new(None),
         })
     }
 
@@ -207,6 +225,17 @@ impl<'a> Obj<'a> {
     /// Marks this object as a bytecode function.
     pub fn set_bytecode_fn(&self, f: Rc<BytecodeFn<'a>>) {
         *self.bytecode.borrow_mut() = Some(f);
+    }
+
+    /// Marks this object as a bound function (`fn.bind(…)`).
+    pub fn set_bound_fn(&self, f: Rc<BoundFn<'a>>) {
+        *self.bound.borrow_mut() = Some(f);
+    }
+
+    /// The bound-function record this object wraps, if any.
+    #[must_use]
+    pub fn bound_fn(&self) -> Option<Rc<BoundFn<'a>>> {
+        self.bound.borrow().clone()
     }
 
     /// The compiled function this object wraps, if it is a bytecode function.
@@ -455,8 +484,15 @@ impl<'a> Value<'a> {
             Value::Number(_) => "number",
             Value::Str(_) => "string",
             Value::Function(_) | Value::Native(_) | Value::Class(_) => "function",
-            // A bytecode function (or callable constructor object) is a function.
-            Value::Object(o) if o.bytecode_fn().is_some() || o.callable().is_some() => "function",
+            // A bytecode / bound function (or callable constructor object) is a
+            // function.
+            Value::Object(o)
+                if o.bytecode_fn().is_some()
+                    || o.bound_fn().is_some()
+                    || o.callable().is_some() =>
+            {
+                "function"
+            }
             Value::Object(_) => "object",
         }
     }
@@ -467,7 +503,9 @@ impl<'a> Value<'a> {
     pub fn is_callable(&self) -> bool {
         match self {
             Value::Function(_) | Value::Native(_) => true,
-            Value::Object(o) => o.callable().is_some() || o.bytecode_fn().is_some(),
+            Value::Object(o) => {
+                o.callable().is_some() || o.bytecode_fn().is_some() || o.bound_fn().is_some()
+            }
             _ => false,
         }
     }

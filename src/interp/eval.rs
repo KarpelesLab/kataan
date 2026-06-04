@@ -1530,6 +1530,18 @@ impl<'a> Interp<'a> {
         key: &str,
         args: Vec<Value<'a>>,
     ) -> Completion<'a, Value<'a>> {
+        // `Function.prototype.bind(thisArg, …partial)` on a callable receiver.
+        if obj.is_callable() && key == "bind" {
+            let bound_this = args.first().cloned().unwrap_or(Value::Undefined);
+            let bound_args = args.get(1..).map(<[_]>::to_vec).unwrap_or_default();
+            let f = Obj::object();
+            f.set_bound_fn(Rc::new(super::value::BoundFn {
+                target: obj,
+                this: bound_this,
+                args: bound_args,
+            }));
+            return Ok(Value::Object(f));
+        }
         // `Function.prototype.call`/`apply` on a callable receiver.
         if obj.is_callable() && (key == "call" || key == "apply") {
             let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
@@ -1576,6 +1588,13 @@ impl<'a> Interp<'a> {
             Value::Object(o) if o.bytecode_fn().is_some() => {
                 let func = o.bytecode_fn().expect("bytecode fn");
                 self.call_bytecode_fn(&func, this, args)
+            }
+            // A bound function: prepend the bound `this` and arguments.
+            Value::Object(o) if o.bound_fn().is_some() => {
+                let bound = o.bound_fn().expect("bound fn");
+                let mut all = bound.args.clone();
+                all.extend(args);
+                self.call_with_this(bound.target.clone(), bound.this.clone(), all)
             }
             // A callable constructor object (`String`, `Number`, …) delegates
             // to its backing native.
