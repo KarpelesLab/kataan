@@ -49,6 +49,8 @@ fn emitted_wasm_runs_on_a_real_engine() {
         function bits(a, b) { return (a & b) * 1000000 + (a | b) * 1000 + (a ^ b); }
         function shifts(x) { return (x << 3) * 1000 + (x >> 1); }
         function bnot(x) { return ~x; }
+        function cube(x) { return x ** 3; }
+        function quad(x) { return x ** 4 + x ** 0; }
     ";
     let program = Parser::parse_program(src).expect("parse");
     let wasm = kataan::wasm::compile_module_binary(&program).expect("compile to wasm");
@@ -86,6 +88,8 @@ fn emitted_wasm_runs_on_a_real_engine() {
             e.bits(12, 10),
             e.shifts(5),
             e.bnot(5),
+            e.cube(3),
+            e.quad(2),
           ];
           console.log(out.join(','));
         }}).catch(err => {{ console.error('INVALID:' + err.message); process.exit(1); }});
@@ -109,7 +113,7 @@ fn emitted_wasm_runs_on_a_real_engine() {
     // absdiff(2,9)=7 — including the native Math.sqrt/max/abs ops.
     assert_eq!(
         stdout.trim(),
-        "5,9,9,55,6765,25,5,7,2,1,0,55,120,26,10,18,13,8,8014006,40002,-6", // …, bits/shifts/bnot (int32 bitwise)
+        "5,9,9,55,6765,25,5,7,2,1,0,55,120,26,10,18,13,8,8014006,40002,-6,27,17", // …, cube(3)=27, quad(2)=16+1=17 (** unroll)
         "wasm produced wrong results"
     );
 

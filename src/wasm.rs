@@ -8,8 +8,9 @@
 //! numeric kernel can be handed to a Wasm runtime instead of interpreted.
 //!
 //! It lowers `let`/assignment locals (incl. compound `+=`/`-=`/`*=`/`/=` and
-//! `++`/`--`), arithmetic, `%`, int32 bitwise ops (`&`/`|`/`^`/`<<`/`>>`/`>>>`/
-//! `~`, via f64↔i32 conversion), comparisons, `Math.*`, ternaries, `if`/`else`,
+//! `++`/`--`), arithmetic, `%`, `**` with a constant integer exponent (unrolled),
+//! int32 bitwise ops (`&`/`|`/`^`/`<<`/`>>`/`>>>`/`~`, via f64↔i32 conversion),
+//! comparisons, `Math.*`, ternaries, `if`/`else`,
 //! `while`/`for`/`do-while` loops (as structured `block`/`loop`/`br_if`, with
 //! `break`/`continue` in any loop lowered to the right `br` target — `for`/
 //! `do-while` use an inner `continue`-block so `continue` still runs the update/
@@ -323,6 +324,20 @@ fn emit_stmt_ctx(
 }
 
 /// Emits the instructions that leave the `f64` value of `expr` on the stack.
+/// A constant non-negative integer exponent `≤ 16` (for unrolling `**`), if the
+/// expression is exactly that.
+fn const_small_exponent(e: &Expr) -> Option<u32> {
+    let Expr::Number { value, .. } = e else {
+        return None;
+    };
+    let n = *value;
+    if (0.0..=16.0).contains(&n) && (n as u32) as f64 == n {
+        Some(n as u32)
+    } else {
+        None
+    }
+}
+
 fn emit_expr(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmError> {
     let pad = "  ".repeat(depth);
     match expr {
@@ -346,6 +361,25 @@ fn emit_expr(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmErro
             out.push_str(&format!(
                 "{pad}i32.trunc_sat_f64_s\n{pad}i32.const -1\n{pad}i32.xor\n{pad}f64.convert_i32_s\n"
             ));
+        }
+        // `a ** n` for a constant non-negative integer `n` (≤ 16): unrolled to
+        // repeated multiplication (WASM has no f64 pow). `n == 0` → `1`.
+        Expr::Binary {
+            op: BinaryOp::Exp,
+            left,
+            right,
+            ..
+        } => {
+            let n = const_small_exponent(right).ok_or(WasmError("non-constant exponent"))?;
+            if n == 0 {
+                out.push_str(&format!("{pad}f64.const 1\n"));
+            } else {
+                emit_expr(left, out, depth)?; // base^1
+                for _ in 1..n {
+                    emit_expr(left, out, depth)?;
+                    out.push_str(&format!("{pad}f64.mul\n"));
+                }
+            }
         }
         // Bitwise ops: JS coerces both sides to int32, operates, and returns an
         // int32 (`>>>` unsigned). Lower as f64→i32, the i32 op, then i32→f64.
@@ -958,6 +992,25 @@ fn emit_expr_bin(
             out.push(0x73); // i32.xor
             out.push(0xb7); // f64.convert_i32_s
         }
+        // `a ** n` for a constant non-negative integer exponent → unrolled mul.
+        Expr::Binary {
+            op: BinaryOp::Exp,
+            left,
+            right,
+            ..
+        } => {
+            let n = const_small_exponent(right).ok_or(WasmError("non-constant exponent"))?;
+            if n == 0 {
+                out.push(0x44); // f64.const 1
+                out.extend_from_slice(&1f64.to_le_bytes());
+            } else {
+                emit_expr_bin(left, locals, fns, out)?;
+                for _ in 1..n {
+                    emit_expr_bin(left, locals, fns, out)?;
+                    out.push(0xa2); // f64.mul
+                }
+            }
+        }
         // Bitwise ops: f64→i32 (saturating), the i32 op, then i32→f64.
         Expr::Binary {
             op:
@@ -1303,6 +1356,20 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_exponentiation_constant_exponent() {
+        // `x ** 3` unrolls to x*x*x; `** 0` is 1; a non-constant exponent fails.
+        let src = "function cube(x) { return x ** 3; } function unit(x) { return x ** 0; }";
+        let wat = module(src);
+        assert!(wat.contains("f64.mul"));
+        assert!(wat.contains("f64.const 1"));
+        assert_well_formed(&wat);
+        let wasm = binary(src);
+        section_ids(&wasm);
+        let bad = Parser::parse_program("function f(a, b) { return a ** b; }").unwrap();
+        assert!(compile_module(&bad).is_err());
     }
 
     #[test]
