@@ -12,11 +12,13 @@
 //! patterns, and modules are added in subsequent increments.
 
 mod expr;
+mod function;
 mod stmt;
 
 pub use expr::{
     Argument, ArrayElement, Expr, ObjectMember, PropertyKey, TemplateElement, TemplateLiteral,
 };
+pub use function::{Arrow, ArrowBody, Function, Param};
 pub use stmt::{
     BindingTarget, CatchClause, ForInit, ForLeft, Program, SourceType, Stmt, SwitchCase, VarDecl,
     VarDeclKind, VarDeclarator,

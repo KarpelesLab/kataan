@@ -1,6 +1,6 @@
 //! Expression nodes.
 
-use super::{AssignOp, BinaryOp, Ident, LogicalOp, UnaryOp, UpdateOp};
+use super::{Arrow, AssignOp, BinaryOp, Function, Ident, LogicalOp, UnaryOp, UpdateOp};
 use crate::common::Span;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -127,6 +127,11 @@ pub enum Expr {
     },
     /// A comma sequence: `a, b, c`.
     Sequence { expressions: Vec<Expr>, span: Span },
+
+    /// A function expression: `function f() { … }`.
+    Function(Function),
+    /// An arrow function: `x => x + 1`.
+    Arrow(Arrow),
 }
 
 impl Expr {
@@ -157,6 +162,8 @@ impl Expr {
             | Expr::Sequence { span, .. } => *span,
             Expr::Template(t) => t.span,
             Expr::Ident(id) => id.span,
+            Expr::Function(f) => f.span,
+            Expr::Arrow(a) => a.span,
         }
     }
 

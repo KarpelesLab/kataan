@@ -6,8 +6,8 @@
 
 use super::Parser;
 use crate::ast::{
-    Argument, ArrayElement, BindingTarget, Expr, ForInit, ForLeft, ObjectMember, Program,
-    PropertyKey, Stmt, TemplateLiteral, VarDeclarator,
+    Argument, ArrayElement, ArrowBody, BindingTarget, Expr, ForInit, ForLeft, Function,
+    ObjectMember, Param, Program, PropertyKey, Stmt, TemplateLiteral, VarDeclarator,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -135,7 +135,52 @@ fn sexpr(e: &Expr) -> String {
             let parts: Vec<String> = expressions.iter().map(sexpr).collect();
             format!("(seq {})", parts.join(" "))
         }
+        Expr::Function(f) => sexpr_function(f),
+        Expr::Arrow(a) => {
+            let body = match &a.body {
+                ArrowBody::Expr(e) => sexpr(e),
+                ArrowBody::Block(b) => format!("(block {})", stmts(b)),
+            };
+            let kw = if a.is_async { "async-arrow" } else { "arrow" };
+            format!("({kw} ({}) {body})", params(&a.params))
+        }
     }
+}
+
+fn sexpr_function(f: &Function) -> String {
+    use alloc::format;
+    let name = f.id.as_ref().map_or("", |id| &id.name);
+    let mut tag = String::from("fn");
+    if f.is_async {
+        tag = "async-fn".into();
+    }
+    if f.is_generator {
+        tag.push('*');
+    }
+    format!(
+        "({tag} {name} ({}) (block {}))",
+        params(&f.params),
+        stmts(&f.body)
+    )
+}
+
+fn params(ps: &[Param]) -> String {
+    use alloc::format;
+    let parts: Vec<String> = ps
+        .iter()
+        .map(|p| {
+            let BindingTarget::Ident(id) = &p.target;
+            let mut s = id.name.clone().into_string();
+            if p.rest {
+                s = format!("...{s}");
+            }
+            if let Some(d) = &p.default {
+                s = format!("{s}={}", sexpr(d));
+            }
+            s
+        })
+        .collect();
+    parts.join(" ")
 }
 
 fn sexpr_key(key: &PropertyKey) -> String {
@@ -356,9 +401,8 @@ fn templates() {
 
 #[test]
 fn deferred_features() {
-    assert!(perr("function(){}").contains("later increment"));
-    assert!(perr("() => 1").contains("empty parentheses"));
     assert!(perr("new.target").contains("new.target"));
+    assert!(perr("class C {}").contains("later increment"));
 }
 
 // === statements =========================================================
@@ -493,6 +537,7 @@ fn sexpr_stmt(s: &Stmt) -> String {
         Stmt::With { object, body, .. } => {
             format!("(with {} {})", sexpr(object), sexpr_stmt(body))
         }
+        Stmt::Function(f) => sexpr_function(f),
     }
 }
 
@@ -640,4 +685,84 @@ fn asi_inserts_semicolons() {
     assert!(sperr("throw\ne").contains("newline after `throw`"));
     // Missing separator without a newline is an error.
     assert!(sperr("a b").contains("semicolon"));
+}
+
+// === functions & arrows =================================================
+
+#[test]
+fn function_declarations() {
+    assert_eq!(prog("function f() {}"), "(fn f () (block ))");
+    assert_eq!(
+        prog("function add(a, b) { return a + b; }"),
+        "(fn add (a b) (block (return (+ a b))))"
+    );
+    assert_eq!(prog("function* g() {}"), "(fn* g () (block ))");
+    assert_eq!(prog("async function h() {}"), "(async-fn h () (block ))");
+    assert!(sperr("function () {}").contains("requires a name"));
+}
+
+#[test]
+fn parameters() {
+    assert_eq!(
+        prog("function f(a, b = 1, ...rest) {}"),
+        "(fn f (a b=1 ...rest) (block ))"
+    );
+    // `async\nfunction` is `async;` then a function declaration (ASI).
+    assert_eq!(
+        prog("async\nfunction f() {}"),
+        "(expr async) (fn f () (block ))"
+    );
+}
+
+#[test]
+fn function_expressions() {
+    assert_eq!(
+        prog("let f = function () {};"),
+        "(let (f (fn  () (block ))))"
+    );
+    assert_eq!(
+        prog("let f = function named(x) { return x; };"),
+        "(let (f (fn named (x) (block (return x)))))"
+    );
+    assert_eq!(
+        prog("(async function () {})"),
+        "(expr (async-fn  () (block )))"
+    );
+}
+
+#[test]
+fn arrow_functions() {
+    assert_eq!(sx("x => x + 1"), "(arrow (x) (+ x 1))");
+    assert_eq!(sx("() => 1"), "(arrow () 1)");
+    assert_eq!(sx("(a, b) => a * b"), "(arrow (a b) (* a b))");
+    assert_eq!(sx("(a, b = 2) => a"), "(arrow (a b=2) a)");
+    assert_eq!(sx("(...xs) => xs"), "(arrow (...xs) xs)");
+    assert_eq!(sx("x => { return x; }"), "(arrow (x) (block (return x)))");
+    assert_eq!(sx("async x => x"), "(async-arrow (x) x)");
+    assert_eq!(sx("async (a) => a"), "(async-arrow (a) a)");
+}
+
+#[test]
+fn arrow_cover_grammar() {
+    // Parenthesized expression vs. arrow params — only `=>` makes it an arrow.
+    assert_eq!(sx("(a + b) * c"), "(* (+ a b) c)");
+    assert_eq!(sx("(a)"), "a");
+    // Nested / right-associative arrows.
+    assert_eq!(sx("a => b => a + b"), "(arrow (a) (arrow (b) (+ a b)))");
+    // Arrow as a call argument.
+    assert_eq!(sx("f(x => x, 1)"), "(call f (arrow (x) x) 1)");
+    // Arrow as a conditional branch.
+    assert_eq!(
+        sx("c ? x => x : y => y"),
+        "(?: c (arrow (x) x) (arrow (y) y))"
+    );
+}
+
+#[test]
+fn iife() {
+    assert_eq!(
+        prog("(function () { return 1; })();"),
+        "(expr (call (fn  () (block (return 1)))))"
+    );
+    assert_eq!(prog("(() => 1)();"), "(expr (call (arrow () 1)))");
 }

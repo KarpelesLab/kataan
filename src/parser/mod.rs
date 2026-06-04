@@ -10,6 +10,7 @@
 //! `Vec<Token>` with O(1) lookahead. Literal values are decoded by [`cook`].
 
 mod cook;
+mod function;
 mod stmt;
 
 #[cfg(test)]
@@ -79,6 +80,14 @@ impl<'src> Parser<'src> {
         self.tokens
             .get(self.pos + n)
             .map_or(TokenKind::Eof, |t| t.kind)
+    }
+
+    /// Whether the token `n` positions ahead is preceded by a line terminator.
+    #[inline]
+    fn nth_newline(&self, n: usize) -> bool {
+        self.tokens
+            .get(self.pos + n)
+            .is_some_and(|t| t.newline_before)
     }
 
     #[inline]
@@ -159,9 +168,12 @@ impl<'src> Parser<'src> {
         Ok(Expr::Sequence { expressions, span })
     }
 
-    /// `AssignmentExpression` — handles `=` and the compound assignments
-    /// (right-associative).
+    /// `AssignmentExpression` — handles arrow functions (via cover-grammar
+    /// lookahead), `=`, and the compound assignments (right-associative).
     fn parse_assignment(&mut self) -> Result<Expr> {
+        if self.at_arrow_head() {
+            return self.parse_arrow();
+        }
         let left = self.parse_conditional()?;
         let Some(op) = assign_op(self.peek()) else {
             return Ok(left);
@@ -713,6 +725,15 @@ impl<'src> Parser<'src> {
                 self.bump();
                 Ok(Expr::Ident(Ident::new(tok.text(self.source), tok.span)))
             }
+            // `async function …` is a function expression. This must precede the
+            // contextual-keyword arm below, which would otherwise treat `async`
+            // as a plain identifier reference.
+            TokenKind::Keyword(Kw::Async)
+                if self.nth_kind(1) == TokenKind::Keyword(Kw::Function) && !self.nth_newline(1) =>
+            {
+                self.bump(); // `async`
+                self.parse_function_expr(true, tok.span)
+            }
             TokenKind::Keyword(kw) if kw.is_contextual() => {
                 self.bump();
                 Ok(Expr::Ident(Ident::new(kw.as_str(), tok.span)))
@@ -720,8 +741,9 @@ impl<'src> Parser<'src> {
             TokenKind::LParen => self.parse_paren(),
             TokenKind::LBracket => self.parse_array(),
             TokenKind::LBrace => self.parse_object(),
-            TokenKind::Keyword(Kw::Function) | TokenKind::Keyword(Kw::Class) => {
-                Err(self.err("function and class expressions are added in a later increment"))
+            TokenKind::Keyword(Kw::Function) => self.parse_function_expr(false, tok.span),
+            TokenKind::Keyword(Kw::Class) => {
+                Err(self.err("class expressions are added in a later increment"))
             }
             _ => Err(self.err(format!("unexpected token {:?}", tok.kind))),
         }

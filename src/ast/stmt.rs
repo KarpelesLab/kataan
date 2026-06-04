@@ -1,6 +1,6 @@
 //! Statement, declaration, and program nodes.
 
-use super::{Expr, Ident};
+use super::{Expr, Function, Ident};
 use crate::common::Span;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -119,6 +119,8 @@ pub enum Stmt {
         body: Box<Stmt>,
         span: Span,
     },
+    /// A function declaration: `function f() { … }`.
+    Function(Function),
 }
 
 impl Stmt {
@@ -145,6 +147,7 @@ impl Stmt {
             | Stmt::Debugger { span }
             | Stmt::With { span, .. } => *span,
             Stmt::Var(decl) => decl.span,
+            Stmt::Function(f) => f.span,
         }
     }
 }

@@ -72,8 +72,11 @@ impl<'src> Parser<'src> {
                 Ok(Stmt::Debugger { span })
             }
             TokenKind::Keyword(Kw::With) => self.parse_with(),
-            TokenKind::Keyword(Kw::Function) => {
-                Err(self.err("function declarations are added in a later increment"))
+            TokenKind::Keyword(Kw::Function) => self.parse_function_declaration(),
+            TokenKind::Keyword(Kw::Async)
+                if self.nth_kind(1) == TokenKind::Keyword(Kw::Function) && !self.nth_newline(1) =>
+            {
+                self.parse_function_declaration()
             }
             TokenKind::Keyword(Kw::Class) => {
                 Err(self.err("class declarations are added in a later increment"))
@@ -103,8 +106,8 @@ impl<'src> Parser<'src> {
     }
 
     /// Parses a brace-delimited block and returns just its statement list (for
-    /// `try`/`catch`/`finally` bodies).
-    fn parse_block_body(&mut self) -> Result<Vec<Stmt>> {
+    /// `try`/`catch`/`finally` and function bodies).
+    pub(super) fn parse_block_body(&mut self) -> Result<Vec<Stmt>> {
         self.expect(TokenKind::LBrace)?;
         let body = self.parse_statement_list(TokenKind::RBrace)?;
         self.expect(TokenKind::RBrace)?;
@@ -194,7 +197,7 @@ impl<'src> Parser<'src> {
     }
 
     /// A binding name. Array/object destructuring patterns are deferred.
-    fn parse_binding_target(&mut self) -> Result<BindingTarget> {
+    pub(super) fn parse_binding_target(&mut self) -> Result<BindingTarget> {
         let tok = self.peek_tok();
         match tok.kind {
             TokenKind::Identifier => {
