@@ -489,8 +489,28 @@ impl<'a> Interp<'a> {
                 NanBox::undefined()
             }
             N_JSON_STRINGIFY => {
-                // Optional `space`: a number → that many spaces, a string → that
-                // string (both capped at 10), else compact output.
+                // Optional `replacer` (arg 1): a function transforms each value,
+                // an array allowlists object keys.
+                let mut value = arg(0);
+                if let Some(rh) = arg(1).as_handle().map(Handle::from_raw) {
+                    if self.is_callable(rh) {
+                        let holder = self.realm.new_object();
+                        self.realm.set_property(holder, "", value);
+                        value = self.json_apply_replacer(holder, "", value, arg(1))?;
+                    } else if self.realm.is_array(rh) {
+                        let allow: Vec<String> = self
+                            .realm
+                            .array_elements(rh)
+                            .map(<[_]>::to_vec)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|e| self.realm.to_display_string(*e))
+                            .collect();
+                        value = self.json_filter_keys(value, &allow);
+                    }
+                }
+                // Optional `space` (arg 2): a number → that many spaces, a string
+                // → that string (both capped at 10), else compact output.
                 let space = arg(2);
                 let indent = if let Some(n) = space.as_number() {
                     " ".repeat((n.max(0.0) as usize).min(10))
@@ -503,9 +523,9 @@ impl<'a> Interp<'a> {
                     String::new()
                 };
                 let result = if indent.is_empty() {
-                    self.json_stringify(arg(0))
+                    self.json_stringify(value)
                 } else {
-                    crate::json::stringify_pretty(&self.realm, arg(0), &indent)
+                    crate::json::stringify_pretty(&self.realm, value, &indent)
                 };
                 match result {
                     Some(s) => NanBox::handle(self.realm.new_string(&s).to_raw()),
@@ -907,6 +927,88 @@ impl<'a> Interp<'a> {
         }
         let kb = self.new_str(key);
         self.call_with_this(reviver, NanBox::handle(holder.to_raw()), &[kb, value])
+    }
+
+    /// `JSON.stringify` function replacer: returns a fresh value tree where each
+    /// node is `replacer.call(holder, key, value)`, recursing into the result's
+    /// own properties/elements (does not mutate the input).
+    fn json_apply_replacer(
+        &mut self,
+        holder: crate::heap::Handle,
+        key: &str,
+        value: NanBox,
+        replacer: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let kb = self.new_str(key);
+        let v = self.call_with_this(replacer, NanBox::handle(holder.to_raw()), &[kb, value])?;
+        if let Some(vh) = v.as_handle().map(Handle::from_raw) {
+            if self.realm.is_array(vh) {
+                let elems = self
+                    .realm
+                    .array_elements(vh)
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default();
+                let mut out = Vec::with_capacity(elems.len());
+                for (i, e) in elems.iter().enumerate() {
+                    let ks = alloc::format!("{i}");
+                    out.push(self.json_apply_replacer(vh, &ks, *e, replacer)?);
+                }
+                return Ok(NanBox::handle(self.realm.new_array(out).to_raw()));
+            }
+            if self.realm.string_value(vh).is_none()
+                && let Some(keys) = self.realm.object_keys(vh)
+            {
+                let no = self.realm.new_object();
+                for k in keys {
+                    let pv = self
+                        .realm
+                        .get_property(vh, &k)
+                        .unwrap_or(NanBox::undefined());
+                    let nv = self.json_apply_replacer(vh, &k, pv, replacer)?;
+                    if !matches!(nv.unpack(), Unpacked::Undefined) {
+                        self.realm.set_property(no, &k, nv);
+                    }
+                }
+                return Ok(NanBox::handle(no.to_raw()));
+            }
+        }
+        Ok(v)
+    }
+
+    /// `JSON.stringify` array replacer: a fresh value tree keeping only object
+    /// properties whose key is in `allow` (array elements are always kept).
+    fn json_filter_keys(&mut self, value: NanBox, allow: &[String]) -> NanBox {
+        if let Some(vh) = value.as_handle().map(Handle::from_raw) {
+            if self.realm.is_array(vh) {
+                let elems = self
+                    .realm
+                    .array_elements(vh)
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default();
+                let out: Vec<NanBox> = elems
+                    .iter()
+                    .map(|e| self.json_filter_keys(*e, allow))
+                    .collect();
+                return NanBox::handle(self.realm.new_array(out).to_raw());
+            }
+            if self.realm.string_value(vh).is_none()
+                && let Some(keys) = self.realm.object_keys(vh)
+            {
+                let no = self.realm.new_object();
+                for k in keys {
+                    if allow.iter().any(|a| a == &k) {
+                        let pv = self
+                            .realm
+                            .get_property(vh, &k)
+                            .unwrap_or(NanBox::undefined());
+                        let nv = self.json_filter_keys(pv, allow);
+                        self.realm.set_property(no, &k, nv);
+                    }
+                }
+                return NanBox::handle(no.to_raw());
+            }
+        }
+        value
     }
 
     fn json_parse(&mut self, c: &[char], pos: &mut usize) -> Result<NanBox, ExecError> {
@@ -5532,6 +5634,28 @@ mod tests {
         let mut interp = Interp::new();
         interp.run(&program).unwrap();
         assert_eq!(interp.output(), "hi 42\narr: 1,2\n");
+    }
+
+    #[test]
+    fn json_stringify_replacer() {
+        // Function replacer: omit keys and transform values (recursively).
+        assert_eq!(
+            run("JSON.stringify({a:1,b:2}, function(k,v){ return k==='b'?undefined:v; })"),
+            "{\"a\":1}"
+        );
+        assert_eq!(
+            run("JSON.stringify({x:{n:1}}, function(k,v){ return typeof v==='number'?v+5:v; })"),
+            "{\"x\":{\"n\":6}}"
+        );
+        // Array replacer: an allowlist applied at every level.
+        assert_eq!(
+            run("JSON.stringify({a:1,b:2,c:3}, ['a','c'])"),
+            "{\"a\":1,\"c\":3}"
+        );
+        assert_eq!(
+            run("JSON.stringify({keep:{a:1,b:2},drop:9}, ['keep','a'])"),
+            "{\"keep\":{\"a\":1}}"
+        );
     }
 
     #[test]
