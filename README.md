@@ -13,18 +13,20 @@ tri-modal model proven out in the sibling projects
 > destructuring, getters/setters, `Map`/`Set`, error handling, an in-house
 > `RegExp` engine, `Date`, `Promise` with a microtask queue, and a basic event
 > loop (`setTimeout`), plus a substantial standard library (Math, JSON,
-> Object/Array/String/Number). A **register bytecode VM** compiles and runs
-> nearly all of the common language directly — every operator (incl.
-> `++`/`--`/`typeof`/`delete`/spread), objects/arrays, method calls with
-> `call`/`apply`/`bind`, `new`, all loops + `for-of`/`for-in`/`switch`/
-> `try`-`catch`, functions/recursion, **closures** that capture enclosing
-> variables, destructuring (incl. rest), and rest/spread arguments — and falls
-> back to the tree-walker only for what it doesn't yet compile (classes,
-> generators, `finally`). Run it with `kataan bcrun`; compiled bytecode can be
-> serialized, reloaded, and run without the source, and a dual-path conformance
-> suite checks both execution paths agree. Kataan works as a CLI/REPL, a Rust
-> library, and a C library (`kt_eval`). The performance-oriented object model
-> (NaN-boxing, hidden classes, GC), JIT tiers, the full host runtime, and the
+> Object/Array/String/Number). A **register bytecode VM** is now the primary
+> execution path (`kataan run` and the C ABI), compiling nearly all of the
+> common language directly — every operator (incl. `++`/`--`/`typeof`/`delete`/
+> spread), objects/arrays, method calls with `call`/`apply`/`bind`, `new`, all
+> loops + `for-of`/`for-in`/`switch`/`try`-`catch`-`finally`,
+> functions/recursion, **closures** (incl. recursive and mutually-recursive),
+> destructuring (incl. rest), rest/spread arguments, and **classes** with
+> `extends`/`super` inheritance and getters/setters — and falls back to the
+> tree-walker only for what it doesn't yet compile (generators, `async`). Compiled
+> bytecode can be serialized, reloaded, and run without the source, and a
+> dual-path conformance suite checks both execution paths agree. Kataan works as
+> a CLI/REPL, a Rust library, and a C library (`kt_eval`). The
+> performance-oriented object model (NaN-boxing, hidden classes, GC), JIT tiers,
+> the full host runtime, and the
 > WASM engine are being built out per the [roadmap](ROADMAP.md). Generators and
 > `async`/`await` await the VM's suspendable frames.
 
