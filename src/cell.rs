@@ -21,7 +21,42 @@ use crate::heap::Handle;
 use crate::nanbox::NanBox;
 use crate::object::Object;
 use crate::rope::Rope;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
+
+/// A `Promise`'s settlement status.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PromiseStatus {
+    /// Not yet settled.
+    Pending,
+    /// Settled with a value.
+    Fulfilled,
+    /// Settled with a reason.
+    Rejected,
+}
+
+/// A `then` reaction: the handlers to run on settlement and the dependent
+/// promise to settle with their result.
+pub struct Reaction {
+    /// Called on fulfillment (`undefined` to pass through).
+    pub on_fulfilled: NanBox,
+    /// Called on rejection (`undefined` to pass through).
+    pub on_rejected: NanBox,
+    /// The promise produced by `then`, settled with the handler's result.
+    pub result: Handle,
+}
+
+/// A `Promise`'s internal state, shared (`Rc`) between the promise and its
+/// resolve/reject functions.
+pub struct PromiseState {
+    /// The settlement status.
+    pub status: PromiseStatus,
+    /// The fulfillment value or rejection reason.
+    pub value: NanBox,
+    /// Reactions registered while pending, drained on settlement.
+    pub reactions: Vec<Reaction>,
+}
 
 /// A heap-allocated reference value.
 pub enum Cell {
@@ -42,6 +77,16 @@ pub enum Cell {
     /// A built-in (native) function, identified by an id the interpreter maps to
     /// a Rust implementation.
     Native(u16),
+    /// A native function bound to a heap value (e.g. a promise's resolve/reject,
+    /// which carry the promise they settle).
+    BoundNative {
+        /// The built-in id.
+        id: u16,
+        /// The bound receiver (e.g. the promise to settle).
+        target: Handle,
+    },
+    /// A `Promise` (its shared settlement state).
+    Promise(Rc<RefCell<PromiseState>>),
     /// A class constructor: an index into the interpreter's class table plus the
     /// scope it was defined in.
     Class {
@@ -123,6 +168,24 @@ impl Cell {
         }
     }
 
+    /// The `(id, target)` if this cell is a bound native function.
+    #[must_use]
+    pub fn as_bound_native(&self) -> Option<(u16, Handle)> {
+        match self {
+            Cell::BoundNative { id, target } => Some((*id, *target)),
+            _ => None,
+        }
+    }
+
+    /// The shared promise state, if this cell is a promise.
+    #[must_use]
+    pub fn as_promise(&self) -> Option<&Rc<RefCell<PromiseState>>> {
+        match self {
+            Cell::Promise(p) => Some(p),
+            _ => None,
+        }
+    }
+
     /// The `(class_id, captured env)`, if this cell is a class.
     #[must_use]
     pub fn as_class(&self) -> Option<(u32, &Scope)> {
@@ -156,8 +219,13 @@ impl Cell {
     pub fn type_of(&self) -> &'static str {
         match self {
             Cell::Str(_) => "string",
-            Cell::Function { .. } | Cell::Native(_) | Cell::Class { .. } => "function",
-            Cell::Object(_) | Cell::Array(_) | Cell::Collection { .. } => "object",
+            Cell::Function { .. }
+            | Cell::Native(_)
+            | Cell::BoundNative { .. }
+            | Cell::Class { .. } => "function",
+            Cell::Object(_) | Cell::Array(_) | Cell::Collection { .. } | Cell::Promise(_) => {
+                "object"
+            }
         }
     }
 }
@@ -186,6 +254,23 @@ impl Trace for Cell {
                     }
                 }
             }
+            // A promise keeps its value and reaction handlers reachable.
+            Cell::Promise(p) => {
+                let s = p.borrow();
+                if let Some(raw) = s.value.as_handle() {
+                    visit(Handle::from_raw(raw));
+                }
+                for r in &s.reactions {
+                    for h in [r.on_fulfilled, r.on_rejected] {
+                        if let Some(raw) = h.as_handle() {
+                            visit(Handle::from_raw(raw));
+                        }
+                    }
+                    visit(r.result);
+                }
+            }
+            // A bound native keeps its target reachable.
+            Cell::BoundNative { target, .. } => visit(*target),
             // Strings and native functions reference no handles.
             Cell::Str(_) | Cell::Native(_) => {}
         }

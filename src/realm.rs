@@ -185,6 +185,38 @@ impl Realm {
         self.heap.get(handle)?.as_native()
     }
 
+    /// The `(id, target)` of a bound native at `handle`.
+    #[must_use]
+    pub fn bound_native_at(&self, handle: Handle) -> Option<(u16, Handle)> {
+        self.heap.get(handle)?.as_bound_native()
+    }
+
+    /// Allocates a bound native function (e.g. a promise resolve/reject).
+    pub fn new_bound_native(&mut self, id: u16, target: Handle) -> Handle {
+        self.heap.alloc(Cell::BoundNative { id, target })
+    }
+
+    /// Allocates a pending `Promise`.
+    pub fn new_promise(&mut self) -> Handle {
+        self.heap
+            .alloc(Cell::Promise(alloc::rc::Rc::new(core::cell::RefCell::new(
+                crate::cell::PromiseState {
+                    status: crate::cell::PromiseStatus::Pending,
+                    value: NanBox::undefined(),
+                    reactions: alloc::vec::Vec::new(),
+                },
+            ))))
+    }
+
+    /// The shared promise state at `handle`, if it is a promise.
+    #[must_use]
+    pub fn promise_state(
+        &self,
+        handle: Handle,
+    ) -> Option<alloc::rc::Rc<core::cell::RefCell<crate::cell::PromiseState>>> {
+        self.heap.get(handle)?.as_promise().cloned()
+    }
+
     /// The string at `handle` as a `String`, or `None` if it is not a string
     /// (or the handle is stale).
     #[must_use]
@@ -382,6 +414,8 @@ impl Realm {
                         "[object Map]".into()
                     }
                 }
+                Some(Cell::BoundNative { .. }) => "function () { … }".into(),
+                Some(Cell::Promise(_)) => "[object Promise]".into(),
                 None => "undefined".into(), // stale handle
             },
         }

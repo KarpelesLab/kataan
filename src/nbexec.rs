@@ -88,8 +88,20 @@ pub struct Interp<'a> {
     this_val: NanBox,
     /// The superclass to invoke for `super(...)` inside the running constructor.
     pending_super: Option<(u32, Scope)>,
+    /// The promise-reaction microtask queue, drained after the script.
+    microtasks: Vec<Job>,
     /// Captured `console.log` output (a line per call).
     output: String,
+}
+
+/// A queued promise reaction: run `handler` with `value`, then settle `result`
+/// with the outcome (or pass `value` through with the source status when
+/// `handler` is `undefined`).
+struct Job {
+    handler: NanBox,
+    value: NanBox,
+    result: Handle,
+    fulfilled: bool,
 }
 
 impl Default for Interp<'_> {
@@ -121,6 +133,10 @@ const N_OBJECT_ASSIGN: u16 = 18;
 const N_OBJECT_ENTRIES: u16 = 19;
 const N_ARRAY_FROM: u16 = 20;
 const N_ARRAY_OF: u16 = 21;
+const N_PROMISE: u16 = 22;
+// Bound natives (carry a target promise handle):
+const N_RESOLVE: u16 = 100;
+const N_REJECT: u16 = 101;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib.
@@ -133,6 +149,7 @@ impl<'a> Interp<'a> {
             classes: Vec::new(),
             this_val: NanBox::undefined(),
             pending_super: None,
+            microtasks: Vec::new(),
             output: String::new(),
         };
         interp.install_globals();
@@ -174,6 +191,11 @@ impl<'a> Interp<'a> {
             ],
         );
         install_namespace(self, "console", &[("log", N_CONSOLE_LOG)]);
+        // `Promise` is a native constructor (`new Promise(executor)`); its
+        // `.resolve`/`.reject` statics are dispatched in `call_method`.
+        let promise_ctor = self.realm.new_native(N_PROMISE);
+        self.current
+            .declare("Promise", NanBox::handle(promise_ctor.to_raw()));
         install_namespace(self, "JSON", &[("stringify", N_JSON_STRINGIFY)]);
         install_namespace(
             self,
@@ -420,10 +442,15 @@ impl<'a> Interp<'a> {
         for stmt in &program.body {
             match self.exec(stmt)? {
                 Flow::Normal(v) => last = v,
-                Flow::Return(v) => return Ok(v),
+                Flow::Return(v) => {
+                    self.drain_microtasks()?;
+                    return Ok(v);
+                }
                 Flow::Break | Flow::Continue => {}
             }
         }
+        // Drain the promise microtask queue (the event loop) before returning.
+        self.drain_microtasks()?;
         Ok(last)
     }
 
@@ -458,6 +485,130 @@ impl<'a> Interp<'a> {
         self.call_with_this(callee, NanBox::undefined(), args)
     }
 
+    // --- promises ---
+
+    /// Settles the promise at `handle` (no-op if already settled), queuing its
+    /// reactions as microtasks.
+    fn settle(&mut self, handle: Handle, value: NanBox, fulfilled: bool) {
+        use crate::cell::PromiseStatus::{Fulfilled, Pending, Rejected};
+        let Some(state) = self.realm.promise_state(handle) else {
+            return;
+        };
+        let reactions = {
+            let mut s = state.borrow_mut();
+            if s.status != Pending {
+                return;
+            }
+            s.status = if fulfilled { Fulfilled } else { Rejected };
+            s.value = value;
+            core::mem::take(&mut s.reactions)
+        };
+        for r in reactions {
+            let handler = if fulfilled {
+                r.on_fulfilled
+            } else {
+                r.on_rejected
+            };
+            self.microtasks.push(Job {
+                handler,
+                value,
+                result: r.result,
+                fulfilled,
+            });
+        }
+    }
+
+    /// Resolves `handle` with `value`, adopting it if `value` is itself a
+    /// promise (chain on its settlement).
+    fn resolve_with(&mut self, handle: Handle, value: NanBox) {
+        let inner = value
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|h| self.realm.promise_state(*h).is_some());
+        if let Some(inner) = inner {
+            // Adopt: when `inner` settles, settle `handle` the same way.
+            let on_f = self.realm.new_bound_native(N_RESOLVE, handle);
+            let on_r = self.realm.new_bound_native(N_REJECT, handle);
+            self.register_then(
+                inner,
+                NanBox::handle(on_f.to_raw()),
+                NanBox::handle(on_r.to_raw()),
+            );
+        } else {
+            self.settle(handle, value, true);
+        }
+    }
+
+    /// Registers `then` reactions on `handle`, returning a new dependent promise.
+    fn promise_then(&mut self, handle: Handle, on_f: NanBox, on_r: NanBox) -> NanBox {
+        let result = self.register_then(handle, on_f, on_r);
+        NanBox::handle(result.to_raw())
+    }
+
+    fn register_then(&mut self, handle: Handle, on_f: NanBox, on_r: NanBox) -> Handle {
+        use crate::cell::PromiseStatus::{Fulfilled, Pending};
+        let result = self.realm.new_promise();
+        let state = self.realm.promise_state(handle).expect("a promise");
+        let settled = {
+            let s = state.borrow();
+            match s.status {
+                Pending => None,
+                status => Some((status == Fulfilled, s.value)),
+            }
+        };
+        match settled {
+            None => state.borrow_mut().reactions.push(crate::cell::Reaction {
+                on_fulfilled: on_f,
+                on_rejected: on_r,
+                result,
+            }),
+            Some((fulfilled, value)) => {
+                let handler = if fulfilled { on_f } else { on_r };
+                self.microtasks.push(Job {
+                    handler,
+                    value,
+                    result,
+                    fulfilled,
+                });
+            }
+        }
+        result
+    }
+
+    /// Drains the microtask queue (the event loop), running each promise
+    /// reaction to completion.
+    fn drain_microtasks(&mut self) -> Result<(), ExecError> {
+        while !self.microtasks.is_empty() {
+            let job = self.microtasks.remove(0);
+            if job
+                .handler
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|h| self.is_callable(h))
+            {
+                match self.call(job.handler, &[job.value]) {
+                    Ok(v) => self.resolve_with(job.result, v),
+                    Err(ExecError::Throw(e)) => self.settle(job.result, e, false),
+                    Err(other) => return Err(other),
+                }
+            } else {
+                // Passthrough: settle with the same status/value.
+                if job.fulfilled {
+                    self.resolve_with(job.result, job.value);
+                } else {
+                    self.settle(job.result, job.value, false);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_callable(&self, handle: Handle) -> bool {
+        self.realm.native_at(handle).is_some()
+            || self.realm.function_at(handle).is_some()
+            || self.realm.bound_native_at(handle).is_some()
+    }
+
     /// Calls `callee` with an explicit `this` (a method receiver, or `undefined`
     /// for a plain call).
     fn call_with_this(
@@ -473,6 +624,16 @@ impl<'a> Interp<'a> {
         // A built-in function dispatches directly.
         if let Some(id) = self.realm.native_at(handle) {
             return self.call_native(id, args);
+        }
+        // A bound native (promise resolve/reject) carries its target.
+        if let Some((id, target)) = self.realm.bound_native_at(handle) {
+            let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
+            match id {
+                N_RESOLVE => self.resolve_with(target, arg0),
+                N_REJECT => self.settle(target, arg0, false),
+                _ => {}
+            }
+            return Ok(NanBox::undefined());
         }
         let Some((func_id, captured)) = self.realm.function_at(handle) else {
             return Err(ExecError::NotCallable);
@@ -521,6 +682,26 @@ impl<'a> Interp<'a> {
             .realm
             .native_at(handle)
             .ok_or(ExecError::Unsupported("new on this value"))?;
+        // `new Promise(executor)`: run executor(resolve, reject).
+        if id == N_PROMISE {
+            let promise = self.realm.new_promise();
+            let resolve = self.realm.new_bound_native(N_RESOLVE, promise);
+            let reject = self.realm.new_bound_native(N_REJECT, promise);
+            let executor = args.first().copied().unwrap_or(NanBox::undefined());
+            let r = self.call(
+                executor,
+                &[
+                    NanBox::handle(resolve.to_raw()),
+                    NanBox::handle(reject.to_raw()),
+                ],
+            );
+            if let Err(ExecError::Throw(e)) = r {
+                self.settle(promise, e, false);
+            } else {
+                r?;
+            }
+            return Ok(NanBox::handle(promise.to_raw()));
+        }
         let is_set = match id {
             N_SET => true,
             N_MAP => false,
@@ -730,6 +911,38 @@ impl<'a> Interp<'a> {
             return Ok(None);
         };
         let handle = Handle::from_raw(raw);
+
+        // --- `Promise.resolve` / `Promise.reject` statics (on the constructor) ---
+        if self.realm.native_at(handle) == Some(N_PROMISE) {
+            match method {
+                "resolve" => {
+                    let p = self.realm.new_promise();
+                    self.resolve_with(p, arg(0));
+                    return Ok(Some(NanBox::handle(p.to_raw())));
+                }
+                "reject" => {
+                    let p = self.realm.new_promise();
+                    self.settle(p, arg(0), false);
+                    return Ok(Some(NanBox::handle(p.to_raw())));
+                }
+                _ => {}
+            }
+        }
+        // --- promise instance methods (`then`/`catch`/`finally`) ---
+        if self.realm.promise_state(handle).is_some() {
+            match method {
+                "then" => return Ok(Some(self.promise_then(handle, arg(0), arg(1)))),
+                "catch" => {
+                    return Ok(Some(self.promise_then(handle, NanBox::undefined(), arg(0))));
+                }
+                "finally" => {
+                    // Simplified: run the callback on either settlement, passing
+                    // the value through.
+                    return Ok(Some(self.promise_then(handle, arg(0), arg(0))));
+                }
+                _ => {}
+            }
+        }
 
         // --- string methods ---
         if let Some(s) = self.realm.string_value(handle) {
@@ -2099,6 +2312,53 @@ mod tests {
     fn number_tofixed() {
         assert_eq!(run("(3.14159).toFixed(2)"), "3.14");
         assert_eq!(run("(1).toFixed(3)"), "1.000");
+    }
+
+    #[test]
+    fn promises_and_microtasks() {
+        // The `then` reactions run on the microtask queue, drained after the
+        // script — observed via captured `console.log` output.
+        let out = |src: &str| {
+            let program = Parser::parse_program(src).expect("parse");
+            let mut interp = Interp::new();
+            interp.run(&program).expect("exec");
+            String::from(interp.output())
+        };
+        // then runs after the synchronous code.
+        assert_eq!(
+            out("console.log('sync');
+                 Promise.resolve(42).then(v => console.log('got:' + v));"),
+            "sync\ngot:42\n"
+        );
+        // Chaining transforms the value through each then.
+        assert_eq!(
+            out("Promise.resolve(1).then(v => v + 1).then(v => v * 10).then(v => console.log(v));"),
+            "20\n"
+        );
+        // catch handles a rejection.
+        assert_eq!(
+            out("Promise.reject('boom').catch(e => console.log('caught:' + e));"),
+            "caught:boom\n"
+        );
+        // A throw in a then handler rejects the chain to the next catch.
+        assert_eq!(
+            out(
+                "Promise.resolve(1).then(() => { throw 'x'; }).catch(e => console.log('rej:' + e));"
+            ),
+            "rej:x\n"
+        );
+        // `new Promise(executor)` with resolve.
+        assert_eq!(
+            out("new Promise((resolve) => { resolve(7); }).then(v => console.log(v));"),
+            "7\n"
+        );
+        // Adoption: resolving with a promise chains its value.
+        assert_eq!(
+            out("Promise.resolve(Promise.resolve(99)).then(v => console.log(v));"),
+            "99\n"
+        );
+        // typeof a promise is object.
+        assert_eq!(run("typeof Promise.resolve(1)"), "object");
     }
 
     #[test]
