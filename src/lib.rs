@@ -40,6 +40,11 @@ pub mod error;
 pub mod lexer;
 pub mod parser;
 
+/// The in-house regular-expression engine (the `regex` feature). Pure Rust,
+/// `no_std`-compatible (`alloc` only).
+#[cfg(feature = "regex")]
+pub mod regex;
+
 /// The tree-walking interpreter (Phase-C semantics MVP). Gated on `std` for
 /// now because it uses floating-point math routines (`powf`, `trunc`, …) that
 /// live in the standard library; the float-math dependency will be revisited

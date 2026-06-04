@@ -367,8 +367,13 @@ Each line becomes one or more `builtins/` modules with Test262-driven tests.
 - **String** + `String.prototype.*` (full method set incl. `matchAll`,
   `replaceAll`, `normalize`, `localeCompare`, `at`, well-formed Unicode
   methods), `String.raw`, template support.
-- **RegExp**: in-house engine (`regex/`) — Unicode mode, named groups,
-  lookbehind, the `d`/`v` flags, sticky/global state, `Symbol.replace` et al.
+- **RegExp**: in-house engine (`regex/`). **A first version is implemented** —
+  a backtracking VM (parser → instruction list → executor) covering literals,
+  `.`, character classes/ranges + `\d\w\s`, anchors, `\b\B`, capturing and
+  non-capturing groups, alternation, greedy/lazy `* + ? {n,m}`, the `i`/`m`/`s`
+  flags, and `replace` with `$&`/`$1`. **Next:** Unicode mode, named groups,
+  lookaround, the `d`/`v` flags, sticky/global state, and `Symbol.replace` —
+  plus wiring it to the `RegExp` builtin and the String methods.
 - **Array** + `Array.prototype.*` (full set incl. `flat`/`flatMap`,
   `at`, `findLast`/`findLastIndex`, the `toSorted`/`toReversed`/`toSpliced`/
   `with` copying methods, `group`*), `Array.from`/`of`/`isArray`. Fast packed
