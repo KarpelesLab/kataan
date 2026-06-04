@@ -10,8 +10,9 @@
 //! It lowers `let`/assignment locals (incl. compound `+=`/`-=`/`*=`/`/=` and
 //! `++`/`--`), arithmetic, `%`, comparisons, `Math.*`, ternaries, `if`/`else`,
 //! `while`/`for`/`do-while` loops (as structured `block`/`loop`/`br_if`, with
-//! `break`/`continue` in `while` loops lowered to the right `br` target), and
-//! function calls — enough for iterative numeric kernels. Both targets are
+//! `break`/`continue` in any loop lowered to the right `br` target — `for`/
+//! `do-while` use an inner `continue`-block so `continue` still runs the update/
+//! re-test), and function calls — enough for iterative numeric kernels. Both
 //! produced: `compile_module` emits WAT text, and `compile_module_binary` emits
 //! a complete `.wasm` binary module (verified to instantiate and run on a real
 //! WebAssembly engine). Engine code, not foreign — pure, safe `alloc`-only Rust.
@@ -239,9 +240,9 @@ fn emit_stmt_ctx(
         }
         // `x = expr;` / `i++;` — a statement-position effect.
         Stmt::Expr { expression, .. } => emit_effect(expression, out, depth),
-        // `for (init; test; update) body` → init, then a `while`-style loop with
-        // the update at the bottom. (`break`/`continue` inside a `for` are not
-        // lowered — the body is emitted with no loop context.)
+        // `for (init; test; update) body` → `block(exit) { loop { test → br_if
+        // exit; block(cont) { body }; update; br loop } }`. The inner `cont`
+        // block lets `continue` (br 0) skip to the update; `break` is br 2.
         Stmt::For {
             init,
             test,
@@ -264,7 +265,9 @@ fn emit_stmt_ctx(
                 None => out.push_str(&format!("{inner2}i32.const 1\n")),
             }
             out.push_str(&format!("{inner2}i32.eqz\n{inner2}br_if 1\n"));
-            emit_stmt_ctx(body, out, depth + 2, None)?;
+            out.push_str(&format!("{inner2}block\n")); // the `continue` target
+            emit_stmt_ctx(body, out, depth + 3, Some((2, 0)))?;
+            out.push_str(&format!("{inner2}end\n"));
             if let Some(u) = update {
                 emit_effect(u, out, depth + 2)?;
             }
@@ -301,14 +304,17 @@ fn emit_stmt_ctx(
             out.push_str(&format!("{inner2}br 0\n{inner}end\n{pad}end\n"));
             Ok(())
         }
-        // `do body while (cond)` → a `loop` that runs the body, then branches
-        // back while the condition holds (no exit block needed).
+        // `do body while (cond)` → `block(exit) { loop { block(cont) { body };
+        // test; br_if loop } }`. `continue` (br 0) falls through to the test;
+        // `break` is br 2.
         Stmt::DoWhile { test, body, .. } => {
             let inner = "  ".repeat(depth + 1);
-            out.push_str(&format!("{pad}loop\n"));
-            emit_stmt_ctx(body, out, depth + 1, None)?;
-            emit_cond(test, out, depth + 1)?;
-            out.push_str(&format!("{inner}br_if 0\n{pad}end\n")); // loop back while cond
+            let inner2 = "  ".repeat(depth + 2);
+            out.push_str(&format!("{pad}block\n{inner}loop\n{inner2}block\n"));
+            emit_stmt_ctx(body, out, depth + 3, Some((2, 0)))?;
+            out.push_str(&format!("{inner2}end\n"));
+            emit_cond(test, out, depth + 2)?;
+            out.push_str(&format!("{inner2}br_if 0\n{inner}end\n{pad}end\n")); // loop back while cond
             Ok(())
         }
         _ => Err(WasmError("statement")),
@@ -806,7 +812,10 @@ fn emit_stmt_bin_ctx(
             out.push(0x45); // i32.eqz
             out.push(0x0d); // br_if
             leb_u(1, out);
-            emit_stmt_bin_ctx(body, locals, fns, out, None)?;
+            out.push(0x02); // block (the `continue` target)
+            out.push(0x40);
+            emit_stmt_bin_ctx(body, locals, fns, out, Some((2, 0)))?;
+            out.push(0x0b); // end continue-block
             if let Some(u) = update {
                 emit_effect_bin(u, locals, fns, out)?;
             }
@@ -850,15 +859,22 @@ fn emit_stmt_bin_ctx(
             out.push(0x0b); // end block
             Ok(())
         }
-        // `do body while (cond)` → a `loop` with a trailing `br_if 0`.
+        // `do body while (cond)` → `block(exit) { loop { block(cont) { body };
+        // test; br_if loop } }`.
         Stmt::DoWhile { test, body, .. } => {
+            out.push(0x02); // block (exit)
+            out.push(0x40);
             out.push(0x03); // loop
             out.push(0x40);
-            emit_stmt_bin_ctx(body, locals, fns, out, None)?;
+            out.push(0x02); // block (continue target)
+            out.push(0x40);
+            emit_stmt_bin_ctx(body, locals, fns, out, Some((2, 0)))?;
+            out.push(0x0b); // end continue-block
             emit_cond_bin(test, locals, fns, out)?;
             out.push(0x0d); // br_if
             leb_u(0, out); // loop back while cond
             out.push(0x0b); // end loop
+            out.push(0x0b); // end block
             Ok(())
         }
         _ => Err(WasmError("statement")),
@@ -1205,6 +1221,17 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_for_break_continue() {
+        // continue must still run the update (i++); break exits the loop.
+        let src = "function f(n) { let s = 0; for (let i = 0; i < n; i++) { if (i === 2) { continue; } if (i === 6) { break; } s += i; } return s; }";
+        let wat = module(src);
+        assert_well_formed(&wat);
+        let wasm = binary(src);
+        section_ids(&wasm);
+        assert!(wasm.contains(&0x0c)); // br present (break/continue)
     }
 
     #[test]
