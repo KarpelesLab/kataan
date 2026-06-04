@@ -92,6 +92,18 @@ impl Realm {
         self.heap.alloc(Cell::Native(id))
     }
 
+    /// Allocates a class value (a class-table index plus its captured scope).
+    pub fn new_class(&mut self, class_id: u32, env: crate::env::Scope) -> Handle {
+        self.heap.alloc(Cell::Class { class_id, env })
+    }
+
+    /// The `(class_id, captured env)` of the class at `handle`, or `None`.
+    #[must_use]
+    pub fn class_at(&self, handle: Handle) -> Option<(u32, crate::env::Scope)> {
+        let (id, env) = self.heap.get(handle)?.as_class()?;
+        Some((id, env.clone()))
+    }
+
     /// Allocates an empty `Map` (`is_set = false`) or `Set` (`is_set = true`).
     pub fn new_collection(&mut self, is_set: bool) -> Handle {
         self.heap.alloc(Cell::Collection {
@@ -360,7 +372,9 @@ impl Realm {
                     parts.join(",")
                 }
                 Some(Cell::Object(_)) => "[object Object]".into(),
-                Some(Cell::Function { .. } | Cell::Native(_)) => "function () { … }".into(),
+                Some(Cell::Function { .. } | Cell::Native(_) | Cell::Class { .. }) => {
+                    "function () { … }".into()
+                }
                 Some(Cell::Collection { is_set, .. }) => {
                     if *is_set {
                         "[object Set]".into()

@@ -24,8 +24,9 @@
 //! remaining migration work. Pure, safe `alloc`-only Rust.
 
 use crate::ast::{
-    Argument, ArrayElement, Arrow, ArrowBody, AssignOp, BinaryOp, BindingTarget, Expr, ForInit,
-    Function, Ident, LogicalOp, ObjectMember, Param, Program, PropertyKey, Stmt, UnaryOp, VarDecl,
+    Argument, ArrayElement, Arrow, ArrowBody, AssignOp, BinaryOp, BindingTarget, Class,
+    ClassMember, Expr, ForInit, Function, Ident, LogicalOp, MethodKind, ObjectMember, Param,
+    Program, PropertyKey, Stmt, UnaryOp, VarDecl,
 };
 use crate::env::Scope;
 use crate::heap::Handle;
@@ -81,6 +82,10 @@ pub struct Interp<'a> {
     current: Scope,
     /// Function-AST table; a closure cell holds an index into this.
     functions: Vec<FnDef<'a>>,
+    /// Class-AST table; a class cell holds an index into this.
+    classes: Vec<&'a Class>,
+    /// The current `this` binding (method/constructor receiver).
+    this_val: NanBox,
     /// Captured `console.log` output (a line per call).
     output: String,
 }
@@ -119,6 +124,8 @@ impl<'a> Interp<'a> {
             realm: Realm::new(),
             current: Scope::root(),
             functions: Vec::new(),
+            classes: Vec::new(),
+            this_val: NanBox::undefined(),
             output: String::new(),
         };
         interp.install_globals();
@@ -374,10 +381,21 @@ impl<'a> Interp<'a> {
 
     /// Calls `callee` with `args`.
     fn call(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        self.call_with_this(callee, NanBox::undefined(), args)
+    }
+
+    /// Calls `callee` with an explicit `this` (a method receiver, or `undefined`
+    /// for a plain call).
+    fn call_with_this(
+        &mut self,
+        callee: NanBox,
+        this_val: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
         let Some(raw) = callee.as_handle() else {
             return Err(ExecError::NotCallable);
         };
-        let handle = crate::heap::Handle::from_raw(raw);
+        let handle = Handle::from_raw(raw);
         // A built-in function dispatches directly.
         if let Some(id) = self.realm.native_at(handle) {
             return self.call_native(id, args);
@@ -386,8 +404,18 @@ impl<'a> Interp<'a> {
             return Err(ExecError::NotCallable);
         };
         let def = self.functions[func_id as usize];
+        self.invoke(def, captured, this_val, args)
+    }
 
-        // A fresh scope nested in the closure's captured environment.
+    /// Runs a function body with `this` and the parameters bound in a fresh
+    /// child of `captured`.
+    fn invoke(
+        &mut self,
+        def: FnDef<'a>,
+        captured: Scope,
+        this_val: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
         let call_scope = captured.child();
         for (i, param) in def.params.iter().enumerate() {
             let BindingTarget::Ident(Ident { name, .. }) = &param.target else {
@@ -396,10 +424,11 @@ impl<'a> Interp<'a> {
             let value = args.get(i).copied().unwrap_or(NanBox::undefined());
             call_scope.declare(name, value);
         }
-
         let saved = core::mem::replace(&mut self.current, call_scope);
+        let saved_this = core::mem::replace(&mut self.this_val, this_val);
         let result = self.run_body(def.body);
         self.current = saved;
+        self.this_val = saved_this;
         result
     }
 
@@ -409,9 +438,14 @@ impl<'a> Interp<'a> {
         let Some(raw) = callee.as_handle() else {
             return Err(ExecError::NotCallable);
         };
+        let handle = Handle::from_raw(raw);
+        // `new UserClass(...)`.
+        if let Some((class_id, env)) = self.realm.class_at(handle) {
+            return self.instantiate(class_id, &env, args);
+        }
         let id = self
             .realm
-            .native_at(Handle::from_raw(raw))
+            .native_at(handle)
             .ok_or(ExecError::Unsupported("new on this value"))?;
         let is_set = match id {
             N_SET => true,
@@ -443,6 +477,83 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(NanBox::handle(handle.to_raw()))
+    }
+
+    /// Registers a class and allocates a class value capturing the current scope.
+    fn make_class(&mut self, class: &'a Class) -> NanBox {
+        let class_id = self.classes.len() as u32;
+        self.classes.push(class);
+        let handle = self.realm.new_class(class_id, self.current.clone());
+        NanBox::handle(handle.to_raw())
+    }
+
+    /// Instantiates `new Class(args)`: creates an object, installs the prototype
+    /// methods as own closures, runs the field initializers and the constructor
+    /// with `this` bound to the instance.
+    fn instantiate(
+        &mut self,
+        class_id: u32,
+        env: &Scope,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let class = self.classes[class_id as usize];
+        let instance = self.realm.new_object();
+        let this_val = NanBox::handle(instance.to_raw());
+
+        // Install instance methods (closures over the class's scope).
+        for member in &class.body {
+            if let ClassMember::Method(m) = member
+                && !m.is_static
+                && m.kind == MethodKind::Method
+            {
+                let key = static_key(&m.key)?;
+                let saved = core::mem::replace(&mut self.current, env.clone());
+                let f = self.make_function(&m.value.params, Body::Block(&m.value.body));
+                self.current = saved;
+                self.realm.set_property(instance, &key, f);
+            }
+        }
+
+        // Run field initializers and the constructor with `this` = instance.
+        let saved_scope = core::mem::replace(&mut self.current, env.child());
+        let saved_this = core::mem::replace(&mut self.this_val, this_val);
+        let result = (|| {
+            for member in &class.body {
+                if let ClassMember::Field(field) = member
+                    && !field.is_static
+                {
+                    let key = static_key(&field.key)?;
+                    let v = match &field.value {
+                        Some(e) => self.eval(e)?,
+                        None => NanBox::undefined(),
+                    };
+                    self.realm.set_property(instance, &key, v);
+                }
+            }
+            if let Some(ctor) = class.body.iter().find_map(|m| match m {
+                ClassMember::Method(m) if m.kind == MethodKind::Constructor => Some(m),
+                _ => None,
+            }) {
+                let scope = self.current.child();
+                for (i, param) in ctor.value.params.iter().enumerate() {
+                    if let BindingTarget::Ident(Ident { name, .. }) = &param.target {
+                        scope.declare(name, args.get(i).copied().unwrap_or(NanBox::undefined()));
+                    }
+                }
+                let saved = core::mem::replace(&mut self.current, scope);
+                for stmt in &ctor.value.body {
+                    if let Flow::Return(_) = self.exec(stmt)? {
+                        break;
+                    }
+                }
+                self.current = saved;
+            }
+            Ok(())
+        })();
+        self.current = saved_scope;
+        self.this_val = saved_this;
+        result?;
+        Ok(this_val)
     }
 
     /// Evaluates a call's arguments.
@@ -833,6 +944,13 @@ impl<'a> Interp<'a> {
             }
             // Function declarations are handled by hoisting; nothing to do here.
             Stmt::Function(_) => Ok(Flow::Normal(NanBox::undefined())),
+            Stmt::Class(class) => {
+                let value = self.make_class(class);
+                if let Some(id) = &class.id {
+                    self.current.declare(&id.name, value);
+                }
+                Ok(Flow::Normal(NanBox::undefined()))
+            }
             Stmt::Block { body, .. } => self.exec_block(body),
             Stmt::If {
                 test,
@@ -1020,8 +1138,10 @@ impl<'a> Interp<'a> {
                     .get(name)
                     .ok_or_else(|| ExecError::NotDefined(String::from(name))),
             },
+            Expr::This(_) => Ok(self.this_val),
             Expr::Function(func) => Ok(self.eval_fn_expr(func)),
             Expr::Arrow(arrow) => Ok(self.eval_arrow(arrow)),
+            Expr::Class(class) => Ok(self.make_class(class)),
             Expr::Unary { op, argument, .. } => {
                 let v = self.eval(argument)?;
                 self.unary(*op, v)
@@ -1087,8 +1207,9 @@ impl<'a> Interp<'a> {
                     let Some(raw) = recv.as_handle() else {
                         return Err(ExecError::NotCallable);
                     };
-                    let f = self.member(crate::heap::Handle::from_raw(raw), property)?;
-                    return self.call(f, &args);
+                    let f = self.member(Handle::from_raw(raw), property)?;
+                    // Method call: `this` is the receiver.
+                    return self.call_with_this(f, recv, &args);
                 }
                 let f = self.eval(callee)?;
                 let args = self.eval_args(arguments)?;
@@ -1692,6 +1813,53 @@ mod tests {
         assert_eq!(run("Math.ceil(3.2)"), "4");
         assert_eq!(run("Math.round(3.5)"), "4");
         assert_eq!(run("Math.sqrt(144)"), "12");
+    }
+
+    #[test]
+    fn classes_and_this() {
+        // A class with a constructor and a method using `this`.
+        assert_eq!(
+            run("class Point {
+                   constructor(x, y) { this.x = x; this.y = y; }
+                   sum() { return this.x + this.y; }
+                 }
+                 let p = new Point(3, 4);
+                 p.sum()"),
+            "7"
+        );
+        // Methods mutate instance state via `this`.
+        assert_eq!(
+            run("class Counter {
+                   constructor() { this.n = 0; }
+                   inc() { this.n += 1; return this.n; }
+                 }
+                 let c = new Counter();
+                 c.inc(); c.inc(); c.inc()"),
+            "3"
+        );
+        // A field initializer.
+        assert_eq!(
+            run("class Box { value = 42; get() { return this.value; } }
+                 new Box().get()"),
+            "42"
+        );
+        // A method calling another method on `this`.
+        assert_eq!(
+            run("class Calc {
+                   constructor(v) { this.v = v; }
+                   double() { return this.v * 2; }
+                   quadruple() { return this.double() * 2; }
+                 }
+                 new Calc(5).quadruple()"),
+            "20"
+        );
+        // typeof a class is function.
+        assert_eq!(run("class A {} typeof A"), "function");
+        // A class expression.
+        assert_eq!(
+            run("let C = class { constructor() { this.k = 9; } }; new C().k"),
+            "9"
+        );
     }
 
     #[test]

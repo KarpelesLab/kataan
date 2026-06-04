@@ -42,6 +42,14 @@ pub enum Cell {
     /// A built-in (native) function, identified by an id the interpreter maps to
     /// a Rust implementation.
     Native(u16),
+    /// A class constructor: an index into the interpreter's class table plus the
+    /// scope it was defined in.
+    Class {
+        /// Index into the owning interpreter's class table (the AST body).
+        class_id: u32,
+        /// The captured lexical environment.
+        env: Scope,
+    },
     /// A `Map` (`is_set = false`) or `Set` (`is_set = true`): insertion-ordered
     /// key/value entries (for a `Set`, the value equals the key).
     Collection {
@@ -115,6 +123,15 @@ impl Cell {
         }
     }
 
+    /// The `(class_id, captured env)`, if this cell is a class.
+    #[must_use]
+    pub fn as_class(&self) -> Option<(u32, &Scope)> {
+        match self {
+            Cell::Class { class_id, env } => Some((*class_id, env)),
+            _ => None,
+        }
+    }
+
     /// The `(is_set, entries)` of a collection, mutably.
     pub fn as_collection_mut(&mut self) -> Option<(bool, &mut Vec<(NanBox, NanBox)>)> {
         match self {
@@ -139,7 +156,7 @@ impl Cell {
     pub fn type_of(&self) -> &'static str {
         match self {
             Cell::Str(_) => "string",
-            Cell::Function { .. } | Cell::Native(_) => "function",
+            Cell::Function { .. } | Cell::Native(_) | Cell::Class { .. } => "function",
             Cell::Object(_) | Cell::Array(_) | Cell::Collection { .. } => "object",
         }
     }
@@ -156,8 +173,8 @@ impl Trace for Cell {
                     }
                 }
             }
-            // A closure keeps its captured environment's handles alive.
-            Cell::Function { env, .. } => env.for_each_handle(visit),
+            // A closure (or class) keeps its captured environment alive.
+            Cell::Function { env, .. } | Cell::Class { env, .. } => env.for_each_handle(visit),
             // A collection's keys and values are reachable.
             Cell::Collection { entries, .. } => {
                 for (k, v) in entries {
