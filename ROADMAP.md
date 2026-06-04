@@ -520,13 +520,15 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   rest), spread in every position (array, object, and call), rest parameters,
   `Function.prototype.call`/`apply`/`bind`, **classes** (constructor,
   instance/static methods + fields, getters/setters, and `extends`/`super`
-  inheritance), and `try`/`catch`/`finally` are all compiled directly — the VM
-  now covers essentially all of the common language. `Interp::run_with_vm` /
-  `kataan bcrun` execute real programs on the VM with automatic tree-walker
-  fallback, and a dual-path conformance corpus checks the two paths agree.
-  **Next:** generators + `async`/`await` (the remaining frontier — they need
-  suspendable VM frames, so they don't run on either path yet), then making the
-  VM the primary execution path and the real object model.
+  inheritance), `try`/`catch`/`finally`, and — on the VM's **suspendable
+  frames** — **generators** and **`async`/`await`** are all compiled directly,
+  so the VM now covers essentially all of the common language. The VM is the
+  **primary execution path** (`kataan run` / `eval` / the C ABI; `run_with_vm`),
+  falling back to the tree-walker only for the few remaining constructs, and a
+  dual-path conformance corpus checks the two paths agree. **Next:** `yield*`
+  delegation and async generators (minor), then the real object model
+  (NaN-boxing / hidden classes / generational GC) and the JIT — the
+  performance, not language, frontier.
 
 - **Phase D′ — Serializable bytecode & code cache** (`serialize` feature)
   🚧 **started** — the container codec is in: `serialize`/`deserialize` with a

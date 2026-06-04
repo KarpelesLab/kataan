@@ -19,16 +19,17 @@ tri-modal model proven out in the sibling projects
 > spread), objects/arrays, method calls with `call`/`apply`/`bind`, `new`, all
 > loops + `for-of`/`for-in`/`switch`/`try`-`catch`-`finally`,
 > functions/recursion, **closures** (incl. recursive and mutually-recursive),
-> destructuring (incl. rest), rest/spread arguments, and **classes** with
-> `extends`/`super` inheritance and getters/setters — and falls back to the
-> tree-walker only for what it doesn't yet compile (generators, `async`). Compiled
+> destructuring (incl. rest), rest/spread arguments, **classes** with
+> `extends`/`super` inheritance and getters/setters, and **generators** +
+> **`async`/`await`** (on the VM's suspendable frames) — falling back to the
+> tree-walker only for the few constructs it doesn't yet compile (`yield*`,
+> async generators, …). Compiled
 > bytecode can be serialized, reloaded, and run without the source, and a
 > dual-path conformance suite checks both execution paths agree. Kataan works as
 > a CLI/REPL, a Rust library, and a C library (`kt_eval`). The
 > performance-oriented object model (NaN-boxing, hidden classes, GC), JIT tiers,
 > the full host runtime, and the
-> WASM engine are being built out per the [roadmap](ROADMAP.md). Generators and
-> `async`/`await` await the VM's suspendable frames.
+> WASM engine are being built out per the [roadmap](ROADMAP.md).
 
 ## Why
 

@@ -21,11 +21,11 @@
 //! (boxed in shared cells, with transitive capture), and **classes** —
 //! constructor, instance/static methods + fields, getters/setters, and
 //! `extends`/`super` inheritance, and `try`/`catch`/`finally`. Object-literal
-//! getters/setters compile too. Not yet: generators/async, computed/private
-//! class keys, a `finally` whose guarded region escapes via
+//! getters/setters compile too, and **generators** + **`async`/`await`** run on
+//! the VM's suspendable frames. Not yet: `yield*` delegation, async generators,
+//! computed/private class keys, a `finally` whose guarded region escapes via
 //! `return`/`break`/`continue`, and captured (hoisted) function *declarations* —
-//! these return a `CompileError`
-//! so the caller falls back to the tree-walker.
+//! these return a `CompileError` so the caller falls back to the tree-walker.
 
 use crate::ast::{
     Arrow, ArrowBody, AssignOp, BinaryOp, BindingTarget, Expr, Function, LogicalOp, Param,
