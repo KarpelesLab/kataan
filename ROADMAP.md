@@ -501,11 +501,17 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   property / collect API, and now carries the **value semantics** a VM runs over
   the new representation: `+` (numeric or rope concat), `-`/`*`/`/`/`%`/`**`,
   unary `-`, `<`/`<=`/`>`/`>=`, `===`/`==`, and `ToNumber`/`ToString`/`ToBoolean`.
-  A minimal register VM (`src/nbvm.rs`) executes arithmetic, control flow,
-  objects, strings, and equality end-to-end on this model. **Next:** migrating
-  the *production* bytecode VM's values/objects onto the `Cell`/`Realm`/GC
-  representation (calls, closures, exceptions, the stdlib) — the point at which
-  the first broad Test262 numbers land.
+  A minimal register VM (`src/nbvm.rs`) executes hand-written op streams, and a
+  tree-walker over the new model — `src/nbeval.rs` (expressions) and
+  `src/nbexec.rs` (statements) — now runs **real parsed programs** on the
+  representation: lexical scope (`src/env.rs`), the full operator set, control
+  flow, **functions and closures** (heap `Cell::Function` closures over `Rc`
+  scope chains, hoisted decls, recursion, higher-order), **exceptions**
+  (`try`/`catch`/`finally`/`throw`), and **native built-ins** (`Cell::Native`: a
+  starter `Math`/`String`/`Number`/`parseInt` stdlib). **Next:** porting the
+  *full* stdlib (console, the Object/Array/String method sets, …) onto the model
+  and folding it back into the production bytecode VM — the point at which the
+  first broad Test262 numbers land.
 
 - **Phase D — Bytecode VM** 🚧 **started**
   AST→register-bytecode compiler, the interpreter loop, inline caches,
