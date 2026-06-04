@@ -79,9 +79,7 @@ impl<'src> Parser<'src> {
             {
                 self.parse_function_declaration()
             }
-            TokenKind::Keyword(Kw::Class) => {
-                Err(self.err("class declarations are added in a later increment"))
-            }
+            TokenKind::Keyword(Kw::Class) => self.parse_class_declaration(),
             TokenKind::Keyword(Kw::Import | Kw::Export) => {
                 Err(self.err("module import/export is added in a later increment"))
             }
@@ -744,7 +742,7 @@ impl<'src> Parser<'src> {
     /// Consumes a statement-terminating `;`, applying Automatic Semicolon
     /// Insertion: a semicolon is implied before `}`, at `Eof`, or before any
     /// token that a line terminator precedes.
-    fn semicolon(&mut self) -> Result<()> {
+    pub(super) fn semicolon(&mut self) -> Result<()> {
         if self.eat(TokenKind::Semicolon) {
             return Ok(());
         }

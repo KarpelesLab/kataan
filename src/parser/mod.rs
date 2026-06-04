@@ -9,6 +9,7 @@
 //! The parser pre-tokenizes the whole input via the [`Lexer`], so it walks a
 //! `Vec<Token>` with O(1) lookahead. Literal values are decoded by [`cook`].
 
+mod class;
 mod cook;
 mod function;
 mod stmt;
@@ -742,9 +743,7 @@ impl<'src> Parser<'src> {
             TokenKind::LBracket => self.parse_array(),
             TokenKind::LBrace => self.parse_object(),
             TokenKind::Keyword(Kw::Function) => self.parse_function_expr(false, tok.span),
-            TokenKind::Keyword(Kw::Class) => {
-                Err(self.err("class expressions are added in a later increment"))
-            }
+            TokenKind::Keyword(Kw::Class) => self.parse_class_expr(),
             _ => Err(self.err(format!("unexpected token {:?}", tok.kind))),
         }
     }

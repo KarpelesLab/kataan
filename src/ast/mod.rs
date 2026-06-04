@@ -11,11 +11,13 @@
 //! increment 1). Statements, declarations, functions, classes, destructuring
 //! patterns, and modules are added in subsequent increments.
 
+mod class;
 mod expr;
 mod function;
 mod pattern;
 mod stmt;
 
+pub use class::{Class, ClassField, ClassMember, ClassMethod, MethodKind};
 pub use expr::{
     Argument, ArrayElement, Expr, ObjectMember, PropertyKey, TemplateElement, TemplateLiteral,
 };

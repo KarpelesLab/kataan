@@ -6,8 +6,9 @@
 
 use super::Parser;
 use crate::ast::{
-    Argument, ArrayElement, ArrayPatternElement, ArrowBody, BindingTarget, Expr, ForInit, ForLeft,
-    Function, ObjectMember, Param, Program, PropertyKey, Stmt, TemplateLiteral, VarDeclarator,
+    Argument, ArrayElement, ArrayPatternElement, ArrowBody, BindingTarget, Class, ClassMember,
+    Expr, ForInit, ForLeft, Function, MethodKind, ObjectMember, Param, Program, PropertyKey, Stmt,
+    TemplateLiteral, VarDeclarator,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -193,7 +194,58 @@ fn sexpr(e: &Expr) -> String {
             let kw = if a.is_async { "async-arrow" } else { "arrow" };
             format!("({kw} ({}) {body})", params(&a.params))
         }
+        Expr::Class(c) => sexpr_class(c),
     }
+}
+
+fn sexpr_class(c: &Class) -> String {
+    use alloc::format;
+    let mut head = String::from("class");
+    if let Some(id) = &c.id {
+        head.push(' ');
+        head.push_str(&id.name);
+    }
+    if let Some(s) = &c.super_class {
+        head.push_str(&format!(" extends {}", sexpr(s)));
+    }
+    let members: Vec<String> = c
+        .body
+        .iter()
+        .map(|m| match m {
+            ClassMember::StaticBlock { body, .. } => format!("(static-block {})", stmts(body)),
+            ClassMember::Field(f) => {
+                let st = if f.is_static { "static-" } else { "" };
+                let v = f
+                    .value
+                    .as_ref()
+                    .map_or(String::new(), |e| format!(" {}", sexpr(e)));
+                format!("({st}field {}{v})", sexpr_key(&f.key))
+            }
+            ClassMember::Method(m) => {
+                let st = if m.is_static { "static-" } else { "" };
+                let kind = match m.kind {
+                    MethodKind::Method => "method",
+                    MethodKind::Get => "get",
+                    MethodKind::Set => "set",
+                    MethodKind::Constructor => "ctor",
+                };
+                let mut flags = String::new();
+                if m.value.is_async {
+                    flags.push_str("async-");
+                }
+                if m.value.is_generator {
+                    flags.push('*');
+                }
+                format!(
+                    "({st}{flags}{kind} {} ({}) (block {}))",
+                    sexpr_key(&m.key),
+                    params(&m.value.params),
+                    stmts(&m.value.body)
+                )
+            }
+        })
+        .collect();
+    format!("({head} {})", members.join(" "))
 }
 
 fn sexpr_function(f: &Function) -> String {
@@ -450,7 +502,11 @@ fn templates() {
 #[test]
 fn deferred_features() {
     assert!(perr("new.target").contains("new.target"));
-    assert!(perr("class C {}").contains("later increment"));
+    // Assignment-target destructuring (`[a,b] = c` as an expression) is not yet
+    // reinterpreted from an array literal.
+    assert!(perr("[a, b] = c").contains("invalid assignment target"));
+    // Module syntax is still deferred (program context).
+    assert!(sperr("import x from 'm';").contains("import/export"));
 }
 
 // === statements =========================================================
@@ -583,6 +639,7 @@ fn sexpr_stmt(s: &Stmt) -> String {
             format!("(with {} {})", sexpr(object), sexpr_stmt(body))
         }
         Stmt::Function(f) => sexpr_function(f),
+        Stmt::Class(c) => sexpr_class(c),
     }
 }
 
@@ -848,5 +905,69 @@ fn destructuring_in_params_and_catch() {
     assert_eq!(
         prog("for (const [k, v] of m) ;"),
         "(for-of (const [k v]) m (empty))"
+    );
+}
+
+// === classes ============================================================
+
+#[test]
+fn empty_and_basic_class() {
+    assert_eq!(prog("class C {}"), "(class C )");
+    assert_eq!(prog("class C extends B {}"), "(class C extends B )");
+    assert!(sperr("class {}").contains("requires a name"));
+    assert_eq!(sx("(class {})"), "(class )");
+}
+
+#[test]
+fn class_methods() {
+    assert_eq!(
+        prog("class C { m(a) { return a; } }"),
+        "(class C (method m (a) (block (return a))))"
+    );
+    assert_eq!(
+        prog("class C { constructor(x) { this.x = x; } }"),
+        "(class C (ctor constructor (x) (block (expr (= (member . this x) x)))))"
+    );
+    assert_eq!(
+        prog("class C { static s() {} m() {} }"),
+        "(class C (static-method s () (block )) (method m () (block )))"
+    );
+    assert_eq!(
+        prog("class C { *gen() {} async a() {} }"),
+        "(class C (*method gen () (block )) (async-method a () (block )))"
+    );
+}
+
+#[test]
+fn class_accessors() {
+    assert_eq!(
+        prog("class C { get x() { return 1; } set x(v) {} }"),
+        "(class C (get x () (block (return 1))) (set x (v) (block )))"
+    );
+    // `get`/`set`/`static`/`async` are usable as plain method names.
+    assert_eq!(
+        prog("class C { get() {} static() {} }"),
+        "(class C (method get () (block )) (method static () (block )))"
+    );
+}
+
+#[test]
+fn class_fields_and_private() {
+    assert_eq!(
+        prog("class C { x = 1; y; static z = 2; }"),
+        "(class C (field x 1) (field y) (static-field z 2))"
+    );
+    assert_eq!(
+        prog("class C { #count = 0; #inc() { this.#count++; } }"),
+        "(class C (field #count 0) (method #inc () (block (expr (post++ (member . this #count))))))"
+    );
+    assert_eq!(
+        prog("class C { static { init(); } }"),
+        "(class C (static-block (expr (call init))))"
+    );
+    // Computed keys.
+    assert_eq!(
+        prog("class C { [k]() {} }"),
+        "(class C (method [k] () (block )))"
     );
 }

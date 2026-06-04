@@ -183,13 +183,13 @@ impl<'src> Parser<'src> {
 
     /// Whether the cursor is a binding identifier (a plain identifier or a
     /// contextual keyword used as a name).
-    fn at_binding_ident(&self) -> bool {
+    pub(super) fn at_binding_ident(&self) -> bool {
         matches!(self.peek(), TokenKind::Identifier)
             || matches!(self.peek(), TokenKind::Keyword(kw) if kw.is_contextual())
     }
 
     /// Parses a binding identifier into an [`Ident`].
-    fn parse_binding_ident(&mut self) -> Result<Ident> {
+    pub(super) fn parse_binding_ident(&mut self) -> Result<Ident> {
         let tok = self.peek_tok();
         match tok.kind {
             TokenKind::Identifier => {

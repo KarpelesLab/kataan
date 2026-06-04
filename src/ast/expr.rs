@@ -1,6 +1,6 @@
 //! Expression nodes.
 
-use super::{Arrow, AssignOp, BinaryOp, Function, Ident, LogicalOp, UnaryOp, UpdateOp};
+use super::{Arrow, AssignOp, BinaryOp, Class, Function, Ident, LogicalOp, UnaryOp, UpdateOp};
 use crate::common::Span;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -132,6 +132,8 @@ pub enum Expr {
     Function(Function),
     /// An arrow function: `x => x + 1`.
     Arrow(Arrow),
+    /// A class expression: `class { … }`.
+    Class(Class),
 }
 
 impl Expr {
@@ -164,6 +166,7 @@ impl Expr {
             Expr::Ident(id) => id.span,
             Expr::Function(f) => f.span,
             Expr::Arrow(a) => a.span,
+            Expr::Class(c) => c.span,
         }
     }
 
