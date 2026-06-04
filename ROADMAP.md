@@ -514,15 +514,19 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   recurse through the shared call path, so bytecode/native/tree-walker callees
   interoperate; the VM reuses the tree-walker's value semantics, and the whole
   instruction set survives the serialize → reload → run round-trip (D′).
-  `for-of`/`for-in`, `typeof`/`void`/`delete`/`++`/`--`, array spread,
-  destructuring (declarations + parameters, with defaults and rest), and
-  **closures/upvalues** (captured variables boxed in shared cells, with
-  transitive capture) are all compiled directly. `Interp::run_with_vm` /
+  `for-of`/`for-in`, `typeof`/`void`/`delete`/`++`/`--`, **closures/upvalues**
+  (captured variables boxed in shared cells, with transitive capture),
+  destructuring (declarations + parameters, with defaults and array/object
+  rest), spread in every position (array, object, and call), rest parameters,
+  `Function.prototype.call`/`apply`/`bind`, **classes** (constructor,
+  instance/static methods + fields, getters/setters, and `extends`/`super`
+  inheritance), and `try`/`catch`/`finally` are all compiled directly — the VM
+  now covers essentially all of the common language. `Interp::run_with_vm` /
   `kataan bcrun` execute real programs on the VM with automatic tree-walker
-  fallback, and the conformance corpus runs through both paths. **Next:**
-  `finally`, classes, generators, call/object spread, rest parameters, and
-  making the VM the primary execution path. (Known limitation, both paths:
-  per-iteration `let` bindings in `for` loops are not yet fresh per iteration.)
+  fallback, and a dual-path conformance corpus checks the two paths agree.
+  **Next:** generators + `async`/`await` (the remaining frontier — they need
+  suspendable VM frames, so they don't run on either path yet), then making the
+  VM the primary execution path and the real object model.
 
 - **Phase D′ — Serializable bytecode & code cache** (`serialize` feature)
   🚧 **started** — the container codec is in: `serialize`/`deserialize` with a
