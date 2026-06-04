@@ -44,6 +44,147 @@ fn constructor_object<'a>(
     obj
 }
 
+/// Compiles a pattern/flags into a `RegExp` object whose `test`/`exec` capture
+/// the compiled engine. Returns a thrown `SyntaxError` if the pattern is
+/// invalid.
+#[cfg(feature = "regex")]
+fn build_regexp<'a>(
+    pattern: &str,
+    flags: &str,
+    proto: Option<Rc<Obj<'a>>>,
+) -> Completion<'a, Value<'a>> {
+    use super::eval::make_error;
+    let compiled = match crate::regex::Regex::new(pattern, flags) {
+        Ok(re) => Rc::new(re),
+        Err(e) => return Err(make_error("SyntaxError", e.to_string())),
+    };
+    let obj = match proto {
+        Some(p) => Obj::with_proto(p),
+        None => Obj::object(),
+    };
+    obj.set("source", Value::str(pattern.to_string()));
+    obj.set("flags", Value::str(flags.to_string()));
+    obj.set("global", Value::Bool(compiled.flags().global));
+    obj.set("ignoreCase", Value::Bool(compiled.flags().ignore_case));
+    obj.set("multiline", Value::Bool(compiled.flags().multiline));
+    obj.set("lastIndex", Value::Number(0.0));
+
+    let re = Rc::clone(&compiled);
+    obj.set(
+        "test",
+        native("test", move |a| {
+            Ok(Value::Bool(re.is_match(&arg(a, 0).to_js_string())))
+        }),
+    );
+    let re = Rc::clone(&compiled);
+    obj.set(
+        "exec",
+        native("exec", move |a| {
+            let text = arg(a, 0).to_js_string();
+            Ok(match re.captures_from(&text, 0) {
+                Some(caps) => caps_to_array(&text, &caps),
+                None => Value::Null,
+            })
+        }),
+    );
+    Ok(Value::Object(obj))
+}
+
+/// Builds a JS match array `[whole, g1, g2, …]` with `index` and `input`
+/// properties, from a [`crate::regex::Captures`] over `text`.
+#[cfg(feature = "regex")]
+fn caps_to_array<'a>(text: &str, caps: &crate::regex::Captures) -> Value<'a> {
+    let chars: Vec<char> = text.chars().collect();
+    let slice = |span: Option<(usize, usize)>| match span {
+        Some((s, e)) => Value::str(chars[s..e].iter().collect::<String>()),
+        None => Value::Undefined,
+    };
+    let groups: Vec<Value<'a>> = caps.groups.iter().map(|g| slice(*g)).collect();
+    let array = Obj::array(groups);
+    array.set("index", Value::Number(caps.whole().0 as f64));
+    array.set("input", Value::str(text.to_string()));
+    Value::Object(array)
+}
+
+/// Handles the `String` methods that accept a `RegExp` first argument
+/// (`match`, `matchAll`, `search`, `replace`, `split`). Returns `None` when the
+/// argument is not a RegExp, so the caller falls back to the string behavior.
+#[cfg(feature = "regex")]
+fn regex_string_op<'a>(s: &str, name: &str, args: &[Value<'a>]) -> Option<Value<'a>> {
+    let re_obj = match args.first() {
+        Some(Value::Object(o)) if o.has("source") => o,
+        _ => return None,
+    };
+    if !matches!(name, "match" | "matchAll" | "search" | "replace" | "split") {
+        return None;
+    }
+    let source = re_obj.get("source").to_js_string();
+    let flags = re_obj.get("flags").to_js_string();
+    let re = crate::regex::Regex::new(&source, &flags).ok()?;
+    let global = re.flags().global;
+    let chars: Vec<char> = s.chars().collect();
+
+    Some(match name {
+        "search" => Value::Number(re.find_from(s, 0).map_or(-1.0, |(start, _)| start as f64)),
+        "replace" => Value::str(re.replace(s, &arg(args, 1).to_js_string())),
+        "match" if global => {
+            // Global: an array of whole-match strings (or null if none).
+            let mut out = Vec::new();
+            let mut pos = 0;
+            while let Some((ms, me)) = re.find_from(s, pos) {
+                out.push(Value::str(chars[ms..me].iter().collect::<String>()));
+                pos = if me > ms { me } else { me + 1 };
+                if pos > chars.len() {
+                    break;
+                }
+            }
+            if out.is_empty() {
+                Value::Null
+            } else {
+                Value::Object(Obj::array(out))
+            }
+        }
+        "match" => match re.captures_from(s, 0) {
+            Some(caps) => caps_to_array(s, &caps),
+            None => Value::Null,
+        },
+        "matchAll" => {
+            let mut out = Vec::new();
+            let mut pos = 0;
+            while let Some(caps) = re.captures_from(s, pos) {
+                let (ms, me) = caps.whole();
+                out.push(caps_to_array(s, &caps));
+                pos = if me > ms { me } else { me + 1 };
+                if pos > chars.len() {
+                    break;
+                }
+            }
+            Value::Object(Obj::array(out))
+        }
+        "split" => {
+            let mut parts = Vec::new();
+            let mut last = 0;
+            let mut pos = 0;
+            while pos <= chars.len() {
+                let Some((ms, me)) = re.find_from(s, pos) else {
+                    break;
+                };
+                if me == ms {
+                    // Skip zero-width matches to guarantee progress.
+                    pos = me + 1;
+                    continue;
+                }
+                parts.push(Value::str(chars[last..ms].iter().collect::<String>()));
+                last = me;
+                pos = me;
+            }
+            parts.push(Value::str(chars[last..].iter().collect::<String>()));
+            Value::Object(Obj::array(parts))
+        }
+        _ => return None,
+    })
+}
+
 /// Milliseconds since the Unix epoch (UTC).
 fn now_ms() -> f64 {
     std::time::SystemTime::now()
@@ -140,6 +281,40 @@ impl<'a> Interp<'a> {
         self.install_errors();
         self.install_collections();
         self.install_date();
+        #[cfg(feature = "regex")]
+        self.install_regexp();
+    }
+
+    /// Installs the `RegExp` constructor (the `regex` feature).
+    #[cfg(feature = "regex")]
+    fn install_regexp(&self) {
+        let proto = Obj::object();
+        let p = Rc::clone(&proto);
+        let ctor = constructor_object("RegExp", move |a| {
+            let pattern = arg(a, 0).to_js_string();
+            let flags = if a.len() > 1 {
+                arg(a, 1).to_js_string()
+            } else {
+                String::new()
+            };
+            build_regexp(&pattern, &flags, Some(Rc::clone(&p)))
+        });
+        ctor.set("prototype", Value::Object(proto));
+        self.define_global("RegExp", Value::Object(ctor));
+    }
+
+    /// Builds a `RegExp` object from a regex *literal* (`/…/flags`), linking it
+    /// to `RegExp.prototype` so `instanceof RegExp` holds.
+    #[cfg(feature = "regex")]
+    pub(super) fn make_regexp(&self, pattern: &str, flags: &str) -> Completion<'a, Value<'a>> {
+        let proto = match self.global().get("RegExp") {
+            Some(Value::Object(ctor)) => match ctor.get("prototype") {
+                Value::Object(p) => Some(p),
+                _ => None,
+            },
+            _ => None,
+        };
+        build_regexp(pattern, flags, proto)
     }
 
     fn install_date(&self) {
@@ -947,6 +1122,11 @@ fn collection_set<'a>(obj: &Rc<Obj<'a>>, key: Value<'a>, value: Value<'a>) {
 /// String prototype methods (none need the evaluator).
 fn string_method<'a>(s: &str, name: &str, args: &[Value<'a>]) -> Option<Value<'a>> {
     let chars: Vec<char> = s.chars().collect();
+    // `str.match/replace/split/…(regexp)` dispatches to the regex engine.
+    #[cfg(feature = "regex")]
+    if let Some(v) = regex_string_op(s, name, args) {
+        return Some(v);
+    }
     let result = match name {
         "toUpperCase" => Value::str(s.to_uppercase()),
         "toLowerCase" => Value::str(s.to_lowercase()),

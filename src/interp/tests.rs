@@ -508,6 +508,22 @@ fn math_builtins() {
     assert_eq!(eval("Math.round(2.5)"), "3");
 }
 
+#[cfg(feature = "regex")]
+#[test]
+fn regexp() {
+    assert_eq!(eval(r"/\d+/.test('abc123')"), "true");
+    assert_eq!(eval(r"/^\d+$/.test('abc')"), "false");
+    assert_eq!(eval(r"'2023-11-14'.match(/(\d+)-(\d+)/)[2]"), "11");
+    assert_eq!(eval(r"'a1b22c333'.match(/\d+/g).join(',')"), "1,22,333");
+    assert_eq!(eval(r"'hello'.replace(/l/g, 'L')"), "heLLo");
+    assert_eq!(eval(r"'a@b'.replace(/(\w)@(\w)/, '$2-$1')"), "b-a");
+    assert_eq!(eval(r"'a,b;c'.split(/[,;]/).join('|')"), "a|b|c");
+    assert_eq!(eval(r"'find cat'.search(/cat/)"), "5");
+    assert_eq!(eval(r"new RegExp('[a-z]+', 'i').test('ABC')"), "true");
+    assert_eq!(eval(r"/x/ instanceof RegExp"), "true");
+    assert_eq!(eval(r"/(\w)(\w)/.exec('hi')[2]"), "i");
+}
+
 #[test]
 fn dates() {
     // Fixed timestamps keep the tests deterministic (no `Date.now`).

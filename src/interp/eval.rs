@@ -812,7 +812,13 @@ impl<'a> Interp<'a> {
                 self.construct(callee_val, args)
             }
             Expr::Class(def) => self.eval_class(def, env),
-            Expr::Regex { .. } => Err(Value::str("RegExp is not yet supported at runtime")),
+            #[cfg(feature = "regex")]
+            Expr::Regex { pattern, flags, .. } => self.make_regexp(pattern, flags),
+            #[cfg(not(feature = "regex"))]
+            Expr::Regex { .. } => Err(make_error(
+                "SyntaxError",
+                "RegExp support requires the `regex` feature",
+            )),
             Expr::TaggedTemplate { tag, quasi, .. } => {
                 let tag_fn = self.eval_expr(tag, env)?;
                 // The strings array carries the cooked quasis and a `raw`
@@ -1471,7 +1477,7 @@ impl<'a> Interp<'a> {
 /// Builds a thrown error value (an object with `name` + `message`) so that a
 /// `catch` clause can read `e.message` / `e.name`. (These objects are not yet
 /// linked to the `Error` prototype, so `instanceof Error` is not supported.)
-fn make_error<'a>(name: &'static str, message: impl Into<String>) -> Value<'a> {
+pub(super) fn make_error<'a>(name: &'static str, message: impl Into<String>) -> Value<'a> {
     let obj = Obj::object();
     obj.set("name", Value::str(name));
     obj.set("message", Value::str(message.into()));
