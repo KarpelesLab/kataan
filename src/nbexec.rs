@@ -3015,7 +3015,8 @@ impl<'a> Interp<'a> {
             }
             PropertyKey::Ident(s) | PropertyKey::Str(s) => self.read_member(handle, s),
             PropertyKey::Number(n) => self.read_member(handle, &alloc::format!("{n}")),
-            PropertyKey::Private(_) => Err(ExecError::Unsupported("private member")),
+            // Private names (`this.#x`) are stored under a `#`-prefixed key.
+            PropertyKey::Private(s) => self.read_member(handle, &alloc::format!("#{s}")),
         }
     }
 
@@ -3182,7 +3183,10 @@ impl<'a> Interp<'a> {
             PropertyKey::Number(n) => {
                 self.realm.set_property(handle, &alloc::format!("{n}"), new);
             }
-            PropertyKey::Private(_) => return Err(ExecError::Unsupported("private assign")),
+            PropertyKey::Private(s) => {
+                self.realm
+                    .set_property(handle, &alloc::format!("#{s}"), new);
+            }
         }
         Ok(())
     }
@@ -3630,8 +3634,9 @@ fn static_key(key: &PropertyKey) -> Result<String, ExecError> {
     match key {
         PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(String::from(&**s)),
         PropertyKey::Number(n) => Ok(alloc::format!("{n}")),
+        // A private field name (`#x`) maps to a `#`-prefixed storage key.
+        PropertyKey::Private(s) => Ok(alloc::format!("#{s}")),
         PropertyKey::Computed(_) => Err(ExecError::Unsupported("computed key")),
-        PropertyKey::Private(_) => Err(ExecError::Unsupported("private key")),
     }
 }
 
@@ -4227,6 +4232,22 @@ mod tests {
         assert_eq!(run("let k = 'a' + 'b'; let o = { [k]: 7 }; o.ab"), "7");
         // A numeric computed key coerces to its string form.
         assert_eq!(run("let o = { [1 + 1]: 'two' }; o['2']"), "two");
+    }
+
+    #[test]
+    fn private_class_fields() {
+        // Private fields store and read through `this.#x`.
+        assert_eq!(
+            run(
+                "class C { #n = 0; bump(){ this.#n++; return this.#n; } } let c = new C(); c.bump(); c.bump()"
+            ),
+            "2"
+        );
+        // ...and are non-enumerable.
+        assert_eq!(
+            run("class C { #s = 1; constructor(){ this.p = 2; } } Object.keys(new C()).join(',')"),
+            "p"
+        );
     }
 
     #[test]

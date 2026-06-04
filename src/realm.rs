@@ -289,6 +289,10 @@ impl Realm {
         Some(
             obj.keys()
                 .iter()
+                // Private fields are stored under a `#`-prefixed key and are
+                // never enumerable (so they stay out of `Object.keys`, spread,
+                // `for-in`, and JSON).
+                .filter(|s| !s.starts_with('#'))
                 .map(|s| alloc::string::String::from(*s))
                 .collect(),
         )
