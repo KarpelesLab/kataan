@@ -293,8 +293,58 @@ impl Parser {
             'S' => class_shorthand(Shorthand::NotSpace),
             'b' => Node::WordBoundary { neg: false },
             'B' => Node::WordBoundary { neg: true },
+            'u' => Node::Char(self.parse_unicode_escape()?),
+            'x' => Node::Char(self.parse_hex_escape(2)?),
             other => Node::Char(escape_char(other)),
         })
+    }
+
+    /// Parses a `\uHHHH` or `\u{H…}` escape body (the `\u` already consumed).
+    fn parse_unicode_escape(&mut self) -> Result<char, RegexError> {
+        let cp = if self.eat('{') {
+            let mut v: u32 = 0;
+            let mut any = false;
+            while let Some(c) = self.peek() {
+                if c == '}' {
+                    self.pos += 1;
+                    break;
+                }
+                let d = c
+                    .to_digit(16)
+                    .ok_or_else(|| RegexError::new("invalid `\\u{…}` escape"))?;
+                v = v.saturating_mul(16).saturating_add(d);
+                self.pos += 1;
+                any = true;
+            }
+            if !any {
+                return Err(RegexError::new("empty `\\u{}` escape"));
+            }
+            v
+        } else {
+            self.parse_hex_digits(4)?
+        };
+        char::from_u32(cp).ok_or_else(|| RegexError::new("escape is not a valid code point"))
+    }
+
+    /// Parses a `\xHH` escape body (the `\x` already consumed).
+    fn parse_hex_escape(&mut self, n: usize) -> Result<char, RegexError> {
+        let cp = self.parse_hex_digits(n)?;
+        char::from_u32(cp).ok_or_else(|| RegexError::new("escape is not a valid code point"))
+    }
+
+    /// Reads exactly `n` hex digits as a code point.
+    fn parse_hex_digits(&mut self, n: usize) -> Result<u32, RegexError> {
+        let mut v: u32 = 0;
+        for _ in 0..n {
+            let c = self
+                .bump()
+                .ok_or_else(|| RegexError::new("incomplete hex escape"))?;
+            let d = c
+                .to_digit(16)
+                .ok_or_else(|| RegexError::new("invalid hex digit in escape"))?;
+            v = v * 16 + d;
+        }
+        Ok(v)
     }
 
     fn parse_class(&mut self) -> Result<Node, RegexError> {
@@ -320,6 +370,14 @@ impl Parser {
                         'W' => items.push(ClassItem::Shorthand(Shorthand::NotWord)),
                         's' => items.push(ClassItem::Shorthand(Shorthand::Space)),
                         'S' => items.push(ClassItem::Shorthand(Shorthand::NotSpace)),
+                        'u' => {
+                            let ch = self.parse_unicode_escape()?;
+                            self.push_class_member(&mut items, ch);
+                        }
+                        'x' => {
+                            let ch = self.parse_hex_escape(2)?;
+                            self.push_class_member(&mut items, ch);
+                        }
                         other => {
                             self.push_class_member(&mut items, escape_char(other));
                         }

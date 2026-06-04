@@ -16,6 +16,28 @@ fn literals_and_anchors() {
 }
 
 #[test]
+fn unicode_and_hex_escapes() {
+    // `\uHHHH` and `\xHH` resolve to the code point.
+    assert!(re(r"A", "").is_match("A"));
+    assert!(re(r"\x41", "").is_match("A"));
+    assert!(re(r"σ", "").is_match("\u{03c3}"));
+    assert!(!re(r"A", "").is_match("B"));
+    // `\uHHHH` 4-digit form (the pattern contains a backslash-u escape).
+    assert!(re("\\u0041", "").is_match("A"));
+    assert!(re("\\u03c3", "").is_match("\u{03c3}"));
+    assert!(!re("\\u0041", "").is_match("B"));
+    // `\u{…}` code-point form (supplementary planes).
+    assert!(re(r"\u{1F600}", "").is_match("\u{1F600}"));
+    // Inside a character class.
+    assert!(re(r"[A-Z]+", "").is_match("HELLO"));
+    assert!(re(r"[\x61\x62]", "").is_match("b"));
+    // `\t` via `\x09`.
+    assert!(re(r"\x09", "").is_match("a\tb"));
+    // A malformed escape is a compile error.
+    assert!(Regex::new(r"\u00", "").is_err());
+}
+
+#[test]
 fn dot_and_classes() {
     assert!(re("a.c", "").is_match("axc"));
     assert!(!re("a.c", "").is_match("a\nc")); // `.` excludes newline

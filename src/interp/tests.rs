@@ -2208,7 +2208,8 @@ fn regex_unicode_case_folding() {
     // long s U+017F to `s`, and the final sigma ς to σ.
     assert_eq!(eval("/k/i.test('\\u212a')"), "true");
     assert_eq!(eval("/S/i.test('\\u017f')"), "true");
-    assert_eq!(eval("/σ/i.test('\\u03c2')"), "true");
+    // `\u` escapes in the pattern resolve to the code point.
+    assert_eq!(eval("/\\u03c3/i.test('\\u03c2')"), "true");
 }
 
 #[cfg(feature = "intl")]
