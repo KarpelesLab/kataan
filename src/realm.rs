@@ -39,6 +39,10 @@ pub struct Realm {
     heap: Heap<Cell>,
     root_shape: Rc<Shape>,
     atoms: AtomTable,
+    /// The in-flight incremental collection's marker, present only while an
+    /// incremental marking cycle is running. The write barrier shades stored
+    /// references into it so concurrent mutation stays sound.
+    incremental: Option<gc::IncrementalMarker>,
 }
 
 impl Default for Realm {
@@ -55,6 +59,7 @@ impl Realm {
             heap: Heap::new(),
             root_shape: Shape::root(),
             atoms: AtomTable::new(),
+            incremental: None,
         }
     }
 
@@ -418,8 +423,13 @@ impl Realm {
     /// remembered set, so a minor collection keeps the young object alive.
     fn write_barrier(&mut self, container: Handle, value: NanBox) {
         if let Some(raw) = value.as_handle() {
-            self.heap
-                .record_edge(container, Handle::from_raw(raw), gc::OLD_AGE);
+            let target = Handle::from_raw(raw);
+            self.heap.record_edge(container, target, gc::OLD_AGE);
+            // Incremental (Dijkstra) barrier: shade a reference stored during a
+            // marking cycle so it cannot be missed.
+            if let Some(marker) = self.incremental.as_mut() {
+                marker.mark_grey(target);
+            }
         }
     }
 
@@ -472,6 +482,43 @@ impl Realm {
         let before = self.heap.len();
         let mut marker = gc::IncrementalMarker::new(roots);
         while !marker.step(&self.heap, step_budget.max(1)) {}
+        let swept = marker.sweep(&mut self.heap);
+        Stats {
+            marked: before - swept,
+            swept,
+        }
+    }
+
+    /// Begins an **interleaved** incremental collection: installs a marker
+    /// seeded from `roots` whose write barrier is now active, so mutation
+    /// (`set_property`/`set_element`/…) between steps stays sound. Pair with
+    /// [`incremental_step`](Realm::incremental_step) and
+    /// [`incremental_finish`](Realm::incremental_finish).
+    pub fn incremental_start(&mut self, roots: &[Handle]) {
+        self.incremental = Some(gc::IncrementalMarker::new(roots));
+    }
+
+    /// Advances the active interleaved marker by up to `step_budget` objects.
+    /// Returns `true` when marking is complete. A no-op (`true`) if no cycle is
+    /// active.
+    pub fn incremental_step(&mut self, step_budget: usize) -> bool {
+        // Split the borrow: the marker scans the heap immutably.
+        let Some(mut marker) = self.incremental.take() else {
+            return true;
+        };
+        let done = marker.step(&self.heap, step_budget.max(1));
+        self.incremental = Some(marker);
+        done
+    }
+
+    /// Finishes the interleaved cycle: sweeps everything marking did not reach,
+    /// clears the active marker, and returns the statistics. A no-op (empty
+    /// stats) if no cycle is active.
+    pub fn incremental_finish(&mut self) -> Stats {
+        let Some(marker) = self.incremental.take() else {
+            return Stats::default();
+        };
+        let before = self.heap.len();
         let swept = marker.sweep(&mut self.heap);
         Stats {
             marked: before - swept,
@@ -1259,6 +1306,29 @@ mod tests {
         let arr = Handle::from_raw(items2.as_handle().unwrap());
         // array[0] still points back at the (relocated) object — the cycle held.
         assert_eq!(realm.get_element(arr, 0).as_handle(), Some(obj2.to_raw()));
+    }
+
+    #[test]
+    fn interleaved_incremental_barrier_keeps_a_mid_cycle_store() {
+        let mut realm = Realm::new();
+        let root = realm.new_object();
+
+        // Start an interleaved cycle and mark the root fully (it has no edges
+        // yet, so marking completes with `root` black).
+        realm.incremental_start(&[root]);
+        while !realm.incremental_step(1) {}
+
+        // Mid-cycle, the mutator allocates a new object (white) and stores it on
+        // the already-black root. The integrated write barrier shades it.
+        let child = realm.new_object();
+        realm.set_property(root, "child", NanBox::handle(child.to_raw()));
+
+        // Drain the re-greyed work, then finish.
+        while !realm.incremental_step(4) {}
+        let stats = realm.incremental_finish();
+
+        assert_eq!(stats.swept, 0, "the barrier-shaded child must survive");
+        assert!(realm.is_live(root) && realm.is_live(child));
     }
 
     #[test]
