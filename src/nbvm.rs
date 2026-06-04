@@ -12,21 +12,24 @@
 //! migrating the full bytecode VM onto this representation.
 //!
 //! It also carries the **bytecode-VM fold**: an AST → bytecode `compile_and_run`
-//! that lowers a growing JavaScript subset (arithmetic, control flow,
-//! arrays/objects, `for`/`do-while` loops, compound assignment and `++`/`--`,
-//! functions with recursion via a per-activation register window, `try`/`catch`/
-//! `throw` exceptions that unwind across calls, and native `console.log`/`Math.*`
-//! calls) onto these ops, with no tree-walking — and it agrees with the
-//! tree-walker on output (a cross-engine parity test). Closures and first-class
-//! function values arrive with later slices; the point is that every value
-//! flowing through it is a single 64-bit word and every object is a GC-managed
-//! heap node, exactly as the production VM will work.
+//! that lowers a broad JavaScript subset (arithmetic, control flow,
+//! arrays/objects, `for`/`do-while`/`for-of`/`switch` with `break`/`continue`,
+//! compound assignment and `++`/`--`, functions with recursion via a
+//! per-activation register window, first-class function values and **closures
+//! with mutable capture** — free variables become shared heap *cells* —
+//! `try`/`catch`/`finally`/`throw` exceptions that unwind across calls, and
+//! native `console.log`/`Math.*`/`String`/`Number` calls) onto these ops, with
+//! no tree-walking — and it agrees with the tree-walker on output (a
+//! cross-engine parity test). The point is that every value flowing through it
+//! is a single 64-bit word and every object is a GC-managed heap node, exactly
+//! as the production VM will work.
 //!
 //! Pure, safe `alloc`-only Rust.
 
 use crate::heap::Handle;
 use crate::nanbox::NanBox;
 use crate::realm::Realm;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -88,6 +91,15 @@ pub enum Op {
     Call { dst: Reg, func: u32, args: Vec<Reg> },
     /// `dst = a first-class function value` wrapping function-table index `func`.
     LoadFunc { dst: Reg, func: u32 },
+    /// `dst = a closure` over `func` capturing the cells in `captures` — a heap
+    /// array `[func_id, cell0, cell1, …]`. Cells are shared by handle, so a
+    /// mutation through a captured variable is visible to every closure sharing
+    /// it.
+    MakeClosure {
+        dst: Reg,
+        func: u32,
+        captures: Vec<Reg>,
+    },
     /// `dst = callee(args…)` — an indirect call through a function value held in
     /// the `callee` register.
     CallValue {
@@ -136,6 +148,9 @@ pub struct FnProto {
     pub n_regs: usize,
     /// Parameters, bound to registers `0..n_params` on entry.
     pub n_params: usize,
+    /// Captured cells, bound to registers `n_params..n_params + n_captures` on
+    /// entry (a closure passes its cells here).
+    pub n_captures: usize,
 }
 
 /// Execution context shared across activations: the heap and the captured
@@ -183,10 +198,25 @@ pub fn run_program_capturing(
 }
 
 fn call(ctx: &mut Ctx, funcs: &[FnProto], id: usize, args: &[NanBox]) -> Result<NanBox, VmError> {
+    call_with_captures(ctx, funcs, id, args, &[])
+}
+
+/// Calls function `id` with `args` (registers `0..n_params`) and `captures`
+/// (registers `n_params..n_params + n_captures`).
+fn call_with_captures(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    args: &[NanBox],
+    captures: &[NanBox],
+) -> Result<NanBox, VmError> {
     let proto = &funcs[id];
     let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
     for (i, a) in args.iter().enumerate().take(proto.n_params) {
         regs[i] = *a;
+    }
+    for (i, c) in captures.iter().enumerate().take(proto.n_captures) {
+        regs[proto.n_params + i] = *c;
     }
     Ok(run_frame(ctx, funcs, &proto.ops, &mut regs)?.unwrap_or(NanBox::undefined()))
 }
@@ -351,6 +381,17 @@ fn run_frame(
                     .new_array(alloc::vec![NanBox::number(*func as f64)]);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
+            Op::MakeClosure {
+                dst,
+                func,
+                captures,
+            } => {
+                // `[func_id, cell0, cell1, …]`.
+                let mut elems = alloc::vec![NanBox::number(*func as f64)];
+                elems.extend(captures.iter().map(|r| regs[*r as usize]));
+                let handle = ctx.realm.new_array(elems);
+                regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            }
             Op::CallValue { dst, callee, args } => {
                 let handle = object_handle(regs[*callee as usize])?;
                 let id = ctx
@@ -358,8 +399,17 @@ fn run_frame(
                     .get_element(handle, 0)
                     .as_number()
                     .ok_or(VmError::NotAnObject)? as usize;
+                // Captured cells live in array slots `1..`.
+                let n_caps = ctx
+                    .realm
+                    .array_length(handle)
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+                let caps: Vec<NanBox> = (0..n_caps)
+                    .map(|i| ctx.realm.get_element(handle, i + 1))
+                    .collect();
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                match call(ctx, funcs, id, &argv) {
+                match call_with_captures(ctx, funcs, id, &argv, &caps) {
                     Ok(ret) => regs[*dst as usize] = ret,
                     Err(VmError::Thrown(v)) => match handlers.pop() {
                         Some((target, reg)) => {
@@ -512,12 +562,30 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
             fn_ids.insert(String::from(&*id.name), (i + 1) as u32);
         }
     }
-    let mut protos = Vec::with_capacity(decls.len() + 1);
-    protos.push(Compiler::compile_fn(&fn_ids, &[], &program.body, true)?);
-    for f in &decls {
-        protos.push(Compiler::compile_fn(&fn_ids, &f.params, &f.body, false)?);
+    let fn_ids = alloc::rc::Rc::new(fn_ids);
+    let protos = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    // Reserve slots 0..=N: main is 0, the top-level functions are 1..=N. Nested
+    // function expressions append beyond N during compilation.
+    let placeholder = || FnProto {
+        ops: Vec::new(),
+        n_regs: 0,
+        n_params: 0,
+        n_captures: 0,
+    };
+    protos
+        .borrow_mut()
+        .extend((0..=decls.len()).map(|_| placeholder()));
+    // Compile main (id 0), then each top-level function (ids 1..=N). Top-level
+    // functions don't capture (they live in the global function table).
+    let main = Compiler::compile_fn(&fn_ids, &protos, &[], &[], &program.body, true)?;
+    protos.borrow_mut()[0] = main;
+    for (i, f) in decls.iter().enumerate() {
+        let proto = Compiler::compile_fn(&fn_ids, &protos, &f.params, &[], &f.body, false)?;
+        protos.borrow_mut()[i + 1] = proto;
     }
-    Ok(protos)
+    Ok(alloc::rc::Rc::try_unwrap(protos)
+        .expect("unique proto table")
+        .into_inner())
 }
 
 /// Maps a built-in namespace member call (`console.log`, `Math.max`/`min`/
@@ -570,15 +638,339 @@ fn static_key(key: &PropertyKey) -> Result<String, CompileError> {
     }
 }
 
+use alloc::collections::BTreeSet;
+
+/// The free variables of a function: names it references that are bound neither
+/// by its parameters nor its local declarations (so they come from an enclosing
+/// scope — i.e. its captures).
+fn free_of_function(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
+    let bound = bound_names(params, body);
+    let mut direct = BTreeSet::new();
+    let mut nested = BTreeSet::new();
+    for s in body {
+        refs_stmt(s, &mut direct, &mut nested);
+    }
+    direct
+        .into_iter()
+        .chain(nested)
+        .filter(|n| !bound.contains(n))
+        .collect()
+}
+
+/// The names a function declares (parameters + local declarations), *not*
+/// descending into nested functions.
+fn bound_names(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for p in params {
+        if let BindingTarget::Ident(Ident { name, .. }) = &p.target {
+            out.insert(String::from(&**name));
+        }
+    }
+    for s in body {
+        declared_in_stmt(s, &mut out);
+    }
+    out
+}
+
+/// This function's own bound names that are captured by some nested function
+/// (and so must be cells).
+fn captured_names(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
+    let bound = bound_names(params, body);
+    let mut direct = BTreeSet::new();
+    let mut nested = BTreeSet::new();
+    for s in body {
+        refs_stmt(s, &mut direct, &mut nested);
+    }
+    bound.intersection(&nested).cloned().collect()
+}
+
+/// Collects the names declared by `s` (let/const/var/function/catch/for-head),
+/// not descending into nested functions or expressions.
+fn declared_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
+    let decl_target = |t: &BindingTarget, out: &mut BTreeSet<String>| {
+        if let BindingTarget::Ident(Ident { name, .. }) = t {
+            out.insert(String::from(&**name));
+        }
+    };
+    match s {
+        Stmt::Var(d) => {
+            for dr in &d.declarations {
+                decl_target(&dr.target, out);
+            }
+        }
+        Stmt::Function(f) => {
+            if let Some(id) = &f.id {
+                out.insert(String::from(&*id.name));
+            }
+        }
+        Stmt::Block { body, .. } => {
+            for s in body {
+                declared_in_stmt(s, out);
+            }
+        }
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            declared_in_stmt(consequent, out);
+            if let Some(a) = alternate {
+                declared_in_stmt(a, out);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => declared_in_stmt(body, out),
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::Var(d)) = init {
+                for dr in &d.declarations {
+                    decl_target(&dr.target, out);
+                }
+            }
+            declared_in_stmt(body, out);
+        }
+        Stmt::ForOf { left, body, .. } | Stmt::ForIn { left, body, .. } => {
+            if let crate::ast::ForLeft::Decl { target, .. } = left {
+                decl_target(target, out);
+            }
+            declared_in_stmt(body, out);
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            for s in block {
+                declared_in_stmt(s, out);
+            }
+            if let Some(h) = handler {
+                if let Some(p) = &h.param {
+                    decl_target(p, out);
+                }
+                for s in &h.body {
+                    declared_in_stmt(s, out);
+                }
+            }
+            if let Some(f) = finalizer {
+                for s in f {
+                    declared_in_stmt(s, out);
+                }
+            }
+        }
+        Stmt::Switch { cases, .. } => {
+            for c in cases {
+                for s in &c.body {
+                    declared_in_stmt(s, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walks `s` collecting direct identifier references (`direct`) and the free
+/// variables of any nested function expression (`nested`).
+fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+    match s {
+        Stmt::Expr { expression, .. } => refs_expr(expression, direct, nested),
+        Stmt::Var(d) => {
+            for dr in &d.declarations {
+                if let Some(e) = &dr.init {
+                    refs_expr(e, direct, nested);
+                }
+            }
+        }
+        Stmt::Return {
+            argument: Some(e), ..
+        }
+        | Stmt::Throw { argument: e, .. } => refs_expr(e, direct, nested),
+        Stmt::Block { body, .. } => body.iter().for_each(|s| refs_stmt(s, direct, nested)),
+        Stmt::If {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            refs_expr(test, direct, nested);
+            refs_stmt(consequent, direct, nested);
+            if let Some(a) = alternate {
+                refs_stmt(a, direct, nested);
+            }
+        }
+        Stmt::While { test, body, .. } | Stmt::DoWhile { body, test, .. } => {
+            refs_expr(test, direct, nested);
+            refs_stmt(body, direct, nested);
+        }
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+            ..
+        } => {
+            match init {
+                Some(ForInit::Var(d)) => {
+                    for dr in &d.declarations {
+                        if let Some(e) = &dr.init {
+                            refs_expr(e, direct, nested);
+                        }
+                    }
+                }
+                Some(ForInit::Expr(e)) => refs_expr(e, direct, nested),
+                None => {}
+            }
+            if let Some(t) = test {
+                refs_expr(t, direct, nested);
+            }
+            if let Some(u) = update {
+                refs_expr(u, direct, nested);
+            }
+            refs_stmt(body, direct, nested);
+        }
+        Stmt::ForOf {
+            left, right, body, ..
+        }
+        | Stmt::ForIn {
+            left, right, body, ..
+        } => {
+            if let crate::ast::ForLeft::Target(e) = left {
+                refs_expr(e, direct, nested);
+            }
+            refs_expr(right, direct, nested);
+            refs_stmt(body, direct, nested);
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            block.iter().for_each(|s| refs_stmt(s, direct, nested));
+            if let Some(h) = handler {
+                h.body.iter().for_each(|s| refs_stmt(s, direct, nested));
+            }
+            if let Some(f) = finalizer {
+                f.iter().for_each(|s| refs_stmt(s, direct, nested));
+            }
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+            ..
+        } => {
+            refs_expr(discriminant, direct, nested);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    refs_expr(t, direct, nested);
+                }
+                c.body.iter().for_each(|s| refs_stmt(s, direct, nested));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walks `e` collecting direct identifier references; for a nested function
+/// expression, collects *its* free variables into `nested` (without descending
+/// for direct refs).
+fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+    match e {
+        Expr::Ident(id) => {
+            direct.insert(String::from(&*id.name));
+        }
+        Expr::Function(f) => nested.extend(free_of_function(&f.params, &f.body)),
+        Expr::Arrow(a) => {
+            let body: Vec<Stmt> = match &a.body {
+                crate::ast::ArrowBody::Block(b) => b.clone(),
+                crate::ast::ArrowBody::Expr(e) => alloc::vec![Stmt::Return {
+                    argument: Some(Box::new((**e).clone())),
+                    span: crate::common::Span::point(0),
+                }],
+            };
+            nested.extend(free_of_function(&a.params, &body));
+        }
+        Expr::Unary { argument, .. } | Expr::Update { argument, .. } => {
+            refs_expr(argument, direct, nested);
+        }
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            refs_expr(left, direct, nested);
+            refs_expr(right, direct, nested);
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            refs_expr(test, direct, nested);
+            refs_expr(consequent, direct, nested);
+            refs_expr(alternate, direct, nested);
+        }
+        Expr::Assign { target, value, .. } => {
+            refs_expr(target, direct, nested);
+            refs_expr(value, direct, nested);
+        }
+        Expr::Member {
+            object, property, ..
+        } => {
+            refs_expr(object, direct, nested);
+            if let PropertyKey::Computed(e) = property {
+                refs_expr(e, direct, nested);
+            }
+        }
+        Expr::Call {
+            callee, arguments, ..
+        } => {
+            refs_expr(callee, direct, nested);
+            for a in arguments {
+                if let crate::ast::Argument::Item(e) = a {
+                    refs_expr(e, direct, nested);
+                }
+            }
+        }
+        Expr::Array { elements, .. } => {
+            for el in elements {
+                if let ArrayElement::Item(e) = el {
+                    refs_expr(e, direct, nested);
+                }
+            }
+        }
+        Expr::Object { members, .. } => {
+            for m in members {
+                if let ObjectMember::Property { key, value, .. } = m {
+                    if let PropertyKey::Computed(e) = key {
+                        refs_expr(e, direct, nested);
+                    }
+                    refs_expr(value, direct, nested);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A variable binding: the register holding it, and whether that register holds
+/// a *cell* (a one-element heap array) rather than the value directly. Captured
+/// variables are cells so closures share their mutations.
+#[derive(Clone, Copy)]
+struct Binding {
+    reg: Reg,
+    cell: bool,
+}
+
 /// A single-pass register-allocating compiler from the AST to [`Op`]s.
 #[derive(Default)]
 struct Compiler {
     ops: Vec<Op>,
-    /// Lexical scopes mapping a name to the register holding its value.
-    scopes: Vec<alloc::collections::BTreeMap<String, Reg>>,
+    /// Lexical scopes mapping a name to its binding.
+    scopes: Vec<alloc::collections::BTreeMap<String, Binding>>,
     next_reg: Reg,
     /// Function name → table id, for resolving calls.
-    fn_ids: alloc::collections::BTreeMap<String, u32>,
+    fn_ids: alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
+    /// The shared function table; nested function expressions append to it.
+    protos: alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
+    /// Names in *this* function that are captured by a nested function and so
+    /// must be stored as cells.
+    cell_names: alloc::collections::BTreeSet<String>,
     /// Per enclosing loop/switch: `break` jump indices awaiting the exit target
     /// (loops and `switch` both push here).
     break_sites: Vec<Vec<usize>>,
@@ -589,24 +981,68 @@ struct Compiler {
 }
 
 impl Compiler {
-    /// Compiles one function: binds `params` to registers `0..n`, compiles
-    /// `body`, and (for `is_main`) returns the last expression's value.
+    /// Compiles one function. `params` bind to registers `0..n_params`;
+    /// `captures` (a closure's free variables, in sorted order) bind to the next
+    /// registers as cells. For `is_main`, the last expression's value is
+    /// returned.
     fn compile_fn(
-        fn_ids: &alloc::collections::BTreeMap<String, u32>,
+        fn_ids: &alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
+        protos: &alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
         params: &[crate::ast::Param],
+        captures: &[String],
         body: &[Stmt],
         is_main: bool,
     ) -> Result<FnProto, CompileError> {
+        // Which of this function's own names are captured by nested functions →
+        // must be cells.
+        let cell_names = captured_names(params, body);
         let mut c = Compiler {
-            fn_ids: fn_ids.clone(),
+            fn_ids: alloc::rc::Rc::clone(fn_ids),
+            protos: alloc::rc::Rc::clone(protos),
+            cell_names,
             ..Compiler::default()
         };
         c.scopes.push(alloc::collections::BTreeMap::new());
-        for p in params {
+        // The VM places arguments in registers `0..n_params` and captured cells
+        // in `n_params..n_params + n_captures`, so reserve those slots first…
+        let arg_regs: Vec<Reg> = params.iter().map(|_| c.alloc()).collect();
+        let cap_regs: Vec<Reg> = captures.iter().map(|_| c.alloc()).collect();
+        // …then bind. A captured parameter is boxed into a fresh cell (preserving
+        // the incoming argument value); a captured local that's a parameter must
+        // share the cell so mutations are visible.
+        for (i, p) in params.iter().enumerate() {
             let BindingTarget::Ident(Ident { name, .. }) = &p.target else {
                 return Err(CompileError::Unsupported("destructuring parameter"));
             };
-            c.declare(name);
+            let b = if c.cell_names.contains(&**name) {
+                let cell = c.alloc();
+                c.ops.push(Op::NewArray { dst: cell, len: 1 });
+                let bind = Binding {
+                    reg: cell,
+                    cell: true,
+                };
+                c.write_var(bind, arg_regs[i]);
+                bind
+            } else {
+                Binding {
+                    reg: arg_regs[i],
+                    cell: false,
+                }
+            };
+            c.scopes
+                .last_mut()
+                .expect("a scope")
+                .insert(String::from(&**name), b);
+        }
+        // Captured cells arrive already boxed (the closure passes the cell).
+        for (j, name) in captures.iter().enumerate() {
+            c.scopes.last_mut().expect("a scope").insert(
+                name.clone(),
+                Binding {
+                    reg: cap_regs[j],
+                    cell: true,
+                },
+            );
         }
         let mut last: Option<Reg> = None;
         for stmt in body {
@@ -624,6 +1060,7 @@ impl Compiler {
         Ok(FnProto {
             n_regs: c.next_reg as usize,
             n_params: params.len(),
+            n_captures: captures.len(),
             ops: c.ops,
         })
     }
@@ -636,17 +1073,57 @@ impl Compiler {
         r
     }
 
-    fn declare(&mut self, name: &str) -> Reg {
-        let r = self.alloc();
+    /// Declares `name`, allocating a register (and a backing cell if the name is
+    /// captured). Returns the binding.
+    fn declare(&mut self, name: &str) -> Binding {
+        let reg = self.alloc();
+        let cell = self.cell_names.contains(name);
+        if cell {
+            // A fresh one-element cell to hold the value.
+            self.ops.push(Op::NewArray { dst: reg, len: 1 });
+        }
+        let b = Binding { reg, cell };
         self.scopes
             .last_mut()
             .expect("a scope")
-            .insert(String::from(name), r);
-        r
+            .insert(String::from(name), b);
+        b
     }
 
-    fn lookup(&self, name: &str) -> Option<Reg> {
+    fn lookup(&self, name: &str) -> Option<Binding> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+
+    /// Emits a read of `name` into a register and returns it (a cell read goes
+    /// through `GetElem`).
+    fn read_var(&mut self, b: Binding) -> Reg {
+        if b.cell {
+            let dst = self.alloc();
+            let idx = self.constant(NanBox::number(0.0)).expect("const");
+            self.ops.push(Op::GetElem {
+                dst,
+                arr: b.reg,
+                index: idx,
+            });
+            dst
+        } else {
+            b.reg
+        }
+    }
+
+    /// Emits a write of `src` into the variable bound by `b` (a cell write goes
+    /// through `SetElem`).
+    fn write_var(&mut self, b: Binding, src: Reg) {
+        if b.cell {
+            let idx = self.constant(NanBox::number(0.0)).expect("const");
+            self.ops.push(Op::SetElem {
+                arr: b.reg,
+                index: idx,
+                src,
+            });
+        } else {
+            self.ops.push(Op::Move { dst: b.reg, src });
+        }
     }
 
     /// Compiles a statement; returns the register of its value if it is an
@@ -750,10 +1227,27 @@ impl Compiler {
                 if let Some(catch) = handler {
                     self.scopes.push(alloc::collections::BTreeMap::new());
                     if let Some(BindingTarget::Ident(Ident { name, .. })) = &catch.param {
+                        // The thrown value is in `catch_reg`; box it into a cell
+                        // if the binding is captured.
+                        let b = if self.cell_names.contains(&**name) {
+                            let cell = self.alloc();
+                            self.ops.push(Op::NewArray { dst: cell, len: 1 });
+                            let bind = Binding {
+                                reg: cell,
+                                cell: true,
+                            };
+                            self.write_var(bind, catch_reg);
+                            bind
+                        } else {
+                            Binding {
+                                reg: catch_reg,
+                                cell: false,
+                            }
+                        };
                         self.scopes
                             .last_mut()
                             .expect("a scope")
-                            .insert(String::from(&**name), catch_reg);
+                            .insert(String::from(&**name), b);
                     }
                     for s in &catch.body {
                         self.stmt(s)?;
@@ -790,10 +1284,7 @@ impl Compiler {
                         }
                     };
                     let slot = self.declare(name);
-                    self.ops.push(Op::Move {
-                        dst: slot,
-                        src: value,
-                    });
+                    self.write_var(slot, value);
                 }
                 Ok(None)
             }
@@ -884,11 +1375,13 @@ impl Compiler {
                     b: len,
                 });
                 let jf = self.emit_jump_if_false(cond);
+                let cur = self.alloc();
                 self.ops.push(Op::GetElem {
-                    dst: elem,
+                    dst: cur,
                     arr,
                     index: i,
                 });
+                self.write_var(elem, cur);
                 self.enter_loop();
                 self.stmt(body)?;
                 let cont = self.ops.len(); // `continue` advances the index
@@ -980,8 +1473,8 @@ impl Compiler {
                 Ok(r)
             }
             Expr::Ident(id) => {
-                if let Some(reg) = self.lookup(&id.name) {
-                    Ok(reg)
+                if let Some(b) = self.lookup(&id.name) {
+                    Ok(self.read_var(b))
                 } else if let Some(&func) = self.fn_ids.get(&*id.name) {
                     // A function referenced as a value: materialize a closure.
                     let dst = self.alloc();
@@ -1136,17 +1629,18 @@ impl Compiler {
                 let compound = !matches!(op, AssignOp::Assign);
                 match &**target {
                     Expr::Ident(id) => {
-                        let slot = self
+                        let b = self
                             .lookup(&id.name)
                             .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
                         let v = self.expr(value)?;
                         let src = if compound {
-                            self.emit_binop(Self::compound_binop(*op)?, slot, v)?
+                            let cur = self.read_var(b);
+                            self.emit_binop(Self::compound_binop(*op)?, cur, v)?
                         } else {
                             v
                         };
-                        self.ops.push(Op::Move { dst: slot, src });
-                        Ok(slot)
+                        self.write_var(b, src);
+                        Ok(src)
                     }
                     // `obj.k (op)= v` / `arr[i] (op)= v`.
                     Expr::Member {
@@ -1189,7 +1683,7 @@ impl Compiler {
                 let Expr::Ident(id) = &**argument else {
                     return Err(CompileError::Unsupported("update target"));
                 };
-                let slot = self
+                let b = self
                     .lookup(&id.name)
                     .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
                 let one = self.constant(NanBox::number(1.0))?;
@@ -1198,20 +1692,71 @@ impl Compiler {
                     crate::ast::UpdateOp::Dec => BinaryOp::Sub,
                 };
                 // Keep the pre-update value for a postfix result.
+                let cur = self.read_var(b);
                 let old = self.alloc();
-                self.ops.push(Op::Move {
-                    dst: old,
-                    src: slot,
-                });
-                let next = self.emit_binop(bop, slot, one)?;
-                self.ops.push(Op::Move {
-                    dst: slot,
-                    src: next,
-                });
-                Ok(if *prefix { slot } else { old })
+                self.ops.push(Op::Move { dst: old, src: cur });
+                let next = self.emit_binop(bop, cur, one)?;
+                self.write_var(b, next);
+                Ok(if *prefix { next } else { old })
+            }
+            // A function expression / arrow → a closure capturing its free
+            // variables (as shared cells).
+            Expr::Function(f) => self.make_closure(&f.params, &f.body),
+            Expr::Arrow(a) => {
+                let body: Vec<Stmt> = match &a.body {
+                    crate::ast::ArrowBody::Block(b) => b.clone(),
+                    crate::ast::ArrowBody::Expr(e) => alloc::vec![Stmt::Return {
+                        argument: Some(Box::new((**e).clone())),
+                        span: crate::common::Span::point(0),
+                    }],
+                };
+                self.make_closure(&a.params, &body)
             }
             _ => Err(CompileError::Unsupported("expression")),
         }
+    }
+
+    /// Compiles a nested function into the shared table and emits the code to
+    /// build a closure over its captured cells.
+    fn make_closure(
+        &mut self,
+        params: &[crate::ast::Param],
+        body: &[Stmt],
+    ) -> Result<Reg, CompileError> {
+        // Captures = free variables that resolve to an enclosing binding (others
+        // are top-level functions / globals, reached directly).
+        let free = free_of_function(params, body);
+        let captures: Vec<String> = free
+            .into_iter()
+            .filter(|n| self.lookup(n).is_some())
+            .collect();
+        // Reserve the new function's table id, compile it, then store it.
+        let id = {
+            let mut p = self.protos.borrow_mut();
+            p.push(FnProto {
+                ops: Vec::new(),
+                n_regs: 0,
+                n_params: 0,
+                n_captures: 0,
+            });
+            (p.len() - 1) as u32
+        };
+        let proto =
+            Compiler::compile_fn(&self.fn_ids, &self.protos, params, &captures, body, false)?;
+        self.protos.borrow_mut()[id as usize] = proto;
+        // Capture the cell registers for each free variable (in the same sorted
+        // order the callee binds them).
+        let capture_regs: Vec<Reg> = captures
+            .iter()
+            .map(|n| self.lookup(n).expect("captured binding").reg)
+            .collect();
+        let dst = self.alloc();
+        self.ops.push(Op::MakeClosure {
+            dst,
+            func: id,
+            captures: capture_regs,
+        });
+        Ok(dst)
     }
 
     fn constant(&mut self, value: NanBox) -> Result<Reg, CompileError> {
@@ -1625,6 +2170,53 @@ mod tests {
                 "let s = 0; for (let i = 0; i < 4; i++) { switch (i) { case 1: continue; default: s += i; } } s"
             ),
             "5"
+        );
+    }
+
+    #[test]
+    fn bytecode_closures_and_capture() {
+        // Capture by value (read-only): currying.
+        assert_eq!(
+            bc("function adder(x) { return function(y) { return x + y; }; } adder(3)(4)"),
+            "7"
+        );
+        // Arrow closures, deeper currying.
+        assert_eq!(
+            bc("let add = (a) => (b) => (c) => a + b + c; add(1)(2)(3)"),
+            "6"
+        );
+        // Mutable shared capture: a counter whose closure mutates the captured
+        // variable — the headline closure case.
+        assert_eq!(
+            bc(
+                "function makeCounter() { let c = 0; return function() { c = c + 1; return c; }; }
+                let n = makeCounter();
+                n(); n(); n()"
+            ),
+            "3"
+        );
+        // Two counters keep independent state.
+        assert_eq!(
+            bc(
+                "function makeCounter() { let c = 0; return function() { c += 1; return c; }; }
+                let a = makeCounter(); let b = makeCounter();
+                a(); a(); b();
+                a() + ',' + b()"
+            ),
+            "3,2"
+        );
+        // A closure observes a mutation made after it was created (shared cell).
+        assert_eq!(
+            bc(
+                "function f() { let v = 'before'; let read = function() { return v; }; v = 'after'; return read(); } f()"
+            ),
+            "after"
+        );
+        // The accumulator pattern.
+        assert_eq!(
+            bc("function makeAcc() { let total = 0; return function(n) { total += n; return total; }; }
+                let acc = makeAcc(); acc(10); acc(20); acc(5)"),
+            "35"
         );
     }
 
