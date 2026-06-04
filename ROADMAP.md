@@ -501,11 +501,15 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   broad Test262 coverage of the language proper. **Done so far:** the
   instruction set + `Chunk`/`Module` containers (`src/bytecode/`), a
   disassembler (`kataan disasm`), the host-native serialization codec (below),
-  **and a working compiler + register VM** for a real subset — literals,
-  globals + block-scoped locals, the arithmetic/comparison ops, `&&`/`||`,
-  member/index reads, calls, assignment (incl. compound), `if`/`while`/blocks,
-  and **functions** (declarations hoisted, function/arrow expressions,
-  positional params, `return`, recursion + mutual recursion). Calls recurse
+  **and a working compiler + register VM** for a broad subset — literals,
+  globals + block-scoped locals, the full arithmetic/comparison set (incl.
+  `!=`/`!==`), `&&`/`||`/`??`, unary `-`/`!`, the ternary, template literals,
+  object/array literals + member/index reads and writes, assignment (incl.
+  compound, on identifiers and members), `if`/`else`, `while`/`do-while`/`for`
+  with `break`/`continue`, blocks, `return`, **functions** (declarations
+  hoisted, function/arrow expressions, positional params, recursion + mutual
+  recursion), and **method calls** with correct `this` plus built-in
+  prototype-method dispatch (`[…].map(…)`, `'…'.toUpperCase()`). Calls recurse
   through the shared call path, so bytecode/native/tree-walker callees
   interoperate; the VM reuses the tree-walker's value semantics. **Next:**
   closures/upvalues (capture currently triggers a tree-walker fallback),
