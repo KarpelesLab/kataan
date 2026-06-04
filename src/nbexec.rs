@@ -24,9 +24,9 @@
 //! remaining migration work. Pure, safe `alloc`-only Rust.
 
 use crate::ast::{
-    Argument, ArrayElement, Arrow, ArrowBody, AssignOp, BinaryOp, BindingTarget, Class,
-    ClassMember, Expr, ForInit, Function, Ident, LogicalOp, MethodKind, ObjectMember, Param,
-    Program, PropertyKey, Stmt, UnaryOp, VarDecl,
+    Argument, ArrayElement, ArrayPatternElement, Arrow, ArrowBody, AssignOp, BinaryOp,
+    BindingTarget, Class, ClassMember, Expr, ForInit, Function, Ident, LogicalOp, MethodKind,
+    ObjectMember, Param, Program, PropertyKey, Stmt, UnaryOp, VarDecl,
 };
 use crate::env::Scope;
 use crate::heap::Handle;
@@ -684,16 +684,26 @@ impl<'a> Interp<'a> {
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
         let call_scope = captured.child();
-        for (i, param) in def.params.iter().enumerate() {
-            let BindingTarget::Ident(Ident { name, .. }) = &param.target else {
-                return Err(ExecError::Unsupported("destructuring parameter"));
-            };
-            let value = args.get(i).copied().unwrap_or(NanBox::undefined());
-            call_scope.declare(name, value);
-        }
         let saved = core::mem::replace(&mut self.current, call_scope);
         let saved_this = core::mem::replace(&mut self.this_val, this_val);
-        let result = self.run_body(def.body);
+        let result = (|| {
+            for (i, param) in def.params.iter().enumerate() {
+                let value = if param.rest {
+                    let rest = args[i.min(args.len())..].to_vec();
+                    NanBox::handle(self.realm.new_array(rest).to_raw())
+                } else {
+                    let mut v = args.get(i).copied().unwrap_or(NanBox::undefined());
+                    if matches!(v.unpack(), Unpacked::Undefined)
+                        && let Some(d) = &param.default
+                    {
+                        v = self.eval(d)?;
+                    }
+                    v
+                };
+                self.bind_pattern(&param.target, value)?;
+            }
+            self.run_body(def.body)
+        })();
         self.current = saved;
         self.this_val = saved_this;
         // An `async` function returns a promise of its result (rejected on throw).
@@ -1469,14 +1479,82 @@ impl<'a> Interp<'a> {
 
     fn exec_var(&mut self, decl: &'a VarDecl) -> Result<(), ExecError> {
         for d in &decl.declarations {
-            let BindingTarget::Ident(Ident { name, .. }) = &d.target else {
-                return Err(ExecError::Unsupported("destructuring binding"));
-            };
             let value = match &d.init {
                 Some(e) => self.eval(e)?,
                 None => NanBox::undefined(),
             };
-            self.current.declare(name, value);
+            self.bind_pattern(&d.target, value)?;
+        }
+        Ok(())
+    }
+
+    /// Binds a (possibly destructuring) target to `value`, declaring the names
+    /// it introduces in the current scope.
+    fn bind_pattern(&mut self, target: &'a BindingTarget, value: NanBox) -> Result<(), ExecError> {
+        match target {
+            BindingTarget::Ident(Ident { name, .. }) => self.current.declare(name, value),
+            BindingTarget::Array(pat) => {
+                let elems = value
+                    .as_handle()
+                    .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default();
+                let mut i = 0;
+                for el in &pat.elements {
+                    match el {
+                        ArrayPatternElement::Hole => i += 1,
+                        ArrayPatternElement::Item {
+                            target, default, ..
+                        } => {
+                            let mut v = elems.get(i).copied().unwrap_or(NanBox::undefined());
+                            if matches!(v.unpack(), Unpacked::Undefined)
+                                && let Some(d) = default
+                            {
+                                v = self.eval(d)?;
+                            }
+                            self.bind_pattern(target, v)?;
+                            i += 1;
+                        }
+                        ArrayPatternElement::Rest { target, .. } => {
+                            let rest = elems[i.min(elems.len())..].to_vec();
+                            let h = self.realm.new_array(rest);
+                            self.bind_pattern(target, NanBox::handle(h.to_raw()))?;
+                        }
+                    }
+                }
+            }
+            BindingTarget::Object(pat) => {
+                let src = value.as_handle().map(Handle::from_raw);
+                let mut used: Vec<String> = Vec::new();
+                for prop in &pat.properties {
+                    let key = static_key(&prop.key)?;
+                    let mut v = src
+                        .and_then(|h| self.realm.get_property(h, &key))
+                        .unwrap_or(NanBox::undefined());
+                    if matches!(v.unpack(), Unpacked::Undefined)
+                        && let Some(d) = &prop.default
+                    {
+                        v = self.eval(d)?;
+                    }
+                    used.push(key);
+                    self.bind_pattern(&prop.value, v)?;
+                }
+                if let Some(rest) = &pat.rest {
+                    let obj = self.realm.new_object();
+                    if let Some(h) = src {
+                        for k in self.realm.object_keys(h).unwrap_or_default() {
+                            if !used.contains(&k) {
+                                let pv = self
+                                    .realm
+                                    .get_property(h, &k)
+                                    .unwrap_or(NanBox::undefined());
+                                self.realm.set_property(obj, &k, pv);
+                            }
+                        }
+                    }
+                    self.bind_pattern(rest, NanBox::handle(obj.to_raw()))?;
+                }
+            }
         }
         Ok(())
     }
@@ -2452,6 +2530,41 @@ mod tests {
         // typeof an async function is function; its call returns a promise.
         assert_eq!(run("async function a() {} typeof a"), "function");
         assert_eq!(run("async function a() { return 1; } typeof a()"), "object");
+    }
+
+    #[test]
+    fn destructuring() {
+        // Array destructuring with defaults, holes, and rest.
+        assert_eq!(run("let [a, b] = [1, 2]; a + b"), "3");
+        assert_eq!(run("let [a, , c] = [1, 2, 3]; a + c"), "4");
+        assert_eq!(run("let [a, b = 9] = [1]; a + b"), "10");
+        assert_eq!(
+            run("let [first, ...rest] = [1, 2, 3, 4]; rest.join(',')"),
+            "2,3,4"
+        );
+        // Object destructuring with shorthand, rename, default, and rest.
+        assert_eq!(run("let { x, y } = { x: 1, y: 2 }; x + y"), "3");
+        assert_eq!(run("let { a: p, b: q } = { a: 10, b: 20 }; p + q"), "30");
+        assert_eq!(run("let { m = 7 } = {}; m"), "7");
+        assert_eq!(
+            run("let { a, ...others } = { a: 1, b: 2, c: 3 }; Object.keys(others).join(',')"),
+            "b,c"
+        );
+        // Nested.
+        assert_eq!(run("let { p: { q } } = { p: { q: 42 } }; q"), "42");
+        assert_eq!(run("let [[a], [b]] = [[1], [2]]; a + b"), "3");
+        // Destructuring function parameters.
+        assert_eq!(run("function f([a, b]) { return a * b; } f([3, 4])"), "12");
+        assert_eq!(
+            run("function g({ x, y }) { return x + y; } g({ x: 5, y: 6 })"),
+            "11"
+        );
+        // Default and rest parameters.
+        assert_eq!(run("function h(a, b = 10) { return a + b; } h(5)"), "15");
+        assert_eq!(
+            run("function r(...xs) { return xs.length; } r(1, 2, 3)"),
+            "3"
+        );
     }
 
     #[test]
