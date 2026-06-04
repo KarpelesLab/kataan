@@ -385,6 +385,15 @@ impl Compiler {
             Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
             Stmt::Empty { .. } => Ok(None),
             Stmt::Function(_) => Ok(None),
+            Stmt::Class(class) => {
+                let Some(id) = &class.id else {
+                    return Err(CompileError::unsupported("anonymous class declaration"));
+                };
+                let ctor = self.compile_class(class)?;
+                let name = self.add_const(Const::Str(id.name.clone().into_string()));
+                self.emit(Op::SetGlobal { name, src: ctor });
+                Ok(None)
+            }
             Stmt::Return { argument, .. } => {
                 let src = match argument {
                     Some(e) => self.expr(e)?,
@@ -1076,6 +1085,189 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compiles a class to a constructor-function value carrying its prototype
+    /// (methods) and static members. Supports a constructor, instance/static
+    /// methods, and instance/static fields with simple keys. `extends`/`super`,
+    /// accessors, computed/private keys, generator/async methods, static
+    /// blocks, and captured members fall back to the tree-walker.
+    fn compile_class(&mut self, class: &crate::ast::Class) -> Result<Reg, CompileError> {
+        use crate::ast::{ClassMember, MethodKind};
+        if class.super_class.is_some() {
+            return Err(CompileError::unsupported("class `extends`"));
+        }
+        let mut ctor: Option<&Function> = None;
+        let mut instance_methods: Vec<(String, &Function)> = Vec::new();
+        let mut static_methods: Vec<(String, &Function)> = Vec::new();
+        let mut instance_fields: Vec<(String, Option<&Expr>)> = Vec::new();
+        let mut static_fields: Vec<(String, Option<&Expr>)> = Vec::new();
+        for member in &class.body {
+            match member {
+                ClassMember::Method(m) => {
+                    if m.value.is_generator || m.value.is_async {
+                        return Err(CompileError::unsupported("generator/async method"));
+                    }
+                    if !matches!(m.kind, MethodKind::Method | MethodKind::Constructor) {
+                        return Err(CompileError::unsupported("class accessor"));
+                    }
+                    if matches!(m.kind, MethodKind::Constructor) {
+                        ctor = Some(&m.value);
+                    } else {
+                        let name = simple_key(&m.key)?;
+                        if m.is_static {
+                            static_methods.push((name, &m.value));
+                        } else {
+                            instance_methods.push((name, &m.value));
+                        }
+                    }
+                }
+                ClassMember::Field(f) => {
+                    let name = simple_key(&f.key)?;
+                    if f.is_static {
+                        static_fields.push((name, f.value.as_ref()));
+                    } else {
+                        instance_fields.push((name, f.value.as_ref()));
+                    }
+                }
+                ClassMember::StaticBlock { .. } => {
+                    return Err(CompileError::unsupported("class static block"));
+                }
+            }
+        }
+
+        // The constructor chunk runs the instance-field initializers, then the
+        // declared constructor body.
+        let ctor_chunk = self.compile_constructor(ctor, &instance_fields)?;
+        let ctor_reg = self.reg();
+        let k = self.add_const(Const::Func(ctor_chunk as u32));
+        self.emit(Op::LoadConst { dst: ctor_reg, k });
+
+        // Build the prototype object with the instance methods.
+        let proto = self.reg();
+        self.emit(Op::NewObject { dst: proto });
+        for (name, func) in instance_methods {
+            let m = self.class_method_value(func)?;
+            let key = self.add_const(Const::Str(name));
+            self.emit(Op::SetProp {
+                obj: proto,
+                key,
+                src: m,
+            });
+        }
+        let proto_key = self.add_const(Const::Str(String::from("prototype")));
+        self.emit(Op::SetProp {
+            obj: ctor_reg,
+            key: proto_key,
+            src: proto,
+        });
+
+        // Static methods and fields live on the constructor object itself.
+        for (name, func) in static_methods {
+            let m = self.class_method_value(func)?;
+            let key = self.add_const(Const::Str(name));
+            self.emit(Op::SetProp {
+                obj: ctor_reg,
+                key,
+                src: m,
+            });
+        }
+        for (name, init) in static_fields {
+            let val = match init {
+                Some(e) => self.expr(e)?,
+                None => {
+                    let r = self.reg();
+                    self.emit(Op::LoadUndefined { dst: r });
+                    r
+                }
+            };
+            let key = self.add_const(Const::Str(name));
+            self.emit(Op::SetProp {
+                obj: ctor_reg,
+                key,
+                src: val,
+            });
+        }
+        Ok(ctor_reg)
+    }
+
+    /// Compiles one class method to a function value; a method that captures an
+    /// enclosing variable falls back (the class isn't modeled as a closure).
+    fn class_method_value(&mut self, func: &Function) -> Result<Reg, CompileError> {
+        let (idx, upvalues) =
+            self.compile_function(&func.params, FnBody::Block(&func.body), "<method>")?;
+        if !upvalues.is_empty() {
+            return Err(CompileError::unsupported("captured class method"));
+        }
+        Ok(self.emit_closure(idx, &upvalues))
+    }
+
+    /// Compiles a class constructor chunk: instance-field initializers
+    /// (`this.f = …`) followed by the declared constructor body.
+    fn compile_constructor(
+        &mut self,
+        ctor: Option<&Function>,
+        fields: &[(String, Option<&Expr>)],
+    ) -> Result<usize, CompileError> {
+        let params: &[Param] = ctor.map_or(&[], |f| &f.params);
+        if params.iter().any(|p| p.rest || p.default.is_some()) {
+            return Err(CompileError::unsupported("constructor rest/default param"));
+        }
+        let chunk_idx = self.module.len();
+        self.module.push(Chunk::new("<constructor>"));
+        self.module[chunk_idx].param_count = params.len() as u16;
+
+        let mut state = FnState::new(chunk_idx, alloc::collections::BTreeSet::new());
+        let mut param_slots = Vec::new();
+        for _ in params {
+            let r = state.next_reg;
+            state.next_reg += 1;
+            param_slots.push(r);
+        }
+        self.funcs.push(state);
+        for (p, slot) in params.iter().zip(param_slots) {
+            if let BindingTarget::Ident(id) = &p.target {
+                self.declare_local(id.name.clone().into_string(), slot);
+            } else {
+                self.funcs.pop();
+                return Err(CompileError::unsupported("constructor pattern param"));
+            }
+        }
+
+        // Instance fields: `this.name = <init>` (or `undefined`).
+        let result: Result<(), CompileError> = (|| {
+            for (name, init) in fields {
+                let val = match init {
+                    Some(e) => self.expr(e)?,
+                    None => {
+                        let r = self.reg();
+                        self.emit(Op::LoadUndefined { dst: r });
+                        r
+                    }
+                };
+                let key = self.add_const(Const::Str(name.clone()));
+                self.emit(Op::SetProp {
+                    obj: THIS_REG,
+                    key,
+                    src: val,
+                });
+            }
+            if let Some(f) = ctor {
+                self.compile_body(&f.body, false)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.funcs.pop();
+            return Err(e);
+        }
+        self.emit(Op::ReturnUndefined);
+        let finished = self.funcs.pop().expect("fn");
+        if !finished.upvalues.is_empty() {
+            return Err(CompileError::unsupported("captured constructor"));
+        }
+        self.module[chunk_idx].register_count = finished.next_reg;
+        Ok(chunk_idx)
+    }
+
     /// Compiles a function body into a new chunk; returns the chunk index and
     /// the upvalues it captured (so the caller can build a closure over it).
     fn compile_function(
@@ -1291,6 +1483,7 @@ impl Compiler {
                 }
                 self.call(callee, arguments)
             }
+            Expr::Class(class) => self.compile_class(class),
             Expr::Function(func) => {
                 let (idx, upvalues) = self.compile_function(
                     &func.params,
@@ -2163,6 +2356,16 @@ fn binop_code(op: BinaryOp) -> Option<u8> {
         BinaryOp::Instanceof => binop::INSTANCEOF,
         _ => return None,
     })
+}
+
+/// Extracts a simple (identifier/string) property key as a string; computed,
+/// numeric, and private keys are reported as unsupported.
+fn simple_key(key: &PropertyKey) -> Result<String, CompileError> {
+    match key {
+        PropertyKey::Ident(name) => Ok(name.clone().into_string()),
+        PropertyKey::Str(s) => Ok(s.clone().into_string()),
+        _ => Err(CompileError::unsupported("computed/private class key")),
+    }
 }
 
 /// Whether a call's argument list contains a spread (`f(...xs)`).

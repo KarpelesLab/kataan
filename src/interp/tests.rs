@@ -317,6 +317,70 @@ fn bytecode_vm_for_of() {
 }
 
 #[test]
+fn bytecode_vm_classes() {
+    // Constructor + instance methods + `this`.
+    assert_eq!(
+        eval_bc(
+            "class Point {
+               constructor(x, y) { this.x = x; this.y = y; }
+               norm() { return Math.sqrt(this.x * this.x + this.y * this.y); }
+             }
+             new Point(3, 4).norm()"
+        ),
+        "5"
+    );
+    // Instance fields with initializers.
+    assert_eq!(
+        eval_bc(
+            "class Box { value = 10; label = 'b'; total() { return this.value; } }
+             let b = new Box(); b.value += 5; b.total() + ',' + b.label"
+        ),
+        "15,b"
+    );
+    // A method mutating a field via `++`.
+    assert_eq!(
+        eval_bc(
+            "class Counter { count = 0; inc() { return ++this.count; } }
+             let c = new Counter(); c.inc(); c.inc(); c.inc()"
+        ),
+        "3"
+    );
+    // Static methods and fields.
+    assert_eq!(
+        eval_bc(
+            "class Registry { static items = []; static add(x) { Registry.items.push(x); return Registry.items.length; } }
+             Registry.add('a'); Registry.add('b')"
+        ),
+        "2"
+    );
+    // instanceof on a compiled class.
+    assert_eq!(
+        eval_bc("class A {} class B {} let a = new A(); (a instanceof A) + ',' + (a instanceof B)"),
+        "true,false"
+    );
+    // A method calling another method on `this`.
+    assert_eq!(
+        eval_bc(
+            "class Calc {
+               constructor(n) { this.n = n; }
+               double() { return this.n * 2; }
+               quadruple() { return this.double() * 2; }
+             }
+             new Calc(5).quadruple()"
+        ),
+        "20"
+    );
+    // A class round-trips through serialize → reload → run.
+    assert_eq!(
+        eval_bc_reloaded(
+            "class Adder { constructor(b) { this.b = b; } add(x) { return x + this.b; } }
+             new Adder(100).add(23)"
+        ),
+        "123"
+    );
+}
+
+#[test]
 fn bytecode_vm_closures() {
     // A counter closing over a mutable local (shared cell).
     assert_eq!(

@@ -1073,6 +1073,21 @@ impl<'a> Interp<'a> {
             // A native or callable-object constructor (e.g. `Error`, `Map`)
             // builds and returns the object.
             Value::Native(_) => self.call_with_this(callee, Value::Undefined, args),
+            // A bytecode-function constructor (a compiled class or `function`):
+            // the instance's prototype is the constructor's `.prototype`.
+            Value::Object(ref o) if o.bytecode_fn().is_some() || o.bound_fn().is_some() => {
+                let instance = match self.get_member(&callee, "prototype")? {
+                    Value::Object(p) => Obj::with_proto(p),
+                    _ => Obj::object(),
+                };
+                let this = Value::Object(instance);
+                let r = self.call_with_this(callee.clone(), this.clone(), args)?;
+                Ok(if matches!(r, Value::Object(_)) {
+                    r
+                } else {
+                    this
+                })
+            }
             Value::Object(ref o) if o.callable().is_some() => {
                 self.call_with_this(callee, Value::Undefined, args)
             }
@@ -1343,12 +1358,18 @@ impl<'a> Interp<'a> {
     fn instance_of(&self, value: &Value<'a>, ctor: &Value<'a>) -> Completion<'a, bool> {
         let target_proto = match ctor {
             Value::Class(cv) => Rc::clone(&cv.prototype),
-            // A built-in constructor object (Error, Map, …): use its
-            // `.prototype` property.
-            Value::Object(o) if o.callable().is_some() => match o.get("prototype") {
-                Value::Object(p) => p,
-                _ => return Ok(false),
-            },
+            // A callable object — a built-in constructor (Error, Map, …) or a
+            // compiled-class / bound constructor: use its `.prototype` property.
+            Value::Object(o)
+                if o.callable().is_some()
+                    || o.bytecode_fn().is_some()
+                    || o.bound_fn().is_some() =>
+            {
+                match o.get("prototype") {
+                    Value::Object(p) => p,
+                    _ => return Ok(false),
+                }
+            }
             _ => {
                 return Err(make_error(
                     "TypeError",
