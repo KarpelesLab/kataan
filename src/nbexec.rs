@@ -32,12 +32,14 @@ use alloc::vec::Vec;
 /// Why execution stopped.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ExecError {
-    /// A construct outside the supported subset (try/catch, generators, …).
+    /// A construct outside the supported subset (generators, classes, …).
     Unsupported(&'static str),
     /// A reference to an undeclared variable.
     NotDefined(String),
     /// A call of a non-function value.
     NotCallable,
+    /// A thrown JS value, propagating until a `catch` handles it.
+    Throw(NanBox),
 }
 
 /// The control-flow outcome of a statement.
@@ -236,16 +238,63 @@ impl<'a> Interp<'a> {
             }
             Stmt::Break { label: None, .. } => Ok(Flow::Break),
             Stmt::Continue { label: None, .. } => Ok(Flow::Continue),
+            Stmt::Throw { argument, .. } => {
+                let v = self.eval(argument)?;
+                Err(ExecError::Throw(v))
+            }
+            Stmt::Try {
+                block,
+                handler,
+                finalizer,
+                ..
+            } => self.exec_try(block, handler.as_ref(), finalizer.as_deref()),
             _ => Err(ExecError::Unsupported("statement")),
         }
     }
 
-    fn exec_block(&mut self, body: &'a [Stmt]) -> Result<Flow, ExecError> {
+    /// `try { … } catch (e) { … } finally { … }`. A `catch` handles a thrown
+    /// value; the `finally` block runs on every exit (normal, thrown, or
+    /// `return`/`break`/`continue`), and its own abrupt completion takes over.
+    fn exec_try(
+        &mut self,
+        block: &'a [Stmt],
+        handler: Option<&'a crate::ast::CatchClause>,
+        finalizer: Option<&'a [Stmt]>,
+    ) -> Result<Flow, ExecError> {
+        let mut outcome = self.exec_scoped(block);
+        // A thrown value is routed to the catch clause, if any.
+        if let (Err(ExecError::Throw(value)), Some(catch)) = (&outcome, handler) {
+            let thrown = *value;
+            let child = self.current.child();
+            if let Some(BindingTarget::Ident(Ident { name, .. })) = &catch.param {
+                child.declare(name, thrown);
+            }
+            let saved = core::mem::replace(&mut self.current, child);
+            outcome = self.exec_seq(&catch.body);
+            self.current = saved;
+        }
+        // `finally` runs regardless; an abrupt finally overrides the outcome.
+        if let Some(fin) = finalizer {
+            match self.exec_scoped(fin) {
+                Ok(Flow::Normal(_)) => outcome,
+                other => other, // finally returned/broke/threw → that wins
+            }
+        } else {
+            outcome
+        }
+    }
+
+    /// Runs a statement list in a fresh child scope.
+    fn exec_scoped(&mut self, body: &'a [Stmt]) -> Result<Flow, ExecError> {
         let child = self.current.child();
         let saved = core::mem::replace(&mut self.current, child);
         let result = self.exec_seq(body);
         self.current = saved;
         result
+    }
+
+    fn exec_block(&mut self, body: &'a [Stmt]) -> Result<Flow, ExecError> {
+        self.exec_scoped(body)
     }
 
     /// Executes a statement sequence in the current scope (with hoisting).
@@ -753,5 +802,58 @@ mod tests {
         let program = Parser::parse_program("let x = 5; x()").unwrap();
         let mut interp = Interp::new();
         assert_eq!(interp.run(&program), Err(ExecError::NotCallable));
+    }
+
+    #[test]
+    fn try_catch_finally() {
+        // A thrown value is caught and bound.
+        assert_eq!(
+            run("let r; try { throw 'boom'; r = 'no'; } catch (e) { r = 'caught:' + e; } r"),
+            "caught:boom"
+        );
+        // No throw: the catch is skipped.
+        assert_eq!(
+            run("let r = 'ok'; try { r = 'a'; } catch (e) { r = 'b'; } r"),
+            "a"
+        );
+        // finally always runs.
+        assert_eq!(
+            run(
+                "let log = ''; try { log += '1'; throw 0; } catch (e) { log += '2'; } finally { log += '3'; } log"
+            ),
+            "123"
+        );
+        // A throw out of a function is caught at the call site.
+        assert_eq!(
+            run("function boom() { throw 'x'; }
+                 let r; try { boom(); } catch (e) { r = 'got:' + e; } r"),
+            "got:x"
+        );
+        // catch without a binding.
+        assert_eq!(
+            run("let r = 'a'; try { throw 1; } catch { r = 'b'; } r"),
+            "b"
+        );
+    }
+
+    #[test]
+    fn uncaught_throw_propagates() {
+        let program = Parser::parse_program("throw 'oops'").unwrap();
+        let mut interp = Interp::new();
+        match interp.run(&program) {
+            Err(ExecError::Throw(v)) => {
+                assert_eq!(interp.realm().to_display_string(v), "oops");
+            }
+            other => panic!("expected a throw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finally_return_overrides() {
+        // A `return` in finally overrides the try's outcome.
+        assert_eq!(
+            run("function f() { try { return 'a'; } finally { return 'b'; } } f()"),
+            "b"
+        );
     }
 }
