@@ -667,6 +667,46 @@ fn promises() {
 }
 
 #[test]
+fn timers_and_event_loop() {
+    // Ordering: synchronous, then microtasks, then timers by delay.
+    assert_eq!(
+        eval_global(
+            "let log = '';
+             setTimeout(() => log += 'T0', 0);
+             setTimeout(() => log += 'T9', 9);
+             setTimeout(() => log += 'T5', 5);
+             Promise.resolve().then(() => log += 'M');
+             log += 'S';",
+            "log"
+        ),
+        "SMT0T5T9"
+    );
+    // Extra arguments are forwarded to the callback.
+    assert_eq!(
+        eval_global("let r; setTimeout((a, b) => r = a + b, 0, 3, 4);", "r"),
+        "7"
+    );
+    // clearTimeout cancels a pending timer.
+    assert_eq!(
+        eval_global(
+            "let r = 'no'; let id = setTimeout(() => r = 'yes', 5); clearTimeout(id);",
+            "r"
+        ),
+        "no"
+    );
+    // A timer can schedule a microtask, which runs before the next timer.
+    assert_eq!(
+        eval_global(
+            "let log = '';
+             setTimeout(() => { log += 'A'; Promise.resolve().then(() => log += 'a'); }, 0);
+             setTimeout(() => log += 'B', 1);",
+            "log"
+        ),
+        "AaB"
+    );
+}
+
+#[test]
 fn dates() {
     // Fixed timestamps keep the tests deterministic (no `Date.now`).
     assert_eq!(

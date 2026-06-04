@@ -51,10 +51,35 @@ pub(super) type Microtask<'a> = Box<dyn FnOnce(&mut Interp<'a>) + 'a>;
 pub(super) type MicrotaskQueue<'a> =
     Rc<core::cell::RefCell<alloc::collections::VecDeque<Microtask<'a>>>>;
 
+/// A scheduled timer callback (a macrotask).
+pub(super) struct Timer<'a> {
+    /// The timer id returned by `setTimeout` (for `clearTimeout`).
+    pub id: f64,
+    /// The requested delay; timers run in `(delay, seq)` order.
+    pub delay: f64,
+    /// Insertion order, to break ties deterministically.
+    pub seq: u64,
+    /// The callback and its extra arguments.
+    pub callback: Value<'a>,
+    pub args: Vec<Value<'a>>,
+}
+
+/// The timer queue plus its id/sequence counters.
+#[derive(Default)]
+pub(super) struct Timers<'a> {
+    pub queue: Vec<Timer<'a>>,
+    pub next_id: f64,
+    pub next_seq: u64,
+}
+
+/// The shared timer queue (cloned by `setTimeout`/`clearTimeout`).
+pub(super) type TimerQueue<'a> = Rc<core::cell::RefCell<Timers<'a>>>;
+
 /// The tree-walking interpreter, holding the global scope.
 pub struct Interp<'a> {
     global: Env<'a>,
     microtasks: MicrotaskQueue<'a>,
+    timers: TimerQueue<'a>,
 }
 
 impl<'a> Default for Interp<'a> {
@@ -75,6 +100,7 @@ impl<'a> Interp<'a> {
         let interp = Self {
             global,
             microtasks: Rc::new(core::cell::RefCell::new(alloc::collections::VecDeque::new())),
+            timers: Rc::new(core::cell::RefCell::new(Timers::default())),
         };
         interp.install_stdlib();
         interp
@@ -85,6 +111,11 @@ impl<'a> Interp<'a> {
         Rc::clone(&self.microtasks)
     }
 
+    /// A handle to the shared timer queue (for `setTimeout`/`clearTimeout`).
+    pub(super) fn timer_queue(&self) -> TimerQueue<'a> {
+        Rc::clone(&self.timers)
+    }
+
     /// Runs all queued microtasks to completion (the Promise reaction jobs),
     /// including any they enqueue in turn.
     pub(super) fn drain_microtasks(&mut self) {
@@ -92,6 +123,39 @@ impl<'a> Interp<'a> {
             let job = self.microtasks.borrow_mut().pop_front();
             match job {
                 Some(job) => job(self),
+                None => break,
+            }
+        }
+    }
+
+    /// Runs the event loop to quiescence: drains microtasks, then repeatedly
+    /// fires the earliest-due timer (by `(delay, seq)`) followed by a full
+    /// microtask drain, until no timers remain. Timers do not wait real time;
+    /// the delay only orders them (true waiting needs the host event loop).
+    pub(super) fn run_event_loop(&mut self) {
+        self.drain_microtasks();
+        loop {
+            // Pop the earliest-due timer.
+            let next = {
+                let mut timers = self.timers.borrow_mut();
+                timers
+                    .queue
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        a.delay
+                            .partial_cmp(&b.delay)
+                            .unwrap_or(core::cmp::Ordering::Equal)
+                            .then(a.seq.cmp(&b.seq))
+                    })
+                    .map(|(i, _)| i)
+                    .map(|i| timers.queue.remove(i))
+            };
+            match next {
+                Some(timer) => {
+                    let _ = self.call_with_this(timer.callback, Value::Undefined, timer.args);
+                    self.drain_microtasks();
+                }
                 None => break,
             }
         }
@@ -114,9 +178,9 @@ impl<'a> Interp<'a> {
         let global = Rc::clone(&self.global);
         self.hoist(&program.body, &global);
         let result = self.eval_stmts(&program.body, &global);
-        // Flush pending Promise reactions before returning (the script is the
-        // single macrotask; microtasks run to completion after it).
-        self.drain_microtasks();
+        // Run the event loop to quiescence (Promise microtasks + timers) before
+        // returning — the script is the initial macrotask.
+        self.run_event_loop();
         match result? {
             Flow::Normal(v) | Flow::Return(v) => Ok(v),
             _ => Ok(Value::Undefined),

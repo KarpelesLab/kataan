@@ -282,8 +282,47 @@ impl<'a> Interp<'a> {
         self.install_collections();
         self.install_date();
         self.install_promise();
+        self.install_timers();
         #[cfg(feature = "regex")]
         self.install_regexp();
+    }
+
+    /// Installs `setTimeout` / `clearTimeout` over the interpreter's timer
+    /// queue. (`setInterval` is omitted: with no real-time waiting it would
+    /// never terminate the event loop.)
+    fn install_timers(&self) {
+        use super::eval::Timer;
+        let timers = self.timer_queue();
+        let t = Rc::clone(&timers);
+        self.define_global(
+            "setTimeout",
+            native("setTimeout", move |a| {
+                let callback = arg(a, 0);
+                let delay = arg(a, 1).to_number().max(0.0);
+                let extra: Vec<Value> = a.iter().skip(2).cloned().collect();
+                let mut timers = t.borrow_mut();
+                let id = timers.next_id;
+                let seq = timers.next_seq;
+                timers.next_id += 1.0;
+                timers.next_seq += 1;
+                timers.queue.push(Timer {
+                    id,
+                    delay,
+                    seq,
+                    callback,
+                    args: extra,
+                });
+                Ok(Value::Number(id))
+            }),
+        );
+        let t = Rc::clone(&timers);
+        let clear = native("clearTimeout", move |a| {
+            let id = arg(a, 0).to_number();
+            t.borrow_mut().queue.retain(|timer| timer.id != id);
+            Ok(Value::Undefined)
+        });
+        self.define_global("clearTimeout", clear.clone());
+        self.define_global("clearInterval", clear);
     }
 
     /// Installs the `RegExp` constructor (the `regex` feature).
