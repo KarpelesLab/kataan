@@ -934,6 +934,55 @@ fn bytecode_vm_try_catch_throw() {
 }
 
 #[test]
+fn bytecode_vm_finally() {
+    // finally runs after a caught throw.
+    assert_eq!(
+        eval_bc(
+            "let log = '';
+             try { log += 'T'; throw 'e'; } catch (x) { log += 'C'; } finally { log += 'F'; }
+             log"
+        ),
+        "TCF"
+    );
+    // finally runs on normal completion (no catch).
+    assert_eq!(
+        eval_bc("let log = ''; try { log += 'T'; } finally { log += 'F'; } log"),
+        "TF"
+    );
+    // finally runs even when nothing is caught, before the error propagates.
+    assert_eq!(
+        eval_bc(
+            "let log = '';
+             try {
+               try { throw 'boom'; } finally { log += 'inner;'; }
+             } catch (e) { log += 'outer:' + e; }
+             log"
+        ),
+        "inner;outer:boom"
+    );
+    // finally observes a value mutated in catch.
+    assert_eq!(
+        eval_bc(
+            "let r = 0;
+             try { throw 1; } catch (e) { r = e; } finally { r += 10; }
+             r"
+        ),
+        "11"
+    );
+    // A throw inside catch still runs finally, then propagates.
+    assert_eq!(
+        eval_bc(
+            "let log = '';
+             try {
+               try { throw 'a'; } catch (e) { log += 'c;'; throw 'b'; } finally { log += 'f;'; }
+             } catch (e) { log += 'outer:' + e; }
+             log"
+        ),
+        "c;f;outer:b"
+    );
+}
+
+#[test]
 fn bytecode_vm_inequality_and_nullish() {
     assert_eq!(eval_bc("1 != 2"), "true");
     assert_eq!(eval_bc("1 != 1"), "false");

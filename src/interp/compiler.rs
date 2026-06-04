@@ -605,44 +605,97 @@ impl Compiler {
         Ok(None)
     }
 
-    /// Compiles `try { … } catch (e) { … }`. A `finally` block falls back to
-    /// the tree-walker for now (its run-on-every-path semantics need more than
-    /// a single guarded region).
+    /// Compiles `try { … } catch (e) { … } finally { … }`. With a `finally`
+    /// block, the guarded code must not `return`/`break`/`continue` *out* of the
+    /// try/catch (the VM has no completion-record unwinding yet) — those cases
+    /// fall back to the tree-walker; the `finally` body is duplicated on the
+    /// normal and exceptional exit paths.
     fn compile_try(
         &mut self,
         block: &[Stmt],
         handler: Option<&crate::ast::CatchClause>,
         finalizer: Option<&[Stmt]>,
     ) -> Result<Option<Reg>, CompileError> {
-        if finalizer.is_some() {
-            return Err(CompileError::unsupported("`finally`"));
+        if handler.is_none() && finalizer.is_none() {
+            return Err(CompileError::unsupported("`try` without `catch`/`finally`"));
         }
-        let Some(handler) = handler else {
-            return Err(CompileError::unsupported("`try` without `catch`"));
-        };
-        // The register the VM drops the thrown value into on a catch.
+        // The `finally` lowering can't yet thread abrupt completions through.
+        if finalizer.is_some()
+            && (escapes_via_abrupt(block) || handler.is_some_and(|h| escapes_via_abrupt(&h.body)))
+        {
+            return Err(CompileError::unsupported(
+                "`finally` with return/break/continue",
+            ));
+        }
+
+        // --- guarded region (try block) ---
         let err_reg = self.reg();
         let ph = self.emit(Op::PushHandler {
             catch: 0,
             err: err_reg,
         });
-        // Guarded region.
         let mark = self.funcs.last().expect("fn").locals.len();
         for s in block {
             self.stmt(s)?;
         }
         self.funcs.last_mut().expect("fn").locals.truncate(mark);
         self.emit(Op::PopHandler);
-        let skip_catch = self.emit(Op::Jump { offset: 0 });
+        // Normal completion of the try block jumps over the handler.
+        let skip_handler = self.emit(Op::Jump { offset: 0 });
 
-        // Catch entry: patch the handler's catch offset to here.
+        // --- handler entry (try block threw; error in `err_reg`) ---
         let catch_pc = self.code_len();
         let ci = self.ci();
         self.module[ci].code[ph] = Op::PushHandler {
             catch: (catch_pc as i64 - (ph as i64 + 1)) as i32,
             err: err_reg,
         };
-        // Bind the catch parameter (if any) to the error register.
+
+        if let Some(handler) = handler {
+            // catch (e) { … } — optionally with a finally on both exits.
+            if let Some(fin) = finalizer {
+                // Guard the catch body so the finally also runs if it throws.
+                let err2 = self.reg();
+                let ph2 = self.emit(Op::PushHandler {
+                    catch: 0,
+                    err: err2,
+                });
+                self.compile_catch_body(handler, err_reg)?;
+                self.emit(Op::PopHandler);
+                let skip_rethrow = self.emit(Op::Jump { offset: 0 });
+                // Catch body threw → run finally, then rethrow.
+                let h2_pc = self.code_len();
+                let ci = self.ci();
+                self.module[ci].code[ph2] = Op::PushHandler {
+                    catch: (h2_pc as i64 - (ph2 as i64 + 1)) as i32,
+                    err: err2,
+                };
+                self.compile_finally(fin)?;
+                self.emit(Op::Throw { src: err2 });
+                self.patch_to_here(skip_rethrow);
+            } else {
+                self.compile_catch_body(handler, err_reg)?;
+            }
+        } else if let Some(fin) = finalizer {
+            // try { … } finally { … } — run finally on the error path, rethrow.
+            self.compile_finally(fin)?;
+            self.emit(Op::Throw { src: err_reg });
+        }
+
+        // Normal path lands here.
+        self.patch_to_here(skip_handler);
+        if let Some(fin) = finalizer {
+            self.compile_finally(fin)?;
+        }
+        Ok(None)
+    }
+
+    /// Compiles a catch clause body, binding its parameter to `err_reg`.
+    fn compile_catch_body(
+        &mut self,
+        handler: &crate::ast::CatchClause,
+        err_reg: Reg,
+    ) -> Result<(), CompileError> {
         let mark = self.funcs.last().expect("fn").locals.len();
         if let Some(BindingTarget::Ident(id)) = &handler.param {
             self.declare_local(id.name.clone().into_string(), err_reg);
@@ -653,8 +706,17 @@ impl Compiler {
             self.stmt(s)?;
         }
         self.funcs.last_mut().expect("fn").locals.truncate(mark);
-        self.patch_to_here(skip_catch);
-        Ok(None)
+        Ok(())
+    }
+
+    /// Compiles a `finally` block (a scoped statement list).
+    fn compile_finally(&mut self, fin: &[Stmt]) -> Result<(), CompileError> {
+        let mark = self.funcs.last().expect("fn").locals.len();
+        for s in fin {
+            self.stmt(s)?;
+        }
+        self.funcs.last_mut().expect("fn").locals.truncate(mark);
+        Ok(())
     }
 
     /// Binds `value_reg` to a binding target — a simple identifier or an
@@ -2655,6 +2717,58 @@ fn binop_code(op: BinaryOp) -> Option<u8> {
         BinaryOp::Instanceof => binop::INSTANCEOF,
         _ => return None,
     })
+}
+
+/// Whether a statement list can complete abruptly *out of itself* via
+/// `return`, or a `break`/`continue` that targets an enclosing loop/switch
+/// (i.e. one not contained in a loop/switch within these statements). Such
+/// completions would need to run an enclosing `finally` first, which the VM
+/// can't yet thread — so they trigger a tree-walker fallback.
+fn escapes_via_abrupt(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| stmt_escapes(s, 0))
+}
+
+fn stmt_escapes(s: &Stmt, loop_depth: usize) -> bool {
+    match s {
+        Stmt::Return { .. } => true,
+        Stmt::Break { .. } | Stmt::Continue { .. } => loop_depth == 0,
+        Stmt::Block { body, .. } => body.iter().any(|s| stmt_escapes(s, loop_depth)),
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            stmt_escapes(consequent, loop_depth)
+                || alternate
+                    .as_ref()
+                    .is_some_and(|a| stmt_escapes(a, loop_depth))
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForIn { body, .. }
+        | Stmt::ForOf { body, .. } => stmt_escapes(body, loop_depth + 1),
+        Stmt::Labeled { body, .. } => stmt_escapes(body, loop_depth),
+        Stmt::Switch { cases, .. } => cases
+            .iter()
+            .any(|c| c.body.iter().any(|s| stmt_escapes(s, loop_depth + 1))),
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            block.iter().any(|s| stmt_escapes(s, loop_depth))
+                || handler
+                    .as_ref()
+                    .is_some_and(|h| h.body.iter().any(|s| stmt_escapes(s, loop_depth)))
+                || finalizer
+                    .as_ref()
+                    .is_some_and(|f| f.iter().any(|s| stmt_escapes(s, loop_depth)))
+        }
+        // Function/class bodies are separate scopes; their returns don't escape.
+        _ => false,
+    }
 }
 
 /// Extracts a simple (identifier/string) property key as a string; computed,
