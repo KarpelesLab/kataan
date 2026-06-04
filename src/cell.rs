@@ -114,6 +114,14 @@ pub enum Cell {
         /// strict equality.
         entries: Vec<(NanBox, NanBox)>,
     },
+    /// A `Symbol` primitive: an immutable description and a process-unique id.
+    /// Symbols compare by identity (two `Symbol("x")` are distinct).
+    Symbol {
+        /// The optional description (`Symbol("desc").description`).
+        description: alloc::boxed::Box<str>,
+        /// A unique id, assigned at creation, giving the symbol its identity.
+        id: u64,
+    },
 }
 
 impl Cell {
@@ -251,12 +259,22 @@ impl Cell {
             | Cell::Native(_)
             | Cell::BoundNative { .. }
             | Cell::Class { .. } => "function",
+            Cell::Symbol { .. } => "symbol",
             Cell::Object(_)
             | Cell::Array(_)
             | Cell::Collection { .. }
             | Cell::Promise(_)
             | Cell::Date(_)
             | Cell::RegExp { .. } => "object",
+        }
+    }
+
+    /// The `(description, id)` of this symbol, if it is one.
+    #[must_use]
+    pub fn as_symbol(&self) -> Option<(&str, u64)> {
+        match self {
+            Cell::Symbol { description, id } => Some((description, *id)),
+            _ => None,
         }
     }
 }
@@ -303,7 +321,11 @@ impl Trace for Cell {
             // A bound native keeps its target reachable.
             Cell::BoundNative { target, .. } => visit(*target),
             // Strings, native functions, dates, and regexes reference no handles.
-            Cell::Str(_) | Cell::Native(_) | Cell::Date(_) | Cell::RegExp { .. } => {}
+            Cell::Str(_)
+            | Cell::Native(_)
+            | Cell::Date(_)
+            | Cell::RegExp { .. }
+            | Cell::Symbol { .. } => {}
         }
     }
 }
@@ -336,7 +358,11 @@ impl crate::gc::Relocate for Cell {
                 }
             }
             Cell::BoundNative { target, .. } => *target = forward(*target),
-            Cell::Str(_) | Cell::Native(_) | Cell::Date(_) | Cell::RegExp { .. } => {}
+            Cell::Str(_)
+            | Cell::Native(_)
+            | Cell::Date(_)
+            | Cell::RegExp { .. }
+            | Cell::Symbol { .. } => {}
         }
     }
 }

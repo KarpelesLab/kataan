@@ -43,6 +43,8 @@ pub struct Realm {
     /// incremental marking cycle is running. The write barrier shades stored
     /// references into it so concurrent mutation stays sound.
     incremental: Option<gc::IncrementalMarker>,
+    /// Monotonic counter giving each `Symbol` a unique identity.
+    next_symbol_id: u64,
 }
 
 impl Default for Realm {
@@ -60,6 +62,7 @@ impl Realm {
             root_shape: Shape::root(),
             atoms: AtomTable::new(),
             incremental: None,
+            next_symbol_id: 1,
         }
     }
 
@@ -72,6 +75,25 @@ impl Realm {
     /// Allocates a string value in the heap and returns its handle.
     pub fn new_string(&mut self, s: &str) -> Handle {
         self.heap.alloc(Cell::Str(Rope::from(s)))
+    }
+
+    /// Allocates a fresh, unique `Symbol` with the given description.
+    pub fn new_symbol(&mut self, description: &str) -> Handle {
+        let id = self.next_symbol_id;
+        self.next_symbol_id += 1;
+        self.heap.alloc(Cell::Symbol {
+            description: alloc::boxed::Box::from(description),
+            id,
+        })
+    }
+
+    /// The `(description, id)` of the symbol at `handle`, if it is one.
+    #[must_use]
+    pub fn symbol_at(&self, handle: Handle) -> Option<(alloc::string::String, u64)> {
+        self.heap
+            .get(handle)?
+            .as_symbol()
+            .map(|(d, id)| (alloc::string::String::from(d), id))
     }
 
     /// Allocates an array of `elements` in the heap and returns its handle.
@@ -649,6 +671,7 @@ impl Realm {
                 Some(Cell::Promise(_)) => "[object Promise]".into(),
                 Some(Cell::Date(ms)) => date_to_iso(*ms),
                 Some(Cell::RegExp { source, flags }) => alloc::format!("/{source}/{flags}"),
+                Some(Cell::Symbol { description, .. }) => alloc::format!("Symbol({description})"),
                 None => "undefined".into(), // stale handle
             },
         }

@@ -120,6 +120,10 @@ pub struct Interp<'a> {
     this_val: NanBox,
     /// When running a generator body eagerly, the buffer `yield` appends to.
     gen_sink: Option<Vec<NanBox>>,
+    /// The `Symbol.for` global registry: shared symbols keyed by string.
+    symbol_registry: alloc::collections::BTreeMap<String, NanBox>,
+    /// Cached well-known symbols (e.g. `Symbol.iterator`), created on first use.
+    well_known_symbols: alloc::collections::BTreeMap<&'static str, NanBox>,
     /// The superclass to invoke for `super(...)` inside the running constructor.
     pending_super: Option<(u32, Scope)>,
     /// The class of the currently-running method (for `super.method()`).
@@ -182,6 +186,7 @@ const N_OBJECT_FROM_ENTRIES: u16 = 34;
 const N_OBJECT_FREEZE: u16 = 35;
 const N_OBJECT_IS_FROZEN: u16 = 36;
 const N_OBJECT_GET_OWN_NAMES: u16 = 37;
+const N_SYMBOL: u16 = 38;
 const N_PARSE_FLOAT: u16 = 31;
 const N_IS_NAN: u16 = 32;
 const N_IS_FINITE: u16 = 33;
@@ -223,6 +228,8 @@ impl<'a> Interp<'a> {
             class_envs: Vec::new(),
             this_val: NanBox::undefined(),
             gen_sink: None,
+            symbol_registry: alloc::collections::BTreeMap::new(),
+            well_known_symbols: alloc::collections::BTreeMap::new(),
             pending_super: None,
             current_home: None,
             pending_label: None,
@@ -334,6 +341,7 @@ impl<'a> Interp<'a> {
             ("isFinite", N_IS_FINITE),
             ("Map", N_MAP),
             ("Set", N_SET),
+            ("Symbol", N_SYMBOL),
         ] {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -380,6 +388,14 @@ impl<'a> Interp<'a> {
             }
             N_NUMBER => NanBox::number(self.realm.to_number(arg(0))),
             N_BOOLEAN => NanBox::boolean(self.realm.truthy(arg(0))),
+            N_SYMBOL => {
+                let desc = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                    String::new()
+                } else {
+                    self.realm.to_display_string(arg(0))
+                };
+                NanBox::handle(self.realm.new_symbol(&desc).to_raw())
+            }
             N_PARSE_INT => {
                 let s = self.realm.to_display_string(arg(0));
                 let radix = match args.get(1) {
@@ -1574,6 +1590,39 @@ impl<'a> Interp<'a> {
         // --- `Date.now()` static ---
         if self.realm.native_at(handle) == Some(N_DATE) && method == "now" {
             return Ok(Some(NanBox::number(now_ms())));
+        }
+        // --- `Symbol.for` / `Symbol.keyFor` (the global symbol registry) ---
+        if self.realm.native_at(handle) == Some(N_SYMBOL) {
+            match method {
+                "for" => {
+                    let key = self.realm.to_display_string(arg(0));
+                    if let Some(s) = self.symbol_registry.get(&key) {
+                        return Ok(Some(*s));
+                    }
+                    let sym = NanBox::handle(self.realm.new_symbol(&key).to_raw());
+                    self.symbol_registry.insert(key, sym);
+                    return Ok(Some(sym));
+                }
+                "keyFor" => {
+                    let target = arg(0);
+                    let found = self
+                        .symbol_registry
+                        .iter()
+                        .find(|(_, v)| self.realm.strict_equals(**v, target))
+                        .map(|(k, _)| k.clone());
+                    return Ok(Some(match found {
+                        Some(k) => self.new_str(&k),
+                        None => NanBox::undefined(),
+                    }));
+                }
+                _ => {}
+            }
+        }
+        // --- symbol instance: `sym.toString()` ---
+        if let Some((desc, _)) = self.realm.symbol_at(handle)
+            && method == "toString"
+        {
+            return Ok(Some(self.new_str(&alloc::format!("Symbol({desc})"))));
         }
         // --- `Number.*` / `String.*` statics (on the constructor) ---
         match self.realm.native_at(handle) {
@@ -3081,6 +3130,21 @@ impl<'a> Interp<'a> {
 
     // --- expressions ---
 
+    /// Returns the cached well-known symbol `name` (e.g. `iterator`), creating it
+    /// on first use. Each is a stable, unique symbol for the realm's lifetime.
+    fn well_known_symbol(&mut self, name: &'static str) -> NanBox {
+        if let Some(s) = self.well_known_symbols.get(name) {
+            return *s;
+        }
+        let sym = NanBox::handle(
+            self.realm
+                .new_symbol(&alloc::format!("Symbol.{name}"))
+                .to_raw(),
+        );
+        self.well_known_symbols.insert(name, sym);
+        sym
+    }
+
     /// Evaluates `e` and returns its JS truthiness (heap-aware, so an empty
     /// string is falsy).
     fn eval_truthy(&mut self, e: &'a Expr) -> Result<bool, ExecError> {
@@ -3512,6 +3576,27 @@ impl<'a> Interp<'a> {
         handle: crate::heap::Handle,
         name: &str,
     ) -> Result<NanBox, ExecError> {
+        // Well-known `Symbol.iterator` / `Symbol.asyncIterator` (lazily created).
+        if self.realm.native_at(handle) == Some(N_SYMBOL)
+            && matches!(
+                name,
+                "iterator" | "asyncIterator" | "hasInstance" | "toPrimitive"
+            )
+        {
+            let key: &'static str = match name {
+                "iterator" => "iterator",
+                "asyncIterator" => "asyncIterator",
+                "hasInstance" => "hasInstance",
+                _ => "toPrimitive",
+            };
+            return Ok(self.well_known_symbol(key));
+        }
+        // A symbol's `description`.
+        if let Some((desc, _)) = self.realm.symbol_at(handle)
+            && name == "description"
+        {
+            return Ok(self.new_str(&desc));
+        }
         // `Number.*` static constants.
         if self.realm.native_at(handle) == Some(N_NUMBER) {
             match name {
@@ -4888,6 +4973,18 @@ mod tests {
             run("class C { #s = 1; constructor(){ this.p = 2; } } Object.keys(new C()).join(',')"),
             "p"
         );
+    }
+
+    #[test]
+    fn symbols() {
+        assert_eq!(run("typeof Symbol('x')"), "symbol");
+        assert_eq!(run("Symbol('hi').toString()"), "Symbol(hi)");
+        assert_eq!(run("Symbol('hi').description"), "hi");
+        assert_eq!(run("Symbol('a') === Symbol('a')"), "false");
+        assert_eq!(run("let s = Symbol(); s === s"), "true");
+        assert_eq!(run("Symbol.for('k') === Symbol.for('k')"), "true");
+        assert_eq!(run("Symbol.keyFor(Symbol.for('k2'))"), "k2");
+        assert_eq!(run("typeof Symbol.iterator"), "symbol");
     }
 
     #[test]
