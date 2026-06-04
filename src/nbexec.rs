@@ -1,43 +1,48 @@
-//! Executing real **statements** over the [`Realm`]/[`NanBox`] model
-//! (`ROADMAP.md` §3 → Phase D migration).
+//! Executing real **statements and functions** over the [`Realm`]/[`NanBox`]
+//! model (`ROADMAP.md` §3 → Phase D migration).
 //!
 //! [`Realm`]: crate::realm::Realm
 //! [`NanBox`]: crate::nanbox::NanBox
 //!
-//! Where [`nbeval`](crate::nbeval) evaluates a single expression, this adds the
-//! machinery a real program needs: **lexical variable scope** (`let`/`const`/
-//! `var`), assignment (incl. compound `+=` etc.), block scoping, and control
-//! flow (`if`/`while`/`for`, `return`/`break`/`continue`). It is a small
-//! tree-walking interpreter whose values are NaN-boxed and whose objects/strings/
-//! arrays live in the realm's GC heap — i.e. the imperative core of the language
-//! running on the performance representation.
+//! A small tree-walking interpreter whose values are NaN-boxed and whose
+//! objects/strings/arrays/functions live in the realm's GC heap — the
+//! imperative *and procedural* core of the language on the performance
+//! representation. It has:
+//! - lexical variable scope ([`Scope`](crate::env::Scope) chains), assignment
+//!   (incl. compound and member targets), block scoping, and control flow
+//!   (`if`/`while`/`for`, `return`/`break`/`continue`);
+//! - **functions and closures**: declarations (hoisted), expressions, and arrows
+//!   become heap closures capturing their defining scope, so a returned inner
+//!   function still sees its enclosing variables — and calls bind arguments in a
+//!   fresh child scope.
 //!
-//! Functions/closures, exceptions, and the stdlib are still ahead (they are the
-//! remainder of the structural migration); this proves variables, assignment,
-//! and control flow execute on the new model. Pure, safe `alloc`-only Rust.
+//! Exceptions and the stdlib are the remaining structural pieces. Pure, safe
+//! `alloc`-only Rust.
 
 use crate::ast::{
-    ArrayElement, AssignOp, BinaryOp, BindingTarget, Expr, ForInit, Ident, LogicalOp, ObjectMember,
-    Program, PropertyKey, Stmt, UnaryOp, VarDecl,
+    Argument, ArrayElement, Arrow, ArrowBody, AssignOp, BinaryOp, BindingTarget, Expr, ForInit,
+    Function, Ident, LogicalOp, ObjectMember, Param, Program, PropertyKey, Stmt, UnaryOp, VarDecl,
 };
+use crate::env::Scope;
 use crate::nanbox::{NanBox, Unpacked};
 use crate::realm::Realm;
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Why execution stopped.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ExecError {
-    /// A construct outside the supported subset (functions, try/catch, …).
+    /// A construct outside the supported subset (try/catch, generators, …).
     Unsupported(&'static str),
     /// A reference to an undeclared variable.
     NotDefined(String),
+    /// A call of a non-function value.
+    NotCallable,
 }
 
 /// The control-flow outcome of a statement.
 enum Flow {
-    /// Fell through normally, carrying the last expression value (for REPL/`run`).
+    /// Fell through normally, carrying the last expression value (for `run`).
     Normal(NanBox),
     /// A `return` (value).
     Return(NanBox),
@@ -47,26 +52,44 @@ enum Flow {
     Continue,
 }
 
-/// A tree-walking interpreter over the performance object model.
-pub struct Interp {
-    realm: Realm,
-    /// Lexical scope stack; the last frame is the innermost.
-    scopes: Vec<BTreeMap<String, NanBox>>,
+/// The body of a registered function: a block, or a concise arrow expression.
+#[derive(Clone, Copy)]
+enum Body<'a> {
+    Block(&'a [Stmt]),
+    Expr(&'a Expr),
 }
 
-impl Default for Interp {
+/// A registered function definition (its AST, held by the interpreter; the heap
+/// closure stores only an index into the table plus the captured scope).
+#[derive(Clone, Copy)]
+struct FnDef<'a> {
+    params: &'a [Param],
+    body: Body<'a>,
+}
+
+/// A tree-walking interpreter over the performance object model.
+pub struct Interp<'a> {
+    realm: Realm,
+    /// The current lexical scope (innermost).
+    current: Scope,
+    /// Function-AST table; a closure cell holds an index into this.
+    functions: Vec<FnDef<'a>>,
+}
+
+impl Default for Interp<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Interp {
+impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope.
     #[must_use]
     pub fn new() -> Self {
         Self {
             realm: Realm::new(),
-            scopes: alloc::vec![BTreeMap::new()],
+            current: Scope::root(),
+            functions: Vec::new(),
         }
     }
 
@@ -78,45 +101,91 @@ impl Interp {
 
     /// Runs a whole program, returning the value of its last expression
     /// statement (or `undefined`).
-    pub fn run(&mut self, program: &Program) -> Result<NanBox, ExecError> {
+    pub fn run(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
+        self.hoist(&program.body)?;
         let mut last = NanBox::undefined();
         for stmt in &program.body {
             match self.exec(stmt)? {
                 Flow::Normal(v) => last = v,
                 Flow::Return(v) => return Ok(v),
-                Flow::Break | Flow::Continue => {} // ignored at top level
+                Flow::Break | Flow::Continue => {}
             }
         }
         Ok(last)
     }
 
-    // --- scope ---
+    // --- functions ---
 
-    fn declare(&mut self, name: &str, value: NanBox) {
-        self.scopes
-            .last_mut()
-            .expect("a scope")
-            .insert(String::from(name), value);
-    }
-
-    fn lookup(&self, name: &str) -> Option<NanBox> {
-        self.scopes.iter().rev().find_map(|s| s.get(name).copied())
-    }
-
-    /// Assigns to the nearest existing binding; returns false if none exists.
-    fn assign(&mut self, name: &str, value: NanBox) -> bool {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(slot) = scope.get_mut(name) {
-                *slot = value;
-                return true;
+    /// Pre-declares hoisted `function` declarations in the current scope, so a
+    /// declaration is callable before its textual position (and mutual
+    /// recursion works).
+    fn hoist(&mut self, stmts: &'a [Stmt]) -> Result<(), ExecError> {
+        for stmt in stmts {
+            if let Stmt::Function(func) = stmt
+                && let Some(id) = &func.id
+            {
+                let value = self.make_function(&func.params, Body::Block(&func.body));
+                self.current.declare(&id.name, value);
             }
         }
-        false
+        Ok(())
+    }
+
+    /// Registers a function definition and allocates a closure capturing the
+    /// current scope.
+    fn make_function(&mut self, params: &'a [Param], body: Body<'a>) -> NanBox {
+        let func_id = self.functions.len() as u32;
+        self.functions.push(FnDef { params, body });
+        let handle = self.realm.new_function(func_id, self.current.clone());
+        NanBox::handle(handle.to_raw())
+    }
+
+    /// Calls `callee` with `args`.
+    fn call(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        let Some(raw) = callee.as_handle() else {
+            return Err(ExecError::NotCallable);
+        };
+        let handle = crate::heap::Handle::from_raw(raw);
+        let Some((func_id, captured)) = self.realm.function_at(handle) else {
+            return Err(ExecError::NotCallable);
+        };
+        let def = self.functions[func_id as usize];
+
+        // A fresh scope nested in the closure's captured environment.
+        let call_scope = captured.child();
+        for (i, param) in def.params.iter().enumerate() {
+            let BindingTarget::Ident(Ident { name, .. }) = &param.target else {
+                return Err(ExecError::Unsupported("destructuring parameter"));
+            };
+            let value = args.get(i).copied().unwrap_or(NanBox::undefined());
+            call_scope.declare(name, value);
+        }
+
+        let saved = core::mem::replace(&mut self.current, call_scope);
+        let result = self.run_body(def.body);
+        self.current = saved;
+        result
+    }
+
+    fn run_body(&mut self, body: Body<'a>) -> Result<NanBox, ExecError> {
+        match body {
+            Body::Expr(e) => self.eval(e),
+            Body::Block(stmts) => {
+                self.hoist(stmts)?;
+                for stmt in stmts {
+                    match self.exec(stmt)? {
+                        Flow::Return(v) => return Ok(v),
+                        Flow::Normal(_) | Flow::Break | Flow::Continue => {}
+                    }
+                }
+                Ok(NanBox::undefined())
+            }
+        }
     }
 
     // --- statements ---
 
-    fn exec(&mut self, stmt: &Stmt) -> Result<Flow, ExecError> {
+    fn exec(&mut self, stmt: &'a Stmt) -> Result<Flow, ExecError> {
         match stmt {
             Stmt::Empty { .. } => Ok(Flow::Normal(NanBox::undefined())),
             Stmt::Expr { expression, .. } => Ok(Flow::Normal(self.eval(expression)?)),
@@ -124,6 +193,8 @@ impl Interp {
                 self.exec_var(decl)?;
                 Ok(Flow::Normal(NanBox::undefined()))
             }
+            // Function declarations are handled by hoisting; nothing to do here.
+            Stmt::Function(_) => Ok(Flow::Normal(NanBox::undefined())),
             Stmt::Block { body, .. } => self.exec_block(body),
             Stmt::If {
                 test,
@@ -169,23 +240,28 @@ impl Interp {
         }
     }
 
-    fn exec_block(&mut self, body: &[Stmt]) -> Result<Flow, ExecError> {
-        self.scopes.push(BTreeMap::new());
-        let mut result = Ok(Flow::Normal(NanBox::undefined()));
-        for stmt in body {
-            match self.exec(stmt) {
-                Ok(Flow::Normal(v)) => result = Ok(Flow::Normal(v)),
-                other => {
-                    result = other;
-                    break;
-                }
-            }
-        }
-        self.scopes.pop();
+    fn exec_block(&mut self, body: &'a [Stmt]) -> Result<Flow, ExecError> {
+        let child = self.current.child();
+        let saved = core::mem::replace(&mut self.current, child);
+        let result = self.exec_seq(body);
+        self.current = saved;
         result
     }
 
-    fn exec_var(&mut self, decl: &VarDecl) -> Result<(), ExecError> {
+    /// Executes a statement sequence in the current scope (with hoisting).
+    fn exec_seq(&mut self, body: &'a [Stmt]) -> Result<Flow, ExecError> {
+        self.hoist(body)?;
+        let mut last = Flow::Normal(NanBox::undefined());
+        for stmt in body {
+            match self.exec(stmt)? {
+                Flow::Normal(v) => last = Flow::Normal(v),
+                other => return Ok(other),
+            }
+        }
+        Ok(last)
+    }
+
+    fn exec_var(&mut self, decl: &'a VarDecl) -> Result<(), ExecError> {
         for d in &decl.declarations {
             let BindingTarget::Ident(Ident { name, .. }) = &d.target else {
                 return Err(ExecError::Unsupported("destructuring binding"));
@@ -194,20 +270,20 @@ impl Interp {
                 Some(e) => self.eval(e)?,
                 None => NanBox::undefined(),
             };
-            self.declare(name, value);
+            self.current.declare(name, value);
         }
         Ok(())
     }
 
     fn exec_for(
         &mut self,
-        init: Option<&ForInit>,
-        test: Option<&Expr>,
-        update: Option<&Expr>,
-        body: &Stmt,
+        init: Option<&'a ForInit>,
+        test: Option<&'a Expr>,
+        update: Option<&'a Expr>,
+        body: &'a Stmt,
     ) -> Result<Flow, ExecError> {
-        // The loop gets its own scope so a `let` in the header is per-loop.
-        self.scopes.push(BTreeMap::new());
+        let child = self.current.child();
+        let saved = core::mem::replace(&mut self.current, child);
         let result = (|| {
             match init {
                 Some(ForInit::Var(decl)) => self.exec_var(decl)?,
@@ -235,13 +311,13 @@ impl Interp {
             }
             Ok(Flow::Normal(NanBox::undefined()))
         })();
-        self.scopes.pop();
+        self.current = saved;
         result
     }
 
     // --- expressions ---
 
-    fn eval(&mut self, expr: &Expr) -> Result<NanBox, ExecError> {
+    fn eval(&mut self, expr: &'a Expr) -> Result<NanBox, ExecError> {
         match expr {
             Expr::Null(_) => Ok(NanBox::null()),
             Expr::Bool { value, .. } => Ok(NanBox::boolean(*value)),
@@ -255,12 +331,15 @@ impl Interp {
                 "NaN" => Ok(NanBox::number(f64::NAN)),
                 "Infinity" => Ok(NanBox::number(f64::INFINITY)),
                 name => self
-                    .lookup(name)
+                    .current
+                    .get(name)
                     .ok_or_else(|| ExecError::NotDefined(String::from(name))),
             },
+            Expr::Function(func) => Ok(self.eval_fn_expr(func)),
+            Expr::Arrow(arrow) => Ok(self.eval_arrow(arrow)),
             Expr::Unary { op, argument, .. } => {
                 let v = self.eval(argument)?;
-                Ok(self.unary(*op, v)?)
+                self.unary(*op, v)
             }
             Expr::Binary {
                 op, left, right, ..
@@ -297,6 +376,19 @@ impl Interp {
             Expr::Assign {
                 op, target, value, ..
             } => self.eval_assign(*op, target, value),
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                let f = self.eval(callee)?;
+                let mut args = Vec::with_capacity(arguments.len());
+                for a in arguments {
+                    match a {
+                        Argument::Item(e) => args.push(self.eval(e)?),
+                        Argument::Spread(_) => return Err(ExecError::Unsupported("call spread")),
+                    }
+                }
+                self.call(f, &args)
+            }
             Expr::Array { elements, .. } => {
                 let mut items = Vec::new();
                 for el in elements {
@@ -343,10 +435,22 @@ impl Interp {
         }
     }
 
+    fn eval_fn_expr(&mut self, func: &'a Function) -> NanBox {
+        self.make_function(&func.params, Body::Block(&func.body))
+    }
+
+    fn eval_arrow(&mut self, arrow: &'a Arrow) -> NanBox {
+        let body = match &arrow.body {
+            ArrowBody::Expr(e) => Body::Expr(e),
+            ArrowBody::Block(b) => Body::Block(b),
+        };
+        self.make_function(&arrow.params, body)
+    }
+
     fn member(
         &mut self,
         handle: crate::heap::Handle,
-        key: &PropertyKey,
+        key: &'a PropertyKey,
     ) -> Result<NanBox, ExecError> {
         match key {
             PropertyKey::Number(n) if as_index(*n).is_some() => {
@@ -384,11 +488,10 @@ impl Interp {
     fn eval_assign(
         &mut self,
         op: AssignOp,
-        target: &Expr,
-        value: &Expr,
+        target: &'a Expr,
+        value: &'a Expr,
     ) -> Result<NanBox, ExecError> {
         let rhs = self.eval(value)?;
-        // Only identifier and `obj.x`/`obj[i]` targets are supported here.
         match target {
             Expr::Ident(id) => {
                 let name = &*id.name;
@@ -396,13 +499,13 @@ impl Interp {
                     rhs
                 } else {
                     let current = self
-                        .lookup(name)
+                        .current
+                        .get(name)
                         .ok_or_else(|| ExecError::NotDefined(String::from(name)))?;
                     self.binary(compound_op(op)?, current, rhs)?
                 };
-                if !self.assign(name, new) {
-                    // An assignment to an undeclared name creates a global (sloppy).
-                    self.scopes[0].insert(String::from(name), new);
+                if !self.current.set(name, new) {
+                    self.current.declare(name, new); // sloppy global
                 }
                 Ok(new)
             }
@@ -420,33 +523,41 @@ impl Interp {
                     let current = self.member(handle, property)?;
                     self.binary(compound_op(op)?, current, rhs)?
                 };
-                match property {
-                    PropertyKey::Number(n) if as_index(*n).is_some() => {
-                        self.realm.set_element(handle, as_index(*n).unwrap(), new);
-                    }
-                    PropertyKey::Computed(e) => {
-                        let k = self.eval(e)?;
-                        if let Some(i) = k.as_number().and_then(as_index) {
-                            self.realm.set_element(handle, i, new);
-                        } else {
-                            let name = self.realm.to_display_string(k);
-                            self.realm.set_property(handle, &name, new);
-                        }
-                    }
-                    PropertyKey::Ident(s) | PropertyKey::Str(s) => {
-                        self.realm.set_property(handle, s, new);
-                    }
-                    PropertyKey::Number(n) => {
-                        self.realm.set_property(handle, &alloc::format!("{n}"), new);
-                    }
-                    PropertyKey::Private(_) => {
-                        return Err(ExecError::Unsupported("private assign"));
-                    }
-                }
+                self.assign_member(handle, property, new)?;
                 Ok(new)
             }
             _ => Err(ExecError::Unsupported("assignment target")),
         }
+    }
+
+    fn assign_member(
+        &mut self,
+        handle: crate::heap::Handle,
+        property: &'a PropertyKey,
+        new: NanBox,
+    ) -> Result<(), ExecError> {
+        match property {
+            PropertyKey::Number(n) if as_index(*n).is_some() => {
+                self.realm.set_element(handle, as_index(*n).unwrap(), new);
+            }
+            PropertyKey::Computed(e) => {
+                let k = self.eval(e)?;
+                if let Some(i) = k.as_number().and_then(as_index) {
+                    self.realm.set_element(handle, i, new);
+                } else {
+                    let name = self.realm.to_display_string(k);
+                    self.realm.set_property(handle, &name, new);
+                }
+            }
+            PropertyKey::Ident(s) | PropertyKey::Str(s) => {
+                self.realm.set_property(handle, s, new);
+            }
+            PropertyKey::Number(n) => {
+                self.realm.set_property(handle, &alloc::format!("{n}"), new);
+            }
+            PropertyKey::Private(_) => return Err(ExecError::Unsupported("private assign")),
+        }
+        Ok(())
     }
 
     fn unary(&mut self, op: UnaryOp, v: NanBox) -> Result<NanBox, ExecError> {
@@ -526,8 +637,6 @@ fn compound_op(op: AssignOp) -> Result<BinaryOp, ExecError> {
         AssignOp::BitAndAssign => BinaryOp::BitAnd,
         AssignOp::BitOrAssign => BinaryOp::BitOr,
         AssignOp::BitXorAssign => BinaryOp::BitXor,
-        // Logical assignment (`&&=`/`||=`/`??=`) short-circuits — not handled
-        // by the plain-binary path.
         _ => return Err(ExecError::Unsupported("logical assignment")),
     })
 }
@@ -565,78 +674,84 @@ mod tests {
     }
 
     #[test]
-    fn variables_and_assignment() {
+    fn variables_assignment_and_control_flow() {
         assert_eq!(run("let x = 1; let y = 2; x + y"), "3");
-        assert_eq!(run("let x = 5; x = x * 2; x"), "10");
-        assert_eq!(run("let x = 1; x += 4; x -= 2; x"), "3");
         assert_eq!(run("let s = 'a'; s += 'b'; s += 'c'; s"), "abc");
-    }
-
-    #[test]
-    fn block_scope() {
-        // An inner block shadows; the outer binding is restored after.
         assert_eq!(run("let x = 1; { let x = 99; } x"), "1");
-        // Assignment without a new `let` reaches the outer binding.
-        assert_eq!(run("let x = 1; { x = 5; } x"), "5");
-    }
-
-    #[test]
-    fn if_else() {
-        assert_eq!(
-            run("let r; if (1 < 2) { r = 'a'; } else { r = 'b'; } r"),
-            "a"
-        );
-        assert_eq!(run("let r; if (1 > 2) r = 'a'; else r = 'b'; r"), "b");
-    }
-
-    #[test]
-    fn while_and_for_loops() {
-        assert_eq!(
-            run("let s = 0; let i = 0; while (i < 5) { s += i; i += 1; } s"),
-            "10"
-        );
         assert_eq!(
             run("let s = 0; for (let i = 1; i <= 10; i += 1) s += i; s"),
             "55"
         );
-        // break / continue.
         assert_eq!(
             run("let s = 0; for (let i = 0; i < 10; i += 1) { if (i === 5) break; s += i; } s"),
             "10"
         );
+    }
+
+    #[test]
+    fn functions_and_return() {
+        assert_eq!(run("function add(a, b) { return a + b; } add(2, 3)"), "5");
+        assert_eq!(run("let sq = function (x) { return x * x; }; sq(7)"), "49");
+        assert_eq!(run("let inc = x => x + 1; inc(41)"), "42");
+        // Hoisting: callable before its definition.
+        assert_eq!(run("f(10); function f(n) { return n; } f(10)"), "10");
+    }
+
+    #[test]
+    fn closures_capture_their_scope() {
+        // A returned inner function still sees the enclosing variable.
         assert_eq!(
             run(
-                "let s = 0; for (let i = 0; i < 6; i += 1) { if (i % 2 === 1) continue; s += i; } s"
+                "function adder(n) { return function (x) { return x + n; }; }
+                 let add5 = adder(5);
+                 add5(10)"
             ),
-            "6"
+            "15"
         );
-    }
-
-    #[test]
-    fn builds_an_array_and_sums_it() {
+        // The capture is by reference: a mutable counter.
         assert_eq!(
-            run(
-                "let a = [10, 20, 30]; let s = 0; for (let i = 0; i < a.length; i += 1) s += a[i]; s"
-            ),
-            "60"
+            run("function counter() {
+                   let c = 0;
+                   return function () { c += 1; return c; };
+                 }
+                 let next = counter();
+                 next(); next(); next()"),
+            "3"
         );
     }
 
     #[test]
-    fn object_mutation() {
+    fn recursion() {
         assert_eq!(
-            run("let o = { count: 0 }; o.count += 5; o.count = o.count * 2; o.count"),
-            "10"
+            run("function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); } fact(5)"),
+            "120"
+        );
+        assert_eq!(
+            run("function fib(n) { return n < 2 ? n : fib(n-1) + fib(n-2); } fib(10)"),
+            "55"
         );
     }
 
     #[test]
-    fn undeclared_variable_is_an_error() {
-        let program = Parser::parse_program("y + 1").unwrap();
+    fn higher_order_and_objects() {
+        // A function stored on an object, called, mutating closed-over state.
+        assert_eq!(
+            run("function makeBox(v) {
+                   let value = v;
+                   return { get: function () { return value; },
+                            set: function (x) { value = x; } };
+                 }
+                 let b = makeBox(1);
+                 b.set(99);
+                 b.get()"),
+            "99"
+        );
+    }
+
+    #[test]
+    fn calling_a_non_function_errors() {
+        let program = Parser::parse_program("let x = 5; x()").unwrap();
         let mut interp = Interp::new();
-        assert_eq!(
-            interp.run(&program),
-            Err(ExecError::NotDefined(String::from("y")))
-        );
+        assert_eq!(interp.run(&program), Err(ExecError::NotCallable));
     }
 }

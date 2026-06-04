@@ -15,6 +15,7 @@
 //!
 //! Pure, safe `alloc`-only Rust.
 
+use crate::env::Scope;
 use crate::gc::Trace;
 use crate::heap::Handle;
 use crate::nanbox::NanBox;
@@ -30,6 +31,14 @@ pub enum Cell {
     Str(Rope),
     /// A dense array of element values.
     Array(Vec<NanBox>),
+    /// A closure: an index into the interpreter's function table plus the
+    /// lexical scope it captured at definition.
+    Function {
+        /// Index into the owning interpreter's function table (the AST body).
+        func_id: u32,
+        /// The captured lexical environment.
+        env: Scope,
+    },
 }
 
 impl Cell {
@@ -76,12 +85,23 @@ impl Cell {
         }
     }
 
+    /// The function's `(func_id, captured env)`, if this cell is a function.
+    #[must_use]
+    pub fn as_function(&self) -> Option<(u32, &Scope)> {
+        match self {
+            Cell::Function { func_id, env } => Some((*func_id, env)),
+            _ => None,
+        }
+    }
+
     /// The `typeof` string for this reference value (`"string"` for strings,
-    /// `"object"` for objects and arrays — JS has no array primitive type).
+    /// `"function"` for functions, `"object"` for objects and arrays — JS has no
+    /// array primitive type).
     #[must_use]
     pub fn type_of(&self) -> &'static str {
         match self {
             Cell::Str(_) => "string",
+            Cell::Function { .. } => "function",
             Cell::Object(_) | Cell::Array(_) => "object",
         }
     }
@@ -98,6 +118,8 @@ impl Trace for Cell {
                     }
                 }
             }
+            // A closure keeps its captured environment's handles alive.
+            Cell::Function { env, .. } => env.for_each_handle(visit),
             Cell::Str(_) => {} // a string references no handles
         }
     }

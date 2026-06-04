@@ -74,6 +74,19 @@ impl Realm {
         self.heap.alloc(Cell::Array(elements))
     }
 
+    /// Allocates a closure: a function-table index plus its captured scope.
+    pub fn new_function(&mut self, func_id: u32, env: crate::env::Scope) -> Handle {
+        self.heap.alloc(Cell::Function { func_id, env })
+    }
+
+    /// The `(func_id, captured env)` of the function at `handle`, or `None` if it
+    /// is not callable.
+    #[must_use]
+    pub fn function_at(&self, handle: Handle) -> Option<(u32, crate::env::Scope)> {
+        let (id, env) = self.heap.get(handle)?.as_function()?;
+        Some((id, env.clone()))
+    }
+
     /// The string at `handle` as a `String`, or `None` if it is not a string
     /// (or the handle is stale).
     #[must_use]
@@ -232,6 +245,7 @@ impl Realm {
                     parts.join(",")
                 }
                 Some(Cell::Object(_)) => "[object Object]".into(),
+                Some(Cell::Function { .. }) => "function () { … }".into(),
                 None => "undefined".into(), // stale handle
             },
         }
