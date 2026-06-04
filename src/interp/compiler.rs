@@ -195,9 +195,6 @@ impl Compiler {
             }
             Stmt::Var(decl) => {
                 for d in &decl.declarations {
-                    let BindingTarget::Ident(id) = &d.target else {
-                        return Err(CompileError::unsupported("destructuring declaration"));
-                    };
                     let value = match &d.init {
                         Some(init) => self.expr(init)?,
                         None => {
@@ -206,12 +203,7 @@ impl Compiler {
                             r
                         }
                     };
-                    let slot = self.reg();
-                    self.emit(Op::Move {
-                        dst: slot,
-                        src: value,
-                    });
-                    self.declare_local(id.name.clone().into_string(), slot);
+                    self.bind_pattern(&d.target, value)?;
                 }
                 Ok(None)
             }
@@ -429,6 +421,151 @@ impl Compiler {
         self.funcs.last_mut().expect("fn").locals.truncate(mark);
         self.patch_to_here(skip_catch);
         Ok(None)
+    }
+
+    /// Binds `value_reg` to a binding target — a simple identifier or an
+    /// array/object destructuring pattern (recursively).
+    fn bind_pattern(&mut self, target: &BindingTarget, value_reg: Reg) -> Result<(), CompileError> {
+        match target {
+            BindingTarget::Ident(id) => {
+                let slot = self.reg();
+                self.emit(Op::Move {
+                    dst: slot,
+                    src: value_reg,
+                });
+                self.declare_local(id.name.clone().into_string(), slot);
+                Ok(())
+            }
+            BindingTarget::Array(pat) => {
+                use crate::ast::ArrayPatternElement;
+                for (i, el) in pat.elements.iter().enumerate() {
+                    match el {
+                        ArrayPatternElement::Hole => {}
+                        ArrayPatternElement::Item {
+                            target, default, ..
+                        } => {
+                            // element = value[i]
+                            let idx = self.reg();
+                            self.emit(Op::LoadInt {
+                                dst: idx,
+                                value: i as i32,
+                            });
+                            let element = self.reg();
+                            self.emit(Op::GetElem {
+                                dst: element,
+                                obj: value_reg,
+                                index: idx,
+                            });
+                            let element = self.apply_default(element, default.as_ref())?;
+                            self.bind_pattern(target, element)?;
+                        }
+                        ArrayPatternElement::Rest { target, .. } => {
+                            // rest = value.slice(i)
+                            let key = self.reg();
+                            let k = self.add_const(Const::Str(String::from("slice")));
+                            self.emit(Op::LoadConst { dst: key, k });
+                            let from = self.reg();
+                            self.emit(Op::LoadInt {
+                                dst: from,
+                                value: i as i32,
+                            });
+                            // The single argument occupies a fresh window slot.
+                            let args_base = self.funcs.last().expect("fn").next_reg;
+                            let slot = self.reg();
+                            self.emit(Op::Move {
+                                dst: slot,
+                                src: from,
+                            });
+                            let rest = self.reg();
+                            self.emit(Op::CallMethod {
+                                dst: rest,
+                                recv: value_reg,
+                                key,
+                                args_base,
+                                argc: 1,
+                            });
+                            self.bind_pattern(target, rest)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            BindingTarget::Object(pat) => {
+                if pat.rest.is_some() {
+                    return Err(CompileError::unsupported("object rest pattern"));
+                }
+                for prop in &pat.properties {
+                    let value = match &prop.key {
+                        PropertyKey::Ident(name) => {
+                            let dst = self.reg();
+                            let key = self.add_const(Const::Str(name.clone().into_string()));
+                            self.emit(Op::GetProp {
+                                dst,
+                                obj: value_reg,
+                                key,
+                            });
+                            dst
+                        }
+                        PropertyKey::Str(s) => {
+                            let dst = self.reg();
+                            let key = self.add_const(Const::Str(s.clone().into_string()));
+                            self.emit(Op::GetProp {
+                                dst,
+                                obj: value_reg,
+                                key,
+                            });
+                            dst
+                        }
+                        PropertyKey::Computed(e) => {
+                            let index = self.expr(e)?;
+                            let dst = self.reg();
+                            self.emit(Op::GetElem {
+                                dst,
+                                obj: value_reg,
+                                index,
+                            });
+                            dst
+                        }
+                        _ => return Err(CompileError::unsupported("object pattern key")),
+                    };
+                    let value = self.apply_default(value, prop.default.as_ref())?;
+                    self.bind_pattern(&prop.value, value)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// If `default` is present, replaces `value_reg` with the default when it is
+    /// `undefined`. Returns the register holding the resolved value.
+    fn apply_default(
+        &mut self,
+        value_reg: Reg,
+        default: Option<&Expr>,
+    ) -> Result<Reg, CompileError> {
+        let Some(default) = default else {
+            return Ok(value_reg);
+        };
+        let undef = self.reg();
+        self.emit(Op::LoadUndefined { dst: undef });
+        let is_undef = self.reg();
+        self.emit(Op::StrictEq {
+            dst: is_undef,
+            a: value_reg,
+            b: undef,
+        });
+        // If not undefined, skip the default assignment.
+        let jf = self.emit(Op::JumpIfFalse {
+            cond: is_undef,
+            offset: 0,
+        });
+        let d = self.expr(default)?;
+        self.emit(Op::Move {
+            dst: value_reg,
+            src: d,
+        });
+        self.patch_to_here(jf);
+        Ok(value_reg)
     }
 
     /// Compiles `for (x of iterable)` (`keys = false`) or `for (x in obj)`

@@ -317,6 +317,33 @@ fn bytecode_vm_for_of() {
 }
 
 #[test]
+fn bytecode_vm_destructuring() {
+    // Array destructuring.
+    assert_eq!(eval_bc("let [a, b] = [1, 2]; a + b"), "3");
+    assert_eq!(eval_bc("let [a, , c] = [1, 2, 3]; a + c"), "4");
+    assert_eq!(
+        eval_bc("let [first, ...rest] = [1, 2, 3, 4]; rest.length"),
+        "3"
+    );
+    assert_eq!(eval_bc("let [a, b = 10] = [5]; a + b"), "15");
+    // Object destructuring.
+    assert_eq!(eval_bc("let { x, y } = { x: 7, y: 8 }; x * y"), "56");
+    assert_eq!(eval_bc("let { a: p, b: q } = { a: 1, b: 2 }; p - q"), "-1");
+    assert_eq!(eval_bc("let { x, y = 99 } = { x: 1 }; x + y"), "100");
+    // Nested destructuring.
+    assert_eq!(
+        eval_bc("let { p: [a, b], q } = { p: [1, 2], q: 3 }; a + b + q"),
+        "6"
+    );
+    assert_eq!(eval_bc("let [{ v }] = [{ v: 42 }]; v"), "42");
+    // Destructuring from a function result.
+    assert_eq!(
+        eval_bc("function pair() { return [10, 20]; } let [a, b] = pair(); a + b"),
+        "30"
+    );
+}
+
+#[test]
 fn bytecode_vm_for_in() {
     // Own keys of an object.
     assert_eq!(
