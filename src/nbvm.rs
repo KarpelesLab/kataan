@@ -2166,6 +2166,9 @@ struct Compiler {
     /// point (`switch` does *not* push here — `continue` targets the nearest
     /// loop).
     continue_sites: Vec<Vec<usize>>,
+    /// Active statement labels → the `break_sites`/`continue_sites` stack index
+    /// of the loop they label (for `break label` / `continue label`).
+    labels: Vec<(String, usize)>,
 }
 
 impl Compiler {
@@ -2815,8 +2818,42 @@ impl Compiler {
                     .push(j);
                 Ok(None)
             }
-            Stmt::Break { .. } | Stmt::Continue { .. } => {
-                Err(CompileError::Unsupported("labeled break/continue"))
+            Stmt::Break {
+                label: Some(label), ..
+            } => {
+                let idx = self
+                    .labels
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n == &*label.name)
+                    .map(|(_, i)| *i)
+                    .ok_or(CompileError::Unsupported("break to unknown label"))?;
+                let j = self.emit_jump();
+                self.break_sites[idx].push(j);
+                Ok(None)
+            }
+            Stmt::Continue {
+                label: Some(label), ..
+            } => {
+                let idx = self
+                    .labels
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n == &*label.name)
+                    .map(|(_, i)| *i)
+                    .ok_or(CompileError::Unsupported("continue to unknown label"))?;
+                let j = self.emit_jump();
+                self.continue_sites[idx].push(j);
+                Ok(None)
+            }
+            // A labeled loop: record the label against the loop's site index so
+            // `break label` / `continue label` can target it.
+            Stmt::Labeled { label, body, .. } => {
+                let idx = self.break_sites.len(); // the loop pushes its sites here
+                self.labels.push((String::from(&*label.name), idx));
+                let r = self.stmt(body);
+                self.labels.pop();
+                r
             }
             Stmt::While { test, body, .. } => {
                 let top = self.ops.len();
@@ -3104,6 +3141,45 @@ impl Compiler {
                         obj,
                         ids: ids.into(),
                     });
+                    return Ok(dst);
+                }
+                // `x instanceof Error/TypeError/…` (the built-in error objects we
+                // model as `{ name, message }`): compare the `name` property.
+                if matches!(op, BinaryOp::Instanceof)
+                    && let Expr::Ident(cls) = &**right
+                    && matches!(
+                        &*cls.name,
+                        "Error"
+                            | "TypeError"
+                            | "RangeError"
+                            | "SyntaxError"
+                            | "ReferenceError"
+                            | "EvalError"
+                            | "URIError"
+                    )
+                {
+                    let obj = self.expr(left)?;
+                    let name = self
+                        .member_read(obj, &PropertyKey::Ident(alloc::boxed::Box::from("name")))?;
+                    let want = self.constant_str(&cls.name);
+                    let dst = self.alloc();
+                    // `instanceof Error` matches any of our error objects.
+                    if &*cls.name == "Error" {
+                        // name ends with "Error" → treat as an Error instance.
+                        let suffix = self.constant_str("Error");
+                        self.ops.push(Op::CallMethod {
+                            dst,
+                            recv: name,
+                            key: String::from("endsWith"),
+                            args: alloc::vec![suffix],
+                        });
+                    } else {
+                        self.ops.push(Op::StrictEq {
+                            dst,
+                            a: name,
+                            b: want,
+                        });
+                    }
                     return Ok(dst);
                 }
                 let a = self.expr(left)?;
@@ -3476,6 +3552,45 @@ impl Compiler {
                 Ok(if *prefix { next } else { old })
             }
             Expr::This(_) => Ok(self.this_reg),
+            // A comma sequence: evaluate all, yield the last.
+            Expr::Sequence { expressions, .. } => {
+                let mut last = self.constant(NanBox::undefined())?;
+                for e in expressions {
+                    last = self.expr(e)?;
+                }
+                Ok(last)
+            }
+            // A tagged template `tag`a${x}b`` → `tag(strings, x, …)`.
+            Expr::TaggedTemplate { tag, quasi, .. } => {
+                let strings = self.alloc();
+                self.ops.push(Op::NewArray {
+                    dst: strings,
+                    len: 0,
+                });
+                for q in &quasi.quasis {
+                    let s = self.constant_str(q.cooked.as_deref().unwrap_or(""));
+                    self.ops.push(Op::ArrayPush {
+                        arr: strings,
+                        src: s,
+                    });
+                }
+                let mut args = alloc::vec![strings];
+                for e in &quasi.expressions {
+                    args.push(self.expr(e)?);
+                }
+                // Dispatch the tag like a normal call.
+                let dst = self.alloc();
+                if let Expr::Ident(id) = &**tag
+                    && self.lookup(&id.name).is_none()
+                    && let Some(&func) = self.fn_ids.get(&*id.name)
+                {
+                    self.ops.push(Op::Call { dst, func, args });
+                } else {
+                    let callee = self.expr(tag)?;
+                    self.ops.push(Op::CallValue { dst, callee, args });
+                }
+                Ok(dst)
+            }
             // `new C(args)` for a known plain class: create the instance, install
             // its methods, run the constructor with `this` = instance.
             Expr::New {
@@ -4477,6 +4592,36 @@ mod tests {
                 let c = new C(); '' + (c instanceof A) + (c instanceof B) + (c instanceof C)"),
             "truetruetrue"
         );
+    }
+
+    #[test]
+    fn bytecode_sequence_tagged_labeled_instanceof_error() {
+        // Sequence expression.
+        assert_eq!(bc("let x = (1, 2, 3); x"), "3");
+        assert_eq!(bc("let a = 0; let b = (a = 5, a + 1); b"), "6");
+        // Tagged template.
+        assert_eq!(
+            bc("function tag(s, ...v) { let out = s[0]; for (let i = 0; i < v.length; i++) { out += '<' + v[i] + '>' + s[i + 1]; } return out; }
+                tag`a${1}b${2}c`"),
+            "a<1>b<2>c"
+        );
+        // Labeled loop with labeled continue/break.
+        assert_eq!(
+            bc(
+                "let hits = ''; outer: for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) { if (j === 1) continue outer; hits += i + '' + j + ','; } } hits"
+            ),
+            "00,10,20,"
+        );
+        assert_eq!(
+            bc(
+                "let n = 0; search: for (let i = 0; i < 5; i++) { for (let j = 0; j < 5; j++) { n++; if (i + j === 3) break search; } } n"
+            ),
+            "4"
+        );
+        // instanceof on built-in errors.
+        assert_eq!(bc("new TypeError('x') instanceof TypeError"), "true");
+        assert_eq!(bc("new RangeError('x') instanceof TypeError"), "false");
+        assert_eq!(bc("new TypeError('x') instanceof Error"), "true");
     }
 
     #[test]

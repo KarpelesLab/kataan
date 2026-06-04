@@ -75,7 +75,7 @@ fn bytecode_runs_and_compiles_real_fixtures() {
     // Ratchet: at least this many whole real-world programs compile fully to
     // bytecode (no fallback). Raise as the fold widens; never let it regress.
     assert!(
-        compiled_fully >= 5,
+        compiled_fully >= 6,
         "bytecode coverage regressed: only {compiled_fully} fixtures compile fully"
     );
 }
