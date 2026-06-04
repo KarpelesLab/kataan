@@ -68,6 +68,11 @@ pub mod gc;
 #[cfg(feature = "alloc")]
 pub mod ic;
 
+/// Interned strings ("atoms"): distinct identifiers/property keys mapped to
+/// small `Copy` integers for O(1) comparison. Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod atom;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
