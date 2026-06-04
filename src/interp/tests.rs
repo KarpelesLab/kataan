@@ -83,6 +83,39 @@ fn bytecode_vm_matches_tree_walker() {
 }
 
 #[test]
+fn bytecode_vm_statements() {
+    // Locals, assignment, and a final-expression completion value.
+    assert_eq!(eval_bc("let x = 10; x + 5"), "15");
+    assert_eq!(eval_bc("let x = 1; x = x + 41; x"), "42");
+    assert_eq!(eval_bc("let a = 2; let b = 3; a * b"), "6");
+    // Compound assignment.
+    assert_eq!(eval_bc("let n = 5; n += 10; n *= 2; n"), "30");
+    // Block scoping (inner shadow does not leak).
+    assert_eq!(eval_bc("let x = 1; { let x = 99; } x"), "1");
+    // if / else.
+    assert_eq!(
+        eval_bc("let r = 0; if (3 > 2) r = 'big'; else r = 'small'; r"),
+        "big"
+    );
+    assert_eq!(
+        eval_bc("let r = 0; if (1 > 2) r = 'a'; else r = 'b'; r"),
+        "b"
+    );
+    // while loop summing 0..5.
+    assert_eq!(
+        eval_bc("let s = 0; let i = 0; while (i < 5) { s += i; i += 1; } s"),
+        "10"
+    );
+    // A loop that calls into the real stdlib.
+    assert_eq!(
+        eval_bc("let m = 0; let i = 1; while (i <= 4) { m = Math.max(m, i * i); i += 1; } m"),
+        "16"
+    );
+    // Globals are written through SetGlobal when not declared local.
+    assert_eq!(eval_bc("g = 7; g + 1"), "8");
+}
+
+#[test]
 fn arithmetic_and_precedence() {
     assert_eq!(eval("1 + 2 * 3"), "7");
     assert_eq!(eval("(1 + 2) * 3"), "9");

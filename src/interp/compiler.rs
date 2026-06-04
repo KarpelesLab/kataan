@@ -7,10 +7,11 @@
 //! the tree-walker). Constructs outside the supported subset return
 //! [`CompileError::Unsupported`] so the caller can fall back to the tree-walker.
 
-use crate::ast::{BinaryOp, Expr, LogicalOp, Stmt, UnaryOp};
+use crate::ast::{AssignOp, BinaryOp, BindingTarget, Expr, LogicalOp, Stmt, UnaryOp};
 use crate::bytecode::{Chunk, Const, Op, Reg};
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// A reason the expression could not be compiled (yet).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,21 +28,18 @@ impl CompileError {
     }
 }
 
-/// Compiles a program whose value is its final expression statement into a
-/// chunk that leaves that value in the returned register.
+/// Compiles a program (the supported statement subset) into a chunk whose
+/// returned value is that of the final expression statement (REPL-style).
 pub(super) fn compile_program(body: &[Stmt]) -> Result<Chunk, CompileError> {
     let mut c = Compiler {
-        chunk: Chunk::new("<expr>"),
+        chunk: Chunk::new("<main>"),
         next_reg: 0,
+        locals: Vec::new(),
     };
     let mut last: Option<Reg> = None;
     for stmt in body {
-        match stmt {
-            Stmt::Expr { expression, .. } => {
-                last = Some(c.expr(expression)?);
-            }
-            Stmt::Empty { .. } => {}
-            _ => return Err(CompileError::unsupported("statement in bytecode mode")),
+        if let Some(reg) = c.stmt(stmt)? {
+            last = Some(reg);
         }
     }
     match last {
@@ -55,6 +53,9 @@ pub(super) fn compile_program(body: &[Stmt]) -> Result<Chunk, CompileError> {
 struct Compiler {
     chunk: Chunk,
     next_reg: Reg,
+    /// In-scope local variables mapped to their backing register (innermost
+    /// last; shadowing resolves to the latest entry).
+    locals: Vec<(String, Reg)>,
 }
 
 impl Compiler {
@@ -63,6 +64,110 @@ impl Compiler {
         let r = self.next_reg;
         self.next_reg += 1;
         r
+    }
+
+    /// The register backing local `name`, if it is in scope.
+    fn resolve(&self, name: &str) -> Option<Reg> {
+        self.locals
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, r)| *r)
+    }
+
+    /// Compiles a statement, returning the value register for an expression
+    /// statement (so the program's completion value can be tracked).
+    fn stmt(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
+        match stmt {
+            Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
+            Stmt::Empty { .. } => Ok(None),
+            Stmt::Var(decl) => {
+                for d in &decl.declarations {
+                    let BindingTarget::Ident(id) = &d.target else {
+                        return Err(CompileError::unsupported("destructuring declaration"));
+                    };
+                    let value = match &d.init {
+                        Some(init) => self.expr(init)?,
+                        None => {
+                            let r = self.reg();
+                            self.chunk.emit(Op::LoadUndefined { dst: r });
+                            r
+                        }
+                    };
+                    // Give the variable its own register, copying the init value
+                    // in (so later reuse of `value` cannot clobber it).
+                    let slot = self.reg();
+                    self.chunk.emit(Op::Move {
+                        dst: slot,
+                        src: value,
+                    });
+                    self.locals.push((id.name.clone().into_string(), slot));
+                }
+                Ok(None)
+            }
+            Stmt::Block { body, .. } => {
+                let mark = self.locals.len();
+                for s in body {
+                    self.stmt(s)?;
+                }
+                self.locals.truncate(mark);
+                Ok(None)
+            }
+            Stmt::If {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                let cond = self.expr(test)?;
+                let jf = self.chunk.emit(Op::JumpIfFalse { cond, offset: 0 });
+                self.stmt(consequent)?;
+                if let Some(alt) = alternate {
+                    let jmp = self.chunk.emit(Op::Jump { offset: 0 });
+                    self.patch_to_here(jf);
+                    self.stmt(alt)?;
+                    self.patch_to_here(jmp);
+                } else {
+                    self.patch_to_here(jf);
+                }
+                Ok(None)
+            }
+            Stmt::While { test, body, .. } => {
+                let top = self.chunk.code.len();
+                let cond = self.expr(test)?;
+                let jf = self.chunk.emit(Op::JumpIfFalse { cond, offset: 0 });
+                self.stmt(body)?;
+                let back = self.chunk.emit(Op::Jump { offset: 0 });
+                self.patch_jump(back, top);
+                self.patch_to_here(jf);
+                Ok(None)
+            }
+            _ => Err(CompileError::unsupported("statement in bytecode mode")),
+        }
+    }
+
+    /// Patches a previously-emitted jump at `idx` to target the current end of
+    /// code.
+    fn patch_to_here(&mut self, idx: usize) {
+        let target = self.chunk.code.len();
+        self.patch_jump(idx, target);
+    }
+
+    /// Patches the jump at `idx` to target instruction `target`.
+    fn patch_jump(&mut self, idx: usize, target: usize) {
+        let offset = (target as i64 - (idx as i64 + 1)) as i32;
+        self.chunk.code[idx] = match &self.chunk.code[idx] {
+            Op::Jump { .. } => Op::Jump { offset },
+            Op::JumpIfFalse { cond, .. } => Op::JumpIfFalse {
+                cond: *cond,
+                offset,
+            },
+            Op::JumpIfTrue { cond, .. } => Op::JumpIfTrue {
+                cond: *cond,
+                offset,
+            },
+            other => other.clone(),
+        };
     }
 
     /// Compiles `expr`, leaving its value in the returned register.
@@ -109,6 +214,12 @@ impl Compiler {
                     self.chunk.emit(Op::LoadUndefined { dst });
                     return Ok(dst);
                 }
+                // A local: copy its register so later writes can't clobber it.
+                if let Some(slot) = self.resolve(&id.name) {
+                    let dst = self.reg();
+                    self.chunk.emit(Op::Move { dst, src: slot });
+                    return Ok(dst);
+                }
                 let dst = self.reg();
                 let name = self
                     .chunk
@@ -116,6 +227,9 @@ impl Compiler {
                 self.chunk.emit(Op::GetGlobal { dst, name });
                 Ok(dst)
             }
+            Expr::Assign {
+                op, target, value, ..
+            } => self.assign(*op, target, value),
             Expr::Unary { op, argument, .. } => self.unary(*op, argument),
             Expr::Binary {
                 op, left, right, ..
@@ -160,32 +274,79 @@ impl Compiler {
         Ok(dst)
     }
 
+    /// Compiles an assignment `target OP= value`, leaving the assigned value in
+    /// the returned register. Only simple identifier targets are supported.
+    fn assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> Result<Reg, CompileError> {
+        let Expr::Ident(id) = target else {
+            return Err(CompileError::unsupported("assignment target"));
+        };
+        // Compute the right-hand side (folding the binary op for `+=` etc.).
+        let rhs = self.expr(value)?;
+        let result = match compound_binop(op) {
+            None => rhs, // plain `=`
+            Some(binop) => {
+                let cur = self.read_ident(&id.name)?;
+                let dst = self.reg();
+                self.emit_binop(binop, dst, cur, rhs)?;
+                dst
+            }
+        };
+        // Store into the local register or the global binding.
+        if let Some(slot) = self.resolve(&id.name) {
+            self.chunk.emit(Op::Move {
+                dst: slot,
+                src: result,
+            });
+        } else {
+            let name = self
+                .chunk
+                .add_constant(Const::Str(id.name.clone().into_string()));
+            self.chunk.emit(Op::SetGlobal { name, src: result });
+        }
+        Ok(result)
+    }
+
+    /// Reads `name` (local copy or global) into a fresh register.
+    fn read_ident(&mut self, name: &str) -> Result<Reg, CompileError> {
+        if let Some(slot) = self.resolve(name) {
+            let dst = self.reg();
+            self.chunk.emit(Op::Move { dst, src: slot });
+            Ok(dst)
+        } else {
+            let dst = self.reg();
+            let k = self.chunk.add_constant(Const::Str(name.into()));
+            self.chunk.emit(Op::GetGlobal { dst, name: k });
+            Ok(dst)
+        }
+    }
+
     fn binary(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> Result<Reg, CompileError> {
         let a = self.expr(left)?;
         let b = self.expr(right)?;
         let dst = self.reg();
-        let make = |dst, a, b| match op {
-            BinaryOp::Add => Some(Op::Add { dst, a, b }),
-            BinaryOp::Sub => Some(Op::Sub { dst, a, b }),
-            BinaryOp::Mul => Some(Op::Mul { dst, a, b }),
-            BinaryOp::Div => Some(Op::Div { dst, a, b }),
-            BinaryOp::Mod => Some(Op::Mod { dst, a, b }),
-            BinaryOp::Exp => Some(Op::Pow { dst, a, b }),
-            BinaryOp::EqEq => Some(Op::Eq { dst, a, b }),
-            BinaryOp::EqEqEq => Some(Op::StrictEq { dst, a, b }),
-            BinaryOp::Lt => Some(Op::Lt { dst, a, b }),
-            BinaryOp::LtEq => Some(Op::Le { dst, a, b }),
-            BinaryOp::Gt => Some(Op::Gt { dst, a, b }),
-            BinaryOp::GtEq => Some(Op::Ge { dst, a, b }),
-            _ => None,
+        self.emit_binop(op, dst, a, b)?;
+        Ok(dst)
+    }
+
+    /// Emits a single binary-op instruction for two existing registers.
+    fn emit_binop(&mut self, op: BinaryOp, dst: Reg, a: Reg, b: Reg) -> Result<(), CompileError> {
+        let inst = match op {
+            BinaryOp::Add => Op::Add { dst, a, b },
+            BinaryOp::Sub => Op::Sub { dst, a, b },
+            BinaryOp::Mul => Op::Mul { dst, a, b },
+            BinaryOp::Div => Op::Div { dst, a, b },
+            BinaryOp::Mod => Op::Mod { dst, a, b },
+            BinaryOp::Exp => Op::Pow { dst, a, b },
+            BinaryOp::EqEq => Op::Eq { dst, a, b },
+            BinaryOp::EqEqEq => Op::StrictEq { dst, a, b },
+            BinaryOp::Lt => Op::Lt { dst, a, b },
+            BinaryOp::LtEq => Op::Le { dst, a, b },
+            BinaryOp::Gt => Op::Gt { dst, a, b },
+            BinaryOp::GtEq => Op::Ge { dst, a, b },
+            _ => return Err(CompileError::unsupported("binary operator")),
         };
-        match make(dst, a, b) {
-            Some(op) => {
-                self.chunk.emit(op);
-                Ok(dst)
-            }
-            None => Err(CompileError::unsupported("binary operator")),
-        }
+        self.chunk.emit(inst);
+        Ok(())
     }
 
     fn logical(&mut self, op: LogicalOp, left: &Expr, right: &Expr) -> Result<Reg, CompileError> {
@@ -279,5 +440,20 @@ impl Compiler {
             argc: arg_regs.len() as u16,
         });
         Ok(dst)
+    }
+}
+
+/// Maps a compound assignment operator to its underlying binary op; `=` returns
+/// `None`. Bitwise/logical compound forms are not yet lowered.
+fn compound_binop(op: AssignOp) -> Option<BinaryOp> {
+    match op {
+        AssignOp::Assign => None,
+        AssignOp::AddAssign => Some(BinaryOp::Add),
+        AssignOp::SubAssign => Some(BinaryOp::Sub),
+        AssignOp::MulAssign => Some(BinaryOp::Mul),
+        AssignOp::DivAssign => Some(BinaryOp::Div),
+        AssignOp::ModAssign => Some(BinaryOp::Mod),
+        AssignOp::ExpAssign => Some(BinaryOp::Exp),
+        _ => None,
     }
 }
