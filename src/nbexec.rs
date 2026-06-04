@@ -146,6 +146,12 @@ const N_ARRAY_OF: u16 = 21;
 const N_PROMISE: u16 = 22;
 const N_DATE: u16 = 25;
 const N_REGEXP: u16 = 26;
+const N_MATH_POW: u16 = 28;
+const N_MATH_SIGN: u16 = 29;
+const N_MATH_TRUNC: u16 = 30;
+const N_PARSE_FLOAT: u16 = 31;
+const N_IS_NAN: u16 = 32;
+const N_IS_FINITE: u16 = 33;
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
@@ -203,6 +209,9 @@ impl<'a> Interp<'a> {
                 ("ceil", N_MATH_CEIL),
                 ("round", N_MATH_ROUND),
                 ("sqrt", N_MATH_SQRT),
+                ("pow", N_MATH_POW),
+                ("sign", N_MATH_SIGN),
+                ("trunc", N_MATH_TRUNC),
             ],
         );
         install_namespace(self, "console", &[("log", N_CONSOLE_LOG)]);
@@ -248,6 +257,9 @@ impl<'a> Interp<'a> {
             ("Number", N_NUMBER),
             ("Boolean", N_BOOLEAN),
             ("parseInt", N_PARSE_INT),
+            ("parseFloat", N_PARSE_FLOAT),
+            ("isNaN", N_IS_NAN),
+            ("isFinite", N_IS_FINITE),
             ("Map", N_MAP),
             ("Set", N_SET),
         ] {
@@ -298,7 +310,13 @@ impl<'a> Interp<'a> {
             N_BOOLEAN => NanBox::boolean(arg(0).to_boolean()),
             N_PARSE_INT => {
                 let s = self.realm.to_display_string(arg(0));
-                NanBox::number(parse_int(&s))
+                let radix = match args.get(1) {
+                    Some(r) if !matches!(r.unpack(), Unpacked::Undefined) => {
+                        self.realm.to_number(*r) as u32
+                    }
+                    _ => 0,
+                };
+                NanBox::number(parse_int(&s, radix))
             }
             N_CONSOLE_LOG => {
                 let line: Vec<String> = args
@@ -417,6 +435,36 @@ impl<'a> Interp<'a> {
             N_MATH_FLOOR | N_MATH_CEIL | N_MATH_ROUND | N_MATH_SQRT => {
                 return Err(ExecError::Unsupported("Math float ops need std"));
             }
+            #[cfg(feature = "std")]
+            N_MATH_POW => NanBox::number(
+                self.realm
+                    .to_number(arg(0))
+                    .powf(self.realm.to_number(arg(1))),
+            ),
+            #[cfg(not(feature = "std"))]
+            N_MATH_POW => return Err(ExecError::Unsupported("Math.pow needs std")),
+            N_MATH_SIGN => {
+                let n = self.realm.to_number(arg(0));
+                NanBox::number(if n.is_nan() {
+                    f64::NAN
+                } else if n > 0.0 {
+                    1.0
+                } else if n < 0.0 {
+                    -1.0
+                } else {
+                    n // ±0
+                })
+            }
+            #[cfg(feature = "std")]
+            N_MATH_TRUNC => NanBox::number(self.realm.to_number(arg(0)).trunc()),
+            #[cfg(not(feature = "std"))]
+            N_MATH_TRUNC => return Err(ExecError::Unsupported("Math.trunc needs std")),
+            N_PARSE_FLOAT => {
+                let s = self.realm.to_display_string(arg(0));
+                NanBox::number(parse_float_prefix(s.trim()))
+            }
+            N_IS_NAN => NanBox::boolean(self.realm.to_number(arg(0)).is_nan()),
+            N_IS_FINITE => NanBox::boolean(self.realm.to_number(arg(0)).is_finite()),
             _ => return Err(ExecError::NotCallable),
         })
     }
@@ -1225,7 +1273,19 @@ impl<'a> Interp<'a> {
         // --- number methods (the receiver is an immediate, not a handle) ---
         if let Some(n) = recv.as_number() {
             return Ok(match method {
-                "toString" => Some(self.new_str(&self.realm.to_display_string(recv))),
+                "toString" => {
+                    // An optional radix (2–36) for integers, else base 10.
+                    let radix = match args.first() {
+                        Some(a) => self.realm.to_number(*a) as u32,
+                        None => 10,
+                    };
+                    if radix == 10 || !(2..=36).contains(&radix) {
+                        Some(self.new_str(&self.realm.to_display_string(recv)))
+                    } else {
+                        Some(self.new_str(&int_to_radix(n, radix)))
+                    }
+                }
+                "valueOf" => Some(recv),
                 #[cfg(feature = "std")]
                 "toFixed" => {
                     let digits = self.realm.to_number(arg(0)) as usize;
@@ -1274,10 +1334,17 @@ impl<'a> Interp<'a> {
                 match (method, re) {
                     ("test", Ok(re)) => return Ok(Some(NanBox::boolean(re.is_match(&text)))),
                     ("exec", Ok(re)) => {
-                        return Ok(Some(match re.find_from(&text, 0) {
-                            Some((s, e)) => {
-                                let matched = self.new_str(&text[s..e]);
-                                NanBox::handle(self.realm.new_array(alloc::vec![matched]).to_raw())
+                        return Ok(Some(match re.captures_from(&text, 0) {
+                            Some(caps) => {
+                                let groups: Vec<NanBox> = caps
+                                    .groups
+                                    .iter()
+                                    .map(|g| match g {
+                                        Some((s, e)) => self.new_str(&text[*s..*e]),
+                                        None => NanBox::undefined(),
+                                    })
+                                    .collect();
+                                NanBox::handle(self.realm.new_array(groups).to_raw())
                             }
                             None => NanBox::null(),
                         }));
@@ -1380,6 +1447,29 @@ impl<'a> Interp<'a> {
                     let from = self.realm.to_display_string(arg(0));
                     let to = self.realm.to_display_string(arg(1));
                     Some(self.new_str(&s.replacen(&from, &to, 1)))
+                }
+                "replaceAll" => {
+                    let from = self.realm.to_display_string(arg(0));
+                    let to = self.realm.to_display_string(arg(1));
+                    Some(self.new_str(&s.replace(&from, &to)))
+                }
+                "at" => {
+                    let i = self.realm.to_number(arg(0));
+                    let chars: Vec<char> = s.chars().collect();
+                    let idx = if i < 0.0 { chars.len() as f64 + i } else { i };
+                    Some(match as_index(idx).and_then(|u| chars.get(u)) {
+                        Some(c) => self.new_str(&String::from(*c)),
+                        None => NanBox::undefined(),
+                    })
+                }
+                "trimStart" => Some(self.new_str(s.trim_start())),
+                "trimEnd" => Some(self.new_str(s.trim_end())),
+                "charCodeAt" | "codePointAt" => {
+                    let i = self.realm.to_number(arg(0)) as usize;
+                    Some(match s.chars().nth(i) {
+                        Some(c) => NanBox::number(u32::from(c) as f64),
+                        None => NanBox::undefined(),
+                    })
                 }
                 "padStart" => {
                     let target = self.realm.to_number(arg(0)) as usize;
@@ -1510,6 +1600,58 @@ impl<'a> Interp<'a> {
                     out.reverse();
                     let h = self.realm.new_array(out);
                     return Ok(Some(NanBox::handle(h.to_raw())));
+                }
+                // One level of flattening (`[1, [2, 3]].flat()`).
+                "flat" => {
+                    let mut out = Vec::new();
+                    for e in &elems {
+                        match e
+                            .as_handle()
+                            .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
+                            .map(<[_]>::to_vec)
+                        {
+                            Some(inner) => out.extend(inner),
+                            None => out.push(*e),
+                        }
+                    }
+                    let h = self.realm.new_array(out);
+                    return Ok(Some(NanBox::handle(h.to_raw())));
+                }
+                // `map` then flatten one level.
+                "flatMap" => {
+                    let f = arg(0);
+                    let mut out = Vec::new();
+                    for (i, e) in elems.iter().enumerate() {
+                        let r = self.call(f, &[*e, NanBox::number(i as f64)])?;
+                        match r
+                            .as_handle()
+                            .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
+                            .map(<[_]>::to_vec)
+                        {
+                            Some(inner) => out.extend(inner),
+                            None => out.push(r),
+                        }
+                    }
+                    let h = self.realm.new_array(out);
+                    return Ok(Some(NanBox::handle(h.to_raw())));
+                }
+                // `at` with negative-from-end indexing.
+                "at" => {
+                    let i = self.realm.to_number(arg(0));
+                    let idx = if i < 0.0 { elems.len() as f64 + i } else { i };
+                    return Ok(Some(
+                        as_index(idx)
+                            .and_then(|u| elems.get(u))
+                            .copied()
+                            .unwrap_or(NanBox::undefined()),
+                    ));
+                }
+                "lastIndexOf" => {
+                    let target = arg(0);
+                    let found = elems
+                        .iter()
+                        .rposition(|e| self.realm.strict_equals(*e, target));
+                    return Ok(Some(NanBox::number(found.map_or(-1.0, |i| i as f64))));
                 }
                 "find" => {
                     let f = arg(0);
@@ -2076,6 +2218,19 @@ impl<'a> Interp<'a> {
     ) -> Result<Flow, ExecError> {
         let child = self.current.child();
         let saved = core::mem::replace(&mut self.current, child);
+        // For a `let`/`const` head, each iteration gets a fresh binding (so a
+        // closure created in the body captures that iteration's value).
+        let per_iter_names: Vec<String> = match init {
+            Some(ForInit::Var(decl)) if decl.kind != crate::ast::VarDeclKind::Var => decl
+                .declarations
+                .iter()
+                .filter_map(|d| match &d.target {
+                    BindingTarget::Ident(Ident { name, .. }) => Some(String::from(&**name)),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let result = (|| {
             match init {
                 Some(ForInit::Var(decl)) => self.exec_var(decl)?,
@@ -2092,7 +2247,26 @@ impl<'a> Interp<'a> {
                 if !go {
                     break;
                 }
-                match self.exec(body)? {
+                // Run the body in a per-iteration scope seeded from the loop
+                // variables, then copy any mutations back for test/update.
+                let flow = if per_iter_names.is_empty() {
+                    self.exec(body)?
+                } else {
+                    let iter = self.current.child();
+                    for name in &per_iter_names {
+                        iter.declare(name, self.current.get(name).unwrap_or(NanBox::undefined()));
+                    }
+                    let loop_scope = core::mem::replace(&mut self.current, iter);
+                    let f = self.exec(body);
+                    for name in &per_iter_names {
+                        if let Some(v) = self.current.get(name) {
+                            loop_scope.set(name, v);
+                        }
+                    }
+                    self.current = loop_scope;
+                    f?
+                };
+                match flow {
                     Flow::Break => break,
                     Flow::Return(v) => return Ok(Flow::Return(v)),
                     Flow::Normal(_) | Flow::Continue => {}
@@ -2417,12 +2591,14 @@ impl<'a> Interp<'a> {
         key: &'a PropertyKey,
     ) -> Result<NanBox, ExecError> {
         match key {
-            PropertyKey::Number(n) if as_index(*n).is_some() => {
+            PropertyKey::Number(n) if as_index(*n).is_some() && self.realm.is_array(handle) => {
                 Ok(self.realm.get_element(handle, as_index(*n).unwrap()))
             }
             PropertyKey::Computed(e) => {
                 let k = self.eval(e)?;
-                if let Some(i) = k.as_number().and_then(as_index) {
+                if let Some(i) = k.as_number().and_then(as_index)
+                    && self.realm.is_array(handle)
+                {
                     return Ok(self.realm.get_element(handle, i));
                 }
                 let name = self.realm.to_display_string(k);
@@ -2558,12 +2734,16 @@ impl<'a> Interp<'a> {
             return Ok(());
         }
         match property {
-            PropertyKey::Number(n) if as_index(*n).is_some() => {
+            PropertyKey::Number(n) if as_index(*n).is_some() && self.realm.is_array(handle) => {
                 self.realm.set_element(handle, as_index(*n).unwrap(), new);
             }
             PropertyKey::Computed(e) => {
                 let k = self.eval(e)?;
-                if let Some(i) = k.as_number().and_then(as_index) {
+                // A numeric index only addresses array storage; on an object a
+                // numeric key is the equivalent string property.
+                if let Some(i) = k.as_number().and_then(as_index)
+                    && self.realm.is_array(handle)
+                {
                     self.realm.set_element(handle, i, new);
                 } else {
                     let name = self.realm.to_display_string(k);
@@ -2784,6 +2964,57 @@ fn json_quote(s: &str) -> String {
     out
 }
 
+/// Renders the integer part of `n` in `radix` (2–36), with a leading `-` for
+/// negatives (matching `Number.prototype.toString(radix)` for integers).
+fn int_to_radix(n: f64, radix: u32) -> String {
+    let neg = n < 0.0;
+    let mut v = n.abs() as u64;
+    if v == 0 {
+        return String::from("0");
+    }
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = Vec::new();
+    while v > 0 {
+        buf.push(DIGITS[(v % radix as u64) as usize]);
+        v /= radix as u64;
+    }
+    if neg {
+        buf.push(b'-');
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap_or_default()
+}
+
+/// Parses the longest leading decimal-float prefix of `s` (à la `parseFloat`),
+/// returning `NaN` if none.
+fn parse_float_prefix(s: &str) -> f64 {
+    let bytes = s.as_bytes();
+    let mut end = 0;
+    let mut seen_dot = false;
+    let mut seen_e = false;
+    while end < bytes.len() {
+        let ch = bytes[end] as char;
+        let ok = match ch {
+            '0'..='9' => true,
+            '+' | '-' if end == 0 || matches!(bytes[end - 1] as char, 'e' | 'E') => true,
+            '.' if !seen_dot && !seen_e => {
+                seen_dot = true;
+                true
+            }
+            'e' | 'E' if !seen_e && end > 0 => {
+                seen_e = true;
+                true
+            }
+            _ => false,
+        };
+        if !ok {
+            break;
+        }
+        end += 1;
+    }
+    s[..end].parse::<f64>().unwrap_or(f64::NAN)
+}
+
 /// Advances `pos` past JSON whitespace.
 fn skip_ws(c: &[char], pos: &mut usize) {
     while c
@@ -2812,26 +3043,46 @@ fn now_ms() -> f64 {
 
 /// A minimal `parseInt`: skips leading whitespace, reads an optional sign and
 /// the leading decimal digits, and returns `NaN` if there are none.
-fn parse_int(s: &str) -> f64 {
-    let t = s.trim_start();
-    let mut chars = t.chars().peekable();
-    let mut out = String::new();
-    if matches!(chars.peek(), Some('+' | '-')) {
-        out.push(chars.next().unwrap());
+fn parse_int(s: &str, radix: u32) -> f64 {
+    let mut t = s.trim_start();
+    let mut neg = false;
+    if let Some(rest) = t.strip_prefix('-') {
+        neg = true;
+        t = rest;
+    } else if let Some(rest) = t.strip_prefix('+') {
+        t = rest;
     }
-    while let Some(c) = chars.peek() {
-        if c.is_ascii_digit() {
-            out.push(*c);
-            chars.next();
-        } else {
-            break;
-        }
+    // Radix 0 means infer: `0x` → 16, else 10. A `0x` prefix is also honored
+    // when radix is explicitly 16.
+    let mut radix = radix;
+    if (radix == 0 || radix == 16)
+        && let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))
+    {
+        t = rest;
+        radix = 16;
     }
-    // Just a sign (or empty) → NaN.
-    if out.is_empty() || out == "+" || out == "-" {
+    if radix == 0 {
+        radix = 10;
+    }
+    if !(2..=36).contains(&radix) {
         return f64::NAN;
     }
-    out.parse::<f64>().unwrap_or(f64::NAN)
+    // Consume the leading digits valid in this radix.
+    let mut value: f64 = 0.0;
+    let mut any = false;
+    for c in t.chars() {
+        match c.to_digit(radix) {
+            Some(d) => {
+                value = value * f64::from(radix) + f64::from(d);
+                any = true;
+            }
+            None => break,
+        }
+    }
+    if !any {
+        return f64::NAN;
+    }
+    if neg { -value } else { value }
 }
 
 /// A non-negative integer array index, if `n` is one.
