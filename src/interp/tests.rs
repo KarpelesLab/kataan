@@ -1257,6 +1257,17 @@ fn string_and_coercion() {
     assert_eq!(eval("typeof 1"), "number");
     assert_eq!(eval("typeof 'x'"), "string");
     assert_eq!(eval("typeof undefinedVar"), "undefined");
+    // `+` does ToPrimitive: arrays/objects coerce to strings and concatenate.
+    assert_eq!(eval("'' + [1, 2, 3]"), "1,2,3");
+    assert_eq!(eval("String([1, 2] + [3, 4])"), "1,23,4");
+    assert_eq!(eval("String([] + [])"), "");
+    assert_eq!(eval("[1] + 1"), "11");
+    assert_eq!(eval("1 + [2]"), "12");
+    assert_eq!(eval("({}) + '!'"), "[object Object]!");
+    // Pure-numeric addition is unaffected.
+    assert_eq!(eval("1 + 2"), "3");
+    assert_eq!(eval("5 + null"), "5");
+    assert_eq!(eval("true + 1"), "2");
 }
 
 #[test]

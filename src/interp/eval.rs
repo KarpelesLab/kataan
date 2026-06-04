@@ -1435,7 +1435,11 @@ impl<'a> Interp<'a> {
         use BinaryOp::*;
         Ok(match op {
             Add => {
-                if matches!(l, Value::Str(_)) || matches!(r, Value::Str(_)) {
+                // `+` does ToPrimitive on each operand; objects/arrays become
+                // strings (their `toString`), so a string anywhere — including
+                // after coercing an array/object — triggers concatenation.
+                let str_like = |v: &Value<'a>| matches!(v, Value::Str(_) | Value::Object(_));
+                if str_like(&l) || str_like(&r) {
                     let mut s = l.to_js_string();
                     s.push_str(&r.to_js_string());
                     Value::str(s)
