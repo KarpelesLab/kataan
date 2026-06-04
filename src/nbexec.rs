@@ -54,10 +54,33 @@ enum Flow {
     Normal(NanBox),
     /// A `return` (value).
     Return(NanBox),
-    /// A `break`.
-    Break,
-    /// A `continue`.
-    Continue,
+    /// A `break`, optionally targeting a label.
+    Break(Option<String>),
+    /// A `continue`, optionally targeting a label.
+    Continue(Option<String>),
+}
+
+/// What a loop should do with a `Flow` produced by its body, given the loop's
+/// own label (if any).
+enum LoopAction {
+    /// Proceed to the next iteration (fall through to the update).
+    Next,
+    /// Stop this loop.
+    Stop,
+    /// Not for this loop — bubble it up to an enclosing loop / labeled block.
+    Propagate(Flow),
+}
+
+/// Classifies a body `Flow` for a loop carrying `label`.
+fn loop_action(flow: Flow, label: &Option<String>) -> LoopAction {
+    match flow {
+        Flow::Normal(_) => LoopAction::Next,
+        Flow::Continue(None) => LoopAction::Next,
+        Flow::Continue(Some(l)) if Some(&l) == label.as_ref() => LoopAction::Next,
+        Flow::Break(None) => LoopAction::Stop,
+        Flow::Break(Some(l)) if Some(&l) == label.as_ref() => LoopAction::Stop,
+        other => LoopAction::Propagate(other),
+    }
 }
 
 /// The body of a registered function: a block, or a concise arrow expression.
@@ -97,6 +120,8 @@ pub struct Interp<'a> {
     pending_super: Option<(u32, Scope)>,
     /// The class of the currently-running method (for `super.method()`).
     current_home: Option<u32>,
+    /// A label attached to the next loop (for `break`/`continue label`).
+    pending_label: Option<String>,
     /// The promise-reaction microtask queue, drained after the script.
     microtasks: Vec<Job>,
     /// Captured `console.log` output (a line per call).
@@ -180,6 +205,7 @@ impl<'a> Interp<'a> {
             this_val: NanBox::undefined(),
             pending_super: None,
             current_home: None,
+            pending_label: None,
             microtasks: Vec::new(),
             output: String::new(),
         };
@@ -727,7 +753,7 @@ impl<'a> Interp<'a> {
                     self.drain_microtasks()?;
                     return Ok(v);
                 }
-                Flow::Break | Flow::Continue => {}
+                Flow::Break(_) | Flow::Continue(_) => {}
             }
         }
         // Drain the promise microtask queue (the event loop) before returning.
@@ -1898,7 +1924,7 @@ impl<'a> Interp<'a> {
                 for stmt in stmts {
                     match self.exec(stmt)? {
                         Flow::Return(v) => return Ok(v),
-                        Flow::Normal(_) | Flow::Break | Flow::Continue => {}
+                        Flow::Normal(_) | Flow::Break(_) | Flow::Continue(_) => {}
                     }
                 }
                 Ok(NanBox::undefined())
@@ -1941,14 +1967,39 @@ impl<'a> Interp<'a> {
                 }
             }
             Stmt::While { test, body, .. } => {
+                let label = self.pending_label.take();
                 while self.eval(test)?.to_boolean() {
-                    match self.exec(body)? {
-                        Flow::Break => break,
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
-                        Flow::Normal(_) | Flow::Continue => {}
+                    match loop_action(self.exec(body)?, &label) {
+                        LoopAction::Next => {}
+                        LoopAction::Stop => break,
+                        LoopAction::Propagate(f) => return Ok(f),
                     }
                 }
                 Ok(Flow::Normal(NanBox::undefined()))
+            }
+            Stmt::DoWhile { body, test, .. } => {
+                let label = self.pending_label.take();
+                loop {
+                    match loop_action(self.exec(body)?, &label) {
+                        LoopAction::Next => {}
+                        LoopAction::Stop => break,
+                        LoopAction::Propagate(f) => return Ok(f),
+                    }
+                    if !self.eval(test)?.to_boolean() {
+                        break;
+                    }
+                }
+                Ok(Flow::Normal(NanBox::undefined()))
+            }
+            Stmt::Labeled { label, body, .. } => {
+                self.pending_label = Some(String::from(&*label.name));
+                let flow = self.exec(body)?;
+                self.pending_label = None;
+                // A labeled non-loop block consumes a matching `break label`.
+                Ok(match flow {
+                    Flow::Break(Some(l)) if l == *label.name => Flow::Normal(NanBox::undefined()),
+                    other => other,
+                })
             }
             Stmt::For {
                 init,
@@ -1964,8 +2015,12 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Flow::Return(v))
             }
-            Stmt::Break { label: None, .. } => Ok(Flow::Break),
-            Stmt::Continue { label: None, .. } => Ok(Flow::Continue),
+            Stmt::Break { label, .. } => {
+                Ok(Flow::Break(label.as_ref().map(|l| String::from(&*l.name))))
+            }
+            Stmt::Continue { label, .. } => Ok(Flow::Continue(
+                label.as_ref().map(|l| String::from(&*l.name)),
+            )),
             Stmt::Throw { argument, .. } => {
                 let v = self.eval(argument)?;
                 Err(ExecError::Throw(v))
@@ -2198,6 +2253,7 @@ impl<'a> Interp<'a> {
         items: Vec<NanBox>,
     ) -> Result<Flow, ExecError> {
         use crate::ast::ForLeft;
+        let label = self.pending_label.take();
         for item in items {
             let child = self.current.child();
             let saved = core::mem::replace(&mut self.current, child);
@@ -2211,10 +2267,10 @@ impl<'a> Interp<'a> {
                 self.exec(body)
             })();
             self.current = saved;
-            match r? {
-                Flow::Break => break,
-                Flow::Return(v) => return Ok(Flow::Return(v)),
-                Flow::Normal(_) | Flow::Continue => {}
+            match loop_action(r?, &label) {
+                LoopAction::Next => {}
+                LoopAction::Stop => break,
+                LoopAction::Propagate(f) => return Ok(f),
             }
         }
         Ok(Flow::Normal(NanBox::undefined()))
@@ -2289,10 +2345,11 @@ impl<'a> Interp<'a> {
             for case in &cases[start..] {
                 for stmt in &case.body {
                     match self.exec(stmt)? {
-                        Flow::Break => return Ok(Flow::Normal(NanBox::undefined())),
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
-                        Flow::Continue => return Ok(Flow::Continue),
+                        // A plain `break` ends the switch; everything else
+                        // (labeled break, continue, return) bubbles out.
+                        Flow::Break(None) => return Ok(Flow::Normal(NanBox::undefined())),
                         Flow::Normal(_) => {}
+                        other => return Ok(other),
                     }
                 }
             }
@@ -2309,6 +2366,7 @@ impl<'a> Interp<'a> {
         update: Option<&'a Expr>,
         body: &'a Stmt,
     ) -> Result<Flow, ExecError> {
+        let label = self.pending_label.take();
         let child = self.current.child();
         let saved = core::mem::replace(&mut self.current, child);
         // For a `let`/`const` head, each iteration gets a fresh binding (so a
@@ -2359,10 +2417,10 @@ impl<'a> Interp<'a> {
                     self.current = loop_scope;
                     f?
                 };
-                match flow {
-                    Flow::Break => break,
-                    Flow::Return(v) => return Ok(Flow::Return(v)),
-                    Flow::Normal(_) | Flow::Continue => {}
+                match loop_action(flow, &label) {
+                    LoopAction::Next => {}
+                    LoopAction::Stop => break,
+                    LoopAction::Propagate(f) => return Ok(f),
                 }
                 if let Some(u) = update {
                     self.eval(u)?;
@@ -3781,6 +3839,40 @@ mod tests {
         assert_eq!(run("new Date(0).getDay()"), "4"); // Thursday
         // typeof a date is object.
         assert_eq!(run("typeof new Date(0)"), "object");
+    }
+
+    #[test]
+    fn labeled_loops_and_do_while() {
+        // `continue label` to an outer loop.
+        assert_eq!(
+            run("let count = 0;
+                 outer: for (let i = 0; i < 3; i++) {
+                   for (let j = 0; j < 3; j++) {
+                     if (j === 1) continue outer;
+                     count++;
+                   }
+                 }
+                 count"),
+            "3"
+        );
+        // `break label` out of nested loops.
+        assert_eq!(
+            run("let hits = 0;
+                 search: for (let i = 0; i < 5; i++) {
+                   for (let j = 0; j < 5; j++) {
+                     hits++;
+                     if (i === 1 && j === 1) break search;
+                   }
+                 }
+                 hits"),
+            "7"
+        );
+        // do/while runs the body at least once.
+        assert_eq!(
+            run("let n = 0, s = 0; do { s += n; n++; } while (n < 4); s"),
+            "6"
+        );
+        assert_eq!(run("let r = 0; do { r++; } while (false); r"), "1");
     }
 
     #[test]
