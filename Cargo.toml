@@ -1,0 +1,94 @@
+# The cargo-fuzz workspace at `fuzz/` (added in a later phase) is excluded from
+# the implicit single-crate workspace, mirroring the `purecrypto` layout: it
+# uses `libfuzzer-sys` (nightly + libFuzzer) and is built separately via
+# `cargo +nightly fuzz run <target>`.
+[workspace]
+exclude = ["fuzz"]
+
+[package]
+name = "kataan"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Karpelès Lab Inc."]
+description = "A high-performance JavaScript engine written in pure Rust. Library, C FFI, and CLI."
+repository = "https://github.com/KarpelesLab/kataan"
+license = "MIT"
+readme = "README.md"
+keywords = ["javascript", "ecmascript", "engine", "interpreter", "vm"]
+categories = ["compilers", "parser-implementations", "development-tools"]
+
+[lib]
+name = "kataan"
+# Default `rlib` only, so the `no_std` core (`--no-default-features --features
+# alloc`) builds without an allocator/panic-handler. The C library is built on
+# demand with an explicit crate type under the `ffi` feature, e.g.
+# `cargo rustc --lib --features ffi --crate-type staticlib` (see CI / ROADMAP).
+
+[[bin]]
+name = "kataan"
+path = "src/bin/kataan/main.rs"
+required-features = ["cli"]
+
+[features]
+# `std` is the convenient default; it implies `alloc`. The pure language core
+# (lexer → parser → compiler → vm + core builtins) builds with only `alloc`
+# (`--no-default-features --features alloc`); `host`, `fetch`, `crypto`, `intl`,
+# and the CLI need `std`.
+default = ["std", "regex", "intl", "module", "host", "cli"]
+std = ["alloc"]
+alloc = []
+
+# --- module gates (wired as each layer lands) ---
+# In-house regular-expression engine (no foreign code).
+regex = []
+# In-house Intl-lite (collation, casing, number/date formatting) over an
+# embedded trimmed CLDR table.
+intl = []
+# ESM + CommonJS module loader/linker.
+module = []
+# Host runtime: event loop, timers, console, encoding, URL, streams, process.
+host = ["std"]
+# `fetch` / Node http(s) transport over the pure-Rust `rsurl` crate.
+fetch = ["host", "dep:rsurl"]
+# `crypto.getRandomValues` / `randomUUID` / WebCrypto `crypto.subtle` over the
+# pure-Rust `purecrypto` crate.
+crypto = ["host", "dep:purecrypto"]
+# Baseline + optimizing JIT tiers (later phases).
+jit = ["std"]
+# C ABI: builds the `ffi` module (the only place broad `unsafe` is allowed).
+# Build a C library with `cargo rustc --features ffi --crate-type cdylib`
+# (or staticlib).
+ffi = ["std"]
+# The `kataan` command-line tool / REPL / script runner.
+cli = ["std", "regex", "module", "host"]
+
+# --- dependencies ---
+# In line with the Karpelès Lab "pure Rust, no foreign code" charter, the only
+# dependencies are sibling pure-Rust crates, each behind an opt-in feature.
+[dependencies]
+# `rsurl` powers `fetch` / Node http(s); keep it on its pure-Rust TLS backend
+# (`purecrypto-tls`) so the "no foreign code" charter holds end to end.
+rsurl = { version = "0.0", optional = true, default-features = false, features = ["purecrypto-tls"] }
+purecrypto = { version = "0.6", optional = true, default-features = false, features = ["rng", "hash", "cipher"] }
+
+[lints.rust]
+# Keep the foundation documented and the API surface honest.
+missing_docs = "warn"
+unreachable_pub = "warn"
+# Deny (not forbid) so the `ffi` module and a small, audited set of VM hot-path
+# primitives can opt back in locally with a scoped `#[allow(unsafe_code)]`; the
+# rest of the engine stays safe Rust.
+unsafe_code = "deny"
+
+[profile.release]
+# The interpreter benefits from aggressive cross-module inlining of the small
+# value/opcode helpers on the hot path. `panic` is intentionally left as the
+# default `unwind` so the `ffi` boundary's `catch_unwind` can turn a Rust panic
+# into a `KtStatus::Internal` rather than aborting across the C ABI.
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

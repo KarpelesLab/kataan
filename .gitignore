@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.pdb
+.*.swp
+# Cargo.lock intentionally not committed for this library crate.
+/Cargo.lock

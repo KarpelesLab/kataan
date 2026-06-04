@@ -1,0 +1,1047 @@
+//! The lexer: ECMAScript source text → a stream of [`Token`]s.
+//!
+//! This is a hand-written, single-pass, allocation-light tokenizer. It is the
+//! first stage of the pipeline and deliberately self-contained: it depends
+//! only on `core`/`alloc` and produces tokens carrying [`Span`]s into the
+//! original source.
+//!
+//! ## What it handles
+//!
+//! - All ECMAScript punctuators and assignment operators, optional chaining
+//!   (`?.`) and nullish coalescing (`??`/`??=`).
+//! - Keywords vs identifiers (Unicode identifier start/continue via a compact
+//!   classifier), private names (`#field`).
+//! - Numeric literals: decimal, hex/octal/binary, exponents, `BigInt` (`n`),
+//!   and numeric separators (`1_000`).
+//! - String literals with the full escape grammar, including line
+//!   continuations.
+//! - Template literals — including nested substitutions and nested templates —
+//!   via an internal brace-kind stack, so the lexer is fully self-contained
+//!   (no parser feedback needed for the common cases).
+//! - The regex-vs-division ambiguity, resolved with the standard
+//!   previous-significant-token heuristic.
+//! - Line terminators and comments, recording for each token whether a line
+//!   terminator preceded it (the signal the parser needs for Automatic
+//!   Semicolon Insertion).
+//!
+//! ## What it defers
+//!
+//! Full template re-lexing driven by the parser (needed only for a few
+//! pathological `}`-after-substitution cases the brace-stack cannot
+//! disambiguate on its own) lands with the parser in Phase B.
+
+mod token;
+
+#[cfg(test)]
+mod tests;
+
+pub use token::{Keyword, Token, TokenKind};
+
+use crate::common::Span;
+use crate::error::{Error, Result};
+use alloc::vec::Vec;
+
+/// Tracks why we are inside a `{ … }`, so a `}` can be disambiguated between
+/// "close a block/object" and "resume a template literal after `${ … }`".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BraceKind {
+    /// An ordinary `{` (block, object literal, destructuring, …).
+    Normal,
+    /// The `{` of a template substitution `${ … }`; its `}` resumes the
+    /// template body.
+    TemplateSubstitution,
+}
+
+/// A streaming ECMAScript tokenizer over a borrowed source string.
+///
+/// Drive it with [`Lexer::next_token`] until it yields [`TokenKind::Eof`], or
+/// collect everything at once with [`Lexer::tokenize`].
+pub struct Lexer<'src> {
+    /// The full source text.
+    source: &'src str,
+    /// Remaining bytes, as raw bytes for fast ASCII dispatch. Always a valid
+    /// UTF-8 boundary at `pos`.
+    bytes: &'src [u8],
+    /// Current byte offset into `source`.
+    pos: usize,
+    /// The kind of the previous significant (non-trivia) token, used to
+    /// resolve the `/` regex-vs-division ambiguity. `None` at start of input.
+    prev_significant: Option<TokenKind>,
+    /// Open-brace stack for template-substitution tracking.
+    brace_stack: Vec<BraceKind>,
+}
+
+impl<'src> Lexer<'src> {
+    /// Creates a lexer over `source`.
+    #[must_use]
+    pub fn new(source: &'src str) -> Self {
+        Self {
+            source,
+            bytes: source.as_bytes(),
+            pos: 0,
+            prev_significant: None,
+            brace_stack: Vec::new(),
+        }
+    }
+
+    /// The source text this lexer is scanning.
+    #[inline]
+    #[must_use]
+    pub fn source(&self) -> &'src str {
+        self.source
+    }
+
+    /// Tokenizes the entire input into a vector ending with an
+    /// [`TokenKind::Eof`] token. Returns the first lexical [`Error`]
+    /// encountered, if any.
+    pub fn tokenize(mut self) -> Result<Vec<Token>> {
+        let mut out = Vec::new();
+        loop {
+            let tok = self.next_token()?;
+            let is_eof = tok.kind == TokenKind::Eof;
+            out.push(tok);
+            if is_eof {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Produces the next token, consuming any leading whitespace/comments. The
+    /// returned token's [`Token::newline_before`] records whether a line
+    /// terminator was skipped before it (for ASI).
+    pub fn next_token(&mut self) -> Result<Token> {
+        let newline_before = self.skip_trivia();
+        let start = self.pos;
+
+        let Some(c) = self.peek() else {
+            return Ok(self.make(TokenKind::Eof, start, newline_before));
+        };
+
+        let kind = match c {
+            b'{' => {
+                self.advance();
+                self.brace_stack.push(BraceKind::Normal);
+                TokenKind::LBrace
+            }
+            b'}' => {
+                // A `}` that closes a template substitution resumes template
+                // scanning rather than emitting a plain `}`.
+                if matches!(
+                    self.brace_stack.last(),
+                    Some(BraceKind::TemplateSubstitution)
+                ) {
+                    self.brace_stack.pop();
+                    return self.read_template_continuation(start, newline_before);
+                }
+                self.advance();
+                self.brace_stack.pop();
+                TokenKind::RBrace
+            }
+            b'(' => self.single(TokenKind::LParen),
+            b')' => self.single(TokenKind::RParen),
+            b'[' => self.single(TokenKind::LBracket),
+            b']' => self.single(TokenKind::RBracket),
+            b';' => self.single(TokenKind::Semicolon),
+            b',' => self.single(TokenKind::Comma),
+            b'~' => self.single(TokenKind::Tilde),
+            b':' => self.single(TokenKind::Colon),
+            b'?' => self.read_question(),
+            // `.` may begin a number (`.5`), the spread `...`, or a member `.`.
+            b'.' if matches!(self.peek_at(1), Some(b'0'..=b'9')) => self.read_number()?,
+            b'.' => self.read_dot(),
+            b'<' => self.read_lt(),
+            b'>' => self.read_gt(),
+            b'=' => self.read_eq(),
+            b'!' => self.read_bang(),
+            b'+' => self.read_plus(),
+            b'-' => self.read_minus(),
+            b'*' => self.read_star(),
+            b'%' => self.read_percent(),
+            b'&' => self.read_amp(),
+            b'|' => self.read_pipe(),
+            b'^' => self.read_caret(),
+            b'/' => return self.read_slash(start, newline_before),
+            b'"' | b'\'' => self.read_string(c)?,
+            b'`' => return self.read_template_start(start, newline_before),
+            b'#' => self.read_private_name()?,
+            b'0'..=b'9' => self.read_number()?,
+            _ => {
+                if is_identifier_start_byte(c) || c >= 0x80 {
+                    self.read_identifier_or_keyword()?
+                } else {
+                    self.advance();
+                    return Err(Error::syntax(
+                        alloc::format!("unexpected character {:?}", c as char),
+                        Span::new(start as u32, self.pos as u32),
+                    ));
+                }
+            }
+        };
+
+        Ok(self.make(kind, start, newline_before))
+    }
+
+    // --- trivia ---------------------------------------------------------
+
+    /// Skips whitespace and comments. Returns whether at least one line
+    /// terminator was crossed.
+    fn skip_trivia(&mut self) -> bool {
+        let mut newline = false;
+        loop {
+            let Some(c) = self.peek() else { return newline };
+            match c {
+                // ASCII whitespace.
+                b' ' | b'\t' | 0x0b | 0x0c => self.advance(),
+                // Line terminators (LF, CR). CRLF counts once.
+                b'\n' => {
+                    newline = true;
+                    self.advance();
+                }
+                b'\r' => {
+                    newline = true;
+                    self.advance();
+                    if self.peek() == Some(b'\n') {
+                        self.advance();
+                    }
+                }
+                b'/' => match self.peek_at(1) {
+                    Some(b'/') => self.skip_line_comment(),
+                    Some(b'*') => newline |= self.skip_block_comment(),
+                    _ => return newline,
+                },
+                // Non-ASCII whitespace / line terminators (NBSP, BOM, U+2028,
+                // U+2029, the Zs category…). Decode one char to classify.
+                _ if c >= 0x80 => {
+                    let ch = self.peek_char().expect("non-empty");
+                    if is_unicode_line_terminator(ch) {
+                        newline = true;
+                        self.advance_char(ch);
+                    } else if is_unicode_whitespace(ch) {
+                        self.advance_char(ch);
+                    } else {
+                        return newline;
+                    }
+                }
+                _ => return newline,
+            }
+        }
+    }
+
+    fn skip_line_comment(&mut self) {
+        // Consume `//` then everything up to (not including) a line terminator.
+        self.advance();
+        self.advance();
+        while let Some(c) = self.peek() {
+            if c == b'\n' || c == b'\r' {
+                break;
+            }
+            if c >= 0x80 {
+                let ch = self.peek_char().expect("non-empty");
+                if is_unicode_line_terminator(ch) {
+                    break;
+                }
+                self.advance_char(ch);
+            } else {
+                self.advance();
+            }
+        }
+    }
+
+    /// Skips a `/* … */` comment. Returns whether it contained a line
+    /// terminator (which, per spec, makes it act as one for ASI).
+    fn skip_block_comment(&mut self) -> bool {
+        self.advance();
+        self.advance();
+        let mut newline = false;
+        while let Some(c) = self.peek() {
+            if c == b'*' && self.peek_at(1) == Some(b'/') {
+                self.advance();
+                self.advance();
+                return newline;
+            }
+            if c == b'\n' || c == b'\r' {
+                newline = true;
+                self.advance();
+            } else if c >= 0x80 {
+                let ch = self.peek_char().expect("non-empty");
+                if is_unicode_line_terminator(ch) {
+                    newline = true;
+                }
+                self.advance_char(ch);
+            } else {
+                self.advance();
+            }
+        }
+        newline
+    }
+
+    // --- multi-character punctuators ------------------------------------
+
+    fn read_question(&mut self) -> TokenKind {
+        self.advance();
+        match self.peek() {
+            // `?.` but only as optional chaining, not `?.5` (which is `?`
+            // then `.5`). The spec carves out a digit after `?.`.
+            Some(b'.') if !matches!(self.peek_at(1), Some(b'0'..=b'9')) => {
+                self.advance();
+                TokenKind::QuestionDot
+            }
+            Some(b'?') => {
+                self.advance();
+                if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::QuestionQuestionEq
+                } else {
+                    TokenKind::QuestionQuestion
+                }
+            }
+            _ => TokenKind::Question,
+        }
+    }
+
+    /// `.` — member access or the `...` spread. The `.5` numeric case is
+    /// routed to [`Self::read_number`] by the caller before reaching here.
+    fn read_dot(&mut self) -> TokenKind {
+        self.advance();
+        if self.peek() == Some(b'.') && self.peek_at(1) == Some(b'.') {
+            self.advance();
+            self.advance();
+            TokenKind::DotDotDot
+        } else {
+            TokenKind::Dot
+        }
+    }
+
+    fn read_lt(&mut self) -> TokenKind {
+        self.advance();
+        match self.peek() {
+            Some(b'=') => self.single(TokenKind::LtEq),
+            Some(b'<') => {
+                self.advance();
+                if self.peek() == Some(b'=') {
+                    self.single(TokenKind::ShlEq)
+                } else {
+                    TokenKind::Shl
+                }
+            }
+            _ => TokenKind::Lt,
+        }
+    }
+
+    fn read_gt(&mut self) -> TokenKind {
+        self.advance();
+        match self.peek() {
+            Some(b'=') => self.single(TokenKind::GtEq),
+            Some(b'>') => {
+                self.advance();
+                match self.peek() {
+                    Some(b'=') => self.single(TokenKind::ShrEq),
+                    Some(b'>') => {
+                        self.advance();
+                        if self.peek() == Some(b'=') {
+                            self.single(TokenKind::UshrEq)
+                        } else {
+                            TokenKind::Ushr
+                        }
+                    }
+                    _ => TokenKind::Shr,
+                }
+            }
+            _ => TokenKind::Gt,
+        }
+    }
+
+    fn read_eq(&mut self) -> TokenKind {
+        self.advance();
+        match self.peek() {
+            Some(b'=') => {
+                self.advance();
+                if self.peek() == Some(b'=') {
+                    self.single(TokenKind::EqEqEq)
+                } else {
+                    TokenKind::EqEq
+                }
+            }
+            Some(b'>') => self.single(TokenKind::Arrow),
+            _ => TokenKind::Eq,
+        }
+    }
+
+    fn read_bang(&mut self) -> TokenKind {
+        self.advance();
+        if self.peek() == Some(b'=') {
+            self.advance();
+            if self.peek() == Some(b'=') {
+                self.single(TokenKind::BangEqEq)
+            } else {
+                TokenKind::BangEq
+            }
+        } else {
+            TokenKind::Bang
+        }
+    }
+
+    fn read_plus(&mut self) -> TokenKind {
+        self.advance();
+        match self.peek() {
+            Some(b'+') => self.single(TokenKind::PlusPlus),
+            Some(b'=') => self.single(TokenKind::PlusEq),
+            _ => TokenKind::Plus,
+        }
+    }
+
+    fn read_minus(&mut self) -> TokenKind {
+        self.advance();
+        match self.peek() {
+            Some(b'-') => self.single(TokenKind::MinusMinus),
+            Some(b'=') => self.single(TokenKind::MinusEq),
+            _ => TokenKind::Minus,
+        }
+    }
+
+    fn read_star(&mut self) -> TokenKind {
+        self.advance();
+        match self.peek() {
+            Some(b'*') => {
+                self.advance();
+                if self.peek() == Some(b'=') {
+                    self.single(TokenKind::StarStarEq)
+                } else {
+                    TokenKind::StarStar
+                }
+            }
+            Some(b'=') => self.single(TokenKind::StarEq),
+            _ => TokenKind::Star,
+        }
+    }
+
+    fn read_percent(&mut self) -> TokenKind {
+        self.advance();
+        if self.peek() == Some(b'=') {
+            self.single(TokenKind::PercentEq)
+        } else {
+            TokenKind::Percent
+        }
+    }
+
+    fn read_amp(&mut self) -> TokenKind {
+        self.advance();
+        match self.peek() {
+            Some(b'&') => {
+                self.advance();
+                if self.peek() == Some(b'=') {
+                    self.single(TokenKind::AmpAmpEq)
+                } else {
+                    TokenKind::AmpAmp
+                }
+            }
+            Some(b'=') => self.single(TokenKind::AmpEq),
+            _ => TokenKind::Amp,
+        }
+    }
+
+    fn read_pipe(&mut self) -> TokenKind {
+        self.advance();
+        match self.peek() {
+            Some(b'|') => {
+                self.advance();
+                if self.peek() == Some(b'=') {
+                    self.single(TokenKind::PipePipeEq)
+                } else {
+                    TokenKind::PipePipe
+                }
+            }
+            Some(b'=') => self.single(TokenKind::PipeEq),
+            _ => TokenKind::Pipe,
+        }
+    }
+
+    fn read_caret(&mut self) -> TokenKind {
+        self.advance();
+        if self.peek() == Some(b'=') {
+            self.single(TokenKind::CaretEq)
+        } else {
+            TokenKind::Caret
+        }
+    }
+
+    /// `/` — either a comment (already handled in trivia), a division
+    /// operator, or the start of a regular-expression literal, decided by the
+    /// previous significant token.
+    fn read_slash(&mut self, start: usize, newline_before: bool) -> Result<Token> {
+        if self.regex_allowed() {
+            return self.read_regex(start, newline_before);
+        }
+        self.advance();
+        let kind = if self.peek() == Some(b'=') {
+            self.single(TokenKind::SlashEq)
+        } else {
+            TokenKind::Slash
+        };
+        Ok(self.make(kind, start, newline_before))
+    }
+
+    // --- literals -------------------------------------------------------
+
+    fn read_string(&mut self, quote: u8) -> Result<TokenKind> {
+        let start = self.pos;
+        self.advance(); // opening quote
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(Error::syntax(
+                    "unterminated string literal",
+                    Span::new(start as u32, self.pos as u32),
+                ));
+            };
+            match c {
+                _ if c == quote => {
+                    self.advance();
+                    return Ok(TokenKind::String);
+                }
+                b'\\' => {
+                    self.advance();
+                    self.consume_escape_tail(start)?;
+                }
+                b'\n' | b'\r' => {
+                    return Err(Error::syntax(
+                        "unterminated string literal (line terminator in string)",
+                        Span::new(start as u32, self.pos as u32),
+                    ));
+                }
+                _ => self.advance_any(),
+            }
+        }
+    }
+
+    /// Consumes the character(s) after a `\` inside a string/template. We do
+    /// not decode the value here (that is the parser's cooked-value step); we
+    /// only consume the right number of source bytes so scanning stays in
+    /// sync, while validating the few escapes that have a fixed shape.
+    fn consume_escape_tail(&mut self, start: usize) -> Result<()> {
+        let Some(c) = self.peek() else {
+            return Err(Error::syntax(
+                "unterminated escape sequence",
+                Span::new(start as u32, self.pos as u32),
+            ));
+        };
+        match c {
+            // Line continuation: `\` followed by a line terminator.
+            b'\n' => self.advance(),
+            b'\r' => {
+                self.advance();
+                if self.peek() == Some(b'\n') {
+                    self.advance();
+                }
+            }
+            b'x' => {
+                self.advance();
+                for _ in 0..2 {
+                    if !self.peek().is_some_and(|b| b.is_ascii_hexdigit()) {
+                        return Err(Error::syntax(
+                            "invalid hexadecimal escape sequence",
+                            Span::new(start as u32, self.pos as u32),
+                        ));
+                    }
+                    self.advance();
+                }
+            }
+            b'u' => {
+                self.advance();
+                self.consume_unicode_escape(start)?;
+            }
+            _ => self.advance_any(),
+        }
+        Ok(())
+    }
+
+    /// Consumes the body of a `\u` escape: either `\uXXXX` or `\u{ … }`.
+    fn consume_unicode_escape(&mut self, start: usize) -> Result<()> {
+        if self.peek() == Some(b'{') {
+            self.advance();
+            let mut any = false;
+            while self.peek().is_some_and(|b| b.is_ascii_hexdigit()) {
+                any = true;
+                self.advance();
+            }
+            if !any || self.peek() != Some(b'}') {
+                return Err(Error::syntax(
+                    "invalid Unicode code-point escape",
+                    Span::new(start as u32, self.pos as u32),
+                ));
+            }
+            self.advance(); // `}`
+        } else {
+            for _ in 0..4 {
+                if !self.peek().is_some_and(|b| b.is_ascii_hexdigit()) {
+                    return Err(Error::syntax(
+                        "invalid Unicode escape sequence",
+                        Span::new(start as u32, self.pos as u32),
+                    ));
+                }
+                self.advance();
+            }
+        }
+        Ok(())
+    }
+
+    /// Scans from a backtick: emits either a [`TokenKind::NoSubstitutionTemplate`]
+    /// (no `${`) or a [`TokenKind::TemplateHead`] (up to and including the first
+    /// `${`), pushing a substitution marker so the matching `}` resumes here.
+    fn read_template_start(&mut self, start: usize, newline_before: bool) -> Result<Token> {
+        self.advance(); // opening backtick
+        let kind = self.scan_template_body(start)?;
+        if kind == TokenKind::TemplateHead {
+            self.brace_stack.push(BraceKind::TemplateSubstitution);
+        }
+        Ok(self.make(kind, start, newline_before))
+    }
+
+    /// Scans from the `}` that closes a substitution: emits either a
+    /// [`TokenKind::TemplateMiddle`] (another `${` follows) or a
+    /// [`TokenKind::TemplateTail`] (closing backtick).
+    fn read_template_continuation(&mut self, start: usize, newline_before: bool) -> Result<Token> {
+        self.advance(); // the `}`
+        let kind = match self.scan_template_body(start)? {
+            TokenKind::NoSubstitutionTemplate => TokenKind::TemplateTail,
+            TokenKind::TemplateHead => {
+                self.brace_stack.push(BraceKind::TemplateSubstitution);
+                TokenKind::TemplateMiddle
+            }
+            other => other,
+        };
+        Ok(self.make(kind, start, newline_before))
+    }
+
+    /// Shared template-body scanner. Assumes the introducer (backtick or `}`)
+    /// has been consumed. Returns [`TokenKind::NoSubstitutionTemplate`] if it
+    /// reached a closing backtick, or [`TokenKind::TemplateHead`] if it
+    /// reached a `${`.
+    fn scan_template_body(&mut self, start: usize) -> Result<TokenKind> {
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(Error::syntax(
+                    "unterminated template literal",
+                    Span::new(start as u32, self.pos as u32),
+                ));
+            };
+            match c {
+                b'`' => {
+                    self.advance();
+                    return Ok(TokenKind::NoSubstitutionTemplate);
+                }
+                b'$' if self.peek_at(1) == Some(b'{') => {
+                    self.advance();
+                    self.advance();
+                    return Ok(TokenKind::TemplateHead);
+                }
+                b'\\' => {
+                    self.advance();
+                    // A `\` escapes the next char (incl. backtick and `$`); we
+                    // just consume one unit so scanning stays in sync.
+                    self.advance_any();
+                }
+                _ => self.advance_any(),
+            }
+        }
+    }
+
+    /// A regular-expression literal `/pattern/flags`. Handles character
+    /// classes (`[...]`, inside which `/` is literal) and escapes.
+    fn read_regex(&mut self, start: usize, newline_before: bool) -> Result<Token> {
+        self.advance(); // opening `/`
+        let mut in_class = false;
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(Error::syntax(
+                    "unterminated regular expression literal",
+                    Span::new(start as u32, self.pos as u32),
+                ));
+            };
+            match c {
+                b'\n' | b'\r' => {
+                    return Err(Error::syntax(
+                        "unterminated regular expression literal (line terminator)",
+                        Span::new(start as u32, self.pos as u32),
+                    ));
+                }
+                b'\\' => {
+                    self.advance();
+                    if self.peek().is_some_and(|b| b == b'\n' || b == b'\r') {
+                        return Err(Error::syntax(
+                            "unterminated regular expression literal",
+                            Span::new(start as u32, self.pos as u32),
+                        ));
+                    }
+                    self.advance_any();
+                }
+                b'[' => {
+                    in_class = true;
+                    self.advance();
+                }
+                b']' => {
+                    in_class = false;
+                    self.advance();
+                }
+                b'/' if !in_class => {
+                    self.advance();
+                    break;
+                }
+                _ => self.advance_any(),
+            }
+        }
+        // Flags: identifier-continue characters immediately after the closing
+        // slash.
+        while let Some(c) = self.peek() {
+            if c < 0x80 {
+                if is_identifier_part_byte(c) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            } else {
+                let ch = self.peek_char().expect("non-empty");
+                if is_identifier_part_char(ch) {
+                    self.advance_char(ch);
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(self.make(TokenKind::Regex, start, newline_before))
+    }
+
+    fn read_private_name(&mut self) -> Result<TokenKind> {
+        let start = self.pos;
+        self.advance(); // `#`
+        match self.peek() {
+            Some(c) if is_identifier_start_byte(c) || c >= 0x80 => {
+                self.read_identifier_tail();
+                Ok(TokenKind::PrivateName)
+            }
+            _ => Err(Error::syntax(
+                "expected an identifier after `#`",
+                Span::new(start as u32, self.pos as u32),
+            )),
+        }
+    }
+
+    fn read_number(&mut self) -> Result<TokenKind> {
+        let start = self.pos;
+        let first = self.peek().expect("called with a digit or dot");
+
+        if first == b'0' {
+            match self.peek_at(1) {
+                Some(b'x' | b'X') => return self.read_radix_number(16, start),
+                Some(b'o' | b'O') => return self.read_radix_number(8, start),
+                Some(b'b' | b'B') => return self.read_radix_number(2, start),
+                _ => {}
+            }
+        }
+
+        // Integer part (decimal), allowing numeric separators.
+        if first == b'.' {
+            self.advance(); // `.`
+            self.read_decimal_digits()?;
+            self.read_exponent()?;
+            return Ok(TokenKind::Number);
+        }
+
+        self.read_decimal_digits()?;
+
+        // BigInt suffix is only valid for an integer with no fraction/exponent.
+        if self.peek() == Some(b'n') {
+            self.advance();
+            return Ok(TokenKind::BigInt);
+        }
+
+        let mut is_float = false;
+        if self.peek() == Some(b'.') {
+            is_float = true;
+            self.advance();
+            // Fractional digits are optional (`1.`).
+            if self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                self.read_decimal_digits()?;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            is_float = true;
+            self.read_exponent()?;
+        }
+
+        let _ = is_float; // both fold to TokenKind::Number for now
+        self.reject_identifier_after_number(start)?;
+        Ok(TokenKind::Number)
+    }
+
+    fn read_radix_number(&mut self, radix: u32, start: usize) -> Result<TokenKind> {
+        self.advance(); // `0`
+        self.advance(); // radix marker
+        let mut any = false;
+        let mut last_was_sep = false;
+        while let Some(c) = self.peek() {
+            if c == b'_' {
+                if !any || last_was_sep {
+                    return Err(self.sep_error(start));
+                }
+                last_was_sep = true;
+                self.advance();
+            } else if (c as char).is_digit(radix) {
+                any = true;
+                last_was_sep = false;
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if !any || last_was_sep {
+            return Err(Error::syntax(
+                "missing digits in numeric literal",
+                Span::new(start as u32, self.pos as u32),
+            ));
+        }
+        if self.peek() == Some(b'n') {
+            self.advance();
+            return Ok(TokenKind::BigInt);
+        }
+        self.reject_identifier_after_number(start)?;
+        Ok(TokenKind::Number)
+    }
+
+    fn read_decimal_digits(&mut self) -> Result<()> {
+        let start = self.pos;
+        let mut last_was_sep = false;
+        let mut any = false;
+        while let Some(c) = self.peek() {
+            if c == b'_' {
+                if !any || last_was_sep {
+                    return Err(self.sep_error(start));
+                }
+                last_was_sep = true;
+                self.advance();
+            } else if c.is_ascii_digit() {
+                any = true;
+                last_was_sep = false;
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if last_was_sep {
+            return Err(self.sep_error(start));
+        }
+        Ok(())
+    }
+
+    fn read_exponent(&mut self) -> Result<()> {
+        if !matches!(self.peek(), Some(b'e' | b'E')) {
+            return Ok(());
+        }
+        let start = self.pos;
+        self.advance(); // `e`
+        if matches!(self.peek(), Some(b'+' | b'-')) {
+            self.advance();
+        }
+        if !self.peek().is_some_and(|b| b.is_ascii_digit()) {
+            return Err(Error::syntax(
+                "missing exponent in numeric literal",
+                Span::new(start as u32, self.pos as u32),
+            ));
+        }
+        self.read_decimal_digits()
+    }
+
+    /// Per spec, an identifier may not immediately follow a numeric literal
+    /// (`3in` is an error, not `3 in`).
+    fn reject_identifier_after_number(&mut self, start: usize) -> Result<()> {
+        if let Some(c) = self.peek()
+            && (is_identifier_start_byte(c) || c >= 0x80)
+        {
+            return Err(Error::syntax(
+                "identifier directly after numeric literal",
+                Span::new(start as u32, self.pos as u32),
+            ));
+        }
+        Ok(())
+    }
+
+    fn sep_error(&self, start: usize) -> Error {
+        Error::syntax(
+            "misplaced numeric separator `_`",
+            Span::new(start as u32, self.pos as u32),
+        )
+    }
+
+    // --- identifiers & keywords -----------------------------------------
+
+    fn read_identifier_or_keyword(&mut self) -> Result<TokenKind> {
+        let start = self.pos;
+        self.read_identifier_tail();
+        let text = &self.source[start..self.pos];
+        Ok(match Keyword::from_str(text) {
+            Some(kw) => TokenKind::Keyword(kw),
+            None => TokenKind::Identifier,
+        })
+    }
+
+    /// Consumes identifier-continue characters from the current position.
+    fn read_identifier_tail(&mut self) {
+        // The start char may already be consumed by the caller, or not; this
+        // routine just eats all identifier-part chars from here.
+        while let Some(c) = self.peek() {
+            if c < 0x80 {
+                if is_identifier_part_byte(c) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            } else {
+                let ch = self.peek_char().expect("non-empty");
+                if is_identifier_part_char(ch) {
+                    self.advance_char(ch);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // --- regex-vs-division heuristic ------------------------------------
+
+    /// Whether a `/` at the current position should begin a regex literal,
+    /// based on the previous significant token. This is the standard heuristic
+    /// used by hand-written JS lexers.
+    fn regex_allowed(&self) -> bool {
+        match self.prev_significant {
+            // Start of input → expression position.
+            None => true,
+            Some(kind) => match kind {
+                // After a value-producing token, `/` is division.
+                TokenKind::Identifier
+                | TokenKind::PrivateName
+                | TokenKind::Number
+                | TokenKind::BigInt
+                | TokenKind::String
+                | TokenKind::Regex
+                | TokenKind::NoSubstitutionTemplate
+                | TokenKind::TemplateTail
+                | TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::RBrace
+                | TokenKind::PlusPlus
+                | TokenKind::MinusMinus => false,
+                // Keywords that produce/precede a value vs. those that precede
+                // an expression.
+                TokenKind::Keyword(kw) => kw.before_expression(),
+                // Everything else (operators, `(`, `,`, `=`, `return`, …) is an
+                // expression position.
+                _ => true,
+            },
+        }
+    }
+
+    // --- low-level cursor ------------------------------------------------
+
+    #[inline]
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    #[inline]
+    fn peek_at(&self, n: usize) -> Option<u8> {
+        self.bytes.get(self.pos + n).copied()
+    }
+
+    /// Decodes the full Unicode scalar at `pos` (for the non-ASCII paths).
+    #[inline]
+    fn peek_char(&self) -> Option<char> {
+        self.source[self.pos..].chars().next()
+    }
+
+    /// Advances one ASCII byte. Must not be called on a multi-byte lead byte.
+    #[inline]
+    fn advance(&mut self) {
+        debug_assert!(self.bytes.get(self.pos).is_some_and(|b| *b < 0x80));
+        self.pos += 1;
+    }
+
+    /// Advances over whatever is at `pos`, whether ASCII or a multi-byte char.
+    #[inline]
+    fn advance_any(&mut self) {
+        match self.peek() {
+            Some(c) if c < 0x80 => self.pos += 1,
+            Some(_) => {
+                let ch = self.peek_char().expect("non-empty");
+                self.pos += ch.len_utf8();
+            }
+            None => {}
+        }
+    }
+
+    /// Advances over a known decoded char.
+    #[inline]
+    fn advance_char(&mut self, ch: char) {
+        self.pos += ch.len_utf8();
+    }
+
+    /// Consumes a single ASCII byte and returns `kind` — the common
+    /// "two-character operator, second char matched" tail.
+    #[inline]
+    fn single(&mut self, kind: TokenKind) -> TokenKind {
+        self.advance();
+        kind
+    }
+
+    /// Finalizes a token spanning `[start, self.pos)`, updating the
+    /// previous-significant-token state for the regex heuristic.
+    fn make(&mut self, kind: TokenKind, start: usize, newline_before: bool) -> Token {
+        if kind != TokenKind::Eof {
+            self.prev_significant = Some(kind);
+        }
+        Token {
+            kind,
+            span: Span::new(start as u32, self.pos as u32),
+            newline_before,
+        }
+    }
+}
+
+// --- identifier classification ------------------------------------------
+
+/// ASCII identifier-start bytes (`$`, `_`, `A–Z`, `a–z`). Non-ASCII is handled
+/// separately via [`is_identifier_part_char`].
+#[inline]
+fn is_identifier_start_byte(c: u8) -> bool {
+    c == b'$' || c == b'_' || c.is_ascii_alphabetic()
+}
+
+/// ASCII identifier-continue bytes (start set plus digits).
+#[inline]
+fn is_identifier_part_byte(c: u8) -> bool {
+    is_identifier_start_byte(c) || c.is_ascii_digit()
+}
+
+/// Whether a non-ASCII char may continue an identifier. This is a pragmatic
+/// approximation of `ID_Continue` (any alphanumeric or connector-ish char, plus
+/// ZWNJ/ZWJ) sufficient for Phase A; the exact Unicode property tables land
+/// with the parser. ASCII is rejected here and routed through the byte
+/// classifiers.
+#[inline]
+fn is_identifier_part_char(ch: char) -> bool {
+    if ch.is_ascii() {
+        return is_identifier_part_byte(ch as u8);
+    }
+    ch.is_alphanumeric() || ch == '\u{200C}' || ch == '\u{200D}'
+}
+
+/// Whether a char is ECMAScript whitespace (the `WhiteSpace` production):
+/// TAB, VT, FF, SP, NBSP, ZWNBSP/BOM, and the Unicode `Zs` category.
+#[inline]
+fn is_unicode_whitespace(ch: char) -> bool {
+    matches!(ch, '\u{00A0}' | '\u{FEFF}') || ch.is_whitespace() && !is_unicode_line_terminator(ch)
+}
+
+/// Whether a char is an ECMAScript `LineTerminator`: LF, CR, LS, PS.
+#[inline]
+fn is_unicode_line_terminator(ch: char) -> bool {
+    matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
