@@ -213,6 +213,27 @@ impl Realm {
         self.heap.get(handle)?.as_date()
     }
 
+    /// Allocates a `RegExp` from its source and flags.
+    pub fn new_regexp(&mut self, source: &str, flags: &str) -> Handle {
+        self.heap.alloc(Cell::RegExp {
+            source: alloc::boxed::Box::from(source),
+            flags: alloc::boxed::Box::from(flags),
+        })
+    }
+
+    /// The `(source, flags)` of the `RegExp` at `handle` (owned), if it is one.
+    #[must_use]
+    pub fn regexp_at(
+        &self,
+        handle: Handle,
+    ) -> Option<(alloc::string::String, alloc::string::String)> {
+        let (s, f) = self.heap.get(handle)?.as_regexp()?;
+        Some((
+            alloc::string::String::from(s),
+            alloc::string::String::from(f),
+        ))
+    }
+
     /// Allocates a pending `Promise`.
     pub fn new_promise(&mut self) -> Handle {
         self.heap
@@ -434,6 +455,7 @@ impl Realm {
                 Some(Cell::BoundNative { .. }) => "function () { … }".into(),
                 Some(Cell::Promise(_)) => "[object Promise]".into(),
                 Some(Cell::Date(ms)) => date_to_iso(*ms),
+                Some(Cell::RegExp { source, flags }) => alloc::format!("/{source}/{flags}"),
                 None => "undefined".into(), // stale handle
             },
         }

@@ -89,6 +89,14 @@ pub enum Cell {
     Promise(Rc<RefCell<PromiseState>>),
     /// A `Date`: milliseconds since the Unix epoch (UTC).
     Date(f64),
+    /// A `RegExp`: its source pattern and flags (compiled on demand by the
+    /// `regex` engine, so the variant itself carries no feature-gated type).
+    RegExp {
+        /// The pattern source.
+        source: alloc::boxed::Box<str>,
+        /// The flags (e.g. `"gi"`).
+        flags: alloc::boxed::Box<str>,
+    },
     /// A class constructor: an index into the interpreter's class table plus the
     /// scope it was defined in.
     Class {
@@ -197,6 +205,15 @@ impl Cell {
         }
     }
 
+    /// The `(source, flags)` if this cell is a `RegExp`.
+    #[must_use]
+    pub fn as_regexp(&self) -> Option<(&str, &str)> {
+        match self {
+            Cell::RegExp { source, flags } => Some((source, flags)),
+            _ => None,
+        }
+    }
+
     /// The `(class_id, captured env)`, if this cell is a class.
     #[must_use]
     pub fn as_class(&self) -> Option<(u32, &Scope)> {
@@ -238,7 +255,8 @@ impl Cell {
             | Cell::Array(_)
             | Cell::Collection { .. }
             | Cell::Promise(_)
-            | Cell::Date(_) => "object",
+            | Cell::Date(_)
+            | Cell::RegExp { .. } => "object",
         }
     }
 }
@@ -284,8 +302,8 @@ impl Trace for Cell {
             }
             // A bound native keeps its target reachable.
             Cell::BoundNative { target, .. } => visit(*target),
-            // Strings, native functions, and dates reference no handles.
-            Cell::Str(_) | Cell::Native(_) | Cell::Date(_) => {}
+            // Strings, native functions, dates, and regexes reference no handles.
+            Cell::Str(_) | Cell::Native(_) | Cell::Date(_) | Cell::RegExp { .. } => {}
         }
     }
 }

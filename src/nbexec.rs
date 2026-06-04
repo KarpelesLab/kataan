@@ -136,6 +136,7 @@ const N_ARRAY_FROM: u16 = 20;
 const N_ARRAY_OF: u16 = 21;
 const N_PROMISE: u16 = 22;
 const N_DATE: u16 = 25;
+const N_REGEXP: u16 = 26;
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
@@ -202,6 +203,10 @@ impl<'a> Interp<'a> {
         let date_ctor = self.realm.new_native(N_DATE);
         self.current
             .declare("Date", NanBox::handle(date_ctor.to_raw()));
+        // `RegExp` is a native constructor.
+        let regexp_ctor = self.realm.new_native(N_REGEXP);
+        self.current
+            .declare("RegExp", NanBox::handle(regexp_ctor.to_raw()));
         install_namespace(self, "JSON", &[("stringify", N_JSON_STRINGIFY)]);
         install_namespace(
             self,
@@ -768,6 +773,18 @@ impl<'a> Interp<'a> {
             let d = self.realm.new_date(ms);
             return Ok(NanBox::handle(d.to_raw()));
         }
+        // `new RegExp(pattern, flags)`.
+        if id == N_REGEXP {
+            let pat = self
+                .realm
+                .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
+            let flags = match args.get(1) {
+                Some(f) => self.realm.to_display_string(*f),
+                None => String::new(),
+            };
+            let r = self.realm.new_regexp(&pat, &flags);
+            return Ok(NanBox::handle(r.to_raw()));
+        }
         let is_set = match id {
             N_SET => true,
             N_MAP => false,
@@ -1001,6 +1018,32 @@ impl<'a> Interp<'a> {
                 "toISOString" | "toJSON" => self.new_str(&crate::realm::date_to_iso(ms)),
                 _ => return Ok(None),
             }));
+        }
+        // --- RegExp instance methods (`test`/`exec`) ---
+        if let Some((source, flags)) = self.realm.regexp_at(handle) {
+            let _ = (&source, &flags);
+            #[cfg(feature = "regex")]
+            {
+                let text = self.realm.to_display_string(arg(0));
+                let re = crate::regex::Regex::new(&source, &flags);
+                match (method, re) {
+                    ("test", Ok(re)) => return Ok(Some(NanBox::boolean(re.is_match(&text)))),
+                    ("exec", Ok(re)) => {
+                        return Ok(Some(match re.find_from(&text, 0) {
+                            Some((s, e)) => {
+                                let matched = self.new_str(&text[s..e]);
+                                NanBox::handle(self.realm.new_array(alloc::vec![matched]).to_raw())
+                            }
+                            None => NanBox::null(),
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            #[cfg(not(feature = "regex"))]
+            if matches!(method, "test" | "exec") {
+                return Err(ExecError::Unsupported("RegExp needs the regex feature"));
+            }
         }
         // --- `Promise.resolve` / `Promise.reject` statics (on the constructor) ---
         if self.realm.native_at(handle) == Some(N_PROMISE) {
@@ -1822,6 +1865,9 @@ impl<'a> Interp<'a> {
                     .get(name)
                     .ok_or_else(|| ExecError::NotDefined(String::from(name))),
             },
+            Expr::Regex { pattern, flags, .. } => Ok(NanBox::handle(
+                self.realm.new_regexp(pattern, flags).to_raw(),
+            )),
             Expr::This(_) => Ok(self.this_val),
             Expr::Await { argument, .. } => {
                 let v = self.eval(argument)?;
@@ -2749,6 +2795,25 @@ mod tests {
         // typeof an async function is function; its call returns a promise.
         assert_eq!(run("async function a() {} typeof a"), "function");
         assert_eq!(run("async function a() { return 1; } typeof a()"), "object");
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn regexp() {
+        // Regex literal + test.
+        assert_eq!(run("/ab+c/.test('xxabbbcyy')"), "true");
+        assert_eq!(run("/^\\d+$/.test('12345')"), "true");
+        assert_eq!(run("/^\\d+$/.test('12a45')"), "false");
+        // case-insensitive flag.
+        assert_eq!(run("/hello/i.test('HELLO')"), "true");
+        // new RegExp(...).
+        assert_eq!(run("new RegExp('a.c').test('axc')"), "true");
+        // exec returns the matched substring (or null).
+        assert_eq!(run("/b+/.exec('aabbbc')[0]"), "bbb");
+        assert_eq!(run("/zzz/.exec('abc') === null"), "true");
+        // A regex renders as /source/flags; typeof is object.
+        assert_eq!(run("'' + /ab/gi"), "/ab/gi");
+        assert_eq!(run("typeof /x/"), "object");
     }
 
     #[test]
