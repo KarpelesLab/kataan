@@ -20,9 +20,11 @@
 //! expressions, rest parameters), **closures** that capture enclosing variables
 //! (boxed in shared cells, with transitive capture), and **classes** —
 //! constructor, instance/static methods + fields, getters/setters, and
-//! `extends`/`super` inheritance. Object-literal getters/setters compile too.
-//! Not yet: `finally`, generators/async, computed/private class keys, and
-//! captured (hoisted) function *declarations* — these return a `CompileError`
+//! `extends`/`super` inheritance, and `try`/`catch`/`finally`. Object-literal
+//! getters/setters compile too. Not yet: generators/async, computed/private
+//! class keys, a `finally` whose guarded region escapes via
+//! `return`/`break`/`continue`, and captured (hoisted) function *declarations* —
+//! these return a `CompileError`
 //! so the caller falls back to the tree-walker.
 
 use crate::ast::{
