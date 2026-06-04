@@ -84,6 +84,11 @@ pub mod rope;
 #[cfg(feature = "alloc")]
 pub mod realm;
 
+/// A minimal register VM over the `Realm`/`NanBox` representation — the proof
+/// that the performance object model executes code. Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod nbvm;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
