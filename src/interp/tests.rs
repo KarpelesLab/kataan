@@ -426,6 +426,36 @@ fn bytecode_vm_update_operator() {
 }
 
 #[test]
+fn bytecode_vm_call_spread() {
+    // Spread into a plain call, mixed with positional args.
+    assert_eq!(
+        eval_bc(
+            "function sum(a, b, c, d) { return a + b + c + d; } let xs = [2, 3]; sum(1, ...xs, 4)"
+        ),
+        "10"
+    );
+    assert_eq!(
+        eval_bc("function f(a, b, c) { return a*100 + b*10 + c; } f(...[1, 2, 3])"),
+        "123"
+    );
+    // Spread into a built-in.
+    assert_eq!(eval_bc("Math.max(...[5, 9, 2, 7])"), "9");
+    assert_eq!(eval_bc("Math.min(1, ...[8, 0, 4])"), "0");
+    // Spread a string's characters as args.
+    assert_eq!(
+        eval_bc("function j(a, b, c) { return a + b + c; } j(...'xyz')"),
+        "xyz"
+    );
+    // Method call with spread keeps the receiver as `this`.
+    assert_eq!(
+        eval_bc(
+            "let o = { base: 100, add(a, b) { return this.base + a + b; } }; let v = [2, 3]; o.add(...v)"
+        ),
+        "105"
+    );
+}
+
+#[test]
 fn bytecode_vm_array_spread() {
     assert_eq!(eval_bc("[...[1, 2, 3]].length"), "3");
     assert_eq!(eval_bc("[0, ...[1, 2], 3].join(',')"), "0,1,2,3");

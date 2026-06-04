@@ -1894,6 +1894,13 @@ impl Compiler {
             return self.method_call(object, property, arguments);
         }
         let callee_reg = self.expr(callee)?;
+        // A spread argument (`f(...xs)`) is lowered to `f.apply(undefined, arr)`.
+        if has_spread(arguments) {
+            let args_array = self.build_args_array(arguments)?;
+            let undef = self.reg();
+            self.emit(Op::LoadUndefined { dst: undef });
+            return Ok(self.emit_apply(callee_reg, undef, args_array));
+        }
         let (args_base, argc) = self.lower_args(arguments)?;
         let dst = self.reg();
         self.emit(Op::Call {
@@ -1930,6 +1937,19 @@ impl Compiler {
             PropertyKey::Computed(expr) => self.expr(expr)?,
             _ => return Err(CompileError::unsupported("method key")),
         };
+        // A spread argument (`obj.m(...xs)`) is lowered to
+        // `obj.m.apply(obj, arr)`: fetch the method value, then apply with
+        // `obj` as `this`.
+        if has_spread(arguments) {
+            let method = self.reg();
+            self.emit(Op::GetElem {
+                dst: method,
+                obj: recv,
+                index: key,
+            });
+            let args_array = self.build_args_array(arguments)?;
+            return Ok(self.emit_apply(method, recv, args_array));
+        }
         let (args_base, argc) = self.lower_args(arguments)?;
         let dst = self.reg();
         self.emit(Op::CallMethod {
@@ -1940,6 +1960,72 @@ impl Compiler {
             argc,
         });
         Ok(dst)
+    }
+
+    /// Builds an array holding all call arguments (items + flattened spreads),
+    /// for the `apply`-based spread-call lowering.
+    fn build_args_array(
+        &mut self,
+        arguments: &[crate::ast::Argument],
+    ) -> Result<Reg, CompileError> {
+        use crate::ast::Argument;
+        let result = self.reg();
+        self.emit(Op::NewArray {
+            dst: result,
+            len: 0,
+        });
+        for arg in arguments {
+            let chunk = match arg {
+                Argument::Item(e) => {
+                    let v = self.expr(e)?;
+                    let one = self.reg();
+                    self.emit(Op::NewArray { dst: one, len: 1 });
+                    let idx = self.reg();
+                    self.emit(Op::LoadInt { dst: idx, value: 0 });
+                    self.emit(Op::SetElem {
+                        obj: one,
+                        index: idx,
+                        src: v,
+                    });
+                    one
+                }
+                Argument::Spread(e) => {
+                    let v = self.expr(e)?;
+                    let items = self.reg();
+                    self.emit(Op::IterValues { dst: items, src: v });
+                    items
+                }
+            };
+            self.concat_into(result, chunk);
+        }
+        Ok(result)
+    }
+
+    /// Emits `callee.apply(this_reg, args_array)`, returning the result reg.
+    fn emit_apply(&mut self, callee: Reg, this_reg: Reg, args_array: Reg) -> Reg {
+        let key = self.reg();
+        let k = self.add_const(Const::Str(String::from("apply")));
+        self.emit(Op::LoadConst { dst: key, k });
+        let base = self.funcs.last().expect("fn").next_reg;
+        let s1 = self.reg();
+        self.emit(Op::Move {
+            dst: s1,
+            src: this_reg,
+        });
+        let s2 = self.reg();
+        self.emit(Op::Move {
+            dst: s2,
+            src: args_array,
+        });
+        let dst = self.reg();
+        self.emit(Op::CallMethod {
+            dst,
+            recv: callee,
+            key,
+            args_base: base,
+            argc: 2,
+        });
+        dst
     }
 
     /// Lowers call arguments into a fresh contiguous register window, returning
@@ -1993,6 +2079,13 @@ fn binop_code(op: BinaryOp) -> Option<u8> {
         BinaryOp::Instanceof => binop::INSTANCEOF,
         _ => return None,
     })
+}
+
+/// Whether a call's argument list contains a spread (`f(...xs)`).
+fn has_spread(arguments: &[crate::ast::Argument]) -> bool {
+    arguments
+        .iter()
+        .any(|a| matches!(a, crate::ast::Argument::Spread(_)))
 }
 
 /// Maps a compound assignment operator to its binary op; `=` returns `None`.
