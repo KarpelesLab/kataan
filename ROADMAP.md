@@ -499,9 +499,18 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   collections, typed arrays, Promise + microtasks, Proxy/Reflect, JSON, Date.
   The bytecode format is position-independent (§2.2) from this phase on. Target:
   broad Test262 coverage of the language proper. **Done so far:** the
-  instruction set and `Chunk`/`Module` containers (`src/bytecode/`), a
-  disassembler, and the host-native serialization codec (below). **Next:** the
-  AST→bytecode compiler and the VM execution loop.
+  instruction set + `Chunk`/`Module` containers (`src/bytecode/`), a
+  disassembler (`kataan disasm`), the host-native serialization codec (below),
+  **and a working compiler + register VM** for a real subset — literals,
+  globals + block-scoped locals, the arithmetic/comparison ops, `&&`/`||`,
+  member/index reads, calls, assignment (incl. compound), `if`/`while`/blocks,
+  and **functions** (declarations hoisted, function/arrow expressions,
+  positional params, `return`, recursion + mutual recursion). Calls recurse
+  through the shared call path, so bytecode/native/tree-walker callees
+  interoperate; the VM reuses the tree-walker's value semantics. **Next:**
+  closures/upvalues (capture currently triggers a tree-walker fallback),
+  exceptions/`try-finally`, object/array literals + property writes, then the
+  remaining statements — and making the VM the primary execution path.
 
 - **Phase D′ — Serializable bytecode & code cache** (`serialize` feature)
   🚧 **started** — the container codec is in: `serialize`/`deserialize` with a
