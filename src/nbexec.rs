@@ -97,6 +97,8 @@ struct FnDef<'a> {
     params: &'a [Param],
     body: Body<'a>,
     is_async: bool,
+    /// Whether this is a generator (`function*`) — run eagerly into an iterator.
+    is_generator: bool,
     /// The class this is a method of (for `super.method()`), if any.
     home_class: Option<u32>,
 }
@@ -116,6 +118,8 @@ pub struct Interp<'a> {
     class_envs: Vec<Scope>,
     /// The current `this` binding (method/constructor receiver).
     this_val: NanBox,
+    /// When running a generator body eagerly, the buffer `yield` appends to.
+    gen_sink: Option<Vec<NanBox>>,
     /// The superclass to invoke for `super(...)` inside the running constructor.
     pending_super: Option<(u32, Scope)>,
     /// The class of the currently-running method (for `super.method()`).
@@ -195,6 +199,13 @@ const N_REFERENCE_ERROR: u16 = N_ERROR_BASE + 4;
 /// A reserved, non-identifier key under which a `new fn()` instance records its
 /// constructor function (a hidden, GC-traced slot) so `instanceof` can match it.
 const CTOR_KEY: &str = "\u{0}ctor";
+/// Reserved hidden keys for an eager generator's result object: the buffer of
+/// yielded values and the current `next()` cursor.
+const GEN_BUF: &str = "\u{0}gbuf";
+const GEN_IDX: &str = "\u{0}gidx";
+/// A safety cap on eagerly-collected `yield`s (an infinite generator would
+/// otherwise hang); exceeding it throws instead.
+const GEN_CAP: usize = 1_000_000;
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
@@ -211,6 +222,7 @@ impl<'a> Interp<'a> {
             class_statics: Vec::new(),
             class_envs: Vec::new(),
             this_val: NanBox::undefined(),
+            gen_sink: None,
             pending_super: None,
             current_home: None,
             pending_label: None,
@@ -808,8 +820,12 @@ impl<'a> Interp<'a> {
             if let Stmt::Function(func) = stmt
                 && let Some(id) = &func.id
             {
-                let value =
-                    self.make_function(&func.params, Body::Block(&func.body), func.is_async);
+                let value = self.make_function(
+                    &func.params,
+                    Body::Block(&func.body),
+                    func.is_async,
+                    func.is_generator,
+                );
                 self.current.declare(&id.name, value);
             }
         }
@@ -818,8 +834,14 @@ impl<'a> Interp<'a> {
 
     /// Registers a function definition and allocates a closure capturing the
     /// current scope.
-    fn make_function(&mut self, params: &'a [Param], body: Body<'a>, is_async: bool) -> NanBox {
-        self.make_method(params, body, is_async, None)
+    fn make_function(
+        &mut self,
+        params: &'a [Param],
+        body: Body<'a>,
+        is_async: bool,
+        is_generator: bool,
+    ) -> NanBox {
+        self.make_method(params, body, is_async, is_generator, None)
     }
 
     fn make_method(
@@ -827,6 +849,7 @@ impl<'a> Interp<'a> {
         params: &'a [Param],
         body: Body<'a>,
         is_async: bool,
+        is_generator: bool,
         home_class: Option<u32>,
     ) -> NanBox {
         let func_id = self.functions.len() as u32;
@@ -834,6 +857,7 @@ impl<'a> Interp<'a> {
             params,
             body,
             is_async,
+            is_generator,
             home_class,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
@@ -843,6 +867,19 @@ impl<'a> Interp<'a> {
     /// Calls `callee` with `args`.
     fn call(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
         self.call_with_this(callee, NanBox::undefined(), args)
+    }
+
+    /// Builds an iterator object over a generator's eagerly-collected `values`:
+    /// a hidden buffer array plus a `next()` cursor, recognized by `for-of`,
+    /// spread, and a `next()` method.
+    fn make_generator(&mut self, values: Vec<NanBox>) -> NanBox {
+        let obj = self.realm.new_object();
+        let buf = self.realm.new_array(values);
+        self.realm
+            .set_hidden_property(obj, GEN_BUF, NanBox::handle(buf.to_raw()));
+        self.realm
+            .set_hidden_property(obj, GEN_IDX, NanBox::number(0.0));
+        NanBox::handle(obj.to_raw())
     }
 
     // --- promises ---
@@ -1041,6 +1078,12 @@ impl<'a> Interp<'a> {
         let saved = core::mem::replace(&mut self.current, call_scope);
         let saved_this = core::mem::replace(&mut self.this_val, this_val);
         let saved_home = core::mem::replace(&mut self.current_home, def.home_class);
+        // A generator body runs eagerly into a fresh yield buffer.
+        let saved_sink = if def.is_generator {
+            Some(self.gen_sink.replace(Vec::new()))
+        } else {
+            None
+        };
         let result = (|| {
             for (i, param) in def.params.iter().enumerate() {
                 let value = if param.rest {
@@ -1062,6 +1105,13 @@ impl<'a> Interp<'a> {
         self.current = saved;
         self.this_val = saved_this;
         self.current_home = saved_home;
+        // A generator call returns an iterator over the values it yielded.
+        if def.is_generator {
+            let collected = self.gen_sink.take().unwrap_or_default();
+            self.gen_sink = saved_sink.flatten();
+            result?; // a throw during collection propagates at call time
+            return Ok(self.make_generator(collected));
+        }
         // An `async` function returns a promise of its result (rejected on throw).
         if def.is_async {
             let promise = self.realm.new_promise();
@@ -1232,8 +1282,12 @@ impl<'a> Interp<'a> {
             match member {
                 ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
                     if let Ok(key) = static_key(&m.key) {
-                        let f =
-                            self.make_function(&m.value.params, Body::Block(&m.value.body), false);
+                        let f = self.make_function(
+                            &m.value.params,
+                            Body::Block(&m.value.body),
+                            false,
+                            m.value.is_generator,
+                        );
                         statics.insert(key, f);
                     }
                 }
@@ -1311,6 +1365,7 @@ impl<'a> Interp<'a> {
                     &m.value.params,
                     Body::Block(&m.value.body),
                     false,
+                    m.value.is_generator,
                     Some(*cid),
                 );
                 self.current = saved;
@@ -1460,6 +1515,51 @@ impl<'a> Interp<'a> {
             return Ok(None);
         };
         let handle = Handle::from_raw(raw);
+
+        // --- generator iterator protocol (`next`/`return`) ---
+        if let Some(buf) = self
+            .realm
+            .get_property(handle, GEN_BUF)
+            .and_then(|b| b.as_handle())
+            .map(Handle::from_raw)
+        {
+            match method {
+                "next" => {
+                    let idx = self
+                        .realm
+                        .get_property(handle, GEN_IDX)
+                        .and_then(|n| n.as_number())
+                        .unwrap_or(0.0) as usize;
+                    let elems = self.realm.array_elements(buf).map(<[_]>::to_vec);
+                    let (value, done) = match elems.as_ref().and_then(|e| e.get(idx)) {
+                        Some(v) => {
+                            self.realm.set_hidden_property(
+                                handle,
+                                GEN_IDX,
+                                NanBox::number((idx + 1) as f64),
+                            );
+                            (*v, false)
+                        }
+                        None => (NanBox::undefined(), true),
+                    };
+                    let res = self.realm.new_object();
+                    self.realm.set_property(res, "value", value);
+                    self.realm.set_property(res, "done", NanBox::boolean(done));
+                    return Ok(Some(NanBox::handle(res.to_raw())));
+                }
+                // `return()` ends the generator early.
+                "return" => {
+                    let len = self.realm.array_elements(buf).map_or(0, <[_]>::len);
+                    self.realm
+                        .set_hidden_property(handle, GEN_IDX, NanBox::number(len as f64));
+                    let res = self.realm.new_object();
+                    self.realm.set_property(res, "value", arg(0));
+                    self.realm.set_property(res, "done", NanBox::boolean(true));
+                    return Ok(Some(NanBox::handle(res.to_raw())));
+                }
+                _ => {}
+            }
+        }
 
         // --- `Date.now()` static ---
         if self.realm.native_at(handle) == Some(N_DATE) && method == "now" {
@@ -2507,6 +2607,25 @@ impl<'a> Interp<'a> {
             }
             return Ok(out);
         }
+        // A generator iterator: its remaining buffered values.
+        if let Some(buf) = self
+            .realm
+            .get_property(h, GEN_BUF)
+            .and_then(|b| b.as_handle())
+            .map(Handle::from_raw)
+        {
+            let idx = self
+                .realm
+                .get_property(h, GEN_IDX)
+                .and_then(|n| n.as_number())
+                .unwrap_or(0.0) as usize;
+            let elems = self
+                .realm
+                .array_elements(buf)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
+            return Ok(elems.into_iter().skip(idx).collect());
+        }
         Err(ExecError::Throw(self.new_str("value is not iterable")))
     }
 
@@ -2864,6 +2983,32 @@ impl<'a> Interp<'a> {
                 let v = self.eval(argument)?;
                 self.await_value(v)
             }
+            // Eager generators: `yield x` appends `x` to the active buffer;
+            // `yield* it` appends each value of the iterable. The expression's
+            // own value is `undefined` (we cannot thread `next()` arguments back).
+            Expr::Yield {
+                argument, delegate, ..
+            } => {
+                let v = match argument {
+                    Some(e) => self.eval(e)?,
+                    None => NanBox::undefined(),
+                };
+                if *delegate {
+                    let vals = self.iterate_values(v)?;
+                    if let Some(sink) = self.gen_sink.as_mut() {
+                        if sink.len() + vals.len() > GEN_CAP {
+                            return Err(ExecError::Throw(self.new_str("generator yield limit")));
+                        }
+                        sink.extend(vals);
+                    }
+                } else if let Some(sink) = self.gen_sink.as_mut() {
+                    if sink.len() >= GEN_CAP {
+                        return Err(ExecError::Throw(self.new_str("generator yield limit")));
+                    }
+                    sink.push(v);
+                }
+                Ok(NanBox::undefined())
+            }
             Expr::Function(func) => Ok(self.eval_fn_expr(func)),
             Expr::Arrow(arrow) => Ok(self.eval_arrow(arrow)),
             Expr::Class(class) => Ok(self.make_class(class)),
@@ -3082,8 +3227,12 @@ impl<'a> Interp<'a> {
                             ..
                         } => {
                             let k = self.eval_prop_key(key)?;
-                            let f =
-                                self.make_function(&value.params, Body::Block(&value.body), false);
+                            let f = self.make_function(
+                                &value.params,
+                                Body::Block(&value.body),
+                                false,
+                                false,
+                            );
                             if *is_getter {
                                 self.realm
                                     .define_accessor(handle, &k, f, NanBox::undefined());
@@ -3122,7 +3271,12 @@ impl<'a> Interp<'a> {
     }
 
     fn eval_fn_expr(&mut self, func: &'a Function) -> NanBox {
-        self.make_function(&func.params, Body::Block(&func.body), func.is_async)
+        self.make_function(
+            &func.params,
+            Body::Block(&func.body),
+            func.is_async,
+            func.is_generator,
+        )
     }
 
     fn eval_arrow(&mut self, arrow: &'a Arrow) -> NanBox {
@@ -3130,7 +3284,7 @@ impl<'a> Interp<'a> {
             ArrowBody::Expr(e) => Body::Expr(e),
             ArrowBody::Block(b) => Body::Block(b),
         };
-        self.make_function(&arrow.params, body, arrow.is_async)
+        self.make_function(&arrow.params, body, arrow.is_async, false)
     }
 
     fn member(
@@ -3434,6 +3588,7 @@ impl<'a> Interp<'a> {
                         &m.value.params,
                         Body::Block(&m.value.body),
                         false,
+                        m.value.is_generator,
                         Some(pid),
                     );
                     self.current = saved;
@@ -4477,6 +4632,35 @@ mod tests {
         assert_eq!(
             run("class C { #s = 1; constructor(){ this.p = 2; } } Object.keys(new C()).join(',')"),
             "p"
+        );
+    }
+
+    #[test]
+    fn eager_generators() {
+        // for-of and spread over a finite generator.
+        assert_eq!(
+            run(
+                "function* g(n){ for (let i=0;i<n;i++) yield i*i; } let s=[]; for (let v of g(4)) s.push(v); s.join(',')"
+            ),
+            "0,1,4,9"
+        );
+        assert_eq!(
+            run("function* g(){ yield 'a'; yield 'b'; } [...g()].join('-')"),
+            "a-b"
+        );
+        // The next() iterator protocol.
+        assert_eq!(
+            run(
+                "function* g(){ yield 1; yield 2; } let it=g(); '' + it.next().value + it.next().value + it.next().done"
+            ),
+            "12true"
+        );
+        // yield* delegation.
+        assert_eq!(
+            run(
+                "function* inner(){ yield 2; yield 3; } function* outer(){ yield 1; yield* inner(); yield 4; } [...outer()].join(',')"
+            ),
+            "1,2,3,4"
         );
     }
 
