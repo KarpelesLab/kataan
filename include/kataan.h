@@ -69,6 +69,32 @@ int kt_version_copy(char *buf, size_t *len);
  */
 int kt_eval(const char *source, size_t source_len, char *out, size_t *out_len);
 
+/*
+ * Compile `source` (UTF-8 JavaScript, `source_len` bytes) to a portable `.ktbc`
+ * bytecode artifact, written into `out` (capacity *out_len bytes) per the in/out
+ * length convention. Call with *out_len == 0 to query the required size.
+ *
+ * Returns:
+ *   KT_OK               on success (`out` holds the bytecode artifact),
+ *   KT_INVALID_INPUT    on a parse/compile error (`out` holds the message) or
+ *                       non-UTF-8 input,
+ *   KT_BUFFER_TOO_SMALL if `out` was too small (*out_len holds the required size),
+ *   KT_NULL_POINTER / KT_INTERNAL as for kt_eval.
+ *
+ * The artifact pairs with kt_load_bytecode: compile once, run many times.
+ */
+int kt_compile(const char *source, size_t source_len, char *out, size_t *out_len);
+
+/*
+ * Verify and run a `.ktbc` bytecode artifact (`bytecode`, `bytecode_len` bytes),
+ * writing its completion value, rendered as a string, into `out` per the in/out
+ * length convention. The artifact is verified (untrusted-load safe) before it
+ * runs. Returns KT_OK on success, KT_INVALID_INPUT for a corrupt/unverifiable
+ * artifact or an uncaught throw (`out` holds the message), or the same
+ * buffer/pointer/internal codes as kt_eval.
+ */
+int kt_load_bytecode(const char *bytecode, size_t bytecode_len, char *out, size_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

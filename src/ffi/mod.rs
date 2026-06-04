@@ -157,6 +157,107 @@ fn eval_to_string(src: &str) -> Result<alloc::string::String, alloc::string::Str
     crate::nbvm::execute(src).map(|(_output, completion)| completion)
 }
 
+/// Compiles `src` to a portable `.ktbc` bytecode artifact, or an error message.
+#[cfg(feature = "std")]
+fn compile_to_bytes(src: &str) -> Result<alloc::vec::Vec<u8>, alloc::string::String> {
+    use alloc::string::ToString;
+    let program = crate::parser::Parser::parse_program(src).map_err(|e| e.to_string())?;
+    let protos = crate::nbvm::compile_program(&program).map_err(|e| alloc::format!("{e:?}"))?;
+    Ok(crate::bytecode::serialize(&protos))
+}
+
+/// Verifies and runs a `.ktbc` artifact, returning the completion string or an
+/// error message.
+#[cfg(feature = "std")]
+fn run_bytecode_to_string(bytes: &[u8]) -> Result<alloc::string::String, alloc::string::String> {
+    let protos =
+        crate::bytecode::deserialize_verified(bytes).map_err(|e| alloc::format!("{e:?}"))?;
+    let mut realm = crate::realm::Realm::new();
+    match crate::nbvm::run_program_capturing(&mut realm, &protos, 0, &[]) {
+        Ok((value, _output)) => Ok(realm.to_display_string(value)),
+        Err(e) => Err(alloc::format!("{e:?}")),
+    }
+}
+
+/// Compiles `source` to a `.ktbc` bytecode artifact written into `out`.
+///
+/// # Safety
+///
+/// Same contract as [`kt_eval`]: `out_len` must be valid; `source` must cover
+/// `source_len` bytes; `out` must hold `*out_len` writable bytes when the result
+/// fits.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_compile(
+    source: *const c_char,
+    source_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if out_len.is_null() || (source.is_null() && source_len != 0) {
+            return KtStatus::NullPointer;
+        }
+        // SAFETY: caller guarantees `source` covers `source_len` bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(source as *const u8, source_len) };
+        let Ok(src) = core::str::from_utf8(bytes) else {
+            return KtStatus::InvalidInput;
+        };
+        let (data, ok) = match compile_to_bytes(src) {
+            Ok(artifact) => (artifact, true),
+            Err(message) => (message.into_bytes(), false),
+        };
+        // SAFETY: `out_len` is non-null; `out` honors the length convention.
+        match unsafe { copy_out(&data, out, out_len) } {
+            KtStatus::Ok if !ok => KtStatus::InvalidInput,
+            other => other,
+        }
+    }));
+    match outcome {
+        Ok(status) => status as c_int,
+        Err(_) => KtStatus::Internal as c_int,
+    }
+}
+
+/// Verifies and runs a `.ktbc` artifact, writing its result string into `out`.
+///
+/// # Safety
+///
+/// Same contract as [`kt_eval`]: `out_len` must be valid; `bytecode` must cover
+/// `bytecode_len` bytes; `out` must hold `*out_len` writable bytes when the
+/// result fits.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_load_bytecode(
+    bytecode: *const c_char,
+    bytecode_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if out_len.is_null() || (bytecode.is_null() && bytecode_len != 0) {
+            return KtStatus::NullPointer;
+        }
+        // SAFETY: caller guarantees `bytecode` covers `bytecode_len` bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(bytecode as *const u8, bytecode_len) };
+        let (text, ok) = match run_bytecode_to_string(bytes) {
+            Ok(value) => (value, true),
+            Err(message) => (message, false),
+        };
+        // SAFETY: `out_len` is non-null; `out` honors the length convention.
+        match unsafe { copy_out(text.as_bytes(), out, out_len) } {
+            KtStatus::Ok if !ok => KtStatus::InvalidInput,
+            other => other,
+        }
+    }));
+    match outcome {
+        Ok(status) => status as c_int,
+        Err(_) => KtStatus::Internal as c_int,
+    }
+}
+
 /// Copies `data` into `out` per the in/out length convention.
 ///
 /// # Safety

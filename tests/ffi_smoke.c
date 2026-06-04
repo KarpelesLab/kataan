@@ -78,6 +78,38 @@ int main(void) {
         return 1;
     }
 
+    /* kt_compile produces a portable bytecode artifact... */
+    const char *prog = "function dbl(n) { return n + n; } dbl(33)";
+    unsigned char art[512];
+    size_t art_len = sizeof(art);
+    rc = kt_compile(prog, strlen(prog), (char *)art, &art_len);
+    if (rc != KT_OK) {
+        fprintf(stderr, "FAIL: kt_compile returned %d\n", rc);
+        return 1;
+    }
+    /* ...which kt_load_bytecode verifies and runs back to the same result. */
+    out_len = sizeof(out);
+    rc = kt_load_bytecode((const char *)art, art_len, out, &out_len);
+    if (rc != KT_OK) {
+        fprintf(stderr, "FAIL: kt_load_bytecode returned %d\n", rc);
+        return 1;
+    }
+    out[out_len] = '\0';
+    if (strcmp(out, "66") != 0) {
+        fprintf(stderr, "FAIL: kt_load_bytecode result '%s', want '66'\n", out);
+        return 1;
+    }
+    printf("kt_compile + kt_load_bytecode(\"dbl(33)\") = %s (%zu-byte artifact)\n", out, art_len);
+
+    /* A corrupt artifact is refused (verifier / decoder), not run. */
+    art[art_len - 1] ^= 0xff;
+    out_len = sizeof(out);
+    rc = kt_load_bytecode((const char *)art, art_len, out, &out_len);
+    if (rc != KT_INVALID_INPUT) {
+        fprintf(stderr, "FAIL: corrupt artifact returned %d, want %d\n", rc, KT_INVALID_INPUT);
+        return 1;
+    }
+
     printf("ffi_smoke: all checks passed\n");
     return 0;
 }
