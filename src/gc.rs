@@ -165,6 +165,90 @@ pub fn compact<T: Trace + Relocate>(heap: &mut Heap<T>, roots: &mut [Handle]) ->
     }
 }
 
+/// An **incremental** (step-bounded) tri-color marker. Where [`collect`] marks
+/// the whole heap in one stop-the-world pass, this splits marking across many
+/// bounded [`step`](IncrementalMarker::step)s that can be interleaved with the
+/// mutator — bounding pause time.
+///
+/// Tri-color invariant: an object is *white* (unmarked — a collection candidate),
+/// *grey* (marked but its children not yet scanned — held in the worklist), or
+/// *black* (marked and scanned). Marking is done when no grey objects remain.
+///
+/// Soundness under concurrent mutation needs a **write barrier**: if the mutator
+/// stores a pointer to a white object into an already-black object, that white
+/// object could be missed — so the barrier ([`mark_grey`](IncrementalMarker::mark_grey),
+/// a Dijkstra-style shade-on-write) greys the stored target, keeping it live.
+pub struct IncrementalMarker {
+    /// Black ∪ grey — everything marked so far.
+    marked: BTreeSet<Handle>,
+    /// The grey worklist (marked, awaiting child scan).
+    grey: Vec<Handle>,
+}
+
+impl IncrementalMarker {
+    /// Begins marking from `roots` (greying each).
+    #[must_use]
+    pub fn new(roots: &[Handle]) -> Self {
+        let mut m = Self {
+            marked: BTreeSet::new(),
+            grey: Vec::new(),
+        };
+        for &r in roots {
+            m.mark_grey(r);
+        }
+        m
+    }
+
+    /// Shades `handle` grey if still white — the write-barrier hook the mutator
+    /// calls when it stores a reference during marking, and how children are
+    /// enqueued during a scan.
+    pub fn mark_grey(&mut self, handle: Handle) {
+        if self.marked.insert(handle) {
+            self.grey.push(handle);
+        }
+    }
+
+    /// Scans up to `budget` grey objects, greying their (live) children.
+    /// Returns `true` once marking is complete (the grey set is empty).
+    pub fn step<T: Trace>(&mut self, heap: &Heap<T>, budget: usize) -> bool {
+        for _ in 0..budget {
+            let Some(handle) = self.grey.pop() else {
+                return true;
+            };
+            let mut edges: Vec<Handle> = Vec::new();
+            if let Some(obj) = heap.get(handle) {
+                obj.trace(&mut |h| edges.push(h));
+            }
+            for edge in edges {
+                if heap.is_live(edge) {
+                    self.mark_grey(edge);
+                }
+            }
+        }
+        self.grey.is_empty()
+    }
+
+    /// Whether marking has finished (no grey objects remain to scan).
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.grey.is_empty()
+    }
+
+    /// Frees every live object that marking did not reach. Call only once
+    /// [`is_complete`](IncrementalMarker::is_complete) holds. Returns the count
+    /// swept.
+    pub fn sweep<T>(&self, heap: &mut Heap<T>) -> usize {
+        let mut swept = 0;
+        for handle in heap.live_handles() {
+            if !self.marked.contains(&handle) {
+                heap.free(handle);
+                swept += 1;
+            }
+        }
+        swept
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +445,58 @@ mod tests {
         let y2 = heap.get(x2).unwrap().edges[0];
         let back = heap.get(y2).unwrap().edges[0];
         assert_eq!(back, x2);
+    }
+
+    #[test]
+    fn incremental_marking_matches_a_full_collection() {
+        // root -> a -> b -> c (a chain), plus unreachable garbage d, e.
+        let mut heap: Heap<Node> = Heap::new();
+        let c = heap.alloc(Node::new(3));
+        let mut b = Node::new(2);
+        b.edges.push(c);
+        let b = heap.alloc(b);
+        let mut a = Node::new(1);
+        a.edges.push(b);
+        let a = heap.alloc(a);
+        let _d = heap.alloc(Node::new(4));
+        let _e = heap.alloc(Node::new(5));
+
+        // Mark one object per step (the finest granularity).
+        let mut marker = IncrementalMarker::new(&[a]);
+        let mut steps = 0;
+        while !marker.step(&heap, 1) {
+            steps += 1;
+            assert!(steps < 100, "marking should terminate");
+        }
+        let swept = marker.sweep(&mut heap);
+        assert_eq!(swept, 2); // d, e
+        assert!(heap.is_live(a) && heap.is_live(b) && heap.is_live(c));
+        assert_eq!(heap.len(), 3);
+    }
+
+    #[test]
+    fn incremental_write_barrier_keeps_a_late_stored_reference() {
+        // Simulate the hazard the barrier guards: during marking, the mutator
+        // stores a reference to a *white* object into an *already-scanned* one.
+        let mut heap: Heap<Node> = Heap::new();
+        let root = heap.alloc(Node::new(1)); // becomes black early
+        let late = heap.alloc(Node::new(2)); // allocated white, not yet referenced
+
+        let mut marker = IncrementalMarker::new(&[root]);
+        // Drive marking to completion of the root (root becomes black, grey
+        // empties — `late` is still white and would be swept).
+        while !marker.step(&heap, 1) {}
+        assert!(marker.is_complete());
+
+        // The mutator now links root -> late and fires the write barrier.
+        heap.get_mut(root).unwrap().edges.push(late);
+        marker.mark_grey(late); // Dijkstra shade-on-write
+        // Re-run to drain the re-greyed work.
+        while !marker.step(&heap, 4) {}
+
+        let swept = marker.sweep(&mut heap);
+        assert_eq!(swept, 0, "the barrier-shaded object must survive");
+        assert!(heap.is_live(late));
     }
 
     #[test]

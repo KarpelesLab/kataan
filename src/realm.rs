@@ -463,6 +463,22 @@ impl Realm {
         gc::compact(&mut self.heap, roots)
     }
 
+    /// Runs an **incremental** collection: marks in step-bounded slices of at
+    /// most `step_budget` objects each (rather than one stop-the-world pass),
+    /// then sweeps. Equivalent result to [`collect`](Realm::collect); the
+    /// step-based [`IncrementalMarker`](gc::IncrementalMarker) is what lets the
+    /// pause be bounded / interleaved with execution.
+    pub fn collect_incremental(&mut self, roots: &[Handle], step_budget: usize) -> Stats {
+        let before = self.heap.len();
+        let mut marker = gc::IncrementalMarker::new(roots);
+        while !marker.step(&self.heap, step_budget.max(1)) {}
+        let swept = marker.sweep(&mut self.heap);
+        Stats {
+            marked: before - swept,
+            swept,
+        }
+    }
+
     // --- value operations (the VM's `+`, `ToString`, `===` over heap values) ---
 
     /// Whether `v` is a heap string.
@@ -1243,6 +1259,25 @@ mod tests {
         let arr = Handle::from_raw(items2.as_handle().unwrap());
         // array[0] still points back at the (relocated) object — the cycle held.
         assert_eq!(realm.get_element(arr, 0).as_handle(), Some(obj2.to_raw()));
+    }
+
+    #[test]
+    fn incremental_collection_matches_full_over_an_object_graph() {
+        let mut realm = Realm::new();
+        let obj = realm.new_object();
+        let name = realm.new_string("widget");
+        let items = realm.new_array(alloc::vec![NanBox::handle(obj.to_raw())]);
+        realm.set_property(obj, "name", NanBox::handle(name.to_raw()));
+        realm.set_property(obj, "items", NanBox::handle(items.to_raw()));
+        let _garbage = realm.new_string("garbage");
+        assert_eq!(realm.object_count(), 4);
+
+        // Tiny step budget → many incremental slices; same result as a full GC.
+        let stats = realm.collect_incremental(&[obj], 1);
+        assert_eq!(stats.marked, 3); // obj, name, items (cycle held)
+        assert_eq!(stats.swept, 1); // the unreachable string
+        assert!(realm.is_live(obj) && realm.is_live(name) && realm.is_live(items));
+        assert_eq!(realm.string_value(name).as_deref(), Some("widget"));
     }
 
     #[test]
