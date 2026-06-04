@@ -1867,6 +1867,36 @@ impl<'a> Interp<'a> {
                     let h = self.realm.new_array(out);
                     return Ok(Some(NanBox::handle(h.to_raw())));
                 }
+                // `fill(value, start?, end?)` — mutate in place, return the array.
+                // `start`/`end` default to `0`/`len`; negatives count from the end.
+                "fill" => {
+                    let len = elems.len();
+                    let value = arg(0);
+                    let start = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        0
+                    } else {
+                        let n = self.realm.to_number(arg(1));
+                        if n < 0.0 {
+                            (len as f64 + n).max(0.0) as usize
+                        } else {
+                            (n as usize).min(len)
+                        }
+                    };
+                    let end = if matches!(arg(2).unpack(), Unpacked::Undefined) {
+                        len
+                    } else {
+                        let n = self.realm.to_number(arg(2));
+                        if n < 0.0 {
+                            (len as f64 + n).max(0.0) as usize
+                        } else {
+                            (n as usize).min(len)
+                        }
+                    };
+                    for i in start..end {
+                        self.realm.set_element(handle, i, value);
+                    }
+                    return Ok(Some(NanBox::handle(handle.to_raw())));
+                }
                 // One level of flattening (`[1, [2, 3]].flat()`).
                 "flat" => {
                     let mut out = Vec::new();
@@ -3859,6 +3889,10 @@ mod tests {
         assert_eq!(run("[1, 2, 3].includes(2)"), "true");
         assert_eq!(run("[1, 2, 3].indexOf(3)"), "2");
         assert_eq!(run("['a', 'b', 'c'].join(', ')"), "a, b, c");
+        // fill: whole array, a [start,end) range, and a negative start.
+        assert_eq!(run("[0, 0, 0].fill(7).join(',')"), "7,7,7");
+        assert_eq!(run("[1, 2, 3, 4].fill(9, 1, 3).join(',')"), "1,9,9,4");
+        assert_eq!(run("[1, 2, 3, 4, 5].fill(0, -2).join(',')"), "1,2,3,0,0");
     }
 
     #[test]
