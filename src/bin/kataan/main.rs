@@ -12,6 +12,7 @@
 //! kataan --version
 //! ```
 
+use kataan::interp::Interp;
 use kataan::lexer::{Lexer, TokenKind};
 use kataan::parser::Parser;
 use std::process::ExitCode;
@@ -40,6 +41,14 @@ fn main() -> ExitCode {
         ["parse", "-e", source] => run_parse(source, "<argv>"),
         ["parse", path] => match std::fs::read_to_string(path) {
             Ok(source) => run_parse(&source, path),
+            Err(e) => {
+                eprintln!("kataan: cannot read {path}: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        ["eval" | "run", "-e", source] => run_eval(source, "<argv>"),
+        ["eval" | "run", path] => match std::fs::read_to_string(path) {
+            Ok(source) => run_eval(&source, path),
             Err(e) => {
                 eprintln!("kataan: cannot read {path}: {e}");
                 ExitCode::FAILURE
@@ -96,6 +105,32 @@ fn run_parse(source: &str, origin: &str) -> ExitCode {
     }
 }
 
+/// Parses and evaluates `source`, printing the completion value (REPL-style).
+/// `origin` is shown in error messages.
+fn run_eval(source: &str, origin: &str) -> ExitCode {
+    let program = match Parser::parse_program(source) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kataan: {origin}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut interp = Interp::new();
+    match interp.run(&program) {
+        Ok(value) => {
+            // Print non-undefined completion values, REPL-style.
+            if !matches!(value, kataan::interp::Value::Undefined) {
+                println!("{}", value.to_js_string());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(thrown) => {
+            eprintln!("kataan: {origin}: Uncaught {}", thrown.to_js_string());
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn print_usage() {
     println!(
         "kataan {} — a JavaScript engine in pure Rust\n\
@@ -105,10 +140,12 @@ fn print_usage() {
          kataan lex -e <SOURCE>    tokenize a source string\n    \
          kataan parse <FILE>       parse a program and dump its AST\n    \
          kataan parse -e <SOURCE>  parse a source string and dump its AST\n    \
+         kataan eval <FILE>        evaluate a program (prints completion value)\n    \
+         kataan eval -e <SOURCE>   evaluate a source string\n    \
          kataan --version          print the version\n    \
          kataan --help             show this help\n\
          \n\
-         `run` and a REPL arrive in later phases — see ROADMAP.md.",
+         A full host runtime and REPL arrive in later phases — see ROADMAP.md.",
         kataan::VERSION
     );
 }
