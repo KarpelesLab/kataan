@@ -37,13 +37,16 @@ pub struct Stats {
     pub swept: usize,
 }
 
-/// Runs one stop-the-world mark-and-sweep cycle: marks everything reachable from
-/// `roots`, frees everything else, and returns what it kept/swept.
-pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
-    // --- mark: depth-first from the roots over outgoing handle edges ---
+/// The age at which an object is considered part of the **old** generation
+/// (has survived at least one collection). Tunable; `1` means "survived once".
+pub const OLD_AGE: u8 = 1;
+
+/// Marks everything reachable from `roots` (depth-first over outgoing handle
+/// edges) and returns the marked set.
+fn mark<T: Trace>(heap: &Heap<T>, roots: impl IntoIterator<Item = Handle>) -> BTreeSet<Handle> {
     let mut marked: BTreeSet<Handle> = BTreeSet::new();
     let mut work: Vec<Handle> = Vec::new();
-    for &root in roots {
+    for root in roots {
         if heap.is_live(root) && marked.insert(root) {
             work.push(root);
         }
@@ -61,11 +64,51 @@ pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
             }
         }
     }
+    marked
+}
+
+/// Runs one stop-the-world **major** mark-and-sweep cycle: marks everything
+/// reachable from `roots`, frees everything else, promotes survivors one
+/// generation, and returns what it kept/swept.
+pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
+    let marked = mark(heap, roots.iter().copied());
 
     // --- sweep: free every live object the mark phase did not reach ---
     let mut swept = 0;
     for handle in heap.live_handles() {
-        if !marked.contains(&handle) {
+        if marked.contains(&handle) {
+            heap.tenure(handle); // a survivor ages toward the old generation
+        } else {
+            heap.free(handle);
+            swept += 1;
+        }
+    }
+
+    Stats {
+        marked: marked.len(),
+        swept,
+    }
+}
+
+/// Runs a **minor** (generational) collection: it reclaims only short-lived
+/// objects in the **young** generation. Because most objects die young, sweeping
+/// just the nursery is cheap.
+///
+/// Correctness without a write barrier: the entire **old** generation is treated
+/// as part of the root set, so a young object kept alive solely by an old
+/// referent survives. (A later refinement adds a remembered set so only mutated
+/// old objects need scanning.) Surviving young objects are promoted.
+pub fn collect_minor<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
+    // Roots = the program roots ∪ the whole old generation.
+    let old = heap.handles_where(|a| a >= OLD_AGE);
+    let marked = mark(heap, roots.iter().copied().chain(old));
+
+    // Sweep only the young generation; promote the young survivors.
+    let mut swept = 0;
+    for handle in heap.handles_where(|a| a < OLD_AGE) {
+        if marked.contains(&handle) {
+            heap.tenure(handle);
+        } else {
             heap.free(handle);
             swept += 1;
         }
@@ -156,6 +199,55 @@ mod tests {
         assert_eq!(stats.marked, 1);
         assert!(!heap.is_live(x) && !heap.is_live(y));
         assert!(heap.is_live(survivor));
+    }
+
+    #[test]
+    fn major_collection_promotes_survivors() {
+        // A survivor of a major collection ages into the old generation.
+        let mut heap: Heap<Node> = Heap::new();
+        let keep = heap.alloc(Node::new(1));
+        assert_eq!(heap.age(keep), Some(0)); // young
+        collect(&mut heap, &[keep]);
+        assert_eq!(heap.age(keep), Some(OLD_AGE)); // promoted
+    }
+
+    #[test]
+    fn minor_collection_sweeps_only_the_young() {
+        let mut heap: Heap<Node> = Heap::new();
+        // `old` survives a major collection → promoted to the old generation.
+        let old = heap.alloc(Node::new(1));
+        collect(&mut heap, &[old]);
+        assert_eq!(heap.age(old), Some(OLD_AGE));
+
+        // Now allocate young objects: one kept by a root, one garbage.
+        let young_keep = heap.alloc(Node::new(2));
+        let young_garbage = heap.alloc(Node::new(3));
+
+        // A minor collection sweeps only the young garbage; `old` is untouched
+        // (not even considered for sweeping) and `young_keep` is promoted.
+        let stats = collect_minor(&mut heap, &[old, young_keep]);
+        assert_eq!(stats.swept, 1);
+        assert!(heap.is_live(old) && heap.is_live(young_keep));
+        assert!(!heap.is_live(young_garbage));
+        assert_eq!(heap.age(young_keep), Some(OLD_AGE)); // promoted
+    }
+
+    #[test]
+    fn minor_collection_keeps_young_referenced_by_old() {
+        // A young object reachable ONLY through an old object must survive a
+        // minor collection (the old generation acts as roots).
+        let mut heap: Heap<Node> = Heap::new();
+        let old = heap.alloc(Node::new(1));
+        collect(&mut heap, &[old]); // promote `old`
+
+        let young = heap.alloc(Node::new(2));
+        heap.get_mut(old).unwrap().edges.push(young); // old -> young edge
+
+        // `young` is not a direct root, but `old` (a root via the old gen) points
+        // at it, so it survives.
+        let stats = collect_minor(&mut heap, &[old]);
+        assert_eq!(stats.swept, 0);
+        assert!(heap.is_live(young));
     }
 
     #[test]

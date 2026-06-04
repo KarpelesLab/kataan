@@ -427,10 +427,18 @@ impl Realm {
         self.heap.is_live(handle)
     }
 
-    /// Runs a garbage collection, keeping everything reachable from `roots` and
-    /// freeing the rest (including cycles). Returns the collection statistics.
+    /// Runs a full (**major**) garbage collection, keeping everything reachable
+    /// from `roots` and freeing the rest (including cycles). Survivors are
+    /// promoted toward the old generation. Returns the collection statistics.
     pub fn collect(&mut self, roots: &[Handle]) -> Stats {
         gc::collect(&mut self.heap, roots)
+    }
+
+    /// Runs a **minor** (generational) collection — reclaims only short-lived
+    /// objects in the young generation, treating the old generation as roots.
+    /// Cheap when most allocation is short-lived. Returns the statistics.
+    pub fn collect_minor(&mut self, roots: &[Handle]) -> Stats {
+        gc::collect_minor(&mut self.heap, roots)
     }
 
     // --- value operations (the VM's `+`, `ToString`, `===` over heap values) ---

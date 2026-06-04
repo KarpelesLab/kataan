@@ -51,8 +51,16 @@ impl Handle {
 /// carry the generation so a freed-then-reallocated slot invalidates old
 /// handles.
 enum Slot<T> {
-    Occupied { generation: u16, value: T },
-    Free { generation: u16 },
+    Occupied {
+        generation: u16,
+        /// Collections this object has survived (for generational GC): `0` is
+        /// the young generation; promoted objects age up.
+        age: u8,
+        value: T,
+    },
+    Free {
+        generation: u16,
+    },
 }
 
 /// A generational arena of `T`, addressed by [`Handle`].
@@ -104,12 +112,17 @@ impl<T> Heap<T> {
                 Slot::Free { generation } => *generation,
                 Slot::Occupied { .. } => unreachable!("free list pointed at a live slot"),
             };
-            *slot = Slot::Occupied { generation, value };
+            *slot = Slot::Occupied {
+                generation,
+                age: 0,
+                value,
+            };
             Handle { index, generation }
         } else {
             let index = self.slots.len() as u32;
             self.slots.push(Slot::Occupied {
                 generation: 0,
+                age: 0,
                 value,
             });
             Handle {
@@ -124,7 +137,9 @@ impl<T> Heap<T> {
     #[must_use]
     pub fn get(&self, handle: Handle) -> Option<&T> {
         match self.slots.get(handle.index as usize)? {
-            Slot::Occupied { generation, value } if *generation == handle.generation => Some(value),
+            Slot::Occupied {
+                generation, value, ..
+            } if *generation == handle.generation => Some(value),
             _ => None,
         }
     }
@@ -133,7 +148,9 @@ impl<T> Heap<T> {
     /// as [`get`](Heap::get).
     pub fn get_mut(&mut self, handle: Handle) -> Option<&mut T> {
         match self.slots.get_mut(handle.index as usize)? {
-            Slot::Occupied { generation, value } if *generation == handle.generation => Some(value),
+            Slot::Occupied {
+                generation, value, ..
+            } if *generation == handle.generation => Some(value),
             _ => None,
         }
     }
@@ -157,6 +174,50 @@ impl<T> Heap<T> {
                     generation: *generation,
                 }),
                 Slot::Free { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The generational age of `handle`'s object (collections survived), or
+    /// `None` if stale. `0` is the young generation.
+    #[must_use]
+    pub fn age(&self, handle: Handle) -> Option<u8> {
+        match self.slots.get(handle.index as usize)? {
+            Slot::Occupied {
+                generation, age, ..
+            } if *generation == handle.generation => Some(*age),
+            _ => None,
+        }
+    }
+
+    /// Promotes `handle`'s object by one generation (saturating), marking it as
+    /// having survived another collection.
+    pub fn tenure(&mut self, handle: Handle) {
+        if let Some(Slot::Occupied {
+            generation, age, ..
+        }) = self.slots.get_mut(handle.index as usize)
+            && *generation == handle.generation
+        {
+            *age = age.saturating_add(1);
+        }
+    }
+
+    /// Handles to live objects whose age satisfies `keep` — e.g. the young
+    /// generation (`|a| a == 0`) for a minor collection, or the old generation
+    /// (`|a| a >= 1`) for the remembered root scan.
+    #[must_use]
+    pub fn handles_where(&self, keep: impl Fn(u8) -> bool) -> Vec<Handle> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| match slot {
+                Slot::Occupied {
+                    generation, age, ..
+                } if keep(*age) => Some(Handle {
+                    index: i as u32,
+                    generation: *generation,
+                }),
+                _ => None,
             })
             .collect()
     }
