@@ -1008,6 +1008,26 @@ impl<'a> Interp<'a> {
                 Value::Number(v.len() as f64)
             }
             "pop" => elements.borrow_mut().pop().unwrap_or(Value::Undefined),
+            // `keys`/`values`/`entries` return array-iterator-like arrays —
+            // indistinguishable from true iterators for `for-of` and spread.
+            "keys" => {
+                let n = elements.borrow().len();
+                Value::Object(Obj::array(
+                    (0..n).map(|i| Value::Number(i as f64)).collect(),
+                ))
+            }
+            "values" => Value::Object(Obj::array(elements.borrow().clone())),
+            "entries" => {
+                let pairs: Vec<Value<'a>> = elements
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        Value::Object(Obj::array(alloc::vec![Value::Number(i as f64), v.clone()]))
+                    })
+                    .collect();
+                Value::Object(Obj::array(pairs))
+            }
             "shift" => {
                 let mut v = elements.borrow_mut();
                 if v.is_empty() {

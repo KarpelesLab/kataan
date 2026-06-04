@@ -1912,6 +1912,17 @@ fn array_methods() {
     assert_eq!(eval("[1, 2, 3].join('-')"), "1-2-3");
     assert_eq!(eval("[1, 2, 3].includes(2)"), "true");
     assert_eq!(eval("[1, 2, 3].indexOf(3)"), "2");
+    // keys / values / entries (usable in for-of and spread).
+    assert_eq!(eval("[...[10, 20, 30].keys()].join(',')"), "0,1,2");
+    assert_eq!(eval("[...['a', 'b'].values()].join(',')"), "a,b");
+    assert_eq!(
+        eval("[...['a', 'b'].entries()].map(([i, v]) => i + ':' + v).join(',')"),
+        "0:a,1:b"
+    );
+    assert_eq!(
+        eval("let out = ''; for (const [i, v] of ['x', 'y'].entries()) out += i + v; out"),
+        "0x1y"
+    );
     assert_eq!(eval("[1, 2, 3, 4].slice(1, 3).join(',')"), "2,3");
     assert_eq!(eval("[1, 2, 3].map(x => x * x).join(',')"), "1,4,9");
     assert_eq!(
