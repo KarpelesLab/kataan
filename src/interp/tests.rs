@@ -317,6 +317,24 @@ fn bytecode_vm_for_of() {
 }
 
 #[test]
+fn bytecode_vm_array_spread() {
+    assert_eq!(eval_bc("[...[1, 2, 3]].length"), "3");
+    assert_eq!(eval_bc("[0, ...[1, 2], 3].join(',')"), "0,1,2,3");
+    assert_eq!(
+        eval_bc("let a = [2, 3]; let b = [1, ...a, 4]; b.join(',')"),
+        "1,2,3,4"
+    );
+    // Spread of a string (characters) and a Set (values).
+    assert_eq!(eval_bc("[...'abc'].join('-')"), "a-b-c");
+    assert_eq!(eval_bc("[...new Set([1, 1, 2, 3, 3])].join(',')"), "1,2,3");
+    // Concatenating two arrays via spread.
+    assert_eq!(
+        eval_bc("let x = [1, 2]; let y = [3, 4]; [...x, ...y].reduce((a, b) => a + b, 0)"),
+        "10"
+    );
+}
+
+#[test]
 fn bytecode_vm_destructuring() {
     // Array destructuring.
     assert_eq!(eval_bc("let [a, b] = [1, 2]; a + b"), "3");

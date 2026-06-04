@@ -1041,6 +1041,14 @@ impl Compiler {
         elements: &[crate::ast::ArrayElement],
     ) -> Result<Reg, CompileError> {
         use crate::ast::ArrayElement;
+        // The spread path builds the array with `concat`; the common path
+        // (no spread) uses direct indexed writes.
+        if elements
+            .iter()
+            .any(|e| matches!(e, ArrayElement::Spread(_)))
+        {
+            return self.array_literal_spread(elements);
+        }
         let dst = self.reg();
         self.emit(Op::NewArray {
             dst,
@@ -1050,7 +1058,7 @@ impl Compiler {
             let value = match el {
                 ArrayElement::Item(e) => self.expr(e)?,
                 ArrayElement::Hole => continue,
-                ArrayElement::Spread(_) => return Err(CompileError::unsupported("array spread")),
+                ArrayElement::Spread(_) => unreachable!("handled above"),
             };
             let index = self.reg();
             self.emit(Op::LoadInt {
@@ -1064,6 +1072,76 @@ impl Compiler {
             });
         }
         Ok(dst)
+    }
+
+    /// Builds an array literal containing spreads: start empty, then `concat`
+    /// each element (a one-element array for an item, the iterated values for a
+    /// spread).
+    fn array_literal_spread(
+        &mut self,
+        elements: &[crate::ast::ArrayElement],
+    ) -> Result<Reg, CompileError> {
+        use crate::ast::ArrayElement;
+        let result = self.reg();
+        self.emit(Op::NewArray {
+            dst: result,
+            len: 0,
+        });
+        for el in elements {
+            let chunk = match el {
+                ArrayElement::Item(e) => {
+                    let v = self.expr(e)?;
+                    let one = self.reg();
+                    self.emit(Op::NewArray { dst: one, len: 1 });
+                    let idx = self.reg();
+                    self.emit(Op::LoadInt { dst: idx, value: 0 });
+                    self.emit(Op::SetElem {
+                        obj: one,
+                        index: idx,
+                        src: v,
+                    });
+                    one
+                }
+                ArrayElement::Hole => {
+                    let one = self.reg();
+                    self.emit(Op::NewArray { dst: one, len: 1 });
+                    one
+                }
+                ArrayElement::Spread(e) => {
+                    let v = self.expr(e)?;
+                    let items = self.reg();
+                    self.emit(Op::IterValues { dst: items, src: v });
+                    items
+                }
+            };
+            self.concat_into(result, chunk);
+        }
+        Ok(result)
+    }
+
+    /// `result = result.concat(arg)` (used when building spread arrays).
+    fn concat_into(&mut self, result: Reg, arg: Reg) {
+        let key = self.reg();
+        let k = self.add_const(Const::Str(String::from("concat")));
+        self.emit(Op::LoadConst { dst: key, k });
+        let args_base = self.funcs.last().expect("fn").next_reg;
+        let slot = self.reg();
+        self.emit(Op::Move {
+            dst: slot,
+            src: arg,
+        });
+        let joined = self.reg();
+        self.emit(Op::CallMethod {
+            dst: joined,
+            recv: result,
+            key,
+            args_base,
+            argc: 1,
+        });
+        self.emit(Op::Move {
+            dst: result,
+            src: joined,
+        });
     }
 
     fn object_literal(
