@@ -54,6 +54,13 @@ pub enum Op {
     Div { dst: Reg, a: Reg, b: Reg },
     /// `dst = a % b` (numeric remainder).
     Mod { dst: Reg, a: Reg, b: Reg },
+    /// A realm-backed binary op (`**`, bitwise, loose `==`/`!=`) selected by a
+    /// small op code — for operators that need full coercion / `i32` semantics.
+    ValueBin { dst: Reg, op: u8, a: Reg, b: Reg },
+    /// `dst = typeof a` (a heap string).
+    TypeOf { dst: Reg, a: Reg },
+    /// `dst = ~a` (bitwise NOT, `i32` semantics).
+    BitNot { dst: Reg, a: Reg },
     /// `dst = -a` (numeric negation).
     Neg { dst: Reg, a: Reg },
     /// `dst = !a` (ECMAScript `ToBoolean` then logical not).
@@ -144,6 +151,17 @@ pub enum Op {
     Return { src: Reg },
 }
 
+// `Op::ValueBin` op codes.
+const VB_POW: u8 = 0;
+const VB_BIT_AND: u8 = 1;
+const VB_BIT_OR: u8 = 2;
+const VB_BIT_XOR: u8 = 3;
+const VB_SHL: u8 = 4;
+const VB_SHR: u8 = 5;
+const VB_USHR: u8 = 6;
+const VB_LOOSE_EQ: u8 = 7;
+const VB_LOOSE_NEQ: u8 = 8;
+
 // Native built-in ids for `Op::CallNative`.
 const NB_CONSOLE_LOG: u16 = 0;
 const NB_MATH_MAX: u16 = 1;
@@ -156,6 +174,10 @@ const NB_MATH_SQRT: u16 = 7;
 const NB_MATH_POW: u16 = 8;
 const NB_STRING: u16 = 9;
 const NB_NUMBER: u16 = 10;
+const NB_PARSE_INT: u16 = 11;
+const NB_PARSE_FLOAT: u16 = 12;
+const NB_IS_NAN: u16 = 13;
+const NB_IS_FINITE: u16 = 14;
 
 /// A compiled function: its instruction stream, register-file size, and the
 /// number of leading registers that receive call arguments.
@@ -317,6 +339,39 @@ fn run_frame(
             Op::Mod { dst, a, b } => {
                 regs[*dst as usize] =
                     NanBox::number(num(regs[*a as usize])? % num(regs[*b as usize])?);
+            }
+            Op::TypeOf { dst, a } => {
+                let t = ctx.realm.type_of_value(regs[*a as usize]);
+                regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(t).to_raw());
+            }
+            #[cfg(feature = "std")]
+            Op::BitNot { dst, a } => {
+                regs[*dst as usize] = ctx.realm.bit_not(regs[*a as usize]);
+            }
+            #[cfg(not(feature = "std"))]
+            Op::BitNot { dst, .. } => regs[*dst as usize] = NanBox::number(f64::NAN),
+            Op::ValueBin { dst, op, a, b } => {
+                let (x, y) = (regs[*a as usize], regs[*b as usize]);
+                regs[*dst as usize] = match *op {
+                    VB_LOOSE_EQ => NanBox::boolean(ctx.realm.loose_equals(x, y)),
+                    VB_LOOSE_NEQ => NanBox::boolean(!ctx.realm.loose_equals(x, y)),
+                    // `**` and bitwise need the realm's `std`-gated math.
+                    #[cfg(feature = "std")]
+                    VB_POW => ctx.realm.pow(x, y),
+                    #[cfg(feature = "std")]
+                    VB_BIT_AND => ctx.realm.bit_and(x, y),
+                    #[cfg(feature = "std")]
+                    VB_BIT_OR => ctx.realm.bit_or(x, y),
+                    #[cfg(feature = "std")]
+                    VB_BIT_XOR => ctx.realm.bit_xor(x, y),
+                    #[cfg(feature = "std")]
+                    VB_SHL => ctx.realm.shl(x, y),
+                    #[cfg(feature = "std")]
+                    VB_SHR => ctx.realm.shr(x, y),
+                    #[cfg(feature = "std")]
+                    VB_USHR => ctx.realm.ushr(x, y),
+                    _ => NanBox::number(f64::NAN),
+                };
             }
             Op::Neg { dst, a } => {
                 regs[*dst as usize] = NanBox::number(-num(regs[*a as usize])?);
@@ -853,8 +908,103 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             ctx.realm
                 .to_number(args.first().copied().unwrap_or(NanBox::undefined())),
         ),
+        NB_PARSE_INT => {
+            let s = ctx
+                .realm
+                .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
+            let radix = args
+                .get(1)
+                .and_then(|r| r.as_number())
+                .map_or(0, |n| n as u32);
+            NanBox::number(parse_int(s.trim(), radix))
+        }
+        NB_PARSE_FLOAT => {
+            let s = ctx
+                .realm
+                .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
+            NanBox::number(parse_float_prefix(s.trim()))
+        }
+        NB_IS_NAN => NanBox::boolean(
+            ctx.realm
+                .to_number(args.first().copied().unwrap_or(NanBox::undefined()))
+                .is_nan(),
+        ),
+        NB_IS_FINITE => NanBox::boolean(
+            ctx.realm
+                .to_number(args.first().copied().unwrap_or(NanBox::undefined()))
+                .is_finite(),
+        ),
         _ => NanBox::undefined(),
     }
+}
+
+/// Parses the longest leading decimal-float prefix of `s` (à la `parseFloat`).
+fn parse_float_prefix(s: &str) -> f64 {
+    let bytes = s.as_bytes();
+    let mut end = 0;
+    let (mut dot, mut e) = (false, false);
+    while end < bytes.len() {
+        let ch = bytes[end] as char;
+        let ok = match ch {
+            '0'..='9' => true,
+            '+' | '-' if end == 0 || matches!(bytes[end - 1] as char, 'e' | 'E') => true,
+            '.' if !dot && !e => {
+                dot = true;
+                true
+            }
+            'e' | 'E' if !e && end > 0 => {
+                e = true;
+                true
+            }
+            _ => false,
+        };
+        if !ok {
+            break;
+        }
+        end += 1;
+    }
+    s[..end].parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// A minimal `parseInt`: leading sign, optional `0x` (radix 0 or 16), then the
+/// digits valid in `radix` (default 10).
+fn parse_int(s: &str, radix: u32) -> f64 {
+    let mut t = s;
+    let mut neg = false;
+    if let Some(r) = t.strip_prefix('-') {
+        neg = true;
+        t = r;
+    } else if let Some(r) = t.strip_prefix('+') {
+        t = r;
+    }
+    let mut radix = radix;
+    if (radix == 0 || radix == 16)
+        && let Some(r) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))
+    {
+        t = r;
+        radix = 16;
+    }
+    if radix == 0 {
+        radix = 10;
+    }
+    if !(2..=36).contains(&radix) {
+        return f64::NAN;
+    }
+    let mut value = 0.0;
+    let mut any = false;
+    for c in t.chars() {
+        match c.to_digit(radix) {
+            Some(d) => {
+                value = value * f64::from(radix) + f64::from(d);
+                any = true;
+            }
+            None => break,
+        }
+    }
+    if !any {
+        return f64::NAN;
+    }
+    if neg { -value } else { value }
 }
 
 // --- AST → bytecode compiler (the first slice of the bytecode-VM fold) ---
@@ -1046,6 +1196,10 @@ fn native_global(callee: &Expr) -> Option<u16> {
     match &*id.name {
         "String" => Some(NB_STRING),
         "Number" => Some(NB_NUMBER),
+        "parseInt" => Some(NB_PARSE_INT),
+        "parseFloat" => Some(NB_PARSE_FLOAT),
+        "isNaN" => Some(NB_IS_NAN),
+        "isFinite" => Some(NB_IS_FINITE),
         _ => None,
     }
 }
@@ -2130,16 +2284,46 @@ impl Compiler {
                     self.ops.push(Op::LoadFunc { dst, func });
                     Ok(dst)
                 } else {
-                    Err(CompileError::Undefined(String::from(&*id.name)))
+                    // The global value identifiers.
+                    match &*id.name {
+                        "undefined" => self.constant(NanBox::undefined()),
+                        "NaN" => self.constant(NanBox::number(f64::NAN)),
+                        "Infinity" => self.constant(NanBox::number(f64::INFINITY)),
+                        _ => Err(CompileError::Undefined(String::from(&*id.name))),
+                    }
                 }
             }
             Expr::Unary { op, argument, .. } => {
+                // `typeof x` must not throw for an undefined identifier.
+                if matches!(op, UnaryOp::Typeof)
+                    && let Expr::Ident(id) = &**argument
+                    && self.lookup(&id.name).is_none()
+                    && !self.fn_ids.contains_key(&*id.name)
+                {
+                    return Ok(self.constant_str("undefined"));
+                }
                 let a = self.expr(argument)?;
                 let dst = self.alloc();
                 match op {
                     UnaryOp::Minus => self.ops.push(Op::Neg { dst, a }),
                     UnaryOp::Not => self.ops.push(Op::Not { dst, a }),
-                    _ => return Err(CompileError::Unsupported("unary operator")),
+                    UnaryOp::Plus => {
+                        // `+x` → ToNumber; `Number(x)` does the same.
+                        self.ops.push(Op::CallNative {
+                            dst,
+                            native: NB_NUMBER,
+                            args: alloc::vec![a],
+                        });
+                    }
+                    UnaryOp::Typeof => self.ops.push(Op::TypeOf { dst, a }),
+                    UnaryOp::BitNot => self.ops.push(Op::BitNot { dst, a }),
+                    UnaryOp::Void => {
+                        self.ops.push(Op::LoadConst {
+                            dst,
+                            value: NanBox::undefined(),
+                        });
+                    }
+                    UnaryOp::Delete => return Err(CompileError::Unsupported("delete")),
                 }
                 Ok(dst)
             }
@@ -2164,7 +2348,13 @@ impl Compiler {
                         self.ops.push(Op::Not { dst: n, a: dst });
                         n
                     }
-                    LogicalOp::Nullish => return Err(CompileError::Unsupported("?? operator")),
+                    LogicalOp::Nullish => {
+                        // Take the right side when the left is nullish.
+                        let nn = self.emit_not_nullish(dst)?;
+                        let g = self.alloc();
+                        self.ops.push(Op::Not { dst: g, a: nn });
+                        g
+                    }
                 };
                 let jf = self.emit_jump_if_false(guard);
                 let r = self.expr(right)?;
@@ -2323,6 +2513,40 @@ impl Compiler {
                 op, target, value, ..
             } => {
                 use crate::ast::AssignOp;
+                // Logical assignment (`&&=`/`||=`/`??=`) short-circuits.
+                if matches!(
+                    op,
+                    AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign
+                ) {
+                    let Expr::Ident(id) = &**target else {
+                        return Err(CompileError::Unsupported("logical assign to member"));
+                    };
+                    let b = self
+                        .lookup(&id.name)
+                        .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                    let cur = self.read_var(b);
+                    // Whether to perform the assignment.
+                    let cond = match op {
+                        AssignOp::AndAssign => cur,
+                        AssignOp::OrAssign => {
+                            let n = self.alloc();
+                            self.ops.push(Op::Not { dst: n, a: cur });
+                            n
+                        }
+                        _ => {
+                            // `??=`: assign when the current value is nullish.
+                            let nn = self.emit_not_nullish(cur)?;
+                            let g = self.alloc();
+                            self.ops.push(Op::Not { dst: g, a: nn });
+                            g
+                        }
+                    };
+                    let jf = self.emit_jump_if_false(cond);
+                    let v = self.expr(value)?;
+                    self.write_var(b, v);
+                    self.patch(jf);
+                    return Ok(self.read_var(b));
+                }
                 let compound = !matches!(op, AssignOp::Assign);
                 match &**target {
                     Expr::Ident(id) => {
@@ -2555,6 +2779,16 @@ impl Compiler {
         Ok(r)
     }
 
+    /// A fresh register holding a new heap string.
+    fn constant_str(&mut self, s: &str) -> Reg {
+        let r = self.alloc();
+        self.ops.push(Op::NewString {
+            dst: r,
+            value: String::from(s),
+        });
+        r
+    }
+
     /// Emits `!(v === null || v === undefined)` into a fresh register.
     fn emit_not_nullish(&mut self, v: Reg) -> Result<Reg, CompileError> {
         let null = self.constant(NanBox::null())?;
@@ -2634,7 +2868,64 @@ impl Compiler {
                 self.ops.push(Op::StrictEq { dst, a, b });
                 self.ops.push(Op::Not { dst, a: dst });
             }
-            _ => return Err(CompileError::Unsupported("binary operator")),
+            // Realm-backed ops (`**`, bitwise, loose `==`/`!=`).
+            BinaryOp::Exp => self.ops.push(Op::ValueBin {
+                dst,
+                op: VB_POW,
+                a,
+                b,
+            }),
+            BinaryOp::BitAnd => self.ops.push(Op::ValueBin {
+                dst,
+                op: VB_BIT_AND,
+                a,
+                b,
+            }),
+            BinaryOp::BitOr => self.ops.push(Op::ValueBin {
+                dst,
+                op: VB_BIT_OR,
+                a,
+                b,
+            }),
+            BinaryOp::BitXor => self.ops.push(Op::ValueBin {
+                dst,
+                op: VB_BIT_XOR,
+                a,
+                b,
+            }),
+            BinaryOp::Shl => self.ops.push(Op::ValueBin {
+                dst,
+                op: VB_SHL,
+                a,
+                b,
+            }),
+            BinaryOp::Shr => self.ops.push(Op::ValueBin {
+                dst,
+                op: VB_SHR,
+                a,
+                b,
+            }),
+            BinaryOp::Ushr => self.ops.push(Op::ValueBin {
+                dst,
+                op: VB_USHR,
+                a,
+                b,
+            }),
+            BinaryOp::EqEq => self.ops.push(Op::ValueBin {
+                dst,
+                op: VB_LOOSE_EQ,
+                a,
+                b,
+            }),
+            BinaryOp::NotEq => self.ops.push(Op::ValueBin {
+                dst,
+                op: VB_LOOSE_NEQ,
+                a,
+                b,
+            }),
+            BinaryOp::In | BinaryOp::Instanceof => {
+                return Err(CompileError::Unsupported("in / instanceof"));
+            }
         }
         Ok(dst)
     }
@@ -2647,6 +2938,16 @@ impl Compiler {
             AssignOp::SubAssign => BinaryOp::Sub,
             AssignOp::MulAssign => BinaryOp::Mul,
             AssignOp::DivAssign => BinaryOp::Div,
+            AssignOp::ModAssign => BinaryOp::Mod,
+            AssignOp::ExpAssign => BinaryOp::Exp,
+            AssignOp::ShlAssign => BinaryOp::Shl,
+            AssignOp::ShrAssign => BinaryOp::Shr,
+            AssignOp::UshrAssign => BinaryOp::Ushr,
+            AssignOp::BitAndAssign => BinaryOp::BitAnd,
+            AssignOp::BitOrAssign => BinaryOp::BitOr,
+            AssignOp::BitXorAssign => BinaryOp::BitXor,
+            // `&&=`/`||=`/`??=` are handled separately (short-circuit), and `=`
+            // isn't compound.
             _ => return Err(CompileError::Unsupported("compound assignment operator")),
         })
     }
@@ -3164,6 +3465,44 @@ mod tests {
                 let o = new C(); o.a + o.b + o.c"),
             "6"
         );
+    }
+
+    #[test]
+    fn bytecode_more_operators() {
+        // `**`, `%`, bitwise, shifts.
+        assert_eq!(bc("2 ** 10"), "1024");
+        assert_eq!(bc("17 % 5"), "2");
+        assert_eq!(bc("6 & 3"), "2");
+        assert_eq!(bc("5 | 2"), "7");
+        assert_eq!(bc("5 ^ 1"), "4");
+        assert_eq!(bc("1 << 4"), "16");
+        assert_eq!(bc("256 >> 2"), "64");
+        // Loose equality.
+        assert_eq!(bc("'' + (1 == 1) + ',' + (1 != 2)"), "true,true");
+        // typeof / unary +.
+        assert_eq!(bc("typeof 42"), "number");
+        assert_eq!(bc("typeof 'hi'"), "string");
+        assert_eq!(bc("typeof undefinedVar"), "undefined");
+        assert_eq!(bc("+'15' + 5"), "20");
+        assert_eq!(bc("~5"), "-6");
+        // Global value identifiers.
+        assert_eq!(bc("undefined === undefined"), "true");
+        assert_eq!(bc("'' + Infinity"), "Infinity");
+        // Nullish coalescing.
+        assert_eq!(bc("let x = null; x ?? 'fallback'"), "fallback");
+        assert_eq!(bc("let x = 0; x ?? 'fallback'"), "0"); // 0 isn't nullish
+        // Compound bitwise / logical assignment.
+        assert_eq!(bc("let n = 12; n &= 10; n"), "8");
+        assert_eq!(bc("let n = 8; n |= 1; n"), "9");
+        assert_eq!(bc("let n = 1; n <<= 3; n"), "8");
+        assert_eq!(bc("let x = 0; x ||= 5; x"), "5");
+        assert_eq!(bc("let x = 1; x &&= 9; x"), "9");
+        assert_eq!(bc("let x = null; x ??= 7; x"), "7");
+        // parseInt / parseFloat / isNaN / isFinite globals.
+        assert_eq!(bc("parseInt('42px')"), "42");
+        assert_eq!(bc("parseInt('ff', 16)"), "255");
+        assert_eq!(bc("parseFloat('3.14xyz')"), "3.14");
+        assert_eq!(bc("'' + isNaN(0 / 0) + ',' + isFinite(1)"), "true,true");
     }
 
     #[test]

@@ -470,7 +470,7 @@ impl Realm {
                     "false".into()
                 }
             }
-            Unpacked::Number(n) => alloc::format!("{n}"),
+            Unpacked::Number(n) => js_number_string(n),
             Unpacked::Handle(raw) => match self.heap.get(Handle::from_raw(raw)) {
                 Some(Cell::Str(r)) => r.materialize(),
                 Some(Cell::Array(elems)) => {
@@ -794,6 +794,22 @@ impl Realm {
             // At least one primitive: decided by the boxed value itself.
             _ => a.strict_equals(b),
         }
+    }
+}
+
+/// Renders a number as ECMAScript `ToString` would for the cases the engine
+/// produces: `±Infinity` (not Rust's `inf`) and `NaN`; finite values use Rust's
+/// `Display` (which omits a trailing `.0` for integers).
+#[must_use]
+pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
+    if n.is_infinite() {
+        if n > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        }
+    } else {
+        alloc::format!("{n}")
     }
 }
 
