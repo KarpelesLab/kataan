@@ -63,6 +63,11 @@ pub mod object;
 #[cfg(feature = "alloc")]
 pub mod gc;
 
+/// Inline caches for property access, keyed on [`shape::Shape`] identity — the
+/// fast path that turns a repeated `obj.x` into a slot load. Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod ic;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
