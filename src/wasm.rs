@@ -235,6 +235,20 @@ fn emit_expr(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmErro
             }
         }
         // `f(args)` → push the f64 arguments, then `call $f`.
+        // `Math.sqrt(x)` / `Math.max(a, b)` → a native `f64.*` instruction.
+        Expr::Call { arguments, .. } if math_call(expr).is_some() => {
+            let (mnemonic, _opcode, arity) = math_call(expr).unwrap();
+            if arguments.len() != arity {
+                return Err(WasmError("Math arity"));
+            }
+            for arg in arguments {
+                let crate::ast::Argument::Item(e) = arg else {
+                    return Err(WasmError("spread argument"));
+                };
+                emit_expr(e, out, depth)?;
+            }
+            out.push_str(&format!("{pad}{mnemonic}\n"));
+        }
         Expr::Call {
             callee, arguments, ..
         } => {
@@ -313,6 +327,39 @@ fn cmp_op(op: BinaryOp) -> &'static str {
         BinaryOp::NotEq | BinaryOp::NotEqEq => "f64.ne",
         _ => "f64.eq", // unreachable for non-comparisons
     }
+}
+
+/// If `expr` is a `Math.<method>` call mapping to a native WASM `f64` op,
+/// returns its `(WAT mnemonic, binary opcode, arity)`.
+fn math_call(expr: &Expr) -> Option<(&'static str, u8, usize)> {
+    let Expr::Call { callee, .. } = expr else {
+        return None;
+    };
+    let Expr::Member {
+        object,
+        property: crate::ast::PropertyKey::Ident(method),
+        ..
+    } = &**callee
+    else {
+        return None;
+    };
+    let Expr::Ident(ns) = &**object else {
+        return None;
+    };
+    if &*ns.name != "Math" {
+        return None;
+    }
+    Some(match &**method {
+        "abs" => ("f64.abs", 0x99, 1),
+        "ceil" => ("f64.ceil", 0x9b, 1),
+        "floor" => ("f64.floor", 0x9c, 1),
+        "trunc" => ("f64.trunc", 0x9d, 1),
+        "round" => ("f64.nearest", 0x9e, 1), // ties-to-even (≈ Math.round)
+        "sqrt" => ("f64.sqrt", 0x9f, 1),
+        "min" => ("f64.min", 0xa4, 2),
+        "max" => ("f64.max", 0xa5, 2),
+        _ => return None,
+    })
 }
 
 /// The single-byte opcode for a comparison's `f64.*` instruction.
@@ -599,6 +646,20 @@ fn emit_expr_bin(
                 _ => return Err(WasmError("binary operator")),
             }
         }
+        // `Math.sqrt(x)` / `Math.max(a, b)` → a native `f64.*` opcode.
+        Expr::Call { arguments, .. } if math_call(expr).is_some() => {
+            let (_mnemonic, opcode, arity) = math_call(expr).unwrap();
+            if arguments.len() != arity {
+                return Err(WasmError("Math arity"));
+            }
+            for arg in arguments {
+                let crate::ast::Argument::Item(e) = arg else {
+                    return Err(WasmError("spread argument"));
+                };
+                emit_expr_bin(e, locals, fns, out)?;
+            }
+            out.push(opcode);
+        }
         Expr::Call {
             callee, arguments, ..
         } => {
@@ -869,6 +930,28 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_math_builtins() {
+        // Unary: Math.sqrt → f64.sqrt (WAT and binary 0x9f).
+        let wat = module("function r(x) { return Math.sqrt(x); }");
+        assert!(wat.contains("f64.sqrt"));
+        assert_well_formed(&wat);
+        let wasm = binary("function r(x) { return Math.sqrt(x); }");
+        assert!(wasm.contains(&0x9f), "f64.sqrt opcode");
+        section_ids(&wasm);
+
+        // Binary: Math.max → f64.max (0xa5); a hypotenuse uses sqrt + max.
+        let wat = module("function clampHi(x, hi) { return Math.max(x, hi); }");
+        assert!(wat.contains("f64.max"));
+        let wasm = binary("function hyp(a, b) { return Math.sqrt(Math.max(a * a, b * b)); }");
+        assert!(wasm.contains(&0x9f) && wasm.contains(&0xa5));
+        section_ids(&wasm);
+
+        // Wrong arity is rejected.
+        let program = Parser::parse_program("function f(x) { return Math.max(x); }").unwrap();
+        assert!(compile_module(&program).is_err());
     }
 
     #[test]

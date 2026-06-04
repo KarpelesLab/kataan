@@ -35,6 +35,8 @@ fn emitted_wasm_runs_on_a_real_engine() {
         }
         function sq(x) { return x * x; }
         function hyp2(a, b) { return sq(a) + sq(b); }
+        function hypot(a, b) { return Math.sqrt(Math.max(sq(a) + sq(b), 0)); }
+        function absdiff(a, b) { return Math.abs(a - b); }
     ";
     let program = Parser::parse_program(src).expect("parse");
     let wasm = kataan::wasm::compile_module_binary(&program).expect("compile to wasm");
@@ -57,6 +59,8 @@ fn emitted_wasm_runs_on_a_real_engine() {
             e.fib(10),
             e.fib(20),
             e.hyp2(3, 4),
+            e.hypot(3, 4),
+            e.absdiff(2, 9),
           ];
           console.log(out.join(','));
         }}).catch(err => {{ console.error('INVALID:' + err.message); process.exit(1); }});
@@ -76,10 +80,11 @@ fn emitted_wasm_runs_on_a_real_engine() {
         output.status.success(),
         "node failed to run the emitted wasm: {stderr}"
     );
-    // add=5, max(4,9)=9, max(9,4)=9, fib(10)=55, fib(20)=6765, hyp2(3,4)=25.
+    // add=5, max=9/9, fib(10)=55, fib(20)=6765, hyp2(3,4)=25, hypot(3,4)=5,
+    // absdiff(2,9)=7 — including the native Math.sqrt/max/abs ops.
     assert_eq!(
         stdout.trim(),
-        "5,9,9,55,6765,25",
+        "5,9,9,55,6765,25,5,7",
         "wasm produced wrong results"
     );
 
