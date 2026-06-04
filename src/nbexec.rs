@@ -1771,9 +1771,29 @@ impl<'a> Interp<'a> {
         }
         // `new Date(ms)` (or `new Date()` for "now").
         if id == N_DATE {
-            let ms = match args.first() {
-                Some(a) => self.realm.to_number(*a),
-                None => now_ms(),
+            let ms = if args.len() >= 2 {
+                // `new Date(year, month, day?, h?, m?, s?, ms?)` (local ≈ UTC here).
+                let num =
+                    |i: usize, dflt: f64| args.get(i).map_or(dflt, |a| self.realm.to_number(*a));
+                let year = num(0, 1970.0) as i64;
+                let month = num(1, 0.0) as i64; // 0-indexed, may overflow
+                let day = num(2, 1.0) as i64;
+                let hours = num(3, 0.0) as i64;
+                let mins = num(4, 0.0) as i64;
+                let secs = num(5, 0.0) as i64;
+                let millis = num(6, 0.0) as i64;
+                // Normalize the (possibly out-of-range) month into the year.
+                let total_months = year * 12 + month;
+                let y = total_months.div_euclid(12);
+                let mo = total_months.rem_euclid(12) as u32 + 1; // 1..=12
+                let days = crate::realm::days_from_civil(y, mo, day as u32);
+                (days * 86_400_000 + hours * 3_600_000 + mins * 60_000 + secs * 1_000 + millis)
+                    as f64
+            } else {
+                match args.first() {
+                    Some(a) => self.realm.to_number(*a),
+                    None => now_ms(),
+                }
             };
             let d = self.realm.new_date(ms);
             return Ok(NanBox::handle(d.to_raw()));
@@ -3777,6 +3797,21 @@ impl<'a> Interp<'a> {
                     }
                 }
                 Ok(())
+            }
+            // A defaulted target in a pattern (`[a = 1] = …`, `{ x: a = 1 } = …`):
+            // use the default when the source value is `undefined`.
+            Expr::Assign {
+                op: AssignOp::Assign,
+                target: inner,
+                value: default_expr,
+                ..
+            } => {
+                let v = if matches!(value.unpack(), Unpacked::Undefined) {
+                    self.eval(default_expr)?
+                } else {
+                    value
+                };
+                self.assign_destructure(inner, v)
             }
             // A leaf target (identifier or member).
             _ => self.assign_to(target, value),
@@ -6369,6 +6404,26 @@ mod tests {
         // name from a declaration and a named function expression.
         assert_eq!(run("function greet(){} greet.name"), "greet");
         assert_eq!(run("let g = function inner(){}; g.name"), "inner");
+    }
+
+    #[test]
+    fn destructuring_assignment_with_defaults() {
+        assert_eq!(run("let a,b; [a,b]=[1,2]; a+','+b"), "1,2");
+        assert_eq!(run("let a,b; [a,b]=[1,2]; [a,b]=[b,a]; a+','+b"), "2,1");
+        assert_eq!(run("let a,b; ({x:a,y:b}={x:10,y:20}); a+','+b"), "10,20");
+        // Default in an assignment pattern.
+        assert_eq!(run("let a,b,c; [a,b,c=99]=[1,2]; String(c)"), "99");
+        assert_eq!(run("let x; ({p:x=7}={}); String(x)"), "7");
+    }
+
+    #[test]
+    fn date_multi_arg_and_subtraction() {
+        assert_eq!(
+            run("let d=new Date(2026,5,5); d.getFullYear()+'/'+d.getMonth()+'/'+d.getDate()"),
+            "2026/5/5"
+        );
+        assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
+        assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
     }
 
     #[test]

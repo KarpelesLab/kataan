@@ -856,7 +856,9 @@ impl Realm {
                         }
                         t.parse::<f64>().unwrap_or(f64::NAN)
                     }
-                    None => f64::NAN, // object/array/stale
+                    // A `Date` coerces to its millisecond timestamp (so `b - a`
+                    // yields an elapsed-ms difference); other objects → NaN.
+                    None => self.date_at(Handle::from_raw(raw)).unwrap_or(f64::NAN),
                 }
             }
         }
@@ -1147,6 +1149,19 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
     let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Days since the Unix epoch for a civil date (`y` full year, `m` in `1..=12`,
+/// `d` day) — the inverse of [`civil_from_days`] (Howard Hinnant's algorithm).
+#[must_use]
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let m = m as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
 }
 
 /// Renders a millisecond timestamp as an ISO-8601 UTC string.
