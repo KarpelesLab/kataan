@@ -41,8 +41,16 @@ pub enum Op {
     Sub { dst: Reg, a: Reg, b: Reg },
     /// `dst = a * b` (numeric).
     Mul { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a / b` (numeric).
+    Div { dst: Reg, a: Reg, b: Reg },
+    /// `dst = -a` (numeric negation).
+    Neg { dst: Reg, a: Reg },
+    /// `dst = !a` (ECMAScript `ToBoolean` then logical not).
+    Not { dst: Reg, a: Reg },
     /// `dst = (a < b)` (numeric) as a boolean.
     Lt { dst: Reg, a: Reg, b: Reg },
+    /// `dst = src` (register copy).
+    Move { dst: Reg, src: Reg },
     /// Jump to `target` if `cond` is falsy (ECMAScript `ToBoolean`).
     JumpIfFalse { cond: Reg, target: usize },
     /// Unconditional jump to `target`.
@@ -113,6 +121,17 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
                 regs[*dst as usize] =
                     NanBox::number(num(regs[*a as usize])? * num(regs[*b as usize])?);
             }
+            Op::Div { dst, a, b } => {
+                regs[*dst as usize] =
+                    NanBox::number(num(regs[*a as usize])? / num(regs[*b as usize])?);
+            }
+            Op::Neg { dst, a } => {
+                regs[*dst as usize] = NanBox::number(-num(regs[*a as usize])?);
+            }
+            Op::Not { dst, a } => {
+                regs[*dst as usize] = NanBox::boolean(!regs[*a as usize].to_boolean());
+            }
+            Op::Move { dst, src } => regs[*dst as usize] = regs[*src as usize],
             Op::Lt { dst, a, b } => {
                 regs[*dst as usize] =
                     NanBox::boolean(num(regs[*a as usize])? < num(regs[*b as usize])?);
@@ -173,9 +192,355 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
     Ok(NanBox::undefined())
 }
 
+// --- AST → bytecode compiler (the first slice of the bytecode-VM fold) ---
+
+use crate::ast::{BinaryOp, BindingTarget, Expr, Ident, LogicalOp, Program, Stmt, UnaryOp};
+
+/// Why compilation could not proceed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CompileError {
+    /// A construct the bytecode compiler does not yet handle.
+    Unsupported(&'static str),
+    /// A reference to a name not declared in scope.
+    Undefined(String),
+}
+
+/// Compiles a (subset of a) program to [`Op`]s over the [`Realm`]/[`NanBox`]
+/// model and runs it, returning the completion value. Supports numeric/string/
+/// boolean/null literals, `let` bindings and assignment, arithmetic and
+/// comparison operators, `!`/unary `-`, `&&`/`||`/`?:` short-circuiting, and
+/// `if`/`while`/block control flow — the first slice of the production VM's
+/// migration onto the new representation.
+///
+/// # Errors
+/// Returns [`CompileError`] for unsupported constructs and [`VmError`] (wrapped)
+/// for runtime faults.
+pub fn compile_and_run(realm: &mut Realm, program: &Program) -> Result<NanBox, CompileError> {
+    let mut c = Compiler::default();
+    c.scopes.push(alloc::collections::BTreeMap::new());
+    let mut last: Option<Reg> = None;
+    for stmt in &program.body {
+        if let Some(r) = c.stmt(stmt)? {
+            last = Some(r);
+        }
+    }
+    let src = last.unwrap_or_else(|| {
+        let r = c.alloc();
+        c.ops.push(Op::LoadConst {
+            dst: r,
+            value: NanBox::undefined(),
+        });
+        r
+    });
+    c.ops.push(Op::Return { src });
+    let reg_count = c.next_reg as usize;
+    run(realm, &c.ops, reg_count).map_err(|_| CompileError::Unsupported("runtime fault"))
+}
+
+/// A single-pass register-allocating compiler from the AST to [`Op`]s.
+#[derive(Default)]
+struct Compiler {
+    ops: Vec<Op>,
+    /// Lexical scopes mapping a name to the register holding its value.
+    scopes: Vec<alloc::collections::BTreeMap<String, Reg>>,
+    next_reg: Reg,
+}
+
+impl Compiler {
+    fn alloc(&mut self) -> Reg {
+        let r = self.next_reg;
+        self.next_reg += 1;
+        r
+    }
+
+    fn declare(&mut self, name: &str) -> Reg {
+        let r = self.alloc();
+        self.scopes
+            .last_mut()
+            .expect("a scope")
+            .insert(String::from(name), r);
+        r
+    }
+
+    fn lookup(&self, name: &str) -> Option<Reg> {
+        self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+
+    /// Compiles a statement; returns the register of its value if it is an
+    /// expression statement (for the program's completion value).
+    fn stmt(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
+        match stmt {
+            Stmt::Empty { .. } => Ok(None),
+            Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
+            Stmt::Var(decl) => {
+                for d in &decl.declarations {
+                    let BindingTarget::Ident(Ident { name, .. }) = &d.target else {
+                        return Err(CompileError::Unsupported("destructuring binding"));
+                    };
+                    let value = match &d.init {
+                        Some(e) => self.expr(e)?,
+                        None => {
+                            let r = self.alloc();
+                            self.ops.push(Op::LoadConst {
+                                dst: r,
+                                value: NanBox::undefined(),
+                            });
+                            r
+                        }
+                    };
+                    let slot = self.declare(name);
+                    self.ops.push(Op::Move {
+                        dst: slot,
+                        src: value,
+                    });
+                }
+                Ok(None)
+            }
+            Stmt::Block { body, .. } => {
+                self.scopes.push(alloc::collections::BTreeMap::new());
+                for s in body {
+                    self.stmt(s)?;
+                }
+                self.scopes.pop();
+                Ok(None)
+            }
+            Stmt::If {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                let cond = self.expr(test)?;
+                let jf = self.emit_jump_if_false(cond);
+                self.stmt(consequent)?;
+                if let Some(alt) = alternate {
+                    let jend = self.emit_jump();
+                    self.patch(jf);
+                    self.stmt(alt)?;
+                    self.patch(jend);
+                } else {
+                    self.patch(jf);
+                }
+                Ok(None)
+            }
+            Stmt::While { test, body, .. } => {
+                let top = self.ops.len();
+                let cond = self.expr(test)?;
+                let jf = self.emit_jump_if_false(cond);
+                self.stmt(body)?;
+                self.ops.push(Op::Jump { target: top });
+                self.patch(jf);
+                Ok(None)
+            }
+            _ => Err(CompileError::Unsupported("statement")),
+        }
+    }
+
+    fn expr(&mut self, expr: &Expr) -> Result<Reg, CompileError> {
+        match expr {
+            Expr::Number { value, .. } => self.constant(NanBox::number(*value)),
+            Expr::Bool { value, .. } => self.constant(NanBox::boolean(*value)),
+            Expr::Null(_) => self.constant(NanBox::null()),
+            Expr::Str { value, .. } => {
+                let r = self.alloc();
+                self.ops.push(Op::NewString {
+                    dst: r,
+                    value: String::from(&**value),
+                });
+                Ok(r)
+            }
+            Expr::Ident(id) => self
+                .lookup(&id.name)
+                .ok_or_else(|| CompileError::Undefined(String::from(&*id.name))),
+            Expr::Unary { op, argument, .. } => {
+                let a = self.expr(argument)?;
+                let dst = self.alloc();
+                match op {
+                    UnaryOp::Minus => self.ops.push(Op::Neg { dst, a }),
+                    UnaryOp::Not => self.ops.push(Op::Not { dst, a }),
+                    _ => return Err(CompileError::Unsupported("unary operator")),
+                }
+                Ok(dst)
+            }
+            Expr::Binary {
+                op, left, right, ..
+            } => {
+                let a = self.expr(left)?;
+                let b = self.expr(right)?;
+                let dst = self.alloc();
+                match op {
+                    BinaryOp::Add => self.ops.push(Op::AddValue { dst, a, b }),
+                    BinaryOp::Sub => self.ops.push(Op::Sub { dst, a, b }),
+                    BinaryOp::Mul => self.ops.push(Op::Mul { dst, a, b }),
+                    BinaryOp::Div => self.ops.push(Op::Div { dst, a, b }),
+                    BinaryOp::Lt => self.ops.push(Op::Lt { dst, a, b }),
+                    BinaryOp::Gt => self.ops.push(Op::Lt { dst, a: b, b: a }),
+                    BinaryOp::LtEq => {
+                        self.ops.push(Op::Lt { dst, a: b, b: a });
+                        self.ops.push(Op::Not { dst, a: dst });
+                    }
+                    BinaryOp::GtEq => {
+                        self.ops.push(Op::Lt { dst, a, b });
+                        self.ops.push(Op::Not { dst, a: dst });
+                    }
+                    BinaryOp::EqEqEq => self.ops.push(Op::StrictEq { dst, a, b }),
+                    BinaryOp::NotEqEq => {
+                        self.ops.push(Op::StrictEq { dst, a, b });
+                        self.ops.push(Op::Not { dst, a: dst });
+                    }
+                    _ => return Err(CompileError::Unsupported("binary operator")),
+                }
+                Ok(dst)
+            }
+            Expr::Logical {
+                op, left, right, ..
+            } => {
+                // Short-circuit: `dst = left`; conditionally overwrite with right.
+                let l = self.expr(left)?;
+                let dst = self.alloc();
+                self.ops.push(Op::Move { dst, src: l });
+                let guard = match op {
+                    LogicalOp::And => dst,
+                    LogicalOp::Or => {
+                        let n = self.alloc();
+                        self.ops.push(Op::Not { dst: n, a: dst });
+                        n
+                    }
+                    LogicalOp::Nullish => return Err(CompileError::Unsupported("?? operator")),
+                };
+                let jf = self.emit_jump_if_false(guard);
+                let r = self.expr(right)?;
+                self.ops.push(Op::Move { dst, src: r });
+                self.patch(jf);
+                Ok(dst)
+            }
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                let cond = self.expr(test)?;
+                let dst = self.alloc();
+                let jf = self.emit_jump_if_false(cond);
+                let c = self.expr(consequent)?;
+                self.ops.push(Op::Move { dst, src: c });
+                let jend = self.emit_jump();
+                self.patch(jf);
+                let a = self.expr(alternate)?;
+                self.ops.push(Op::Move { dst, src: a });
+                self.patch(jend);
+                Ok(dst)
+            }
+            Expr::Assign {
+                op, target, value, ..
+            } => {
+                if !matches!(op, crate::ast::AssignOp::Assign) {
+                    return Err(CompileError::Unsupported("compound assignment"));
+                }
+                let Expr::Ident(id) = &**target else {
+                    return Err(CompileError::Unsupported("assignment target"));
+                };
+                let v = self.expr(value)?;
+                let slot = self
+                    .lookup(&id.name)
+                    .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                self.ops.push(Op::Move { dst: slot, src: v });
+                Ok(slot)
+            }
+            _ => Err(CompileError::Unsupported("expression")),
+        }
+    }
+
+    fn constant(&mut self, value: NanBox) -> Result<Reg, CompileError> {
+        let r = self.alloc();
+        self.ops.push(Op::LoadConst { dst: r, value });
+        Ok(r)
+    }
+
+    /// Emits a `JumpIfFalse` with a placeholder target; returns its index.
+    fn emit_jump_if_false(&mut self, cond: Reg) -> usize {
+        let i = self.ops.len();
+        self.ops.push(Op::JumpIfFalse { cond, target: 0 });
+        i
+    }
+
+    fn emit_jump(&mut self) -> usize {
+        let i = self.ops.len();
+        self.ops.push(Op::Jump { target: 0 });
+        i
+    }
+
+    /// Backpatches the jump at `idx` to land at the current instruction.
+    fn patch(&mut self, idx: usize) {
+        let target = self.ops.len();
+        match &mut self.ops[idx] {
+            Op::JumpIfFalse { target: t, .. } | Op::Jump { target: t } => *t = target,
+            _ => unreachable!("patch a non-jump"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compiles `src` to bytecode and runs it over a fresh realm, returning the
+    /// completion value as a display string.
+    fn bc(src: &str) -> String {
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let mut realm = Realm::new();
+        let value = compile_and_run(&mut realm, &program).expect("compile+run");
+        realm.to_display_string(value)
+    }
+
+    #[test]
+    fn bytecode_arithmetic_and_precedence() {
+        assert_eq!(bc("2 + 3 * 4"), "14");
+        assert_eq!(bc("(2 + 3) * 4"), "20");
+        assert_eq!(bc("10 / 4"), "2.5");
+        assert_eq!(bc("-5 + 3"), "-2");
+        assert_eq!(bc("'a' + 'b' + 'c'"), "abc");
+        assert_eq!(bc("1 + 2; 3 + 4"), "7"); // completion is the last expression
+    }
+
+    #[test]
+    fn bytecode_comparisons_and_logic() {
+        assert_eq!(bc("3 < 5"), "true");
+        assert_eq!(bc("5 <= 5"), "true");
+        assert_eq!(bc("7 > 2"), "true");
+        assert_eq!(bc("2 >= 9"), "false");
+        assert_eq!(bc("1 === 1"), "true");
+        assert_eq!(bc("1 !== 2"), "true");
+        assert_eq!(bc("!false"), "true");
+        assert_eq!(bc("true && 7"), "7");
+        assert_eq!(bc("false || 'fallback'"), "fallback");
+        assert_eq!(bc("0 && 9"), "0"); // short-circuit keeps the falsy left
+        assert_eq!(bc("(3 > 2) ? 'yes' : 'no'"), "yes");
+    }
+
+    #[test]
+    fn bytecode_variables_and_control_flow() {
+        // let bindings, assignment, and a while loop, all compiled to bytecode.
+        assert_eq!(
+            bc("let sum = 0; let i = 1; while (i <= 5) { sum = sum + i; i = i + 1; } sum"),
+            "15"
+        );
+        // if / else.
+        assert_eq!(
+            bc("let x = 7; let r = 0; if (x > 5) { r = 1; } else { r = 2; } r"),
+            "1"
+        );
+        // Block scoping doesn't clobber the outer binding's register.
+        assert_eq!(bc("let a = 1; { let a = 99; } a"), "1");
+        // Fibonacci via a loop — exercises the whole pipeline.
+        assert_eq!(
+            bc(
+                "let a = 0; let b = 1; let n = 10; while (n > 0) { let t = a + b; a = b; b = t; n = n - 1; } a"
+            ),
+            "55"
+        );
+    }
 
     #[test]
     fn arithmetic() {
