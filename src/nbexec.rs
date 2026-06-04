@@ -320,6 +320,22 @@ impl<'a> Interp<'a> {
                 ("trunc", N_MATH_TRUNC),
             ],
         );
+        // The `Math` numeric constants.
+        if let Some(mh) = self.current.get("Math").and_then(NanBox::as_handle) {
+            let math = Handle::from_raw(mh);
+            for (name, value) in [
+                ("PI", core::f64::consts::PI),
+                ("E", core::f64::consts::E),
+                ("LN2", core::f64::consts::LN_2),
+                ("LN10", core::f64::consts::LN_10),
+                ("LOG2E", core::f64::consts::LOG2_E),
+                ("LOG10E", core::f64::consts::LOG10_E),
+                ("SQRT2", core::f64::consts::SQRT_2),
+                ("SQRT1_2", core::f64::consts::FRAC_1_SQRT_2),
+            ] {
+                self.realm.set_property(math, name, NanBox::number(value));
+            }
+        }
         install_namespace(self, "console", &[("log", N_CONSOLE_LOG)]);
         // `Promise` is a native constructor (`new Promise(executor)`); its
         // `.resolve`/`.reject` statics are dispatched in `call_method`.
@@ -6536,6 +6552,14 @@ mod tests {
         );
         assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
         assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
+    }
+
+    #[test]
+    fn math_constants() {
+        assert_eq!(run("Math.PI > 3.14 && Math.PI < 3.15"), "true");
+        assert_eq!(run("Math.E > 2.71 && Math.E < 2.72"), "true");
+        assert_eq!(run("Math.SQRT2 * Math.SQRT2 > 1.999"), "true");
+        assert_eq!(run("Math.floor(Math.LN2 * 1000)"), "693");
     }
 
     #[test]
