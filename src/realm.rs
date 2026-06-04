@@ -136,6 +136,107 @@ impl Realm {
     pub fn collect(&mut self, roots: &[Handle]) -> Stats {
         gc::collect(&mut self.heap, roots)
     }
+
+    // --- value operations (the VM's `+`, `ToString`, `===` over heap values) ---
+
+    /// Whether `v` is a heap string.
+    #[must_use]
+    fn is_string(&self, v: NanBox) -> bool {
+        v.as_handle()
+            .and_then(|raw| self.heap.get(Handle::from_raw(raw)))
+            .is_some_and(|c| c.as_str().is_some())
+    }
+
+    /// The rope view of `v` for concatenation: a string cell's own rope (shared,
+    /// so concatenation stays O(1)), or a fresh leaf from its `ToString`.
+    fn rope_of(&self, v: NanBox) -> Rope {
+        if let Some(raw) = v.as_handle()
+            && let Some(rope) = self.heap.get(Handle::from_raw(raw)).and_then(Cell::as_str)
+        {
+            return rope.clone();
+        }
+        Rope::from(self.to_display_string(v).as_str())
+    }
+
+    /// ECMAScript `ToString` for display: numbers/booleans/null/undefined render
+    /// directly; a string yields its text; an array joins its elements with
+    /// `","`; a plain object is `"[object Object]"`.
+    #[must_use]
+    pub fn to_display_string(&self, v: NanBox) -> alloc::string::String {
+        use crate::nanbox::Unpacked;
+        match v.unpack() {
+            Unpacked::Undefined => "undefined".into(),
+            Unpacked::Null => "null".into(),
+            Unpacked::Bool(b) => {
+                if b {
+                    "true".into()
+                } else {
+                    "false".into()
+                }
+            }
+            Unpacked::Number(n) => alloc::format!("{n}"),
+            Unpacked::Handle(raw) => match self.heap.get(Handle::from_raw(raw)) {
+                Some(Cell::Str(r)) => r.materialize(),
+                Some(Cell::Array(elems)) => {
+                    let parts: Vec<alloc::string::String> = elems
+                        .iter()
+                        .map(|e| {
+                            // A hole-ish nullish element renders empty, per `Array#join`.
+                            if matches!(e.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                                alloc::string::String::new()
+                            } else {
+                                self.to_display_string(*e)
+                            }
+                        })
+                        .collect();
+                    parts.join(",")
+                }
+                Some(Cell::Object(_)) => "[object Object]".into(),
+                None => "undefined".into(), // stale handle
+            },
+        }
+    }
+
+    /// The ECMAScript `+` operator (the cases this model covers): number + number
+    /// is numeric addition; if either side is a string it is string
+    /// concatenation, producing a new heap string built by joining ropes (so a
+    /// loop of `+` stays O(1) per step). Other combinations coerce to string for
+    /// now (full `ToPrimitive` arrives with the boxed primitives).
+    pub fn add(&mut self, a: NanBox, b: NanBox) -> NanBox {
+        if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
+            return NanBox::number(x + y);
+        }
+        if self.is_string(a) || self.is_string(b) {
+            let combined = self.rope_of(a).concat(&self.rope_of(b));
+            let handle = self.heap.alloc(Cell::Str(combined));
+            return NanBox::handle(handle.to_raw());
+        }
+        // No string and not both numbers: numeric fast path yields NaN.
+        NanBox::number(f64::NAN)
+    }
+
+    /// ECMAScript strict equality (`===`) over heap values: primitives compare
+    /// by value; two strings compare by *content* (strings are primitives, so
+    /// distinct allocations of `"ab"` are equal); other references compare by
+    /// identity.
+    #[must_use]
+    pub fn strict_equals(&self, a: NanBox, b: NanBox) -> bool {
+        match (a.as_handle(), b.as_handle()) {
+            (Some(ha), Some(hb)) => {
+                if ha == hb {
+                    return true; // same heap cell
+                }
+                let sa = self.heap.get(Handle::from_raw(ha)).and_then(Cell::as_str);
+                let sb = self.heap.get(Handle::from_raw(hb)).and_then(Cell::as_str);
+                match (sa, sb) {
+                    (Some(ra), Some(rb)) => ra.materialize() == rb.materialize(),
+                    _ => false, // distinct non-string references
+                }
+            }
+            // At least one primitive: decided by the boxed value itself.
+            _ => a.strict_equals(b),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +323,80 @@ mod tests {
         // A property op on a string cell is rejected (not an object).
         assert!(!realm.set_property(s, "x", NanBox::number(1.0)));
         assert_eq!(realm.get_property(s, "x"), None);
+    }
+
+    #[test]
+    fn add_numbers_and_concatenates_strings() {
+        let mut realm = Realm::new();
+        // number + number → numeric.
+        let n = realm.add(NanBox::number(2.0), NanBox::number(3.0));
+        assert_eq!(n.as_number(), Some(5.0));
+        // string + number → concatenation (coerced).
+        let hi = realm.new_string("count: ");
+        let r = realm.add(NanBox::handle(hi.to_raw()), NanBox::number(42.0));
+        assert_eq!(realm.to_display_string(r), "count: 42");
+        // string + string.
+        let a = realm.new_string("foo");
+        let b = realm.new_string("bar");
+        let ab = realm.add(NanBox::handle(a.to_raw()), NanBox::handle(b.to_raw()));
+        assert_eq!(realm.to_display_string(ab), "foobar");
+    }
+
+    #[test]
+    fn string_append_loop_builds_correctly() {
+        // The `s += part` shape, now through ropes in the heap.
+        let mut realm = Realm::new();
+        let mut acc = NanBox::handle(realm.new_string("").to_raw());
+        let mut expected = alloc::string::String::new();
+        for i in 0..30 {
+            let part = realm.new_string(&alloc::format!("{i},"));
+            acc = realm.add(acc, NanBox::handle(part.to_raw()));
+            expected.push_str(&alloc::format!("{i},"));
+        }
+        assert_eq!(realm.to_display_string(acc), expected);
+    }
+
+    #[test]
+    fn to_display_string_covers_kinds() {
+        let mut realm = Realm::new();
+        assert_eq!(realm.to_display_string(NanBox::undefined()), "undefined");
+        assert_eq!(realm.to_display_string(NanBox::null()), "null");
+        assert_eq!(realm.to_display_string(NanBox::boolean(true)), "true");
+        assert_eq!(realm.to_display_string(NanBox::number(3.5)), "3.5");
+        let arr = realm.new_array(alloc::vec![
+            NanBox::number(1.0),
+            NanBox::number(2.0),
+            NanBox::number(3.0),
+        ]);
+        assert_eq!(
+            realm.to_display_string(NanBox::handle(arr.to_raw())),
+            "1,2,3"
+        );
+        let obj = realm.new_object();
+        assert_eq!(
+            realm.to_display_string(NanBox::handle(obj.to_raw())),
+            "[object Object]"
+        );
+    }
+
+    #[test]
+    fn strict_equals_strings_by_value_objects_by_identity() {
+        let mut realm = Realm::new();
+        // Primitives.
+        assert!(realm.strict_equals(NanBox::number(1.0), NanBox::number(1.0)));
+        assert!(!realm.strict_equals(NanBox::number(1.0), NanBox::null()));
+        // Two distinct string allocations with equal content are ===.
+        let a = realm.new_string("hello");
+        let b = realm.new_string("hello");
+        let c = realm.new_string("world");
+        assert_ne!(a.to_raw(), b.to_raw()); // genuinely different cells
+        assert!(realm.strict_equals(NanBox::handle(a.to_raw()), NanBox::handle(b.to_raw())));
+        assert!(!realm.strict_equals(NanBox::handle(a.to_raw()), NanBox::handle(c.to_raw())));
+        // Objects compare by identity.
+        let o1 = realm.new_object();
+        let o2 = realm.new_object();
+        assert!(realm.strict_equals(NanBox::handle(o1.to_raw()), NanBox::handle(o1.to_raw())));
+        assert!(!realm.strict_equals(NanBox::handle(o1.to_raw()), NanBox::handle(o2.to_raw())));
     }
 
     #[test]
