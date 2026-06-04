@@ -23,9 +23,12 @@ The non-negotiables:
   for speed without a flag.
 - **Deployable bytecode.** Compiled JS bytecode is a first-class, serializable
   artifact: it can be exported to disk, content-addressed, cached, and reloaded
-  (ideally zero-copy via `mmap`) without re-parsing the source. This is a hard
-  design constraint on the bytecode format from day one (see §2.2), not a
-  bolt-on — it shapes how constants, atoms, and inline-cache slots are encoded.
+  (zero-copy via `mmap` on a matching host) without re-parsing the source. The
+  on-disk form is **host-native** (endianness matches the machine) for that
+  zero-copy path, with an explicit on-demand conversion when a blob is read on a
+  differing host — not a single slow canonical encoding. This is a hard design
+  constraint on the bytecode format from day one (see §2.2), not a bolt-on — it
+  shapes how constants, atoms, and inline-cache slots are encoded.
 
 ---
 
@@ -164,19 +167,39 @@ right call — that's the Fastly/Shopify niche. Kataan's stated goal is
 Node-competitive performance, so it takes the native-JIT path and treats edge
 sandboxing as the conditional tier above.
 
-### 2.2 Portable, serializable bytecode (the code cache)
+### 2.2 Serializable, host-native bytecode (the code cache)
 
 Compiled JS is a **persistable artifact**. The motivating use case: a web server
 hosting hundreds of compiled JS bases that cannot all stay resident in memory —
 compile once, persist the bytecode, then load → run → evict on demand, reloading
 from the cache (ideally zero-copy) instead of re-parsing source.
 
-This imposes concrete, up-front constraints on the bytecode format:
+The format is deliberately **not** byte-for-byte portable across architectures.
+It is **host-native** — endianness (and any other host-specific encoding
+choice) match the producing machine, so a blob can be `mmap`'d and run *as-is*
+on a matching host, which is the overwhelmingly common case (a server, or a
+homogeneous cluster, reloading what it compiled). Portability is provided by an
+explicit, on-demand **conversion** pass rather than by a slow canonical
+encoding everyone pays for. This imposes concrete, up-front constraints on the
+format:
 
-- **Self-contained, position-independent module.** A serialized unit is
+- **Self-contained, position-independent layout.** A serialized unit is
   `(bytecode + constant pool + atom/string table + function & scope metadata +
   optional source map)`, all cross-referenced by **index**, never by live heap
   pointer. Nothing in the on-disk form may embed a runtime address.
+  *Position*-independent (no addresses) is a separate axis from *encoding*-
+  independent: the layout is relocatable, but its integer encoding is host-
+  native (next bullet). Offsets/sizes use explicit fixed-width fields (`u32`/
+  `u64`), so word size never enters — endianness is the only host-encoding axis.
+- **Host-native encoding, convertible on demand.** Multi-byte fields are stored
+  in the host's byte order; the header records which (plus an alignment/ABI
+  tag). On a *matching* host the loader maps and runs with zero transformation.
+  On a *mismatched* host (e.g. a big-endian reader of a little-endian blob) the
+  loader runs a one-time, deterministic **byte-swap / re-pack** pass that yields
+  a matching blob — and re-caches it under the host-tagged key so the cost is
+  paid once. This conversion is *cheap and lossless* (a structural swap, no
+  semantics), and crucially is **not** a recompile — it is the fast path for a
+  host-format mismatch, distinct from the version mismatch below.
 - **Module-local atoms, remapped on load.** Interned strings are per-runtime
   integers, so a module carries its own string table and its atoms are
   module-local indices, re-interned into the host runtime's table at load time.
@@ -187,16 +210,25 @@ This imposes concrete, up-front constraints on the bytecode format:
   *hints* for the JIT, never as pointers.)
 - **Shapes are rebuilt at runtime.** The format references property keys by
   atom; hidden classes form as objects are constructed. No shape is serialized.
-- **Versioned + integrity-checked.** A header carries a magic, a format
-  version, and an engine-version/flags hash; a mismatch (or a failed checksum)
-  falls back to recompiling from source. The store is content-addressed by
-  source hash, so identical sources across tenants dedup to one artifact.
-- **Zero-copy loadable.** The layout is flat and aligned so a cached module can
-  be `mmap`'d and the interpreter run directly over the mapped bytes — the key
-  to fast load/evict/reload churn. The read-only bytecode pages are
-  **shareable across many concurrent contexts** (even across processes): the
-  immutable bytecode backs the program, while each lightweight context owns its
-  own mutable heap/globals — exactly the model needed for "hundreds of bases."
+- **Versioned + integrity-checked, with two distinct mismatch paths.** A header
+  carries a magic, a format version, an engine-version/flags hash, and the
+  host-encoding tag (endianness/alignment). The loader distinguishes:
+  *(a)* **version/flags mismatch or failed checksum → recompile from source**
+  (the bytecode may mean something different, so it cannot be trusted); and
+  *(b)* **host-encoding mismatch, same version → convert** (the cheap byte-swap
+  pass above, no recompile). The store is content-addressed by source hash;
+  the resident artifact additionally carries the host tag, so a little-endian
+  and a big-endian host don't collide on incompatible bytes — they hold (or
+  convert into) their own host-tagged variant. Identical sources across tenants
+  on the same host class dedup to one artifact.
+- **Zero-copy loadable (on a matching host).** The layout is flat and aligned so
+  a cached module can be `mmap`'d and the interpreter run directly over the
+  mapped bytes — the key to fast load/evict/reload churn. (On a mismatched host
+  the one-time conversion runs first, then the result is zero-copy on every
+  subsequent load.) The read-only bytecode pages are **shareable across many
+  concurrent contexts** (even across processes): the immutable bytecode backs
+  the program, while each lightweight context owns its own mutable
+  heap/globals — exactly the model needed for "hundreds of bases."
 - **Lazy function bodies.** Nested function bytecode is stored per-function and
   can be faulted in on first call, so loading a large base doesn't materialize
   code that never runs.
@@ -444,10 +476,11 @@ and (from D onward) reports a Test262 pass-rate number.
 
 - **Phase D′ — Serializable bytecode & code cache** (`serialize` feature)
   Lands alongside / right after D, while the bytecode format is still malleable.
-  The versioned, `mmap`-able artifact format (§2.2): export/reload, module-local
-  atom remapping, reset IC slots, integrity + version check, content-addressed
-  store, lazy per-function bodies, and the untrusted-load verifier. Read-only
-  bytecode shareable across many contexts. *Deliverable: `kataan compile
+  The versioned, `mmap`-able artifact format (§2.2): export/reload, host-native
+  encoding with the on-demand byte-swap conversion path, module-local atom
+  remapping, reset IC slots, integrity + version check, content-addressed store,
+  lazy per-function bodies, and the untrusted-load verifier. Read-only bytecode
+  shareable across many contexts. *Deliverable: `kataan compile
   app.js -o app.ktbc` and `kataan run app.ktbc`; the C `kt_compile` /
   `kt_load_bytecode` pair.* Validated against the hundreds-of-bases server
   scenario (load → run → evict → reload churn, cross-tenant dedup).
@@ -497,11 +530,12 @@ and (from D onward) reports a Test262 pass-rate number.
 - **Correctness**: Test262 pass-rate tracked in CI; target >95% of the
   language (non-Intl) suite by end of Phase E.
 - **Startup**: cold `kataan -e '...'` time competitive with `node -e`.
-- **Code-cache load**: loading a cached bytecode module is dramatically faster
-  than compiling from source (target: parse+compile skipped entirely, load
-  dominated by `mmap` + atom remap), and many contexts can share one resident
-  read-only module. Measured on the hundreds-of-bases load/evict/reload
-  workload.
+- **Code-cache load**: on a matching host, loading a cached bytecode module is
+  dramatically faster than compiling from source (target: parse+compile skipped
+  entirely, load dominated by `mmap` + atom remap), and many contexts can share
+  one resident read-only module. A cross-arch load pays the one-time byte-swap
+  conversion (measured separately, expected ≪ a recompile) and is zero-copy
+  thereafter. Measured on the hundreds-of-bases load/evict/reload workload.
 - **Throughput**: SunSpider/Kraken-style microbenchmarks and a small set of
   realistic scripts; interpreter within a small multiple of V8's interpreter by
   Phase E, JIT closing the gap through G/H.
