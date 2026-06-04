@@ -78,6 +78,19 @@ pub struct Obj<'a> {
     callable: RefCell<Option<Value<'a>>>,
     /// For `Promise` instances: the internal settlement state.
     promise: RefCell<Option<Rc<RefCell<super::promise::PromiseState<'a>>>>>,
+    /// For bytecode functions: the compiled module + chunk + captured values.
+    bytecode: RefCell<Option<Rc<BytecodeFn<'a>>>>,
+}
+
+/// A compiled (bytecode) function value: the module it lives in, the index of
+/// its chunk, and any values captured from enclosing scopes (upvalues).
+pub struct BytecodeFn<'a> {
+    /// The module containing this function's chunk (and any nested ones).
+    pub module: Rc<crate::bytecode::Module>,
+    /// The chunk index within the module.
+    pub chunk: u32,
+    /// Captured upvalue cells, addressed by capture index.
+    pub captures: Vec<Value<'a>>,
 }
 
 /// A getter/setter accessor property.
@@ -110,6 +123,7 @@ impl<'a> Obj<'a> {
             accessors: RefCell::new(Vec::new()),
             callable: RefCell::new(None),
             promise: RefCell::new(None),
+            bytecode: RefCell::new(None),
         })
     }
 
@@ -124,6 +138,7 @@ impl<'a> Obj<'a> {
             accessors: RefCell::new(Vec::new()),
             callable: RefCell::new(None),
             promise: RefCell::new(None),
+            bytecode: RefCell::new(None),
         })
     }
 
@@ -138,6 +153,7 @@ impl<'a> Obj<'a> {
             accessors: RefCell::new(Vec::new()),
             callable: RefCell::new(None),
             promise: RefCell::new(None),
+            bytecode: RefCell::new(None),
         })
     }
 
@@ -155,6 +171,7 @@ impl<'a> Obj<'a> {
             accessors: RefCell::new(Vec::new()),
             callable: RefCell::new(None),
             promise: RefCell::new(None),
+            bytecode: RefCell::new(None),
         })
     }
 
@@ -185,6 +202,17 @@ impl<'a> Obj<'a> {
     #[must_use]
     pub fn promise_state(&self) -> Option<Rc<RefCell<super::promise::PromiseState<'a>>>> {
         self.promise.borrow().clone()
+    }
+
+    /// Marks this object as a bytecode function.
+    pub fn set_bytecode_fn(&self, f: Rc<BytecodeFn<'a>>) {
+        *self.bytecode.borrow_mut() = Some(f);
+    }
+
+    /// The compiled function this object wraps, if it is a bytecode function.
+    #[must_use]
+    pub fn bytecode_fn(&self) -> Option<Rc<BytecodeFn<'a>>> {
+        self.bytecode.borrow().clone()
     }
 
     /// Defines (or extends) the getter for `key`.
@@ -427,6 +455,8 @@ impl<'a> Value<'a> {
             Value::Number(_) => "number",
             Value::Str(_) => "string",
             Value::Function(_) | Value::Native(_) | Value::Class(_) => "function",
+            // A bytecode function (or callable constructor object) is a function.
+            Value::Object(o) if o.bytecode_fn().is_some() || o.callable().is_some() => "function",
             Value::Object(_) => "object",
         }
     }
@@ -437,7 +467,7 @@ impl<'a> Value<'a> {
     pub fn is_callable(&self) -> bool {
         match self {
             Value::Function(_) | Value::Native(_) => true,
-            Value::Object(o) => o.callable().is_some(),
+            Value::Object(o) => o.callable().is_some() || o.bytecode_fn().is_some(),
             _ => false,
         }
     }

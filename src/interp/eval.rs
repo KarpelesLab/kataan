@@ -1501,6 +1501,11 @@ impl<'a> Interp<'a> {
     ) -> Completion<'a, Value<'a>> {
         match callee {
             Value::Native(n) => (n.call)(&args),
+            // A bytecode function: run its chunk through the VM.
+            Value::Object(o) if o.bytecode_fn().is_some() => {
+                let func = o.bytecode_fn().expect("bytecode fn");
+                self.call_bytecode_fn(&func, args)
+            }
             // A callable constructor object (`String`, `Number`, …) delegates
             // to its backing native.
             Value::Object(o) if o.callable().is_some() => {

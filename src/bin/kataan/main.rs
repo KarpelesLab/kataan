@@ -145,7 +145,6 @@ fn run_eval(source: &str, origin: &str) -> ExitCode {
 /// Compiles `source` to bytecode and prints its disassembly. Falls back with a
 /// message for constructs outside the bytecode compiler's current subset.
 fn run_disasm(source: &str, origin: &str) -> ExitCode {
-    use kataan::bytecode::Module;
     use kataan::interp::compile_program;
 
     let program = match Parser::parse_program(source) {
@@ -156,8 +155,8 @@ fn run_disasm(source: &str, origin: &str) -> ExitCode {
         }
     };
     match compile_program(&program.body) {
-        Ok(chunk) => {
-            print!("{}", Module::new(chunk).disassemble());
+        Ok(module) => {
+            print!("{}", module.disassemble());
             ExitCode::SUCCESS
         }
         Err(e) => {

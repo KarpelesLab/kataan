@@ -116,6 +116,56 @@ fn bytecode_vm_statements() {
 }
 
 #[test]
+fn bytecode_vm_functions() {
+    // Declaration, parameters, return.
+    assert_eq!(
+        eval_bc("function add(a, b) { return a + b; } add(3, 4)"),
+        "7"
+    );
+    // Recursion (the declaration is hoisted to a global).
+    assert_eq!(
+        eval_bc("function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); } fib(10)"),
+        "55"
+    );
+    // Local function called within a loop.
+    assert_eq!(
+        eval_bc(
+            "function sq(x) { return x * x; }
+             let total = 0; let i = 1;
+             while (i <= 4) { total += sq(i); i += 1; }
+             total"
+        ),
+        "30" // 1 + 4 + 9 + 16
+    );
+    // A function expression assigned to a local, then called.
+    assert_eq!(
+        eval_bc("let f = function (n) { return n * 10; }; f(5)"),
+        "50"
+    );
+    // An arrow with an expression body.
+    assert_eq!(eval_bc("let inc = x => x + 1; inc(inc(inc(0)))"), "3");
+    // A function may call another by name (mutual reference via globals).
+    assert_eq!(
+        eval_bc(
+            "function ev(n) { if (n === 0) return true; return od(n - 1); }
+             function od(n) { if (n === 0) return false; return ev(n - 1); }
+             ev(8)"
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn bytecode_vm_falls_back_on_captures() {
+    // A closure over an enclosing local is reported as unsupported, so a caller
+    // can fall back to the tree-walker.
+    let program =
+        Parser::parse_program("function outer() { let x = 1; return () => x; } outer()").unwrap();
+    let mut interp = Interp::new();
+    assert!(interp.eval_via_bytecode(&program.body).is_err());
+}
+
+#[test]
 fn arithmetic_and_precedence() {
     assert_eq!(eval("1 + 2 * 3"), "7");
     assert_eq!(eval("(1 + 2) * 3"), "9");

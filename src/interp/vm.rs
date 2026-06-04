@@ -1,13 +1,17 @@
-//! A register-machine interpreter for the [`crate::bytecode`] expression
-//! subset. It executes a [`Chunk`] against the [`Interp`]'s globals, reusing
+//! A register-machine interpreter for the [`crate::bytecode`] language subset.
+//!
+//! It executes a [`Module`]'s chunks against the [`Interp`]'s globals, reusing
 //! the tree-walker's value operations (`eval_binary`, `get_member`,
-//! `call_with_this`) so the two execution paths agree on semantics.
+//! `call_with_this`) so the two execution paths agree on semantics. Function
+//! calls recurse through `call_with_this`, so the Rust call stack mirrors the
+//! JS one (and bytecode/native/tree-walker callees interoperate).
 
 use super::Completion;
 use super::eval::Interp;
-use super::value::Value;
+use super::value::{BytecodeFn, Obj, Value};
 use crate::ast::BinaryOp;
-use crate::bytecode::{Chunk, Const, Op};
+use crate::bytecode::{Chunk, Const, Module, Op};
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -21,13 +25,36 @@ impl<'a> Interp<'a> {
         &mut self,
         body: &[crate::ast::Stmt],
     ) -> Result<Completion<'a, Value<'a>>, super::compiler::CompileError> {
-        let chunk = super::compiler::compile_program(body)?;
-        Ok(self.run_chunk(&chunk))
+        let module = Rc::new(super::compiler::compile_program(body)?);
+        Ok(self.run_chunk(&module, 0, Vec::new()))
     }
 
-    /// Executes `chunk` and returns the value it returns.
-    pub(super) fn run_chunk(&mut self, chunk: &Chunk) -> Completion<'a, Value<'a>> {
+    /// Calls a bytecode function value (dispatched from `call_with_this`).
+    pub(super) fn call_bytecode_fn(
+        &mut self,
+        func: &Rc<BytecodeFn<'a>>,
+        args: Vec<Value<'a>>,
+    ) -> Completion<'a, Value<'a>> {
+        self.run_chunk(&func.module, func.chunk, args)
+    }
+
+    /// Executes chunk `chunk_idx` of `module` with `args` bound to its leading
+    /// (parameter) registers, returning the value it returns.
+    fn run_chunk(
+        &mut self,
+        module: &Rc<Module>,
+        chunk_idx: u32,
+        args: Vec<Value<'a>>,
+    ) -> Completion<'a, Value<'a>> {
+        let chunk: &Chunk = &module.chunks[chunk_idx as usize];
         let mut regs: Vec<Value<'a>> = alloc::vec![Value::Undefined; chunk.register_count as usize];
+        // Bind arguments to the parameter registers (extras ignored, missing
+        // stay `undefined`).
+        for (i, arg) in args.into_iter().enumerate() {
+            if i < regs.len() {
+                regs[i] = arg;
+            }
+        }
         let mut pc = 0usize;
         loop {
             let op = &chunk.code[pc];
@@ -37,7 +64,9 @@ impl<'a> Interp<'a> {
                     regs[*dst as usize] = match &chunk.constants[*k as usize] {
                         Const::Number(n) => Value::Number(*n),
                         Const::Str(s) => Value::str(s.clone()),
-                        Const::Func(_) => Value::Undefined,
+                        // A function constant materializes a bytecode-function
+                        // value over the same module.
+                        Const::Func(idx) => Value::Object(make_bytecode_fn(module, *idx)),
                     };
                 }
                 Op::LoadUndefined { dst } => regs[*dst as usize] = Value::Undefined,
@@ -97,9 +126,7 @@ impl<'a> Interp<'a> {
                     regs[*dst as usize] = self.get_member(&obj, &key)?;
                 }
 
-                Op::Jump { offset } => {
-                    pc = apply_offset(pc, *offset);
-                }
+                Op::Jump { offset } => pc = apply_offset(pc, *offset),
                 Op::JumpIfFalse { cond, offset } => {
                     if !regs[*cond as usize].to_boolean() {
                         pc = apply_offset(pc, *offset);
@@ -127,7 +154,7 @@ impl<'a> Interp<'a> {
                 Op::Return { src } => return Ok(regs[*src as usize].clone()),
                 Op::ReturnUndefined => return Ok(Value::Undefined),
 
-                // Object/array construction is added with the statement compiler.
+                // Object/array construction is added with a later compiler slice.
                 Op::NewObject { .. }
                 | Op::NewArray { .. }
                 | Op::SetProp { .. }
@@ -155,6 +182,17 @@ impl<'a> Interp<'a> {
         regs[dst as usize] = self.eval_binary(op, l, r)?;
         Ok(())
     }
+}
+
+/// Builds a bytecode-function value (an object carrying the compiled function).
+fn make_bytecode_fn<'a>(module: &Rc<Module>, chunk: u32) -> Rc<Obj<'a>> {
+    let obj = Obj::object();
+    obj.set_bytecode_fn(Rc::new(BytecodeFn {
+        module: Rc::clone(module),
+        chunk,
+        captures: Vec::new(),
+    }));
+    obj
 }
 
 /// Reads a string constant from the pool.

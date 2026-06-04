@@ -1,19 +1,28 @@
-//! A small AST→bytecode compiler for the *expression* subset, plus a thin
-//! statement wrapper that returns the value of the final expression.
+//! The AST→bytecode compiler for the supported language subset.
 //!
-//! This is the first slice of the Phase-D pipeline: it lowers an [`Expr`] to a
-//! [`Chunk`] of register bytecode that [`super::vm`] then executes, reusing the
-//! interpreter's value semantics (so the bytecode path stays consistent with
-//! the tree-walker). Constructs outside the supported subset return
-//! [`CompileError::Unsupported`] so the caller can fall back to the tree-walker.
+//! Lowers a program to a [`Module`] of register-bytecode [`Chunk`]s that
+//! [`super::vm`] executes, reusing the interpreter's value semantics so the
+//! bytecode path stays consistent with the tree-walker. Constructs outside the
+//! subset return [`CompileError`] so the caller can fall back to the
+//! tree-walker.
+//!
+//! Supported: literals, globals + block-scoped locals, the arithmetic /
+//! comparison binary ops, unary `-`/`!`, `&&`/`||`, member/index access, calls,
+//! assignment (incl. arithmetic compound forms), `if`/`else`, `while`, blocks,
+//! `return`, and **functions** — declarations (hoisted) and function/arrow
+//! expressions with positional parameters. A function that captures a variable
+//! from an enclosing function (an upvalue) is reported as unsupported for now.
 
-use crate::ast::{AssignOp, BinaryOp, BindingTarget, Expr, LogicalOp, Stmt, UnaryOp};
-use crate::bytecode::{Chunk, Const, Op, Reg};
+use crate::ast::{
+    Arrow, ArrowBody, AssignOp, BinaryOp, BindingTarget, Expr, Function, LogicalOp, Param,
+    PropertyKey, Stmt, UnaryOp,
+};
+use crate::bytecode::{Chunk, Const, ConstIdx, Module, Op, Reg};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// A reason the expression could not be compiled (yet).
+/// A reason a program could not be compiled to bytecode (yet).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileError {
     /// What was unsupported.
@@ -28,59 +37,139 @@ impl CompileError {
     }
 }
 
-/// Compiles a program (the supported statement subset) into a chunk whose
-/// returned value is that of the final expression statement (REPL-style).
-pub fn compile_program(body: &[Stmt]) -> Result<Chunk, CompileError> {
+/// Compiles a program to a module whose entry chunk (#0) returns the value of
+/// the final expression statement (REPL-style).
+pub fn compile_program(body: &[Stmt]) -> Result<Module, CompileError> {
     let mut c = Compiler {
-        chunk: Chunk::new("<main>"),
-        next_reg: 0,
-        locals: Vec::new(),
+        module: alloc::vec![Chunk::new("<main>")],
+        funcs: alloc::vec![FnState::new(0, Vec::new())],
     };
-    let mut last: Option<Reg> = None;
-    for stmt in body {
-        if let Some(reg) = c.stmt(stmt)? {
-            last = Some(reg);
+    c.compile_body(body, true)?;
+    let main = c.funcs.pop().expect("entry function state");
+    c.module[0].register_count = main.next_reg;
+    Ok(Module { chunks: c.module })
+}
+
+/// Per-function compilation state.
+struct FnState {
+    chunk_idx: usize,
+    next_reg: Reg,
+    /// In-scope locals → backing register (innermost last; shadowing wins).
+    locals: Vec<(String, Reg)>,
+    /// Names visible from enclosing functions, to detect (unsupported) captures.
+    enclosing: Vec<String>,
+}
+
+impl FnState {
+    fn new(chunk_idx: usize, enclosing: Vec<String>) -> Self {
+        Self {
+            chunk_idx,
+            next_reg: 0,
+            locals: Vec::new(),
+            enclosing,
         }
     }
-    match last {
-        Some(reg) => c.chunk.emit(Op::Return { src: reg }),
-        None => c.chunk.emit(Op::ReturnUndefined),
-    };
-    c.chunk.register_count = c.next_reg;
-    Ok(c.chunk)
 }
 
 struct Compiler {
-    chunk: Chunk,
-    next_reg: Reg,
-    /// In-scope local variables mapped to their backing register (innermost
-    /// last; shadowing resolves to the latest entry).
-    locals: Vec<(String, Reg)>,
+    module: Vec<Chunk>,
+    /// Function-compilation stack; the last entry is the current function.
+    funcs: Vec<FnState>,
 }
 
 impl Compiler {
-    /// Allocates a fresh register.
+    // --- current-function accessors ------------------------------------
+
+    fn ci(&self) -> usize {
+        self.funcs.last().expect("a current function").chunk_idx
+    }
+    fn emit(&mut self, op: Op) -> usize {
+        let i = self.ci();
+        self.module[i].emit(op)
+    }
+    fn add_const(&mut self, c: Const) -> ConstIdx {
+        let i = self.ci();
+        self.module[i].add_constant(c)
+    }
+    fn code_len(&self) -> usize {
+        self.module[self.ci()].code.len()
+    }
     fn reg(&mut self) -> Reg {
-        let r = self.next_reg;
-        self.next_reg += 1;
+        let f = self.funcs.last_mut().expect("a current function");
+        let r = f.next_reg;
+        f.next_reg += 1;
         r
     }
-
-    /// The register backing local `name`, if it is in scope.
     fn resolve(&self, name: &str) -> Option<Reg> {
-        self.locals
+        self.funcs
+            .last()
+            .expect("a current function")
+            .locals
             .iter()
             .rev()
             .find(|(n, _)| n == name)
             .map(|(_, r)| *r)
     }
+    fn declare_local(&mut self, name: String, reg: Reg) {
+        self.funcs
+            .last_mut()
+            .expect("a current function")
+            .locals
+            .push((name, reg));
+    }
+    /// Whether `name` is a local of an enclosing function (an upvalue capture).
+    fn is_capture(&self, name: &str) -> bool {
+        self.funcs
+            .last()
+            .expect("a current function")
+            .enclosing
+            .iter()
+            .any(|n| n == name)
+    }
 
-    /// Compiles a statement, returning the value register for an expression
-    /// statement (so the program's completion value can be tracked).
+    // --- statements -----------------------------------------------------
+
+    /// Compiles a statement list. With `return_last`, the value of the final
+    /// expression statement is returned; otherwise the chunk falls off the end.
+    fn compile_body(&mut self, body: &[Stmt], return_last: bool) -> Result<(), CompileError> {
+        for stmt in body {
+            if let Stmt::Function(func) = stmt {
+                self.compile_function_decl(func)?;
+            }
+        }
+        let mut last: Option<Reg> = None;
+        for stmt in body {
+            if matches!(stmt, Stmt::Function(_)) {
+                continue;
+            }
+            last = self.stmt(stmt)?;
+        }
+        if return_last {
+            match last {
+                Some(reg) => self.emit(Op::Return { src: reg }),
+                None => self.emit(Op::ReturnUndefined),
+            };
+        }
+        Ok(())
+    }
+
     fn stmt(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
         match stmt {
             Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
             Stmt::Empty { .. } => Ok(None),
+            Stmt::Function(_) => Ok(None),
+            Stmt::Return { argument, .. } => {
+                let src = match argument {
+                    Some(e) => self.expr(e)?,
+                    None => {
+                        let r = self.reg();
+                        self.emit(Op::LoadUndefined { dst: r });
+                        r
+                    }
+                };
+                self.emit(Op::Return { src });
+                Ok(None)
+            }
             Stmt::Var(decl) => {
                 for d in &decl.declarations {
                     let BindingTarget::Ident(id) = &d.target else {
@@ -90,27 +179,32 @@ impl Compiler {
                         Some(init) => self.expr(init)?,
                         None => {
                             let r = self.reg();
-                            self.chunk.emit(Op::LoadUndefined { dst: r });
+                            self.emit(Op::LoadUndefined { dst: r });
                             r
                         }
                     };
-                    // Give the variable its own register, copying the init value
-                    // in (so later reuse of `value` cannot clobber it).
                     let slot = self.reg();
-                    self.chunk.emit(Op::Move {
+                    self.emit(Op::Move {
                         dst: slot,
                         src: value,
                     });
-                    self.locals.push((id.name.clone().into_string(), slot));
+                    self.declare_local(id.name.clone().into_string(), slot);
                 }
                 Ok(None)
             }
             Stmt::Block { body, .. } => {
-                let mark = self.locals.len();
+                let mark = self.funcs.last().expect("fn").locals.len();
                 for s in body {
-                    self.stmt(s)?;
+                    if let Stmt::Function(f) = s {
+                        self.compile_function_decl(f)?;
+                    }
                 }
-                self.locals.truncate(mark);
+                for s in body {
+                    if !matches!(s, Stmt::Function(_)) {
+                        self.stmt(s)?;
+                    }
+                }
+                self.funcs.last_mut().expect("fn").locals.truncate(mark);
                 Ok(None)
             }
             Stmt::If {
@@ -120,10 +214,10 @@ impl Compiler {
                 ..
             } => {
                 let cond = self.expr(test)?;
-                let jf = self.chunk.emit(Op::JumpIfFalse { cond, offset: 0 });
+                let jf = self.emit(Op::JumpIfFalse { cond, offset: 0 });
                 self.stmt(consequent)?;
                 if let Some(alt) = alternate {
-                    let jmp = self.chunk.emit(Op::Jump { offset: 0 });
+                    let jmp = self.emit(Op::Jump { offset: 0 });
                     self.patch_to_here(jf);
                     self.stmt(alt)?;
                     self.patch_to_here(jmp);
@@ -133,11 +227,11 @@ impl Compiler {
                 Ok(None)
             }
             Stmt::While { test, body, .. } => {
-                let top = self.chunk.code.len();
+                let top = self.code_len();
                 let cond = self.expr(test)?;
-                let jf = self.chunk.emit(Op::JumpIfFalse { cond, offset: 0 });
+                let jf = self.emit(Op::JumpIfFalse { cond, offset: 0 });
                 self.stmt(body)?;
-                let back = self.chunk.emit(Op::Jump { offset: 0 });
+                let back = self.emit(Op::Jump { offset: 0 });
                 self.patch_jump(back, top);
                 self.patch_to_here(jf);
                 Ok(None)
@@ -146,17 +240,76 @@ impl Compiler {
         }
     }
 
-    /// Patches a previously-emitted jump at `idx` to target the current end of
-    /// code.
+    /// Compiles a function declaration and binds it as a global.
+    fn compile_function_decl(&mut self, func: &Function) -> Result<(), CompileError> {
+        let Some(id) = &func.id else {
+            return Err(CompileError::unsupported("anonymous function declaration"));
+        };
+        let chunk_idx = self.compile_function(&func.params, FnBody::Block(&func.body), &id.name)?;
+        let dst = self.reg();
+        let k = self.add_const(Const::Func(chunk_idx as u32));
+        self.emit(Op::LoadConst { dst, k });
+        let name = self.add_const(Const::Str(id.name.clone().into_string()));
+        self.emit(Op::SetGlobal { name, src: dst });
+        Ok(())
+    }
+
+    /// Compiles a function body into a new chunk; returns the chunk index.
+    fn compile_function(
+        &mut self,
+        params: &[Param],
+        body: FnBody,
+        name: &str,
+    ) -> Result<usize, CompileError> {
+        let mut param_names = Vec::new();
+        for p in params {
+            match &p.target {
+                BindingTarget::Ident(id) if p.default.is_none() && !p.rest => {
+                    param_names.push(id.name.clone().into_string());
+                }
+                _ => return Err(CompileError::unsupported("parameter pattern/default/rest")),
+            }
+        }
+
+        let outer = self.funcs.last().expect("fn");
+        let mut enclosing = outer.enclosing.clone();
+        enclosing.extend(outer.locals.iter().map(|(n, _)| n.clone()));
+
+        let chunk_idx = self.module.len();
+        self.module.push(Chunk::new(name));
+        self.module[chunk_idx].param_count = param_names.len() as u16;
+
+        let mut state = FnState::new(chunk_idx, enclosing);
+        for pname in &param_names {
+            let r = state.next_reg;
+            state.next_reg += 1;
+            state.locals.push((pname.clone(), r));
+        }
+        self.funcs.push(state);
+
+        match body {
+            FnBody::Block(stmts) => self.compile_body(stmts, false)?,
+            FnBody::Expr(expr) => {
+                let r = self.expr(expr)?;
+                self.emit(Op::Return { src: r });
+            }
+        }
+        self.emit(Op::ReturnUndefined);
+
+        let finished = self.funcs.pop().expect("fn");
+        self.module[chunk_idx].register_count = finished.next_reg;
+        Ok(chunk_idx)
+    }
+
     fn patch_to_here(&mut self, idx: usize) {
-        let target = self.chunk.code.len();
+        let target = self.code_len();
         self.patch_jump(idx, target);
     }
 
-    /// Patches the jump at `idx` to target instruction `target`.
     fn patch_jump(&mut self, idx: usize, target: usize) {
         let offset = (target as i64 - (idx as i64 + 1)) as i32;
-        self.chunk.code[idx] = match &self.chunk.code[idx] {
+        let ci = self.ci();
+        self.module[ci].code[idx] = match &self.module[ci].code[idx] {
             Op::Jump { .. } => Op::Jump { offset },
             Op::JumpIfFalse { cond, .. } => Op::JumpIfFalse {
                 cond: *cond,
@@ -170,63 +323,43 @@ impl Compiler {
         };
     }
 
-    /// Compiles `expr`, leaving its value in the returned register.
+    // --- expressions ----------------------------------------------------
+
     fn expr(&mut self, expr: &Expr) -> Result<Reg, CompileError> {
         match expr {
             Expr::Number { value, .. } => {
                 let dst = self.reg();
-                // Small integers use the compact immediate form.
                 if value.fract() == 0.0
                     && *value >= f64::from(i32::MIN)
                     && *value <= f64::from(i32::MAX)
                 {
-                    self.chunk.emit(Op::LoadInt {
+                    self.emit(Op::LoadInt {
                         dst,
                         value: *value as i32,
                     });
                 } else {
-                    let k = self.chunk.add_constant(Const::Number(*value));
-                    self.chunk.emit(Op::LoadConst { dst, k });
+                    let k = self.add_const(Const::Number(*value));
+                    self.emit(Op::LoadConst { dst, k });
                 }
                 Ok(dst)
             }
             Expr::Str { value, .. } => {
                 let dst = self.reg();
-                let k = self
-                    .chunk
-                    .add_constant(Const::Str(value.clone().into_string()));
-                self.chunk.emit(Op::LoadConst { dst, k });
+                let k = self.add_const(Const::Str(value.clone().into_string()));
+                self.emit(Op::LoadConst { dst, k });
                 Ok(dst)
             }
             Expr::Bool { value, .. } => {
                 let dst = self.reg();
-                self.chunk.emit(Op::LoadBool { dst, value: *value });
+                self.emit(Op::LoadBool { dst, value: *value });
                 Ok(dst)
             }
             Expr::Null(_) => {
                 let dst = self.reg();
-                self.chunk.emit(Op::LoadNull { dst });
+                self.emit(Op::LoadNull { dst });
                 Ok(dst)
             }
-            Expr::Ident(id) => {
-                if id.name.as_ref() == "undefined" {
-                    let dst = self.reg();
-                    self.chunk.emit(Op::LoadUndefined { dst });
-                    return Ok(dst);
-                }
-                // A local: copy its register so later writes can't clobber it.
-                if let Some(slot) = self.resolve(&id.name) {
-                    let dst = self.reg();
-                    self.chunk.emit(Op::Move { dst, src: slot });
-                    return Ok(dst);
-                }
-                let dst = self.reg();
-                let name = self
-                    .chunk
-                    .add_constant(Const::Str(id.name.clone().into_string()));
-                self.chunk.emit(Op::GetGlobal { dst, name });
-                Ok(dst)
-            }
+            Expr::Ident(id) => self.read_ident(&id.name),
             Expr::Assign {
                 op, target, value, ..
             } => self.assign(*op, target, value),
@@ -259,31 +392,63 @@ impl Compiler {
                 }
                 self.call(callee, arguments)
             }
+            Expr::Function(func) => {
+                let idx = self.compile_function(
+                    &func.params,
+                    FnBody::Block(&func.body),
+                    func.id.as_ref().map_or("<anonymous>", |id| &id.name),
+                )?;
+                let dst = self.reg();
+                let k = self.add_const(Const::Func(idx as u32));
+                self.emit(Op::LoadConst { dst, k });
+                Ok(dst)
+            }
+            Expr::Arrow(arrow) => self.arrow(arrow),
             _ => Err(CompileError::unsupported("expression")),
         }
     }
 
-    fn unary(&mut self, op: UnaryOp, argument: &Expr) -> Result<Reg, CompileError> {
-        let src = self.expr(argument)?;
-        let dst = self.reg();
-        match op {
-            UnaryOp::Minus => self.chunk.emit(Op::Neg { dst, src }),
-            UnaryOp::Not => self.chunk.emit(Op::Not { dst, src }),
-            _ => return Err(CompileError::unsupported("unary operator")),
+    fn arrow(&mut self, arrow: &Arrow) -> Result<Reg, CompileError> {
+        let body = match &arrow.body {
+            ArrowBody::Expr(e) => FnBody::Expr(e),
+            ArrowBody::Block(b) => FnBody::Block(b),
         };
+        let idx = self.compile_function(&arrow.params, body, "<arrow>")?;
+        let dst = self.reg();
+        let k = self.add_const(Const::Func(idx as u32));
+        self.emit(Op::LoadConst { dst, k });
         Ok(dst)
     }
 
-    /// Compiles an assignment `target OP= value`, leaving the assigned value in
-    /// the returned register. Only simple identifier targets are supported.
+    /// Reads `name` (local copy, or global) into a fresh register; a reference
+    /// to an enclosing function's local is an unsupported capture.
+    fn read_ident(&mut self, name: &str) -> Result<Reg, CompileError> {
+        if name == "undefined" {
+            let dst = self.reg();
+            self.emit(Op::LoadUndefined { dst });
+            return Ok(dst);
+        }
+        if let Some(slot) = self.resolve(name) {
+            let dst = self.reg();
+            self.emit(Op::Move { dst, src: slot });
+            return Ok(dst);
+        }
+        if self.is_capture(name) {
+            return Err(CompileError::unsupported("captured (closure) variable"));
+        }
+        let dst = self.reg();
+        let k = self.add_const(Const::Str(name.into()));
+        self.emit(Op::GetGlobal { dst, name: k });
+        Ok(dst)
+    }
+
     fn assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> Result<Reg, CompileError> {
         let Expr::Ident(id) = target else {
             return Err(CompileError::unsupported("assignment target"));
         };
-        // Compute the right-hand side (folding the binary op for `+=` etc.).
         let rhs = self.expr(value)?;
         let result = match compound_binop(op) {
-            None => rhs, // plain `=`
+            None => rhs,
             Some(binop) => {
                 let cur = self.read_ident(&id.name)?;
                 let dst = self.reg();
@@ -291,33 +456,29 @@ impl Compiler {
                 dst
             }
         };
-        // Store into the local register or the global binding.
         if let Some(slot) = self.resolve(&id.name) {
-            self.chunk.emit(Op::Move {
+            self.emit(Op::Move {
                 dst: slot,
                 src: result,
             });
+        } else if self.is_capture(&id.name) {
+            return Err(CompileError::unsupported("captured (closure) variable"));
         } else {
-            let name = self
-                .chunk
-                .add_constant(Const::Str(id.name.clone().into_string()));
-            self.chunk.emit(Op::SetGlobal { name, src: result });
+            let name = self.add_const(Const::Str(id.name.clone().into_string()));
+            self.emit(Op::SetGlobal { name, src: result });
         }
         Ok(result)
     }
 
-    /// Reads `name` (local copy or global) into a fresh register.
-    fn read_ident(&mut self, name: &str) -> Result<Reg, CompileError> {
-        if let Some(slot) = self.resolve(name) {
-            let dst = self.reg();
-            self.chunk.emit(Op::Move { dst, src: slot });
-            Ok(dst)
-        } else {
-            let dst = self.reg();
-            let k = self.chunk.add_constant(Const::Str(name.into()));
-            self.chunk.emit(Op::GetGlobal { dst, name: k });
-            Ok(dst)
-        }
+    fn unary(&mut self, op: UnaryOp, argument: &Expr) -> Result<Reg, CompileError> {
+        let src = self.expr(argument)?;
+        let dst = self.reg();
+        match op {
+            UnaryOp::Minus => self.emit(Op::Neg { dst, src }),
+            UnaryOp::Not => self.emit(Op::Not { dst, src }),
+            _ => return Err(CompileError::unsupported("unary operator")),
+        };
+        Ok(dst)
     }
 
     fn binary(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> Result<Reg, CompileError> {
@@ -328,7 +489,6 @@ impl Compiler {
         Ok(dst)
     }
 
-    /// Emits a single binary-op instruction for two existing registers.
     fn emit_binop(&mut self, op: BinaryOp, dst: Reg, a: Reg, b: Reg) -> Result<(), CompileError> {
         let inst = match op {
             BinaryOp::Add => Op::Add { dst, a, b },
@@ -345,66 +505,50 @@ impl Compiler {
             BinaryOp::GtEq => Op::Ge { dst, a, b },
             _ => return Err(CompileError::unsupported("binary operator")),
         };
-        self.chunk.emit(inst);
+        self.emit(inst);
         Ok(())
     }
 
     fn logical(&mut self, op: LogicalOp, left: &Expr, right: &Expr) -> Result<Reg, CompileError> {
-        // Evaluate `left` into `dst`; short-circuit over `right` based on the op.
         let dst = self.reg();
         let l = self.expr(left)?;
-        self.chunk.emit(Op::Move { dst, src: l });
-        // Reserve the conditional jump; patch its offset after compiling `right`.
+        self.emit(Op::Move { dst, src: l });
         let jump_idx = match op {
-            LogicalOp::And => self.chunk.emit(Op::JumpIfFalse {
+            LogicalOp::And => self.emit(Op::JumpIfFalse {
                 cond: dst,
                 offset: 0,
             }),
-            LogicalOp::Or => self.chunk.emit(Op::JumpIfTrue {
+            LogicalOp::Or => self.emit(Op::JumpIfTrue {
                 cond: dst,
                 offset: 0,
             }),
             LogicalOp::Nullish => return Err(CompileError::unsupported("`??` operator")),
         };
         let r = self.expr(right)?;
-        self.chunk.emit(Op::Move { dst, src: r });
-        // Offset is relative to the instruction *after* the jump.
-        let target = self.chunk.code.len();
-        let offset = (target as i64 - (jump_idx as i64 + 1)) as i32;
-        self.chunk.code[jump_idx] = match op {
-            LogicalOp::And => Op::JumpIfFalse { cond: dst, offset },
-            LogicalOp::Or => Op::JumpIfTrue { cond: dst, offset },
-            LogicalOp::Nullish => unreachable!(),
-        };
+        self.emit(Op::Move { dst, src: r });
+        self.patch_to_here(jump_idx);
         Ok(dst)
     }
 
-    fn member(
-        &mut self,
-        object: &Expr,
-        property: &crate::ast::PropertyKey,
-    ) -> Result<Reg, CompileError> {
-        use crate::ast::PropertyKey;
+    fn member(&mut self, object: &Expr, property: &PropertyKey) -> Result<Reg, CompileError> {
         let obj = self.expr(object)?;
         match property {
             PropertyKey::Ident(name) => {
                 let dst = self.reg();
-                let key = self
-                    .chunk
-                    .add_constant(Const::Str(name.clone().into_string()));
-                self.chunk.emit(Op::GetProp { dst, obj, key });
+                let key = self.add_const(Const::Str(name.clone().into_string()));
+                self.emit(Op::GetProp { dst, obj, key });
                 Ok(dst)
             }
             PropertyKey::Str(s) => {
                 let dst = self.reg();
-                let key = self.chunk.add_constant(Const::Str(s.clone().into_string()));
-                self.chunk.emit(Op::GetProp { dst, obj, key });
+                let key = self.add_const(Const::Str(s.clone().into_string()));
+                self.emit(Op::GetProp { dst, obj, key });
                 Ok(dst)
             }
             PropertyKey::Computed(expr) => {
                 let index = self.expr(expr)?;
                 let dst = self.reg();
-                self.chunk.emit(Op::GetElem { dst, obj, index });
+                self.emit(Op::GetElem { dst, obj, index });
                 Ok(dst)
             }
             _ => Err(CompileError::unsupported("member key")),
@@ -418,22 +562,20 @@ impl Compiler {
     ) -> Result<Reg, CompileError> {
         use crate::ast::Argument;
         let callee_reg = self.expr(callee)?;
-        // Compile each argument first (each may use scratch registers), then
-        // copy the results into a fresh contiguous window the `Call` expects.
-        let mut arg_regs = alloc::vec::Vec::new();
+        let mut arg_regs = Vec::new();
         for arg in arguments {
             match arg {
                 Argument::Item(e) => arg_regs.push(self.expr(e)?),
                 Argument::Spread(_) => return Err(CompileError::unsupported("spread argument")),
             }
         }
-        let args_base = self.next_reg;
+        let args_base = self.funcs.last().expect("fn").next_reg;
         for &src in &arg_regs {
             let slot = self.reg();
-            self.chunk.emit(Op::Move { dst: slot, src });
+            self.emit(Op::Move { dst: slot, src });
         }
         let dst = self.reg();
-        self.chunk.emit(Op::Call {
+        self.emit(Op::Call {
             dst,
             callee: callee_reg,
             args_base,
@@ -443,8 +585,13 @@ impl Compiler {
     }
 }
 
-/// Maps a compound assignment operator to its underlying binary op; `=` returns
-/// `None`. Bitwise/logical compound forms are not yet lowered.
+/// A function body source: a block of statements or a single expression (arrow).
+enum FnBody<'b> {
+    Block(&'b [Stmt]),
+    Expr(&'b Expr),
+}
+
+/// Maps a compound assignment operator to its binary op; `=` returns `None`.
 fn compound_binop(op: AssignOp) -> Option<BinaryOp> {
     match op {
         AssignOp::Assign => None,
