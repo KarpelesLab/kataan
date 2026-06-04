@@ -39,6 +39,7 @@ pub mod bytecode;
 pub mod common;
 pub mod error;
 pub mod lexer;
+pub mod nanbox;
 pub mod parser;
 
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
