@@ -341,6 +341,27 @@ fn bytecode_vm_destructuring() {
         eval_bc("function pair() { return [10, 20]; } let [a, b] = pair(); a + b"),
         "30"
     );
+    // Parameter defaults and destructuring.
+    assert_eq!(
+        eval_bc("function f(a, b = 10) { return a + b; } f(5)"),
+        "15"
+    );
+    assert_eq!(
+        eval_bc("function f(a, b = 10) { return a + b; } f(5, 20)"),
+        "25"
+    );
+    assert_eq!(
+        eval_bc("let dist = ([x1, y1], [x2, y2]) => (x2-x1) + (y2-y1); dist([0, 0], [3, 4])"),
+        "7"
+    );
+    assert_eq!(
+        eval_bc("function area({ w, h }) { return w * h; } area({ w: 4, h: 5 })"),
+        "20"
+    );
+    assert_eq!(
+        eval_bc("function greet({ name = 'world' } = {}) { return 'hi ' + name; } greet({})"),
+        "hi world"
+    );
 }
 
 #[test]

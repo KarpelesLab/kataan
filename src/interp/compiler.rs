@@ -793,14 +793,9 @@ impl Compiler {
         body: FnBody,
         name: &str,
     ) -> Result<usize, CompileError> {
-        let mut param_names = Vec::new();
-        for p in params {
-            match &p.target {
-                BindingTarget::Ident(id) if p.default.is_none() && !p.rest => {
-                    param_names.push(id.name.clone().into_string());
-                }
-                _ => return Err(CompileError::unsupported("parameter pattern/default/rest")),
-            }
+        // Rest parameters (variadic) aren't supported yet.
+        if params.iter().any(|p| p.rest) {
+            return Err(CompileError::unsupported("rest parameter"));
         }
 
         let outer = self.funcs.last().expect("fn");
@@ -809,15 +804,29 @@ impl Compiler {
 
         let chunk_idx = self.module.len();
         self.module.push(Chunk::new(name));
-        self.module[chunk_idx].param_count = param_names.len() as u16;
+        self.module[chunk_idx].param_count = params.len() as u16;
 
         let mut state = FnState::new(chunk_idx, enclosing);
-        for pname in &param_names {
+        // Reserve a positional register per parameter (the VM binds args here).
+        let mut param_slots = Vec::new();
+        for _ in params {
             let r = state.next_reg;
             state.next_reg += 1;
-            state.locals.push((pname.clone(), r));
+            param_slots.push(r);
         }
         self.funcs.push(state);
+
+        // Bind each parameter: a plain identifier maps to its slot directly;
+        // defaults and destructuring patterns are lowered like declarations.
+        for (p, slot) in params.iter().zip(param_slots) {
+            let bound = self.apply_default(slot, p.default.as_ref())?;
+            match &p.target {
+                BindingTarget::Ident(id) if p.default.is_none() => {
+                    self.declare_local(id.name.clone().into_string(), slot);
+                }
+                _ => self.bind_pattern(&p.target, bound)?,
+            }
+        }
 
         match body {
             FnBody::Block(stmts) => self.compile_body(stmts, false)?,
