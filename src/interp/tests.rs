@@ -317,6 +317,60 @@ fn bytecode_vm_for_of() {
 }
 
 #[test]
+fn bytecode_vm_accessors() {
+    // Object-literal getter.
+    assert_eq!(
+        eval_bc("let o = { a: 3, get double() { return this.a * 2; } }; o.double"),
+        "6"
+    );
+    // Object-literal getter + setter.
+    assert_eq!(
+        eval_bc(
+            "let o = { _v: 0, get v() { return this._v; }, set v(x) { this._v = x + 1; } };
+             o.v = 41; o.v"
+        ),
+        "42"
+    );
+    // Class getter computed from a field.
+    assert_eq!(
+        eval_bc(
+            "class Circle {
+               constructor(r) { this.r = r; }
+               get area() { return Math.round(this.r * this.r * 3.14); }
+             }
+             new Circle(2).area"
+        ),
+        "13"
+    );
+    // Class getter + setter pair.
+    assert_eq!(
+        eval_bc(
+            "class Box {
+               constructor() { this._w = 1; }
+               get width() { return this._w; }
+               set width(x) { this._w = x < 0 ? 0 : x; }
+             }
+             let b = new Box(); b.width = -5; let neg = b.width; b.width = 9; neg + ',' + b.width"
+        ),
+        "0,9"
+    );
+    // A static getter.
+    assert_eq!(
+        eval_bc("class Config { static get version() { return 3; } } Config.version"),
+        "3"
+    );
+    // An inherited getter.
+    assert_eq!(
+        eval_bc(
+            "class Base { get kind() { return 'base'; } }
+             class Sub extends Base {}
+             new Sub().kind"
+        ),
+        "base"
+    );
+}
+
+#[test]
 fn bytecode_vm_classes() {
     // Constructor + instance methods + `this`.
     assert_eq!(

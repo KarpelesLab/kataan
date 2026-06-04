@@ -232,12 +232,12 @@ impl<'a> Interp<'a> {
                     Op::GetProp { dst, obj, key } => {
                         let k = const_str(chunk, *key);
                         let obj = regs[*obj as usize].clone();
-                        regs[*dst as usize] = self.get_member(&obj, &k)?;
+                        regs[*dst as usize] = self.get_property(&obj, &k)?;
                     }
                     Op::GetElem { dst, obj, index } => {
                         let obj = regs[*obj as usize].clone();
                         let key = regs[*index as usize].to_js_string();
-                        regs[*dst as usize] = self.get_member(&obj, &key)?;
+                        regs[*dst as usize] = self.get_property(&obj, &key)?;
                     }
 
                     Op::Jump { offset } => pc = apply_offset(pc, *offset),
@@ -313,13 +313,13 @@ impl<'a> Interp<'a> {
                         let k = const_str(chunk, *key);
                         let target = regs[*obj as usize].clone();
                         let value = regs[*src as usize].clone();
-                        self.set_member(&target, &k, value)?;
+                        self.set_property(&target, &k, value)?;
                     }
                     Op::SetElem { obj, index, src } => {
                         let target = regs[*obj as usize].clone();
                         let key = regs[*index as usize].to_js_string();
                         let value = regs[*src as usize].clone();
-                        self.set_member(&target, &key, value)?;
+                        self.set_property(&target, &key, value)?;
                     }
                 }
                 Ok(None)

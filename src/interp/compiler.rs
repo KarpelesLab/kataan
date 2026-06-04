@@ -1112,23 +1112,33 @@ impl Compiler {
         let mut static_methods: Vec<(String, &Function)> = Vec::new();
         let mut instance_fields: Vec<(String, Option<&Expr>)> = Vec::new();
         let mut static_fields: Vec<(String, Option<&Expr>)> = Vec::new();
+        // Accessors: (name, is_getter, function).
+        let mut instance_accessors: Vec<(String, bool, &Function)> = Vec::new();
+        let mut static_accessors: Vec<(String, bool, &Function)> = Vec::new();
         for member in &class.body {
             match member {
                 ClassMember::Method(m) => {
                     if m.value.is_generator || m.value.is_async {
                         return Err(CompileError::unsupported("generator/async method"));
                     }
-                    if !matches!(m.kind, MethodKind::Method | MethodKind::Constructor) {
-                        return Err(CompileError::unsupported("class accessor"));
-                    }
-                    if matches!(m.kind, MethodKind::Constructor) {
-                        ctor = Some(&m.value);
-                    } else {
-                        let name = simple_key(&m.key)?;
-                        if m.is_static {
-                            static_methods.push((name, &m.value));
-                        } else {
-                            instance_methods.push((name, &m.value));
+                    match m.kind {
+                        MethodKind::Constructor => ctor = Some(&m.value),
+                        MethodKind::Method => {
+                            let name = simple_key(&m.key)?;
+                            if m.is_static {
+                                static_methods.push((name, &m.value));
+                            } else {
+                                instance_methods.push((name, &m.value));
+                            }
+                        }
+                        MethodKind::Get | MethodKind::Set => {
+                            let name = simple_key(&m.key)?;
+                            let is_getter = matches!(m.kind, MethodKind::Get);
+                            if m.is_static {
+                                static_accessors.push((name, is_getter, &m.value));
+                            } else {
+                                instance_accessors.push((name, is_getter, &m.value));
+                            }
                         }
                     }
                 }
@@ -1192,6 +1202,12 @@ impl Compiler {
             self.emit_set_prototype_of(ctor_reg, super_val2);
         }
 
+        // Instance getters/setters go on the prototype.
+        for (name, is_getter, func) in instance_accessors {
+            let f = self.class_method_value(func)?;
+            self.emit_define_accessor(proto, &name, is_getter, f);
+        }
+
         // Static methods and fields live on the constructor object itself.
         for (name, func) in static_methods {
             let m = self.class_method_value(func)?;
@@ -1201,6 +1217,10 @@ impl Compiler {
                 key,
                 src: m,
             });
+        }
+        for (name, is_getter, func) in static_accessors {
+            let f = self.class_method_value(func)?;
+            self.emit_define_accessor(ctor_reg, &name, is_getter, f);
         }
         for (name, init) in static_fields {
             let val = match init {
@@ -1225,6 +1245,67 @@ impl Compiler {
             .locals
             .truncate(super_mark);
         Ok(ctor_reg)
+    }
+
+    /// Installs an accessor on `obj`: `Object.defineProperty(obj, name,
+    /// { get|set: func, enumerable: true, configurable: true })`.
+    fn emit_define_accessor(&mut self, obj: Reg, name: &str, is_getter: bool, func: Reg) {
+        // Build the descriptor object.
+        let desc = self.reg();
+        self.emit(Op::NewObject { dst: desc });
+        let accessor_key = self.add_const(Const::Str(String::from(if is_getter {
+            "get"
+        } else {
+            "set"
+        })));
+        self.emit(Op::SetProp {
+            obj: desc,
+            key: accessor_key,
+            src: func,
+        });
+        for flag in ["enumerable", "configurable"] {
+            let t = self.reg();
+            self.emit(Op::LoadBool {
+                dst: t,
+                value: true,
+            });
+            let fk = self.add_const(Const::Str(String::from(flag)));
+            self.emit(Op::SetProp {
+                obj: desc,
+                key: fk,
+                src: t,
+            });
+        }
+        // The property name as a register.
+        let name_reg = self.reg();
+        let nk = self.add_const(Const::Str(String::from(name)));
+        self.emit(Op::LoadConst {
+            dst: name_reg,
+            k: nk,
+        });
+        // Object.defineProperty(obj, name, desc).
+        let object_global = self.reg();
+        let g = self.add_const(Const::Str(String::from("Object")));
+        self.emit(Op::GetGlobal {
+            dst: object_global,
+            name: g,
+        });
+        let key = self.reg();
+        let k = self.add_const(Const::Str(String::from("defineProperty")));
+        self.emit(Op::LoadConst { dst: key, k });
+        let base = self.funcs.last().expect("fn").next_reg;
+        for src in [obj, name_reg, desc] {
+            let slot = self.reg();
+            self.emit(Op::Move { dst: slot, src });
+        }
+        let ret = self.reg();
+        self.emit(Op::CallMethod {
+            dst: ret,
+            recv: object_global,
+            key,
+            args_base: base,
+            argc: 3,
+        });
     }
 
     /// `Object.setPrototypeOf(target, proto)`.
@@ -1820,8 +1901,21 @@ impl Compiler {
                 self.emit_object_assign(dst, src);
                 continue;
             }
+            // `{ get x() {…} }` / `{ set x(v) {…} }` install an accessor.
+            if let ObjectMember::Accessor {
+                is_getter,
+                key,
+                value,
+                ..
+            } = member
+            {
+                let name = simple_key(key)?;
+                let func = self.class_method_value(value)?;
+                self.emit_define_accessor(dst, &name, *is_getter, func);
+                continue;
+            }
             let ObjectMember::Property { key, value, .. } = member else {
-                return Err(CompileError::unsupported("object accessor"));
+                return Err(CompileError::unsupported("object member"));
             };
             let val = self.expr(value)?;
             match key {

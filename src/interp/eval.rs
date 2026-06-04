@@ -1435,6 +1435,43 @@ impl<'a> Interp<'a> {
     /// Reads property `key` from `obj`, boxing the few primitive cases we
     /// support (`String.length` / string indexing) and throwing on `null` /
     /// `undefined`.
+    /// Reads property `key` of `obj`, **invoking a getter accessor** (with
+    /// `obj` as `this`) if one is present. This is the accessor-aware read used
+    /// by the bytecode VM and method dispatch; [`get_member`](Self::get_member)
+    /// is the raw data-property read.
+    pub(super) fn get_property(&mut self, obj: &Value<'a>, key: &str) -> Completion<'a, Value<'a>> {
+        if let Value::Object(o) = obj
+            && let Some(acc) = o.find_accessor(key)
+        {
+            return match acc.get {
+                Some(getter) => self.call_with_this(getter, obj.clone(), Vec::new()),
+                None => Ok(Value::Undefined),
+            };
+        }
+        self.get_member(obj, key)
+    }
+
+    /// Writes `value` to property `key` of `obj`, **invoking a setter accessor**
+    /// (with `obj` as `this`) if one is present. The accessor-aware write used
+    /// by the bytecode VM.
+    pub(super) fn set_property(
+        &mut self,
+        obj: &Value<'a>,
+        key: &str,
+        value: Value<'a>,
+    ) -> Completion<'a, ()> {
+        if let Value::Object(o) = obj
+            && let Some(acc) = o.find_accessor(key)
+        {
+            if let Some(setter) = acc.set {
+                self.call_with_this(setter, obj.clone(), alloc::vec![value])?;
+            }
+            // An accessor with no setter silently ignores the write.
+            return Ok(());
+        }
+        self.set_member(obj, key, value)
+    }
+
     pub(super) fn get_member(&self, obj: &Value<'a>, key: &str) -> Completion<'a, Value<'a>> {
         match obj {
             // `Map`/`Set` expose `size` as an accessor.
@@ -1584,7 +1621,7 @@ impl<'a> Interp<'a> {
             };
             return self.call_with_this(obj, this_arg, call_args);
         }
-        let member = self.get_member(&obj, key)?;
+        let member = self.get_property(&obj, key)?;
         if member.is_callable() {
             return self.call_with_this(member, obj, args);
         }
