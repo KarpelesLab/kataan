@@ -189,6 +189,9 @@ const ERROR_NAMES: [&str; 5] = [
 ];
 const N_TYPE_ERROR: u16 = N_ERROR_BASE + 1;
 const N_REFERENCE_ERROR: u16 = N_ERROR_BASE + 4;
+/// A reserved, non-identifier key under which a `new fn()` instance records its
+/// constructor function (a hidden, GC-traced slot) so `instanceof` can match it.
+const CTOR_KEY: &str = "\u{0}ctor";
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
@@ -1057,6 +1060,22 @@ impl<'a> Interp<'a> {
         // `new UserClass(...)`.
         if let Some((class_id, env)) = self.realm.class_at(handle) {
             return self.instantiate(class_id, &env, args);
+        }
+        // `new constructorFunction(...)`: bind a fresh object as `this`, run the
+        // body, and return it — unless the function explicitly returned an object
+        // (the spec's constructor return rule).
+        if self.realm.function_at(handle).is_some() {
+            let instance = self.realm.new_object();
+            let this = NanBox::handle(instance.to_raw());
+            // Record the constructor for `instanceof` (hidden, GC-traced slot).
+            self.realm.set_hidden_property(instance, CTOR_KEY, callee);
+            let ret = self.call_with_this(callee, this, args)?;
+            if let Some(rh) = ret.as_handle().map(Handle::from_raw)
+                && (self.realm.is_array(rh) || self.realm.object_keys(rh).is_some())
+            {
+                return Ok(ret);
+            }
+            return Ok(this);
         }
         let id = self
             .realm
@@ -3328,6 +3347,14 @@ impl<'a> Interp<'a> {
                 _ => false,
             });
         }
+        // Plain function constructors: match the instance's recorded constructor.
+        if self.realm.function_at(ch).is_some() {
+            return Ok(self
+                .realm
+                .get_property(oh, CTOR_KEY)
+                .and_then(|t| t.as_handle())
+                == ctor.as_handle());
+        }
         let (Some(tag), Some((target_id, _))) = (self.realm.class_tag(oh), self.realm.class_at(ch))
         else {
             return Ok(false);
@@ -4248,6 +4275,29 @@ mod tests {
         assert_eq!(
             run("class C { #s = 1; constructor(){ this.p = 2; } } Object.keys(new C()).join(',')"),
             "p"
+        );
+    }
+
+    #[test]
+    fn new_on_constructor_functions() {
+        // `this` binding + implicit instance return.
+        assert_eq!(run("function P(x){ this.x = x; } new P(7).x"), "7");
+        // `instanceof` matches the constructing function, not others.
+        assert_eq!(
+            run(
+                "function P(){} function Q(){} let p = new P(); '' + (p instanceof P) + (p instanceof Q)"
+            ),
+            "truefalse"
+        );
+        // An explicit object return overrides the new instance.
+        assert_eq!(
+            run("function F(){ this.a = 1; return { b: 2 }; } let o = new F(); '' + o.a + o.b"),
+            "undefined2"
+        );
+        // The hidden constructor tag does not enumerate.
+        assert_eq!(
+            run("function P(){ this.v = 1; } Object.keys(new P()).join(',')"),
+            "v"
         );
     }
 
