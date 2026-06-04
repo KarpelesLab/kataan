@@ -42,6 +42,15 @@ pub enum Cell {
     /// A built-in (native) function, identified by an id the interpreter maps to
     /// a Rust implementation.
     Native(u16),
+    /// A `Map` (`is_set = false`) or `Set` (`is_set = true`): insertion-ordered
+    /// key/value entries (for a `Set`, the value equals the key).
+    Collection {
+        /// Whether this is a `Set` (vs a `Map`).
+        is_set: bool,
+        /// The entries, in insertion order, compared by `SameValueZero`-ish
+        /// strict equality.
+        entries: Vec<(NanBox, NanBox)>,
+    },
 }
 
 impl Cell {
@@ -106,6 +115,23 @@ impl Cell {
         }
     }
 
+    /// The `(is_set, entries)` of a collection, mutably.
+    pub fn as_collection_mut(&mut self) -> Option<(bool, &mut Vec<(NanBox, NanBox)>)> {
+        match self {
+            Cell::Collection { is_set, entries } => Some((*is_set, entries)),
+            _ => None,
+        }
+    }
+
+    /// The `(is_set, entries)` of a collection.
+    #[must_use]
+    pub fn as_collection(&self) -> Option<(bool, &[(NanBox, NanBox)])> {
+        match self {
+            Cell::Collection { is_set, entries } => Some((*is_set, entries)),
+            _ => None,
+        }
+    }
+
     /// The `typeof` string for this reference value (`"string"` for strings,
     /// `"function"` for functions, `"object"` for objects and arrays — JS has no
     /// array primitive type).
@@ -114,7 +140,7 @@ impl Cell {
         match self {
             Cell::Str(_) => "string",
             Cell::Function { .. } | Cell::Native(_) => "function",
-            Cell::Object(_) | Cell::Array(_) => "object",
+            Cell::Object(_) | Cell::Array(_) | Cell::Collection { .. } => "object",
         }
     }
 }
@@ -132,6 +158,17 @@ impl Trace for Cell {
             }
             // A closure keeps its captured environment's handles alive.
             Cell::Function { env, .. } => env.for_each_handle(visit),
+            // A collection's keys and values are reachable.
+            Cell::Collection { entries, .. } => {
+                for (k, v) in entries {
+                    if let Some(raw) = k.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                    if let Some(raw) = v.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                }
+            }
             // Strings and native functions reference no handles.
             Cell::Str(_) | Cell::Native(_) => {}
         }

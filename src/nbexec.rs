@@ -108,6 +108,8 @@ const N_MATH_FLOOR: u16 = 12;
 const N_MATH_CEIL: u16 = 13;
 const N_MATH_ROUND: u16 = 14;
 const N_MATH_SQRT: u16 = 15;
+const N_MAP: u16 = 16;
+const N_SET: u16 = 17;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib.
@@ -170,6 +172,8 @@ impl<'a> Interp<'a> {
             ("Number", N_NUMBER),
             ("Boolean", N_BOOLEAN),
             ("parseInt", N_PARSE_INT),
+            ("Map", N_MAP),
+            ("Set", N_SET),
         ] {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -397,6 +401,48 @@ impl<'a> Interp<'a> {
         let result = self.run_body(def.body);
         self.current = saved;
         result
+    }
+
+    /// `new Callee(args)` — supports the built-in `Map`/`Set` constructors
+    /// (optionally seeded from an iterable argument).
+    fn construct(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        let Some(raw) = callee.as_handle() else {
+            return Err(ExecError::NotCallable);
+        };
+        let id = self
+            .realm
+            .native_at(Handle::from_raw(raw))
+            .ok_or(ExecError::Unsupported("new on this value"))?;
+        let is_set = match id {
+            N_SET => true,
+            N_MAP => false,
+            _ => return Err(ExecError::Unsupported("new on this constructor")),
+        };
+        let handle = self.realm.new_collection(is_set);
+        // Seed from an iterable: a `Set` from array elements, a `Map` from
+        // `[key, value]` pairs.
+        if let Some(seed) = args
+            .first()
+            .copied()
+            .and_then(NanBox::as_handle)
+            .and_then(|r| self.realm.array_elements(Handle::from_raw(r)))
+            .map(<[_]>::to_vec)
+        {
+            for item in seed {
+                if is_set {
+                    self.realm.collection_set(handle, item, item);
+                } else if let Some(pr) = item
+                    .as_handle()
+                    .and_then(|r| self.realm.array_elements(Handle::from_raw(r)))
+                    .map(<[_]>::to_vec)
+                {
+                    let k = pr.first().copied().unwrap_or(NanBox::undefined());
+                    let v = pr.get(1).copied().unwrap_or(NanBox::undefined());
+                    self.realm.collection_set(handle, k, v);
+                }
+            }
+        }
+        Ok(NanBox::handle(handle.to_raw()))
     }
 
     /// Evaluates a call's arguments.
@@ -657,6 +703,58 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::handle(h.to_raw())));
                 }
                 _ => {}
+            }
+        }
+
+        // --- Map / Set methods ---
+        if let Some(size) = self.realm.collection_size(handle) {
+            match method {
+                "set" => {
+                    self.realm.collection_set(handle, arg(0), arg(1));
+                    return Ok(Some(recv)); // Map.set returns the map (chainable)
+                }
+                "add" => {
+                    self.realm.collection_set(handle, arg(0), arg(0));
+                    return Ok(Some(recv)); // Set.add returns the set
+                }
+                "get" => {
+                    return Ok(Some(
+                        self.realm
+                            .collection_get(handle, arg(0))
+                            .unwrap_or(NanBox::undefined()),
+                    ));
+                }
+                "has" => {
+                    return Ok(Some(NanBox::boolean(
+                        self.realm.collection_has(handle, arg(0)),
+                    )));
+                }
+                "delete" => {
+                    return Ok(Some(NanBox::boolean(
+                        self.realm.collection_delete(handle, arg(0)),
+                    )));
+                }
+                "forEach" => {
+                    let f = arg(0);
+                    for (k, v) in self.realm.collection_entries(handle).unwrap_or_default() {
+                        // (value, key) per the JS signature.
+                        self.call(f, &[v, k])?;
+                    }
+                    return Ok(Some(NanBox::undefined()));
+                }
+                "keys" => {
+                    let keys: Vec<NanBox> = self
+                        .realm
+                        .collection_entries(handle)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .collect();
+                    return Ok(Some(NanBox::handle(self.realm.new_array(keys).to_raw())));
+                }
+                _ => {
+                    let _ = size;
+                }
             }
         }
         Ok(None)
@@ -996,6 +1094,13 @@ impl<'a> Interp<'a> {
                 let args = self.eval_args(arguments)?;
                 self.call(f, &args)
             }
+            Expr::New {
+                callee, arguments, ..
+            } => {
+                let f = self.eval(callee)?;
+                let args = self.eval_args(arguments)?;
+                self.construct(f, &args)
+            }
             Expr::Array { elements, .. } => {
                 let mut items = Vec::new();
                 for el in elements {
@@ -1088,6 +1193,12 @@ impl<'a> Interp<'a> {
             if let Some(s) = self.realm.string_value(handle) {
                 return NanBox::number(s.chars().count() as f64);
             }
+        }
+        // `Map`/`Set` expose `size`.
+        if key == "size"
+            && let Some(n) = self.realm.collection_size(handle)
+        {
+            return NanBox::number(n as f64);
         }
         NanBox::undefined()
     }
@@ -1581,6 +1692,46 @@ mod tests {
         assert_eq!(run("Math.ceil(3.2)"), "4");
         assert_eq!(run("Math.round(3.5)"), "4");
         assert_eq!(run("Math.sqrt(144)"), "12");
+    }
+
+    #[test]
+    fn maps_and_sets() {
+        // Map: set/get/has/size/delete.
+        assert_eq!(
+            run("let m = new Map(); m.set('a', 1); m.set('b', 2); m.get('a') + m.get('b')"),
+            "3"
+        );
+        assert_eq!(run("let m = new Map(); m.set('x', 1); m.has('x')"), "true");
+        assert_eq!(run("let m = new Map(); m.set('x', 1); m.size"), "1");
+        assert_eq!(
+            run("let m = new Map(); m.set('x', 1); m.delete('x'); m.has('x')"),
+            "false"
+        );
+        // set returns the map (chainable); overwriting a key keeps size.
+        assert_eq!(
+            run("let m = new Map(); m.set('a', 1); m.set('a', 9); m.get('a') + ':' + m.size"),
+            "9:1"
+        );
+        // Map seeded from pairs.
+        assert_eq!(
+            run("let m = new Map([['a', 1], ['b', 2]]); m.get('b')"),
+            "2"
+        );
+        // Set: add/has/size, dedup, and seeding from an array.
+        assert_eq!(
+            run("let s = new Set(); s.add(1); s.add(1); s.add(2); s.size"),
+            "2"
+        );
+        assert_eq!(run("let s = new Set([1, 2, 2, 3]); s.size"), "3");
+        assert_eq!(run("new Set([1, 2, 3]).has(2)"), "true");
+        // forEach over a Map accumulating values.
+        assert_eq!(
+            run("let m = new Map([['a', 10], ['b', 20]]);
+                 let t = 0; m.forEach(v => { t += v; }); t"),
+            "30"
+        );
+        // typeof a Map is object.
+        assert_eq!(run("typeof new Map()"), "object");
     }
 
     #[test]

@@ -92,6 +92,81 @@ impl Realm {
         self.heap.alloc(Cell::Native(id))
     }
 
+    /// Allocates an empty `Map` (`is_set = false`) or `Set` (`is_set = true`).
+    pub fn new_collection(&mut self, is_set: bool) -> Handle {
+        self.heap.alloc(Cell::Collection {
+            is_set,
+            entries: Vec::new(),
+        })
+    }
+
+    /// Sets `key → value` in the collection at `handle` (inserting or updating,
+    /// by strict-equality key match). Returns `false` if not a collection.
+    pub fn collection_set(&mut self, handle: Handle, key: NanBox, value: NanBox) -> bool {
+        // Find an existing key first (immutable strict_equals borrow), then write.
+        let pos = match self.heap.get(handle).and_then(Cell::as_collection) {
+            Some((_, entries)) => entries
+                .iter()
+                .position(|(k, _)| self.strict_equals(*k, key)),
+            None => return false,
+        };
+        let Some((_, entries)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut) else {
+            return false;
+        };
+        match pos {
+            Some(i) => entries[i].1 = value,
+            None => entries.push((key, value)),
+        }
+        true
+    }
+
+    /// The value for `key` in the collection, or `None` if absent / not a
+    /// collection.
+    #[must_use]
+    pub fn collection_get(&self, handle: Handle, key: NanBox) -> Option<NanBox> {
+        let (_, entries) = self.heap.get(handle)?.as_collection()?;
+        entries
+            .iter()
+            .find(|(k, _)| self.strict_equals(*k, key))
+            .map(|(_, v)| *v)
+    }
+
+    /// Whether the collection contains `key`.
+    #[must_use]
+    pub fn collection_has(&self, handle: Handle, key: NanBox) -> bool {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_collection)
+            .is_some_and(|(_, e)| e.iter().any(|(k, _)| self.strict_equals(*k, key)))
+    }
+
+    /// Removes `key`; returns whether it was present.
+    pub fn collection_delete(&mut self, handle: Handle, key: NanBox) -> bool {
+        let pos = match self.heap.get(handle).and_then(Cell::as_collection) {
+            Some((_, e)) => e.iter().position(|(k, _)| self.strict_equals(*k, key)),
+            None => return false,
+        };
+        if let Some(i) = pos
+            && let Some((_, e)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut)
+        {
+            e.remove(i);
+            return true;
+        }
+        false
+    }
+
+    /// The number of entries, or `None` if not a collection.
+    #[must_use]
+    pub fn collection_size(&self, handle: Handle) -> Option<usize> {
+        Some(self.heap.get(handle)?.as_collection()?.1.len())
+    }
+
+    /// A snapshot of the collection's entries (for iteration / `forEach`).
+    #[must_use]
+    pub fn collection_entries(&self, handle: Handle) -> Option<Vec<(NanBox, NanBox)>> {
+        Some(self.heap.get(handle)?.as_collection()?.1.to_vec())
+    }
+
     /// The native-function id at `handle`, or `None` if it is not a native.
     #[must_use]
     pub fn native_at(&self, handle: Handle) -> Option<u16> {
@@ -286,6 +361,13 @@ impl Realm {
                 }
                 Some(Cell::Object(_)) => "[object Object]".into(),
                 Some(Cell::Function { .. } | Cell::Native(_)) => "function () { … }".into(),
+                Some(Cell::Collection { is_set, .. }) => {
+                    if *is_set {
+                        "[object Set]".into()
+                    } else {
+                        "[object Map]".into()
+                    }
+                }
                 None => "undefined".into(), // stale handle
             },
         }
