@@ -514,9 +514,12 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   recurse through the shared call path, so bytecode/native/tree-walker callees
   interoperate; the VM reuses the tree-walker's value semantics, and the whole
   instruction set survives the serialize → reload → run round-trip (D′).
-  **Next:** closures/upvalues (capture currently triggers a tree-walker
-  fallback), `finally`, for-in/for-of, destructuring, classes — and making the
-  VM the primary execution path.
+  `for-of` (arrays/strings/Sets/Maps), `typeof`/`void`/`delete`, and the
+  full unary/bitwise set are in, and `Interp::run_with_vm` / `kataan bcrun`
+  execute real programs on the VM with automatic tree-walker fallback — the
+  conformance corpus runs through both paths. **Next:** closures/upvalues
+  (capture currently triggers a tree-walker fallback), `finally`, for-in,
+  destructuring, classes — and making the VM the primary execution path.
 
 - **Phase D′ — Serializable bytecode & code cache** (`serialize` feature)
   🚧 **started** — the container codec is in: `serialize`/`deserialize` with a
