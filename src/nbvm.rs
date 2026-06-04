@@ -115,6 +115,13 @@ pub enum Op {
     /// `dst = src.slice(from)` — a new array of `src`'s elements from index
     /// `from` (a numeric register) onward (for a rest pattern).
     ArraySliceFrom { dst: Reg, src: Reg, from: Reg },
+    /// `dst = { ...src }` minus the `exclude` keys — `src`'s own properties not
+    /// already destructured (an object-rest pattern).
+    ObjectRest {
+        dst: Reg,
+        src: Reg,
+        exclude: alloc::rc::Rc<[String]>,
+    },
     /// `dst = a new `Map`/`Set``, optionally seeded from the iterable array in
     /// `seed` (a `Set` from its elements, a `Map` from `[k, v]` pairs).
     NewCollection {
@@ -551,6 +558,20 @@ fn run_frame(
                 for (i, e) in elems.into_iter().enumerate() {
                     ctx.realm.set_element(handle, start + i, e);
                 }
+            }
+            Op::ObjectRest { dst, src, exclude } => {
+                let srch = object_handle(regs[*src as usize])?;
+                let new_obj = ctx.realm.new_object();
+                for k in ctx.realm.object_keys(srch).unwrap_or_default() {
+                    if !exclude.iter().any(|e| *e == k) {
+                        let v = ctx
+                            .realm
+                            .get_property(srch, &k)
+                            .unwrap_or(NanBox::undefined());
+                        ctx.realm.set_property(new_obj, &k, v);
+                    }
+                }
+                regs[*dst as usize] = NanBox::handle(new_obj.to_raw());
             }
             Op::NewCollection { dst, is_set, seed } => {
                 let coll = ctx.realm.new_collection(*is_set);
@@ -2180,19 +2201,28 @@ impl Compiler {
                 Ok(())
             }
             BindingTarget::Object(pat) => {
-                if pat.rest.is_some() {
-                    return Err(CompileError::Unsupported("object rest pattern"));
-                }
+                let mut named: Vec<String> = Vec::new();
                 for prop in &pat.properties {
                     let key = static_key(&prop.key)?;
                     let v = self.alloc();
                     self.ops.push(Op::GetProp {
                         dst: v,
                         obj: value_reg,
-                        key,
+                        key: key.clone(),
                     });
                     self.apply_default(v, prop.default.as_ref())?;
                     self.bind_pattern(&prop.value, v)?;
+                    named.push(key);
+                }
+                // `...rest` = a new object of the remaining own properties.
+                if let Some(rest) = &pat.rest {
+                    let r = self.alloc();
+                    self.ops.push(Op::ObjectRest {
+                        dst: r,
+                        src: value_reg,
+                        exclude: named.into(),
+                    });
+                    self.bind_pattern(rest, r)?;
                 }
                 Ok(())
             }
@@ -4052,6 +4082,15 @@ mod tests {
         assert_eq!(
             bc("let [, , ...rest] = [1, 2, 3, 4, 5]; rest.join(',')"),
             "3,4,5"
+        );
+        // Object rest pattern.
+        assert_eq!(
+            bc("let { a, ...rest } = { a: 1, b: 2, c: 3 }; a + '|' + Object.keys(rest).join(',')"),
+            "1|b,c"
+        );
+        assert_eq!(
+            bc("let { a, b, ...rest } = { a: 1, b: 2, c: 3, d: 4 }; rest.c + rest.d"),
+            "7"
         );
         // Object destructuring with shorthand, rename, and default.
         assert_eq!(bc("let { x, y } = { x: 1, y: 2 }; x + y"), "3");
