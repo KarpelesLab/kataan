@@ -455,16 +455,32 @@ fn emit_expr(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmErro
         // `Math.sqrt(x)` / `Math.max(a, b)` → a native `f64.*` instruction.
         Expr::Call { arguments, .. } if math_call(expr).is_some() => {
             let (mnemonic, _opcode, arity) = math_call(expr).unwrap();
-            if arguments.len() != arity {
-                return Err(WasmError("Math arity"));
+            // `Math.min`/`Math.max` are variadic: left-fold the binary op.
+            if matches!(mnemonic, "f64.min" | "f64.max") {
+                if arguments.is_empty() {
+                    return Err(WasmError("Math.min/max needs at least one argument"));
+                }
+                for (i, arg) in arguments.iter().enumerate() {
+                    let crate::ast::Argument::Item(e) = arg else {
+                        return Err(WasmError("spread argument"));
+                    };
+                    emit_expr(e, out, depth)?;
+                    if i > 0 {
+                        out.push_str(&format!("{pad}{mnemonic}\n"));
+                    }
+                }
+            } else {
+                if arguments.len() != arity {
+                    return Err(WasmError("Math arity"));
+                }
+                for arg in arguments {
+                    let crate::ast::Argument::Item(e) = arg else {
+                        return Err(WasmError("spread argument"));
+                    };
+                    emit_expr(e, out, depth)?;
+                }
+                out.push_str(&format!("{pad}{mnemonic}\n"));
             }
-            for arg in arguments {
-                let crate::ast::Argument::Item(e) = arg else {
-                    return Err(WasmError("spread argument"));
-                };
-                emit_expr(e, out, depth)?;
-            }
-            out.push_str(&format!("{pad}{mnemonic}\n"));
         }
         Expr::Call {
             callee, arguments, ..
@@ -1072,19 +1088,35 @@ fn emit_expr_bin(
                 _ => return Err(WasmError("binary operator")),
             }
         }
-        // `Math.sqrt(x)` / `Math.max(a, b)` → a native `f64.*` opcode.
+        // `Math.sqrt(x)` / `Math.max(a, b, …)` → a native `f64.*` opcode.
         Expr::Call { arguments, .. } if math_call(expr).is_some() => {
-            let (_mnemonic, opcode, arity) = math_call(expr).unwrap();
-            if arguments.len() != arity {
-                return Err(WasmError("Math arity"));
+            let (mnemonic, opcode, arity) = math_call(expr).unwrap();
+            // `Math.min`/`Math.max` are variadic: left-fold the binary op.
+            if matches!(mnemonic, "f64.min" | "f64.max") {
+                if arguments.is_empty() {
+                    return Err(WasmError("Math.min/max needs at least one argument"));
+                }
+                for (i, arg) in arguments.iter().enumerate() {
+                    let crate::ast::Argument::Item(e) = arg else {
+                        return Err(WasmError("spread argument"));
+                    };
+                    emit_expr_bin(e, locals, fns, out)?;
+                    if i > 0 {
+                        out.push(opcode);
+                    }
+                }
+            } else {
+                if arguments.len() != arity {
+                    return Err(WasmError("Math arity"));
+                }
+                for arg in arguments {
+                    let crate::ast::Argument::Item(e) = arg else {
+                        return Err(WasmError("spread argument"));
+                    };
+                    emit_expr_bin(e, locals, fns, out)?;
+                }
+                out.push(opcode);
             }
-            for arg in arguments {
-                let crate::ast::Argument::Item(e) = arg else {
-                    return Err(WasmError("spread argument"));
-                };
-                emit_expr_bin(e, locals, fns, out)?;
-            }
-            out.push(opcode);
         }
         Expr::Call {
             callee, arguments, ..
@@ -1493,8 +1525,17 @@ mod tests {
         assert!(wasm.contains(&0x9f) && wasm.contains(&0xa5));
         section_ids(&wasm);
 
-        // Wrong arity is rejected.
-        let program = Parser::parse_program("function f(x) { return Math.max(x); }").unwrap();
+        // Math.max/min are variadic (left-folded): 1 or 3 args are fine.
+        let v = module("function f(a, b, c) { return Math.max(a, b, c); }");
+        assert_eq!(v.matches("f64.max").count(), 2, "two folds for three args");
+        assert_well_formed(&v);
+        assert!(
+            compile_module(&Parser::parse_program("function f(x){return Math.max(x);}").unwrap())
+                .is_ok()
+        );
+        // A unary op with the wrong arity is still rejected.
+        let program =
+            Parser::parse_program("function f(a, b) { return Math.sqrt(a, b); }").unwrap();
         assert!(compile_module(&program).is_err());
     }
 
