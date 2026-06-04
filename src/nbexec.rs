@@ -1665,6 +1665,67 @@ impl<'a> Interp<'a> {
                     self.settle(p, arg(0), false);
                     return Ok(Some(NanBox::handle(p.to_raw())));
                 }
+                // `Promise.all(iterable)`: resolve with the array of awaited
+                // values, or reject with the first rejection (eager model).
+                "all" => {
+                    let items = self.iterate_values(arg(0))?;
+                    let p = self.realm.new_promise();
+                    let mut results = Vec::with_capacity(items.len());
+                    for item in items {
+                        match self.await_value(item) {
+                            Ok(v) => results.push(v),
+                            Err(ExecError::Throw(e)) => {
+                                self.settle(p, e, false);
+                                return Ok(Some(NanBox::handle(p.to_raw())));
+                            }
+                            Err(other) => return Err(other),
+                        }
+                    }
+                    let arr = self.realm.new_array(results);
+                    self.resolve_with(p, NanBox::handle(arr.to_raw()));
+                    return Ok(Some(NanBox::handle(p.to_raw())));
+                }
+                // `Promise.race(iterable)`: settle with the first input to settle
+                // (eager — the first list element).
+                "race" => {
+                    let items = self.iterate_values(arg(0))?;
+                    let p = self.realm.new_promise();
+                    if let Some(item) = items.into_iter().next() {
+                        match self.await_value(item) {
+                            Ok(v) => self.resolve_with(p, v),
+                            Err(ExecError::Throw(e)) => self.settle(p, e, false),
+                            Err(other) => return Err(other),
+                        }
+                    }
+                    return Ok(Some(NanBox::handle(p.to_raw())));
+                }
+                // `Promise.allSettled(iterable)`: never rejects; each entry is
+                // `{status, value}` or `{status, reason}`.
+                "allSettled" => {
+                    let items = self.iterate_values(arg(0))?;
+                    let mut results = Vec::with_capacity(items.len());
+                    for item in items {
+                        let obj = self.realm.new_object();
+                        match self.await_value(item) {
+                            Ok(v) => {
+                                let s = self.new_str("fulfilled");
+                                self.realm.set_property(obj, "status", s);
+                                self.realm.set_property(obj, "value", v);
+                            }
+                            Err(ExecError::Throw(e)) => {
+                                let s = self.new_str("rejected");
+                                self.realm.set_property(obj, "status", s);
+                                self.realm.set_property(obj, "reason", e);
+                            }
+                            Err(other) => return Err(other),
+                        }
+                        results.push(NanBox::handle(obj.to_raw()));
+                    }
+                    let p = self.realm.new_promise();
+                    let arr = self.realm.new_array(results);
+                    self.resolve_with(p, NanBox::handle(arr.to_raw()));
+                    return Ok(Some(NanBox::handle(p.to_raw())));
+                }
                 _ => {}
             }
         }
@@ -4134,6 +4195,14 @@ mod tests {
         interp.realm().to_display_string(value)
     }
 
+    /// Runs `src` and returns its captured `console` output.
+    fn out(src: &str) -> String {
+        let program = Parser::parse_program(src).expect("parse");
+        let mut interp = Interp::new();
+        interp.run(&program).expect("exec");
+        String::from(interp.output())
+    }
+
     #[test]
     fn variables_assignment_and_control_flow() {
         assert_eq!(run("let x = 1; let y = 2; x + y"), "3");
@@ -4793,6 +4862,29 @@ mod tests {
         assert_eq!(
             run("class C { #s = 1; constructor(){ this.p = 2; } } Object.keys(new C()).join(',')"),
             "p"
+        );
+    }
+
+    #[test]
+    fn promise_combinators() {
+        // Drive the combinators through output (await/then resolve eagerly).
+        assert_eq!(
+            out(
+                "Promise.all([Promise.resolve(1), 2, Promise.resolve(3)]).then(r => console.log(r.join(',')));"
+            ),
+            "1,2,3\n"
+        );
+        assert_eq!(
+            out(
+                "Promise.race([Promise.resolve('a'), Promise.resolve('b')]).then(v => console.log(v));"
+            ),
+            "a\n"
+        );
+        assert_eq!(
+            out(
+                "Promise.all([Promise.resolve(1), Promise.reject('boom')]).catch(e => console.log('caught:' + e));"
+            ),
+            "caught:boom\n"
         );
     }
 
