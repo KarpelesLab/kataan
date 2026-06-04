@@ -63,7 +63,9 @@ impl<'a> Interp<'a> {
         global.declare("undefined", Value::Undefined, false);
         global.declare("NaN", Value::Number(f64::NAN), false);
         global.declare("Infinity", Value::Number(f64::INFINITY), false);
-        Self { global }
+        let interp = Self { global };
+        interp.install_stdlib();
+        interp
     }
 
     /// The global scope, for injecting host bindings (e.g. `console`).
@@ -645,9 +647,10 @@ impl<'a> Interp<'a> {
                 optional,
                 ..
             } => {
-                // A call on a member expression supplies `this`; otherwise the
-                // receiver is undefined.
-                let (this_val, callee_val) = if let Expr::Member {
+                // A call on a member expression supplies `this`, and falls back
+                // to the built-in prototype methods when there is no own
+                // property; a plain call has an undefined receiver.
+                if let Expr::Member {
                     object,
                     property,
                     optional: member_opt,
@@ -659,15 +662,28 @@ impl<'a> Interp<'a> {
                         return Ok(Value::Undefined);
                     }
                     let key = self.member_key(property, env)?;
-                    (obj.clone(), self.get_member(&obj, &key)?)
-                } else {
-                    (Value::Undefined, self.eval_expr(callee, env)?)
-                };
+                    let member = self.get_member(&obj, &key)?;
+                    let args = self.eval_arguments(arguments, env)?;
+                    if member.is_callable() {
+                        return self.call_with_this(member, obj, args);
+                    }
+                    if let Some(result) = self.call_builtin_method(&obj, &key, &args)? {
+                        return Ok(result);
+                    }
+                    if *optional && matches!(member, Value::Undefined | Value::Null) {
+                        return Ok(Value::Undefined);
+                    }
+                    return Err(Value::str(alloc::format!(
+                        "{}.{key} is not a function",
+                        obj.to_js_string()
+                    )));
+                }
+                let callee_val = self.eval_expr(callee, env)?;
                 if *optional && matches!(callee_val, Value::Undefined | Value::Null) {
                     return Ok(Value::Undefined);
                 }
                 let args = self.eval_arguments(arguments, env)?;
-                self.call_with_this(callee_val, this_val, args)
+                self.call_with_this(callee_val, Value::Undefined, args)
             }
             Expr::Function(f) => Ok(Value::Function(Rc::new(Closure {
                 def: Callable::Function(f),
@@ -1015,7 +1031,7 @@ impl<'a> Interp<'a> {
         Ok(args)
     }
 
-    fn call_with_this(
+    pub(super) fn call_with_this(
         &mut self,
         callee: Value<'a>,
         this: Value<'a>,

@@ -16,6 +16,7 @@
 //! assert_eq!(result.to_js_string(), "42");
 //! ```
 
+mod builtins;
 mod env;
 mod eval;
 mod value;

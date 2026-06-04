@@ -258,6 +258,98 @@ fn for_of_and_for_in() {
 }
 
 #[test]
+fn math_builtins() {
+    assert_eq!(eval("Math.abs(-5)"), "5");
+    assert_eq!(eval("Math.floor(3.7)"), "3");
+    assert_eq!(eval("Math.ceil(3.2)"), "4");
+    assert_eq!(eval("Math.max(1, 9, 4, 2)"), "9");
+    assert_eq!(eval("Math.min(3, -2, 8)"), "-2");
+    assert_eq!(eval("Math.pow(2, 10)"), "1024");
+    assert_eq!(eval("Math.sqrt(144)"), "12");
+    assert_eq!(eval("Math.round(2.5)"), "3");
+}
+
+#[test]
+fn number_globals() {
+    assert_eq!(eval("parseInt('42px')"), "42");
+    assert_eq!(eval("parseInt('ff', 16)"), "255");
+    assert_eq!(eval("parseInt('0x1F')"), "31");
+    assert_eq!(eval("parseFloat('3.14abc')"), "3.14");
+    assert_eq!(eval("isNaN(0 / 0)"), "true");
+    assert_eq!(eval("isFinite(1 / 0)"), "false");
+    assert_eq!(eval("Number('12') + 3"), "15");
+    assert_eq!(eval("String(42) + '!'"), "42!");
+}
+
+#[test]
+fn array_methods() {
+    assert_eq!(eval("let a = [1, 2]; a.push(3, 4); a.length"), "4");
+    assert_eq!(eval("let a = [1, 2, 3]; a.pop()"), "3");
+    assert_eq!(eval("[1, 2, 3].join('-')"), "1-2-3");
+    assert_eq!(eval("[1, 2, 3].includes(2)"), "true");
+    assert_eq!(eval("[1, 2, 3].indexOf(3)"), "2");
+    assert_eq!(eval("[1, 2, 3, 4].slice(1, 3).join(',')"), "2,3");
+    assert_eq!(eval("[1, 2, 3].map(x => x * x).join(',')"), "1,4,9");
+    assert_eq!(
+        eval("[1, 2, 3, 4].filter(x => x % 2 === 0).join(',')"),
+        "2,4"
+    );
+    assert_eq!(eval("[1, 2, 3, 4].reduce((a, b) => a + b, 0)"), "10");
+    assert_eq!(eval("[1, 2, 3, 4].reduce((a, b) => a + b)"), "10");
+    assert_eq!(eval("let s = 0; [1, 2, 3].forEach(x => s += x); s"), "6");
+    assert_eq!(eval("[1, 2, 3].find(x => x > 1)"), "2");
+    assert_eq!(eval("[1, 2, 3].some(x => x > 2)"), "true");
+    assert_eq!(eval("[2, 4, 6].every(x => x % 2 === 0)"), "true");
+    assert_eq!(eval("Array.isArray([1, 2])"), "true");
+    assert_eq!(eval("Array.isArray('nope')"), "false");
+}
+
+#[test]
+fn string_methods() {
+    assert_eq!(eval("'hello'.toUpperCase()"), "HELLO");
+    assert_eq!(eval("'HELLO'.toLowerCase()"), "hello");
+    assert_eq!(eval("'  hi  '.trim()"), "hi");
+    assert_eq!(eval("'hello world'.includes('world')"), "true");
+    assert_eq!(eval("'hello'.indexOf('l')"), "2");
+    assert_eq!(eval("'hello'.slice(1, 4)"), "ell");
+    assert_eq!(eval("'a,b,c'.split(',').length"), "3");
+    assert_eq!(eval("'ab'.repeat(3)"), "ababab");
+    assert_eq!(eval("'hello'.charAt(1)"), "e");
+    assert_eq!(eval("'hello'.startsWith('he')"), "true");
+}
+
+#[test]
+fn object_statics() {
+    assert_eq!(eval("Object.keys({ a: 1, b: 2 }).join(',')"), "a,b");
+    assert_eq!(eval("Object.values({ a: 1, b: 2 }).join(',')"), "1,2");
+    assert_eq!(
+        eval("Object.entries({ a: 1 }).map(e => e[0] + '=' + e[1]).join(',')"),
+        "a=1"
+    );
+    assert_eq!(
+        eval("let t = Object.assign({}, { a: 1 }, { b: 2 }); t.a + t.b"),
+        "3"
+    );
+}
+
+#[test]
+fn json() {
+    assert_eq!(eval("JSON.stringify(42)"), "42");
+    assert_eq!(eval("JSON.stringify('hi')"), "\"hi\"");
+    assert_eq!(eval("JSON.stringify([1, 2, 3])"), "[1,2,3]");
+    assert_eq!(
+        eval("JSON.stringify({ a: 1, b: 'x' })"),
+        "{\"a\":1,\"b\":\"x\"}"
+    );
+    assert_eq!(eval("JSON.parse('[1, 2, 3]').length"), "3");
+    assert_eq!(eval("JSON.parse('{\"n\": 42}').n"), "42");
+    assert_eq!(
+        eval("let o = JSON.parse(JSON.stringify({ x: [1, 2], y: 'z' })); o.x[1] + o.y"),
+        "2z"
+    );
+}
+
+#[test]
 fn update_and_compound_assignment() {
     assert_eq!(eval("let x = 5; x++; x"), "6");
     assert_eq!(eval("let x = 5; let y = x++; `${x},${y}`"), "6,5");
