@@ -35,7 +35,6 @@ extern crate alloc;
 extern crate std;
 
 pub mod ast;
-pub mod bytecode;
 pub mod common;
 pub mod error;
 pub mod lexer;
@@ -107,6 +106,11 @@ pub mod wasm;
 /// that the performance object model executes code. Needs `alloc`.
 #[cfg(feature = "alloc")]
 pub mod nbvm;
+
+/// A portable `KTBC` serialization codec for the bytecode VM's compiled programs
+/// (the code cache — `ROADMAP.md` Phase D′). Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod bytecode;
 
 /// Evaluates the real parser AST (the expression subset) over the
 /// `Realm`/`NanBox` model — the front-end → new-representation bridge. Needs

@@ -1,0 +1,770 @@
+//! A portable serialization codec for the bytecode VM's compiled programs
+//! (`ROADMAP.md` Phase D′ — serializable bytecode / code cache).
+//!
+//! A compiled program is a `Vec<FnProto>` (function 0 is the top-level body).
+//! `serialize` turns it into a self-describing `KTBC` byte container —
+//! `magic + version + function table` — that `deserialize` reloads after
+//! validating the magic and version. This is the artifact behind
+//! `kataan compile app.js -o app.ktbc` / `kataan run app.ktbc`: parse and compile
+//! once, then run from bytecode without re-parsing.
+//!
+//! Integers are little-endian; strings and lists are length-prefixed; a
+//! `LoadConst` value is encoded by its primitive kind (compile-time constants are
+//! never heap handles). Pure, safe `alloc`-only Rust.
+
+use crate::nanbox::{NanBox, Unpacked};
+use crate::nbvm::{FnProto, Op, Reg};
+use alloc::rc::Rc;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+const MAGIC: &[u8; 4] = b"KTBC";
+const VERSION: u16 = 1;
+
+/// Why a bytecode artifact failed to load.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DecodeError {
+    /// The `KTBC` magic was missing.
+    BadMagic,
+    /// The version is not understood by this build.
+    BadVersion(u16),
+    /// The buffer ended mid-record.
+    Truncated,
+    /// An unknown opcode/value tag (a corrupt or incompatible artifact).
+    BadTag(u8),
+}
+
+// --- writers ---
+
+fn w_u8(v: u8, out: &mut Vec<u8>) {
+    out.push(v);
+}
+fn w_u16(v: u16, out: &mut Vec<u8>) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn w_u32(v: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn w_usize(v: usize, out: &mut Vec<u8>) {
+    w_u32(v as u32, out);
+}
+fn w_reg(v: Reg, out: &mut Vec<u8>) {
+    w_u16(v, out);
+}
+fn w_bool(v: bool, out: &mut Vec<u8>) {
+    out.push(u8::from(v));
+}
+fn w_str(s: &str, out: &mut Vec<u8>) {
+    w_u32(s.len() as u32, out);
+    out.extend_from_slice(s.as_bytes());
+}
+fn w_regs(rs: &[Reg], out: &mut Vec<u8>) {
+    w_u32(rs.len() as u32, out);
+    for r in rs {
+        w_reg(*r, out);
+    }
+}
+fn w_u32s(xs: &[u32], out: &mut Vec<u8>) {
+    w_u32(xs.len() as u32, out);
+    for x in xs {
+        w_u32(*x, out);
+    }
+}
+fn w_strs(xs: &[String], out: &mut Vec<u8>) {
+    w_u32(xs.len() as u32, out);
+    for x in xs {
+        w_str(x, out);
+    }
+}
+
+/// Encodes a `LoadConst` value by its primitive kind.
+fn w_value(v: NanBox, out: &mut Vec<u8>) {
+    match v.unpack() {
+        Unpacked::Undefined => w_u8(0, out),
+        Unpacked::Null => w_u8(1, out),
+        Unpacked::Bool(b) => {
+            w_u8(2, out);
+            w_bool(b, out);
+        }
+        Unpacked::Number(n) => {
+            w_u8(3, out);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        Unpacked::Handle(h) => {
+            w_u8(4, out);
+            out.extend_from_slice(&h.to_le_bytes());
+        }
+    }
+}
+
+// --- readers ---
+
+/// A cursor over the artifact bytes.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated)?;
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(DecodeError::Truncated)?;
+        self.pos = end;
+        Ok(slice)
+    }
+    fn u8(&mut self) -> Result<u8, DecodeError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, DecodeError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, DecodeError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn usize(&mut self) -> Result<usize, DecodeError> {
+        Ok(self.u32()? as usize)
+    }
+    fn reg(&mut self) -> Result<Reg, DecodeError> {
+        self.u16()
+    }
+    fn boolean(&mut self) -> Result<bool, DecodeError> {
+        Ok(self.u8()? != 0)
+    }
+    fn string(&mut self) -> Result<String, DecodeError> {
+        let len = self.u32()? as usize;
+        let bytes = self.take(len)?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+    fn regs(&mut self) -> Result<Vec<Reg>, DecodeError> {
+        let n = self.u32()? as usize;
+        (0..n).map(|_| self.reg()).collect()
+    }
+    fn u32s(&mut self) -> Result<Vec<u32>, DecodeError> {
+        let n = self.u32()? as usize;
+        (0..n).map(|_| self.u32()).collect()
+    }
+    fn strings(&mut self) -> Result<Vec<String>, DecodeError> {
+        let n = self.u32()? as usize;
+        (0..n).map(|_| self.string()).collect()
+    }
+    fn value(&mut self) -> Result<NanBox, DecodeError> {
+        match self.u8()? {
+            0 => Ok(NanBox::undefined()),
+            1 => Ok(NanBox::null()),
+            2 => Ok(NanBox::boolean(self.boolean()?)),
+            3 => Ok(NanBox::number(f64::from_le_bytes(
+                self.take(8)?.try_into().unwrap(),
+            ))),
+            4 => Ok(NanBox::handle(u64::from_le_bytes(
+                self.take(8)?.try_into().unwrap(),
+            ))),
+            t => Err(DecodeError::BadTag(t)),
+        }
+    }
+}
+
+/// Serializes a compiled program (the function table) to a `KTBC` artifact.
+#[must_use]
+pub fn serialize(protos: &[FnProto]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    w_u16(VERSION, &mut out);
+    w_u32(protos.len() as u32, &mut out);
+    for p in protos {
+        w_usize(p.n_regs, &mut out);
+        w_usize(p.n_params, &mut out);
+        w_usize(p.n_captures, &mut out);
+        match p.rest_from {
+            Some(r) => {
+                w_u8(1, &mut out);
+                w_usize(r, &mut out);
+            }
+            None => w_u8(0, &mut out),
+        }
+        w_bool(p.is_async, &mut out);
+        w_u32(p.ops.len() as u32, &mut out);
+        for op in &p.ops {
+            write_op(op, &mut out);
+        }
+    }
+    out
+}
+
+/// Reloads a compiled program from a `KTBC` artifact.
+///
+/// # Errors
+/// Returns [`DecodeError`] for a bad magic/version, truncation, or corrupt tag.
+pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
+    let mut r = Reader { bytes, pos: 0 };
+    if r.take(4)? != MAGIC {
+        return Err(DecodeError::BadMagic);
+    }
+    let version = r.u16()?;
+    if version != VERSION {
+        return Err(DecodeError::BadVersion(version));
+    }
+    let n = r.u32()? as usize;
+    let mut protos = Vec::with_capacity(n);
+    for _ in 0..n {
+        let n_regs = r.usize()?;
+        let n_params = r.usize()?;
+        let n_captures = r.usize()?;
+        let rest_from = if r.u8()? == 1 { Some(r.usize()?) } else { None };
+        let is_async = r.boolean()?;
+        let n_ops = r.u32()? as usize;
+        let mut ops = Vec::with_capacity(n_ops);
+        for _ in 0..n_ops {
+            ops.push(read_op(&mut r)?);
+        }
+        protos.push(FnProto {
+            ops,
+            n_regs,
+            n_params,
+            n_captures,
+            rest_from,
+            is_async,
+        });
+    }
+    Ok(protos)
+}
+
+/// Writes one op: a tag byte followed by its fields.
+fn write_op(op: &Op, out: &mut Vec<u8>) {
+    // A 3-register op: `tag dst a b`.
+    let bin = |tag: u8, dst: Reg, a: Reg, b: Reg, out: &mut Vec<u8>| {
+        w_u8(tag, out);
+        w_reg(dst, out);
+        w_reg(a, out);
+        w_reg(b, out);
+    };
+    let un = |tag: u8, dst: Reg, a: Reg, out: &mut Vec<u8>| {
+        w_u8(tag, out);
+        w_reg(dst, out);
+        w_reg(a, out);
+    };
+    match op {
+        Op::LoadConst { dst, value } => {
+            w_u8(0, out);
+            w_reg(*dst, out);
+            w_value(*value, out);
+        }
+        Op::Add { dst, a, b } => bin(1, *dst, *a, *b, out),
+        Op::Sub { dst, a, b } => bin(2, *dst, *a, *b, out),
+        Op::Mul { dst, a, b } => bin(3, *dst, *a, *b, out),
+        Op::Div { dst, a, b } => bin(4, *dst, *a, *b, out),
+        Op::Mod { dst, a, b } => bin(5, *dst, *a, *b, out),
+        Op::ValueBin { dst, op, a, b } => {
+            w_u8(6, out);
+            w_reg(*dst, out);
+            w_u8(*op, out);
+            w_reg(*a, out);
+            w_reg(*b, out);
+        }
+        Op::HasProp { dst, key, obj } => bin(7, *dst, *key, *obj, out),
+        Op::IsBuiltin { dst, obj, kind } => {
+            w_u8(8, out);
+            w_reg(*dst, out);
+            w_reg(*obj, out);
+            w_u8(*kind, out);
+        }
+        Op::DeleteProp { dst, obj, key } => bin(9, *dst, *obj, *key, out),
+        Op::SetClassTag { obj, class_id } => {
+            w_u8(10, out);
+            w_reg(*obj, out);
+            w_u32(*class_id, out);
+        }
+        Op::DefineAccessor {
+            obj,
+            key,
+            getter,
+            setter,
+        } => {
+            w_u8(11, out);
+            w_reg(*obj, out);
+            w_str(key, out);
+            w_reg(*getter, out);
+            w_reg(*setter, out);
+        }
+        Op::InstanceOf { dst, obj, ids } => {
+            w_u8(12, out);
+            w_reg(*dst, out);
+            w_reg(*obj, out);
+            w_u32s(ids, out);
+        }
+        Op::TypeOf { dst, a } => un(13, *dst, *a, out),
+        Op::BitNot { dst, a } => un(14, *dst, *a, out),
+        Op::Neg { dst, a } => un(15, *dst, *a, out),
+        Op::Not { dst, a } => un(16, *dst, *a, out),
+        Op::Lt { dst, a, b } => bin(17, *dst, *a, *b, out),
+        Op::Move { dst, src } => un(18, *dst, *src, out),
+        Op::JumpIfFalse { cond, target } => {
+            w_u8(19, out);
+            w_reg(*cond, out);
+            w_usize(*target, out);
+        }
+        Op::Jump { target } => {
+            w_u8(20, out);
+            w_usize(*target, out);
+        }
+        Op::AddValue { dst, a, b } => bin(21, *dst, *a, *b, out),
+        Op::StrictEq { dst, a, b } => bin(22, *dst, *a, *b, out),
+        Op::NewString { dst, value } => {
+            w_u8(23, out);
+            w_reg(*dst, out);
+            w_str(value, out);
+        }
+        Op::NewArray { dst, len } => {
+            w_u8(24, out);
+            w_reg(*dst, out);
+            w_usize(*len, out);
+        }
+        Op::GetElem { dst, arr, index } => bin(25, *dst, *arr, *index, out),
+        Op::SetElem { arr, index, src } => bin(26, *arr, *index, *src, out),
+        Op::GetKey { dst, obj, key } => bin(27, *dst, *obj, *key, out),
+        Op::SetKey { obj, key, src } => bin(28, *obj, *key, *src, out),
+        Op::ObjectSpread { dst, src } => un(29, *dst, *src, out),
+        Op::EnumKeys { dst, obj } => un(30, *dst, *obj, out),
+        Op::ArrayLen { dst, arr } => un(31, *dst, *arr, out),
+        Op::CollectionSize { dst, recv } => un(32, *dst, *recv, out),
+        Op::ArrayPush { arr, src } => un(33, *arr, *src, out),
+        Op::ArrayExtend { arr, src } => un(34, *arr, *src, out),
+        Op::ArraySliceFrom { dst, src, from } => bin(35, *dst, *src, *from, out),
+        Op::ObjectRest { dst, src, exclude } => {
+            w_u8(36, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+            w_strs(exclude, out);
+        }
+        Op::NewCollection { dst, is_set, seed } => {
+            w_u8(37, out);
+            w_reg(*dst, out);
+            w_bool(*is_set, out);
+            match seed {
+                Some(s) => {
+                    w_u8(1, out);
+                    w_reg(*s, out);
+                }
+                None => w_u8(0, out),
+            }
+        }
+        Op::NewRegExp { dst, source, flags } => {
+            w_u8(38, out);
+            w_reg(*dst, out);
+            w_str(source, out);
+            w_str(flags, out);
+        }
+        Op::NewObject { dst } => {
+            w_u8(39, out);
+            w_reg(*dst, out);
+        }
+        Op::SetProp { obj, key, src } => {
+            w_u8(40, out);
+            w_reg(*obj, out);
+            w_str(key, out);
+            w_reg(*src, out);
+        }
+        Op::GetProp { dst, obj, key } => {
+            w_u8(41, out);
+            w_reg(*dst, out);
+            w_reg(*obj, out);
+            w_str(key, out);
+        }
+        Op::Call { dst, func, args } => {
+            w_u8(42, out);
+            w_reg(*dst, out);
+            w_u32(*func, out);
+            w_regs(args, out);
+        }
+        Op::LoadFunc { dst, func } => {
+            w_u8(43, out);
+            w_reg(*dst, out);
+            w_u32(*func, out);
+        }
+        Op::MakeClosure {
+            dst,
+            func,
+            captures,
+        } => {
+            w_u8(44, out);
+            w_reg(*dst, out);
+            w_u32(*func, out);
+            w_regs(captures, out);
+        }
+        Op::CallValue { dst, callee, args } => {
+            w_u8(45, out);
+            w_reg(*dst, out);
+            w_reg(*callee, out);
+            w_regs(args, out);
+        }
+        Op::CallValueThis {
+            dst,
+            callee,
+            recv,
+            args,
+        } => {
+            w_u8(46, out);
+            w_reg(*dst, out);
+            w_reg(*callee, out);
+            w_reg(*recv, out);
+            w_regs(args, out);
+        }
+        Op::CallMethod {
+            dst,
+            recv,
+            key,
+            args,
+        } => {
+            w_u8(47, out);
+            w_reg(*dst, out);
+            w_reg(*recv, out);
+            w_str(key, out);
+            w_regs(args, out);
+        }
+        Op::CallCtor { ctor, recv, args } => {
+            w_u8(48, out);
+            w_u32(*ctor, out);
+            w_reg(*recv, out);
+            w_regs(args, out);
+        }
+        Op::CallNative { dst, native, args } => {
+            w_u8(49, out);
+            w_reg(*dst, out);
+            w_u16(*native, out);
+            w_regs(args, out);
+        }
+        Op::PushHandler { target, reg } => {
+            w_u8(50, out);
+            w_usize(*target, out);
+            w_reg(*reg, out);
+        }
+        Op::PopHandler => w_u8(51, out),
+        Op::Throw { src } => {
+            w_u8(52, out);
+            w_reg(*src, out);
+        }
+        Op::Return { src } => {
+            w_u8(53, out);
+            w_reg(*src, out);
+        }
+    }
+}
+
+/// Reads one op (the inverse of [`write_op`]).
+fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
+    let tag = r.u8()?;
+    Ok(match tag {
+        0 => Op::LoadConst {
+            dst: r.reg()?,
+            value: r.value()?,
+        },
+        1 => Op::Add {
+            dst: r.reg()?,
+            a: r.reg()?,
+            b: r.reg()?,
+        },
+        2 => Op::Sub {
+            dst: r.reg()?,
+            a: r.reg()?,
+            b: r.reg()?,
+        },
+        3 => Op::Mul {
+            dst: r.reg()?,
+            a: r.reg()?,
+            b: r.reg()?,
+        },
+        4 => Op::Div {
+            dst: r.reg()?,
+            a: r.reg()?,
+            b: r.reg()?,
+        },
+        5 => Op::Mod {
+            dst: r.reg()?,
+            a: r.reg()?,
+            b: r.reg()?,
+        },
+        6 => Op::ValueBin {
+            dst: r.reg()?,
+            op: r.u8()?,
+            a: r.reg()?,
+            b: r.reg()?,
+        },
+        7 => Op::HasProp {
+            dst: r.reg()?,
+            key: r.reg()?,
+            obj: r.reg()?,
+        },
+        8 => Op::IsBuiltin {
+            dst: r.reg()?,
+            obj: r.reg()?,
+            kind: r.u8()?,
+        },
+        9 => Op::DeleteProp {
+            dst: r.reg()?,
+            obj: r.reg()?,
+            key: r.reg()?,
+        },
+        10 => Op::SetClassTag {
+            obj: r.reg()?,
+            class_id: r.u32()?,
+        },
+        11 => Op::DefineAccessor {
+            obj: r.reg()?,
+            key: r.string()?,
+            getter: r.reg()?,
+            setter: r.reg()?,
+        },
+        12 => Op::InstanceOf {
+            dst: r.reg()?,
+            obj: r.reg()?,
+            ids: Rc::from(r.u32s()?.as_slice()),
+        },
+        13 => Op::TypeOf {
+            dst: r.reg()?,
+            a: r.reg()?,
+        },
+        14 => Op::BitNot {
+            dst: r.reg()?,
+            a: r.reg()?,
+        },
+        15 => Op::Neg {
+            dst: r.reg()?,
+            a: r.reg()?,
+        },
+        16 => Op::Not {
+            dst: r.reg()?,
+            a: r.reg()?,
+        },
+        17 => Op::Lt {
+            dst: r.reg()?,
+            a: r.reg()?,
+            b: r.reg()?,
+        },
+        18 => Op::Move {
+            dst: r.reg()?,
+            src: r.reg()?,
+        },
+        19 => Op::JumpIfFalse {
+            cond: r.reg()?,
+            target: r.usize()?,
+        },
+        20 => Op::Jump { target: r.usize()? },
+        21 => Op::AddValue {
+            dst: r.reg()?,
+            a: r.reg()?,
+            b: r.reg()?,
+        },
+        22 => Op::StrictEq {
+            dst: r.reg()?,
+            a: r.reg()?,
+            b: r.reg()?,
+        },
+        23 => Op::NewString {
+            dst: r.reg()?,
+            value: r.string()?,
+        },
+        24 => Op::NewArray {
+            dst: r.reg()?,
+            len: r.usize()?,
+        },
+        25 => Op::GetElem {
+            dst: r.reg()?,
+            arr: r.reg()?,
+            index: r.reg()?,
+        },
+        26 => Op::SetElem {
+            arr: r.reg()?,
+            index: r.reg()?,
+            src: r.reg()?,
+        },
+        27 => Op::GetKey {
+            dst: r.reg()?,
+            obj: r.reg()?,
+            key: r.reg()?,
+        },
+        28 => Op::SetKey {
+            obj: r.reg()?,
+            key: r.reg()?,
+            src: r.reg()?,
+        },
+        29 => Op::ObjectSpread {
+            dst: r.reg()?,
+            src: r.reg()?,
+        },
+        30 => Op::EnumKeys {
+            dst: r.reg()?,
+            obj: r.reg()?,
+        },
+        31 => Op::ArrayLen {
+            dst: r.reg()?,
+            arr: r.reg()?,
+        },
+        32 => Op::CollectionSize {
+            dst: r.reg()?,
+            recv: r.reg()?,
+        },
+        33 => Op::ArrayPush {
+            arr: r.reg()?,
+            src: r.reg()?,
+        },
+        34 => Op::ArrayExtend {
+            arr: r.reg()?,
+            src: r.reg()?,
+        },
+        35 => Op::ArraySliceFrom {
+            dst: r.reg()?,
+            src: r.reg()?,
+            from: r.reg()?,
+        },
+        36 => Op::ObjectRest {
+            dst: r.reg()?,
+            src: r.reg()?,
+            exclude: Rc::from(r.strings()?.as_slice()),
+        },
+        37 => Op::NewCollection {
+            dst: r.reg()?,
+            is_set: r.boolean()?,
+            seed: if r.u8()? == 1 { Some(r.reg()?) } else { None },
+        },
+        38 => Op::NewRegExp {
+            dst: r.reg()?,
+            source: r.string()?,
+            flags: r.string()?,
+        },
+        39 => Op::NewObject { dst: r.reg()? },
+        40 => Op::SetProp {
+            obj: r.reg()?,
+            key: r.string()?,
+            src: r.reg()?,
+        },
+        41 => Op::GetProp {
+            dst: r.reg()?,
+            obj: r.reg()?,
+            key: r.string()?,
+        },
+        42 => Op::Call {
+            dst: r.reg()?,
+            func: r.u32()?,
+            args: r.regs()?,
+        },
+        43 => Op::LoadFunc {
+            dst: r.reg()?,
+            func: r.u32()?,
+        },
+        44 => Op::MakeClosure {
+            dst: r.reg()?,
+            func: r.u32()?,
+            captures: r.regs()?,
+        },
+        45 => Op::CallValue {
+            dst: r.reg()?,
+            callee: r.reg()?,
+            args: r.regs()?,
+        },
+        46 => Op::CallValueThis {
+            dst: r.reg()?,
+            callee: r.reg()?,
+            recv: r.reg()?,
+            args: r.regs()?,
+        },
+        47 => Op::CallMethod {
+            dst: r.reg()?,
+            recv: r.reg()?,
+            key: r.string()?,
+            args: r.regs()?,
+        },
+        48 => Op::CallCtor {
+            ctor: r.u32()?,
+            recv: r.reg()?,
+            args: r.regs()?,
+        },
+        49 => Op::CallNative {
+            dst: r.reg()?,
+            native: r.u16()?,
+            args: r.regs()?,
+        },
+        50 => Op::PushHandler {
+            target: r.usize()?,
+            reg: r.reg()?,
+        },
+        51 => Op::PopHandler,
+        52 => Op::Throw { src: r.reg()? },
+        53 => Op::Return { src: r.reg()? },
+        t => return Err(DecodeError::BadTag(t)),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::Parser;
+    use crate::realm::Realm;
+
+    /// Compiles `src`, round-trips its bytecode through the codec, runs the
+    /// reloaded program, and returns its completion display string.
+    fn roundtrip_run(src: &str) -> String {
+        let program = Parser::parse_program(src).expect("parse");
+        let protos = crate::nbvm::compile_program(&program).expect("compile");
+        let bytes = serialize(&protos);
+        // It's a KTBC container.
+        assert_eq!(&bytes[0..4], MAGIC);
+        let reloaded = deserialize(&bytes).expect("deserialize");
+        // The decode is structurally exact (same byte image when re-serialized).
+        assert_eq!(
+            serialize(&reloaded),
+            bytes,
+            "round-trip is not byte-identical"
+        );
+
+        let mut realm = Realm::new();
+        let (value, _out) =
+            crate::nbvm::run_program_capturing(&mut realm, &reloaded, 0, &[]).expect("run");
+        realm.to_display_string(value)
+    }
+
+    #[test]
+    fn roundtrips_and_runs_a_varied_program() {
+        // Exercises constants, arithmetic, closures, classes, arrays, control
+        // flow, strings, and calls — a broad span of opcodes.
+        assert_eq!(roundtrip_run("1 + 2 * 3"), "7");
+        assert_eq!(
+            roundtrip_run("function makeAdder(x){ return y => x + y; } makeAdder(10)(5)"),
+            "15"
+        );
+        assert_eq!(
+            roundtrip_run(
+                "class P { constructor(x){ this.x = x; } get(){ return this.x; } } new P(9).get()"
+            ),
+            "9"
+        );
+        assert_eq!(
+            roundtrip_run("let s = 0; for (let i = 0; i < 5; i++) { s += i; } s"),
+            "10"
+        );
+        assert_eq!(
+            roundtrip_run("[1,2,3,4].map(x => x * x).filter(x => x > 4).join(',')"),
+            "9,16"
+        );
+        assert_eq!(roundtrip_run("`hi ${'a' + 'b'}`"), "hi ab");
+    }
+
+    #[test]
+    fn rejects_corrupt_artifacts() {
+        assert_eq!(deserialize(b"XXXX...").unwrap_err(), DecodeError::BadMagic);
+        // Right magic, wrong version.
+        let mut bad = MAGIC.to_vec();
+        bad.extend_from_slice(&999u16.to_le_bytes());
+        bad.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(deserialize(&bad).unwrap_err(), DecodeError::BadVersion(999));
+        // Truncated mid-record.
+        let program = Parser::parse_program("1 + 1").unwrap();
+        let protos = crate::nbvm::compile_program(&program).unwrap();
+        let bytes = serialize(&protos);
+        assert_eq!(
+            deserialize(&bytes[..bytes.len() - 1]).unwrap_err(),
+            DecodeError::Truncated
+        );
+    }
+}

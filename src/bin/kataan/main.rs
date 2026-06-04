@@ -47,13 +47,18 @@ fn main() -> ExitCode {
             }
         },
         ["eval" | "run", "-e", source] => run_eval_nb(source, "<argv>"),
-        ["eval" | "run", path] => match std::fs::read_to_string(path) {
-            Ok(source) => run_eval_nb(&source, path),
+        // `run` accepts either JS source or a compiled `.ktbc` artifact (detected
+        // by its `KTBC` magic).
+        ["eval" | "run", path] => match std::fs::read(path) {
+            Ok(bytes) if bytes.starts_with(b"KTBC") => run_bytecode(&bytes, path),
+            Ok(bytes) => run_eval_nb(&String::from_utf8_lossy(&bytes), path),
             Err(e) => {
                 eprintln!("kataan: cannot read {path}: {e}");
                 ExitCode::FAILURE
             }
         },
+        // Compile JS to a portable `.ktbc` bytecode artifact (Phase D′).
+        ["compile", path, "-o", out] | ["compile", "-o", out, path] => run_compile(path, out),
         // Run through the new-representation engine (`ROADMAP.md` §3).
         ["nbrun", "-e", source] => run_eval_nb(source, "<argv>"),
         ["nbrun", path] => match std::fs::read_to_string(path) {
@@ -137,6 +142,70 @@ fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
     }
 }
 
+/// Compiles `path`'s JavaScript to a portable `.ktbc` bytecode artifact written
+/// to `out` (Phase D′ — `kataan compile app.js -o app.ktbc`).
+fn run_compile(path: &str, out: &str) -> ExitCode {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("kataan: cannot read {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let program = match Parser::parse_program(&source) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kataan: {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let protos = match kataan::nbvm::compile_program(&program) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kataan: {path}: cannot compile to bytecode: {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bytes = kataan::bytecode::serialize(&protos);
+    match std::fs::write(out, &bytes) {
+        Ok(()) => {
+            eprintln!("kataan: wrote {} ({} bytes)", out, bytes.len());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kataan: cannot write {out}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Loads and runs a compiled `.ktbc` bytecode artifact (the inverse of
+/// `compile`), printing any `console` output and a non-empty completion value.
+fn run_bytecode(bytes: &[u8], origin: &str) -> ExitCode {
+    let protos = match kataan::bytecode::deserialize(bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kataan: {origin}: invalid bytecode artifact: {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut realm = kataan::realm::Realm::new();
+    match kataan::nbvm::run_program_capturing(&mut realm, &protos, 0, &[]) {
+        Ok((value, output)) => {
+            print!("{output}");
+            let completion = realm.to_display_string(value);
+            if !completion.is_empty() && completion != "undefined" {
+                println!("{completion}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kataan: {origin}: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Runs a read-eval-print loop on the new-representation tree-walker
 /// (`nbexec::Interp`), which carries its own `console` and persists globals
 /// across lines. Each line's AST is leaked to `&'static` so values the
@@ -208,6 +277,8 @@ fn print_usage() {
          kataan eval <FILE>        evaluate a program (prints completion value)\n    \
          kataan eval -e <SOURCE>   evaluate a source string\n    \
          kataan repl               start an interactive REPL\n    \
+         kataan compile <FILE> -o <OUT.ktbc>  compile JS to a bytecode artifact\n    \
+         kataan run <FILE.ktbc>    run a compiled bytecode artifact\n    \
          kataan nbrun <FILE>       alias for `run` (the new-representation engine)\n    \
          kataan nbrun -e <SOURCE>  run a source string on the new engine\n    \
          kataan --version          print the version\n    \
