@@ -24,16 +24,19 @@
 //! [`Handle`]: crate::heap::Handle
 
 use crate::atom::{Atom, AtomTable};
+use crate::cell::Cell;
 use crate::gc::{self, Stats};
 use crate::heap::{Handle, Heap};
 use crate::nanbox::NanBox;
 use crate::object::Object;
+use crate::rope::Rope;
 use crate::shape::Shape;
 use alloc::rc::Rc;
+use alloc::vec::Vec;
 
 /// An object-model context: the heap, the shared root shape, and the atom table.
 pub struct Realm {
-    heap: Heap<Object>,
+    heap: Heap<Cell>,
     root_shape: Rc<Shape>,
     atoms: AtomTable,
 }
@@ -58,20 +61,50 @@ impl Realm {
     /// Allocates a fresh empty object in the heap and returns its handle.
     pub fn new_object(&mut self) -> Handle {
         let obj = Object::new(Rc::clone(&self.root_shape));
-        self.heap.alloc(obj)
+        self.heap.alloc(Cell::Object(obj))
+    }
+
+    /// Allocates a string value in the heap and returns its handle.
+    pub fn new_string(&mut self, s: &str) -> Handle {
+        self.heap.alloc(Cell::Str(Rope::from(s)))
+    }
+
+    /// Allocates an array of `elements` in the heap and returns its handle.
+    pub fn new_array(&mut self, elements: Vec<NanBox>) -> Handle {
+        self.heap.alloc(Cell::Array(elements))
+    }
+
+    /// The string at `handle` as a `String`, or `None` if it is not a string
+    /// (or the handle is stale).
+    #[must_use]
+    pub fn string_value(&self, handle: Handle) -> Option<alloc::string::String> {
+        Some(self.heap.get(handle)?.as_str()?.materialize())
+    }
+
+    /// The array elements at `handle`, or `None` if it is not an array.
+    #[must_use]
+    pub fn array_elements(&self, handle: Handle) -> Option<&[NanBox]> {
+        self.heap.get(handle)?.as_array()
+    }
+
+    /// The `typeof` string for the heap value at `handle` (`"string"`/`"object"`),
+    /// or `None` if the handle is stale.
+    #[must_use]
+    pub fn type_of(&self, handle: Handle) -> Option<&'static str> {
+        Some(self.heap.get(handle)?.type_of())
     }
 
     /// The value of own property `key` on the object at `handle`, or `None` if
-    /// the property is absent or the handle is stale.
+    /// the property is absent, the cell is not an object, or the handle is stale.
     #[must_use]
     pub fn get_property(&self, handle: Handle, key: &str) -> Option<NanBox> {
-        self.heap.get(handle)?.get(key)
+        self.heap.get(handle)?.as_object()?.get(key)
     }
 
     /// Sets own property `key` to `value` on the object at `handle`. Returns
-    /// `false` if the handle is stale (nothing was set).
+    /// `false` if the handle is stale or the cell is not an object.
     pub fn set_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
-        match self.heap.get_mut(handle) {
+        match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             Some(obj) => {
                 obj.set(key, value);
                 true
@@ -129,8 +162,8 @@ mod tests {
         realm.set_property(a, "p", NanBox::number(1.0));
         realm.set_property(b, "p", NanBox::number(9.0));
         // Same structure built from the realm's shared root → same shape.
-        let sa = Rc::clone(realm.heap.get(a).unwrap().shape());
-        let sb = Rc::clone(realm.heap.get(b).unwrap().shape());
+        let sa = Rc::clone(realm.heap.get(a).unwrap().as_object().unwrap().shape());
+        let sb = Rc::clone(realm.heap.get(b).unwrap().as_object().unwrap().shape());
         assert!(Rc::ptr_eq(&sa, &sb));
     }
 
@@ -173,5 +206,40 @@ mod tests {
         let a = realm.intern("length");
         let b = realm.intern("length");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn strings_and_arrays_are_heap_values() {
+        let mut realm = Realm::new();
+        let s = realm.new_string("hello");
+        let arr = realm.new_array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)]);
+        let obj = realm.new_object();
+        assert_eq!(realm.string_value(s).as_deref(), Some("hello"));
+        assert_eq!(realm.array_elements(arr).map(<[_]>::len), Some(2));
+        assert_eq!(realm.type_of(s), Some("string"));
+        assert_eq!(realm.type_of(arr), Some("object"));
+        assert_eq!(realm.type_of(obj), Some("object"));
+        // A property op on a string cell is rejected (not an object).
+        assert!(!realm.set_property(s, "x", NanBox::number(1.0)));
+        assert_eq!(realm.get_property(s, "x"), None);
+    }
+
+    #[test]
+    fn gc_keeps_a_mixed_object_array_string_graph() {
+        let mut realm = Realm::new();
+        // obj.name -> string; obj.items -> array; array[0] -> obj (a cycle).
+        let obj = realm.new_object();
+        let name = realm.new_string("widget");
+        let items = realm.new_array(alloc::vec![NanBox::handle(obj.to_raw())]);
+        realm.set_property(obj, "name", NanBox::handle(name.to_raw()));
+        realm.set_property(obj, "items", NanBox::handle(items.to_raw()));
+        let _unreachable = realm.new_string("garbage");
+        assert_eq!(realm.object_count(), 4);
+
+        let stats = realm.collect(&[obj]);
+        assert_eq!(stats.marked, 3); // obj, name, items (cycle obj<-items kept)
+        assert_eq!(stats.swept, 1); // the unreachable string
+        assert!(realm.is_live(obj) && realm.is_live(name) && realm.is_live(items));
+        assert_eq!(realm.string_value(name).as_deref(), Some("widget"));
     }
 }

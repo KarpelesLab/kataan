@@ -58,6 +58,11 @@ pub mod shape;
 #[cfg(feature = "alloc")]
 pub mod object;
 
+/// Heap cells — the reference types (object / string / array) a heap slot holds.
+/// Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod cell;
+
 /// A mark-and-sweep tracing garbage collector over [`heap::Heap`] — reclaims
 /// unreachable objects, including reference cycles. Needs `alloc`.
 #[cfg(feature = "alloc")]

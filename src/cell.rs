@@ -1,0 +1,149 @@
+//! Heap cells — the reference types the managed heap holds (`ROADMAP.md` §3).
+//!
+//! A NaN-boxed handle can point at any *reference* value, not just a plain
+//! object: a string, an array, a function, … all live on the heap. `Cell` is
+//! that sum — what a [`heap::Heap`](crate::heap::Heap) slot actually stores in
+//! the performance model. This turn covers the three core kinds:
+//! - `Cell::Object` — a shape + slots object,
+//! - `Cell::Str` — a string *value*, backed by a [`rope::Rope`](crate::rope::Rope)
+//!   so concatenation stays O(1),
+//! - `Cell::Array` — a dense vector of element values.
+//!
+//! A cell knows how to enumerate its outgoing handles, so the collector traces a
+//! mixed object/array/string graph uniformly: objects report their property
+//! slots, arrays their elements, strings nothing.
+//!
+//! Pure, safe `alloc`-only Rust.
+
+use crate::gc::Trace;
+use crate::heap::Handle;
+use crate::nanbox::NanBox;
+use crate::object::Object;
+use crate::rope::Rope;
+use alloc::vec::Vec;
+
+/// A heap-allocated reference value.
+pub enum Cell {
+    /// An ordinary object (shape + value slots).
+    Object(Object),
+    /// A string value (rope-backed for O(1) concatenation).
+    Str(Rope),
+    /// A dense array of element values.
+    Array(Vec<NanBox>),
+}
+
+impl Cell {
+    /// The object, if this cell is one.
+    #[must_use]
+    pub fn as_object(&self) -> Option<&Object> {
+        match self {
+            Cell::Object(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The object mutably, if this cell is one.
+    pub fn as_object_mut(&mut self) -> Option<&mut Object> {
+        match self {
+            Cell::Object(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The string, if this cell is one.
+    #[must_use]
+    pub fn as_str(&self) -> Option<&Rope> {
+        match self {
+            Cell::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The array elements, if this cell is one.
+    #[must_use]
+    pub fn as_array(&self) -> Option<&[NanBox]> {
+        match self {
+            Cell::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The array elements mutably, if this cell is one.
+    pub fn as_array_mut(&mut self) -> Option<&mut Vec<NanBox>> {
+        match self {
+            Cell::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The `typeof` string for this reference value (`"string"` for strings,
+    /// `"object"` for objects and arrays — JS has no array primitive type).
+    #[must_use]
+    pub fn type_of(&self) -> &'static str {
+        match self {
+            Cell::Str(_) => "string",
+            Cell::Object(_) | Cell::Array(_) => "object",
+        }
+    }
+}
+
+impl Trace for Cell {
+    fn trace(&self, visit: &mut dyn FnMut(Handle)) {
+        match self {
+            Cell::Object(o) => o.trace_handles(visit),
+            Cell::Array(elems) => {
+                for e in elems {
+                    if let Some(raw) = e.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                }
+            }
+            Cell::Str(_) => {} // a string references no handles
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heap::Heap;
+    use crate::shape::Shape;
+    use alloc::rc::Rc;
+
+    #[test]
+    fn accessors_select_the_right_kind() {
+        let obj = Cell::Object(Object::new(Shape::root()));
+        assert!(obj.as_object().is_some());
+        assert!(obj.as_str().is_none());
+        assert!(obj.as_array().is_none());
+        assert_eq!(obj.type_of(), "object");
+
+        let s = Cell::Str(Rope::from("hi"));
+        assert_eq!(s.as_str().map(Rope::materialize).as_deref(), Some("hi"));
+        assert_eq!(s.type_of(), "string");
+
+        let a = Cell::Array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)]);
+        assert_eq!(a.as_array().map(<[_]>::len), Some(2));
+        assert_eq!(a.type_of(), "object");
+    }
+
+    #[test]
+    fn gc_traces_arrays_and_objects_uniformly() {
+        // root array -> object -> (handle to) a leaf; plus an unreachable string.
+        let mut heap: Heap<Cell> = Heap::new();
+        let root_shape = Shape::root();
+
+        let leaf = heap.alloc(Cell::Object(Object::new(Rc::clone(&root_shape))));
+        let mut mid = Object::new(Rc::clone(&root_shape));
+        mid.set("leaf", NanBox::handle(leaf.to_raw()));
+        let mid_h = heap.alloc(Cell::Object(mid));
+        let arr = heap.alloc(Cell::Array(alloc::vec![NanBox::handle(mid_h.to_raw())]));
+        let _garbage = heap.alloc(Cell::Str(Rope::from("unreferenced")));
+        assert_eq!(heap.len(), 4);
+
+        let stats = crate::gc::collect(&mut heap, &[arr]);
+        assert_eq!(stats.marked, 3); // arr -> mid -> leaf
+        assert_eq!(stats.swept, 1); // the string
+        assert!(heap.is_live(arr) && heap.is_live(mid_h) && heap.is_live(leaf));
+    }
+}
