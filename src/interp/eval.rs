@@ -1530,6 +1530,27 @@ impl<'a> Interp<'a> {
         key: &str,
         args: Vec<Value<'a>>,
     ) -> Completion<'a, Value<'a>> {
+        // `Function.prototype.call`/`apply` on a callable receiver.
+        if obj.is_callable() && (key == "call" || key == "apply") {
+            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let call_args = if key == "call" {
+                args.get(1..).map(<[_]>::to_vec).unwrap_or_default()
+            } else {
+                match args.get(1) {
+                    Some(Value::Object(o)) if o.is_array() => {
+                        o.elements().expect("array").borrow().clone()
+                    }
+                    None | Some(Value::Null | Value::Undefined) => Vec::new(),
+                    Some(_) => {
+                        return Err(make_error(
+                            "TypeError",
+                            "Function.prototype.apply: argument list must be an array",
+                        ));
+                    }
+                }
+            };
+            return self.call_with_this(obj, this_arg, call_args);
+        }
         let member = self.get_member(&obj, key)?;
         if member.is_callable() {
             return self.call_with_this(member, obj, args);

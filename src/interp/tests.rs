@@ -372,6 +372,40 @@ fn bytecode_vm_closures() {
 }
 
 #[test]
+fn function_apply_and_call() {
+    // Tree-walker.
+    assert_eq!(
+        eval("function add(a, b, c) { return a + b + c; } add.apply(null, [1, 2, 3])"),
+        "6"
+    );
+    assert_eq!(
+        eval("function add(a, b, c) { return a + b + c; } add.call(null, 4, 5, 6)"),
+        "15"
+    );
+    assert_eq!(eval("Math.max.apply(null, [7, 2, 9, 1])"), "9");
+    // `this` rebinding via call/apply.
+    assert_eq!(
+        eval("const o = { v: 10, get() { return this.v; } }; o.get.call({ v: 99 })"),
+        "99"
+    );
+    assert_eq!(
+        eval("function id() { return this.x; } id.apply({ x: 'hi' })"),
+        "hi"
+    );
+    // apply with no/empty argument list.
+    assert_eq!(eval("function n() { return 7; } n.apply(null)"), "7");
+    // Through the bytecode VM.
+    assert_eq!(
+        eval_bc("function mul(a, b) { return a * b; } mul.apply(null, [6, 7])"),
+        "42"
+    );
+    assert_eq!(
+        eval_bc("function mul(a, b) { return a * b; } mul.call(null, 3, 4)"),
+        "12"
+    );
+}
+
+#[test]
 fn bytecode_vm_update_operator() {
     // Prefix and postfix, increment and decrement, on locals.
     assert_eq!(eval_bc("let x = 5; ++x"), "6");
