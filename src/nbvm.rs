@@ -575,12 +575,9 @@ impl Compiler {
                 finalizer,
                 ..
             } => {
-                if finalizer.is_some() {
-                    return Err(CompileError::Unsupported("finally"));
+                if handler.is_none() && finalizer.is_none() {
+                    return Err(CompileError::Unsupported("try without catch/finally"));
                 }
-                let Some(catch) = handler else {
-                    return Err(CompileError::Unsupported("try without catch"));
-                };
                 // The register the thrown value lands in (and the catch binding,
                 // if any, names it).
                 let catch_reg = self.alloc();
@@ -589,27 +586,38 @@ impl Compiler {
                     target: 0,
                     reg: catch_reg,
                 });
-                // try body
-                self.scopes.push(alloc::collections::BTreeMap::new());
-                for s in block {
-                    self.stmt(s)?;
-                }
-                self.scopes.pop();
+                self.block_stmts(block)?;
                 self.ops.push(Op::PopHandler);
+                // Normal completion: run `finally`, then jump past the handler.
+                if let Some(fin) = finalizer {
+                    self.block_stmts(fin)?;
+                }
                 let jend = self.emit_jump();
-                // catch entry
+
+                // Handler entry: the thrown value is in `catch_reg`.
                 self.patch(push);
-                self.scopes.push(alloc::collections::BTreeMap::new());
-                if let Some(BindingTarget::Ident(Ident { name, .. })) = &catch.param {
-                    self.scopes
-                        .last_mut()
-                        .expect("a scope")
-                        .insert(String::from(&**name), catch_reg);
+                if let Some(catch) = handler {
+                    self.scopes.push(alloc::collections::BTreeMap::new());
+                    if let Some(BindingTarget::Ident(Ident { name, .. })) = &catch.param {
+                        self.scopes
+                            .last_mut()
+                            .expect("a scope")
+                            .insert(String::from(&**name), catch_reg);
+                    }
+                    for s in &catch.body {
+                        self.stmt(s)?;
+                    }
+                    self.scopes.pop();
+                    if let Some(fin) = finalizer {
+                        self.block_stmts(fin)?;
+                    }
+                } else {
+                    // `try { } finally { }`: run `finally`, then re-raise.
+                    if let Some(fin) = finalizer {
+                        self.block_stmts(fin)?;
+                    }
+                    self.ops.push(Op::Throw { src: catch_reg });
                 }
-                for s in &catch.body {
-                    self.stmt(s)?;
-                }
-                self.scopes.pop();
                 self.patch(jend);
                 Ok(None)
             }
@@ -963,6 +971,16 @@ impl Compiler {
         Ok(r)
     }
 
+    /// Compiles a statement list in a fresh lexical scope.
+    fn block_stmts(&mut self, stmts: &'_ [Stmt]) -> Result<(), CompileError> {
+        self.scopes.push(alloc::collections::BTreeMap::new());
+        for s in stmts {
+            self.stmt(s)?;
+        }
+        self.scopes.pop();
+        Ok(())
+    }
+
     /// Emits the op(s) for `a <op> b` into a fresh register, returning it.
     fn emit_binop(&mut self, op: BinaryOp, a: Reg, b: Reg) -> Result<Reg, CompileError> {
         let dst = self.alloc();
@@ -1154,6 +1172,32 @@ mod tests {
                 "let s = 0; for (let i = 0; i < 5; i++) { try { if (i === 2) { throw 0; } s += i; } catch (e) { s += 100; } } s"
             ),
             "108"
+        );
+    }
+
+    #[test]
+    fn bytecode_finally() {
+        // finally runs on the normal (no-throw) path.
+        assert_eq!(
+            bc("let log = ''; try { log += 't'; } finally { log += 'f'; } log"),
+            "tf"
+        );
+        // finally runs after the catch on the throwing path.
+        assert_eq!(
+            bc(
+                "let log = ''; try { log += 't'; throw 1; } catch (e) { log += 'c'; } finally { log += 'f'; } log"
+            ),
+            "tcf"
+        );
+        // try/finally (no catch): finally runs, then the throw propagates and is
+        // caught by an outer try.
+        assert_eq!(
+            bc("let log = '';
+                try {
+                  try { log += 't'; throw 'x'; } finally { log += 'f'; }
+                } catch (e) { log += 'o:' + e; }
+                log"),
+            "tfo:x"
         );
     }
 
