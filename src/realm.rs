@@ -151,6 +151,16 @@ impl Realm {
         Some(a.len())
     }
 
+    /// `arr.pop()` — removes and returns the last element (`undefined` if empty
+    /// or not an array).
+    pub fn array_pop(&mut self, handle: Handle) -> NanBox {
+        self.heap
+            .get_mut(handle)
+            .and_then(Cell::as_array_mut)
+            .and_then(Vec::pop)
+            .unwrap_or(NanBox::undefined())
+    }
+
     /// The `typeof` string for the heap value at `handle` (`"string"`/`"object"`),
     /// or `None` if the handle is stale.
     #[must_use]

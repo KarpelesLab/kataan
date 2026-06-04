@@ -14,10 +14,14 @@
 //! - **functions and closures**: declarations (hoisted), expressions, and arrows
 //!   become heap closures capturing their defining scope, so a returned inner
 //!   function still sees its enclosing variables — and calls bind arguments in a
-//!   fresh child scope.
+//!   fresh child scope;
+//! - **exceptions** (`try`/`catch`/`finally`/`throw`); and
+//! - a **starter stdlib**: native globals (`Math`, `String`/`Number`/`parseInt`)
+//!   and built-in String/Array methods, including the higher-order
+//!   `map`/`filter`/`reduce`/`forEach` that call back into closures.
 //!
-//! Exceptions and the stdlib are the remaining structural pieces. Pure, safe
-//! `alloc`-only Rust.
+//! The *full* stdlib port and folding back into the bytecode VM are the
+//! remaining migration work. Pure, safe `alloc`-only Rust.
 
 use crate::ast::{
     Argument, ArrayElement, Arrow, ArrowBody, AssignOp, BinaryOp, BindingTarget, Expr, ForInit,
@@ -256,6 +260,158 @@ impl<'a> Interp<'a> {
         let result = self.run_body(def.body);
         self.current = saved;
         result
+    }
+
+    /// Evaluates a call's arguments.
+    fn eval_args(&mut self, arguments: &'a [Argument]) -> Result<Vec<NanBox>, ExecError> {
+        let mut args = Vec::with_capacity(arguments.len());
+        for a in arguments {
+            match a {
+                Argument::Item(e) => args.push(self.eval(e)?),
+                Argument::Spread(_) => return Err(ExecError::Unsupported("call spread")),
+            }
+        }
+        Ok(args)
+    }
+
+    /// Dispatches a built-in method on a string/array receiver. Returns
+    /// `Ok(None)` if `method` is not a recognized built-in (the caller then
+    /// treats it as an ordinary property-valued function).
+    fn call_method(
+        &mut self,
+        recv: NanBox,
+        method: &str,
+        args: &[NanBox],
+    ) -> Result<Option<NanBox>, ExecError> {
+        let Some(raw) = recv.as_handle() else {
+            return Ok(None);
+        };
+        let handle = crate::heap::Handle::from_raw(raw);
+        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+
+        // --- string methods ---
+        if let Some(s) = self.realm.string_value(handle) {
+            let out = match method {
+                "toUpperCase" => Some(self.new_str(&s.to_uppercase())),
+                "toLowerCase" => Some(self.new_str(&s.to_lowercase())),
+                "trim" => Some(self.new_str(s.trim())),
+                "charAt" => {
+                    let i = self.realm.to_number(arg(0)) as usize;
+                    Some(self.new_str(&s.chars().nth(i).map(String::from).unwrap_or_default()))
+                }
+                "includes" => Some(NanBox::boolean(
+                    s.contains(&self.realm.to_display_string(arg(0))),
+                )),
+                "indexOf" => {
+                    let needle = self.realm.to_display_string(arg(0));
+                    let idx = s
+                        .find(&needle)
+                        .map_or(-1.0, |b| s[..b].chars().count() as f64);
+                    Some(NanBox::number(idx))
+                }
+                "repeat" => {
+                    let n = self.realm.to_number(arg(0));
+                    let n = if n >= 0.0 { n as usize } else { 0 };
+                    Some(self.new_str(&s.repeat(n)))
+                }
+                _ => None,
+            };
+            if out.is_some() {
+                return Ok(out);
+            }
+        }
+
+        // --- array methods ---
+        if let Some(elems) = self.realm.array_elements(handle).map(<[_]>::to_vec) {
+            match method {
+                "push" => {
+                    let mut len = elems.len();
+                    for a in args {
+                        len = self.realm.array_push(handle, *a).unwrap_or(len);
+                    }
+                    return Ok(Some(NanBox::number(len as f64)));
+                }
+                "pop" => return Ok(Some(self.realm.array_pop(handle))),
+                "join" => {
+                    let sep = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                        String::from(",")
+                    } else {
+                        self.realm.to_display_string(arg(0))
+                    };
+                    let parts: Vec<String> = elems
+                        .iter()
+                        .map(|e| self.realm.to_display_string(*e))
+                        .collect();
+                    return Ok(Some(self.new_str(&parts.join(&sep))));
+                }
+                "includes" => {
+                    let target = arg(0);
+                    let found = elems.iter().any(|e| self.realm.strict_equals(*e, target));
+                    return Ok(Some(NanBox::boolean(found)));
+                }
+                "indexOf" => {
+                    let target = arg(0);
+                    let idx = elems
+                        .iter()
+                        .position(|e| self.realm.strict_equals(*e, target))
+                        .map_or(-1.0, |i| i as f64);
+                    return Ok(Some(NanBox::number(idx)));
+                }
+                "map" => {
+                    let f = arg(0);
+                    let mut out = Vec::with_capacity(elems.len());
+                    for (i, e) in elems.iter().enumerate() {
+                        out.push(self.call(f, &[*e, NanBox::number(i as f64)])?);
+                    }
+                    let h = self.realm.new_array(out);
+                    return Ok(Some(NanBox::handle(h.to_raw())));
+                }
+                "filter" => {
+                    let f = arg(0);
+                    let mut out = Vec::new();
+                    for (i, e) in elems.iter().enumerate() {
+                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                            out.push(*e);
+                        }
+                    }
+                    let h = self.realm.new_array(out);
+                    return Ok(Some(NanBox::handle(h.to_raw())));
+                }
+                "forEach" => {
+                    let f = arg(0);
+                    for (i, e) in elems.iter().enumerate() {
+                        self.call(f, &[*e, NanBox::number(i as f64)])?;
+                    }
+                    return Ok(Some(NanBox::undefined()));
+                }
+                "reduce" => {
+                    let f = arg(0);
+                    let mut acc;
+                    let mut start = 0;
+                    if args.len() >= 2 {
+                        acc = arg(1);
+                    } else if elems.is_empty() {
+                        return Err(ExecError::Throw(
+                            self.new_str("Reduce of empty array with no initial value"),
+                        ));
+                    } else {
+                        acc = elems[0];
+                        start = 1;
+                    }
+                    for (i, e) in elems.iter().enumerate().skip(start) {
+                        acc = self.call(f, &[acc, *e, NanBox::number(i as f64)])?;
+                    }
+                    return Ok(Some(acc));
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Allocates a heap string and returns its boxed handle.
+    fn new_str(&mut self, s: &str) -> NanBox {
+        NanBox::handle(self.realm.new_string(s).to_raw())
     }
 
     fn run_body(&mut self, body: Body<'a>) -> Result<NanBox, ExecError> {
@@ -517,14 +673,34 @@ impl<'a> Interp<'a> {
             Expr::Call {
                 callee, arguments, ..
             } => {
-                let f = self.eval(callee)?;
-                let mut args = Vec::with_capacity(arguments.len());
-                for a in arguments {
-                    match a {
-                        Argument::Item(e) => args.push(self.eval(e)?),
-                        Argument::Spread(_) => return Err(ExecError::Unsupported("call spread")),
+                // A `recv.method(args)` call: try a built-in method on the
+                // receiver before falling back to a property-valued function.
+                if let Expr::Member {
+                    object,
+                    property,
+                    optional,
+                    ..
+                } = &**callee
+                {
+                    let recv = self.eval(object)?;
+                    if *optional && matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                        return Ok(NanBox::undefined());
                     }
+                    let args = self.eval_args(arguments)?;
+                    if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property
+                        && let Some(result) = self.call_method(recv, name, &args)?
+                    {
+                        return Ok(result);
+                    }
+                    // Not a built-in method: read the member and call it.
+                    let Some(raw) = recv.as_handle() else {
+                        return Err(ExecError::NotCallable);
+                    };
+                    let f = self.member(crate::heap::Handle::from_raw(raw), property)?;
+                    return self.call(f, &args);
                 }
+                let f = self.eval(callee)?;
+                let args = self.eval_args(arguments)?;
                 self.call(f, &args)
             }
             Expr::Array { elements, .. } => {
@@ -992,6 +1168,49 @@ mod tests {
                  clamp(15, 0, 10)"
             ),
             "10"
+        );
+    }
+
+    #[test]
+    fn string_methods() {
+        assert_eq!(run("'hello'.toUpperCase()"), "HELLO");
+        assert_eq!(run("'HELLO'.toLowerCase()"), "hello");
+        assert_eq!(run("'  hi  '.trim()"), "hi");
+        assert_eq!(run("'hello'.charAt(1)"), "e");
+        assert_eq!(run("'hello'.includes('ell')"), "true");
+        assert_eq!(run("'hello'.indexOf('l')"), "2");
+        assert_eq!(run("'ab'.repeat(3)"), "ababab");
+    }
+
+    #[test]
+    fn array_methods() {
+        assert_eq!(run("let a = [1, 2]; a.push(3); a.join('-')"), "1-2-3");
+        assert_eq!(run("let a = [1, 2, 3]; a.pop()"), "3");
+        assert_eq!(run("[1, 2, 3].includes(2)"), "true");
+        assert_eq!(run("[1, 2, 3].indexOf(3)"), "2");
+        assert_eq!(run("['a', 'b', 'c'].join(', ')"), "a, b, c");
+    }
+
+    #[test]
+    fn higher_order_array_methods() {
+        // map / filter / reduce with closures.
+        assert_eq!(run("[1, 2, 3].map(x => x * 2).join(',')"), "2,4,6");
+        assert_eq!(
+            run("[1, 2, 3, 4].filter(x => x % 2 === 0).join(',')"),
+            "2,4"
+        );
+        assert_eq!(run("[1, 2, 3, 4].reduce((a, b) => a + b, 0)"), "10");
+        assert_eq!(run("[1, 2, 3, 4].reduce((a, b) => a + b)"), "10"); // no initial
+        // forEach with a closed-over accumulator.
+        assert_eq!(
+            run("let total = 0; [10, 20, 30].forEach(x => { total += x; }); total"),
+            "60"
+        );
+        // Chained, with a captured multiplier.
+        assert_eq!(
+            run("let k = 3;
+                 [1, 2, 3, 4].filter(x => x > 1).map(x => x * k).reduce((a, b) => a + b, 0)"),
+            "27"
         );
     }
 }
