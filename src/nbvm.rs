@@ -53,6 +53,14 @@ pub enum Op {
     StrictEq { dst: Reg, a: Reg, b: Reg },
     /// `dst = a new heap string`.
     NewString { dst: Reg, value: String },
+    /// `dst = a new array of `len` `undefined` elements`.
+    NewArray { dst: Reg, len: usize },
+    /// `dst = arr[index]` (index taken from a register, `undefined` if absent).
+    GetElem { dst: Reg, arr: Reg, index: Reg },
+    /// `arr[index] = src` (grows the array if needed).
+    SetElem { arr: Reg, index: Reg, src: Reg },
+    /// `dst = arr.length`.
+    ArrayLen { dst: Reg, arr: Reg },
     /// `dst = a new empty object` (allocated in the realm's heap).
     NewObject { dst: Reg },
     /// `obj[key] = src` (own property set through the object's shape).
@@ -125,6 +133,25 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             Op::NewString { dst, value } => {
                 let handle = realm.new_string(value);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            }
+            Op::NewArray { dst, len } => {
+                let handle = realm.new_array(vec![NanBox::undefined(); *len]);
+                regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            }
+            Op::GetElem { dst, arr, index } => {
+                let handle = object_handle(regs[*arr as usize])?;
+                let i = num(regs[*index as usize])? as usize;
+                regs[*dst as usize] = realm.get_element(handle, i);
+            }
+            Op::SetElem { arr, index, src } => {
+                let handle = object_handle(regs[*arr as usize])?;
+                let i = num(regs[*index as usize])? as usize;
+                realm.set_element(handle, i, regs[*src as usize]);
+            }
+            Op::ArrayLen { dst, arr } => {
+                let handle = object_handle(regs[*arr as usize])?;
+                let len = realm.array_length(handle).unwrap_or(0);
+                regs[*dst as usize] = NanBox::number(len as f64);
             }
             Op::NewObject { dst } => {
                 let handle = realm.new_object();
@@ -322,6 +349,98 @@ mod tests {
         let mut realm = Realm::new();
         let result = run(&mut realm, &prog, 6).unwrap();
         assert_eq!(realm.to_display_string(result), "xxxxx");
+    }
+
+    #[test]
+    fn sums_an_array_in_a_loop() {
+        // a = [10, 20, 30]; sum = 0; for (i=0; i<a.length; i++) sum += a[i]; → 60
+        // regs: 0=a 1=sum 2=i 3=len 4=step 5=cond 6=elem
+        let prog = vec![
+            Op::NewArray { dst: 0, len: 3 },
+            Op::LoadConst {
+                dst: 6,
+                value: NanBox::number(10.0),
+            },
+            Op::LoadConst {
+                dst: 2,
+                value: NanBox::number(0.0),
+            },
+            Op::SetElem {
+                arr: 0,
+                index: 2,
+                src: 6,
+            }, // a[0] = 10
+            Op::LoadConst {
+                dst: 6,
+                value: NanBox::number(20.0),
+            },
+            Op::LoadConst {
+                dst: 2,
+                value: NanBox::number(1.0),
+            },
+            Op::SetElem {
+                arr: 0,
+                index: 2,
+                src: 6,
+            }, // a[1] = 20
+            Op::LoadConst {
+                dst: 6,
+                value: NanBox::number(30.0),
+            },
+            Op::LoadConst {
+                dst: 2,
+                value: NanBox::number(2.0),
+            },
+            Op::SetElem {
+                arr: 0,
+                index: 2,
+                src: 6,
+            }, // a[2] = 30
+            Op::LoadConst {
+                dst: 1,
+                value: NanBox::number(0.0),
+            }, // sum = 0
+            Op::LoadConst {
+                dst: 2,
+                value: NanBox::number(0.0),
+            }, // i = 0
+            Op::ArrayLen { dst: 3, arr: 0 }, // len = 3
+            Op::LoadConst {
+                dst: 4,
+                value: NanBox::number(1.0),
+            }, // step
+            // loop head @ 14:
+            Op::Lt { dst: 5, a: 2, b: 3 }, // 14: cond = i < len
+            Op::JumpIfFalse {
+                cond: 5,
+                target: 19,
+            }, // 15: exit
+            Op::GetElem {
+                dst: 6,
+                arr: 0,
+                index: 2,
+            }, // 16: elem = a[i]
+            Op::Add { dst: 1, a: 1, b: 6 }, // 17: sum += elem
+            Op::Add { dst: 2, a: 2, b: 4 }, // 18: i += 1 ... then loop
+            Op::Return { src: 1 },         // 19
+        ];
+        // patch the loop-back: after 18 we must jump to 14, and exit at 19.
+        let prog = {
+            let mut p = prog;
+            // Insert a Jump back to head before the Return by rewriting index 18's
+            // successor: we append a Jump and move Return.
+            p.insert(19, Op::Jump { target: 14 });
+            // Now Return is at 20; the exit target (was 19) still points at the Jump,
+            // so fix JumpIfFalse to land on the Return at 20.
+            p[15] = Op::JumpIfFalse {
+                cond: 5,
+                target: 20,
+            };
+            p
+        };
+        let mut realm = Realm::new();
+        let result = run(&mut realm, &prog, 7).unwrap();
+        assert_eq!(result.as_number(), Some(60.0));
     }
 
     #[test]
