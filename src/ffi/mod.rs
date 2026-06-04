@@ -158,7 +158,8 @@ fn eval_to_string(src: &str) -> Result<alloc::string::String, alloc::string::Str
 
     let program = Parser::parse_program(src).map_err(|e| alloc::string::ToString::to_string(&e))?;
     let mut interp = Interp::new();
-    match interp.run(&program) {
+    // Run on the bytecode VM (with automatic tree-walker fallback).
+    match interp.run_with_vm(&program) {
         Ok(value) => Ok(value.to_js_string()),
         Err(thrown) => Err(thrown.to_js_string()),
     }

@@ -135,7 +135,9 @@ fn run_eval(source: &str, origin: &str) -> ExitCode {
     };
     let mut interp = Interp::new();
     install_console(&interp);
-    match interp.run(&program) {
+    // The bytecode VM is the primary execution path (it falls back to the
+    // tree-walker for constructs it doesn't yet compile).
+    match interp.run_with_vm(&program) {
         Ok(value) => {
             // Print non-undefined completion values, REPL-style.
             if !matches!(value, kataan::interp::Value::Undefined) {
@@ -152,6 +154,7 @@ fn run_eval(source: &str, origin: &str) -> ExitCode {
 
 /// Parses and evaluates `source` through the **bytecode VM** (falling back to
 /// the tree-walker for unsupported constructs), printing the completion value.
+/// (Kept as an explicit subcommand; `run`/`eval` use the same path now.)
 fn run_eval_vm(source: &str, origin: &str) -> ExitCode {
     let program = match Parser::parse_program(source) {
         Ok(p) => p,

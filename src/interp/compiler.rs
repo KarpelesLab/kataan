@@ -201,6 +201,26 @@ impl Compiler {
     fn declare_local(&mut self, name: String, reg: Reg) {
         self.declare_local_cell(name, reg, false);
     }
+    /// Pre-declares (as empty cells) the captured simple `let`/`const`/`var`
+    /// bindings declared directly in `stmts`, so initializers can forward- and
+    /// self-reference them (recursive / mutually-recursive closures). Only
+    /// simple identifiers are hoisted; patterns and params box per-site.
+    fn predeclare_captured_cells(&mut self, stmts: &[Stmt]) {
+        for s in stmts {
+            let Stmt::Var(decl) = s else { continue };
+            for d in &decl.declarations {
+                if let BindingTarget::Ident(id) = &d.target
+                    && self.is_captured_here(&id.name)
+                    && self.resolve(&id.name).is_none_or(|l| !l.is_cell)
+                {
+                    let undef = self.reg();
+                    self.emit(Op::LoadUndefined { dst: undef });
+                    let cell = self.new_cell(undef);
+                    self.declare_local_cell(id.name.clone().into_string(), cell, true);
+                }
+            }
+        }
+    }
     /// Whether `name` is captured by nested functions in the current function
     /// (and so must be stored in a cell).
     fn is_captured_here(&self, name: &str) -> bool {
@@ -367,6 +387,7 @@ impl Compiler {
     /// Compiles a statement list. With `return_last`, the value of the final
     /// expression statement is returned; otherwise the chunk falls off the end.
     fn compile_body(&mut self, body: &[Stmt], return_last: bool) -> Result<(), CompileError> {
+        self.predeclare_captured_cells(body);
         for stmt in body {
             if let Stmt::Function(func) = stmt {
                 self.compile_function_decl(func)?;
@@ -416,6 +437,20 @@ impl Compiler {
             }
             Stmt::Var(decl) => {
                 for d in &decl.declarations {
+                    // A captured simple binding has had its cell pre-declared at
+                    // scope entry (so forward/self references resolve — e.g.
+                    // recursive or mutually-recursive `const f = … f … `); just
+                    // store the initializer into it.
+                    if let BindingTarget::Ident(id) = &d.target
+                        && self.is_captured_here(&id.name)
+                    {
+                        let cell = self.resolve(&id.name).expect("predeclared cell").reg;
+                        if let Some(init) = &d.init {
+                            let value = self.expr(init)?;
+                            self.cell_set(cell, value);
+                        }
+                        continue;
+                    }
                     let value = match &d.init {
                         Some(init) => self.expr(init)?,
                         None => {
@@ -430,6 +465,7 @@ impl Compiler {
             }
             Stmt::Block { body, .. } => {
                 let mark = self.funcs.last().expect("fn").locals.len();
+                self.predeclare_captured_cells(body);
                 for s in body {
                     if let Stmt::Function(f) = s {
                         self.compile_function_decl(f)?;

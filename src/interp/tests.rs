@@ -1093,11 +1093,45 @@ fn bytecode_vm_loops() {
 
 #[test]
 fn bytecode_vm_falls_back_on_unsupported() {
-    // A class declaration is still outside the bytecode compiler's subset, so it
-    // is reported as unsupported and the caller falls back to the tree-walker.
-    let program = Parser::parse_program("class C { m() { return 1; } } new C().m()").unwrap();
+    // A generator is still outside the bytecode compiler's subset (it needs
+    // suspendable frames), so it is reported as unsupported and the caller falls
+    // back to the tree-walker.
+    let program = Parser::parse_program("function* g() { yield 1; } [...g()]").unwrap();
     let mut interp = Interp::new();
     assert!(interp.eval_via_bytecode(&program.body).is_err());
+}
+
+#[test]
+fn bytecode_vm_recursive_and_mutual_closures() {
+    // A closure that references itself in its own initializer (memoized fib).
+    assert_eq!(
+        eval_bc(
+            "const memo = (f) => { const c = {}; return (n) => n in c ? c[n] : (c[n] = f(n)); };
+             const fib = memo((n) => (n < 2 ? n : fib(n - 1) + fib(n - 2)));
+             fib(20)"
+        ),
+        "6765"
+    );
+    // Mutually-recursive closures via forward reference.
+    assert_eq!(
+        eval_bc(
+            "const isEven = (n) => (n === 0 ? true : isOdd(n - 1));
+             const isOdd = (n) => (n === 0 ? false : isEven(n - 1));
+             '' + isEven(10) + ',' + isOdd(7)"
+        ),
+        "true,true"
+    );
+    // Self-recursion inside a function body (block scope).
+    assert_eq!(
+        eval_bc(
+            "function run() {
+               const fact = (n) => (n <= 1 ? 1 : n * fact(n - 1));
+               return fact(6);
+             }
+             run()"
+        ),
+        "720"
+    );
 }
 
 #[test]
