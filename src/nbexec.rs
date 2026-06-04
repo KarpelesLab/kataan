@@ -196,6 +196,7 @@ const N_OBJECT_SET_PROTO: u16 = 109;
 const N_OBJECT_DEFINE_PROP: u16 = 110;
 const N_OBJECT_GET_OWN_DESC: u16 = 111;
 const N_WEAKMAP: u16 = 112;
+const N_OBJECT_IS: u16 = 123;
 const N_WEAKSET: u16 = 113;
 const N_REFLECT_GET: u16 = 114;
 const N_REFLECT_SET: u16 = 115;
@@ -359,6 +360,7 @@ impl<'a> Interp<'a> {
                 ("setPrototypeOf", N_OBJECT_SET_PROTO),
                 ("defineProperty", N_OBJECT_DEFINE_PROP),
                 ("getOwnPropertyDescriptor", N_OBJECT_GET_OWN_DESC),
+                ("is", N_OBJECT_IS),
             ],
         );
         install_namespace(
@@ -560,6 +562,19 @@ impl<'a> Interp<'a> {
                     }
                 }
                 arg(0)
+            }
+            // `Object.is(a, b)` — SameValue: like `===` but `NaN` is equal to
+            // itself and `+0`/`-0` differ.
+            N_OBJECT_IS => {
+                let (a, b) = (arg(0), arg(1));
+                let same = match (a.as_number(), b.as_number()) {
+                    (Some(x), Some(y)) => {
+                        (x == y && (x != 0.0 || x.is_sign_positive() == y.is_sign_positive()))
+                            || (x.is_nan() && y.is_nan())
+                    }
+                    _ => self.realm.strict_equals(a, b),
+                };
+                NanBox::boolean(same)
             }
             // --- Reflect.* ---
             N_REFLECT_GET => {
@@ -1715,8 +1730,10 @@ impl<'a> Interp<'a> {
                 if m.is_static {
                     continue;
                 }
-                let key = static_key(&m.key)?;
                 let saved = core::mem::replace(&mut self.current, cenv.clone());
+                // Resolve the key in the class scope (so `[computed]` names see
+                // the enclosing bindings).
+                let key = self.eval_prop_key(&m.key)?;
                 let f = self.make_method(
                     &m.value.params,
                     Body::Block(&m.value.body),
@@ -2052,6 +2069,14 @@ impl<'a> Interp<'a> {
                             .as_number()
                             .is_some_and(|n| n.is_finite() && (n as i64) as f64 == n);
                         return Ok(Some(NanBox::boolean(is_int)));
+                    }
+                    "isSafeInteger" => {
+                        let safe = arg(0).as_number().is_some_and(|n| {
+                            n.is_finite()
+                                && (n as i64) as f64 == n
+                                && n.abs() <= 9_007_199_254_740_991.0
+                        });
+                        return Ok(Some(NanBox::boolean(safe)));
                     }
                     "isFinite" => {
                         return Ok(Some(NanBox::boolean(
@@ -5819,6 +5844,25 @@ mod tests {
         assert!(eval_source("throw 'boom'").is_err());
         // A parse error surfaces as an Err.
         assert!(eval_source("let = ;").is_err());
+    }
+
+    #[test]
+    fn object_is_and_safe_integer_and_computed_methods() {
+        assert_eq!(run("Object.is(NaN, NaN)"), "true");
+        assert_eq!(run("Object.is(0, -0)"), "false");
+        assert_eq!(run("Object.is(-0, -0)"), "true");
+        assert_eq!(
+            run("Object.is('a', 'a') + ':' + Object.is(1, 2)"),
+            "true:false"
+        );
+        assert_eq!(run("Number.isSafeInteger(9007199254740991)"), "true");
+        assert_eq!(run("Number.isSafeInteger(9007199254740992)"), "false");
+        assert_eq!(run("Number.isSafeInteger(1.5)"), "false");
+        // Computed class method name.
+        assert_eq!(
+            run("let k='go'; class C { [k](){ return 42; } } new C().go()"),
+            "42"
+        );
     }
 
     #[test]
