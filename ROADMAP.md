@@ -451,21 +451,31 @@ caller-owned/`mmap`'d buffer). The WASM peer engine (§2.1) is likewise reachabl
 ## 7. Milestones
 
 Each milestone ends with: it builds clean under `cargo clippy`, has unit tests,
-and (from D onward) reports a Test262 pass-rate number.
+and (from D onward) reports a Test262 pass-rate number. Status as of this
+writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
 
-- **Phase A — Scaffold & lexer** *(current)*
+- **Phase A — Scaffold & lexer** ✅ **done**
   Crate layout, CI, conventions; a complete, tested tokenizer; CLI that can
-  `--tokens` a file. *Deliverable: `kataan lex file.js`.*
+  `lex` a file. *Deliverable: `kataan lex file.js`.*
 
-- **Phase B — Parser & AST**
-  Full ECMAScript expression + statement grammar, modules vs scripts, strict
-  mode, ASI, destructuring, classes, async/generators at the syntax level.
-  `kataan parse --json file.js`. Round-tripping & error-recovery tests.
+- **Phase B — Parser & AST** ✅ **done**
+  Full ECMAScript grammar, lex → parse → AST: expressions (precedence, the
+  `**`/`??` corner cases, optional chaining), statements + ASI, destructuring
+  patterns, functions / arrows (cover grammar) / classes, generators & async
+  with `yield`/`await`, and module `import`/`export` (source-type inferred).
+  *Deliverable: `kataan parse [-e] file.js`.*
 
-- **Phase C — Tree-walk MVP → object model**
-  A correct (not yet fast) evaluator to validate semantics, *then* introduce
-  NaN-boxed `Value`, shapes, the GC, and core intrinsics (Object/Function/
-  Array/Number/String/Boolean/Symbol/Error/Math). First Test262 numbers.
+- **Phase C — Tree-walk MVP → object model** 🚧 **in progress**
+  A correct (not yet fast) evaluator to validate semantics, *then* the
+  performance-oriented object model. **Done so far:** the tree-walking
+  interpreter (`src/interp/`) — primitives + full operator/coercion set,
+  control flow, functions/closures/`this`, a provisional object/array model,
+  member access, destructuring, `for-of`/`for-in`, and a first standard-library
+  slice (Math, JSON, Object statics, Array/String prototype methods, the Number
+  globals); `kataan run app.js` with a minimal `console`. **Next:** classes &
+  `new` at runtime, `Error`/`Symbol`/`Map`/`Set`/`Date`/`RegExp` and `Promise`,
+  then the *real* object model — NaN-boxed `Value`, shapes/inline caches, and
+  the GC — plus the first Test262 numbers.
 
 - **Phase D — Bytecode VM**
   AST→register-bytecode compiler, the interpreter loop, inline caches,
