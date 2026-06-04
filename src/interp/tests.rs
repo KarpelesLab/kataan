@@ -1356,6 +1356,18 @@ fn optional_chaining_and_calls() {
     );
     // Optional call on a plain (non-member) callee.
     assert_eq!(eval("let f; String(f?.())"), "undefined");
+    // A `?.` short-circuits the *rest* of the chain (not just one link), so
+    // continued access/calls after a nullish link don't throw.
+    assert_eq!(eval("const o = {}; String(o.a?.b.c)"), "undefined");
+    assert_eq!(eval("const o = {}; String(o.a?.b.c.d.e)"), "undefined");
+    assert_eq!(
+        eval("const o = {}; String(o.missing?.().join(','))"),
+        "undefined"
+    );
+    // A nullish `?.` operand short-circuits the whole chain (but a *present*
+    // operand does not: `({})?.a.b` still throws, exercised elsewhere).
+    assert_eq!(eval("const o = null; String(o?.a.b.c)"), "undefined");
+    assert_eq!(eval("const o = { a: { b: { c: 9 } } }; o?.a.b.c"), "9");
 }
 
 #[test]

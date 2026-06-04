@@ -714,6 +714,87 @@ impl<'a> Interp<'a> {
 
     // --- expressions ----------------------------------------------------
 
+    /// Evaluates a member/call **chain**, returning `Ok(None)` when an optional
+    /// link (`?.`/`?.()`) short-circuits — which propagates to the end of the
+    /// chain so `a?.b.c` yields `undefined` rather than throwing on `.c`. Any
+    /// other expression is evaluated normally and wrapped in `Some`.
+    fn eval_chain(&mut self, expr: &'a Expr, env: &Env<'a>) -> Completion<'a, Option<Value<'a>>> {
+        match expr {
+            Expr::Member {
+                object,
+                property,
+                optional,
+                ..
+            } => {
+                let Some(obj) = self.eval_chain(object, env)? else {
+                    return Ok(None);
+                };
+                if *optional && matches!(obj, Value::Undefined | Value::Null) {
+                    return Ok(None);
+                }
+                let key = self.member_key(property, env)?;
+                // A getter accessor is invoked with the object as `this`.
+                if let Value::Object(o) = &obj
+                    && let Some(acc) = o.find_accessor(&key)
+                {
+                    return Ok(Some(match acc.get {
+                        Some(getter) => self.call_with_this(getter, obj.clone(), Vec::new())?,
+                        None => Value::Undefined,
+                    }));
+                }
+                Ok(Some(self.get_member(&obj, &key)?))
+            }
+            Expr::Call {
+                callee,
+                arguments,
+                optional,
+                ..
+            } => {
+                // A call on a member supplies `this` and falls back to built-in
+                // prototype methods; a plain call has an undefined receiver.
+                if let Expr::Member {
+                    object,
+                    property,
+                    optional: member_opt,
+                    ..
+                } = &**callee
+                {
+                    let Some(obj) = self.eval_chain(object, env)? else {
+                        return Ok(None);
+                    };
+                    if *member_opt && matches!(obj, Value::Undefined | Value::Null) {
+                        return Ok(None);
+                    }
+                    let key = self.member_key(property, env)?;
+                    if *optional {
+                        let member = self.get_property(&obj, &key)?;
+                        if matches!(member, Value::Undefined | Value::Null) {
+                            return Ok(None);
+                        }
+                        let args = self.eval_arguments(arguments, env)?;
+                        return Ok(Some(self.call_with_this(member, obj, args)?));
+                    }
+                    let args = self.eval_arguments(arguments, env)?;
+                    return Ok(Some(self.call_member(obj, &key, args)?));
+                }
+                let Some(callee_val) = self.eval_chain(callee, env)? else {
+                    return Ok(None);
+                };
+                if *optional && matches!(callee_val, Value::Undefined | Value::Null) {
+                    return Ok(None);
+                }
+                let args = self.eval_arguments(arguments, env)?;
+                Ok(Some(self.call_with_this(
+                    callee_val,
+                    Value::Undefined,
+                    args,
+                )?))
+            }
+            // A non-chain operand: evaluate it normally (starts/ends a chain).
+            other => Ok(Some(self.eval_expr(other, env)?)),
+        }
+    }
+
     fn eval_expr(&mut self, expr: &'a Expr, env: &Env<'a>) -> Completion<'a, Value<'a>> {
         match expr {
             Expr::Null(_) => Ok(Value::Null),
@@ -813,40 +894,10 @@ impl<'a> Interp<'a> {
                     let args = self.eval_arguments(arguments, env)?;
                     return self.call_super_method(env, &key, args);
                 }
-                // A call on a member expression supplies `this`, and falls back
-                // to the built-in prototype methods when there is no own
-                // property; a plain call has an undefined receiver.
-                if let Expr::Member {
-                    object,
-                    property,
-                    optional: member_opt,
-                    ..
-                } = &**callee
-                {
-                    let obj = self.eval_expr(object, env)?;
-                    if *member_opt && matches!(obj, Value::Undefined | Value::Null) {
-                        return Ok(Value::Undefined);
-                    }
-                    let key = self.member_key(property, env)?;
-                    // An optional call `obj.m?.(…)` skips the call (and the
-                    // argument evaluation) when the method is null/undefined.
-                    if *optional {
-                        let member = self.get_property(&obj, &key)?;
-                        if matches!(member, Value::Undefined | Value::Null) {
-                            return Ok(Value::Undefined);
-                        }
-                        let args = self.eval_arguments(arguments, env)?;
-                        return self.call_with_this(member, obj, args);
-                    }
-                    let args = self.eval_arguments(arguments, env)?;
-                    return self.call_member(obj, &key, args);
-                }
-                let callee_val = self.eval_expr(callee, env)?;
-                if *optional && matches!(callee_val, Value::Undefined | Value::Null) {
-                    return Ok(Value::Undefined);
-                }
-                let args = self.eval_arguments(arguments, env)?;
-                self.call_with_this(callee_val, Value::Undefined, args)
+                // Otherwise evaluate as an (optional-)chain link: a `?.` whose
+                // left side is nullish short-circuits the *rest* of the chain.
+                let _ = (callee, arguments, optional);
+                Ok(self.eval_chain(expr, env)?.unwrap_or(Value::Undefined))
             }
             Expr::Function(f) => Ok(Value::Function(Rc::new(Closure {
                 def: Callable::Function(f),
@@ -856,27 +907,10 @@ impl<'a> Interp<'a> {
                 def: Callable::Arrow(a),
                 env: Rc::clone(env),
             }))),
-            Expr::Member {
-                object,
-                property,
-                optional,
-                ..
-            } => {
-                let obj = self.eval_expr(object, env)?;
-                if *optional && matches!(obj, Value::Undefined | Value::Null) {
-                    return Ok(Value::Undefined);
-                }
-                let key = self.member_key(property, env)?;
-                // A getter accessor is invoked with the object as `this`.
-                if let Value::Object(o) = &obj
-                    && let Some(acc) = o.find_accessor(&key)
-                {
-                    return match acc.get {
-                        Some(getter) => self.call_with_this(getter, obj.clone(), Vec::new()),
-                        None => Ok(Value::Undefined),
-                    };
-                }
-                self.get_member(&obj, &key)
+            Expr::Member { .. } => {
+                // An (optional-)chain link; `?.` short-circuits the rest.
+                self.eval_chain(expr, env)
+                    .map(|o| o.unwrap_or(Value::Undefined))
             }
             Expr::Array { elements, .. } => {
                 let mut items = Vec::new();
