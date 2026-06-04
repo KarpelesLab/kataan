@@ -311,7 +311,10 @@ impl Compiler {
             } => self.compile_switch(discriminant, cases),
             Stmt::ForOf {
                 left, right, body, ..
-            } => self.compile_for_of(left, right, body),
+            } => self.compile_for_each(left, right, body, false),
+            Stmt::ForIn {
+                left, right, body, ..
+            } => self.compile_for_each(left, right, body, true),
             Stmt::Break { label: None, .. } => {
                 let j = self.emit(Op::Jump { offset: 0 });
                 self.add_break(j)?;
@@ -428,14 +431,15 @@ impl Compiler {
         Ok(None)
     }
 
-    /// Compiles `for (const x of iterable) body`. The iterable is materialized
-    /// into an array (`IterValues`) and walked by index; only a simple
-    /// identifier loop variable is supported.
-    fn compile_for_of(
+    /// Compiles `for (x of iterable)` (`keys = false`) or `for (x in obj)`
+    /// (`keys = true`). The source is materialized into an array of values/keys
+    /// and walked by index; only a simple identifier loop variable is supported.
+    fn compile_for_each(
         &mut self,
         left: &crate::ast::ForLeft,
         right: &Expr,
         body: &Stmt,
+        keys: bool,
     ) -> Result<Option<Reg>, CompileError> {
         use crate::ast::ForLeft;
         let var_name = match left {
@@ -447,18 +451,27 @@ impl Compiler {
                 if let Expr::Ident(id) = &**t {
                     id.name.clone().into_string()
                 } else {
-                    return Err(CompileError::unsupported("for-of target"));
+                    return Err(CompileError::unsupported("for-of/in target"));
                 }
             }
-            ForLeft::Decl { .. } => return Err(CompileError::unsupported("for-of destructuring")),
+            ForLeft::Decl { .. } => {
+                return Err(CompileError::unsupported("for-of/in destructuring"));
+            }
         };
 
         let iterable = self.expr(right)?;
         let arr = self.reg();
-        self.emit(Op::IterValues {
-            dst: arr,
-            src: iterable,
-        });
+        if keys {
+            self.emit(Op::IterKeys {
+                dst: arr,
+                src: iterable,
+            });
+        } else {
+            self.emit(Op::IterValues {
+                dst: arr,
+                src: iterable,
+            });
+        }
         let len = self.reg();
         let klen = self.add_const(Const::Str(String::from("length")));
         self.emit(Op::GetProp {

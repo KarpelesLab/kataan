@@ -191,6 +191,7 @@ mod tag {
     pub(super) const TYPE_OF_GLOBAL: u8 = 41;
     pub(super) const DELETE_MEMBER: u8 = 42;
     pub(super) const ITER_VALUES: u8 = 43;
+    pub(super) const ITER_KEYS: u8 = 44;
 }
 
 fn write_op(w: &mut Writer, op: &Op) {
@@ -254,6 +255,11 @@ fn write_op(w: &mut Writer, op: &Op) {
         }
         Op::IterValues { dst, src } => {
             w.raw(tag::ITER_VALUES);
+            w.u16(*dst);
+            w.u16(*src);
+        }
+        Op::IterKeys { dst, src } => {
+            w.raw(tag::ITER_KEYS);
             w.u16(*dst);
             w.u16(*src);
         }
@@ -479,6 +485,10 @@ fn read_op(r: &mut Reader) -> Result<Op, BytecodeError> {
             key: r.u16()?,
         },
         tag::ITER_VALUES => Op::IterValues {
+            dst: r.u16()?,
+            src: r.u16()?,
+        },
+        tag::ITER_KEYS => Op::IterKeys {
             dst: r.u16()?,
             src: r.u16()?,
         },

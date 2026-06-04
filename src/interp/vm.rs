@@ -162,6 +162,14 @@ impl<'a> Interp<'a> {
                         super::builtins::iterate_into(&v, &mut items);
                         regs[*dst as usize] = Value::Object(Obj::array(items));
                     }
+                    Op::IterKeys { dst, src } => {
+                        // Own enumerable keys (array indices / property names).
+                        let keys: Vec<Value<'a>> = match &regs[*src as usize] {
+                            Value::Object(o) => o.own_keys().into_iter().map(Value::str).collect(),
+                            _ => Vec::new(),
+                        };
+                        regs[*dst as usize] = Value::Object(Obj::array(keys));
+                    }
                     Op::TypeOfGlobal { dst, name } => {
                         let key = const_str(chunk, *name);
                         // An unbound global yields "undefined" (no throw).

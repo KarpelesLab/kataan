@@ -317,6 +317,30 @@ fn bytecode_vm_for_of() {
 }
 
 #[test]
+fn bytecode_vm_for_in() {
+    // Own keys of an object.
+    assert_eq!(
+        eval_bc("let o = { a: 1, b: 2, c: 3 }; let out = ''; for (const k in o) out += k; out"),
+        "abc"
+    );
+    // Sum the values by key.
+    assert_eq!(
+        eval_bc("let o = { a: 1, b: 2, c: 3 }; let s = 0; for (const k in o) s += o[k]; s"),
+        "6"
+    );
+    // Array indices.
+    assert_eq!(
+        eval_bc("let a = [10, 20, 30]; let out = ''; for (const i in a) out += i; out"),
+        "012"
+    );
+    // for-in over a non-object yields nothing (no throw).
+    assert_eq!(
+        eval_bc("let count = 0; for (const k in 42) count += 1; count"),
+        "0"
+    );
+}
+
+#[test]
 fn bytecode_vm_switch() {
     let sw = |n: &str| {
         alloc::format!(

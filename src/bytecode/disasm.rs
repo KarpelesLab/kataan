@@ -54,6 +54,7 @@ fn render_op(op: &Op) -> String {
         Op::TypeOf { dst, src } => format!("TypeOf      r{dst}, r{src}"),
         Op::DeleteMember { dst, obj, key } => format!("DeleteMbr   r{dst}, r{obj}[r{key}]"),
         Op::IterValues { dst, src } => format!("IterValues  r{dst}, r{src}"),
+        Op::IterKeys { dst, src } => format!("IterKeys    r{dst}, r{src}"),
         Op::TypeOfGlobal { dst, name } => format!("TypeOfGlbl  r{dst}, k{name}"),
         Op::Eq { dst, a, b } => format!("Eq          r{dst}, r{a}, r{b}"),
         Op::StrictEq { dst, a, b } => format!("StrictEq    r{dst}, r{a}, r{b}"),

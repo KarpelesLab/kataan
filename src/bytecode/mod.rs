@@ -236,6 +236,12 @@ pub enum Op {
         dst: Reg,
         src: Reg,
     },
+    /// `dst = an array of `src`'s own enumerable keys` (array indices /
+    /// object property names, as strings). Drives `for-in`.
+    IterKeys {
+        dst: Reg,
+        src: Reg,
+    },
 
     // --- control flow ---
     Jump {
