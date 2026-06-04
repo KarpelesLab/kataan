@@ -187,6 +187,7 @@ const N_OBJECT_FREEZE: u16 = 35;
 const N_OBJECT_IS_FROZEN: u16 = 36;
 const N_OBJECT_GET_OWN_NAMES: u16 = 37;
 const N_SYMBOL: u16 = 38;
+const N_BIGINT: u16 = 39;
 const N_PARSE_FLOAT: u16 = 31;
 const N_IS_NAN: u16 = 32;
 const N_IS_FINITE: u16 = 33;
@@ -342,6 +343,7 @@ impl<'a> Interp<'a> {
             ("Map", N_MAP),
             ("Set", N_SET),
             ("Symbol", N_SYMBOL),
+            ("BigInt", N_BIGINT),
         ] {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -395,6 +397,21 @@ impl<'a> Interp<'a> {
                     self.realm.to_display_string(arg(0))
                 };
                 NanBox::handle(self.realm.new_symbol(&desc).to_raw())
+            }
+            N_BIGINT => {
+                // From a number (truncated) or a numeric string.
+                let v = arg(0);
+                let n = if let Some(raw) = v.as_handle() {
+                    let h = Handle::from_raw(raw);
+                    if let Some(s) = self.realm.string_value(h) {
+                        parse_bigint(s.trim())
+                    } else {
+                        self.realm.bigint_at(h).unwrap_or_default()
+                    }
+                } else {
+                    self.realm.to_number(v) as i128
+                };
+                NanBox::handle(self.realm.new_bigint(n).to_raw())
             }
             N_PARSE_INT => {
                 let s = self.realm.to_display_string(arg(0));
@@ -1623,6 +1640,21 @@ impl<'a> Interp<'a> {
             && method == "toString"
         {
             return Ok(Some(self.new_str(&alloc::format!("Symbol({desc})"))));
+        }
+        // --- BigInt instance: `toString(radix)` / `valueOf` ---
+        if let Some(big) = self.realm.bigint_at(handle) {
+            match method {
+                "toString" => {
+                    let radix = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                        10
+                    } else {
+                        self.realm.to_number(arg(0)) as u32
+                    };
+                    return Ok(Some(self.new_str(&bigint_to_radix(big, radix))));
+                }
+                "valueOf" => return Ok(Some(NanBox::handle(self.realm.new_bigint(big).to_raw()))),
+                _ => {}
+            }
         }
         // --- `Number.*` / `String.*` statics (on the constructor) ---
         match self.realm.native_at(handle) {
@@ -3175,6 +3207,10 @@ impl<'a> Interp<'a> {
             Expr::Null(_) => Ok(NanBox::null()),
             Expr::Bool { value, .. } => Ok(NanBox::boolean(*value)),
             Expr::Number { value, .. } => Ok(NanBox::number(*value)),
+            Expr::BigInt { digits, .. } => {
+                let n = parse_bigint(digits);
+                Ok(NanBox::handle(self.realm.new_bigint(n).to_raw()))
+            }
             Expr::Str { value, .. } => {
                 let h = self.realm.new_string(value);
                 Ok(NanBox::handle(h.to_raw()))
@@ -3776,6 +3812,24 @@ impl<'a> Interp<'a> {
     }
 
     fn unary(&mut self, op: UnaryOp, v: NanBox) -> Result<NanBox, ExecError> {
+        // BigInt negation / bitwise-not stay BigInt.
+        if let Some(big) = v
+            .as_handle()
+            .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)))
+        {
+            match op {
+                UnaryOp::Minus => {
+                    return Ok(NanBox::handle(
+                        self.realm.new_bigint(big.wrapping_neg()).to_raw(),
+                    ));
+                }
+                UnaryOp::BitNot => {
+                    return Ok(NanBox::handle(self.realm.new_bigint(!big).to_raw()));
+                }
+                UnaryOp::Not => return Ok(NanBox::boolean(big == 0)),
+                _ => {}
+            }
+        }
         Ok(match op {
             UnaryOp::Plus => NanBox::number(self.realm.to_number(v)),
             UnaryOp::Minus => self.realm.neg(v),
@@ -3793,7 +3847,116 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// The BigInt operator path. Returns `None` to fall through (e.g. `bigint +
+    /// string` is string concatenation). Both operands BigInt → i128 arithmetic;
+    /// a mix with a Number throws a `TypeError` for arithmetic but compares
+    /// numerically for `<`/`==`.
+    fn bigint_binary(
+        &mut self,
+        op: BinaryOp,
+        abig: Option<i128>,
+        bbig: Option<i128>,
+        a: NanBox,
+        b: NanBox,
+    ) -> Result<Option<NanBox>, ExecError> {
+        // Strict equality: equal only if both are BigInt with the same value.
+        match op {
+            BinaryOp::EqEqEq => return Ok(Some(NanBox::boolean(abig.is_some() && abig == bbig))),
+            BinaryOp::NotEqEq => {
+                return Ok(Some(NanBox::boolean(!(abig.is_some() && abig == bbig))));
+            }
+            _ => {}
+        }
+        if let (Some(x), Some(y)) = (abig, bbig) {
+            let val = |this: &mut Self, n: i128| NanBox::handle(this.realm.new_bigint(n).to_raw());
+            let zero_div = |this: &mut Self| {
+                let m = this.new_str("Division by zero");
+                ExecError::Throw(this.make_error(N_TYPE_ERROR, Some(m)))
+            };
+            let r = match op {
+                BinaryOp::Add => val(self, x.wrapping_add(y)),
+                BinaryOp::Sub => val(self, x.wrapping_sub(y)),
+                BinaryOp::Mul => val(self, x.wrapping_mul(y)),
+                BinaryOp::Div => {
+                    if y == 0 {
+                        return Err(zero_div(self));
+                    }
+                    val(self, x / y)
+                }
+                BinaryOp::Mod => {
+                    if y == 0 {
+                        return Err(zero_div(self));
+                    }
+                    val(self, x % y)
+                }
+                BinaryOp::BitAnd => val(self, x & y),
+                BinaryOp::BitOr => val(self, x | y),
+                BinaryOp::BitXor => val(self, x ^ y),
+                BinaryOp::Exp => {
+                    let e = u32::try_from(y).unwrap_or(0);
+                    val(self, x.checked_pow(e).unwrap_or(i128::MAX))
+                }
+                BinaryOp::Lt => NanBox::boolean(x < y),
+                BinaryOp::Gt => NanBox::boolean(x > y),
+                BinaryOp::LtEq => NanBox::boolean(x <= y),
+                BinaryOp::GtEq => NanBox::boolean(x >= y),
+                BinaryOp::EqEq => NanBox::boolean(x == y),
+                BinaryOp::NotEq => NanBox::boolean(x != y),
+                _ => return Ok(None),
+            };
+            return Ok(Some(r));
+        }
+        // Mixed: `bigint + string` (either side a string) → string concat.
+        if matches!(op, BinaryOp::Add) {
+            let is_str = |this: &Self, v: NanBox| {
+                v.as_handle()
+                    .is_some_and(|raw| this.realm.string_value(Handle::from_raw(raw)).is_some())
+            };
+            if is_str(self, a) || is_str(self, b) {
+                return Ok(None);
+            }
+        }
+        // BigInt vs Number: compare numerically (`<`/`==` only).
+        if matches!(
+            op,
+            BinaryOp::EqEq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::LtEq
+                | BinaryOp::GtEq
+        ) {
+            let xn = abig.map_or_else(|| self.realm.to_number(a), |x| x as f64);
+            let yn = bbig.map_or_else(|| self.realm.to_number(b), |y| y as f64);
+            let r = match op {
+                BinaryOp::EqEq => xn == yn,
+                BinaryOp::NotEq => xn != yn,
+                BinaryOp::Lt => xn < yn,
+                BinaryOp::Gt => xn > yn,
+                BinaryOp::LtEq => xn <= yn,
+                _ => xn >= yn,
+            };
+            return Ok(Some(NanBox::boolean(r)));
+        }
+        // Mixed arithmetic is a TypeError.
+        let m = self.new_str("Cannot mix BigInt and other types");
+        Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
+    }
+
     fn binary(&mut self, op: BinaryOp, a: NanBox, b: NanBox) -> Result<NanBox, ExecError> {
+        // BigInt operands take a dedicated path (i128 arithmetic; mixing with
+        // other numeric types throws, per the spec).
+        let abig = a
+            .as_handle()
+            .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)));
+        let bbig = b
+            .as_handle()
+            .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)));
+        if (abig.is_some() || bbig.is_some())
+            && let Some(r) = self.bigint_binary(op, abig, bbig, a, b)?
+        {
+            return Ok(r);
+        }
         Ok(match op {
             BinaryOp::Add => self.realm.add(a, b),
             BinaryOp::Sub => self.realm.sub(a, b),
@@ -4256,6 +4419,40 @@ fn parse_int(s: &str, radix: u32) -> f64 {
         return f64::NAN;
     }
     if neg { -value } else { value }
+}
+
+/// Renders a `BigInt` in the given radix (2..=36), base 10 by default.
+fn bigint_to_radix(mut n: i128, radix: u32) -> String {
+    if radix == 10 || !(2..=36).contains(&radix) {
+        return alloc::format!("{n}");
+    }
+    if n == 0 {
+        return String::from("0");
+    }
+    let neg = n < 0;
+    let mut digits = Vec::new();
+    let r = i128::from(radix);
+    while n != 0 {
+        let d = (n % r).unsigned_abs() as u32;
+        digits.push(core::char::from_digit(d, radix).unwrap());
+        n /= r;
+    }
+    if neg {
+        digits.push('-');
+    }
+    digits.iter().rev().collect()
+}
+
+/// Parses a normalized `BigInt` digit string (decimal, or `0x`/`0o`/`0b`
+/// prefixed) into `i128`. Out-of-range values saturate (the bounded model).
+fn parse_bigint(digits: &str) -> i128 {
+    let (radix, body) = match digits.get(0..2) {
+        Some("0x" | "0X") => (16, &digits[2..]),
+        Some("0o" | "0O") => (8, &digits[2..]),
+        Some("0b" | "0B") => (2, &digits[2..]),
+        _ => (10, digits),
+    };
+    i128::from_str_radix(body, radix).unwrap_or(0)
 }
 
 /// Normalizes an optional `fromIndex` for `indexOf`/`includes`: undefined → 0,
@@ -4972,6 +5169,25 @@ mod tests {
         assert_eq!(
             run("class C { #s = 1; constructor(){ this.p = 2; } } Object.keys(new C()).join(',')"),
             "p"
+        );
+    }
+
+    #[test]
+    fn bigints() {
+        assert_eq!(run("typeof 5n"), "bigint");
+        assert_eq!(run("(2n + 3n).toString()"), "5");
+        assert_eq!(run("100n * 100n === 10000n"), "true");
+        assert_eq!(run("2n ** 16n === 65536n"), "true");
+        assert_eq!(run("10n / 3n === 3n"), "true");
+        assert_eq!(run("-7n === 0n - 7n"), "true");
+        assert_eq!(run("BigInt(99) === 99n"), "true");
+        assert_eq!(run("10n === 10"), "false");
+        assert_eq!(run("10n == 10"), "true");
+        assert_eq!(run("!!0n"), "false");
+        // Mixing BigInt and Number in arithmetic throws.
+        assert_eq!(
+            run("let r='ok'; try { 1n + 1; } catch (e) { r = 'threw'; } r"),
+            "threw"
         );
     }
 

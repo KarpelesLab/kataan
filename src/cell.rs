@@ -122,6 +122,9 @@ pub enum Cell {
         /// A unique id, assigned at creation, giving the symbol its identity.
         id: u64,
     },
+    /// A `BigInt` primitive. Backed by `i128` (a bounded approximation of
+    /// arbitrary precision — sufficient for the common ±2^127 range).
+    BigInt(i128),
 }
 
 impl Cell {
@@ -260,6 +263,7 @@ impl Cell {
             | Cell::BoundNative { .. }
             | Cell::Class { .. } => "function",
             Cell::Symbol { .. } => "symbol",
+            Cell::BigInt(_) => "bigint",
             Cell::Object(_)
             | Cell::Array(_)
             | Cell::Collection { .. }
@@ -274,6 +278,15 @@ impl Cell {
     pub fn as_symbol(&self) -> Option<(&str, u64)> {
         match self {
             Cell::Symbol { description, id } => Some((description, *id)),
+            _ => None,
+        }
+    }
+
+    /// The `i128` value if this cell is a `BigInt`.
+    #[must_use]
+    pub fn as_bigint(&self) -> Option<i128> {
+        match self {
+            Cell::BigInt(n) => Some(*n),
             _ => None,
         }
     }
@@ -325,7 +338,8 @@ impl Trace for Cell {
             | Cell::Native(_)
             | Cell::Date(_)
             | Cell::RegExp { .. }
-            | Cell::Symbol { .. } => {}
+            | Cell::Symbol { .. }
+            | Cell::BigInt(_) => {}
         }
     }
 }
@@ -362,7 +376,8 @@ impl crate::gc::Relocate for Cell {
             | Cell::Native(_)
             | Cell::Date(_)
             | Cell::RegExp { .. }
-            | Cell::Symbol { .. } => {}
+            | Cell::Symbol { .. }
+            | Cell::BigInt(_) => {}
         }
     }
 }

@@ -96,6 +96,17 @@ impl Realm {
             .map(|(d, id)| (alloc::string::String::from(d), id))
     }
 
+    /// Allocates a `BigInt` with value `n`.
+    pub fn new_bigint(&mut self, n: i128) -> Handle {
+        self.heap.alloc(Cell::BigInt(n))
+    }
+
+    /// The `i128` value of the `BigInt` at `handle`, if it is one.
+    #[must_use]
+    pub fn bigint_at(&self, handle: Handle) -> Option<i128> {
+        self.heap.get(handle)?.as_bigint()
+    }
+
     /// Allocates an array of `elements` in the heap and returns its handle.
     pub fn new_array(&mut self, elements: Vec<NanBox>) -> Handle {
         self.heap.alloc(Cell::Array(elements))
@@ -672,6 +683,7 @@ impl Realm {
                 Some(Cell::Date(ms)) => date_to_iso(*ms),
                 Some(Cell::RegExp { source, flags }) => alloc::format!("/{source}/{flags}"),
                 Some(Cell::Symbol { description, .. }) => alloc::format!("Symbol({description})"),
+                Some(Cell::BigInt(n)) => alloc::format!("{n}"),
                 None => "undefined".into(), // stale handle
             },
         }
@@ -837,8 +849,12 @@ impl Realm {
     #[must_use]
     pub fn truthy(&self, v: NanBox) -> bool {
         if let Some(raw) = v.as_handle() {
-            if let Some(s) = self.string_value(Handle::from_raw(raw)) {
+            let h = Handle::from_raw(raw);
+            if let Some(s) = self.string_value(h) {
                 return !s.is_empty();
+            }
+            if let Some(n) = self.bigint_at(h) {
+                return n != 0; // `0n` is falsy
             }
             return true;
         }
