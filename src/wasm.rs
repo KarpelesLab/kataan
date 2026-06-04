@@ -10,10 +10,10 @@
 //! It lowers `let`/assignment locals, arithmetic, comparisons, ternaries,
 //! `if`/`else`, `while` loops (as structured `block`/`loop`/`br_if`), and
 //! function calls — enough for iterative numeric kernels. Both targets are
-//! produced: [`compile_module`] emits WAT text, and [`compile_module_binary`]
-//! emits a complete `.wasm` binary module (verified to instantiate and run on a
-//! real WebAssembly engine). Engine code, not foreign — pure, safe `alloc`-only
-//! Rust. Unsupported constructs (objects, strings, `for-of`) are reported, not
+//! produced: `compile_module` emits WAT text, and `compile_module_binary` emits
+//! a complete `.wasm` binary module (verified to instantiate and run on a real
+//! WebAssembly engine). Engine code, not foreign — pure, safe `alloc`-only Rust.
+//! Unsupported constructs (objects, strings, `for-of`) are reported, not
 //! mis-compiled.
 
 use crate::ast::{BinaryOp, BindingTarget, Expr, Function, Stmt, UnaryOp};
