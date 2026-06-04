@@ -180,6 +180,47 @@ fn bytecode_vm_object_array_literals() {
     );
 }
 
+/// Compiles to bytecode, serializes it, deserializes it, and runs the reloaded
+/// module — the export/reload round-trip.
+fn eval_bc_reloaded(src: &str) -> String {
+    use crate::bytecode::{deserialize, serialize};
+    let program = Parser::parse_program(src).expect("parse ok");
+    let module = crate::interp::compile_program(&program.body).expect("compile ok");
+    let bytes = serialize(&module);
+    let reloaded = deserialize(&bytes).expect("deserialize ok");
+    let mut interp = Interp::new();
+    match interp.run_module(alloc::rc::Rc::new(reloaded)) {
+        Ok(v) => v.to_js_string(),
+        Err(e) => panic!("uncaught: {}", e.to_js_string()),
+    }
+}
+
+#[test]
+fn bytecode_serialize_reload_run_roundtrip() {
+    // Programs run identically after a serialize → deserialize → run round-trip.
+    assert_eq!(eval_bc_reloaded("1 + 2 * 3"), "7");
+    assert_eq!(
+        eval_bc_reloaded("function fib(n) { return n < 2 ? n : fib(n-1) + fib(n-2); } fib(10)"),
+        "55"
+    );
+    assert_eq!(
+        eval_bc_reloaded("let s = 0; for (let i = 1; i <= 100; i += 1) s += i; s"),
+        "5050"
+    );
+    assert_eq!(
+        eval_bc_reloaded("[1, 2, 3, 4].map(x => x * x).reduce((a, b) => a + b, 0)"),
+        "30"
+    );
+    assert_eq!(
+        eval_bc_reloaded("let o = { v: 21, dbl() { return this.v * 2; } }; o.dbl()"),
+        "42"
+    );
+    assert_eq!(
+        eval_bc_reloaded("let r = 0; try { throw 'e'; } catch (x) { r = x; } `caught:${r}`"),
+        "caught:e"
+    );
+}
+
 #[test]
 fn bytecode_vm_bitwise_in_instanceof() {
     // Bitwise / shift via the generic Binary op.

@@ -29,6 +29,14 @@ impl<'a> Interp<'a> {
         Ok(self.run_chunk(&module, 0, Value::Undefined, Vec::new()))
     }
 
+    /// Executes a compiled module's entry chunk. Together with
+    /// [`crate::bytecode::serialize`]/[`deserialize`](crate::bytecode::deserialize)
+    /// this is the export/reload path: a module can be compiled once, persisted,
+    /// and later reloaded and run without the source.
+    pub fn run_module(&mut self, module: Rc<Module>) -> Completion<'a, Value<'a>> {
+        self.run_chunk(&module, 0, Value::Undefined, Vec::new())
+    }
+
     /// Calls a bytecode function value (dispatched from `call_with_this`).
     pub(super) fn call_bytecode_fn(
         &mut self,
