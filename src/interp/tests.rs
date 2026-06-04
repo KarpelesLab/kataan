@@ -222,6 +222,36 @@ fn bytecode_serialize_reload_run_roundtrip() {
 }
 
 #[test]
+fn bytecode_vm_compound_and_logical_assignment() {
+    // Bitwise / shift compound assignment.
+    assert_eq!(eval_bc("let n = 8; n &= 12; n"), "8");
+    assert_eq!(eval_bc("let n = 8; n |= 3; n"), "11");
+    assert_eq!(eval_bc("let n = 6; n ^= 3; n"), "5");
+    assert_eq!(eval_bc("let n = 1; n <<= 4; n"), "16");
+    assert_eq!(eval_bc("let n = 64; n >>= 2; n"), "16");
+    // Logical assignment short-circuits.
+    assert_eq!(eval_bc("let o = {}; o.x ??= 5; o.x ??= 9; o.x"), "5");
+    assert_eq!(eval_bc("let a = null; a ??= 7; a"), "7");
+    assert_eq!(eval_bc("let b = 0; b ||= 42; b"), "42");
+    assert_eq!(eval_bc("let c = 3; c ||= 99; c"), "3");
+    assert_eq!(eval_bc("let d = 1; d &&= 2; d &&= 3; d"), "3");
+    assert_eq!(eval_bc("let e = 5; e &&= 0; e &&= 9; e"), "0");
+    // The right-hand side is not evaluated when the assignment doesn't fire.
+    assert_eq!(
+        eval_bc(
+            "let calls = 0; const side = () => { calls += 1; return 1; };
+             let v = 10; v ??= side(); calls"
+        ),
+        "0"
+    );
+    // Logical assignment on a member.
+    assert_eq!(
+        eval_bc("let cfg = { count: 0 }; cfg.count ||= 5; cfg.count ||= 9; cfg.count"),
+        "5"
+    );
+}
+
+#[test]
 fn bytecode_vm_bitwise_in_instanceof() {
     // Bitwise / shift via the generic Binary op.
     assert_eq!(eval_bc("5 & 3"), "1");

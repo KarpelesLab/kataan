@@ -2084,6 +2084,11 @@ impl Compiler {
     }
 
     fn assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> Result<Reg, CompileError> {
+        // Logical assignments (`&&=`/`||=`/`??=`) short-circuit: the value is
+        // only evaluated and stored when the current value warrants it.
+        if let Some(logic) = logical_assign_op(op) {
+            return self.logical_assign(logic, target, value);
+        }
         match target {
             Expr::Ident(id) => self.assign_ident(op, &id.name, value),
             Expr::Member {
@@ -2093,6 +2098,103 @@ impl Compiler {
                 ..
             } => self.assign_member(op, object, property, value),
             _ => Err(CompileError::unsupported("assignment target")),
+        }
+    }
+
+    /// Compiles a short-circuiting logical assignment (`a &&= b` / `a ||= b` /
+    /// `a ??= b`) on an identifier or member target.
+    fn logical_assign(
+        &mut self,
+        logic: LogicalOp,
+        target: &Expr,
+        value: &Expr,
+    ) -> Result<Reg, CompileError> {
+        // Read the current value, decide whether to assign, and (only then)
+        // evaluate the right-hand side and store it. The result register holds
+        // the current value unless the assignment fires.
+        let cur = self.expr(target)?;
+        let result = self.reg();
+        self.emit(Op::Move {
+            dst: result,
+            src: cur,
+        });
+        // `should_assign`: && → cur truthy; || → cur falsy; ?? → cur nullish.
+        let cond = match logic {
+            LogicalOp::And => cur,
+            LogicalOp::Or => {
+                let n = self.reg();
+                self.emit(Op::Not { dst: n, src: cur });
+                n
+            }
+            LogicalOp::Nullish => {
+                let null_reg = self.reg();
+                self.emit(Op::LoadNull { dst: null_reg });
+                let eq = self.reg();
+                // `cur == null` is true for both null and undefined.
+                self.emit(Op::Eq {
+                    dst: eq,
+                    a: cur,
+                    b: null_reg,
+                });
+                eq
+            }
+        };
+        let skip = self.emit(Op::JumpIfFalse { cond, offset: 0 });
+        let rhs = self.expr(value)?;
+        self.assign_to_target(target, rhs)?;
+        self.emit(Op::Move {
+            dst: result,
+            src: rhs,
+        });
+        self.patch_to_here(skip);
+        Ok(result)
+    }
+
+    /// Plain `target = value` (identifier or member), returning `value`.
+    fn assign_to_target(&mut self, target: &Expr, value: Reg) -> Result<(), CompileError> {
+        match target {
+            Expr::Ident(id) => {
+                let binding = self.lookup_binding(&id.name)?;
+                self.write_binding(&binding, &id.name, value);
+                Ok(())
+            }
+            Expr::Member {
+                object,
+                property,
+                optional: false,
+                ..
+            } => {
+                let obj = self.expr(object)?;
+                match property {
+                    PropertyKey::Ident(name) => {
+                        let key = self.add_const(Const::Str(name.clone().into_string()));
+                        self.emit(Op::SetProp {
+                            obj,
+                            key,
+                            src: value,
+                        });
+                    }
+                    PropertyKey::Str(s) => {
+                        let key = self.add_const(Const::Str(s.clone().into_string()));
+                        self.emit(Op::SetProp {
+                            obj,
+                            key,
+                            src: value,
+                        });
+                    }
+                    PropertyKey::Computed(e) => {
+                        let index = self.expr(e)?;
+                        self.emit(Op::SetElem {
+                            obj,
+                            index,
+                            src: value,
+                        });
+                    }
+                    _ => return Err(CompileError::unsupported("logical-assign member key")),
+                }
+                Ok(())
+            }
+            _ => Err(CompileError::unsupported("logical-assign target")),
         }
     }
 
@@ -2829,13 +2931,31 @@ fn has_spread(arguments: &[crate::ast::Argument]) -> bool {
 /// Maps a compound assignment operator to its binary op; `=` returns `None`.
 fn compound_binop(op: AssignOp) -> Option<BinaryOp> {
     match op {
-        AssignOp::Assign => None,
         AssignOp::AddAssign => Some(BinaryOp::Add),
         AssignOp::SubAssign => Some(BinaryOp::Sub),
         AssignOp::MulAssign => Some(BinaryOp::Mul),
         AssignOp::DivAssign => Some(BinaryOp::Div),
         AssignOp::ModAssign => Some(BinaryOp::Mod),
         AssignOp::ExpAssign => Some(BinaryOp::Exp),
+        AssignOp::ShlAssign => Some(BinaryOp::Shl),
+        AssignOp::ShrAssign => Some(BinaryOp::Shr),
+        AssignOp::UshrAssign => Some(BinaryOp::Ushr),
+        AssignOp::BitAndAssign => Some(BinaryOp::BitAnd),
+        AssignOp::BitOrAssign => Some(BinaryOp::BitOr),
+        AssignOp::BitXorAssign => Some(BinaryOp::BitXor),
+        // `=` and the logical assignments (`&&=`/`||=`/`??=`) are not plain
+        // read-modify-write folds.
+        _ => None,
+    }
+}
+
+/// The logical assignment operators short-circuit; `=` and arithmetic/bitwise
+/// compounds return `None`.
+fn logical_assign_op(op: AssignOp) -> Option<LogicalOp> {
+    match op {
+        AssignOp::AndAssign => Some(LogicalOp::And),
+        AssignOp::OrAssign => Some(LogicalOp::Or),
+        AssignOp::NullishAssign => Some(LogicalOp::Nullish),
         _ => None,
     }
 }
