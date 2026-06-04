@@ -53,6 +53,27 @@ type State<'a> = Rc<RefCell<PromiseState<'a>>>;
 
 impl<'a> Interp<'a> {
     /// Installs the `Promise` constructor and its statics.
+    /// Creates a promise already settled with `value` (fulfilled, or rejected
+    /// when `rejected`). Used to wrap the result of an `async` function.
+    pub(super) fn settled_promise(&self, value: Value<'a>, rejected: bool) -> Value<'a> {
+        let proto = match self.global().get("Promise") {
+            Some(Value::Object(ctor)) => match ctor.get("prototype") {
+                Value::Object(p) => p,
+                _ => Obj::object(),
+            },
+            _ => Obj::object(),
+        };
+        let queue = self.microtask_queue();
+        let (obj, state) = new_promise(&queue, &proto);
+        let status = if rejected {
+            Status::Rejected
+        } else {
+            Status::Fulfilled
+        };
+        settle(&state, status, value, &queue);
+        Value::Object(obj)
+    }
+
     pub(super) fn install_promise(&self) {
         let proto = Obj::object();
         let queue = self.microtask_queue();

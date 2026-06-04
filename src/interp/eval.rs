@@ -1790,31 +1790,47 @@ impl<'a> Interp<'a> {
             }
             Value::Function(closure) => {
                 let scope = Scope::child(&closure.env);
-                match closure.def {
+                let (is_async, result) = match closure.def {
                     Callable::Function(f) => {
                         // Ordinary functions bind their own `this`; arrows do
                         // not (they inherit it lexically).
                         scope.declare("this", this, false);
                         self.bind_params(&f.params, &args, &scope)?;
                         self.hoist(&f.body, &scope);
-                        match self.eval_stmts(&f.body, &scope)? {
-                            Flow::Return(v) => Ok(v),
-                            _ => Ok(Value::Undefined),
-                        }
+                        let r = match self.eval_stmts(&f.body, &scope) {
+                            Ok(Flow::Return(v)) => Ok(v),
+                            Ok(_) => Ok(Value::Undefined),
+                            Err(e) => Err(e),
+                        };
+                        (f.is_async, r)
                     }
                     Callable::Arrow(a) => {
                         self.bind_params(&a.params, &args, &scope)?;
-                        match &a.body {
+                        let r = match &a.body {
                             ArrowBody::Expr(e) => self.eval_expr(e, &scope),
                             ArrowBody::Block(body) => {
                                 self.hoist(body, &scope);
-                                match self.eval_stmts(body, &scope)? {
-                                    Flow::Return(v) => Ok(v),
-                                    _ => Ok(Value::Undefined),
+                                match self.eval_stmts(body, &scope) {
+                                    Ok(Flow::Return(v)) => Ok(v),
+                                    Ok(_) => Ok(Value::Undefined),
+                                    Err(e) => Err(e),
                                 }
                             }
-                        }
+                        };
+                        (a.is_async, r)
                     }
+                };
+                // An `async` function always returns a promise: it fulfils with
+                // the return value, or rejects with a thrown value. (`await`
+                // inside the body is still unsupported and surfaces as a
+                // rejection.)
+                if is_async {
+                    match result {
+                        Ok(v) => Ok(self.settled_promise(v, false)),
+                        Err(e) => Ok(self.settled_promise(e, true)),
+                    }
+                } else {
+                    result
                 }
             }
             _ => Err(make_error(

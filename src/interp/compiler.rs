@@ -1172,6 +1172,9 @@ impl Compiler {
 
     /// Compiles a function declaration and binds it as a global.
     fn compile_function_decl(&mut self, func: &Function) -> Result<(), CompileError> {
+        if func.is_async || func.is_generator {
+            return Err(CompileError::unsupported("async/generator function"));
+        }
         let Some(id) = &func.id else {
             return Err(CompileError::unsupported("anonymous function declaration"));
         };
@@ -1785,6 +1788,9 @@ impl Compiler {
             }
             Expr::Class(class) => self.compile_class(class),
             Expr::Function(func) => {
+                if func.is_async || func.is_generator {
+                    return Err(CompileError::unsupported("async/generator function"));
+                }
                 let (idx, upvalues) = self.compile_function(
                     &func.params,
                     FnBody::Block(&func.body),
@@ -2063,6 +2069,9 @@ impl Compiler {
     }
 
     fn arrow(&mut self, arrow: &Arrow) -> Result<Reg, CompileError> {
+        if arrow.is_async {
+            return Err(CompileError::unsupported("async arrow"));
+        }
         let body = match &arrow.body {
             ArrowBody::Expr(e) => FnBody::Expr(e),
             ArrowBody::Block(b) => FnBody::Block(b),

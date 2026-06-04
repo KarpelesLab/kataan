@@ -1850,6 +1850,38 @@ fn promises() {
         eval_global("let r; Promise.all([]).then(a => r = a.length);", "r"),
         "0"
     );
+    // An async function returns a promise that fulfils with its return value.
+    assert_eq!(
+        eval_global(
+            "let r; async function f() { return 42; } f().then(v => r = v);",
+            "r"
+        ),
+        "42"
+    );
+    // An async function that throws returns a rejected promise.
+    assert_eq!(
+        eval_global(
+            "let r; async function g() { throw 'oops'; } g().catch(e => r = 'caught:' + e);",
+            "r"
+        ),
+        "caught:oops"
+    );
+    // An async arrow likewise.
+    assert_eq!(
+        eval_global(
+            "let r; const h = async () => 7; h().then(v => r = v + 1);",
+            "r"
+        ),
+        "8"
+    );
+    // The result is genuinely a Promise.
+    assert_eq!(
+        eval_global(
+            "let r; async function f() {} r = f() instanceof Promise;",
+            "r"
+        ),
+        "true"
+    );
     // Promise.race settles with the first.
     assert_eq!(
         eval_global(
