@@ -184,11 +184,29 @@ impl Expr {
     }
 
     /// Whether this expression is a valid target for assignment / update — an
-    /// identifier or a member access. (Destructuring patterns as targets are
-    /// added with the pattern grammar.)
+    /// identifier, a member access, or an array/object **destructuring** pattern
+    /// whose elements are themselves valid targets (with optional defaults).
     #[must_use]
     pub fn is_assignment_target(&self) -> bool {
-        matches!(self, Expr::Ident(_) | Expr::Member { .. })
+        match self {
+            Expr::Ident(_) | Expr::Member { .. } => true,
+            Expr::Array { elements, .. } => elements.iter().all(|el| match el {
+                ArrayElement::Hole => true,
+                ArrayElement::Item(e) | ArrayElement::Spread(e) => e.is_assignment_target(),
+            }),
+            Expr::Object { members, .. } => members.iter().all(|m| match m {
+                ObjectMember::Property { value, .. } => value.is_assignment_target(),
+                ObjectMember::Spread { value, .. } => value.is_assignment_target(),
+                ObjectMember::Accessor { .. } => false,
+            }),
+            // A default in a destructuring pattern: `[a = 1] = …`.
+            Expr::Assign {
+                op: crate::ast::AssignOp::Assign,
+                target,
+                ..
+            } => target.is_assignment_target(),
+            _ => false,
+        }
     }
 }
 

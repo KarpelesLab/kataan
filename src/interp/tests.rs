@@ -1132,6 +1132,41 @@ fn bytecode_vm_falls_back_on_unsupported() {
 }
 
 #[test]
+fn destructuring_assignment() {
+    // Swap via array destructuring assignment.
+    assert_eq!(
+        eval("let a = 1, b = 2; [a, b] = [b, a]; a + ',' + b"),
+        "2,1"
+    );
+    // Array rest into an existing variable.
+    assert_eq!(
+        eval("let x, y, z; [x, y, ...z] = [1, 2, 3, 4]; x + ',' + y + ',' + z.join('-')"),
+        "1,2,3-4"
+    );
+    // Holes are skipped.
+    assert_eq!(eval("let s; [, s] = [10, 20]; s"), "20");
+    // Defaults in array destructuring assignment.
+    assert_eq!(eval("let a, b; [a = 5, b = 6] = [1]; a + ',' + b"), "1,6");
+    // Object destructuring assignment with renaming.
+    assert_eq!(
+        eval("let p, q; ({ x: p, y: q } = { x: 7, y: 8 }); p + ',' + q"),
+        "7,8"
+    );
+    // A member as a destructuring target.
+    assert_eq!(eval("let o = {}; ({ v: o.val } = { v: 42 }); o.val"), "42");
+    // Object rest in destructuring assignment.
+    assert_eq!(
+        eval("let f, r; ({ f, ...r } = { f: 1, a: 2, b: 3 }); f + ',' + JSON.stringify(r)"),
+        "1,{\"a\":2,\"b\":3}"
+    );
+    // Nested destructuring assignment.
+    assert_eq!(
+        eval("let a, b, c; [a, [b, c]] = [1, [2, 3]]; a + ',' + b + ',' + c"),
+        "1,2,3"
+    );
+}
+
+#[test]
 fn optional_chaining_and_calls() {
     // Optional member access.
     assert_eq!(eval("const o = { a: { b: 42 } }; o?.a?.b"), "42");

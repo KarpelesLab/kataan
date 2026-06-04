@@ -522,9 +522,18 @@ fn templates() {
 #[test]
 fn deferred_features() {
     assert!(perr("new.target").contains("new.target"));
-    // Assignment-target destructuring (`[a,b] = c` as an expression) is not yet
-    // reinterpreted from an array literal.
-    assert!(perr("[a, b] = c").contains("invalid assignment target"));
+    // A non-pattern array element is still an invalid destructuring target.
+    assert!(perr("[a + b] = c").contains("invalid assignment target"));
+}
+
+#[test]
+fn destructuring_assignment_targets_parse() {
+    // Array/object literals on the left of `=` are valid destructuring targets.
+    assert!(Parser::parse_program("[a, b] = [b, a];").is_ok());
+    assert!(Parser::parse_program("[x, , ...rest] = arr;").is_ok());
+    assert!(Parser::parse_program("({ a, b: c } = obj);").is_ok());
+    assert!(Parser::parse_program("({ a, ...rest } = obj);").is_ok());
+    assert!(Parser::parse_program("[a = 1, b = 2] = arr;").is_ok());
 }
 
 // === statements =========================================================

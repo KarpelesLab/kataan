@@ -1303,8 +1303,111 @@ impl<'a> Interp<'a> {
                 }
                 self.set_member(&obj, &key, value)
             }
+            // Destructuring assignment into existing targets.
+            Expr::Array { elements, .. } => self.store_array_pattern(elements, value, env),
+            Expr::Object { members, .. } => self.store_object_pattern(members, value, env),
+            // A defaulted target in a pattern: `[a = 1] = …` (handled here when
+            // the default isn't triggered, i.e. a bare `(x = 1) = v`).
+            Expr::Assign {
+                op: AssignOp::Assign,
+                target,
+                ..
+            } => self.store(target, value, env),
             _ => Err(Value::str("invalid assignment target")),
         }
+    }
+
+    /// Destructures `value` into an array assignment pattern's element targets.
+    fn store_array_pattern(
+        &mut self,
+        elements: &'a [crate::ast::ArrayElement],
+        value: Value<'a>,
+        env: &Env<'a>,
+    ) -> Completion<'a, ()> {
+        use crate::ast::ArrayElement;
+        let mut items = Vec::new();
+        super::builtins::iterate_into(&value, &mut items);
+        let mut idx = 0;
+        for el in elements {
+            match el {
+                ArrayElement::Hole => idx += 1,
+                ArrayElement::Spread(target) => {
+                    let rest: Vec<Value<'a>> = items.get(idx..).unwrap_or(&[]).to_vec();
+                    self.store(target, Value::Object(Obj::array(rest)), env)?;
+                    break;
+                }
+                ArrayElement::Item(target) => {
+                    let v = items.get(idx).cloned().unwrap_or(Value::Undefined);
+                    self.store_with_default(target, v, env)?;
+                    idx += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Destructures `value` into an object assignment pattern's property targets.
+    fn store_object_pattern(
+        &mut self,
+        members: &'a [crate::ast::ObjectMember],
+        value: Value<'a>,
+        env: &Env<'a>,
+    ) -> Completion<'a, ()> {
+        use crate::ast::ObjectMember;
+        let mut taken: Vec<String> = Vec::new();
+        for m in members {
+            match m {
+                ObjectMember::Property {
+                    key, value: target, ..
+                } => {
+                    let k = self.member_key(key, env)?;
+                    let v = self.get_property(&value, &k)?;
+                    taken.push(k);
+                    self.store_with_default(target, v, env)?;
+                }
+                ObjectMember::Spread { value: target, .. } => {
+                    // Rest: the source's own keys minus the ones already taken.
+                    let rest = Obj::object();
+                    if let Value::Object(o) = &value {
+                        for k in o.own_keys() {
+                            if !taken.contains(&k) {
+                                rest.set(&k, self.get_property(&value, &k)?);
+                            }
+                        }
+                    }
+                    self.store(target, Value::Object(rest), env)?;
+                }
+                ObjectMember::Accessor { .. } => {
+                    return Err(make_error("SyntaxError", "invalid destructuring target"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores `value` into `target`, applying a default when `target` is a
+    /// `t = default` pattern and the value is `undefined`.
+    fn store_with_default(
+        &mut self,
+        target: &'a Expr,
+        value: Value<'a>,
+        env: &Env<'a>,
+    ) -> Completion<'a, ()> {
+        if let Expr::Assign {
+            op: AssignOp::Assign,
+            target: inner,
+            value: default,
+            ..
+        } = target
+        {
+            let v = if matches!(value, Value::Undefined) {
+                self.eval_expr(default, env)?
+            } else {
+                value
+            };
+            return self.store(inner, v, env);
+        }
+        self.store(target, value, env)
     }
 
     fn assign_ident(&self, name: &str, value: Value<'a>, env: &Env<'a>) -> Completion<'a, ()> {
