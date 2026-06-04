@@ -7,7 +7,8 @@
 //! ```text
 //! kataan lex FILE            # print the tokens of FILE
 //! kataan lex -e 'SOURCE'     # tokenize SOURCE from the command line
-//! kataan parse -e 'EXPR'     # parse an expression and dump its AST
+//! kataan parse FILE          # parse a program and dump its AST
+//! kataan parse -e 'SOURCE'   # parse SOURCE (a program) and dump its AST
 //! kataan --version
 //! ```
 
@@ -37,6 +38,13 @@ fn main() -> ExitCode {
             }
         },
         ["parse", "-e", source] => run_parse(source, "<argv>"),
+        ["parse", path] => match std::fs::read_to_string(path) {
+            Ok(source) => run_parse(&source, path),
+            Err(e) => {
+                eprintln!("kataan: cannot read {path}: {e}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!("kataan: unrecognized arguments: {}", args.join(" "));
             eprintln!("try `kataan --help`");
@@ -73,12 +81,12 @@ fn run_lex(source: &str, origin: &str) -> ExitCode {
     }
 }
 
-/// Parses `source` as a single expression and prints its AST. `origin` is
-/// shown in error messages.
+/// Parses `source` as a program and prints its AST. `origin` is shown in error
+/// messages.
 fn run_parse(source: &str, origin: &str) -> ExitCode {
-    match Parser::parse_expression_entry(source) {
-        Ok(expr) => {
-            println!("{expr:#?}");
+    match Parser::parse_program(source) {
+        Ok(program) => {
+            println!("{program:#?}");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -95,11 +103,12 @@ fn print_usage() {
          USAGE:\n    \
          kataan lex <FILE>         tokenize a script file\n    \
          kataan lex -e <SOURCE>    tokenize a source string\n    \
-         kataan parse -e <EXPR>    parse an expression and dump its AST\n    \
+         kataan parse <FILE>       parse a program and dump its AST\n    \
+         kataan parse -e <SOURCE>  parse a source string and dump its AST\n    \
          kataan --version          print the version\n    \
          kataan --help             show this help\n\
          \n\
-         Full-program parsing, `run`, and a REPL arrive in later phases — see ROADMAP.md.",
+         `run` and a REPL arrive in later phases — see ROADMAP.md.",
         kataan::VERSION
     );
 }

@@ -12,9 +12,14 @@
 //! patterns, and modules are added in subsequent increments.
 
 mod expr;
+mod stmt;
 
 pub use expr::{
     Argument, ArrayElement, Expr, ObjectMember, PropertyKey, TemplateElement, TemplateLiteral,
+};
+pub use stmt::{
+    BindingTarget, CatchClause, ForInit, ForLeft, Program, SourceType, Stmt, SwitchCase, VarDecl,
+    VarDeclKind, VarDeclarator,
 };
 
 use crate::common::Span;

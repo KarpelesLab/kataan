@@ -10,6 +10,7 @@
 //! `Vec<Token>` with O(1) lookahead. Literal values are decoded by [`cook`].
 
 mod cook;
+mod stmt;
 
 #[cfg(test)]
 mod tests;
@@ -70,6 +71,14 @@ impl<'src> Parser<'src> {
     #[inline]
     fn peek_tok(&self) -> Token {
         self.tokens[self.pos]
+    }
+
+    /// The kind of the token `n` positions ahead (clamped to `Eof`).
+    #[inline]
+    fn nth_kind(&self, n: usize) -> TokenKind {
+        self.tokens
+            .get(self.pos + n)
+            .map_or(TokenKind::Eof, |t| t.kind)
     }
 
     #[inline]
@@ -928,6 +937,17 @@ impl<'src> Parser<'src> {
     fn without_no_in<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         let saved = self.no_in;
         self.no_in = false;
+        let r = f(self);
+        self.no_in = saved;
+        r
+    }
+
+    /// Runs `f` with `no_in` set, so a top-level `in` is *not* taken as a
+    /// relational operator — used while parsing a `for`-loop header, where a
+    /// bare `in` introduces a `for-in` loop instead.
+    fn with_no_in<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let saved = self.no_in;
+        self.no_in = true;
         let r = f(self);
         self.no_in = saved;
         r
