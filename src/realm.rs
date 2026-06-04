@@ -351,6 +351,19 @@ impl Realm {
         self.heap.get(handle)?.as_object()?.get(key)
     }
 
+    /// Defines an accessor (getter/setter) property on the object at `handle`.
+    pub fn define_accessor(&mut self, handle: Handle, key: &str, getter: NanBox, setter: NanBox) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.define_accessor(key, getter, setter);
+        }
+    }
+
+    /// The `(getter, setter)` of accessor `key` on `handle`, if defined.
+    #[must_use]
+    pub fn accessor(&self, handle: Handle, key: &str) -> Option<(NanBox, NanBox)> {
+        self.heap.get(handle)?.as_object()?.accessor(key)
+    }
+
     /// Sets own property `key` to `value` on the object at `handle`. Returns
     /// `false` if the handle is stale or the cell is not an object.
     pub fn set_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {

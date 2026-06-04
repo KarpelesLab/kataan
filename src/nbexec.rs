@@ -85,6 +85,8 @@ pub struct Interp<'a> {
     functions: Vec<FnDef<'a>>,
     /// Class-AST table; a class cell holds an index into this.
     classes: Vec<&'a Class>,
+    /// Per-class static members (`Class.foo`), parallel to `classes`.
+    class_statics: Vec<alloc::collections::BTreeMap<String, NanBox>>,
     /// The current `this` binding (method/constructor receiver).
     this_val: NanBox,
     /// The superclass to invoke for `super(...)` inside the running constructor.
@@ -150,6 +152,7 @@ impl<'a> Interp<'a> {
             current: Scope::root(),
             functions: Vec::new(),
             classes: Vec::new(),
+            class_statics: Vec::new(),
             this_val: NanBox::undefined(),
             pending_super: None,
             microtasks: Vec::new(),
@@ -821,6 +824,30 @@ impl<'a> Interp<'a> {
     fn make_class(&mut self, class: &'a Class) -> NanBox {
         let class_id = self.classes.len() as u32;
         self.classes.push(class);
+        // Build the static members (`static foo() {}` / `static x = …`).
+        let mut statics = alloc::collections::BTreeMap::new();
+        for member in &class.body {
+            match member {
+                ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
+                    if let Ok(key) = static_key(&m.key) {
+                        let f =
+                            self.make_function(&m.value.params, Body::Block(&m.value.body), false);
+                        statics.insert(key, f);
+                    }
+                }
+                ClassMember::Field(field) if field.is_static => {
+                    if let Ok(key) = static_key(&field.key) {
+                        let v = match &field.value {
+                            Some(e) => self.eval(e).unwrap_or(NanBox::undefined()),
+                            None => NanBox::undefined(),
+                        };
+                        statics.insert(key, v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.class_statics.push(statics);
         let handle = self.realm.new_class(class_id, self.current.clone());
         NanBox::handle(handle.to_raw())
     }
@@ -869,15 +896,29 @@ impl<'a> Interp<'a> {
         for (cid, cenv) in chain.iter().rev() {
             let class = self.classes[*cid as usize];
             for member in &class.body {
-                if let ClassMember::Method(m) = member
-                    && !m.is_static
-                    && m.kind == MethodKind::Method
-                {
-                    let key = static_key(&m.key)?;
-                    let saved = core::mem::replace(&mut self.current, cenv.clone());
-                    let f = self.make_function(&m.value.params, Body::Block(&m.value.body), false);
-                    self.current = saved;
-                    self.realm.set_property(instance, &key, f);
+                let ClassMember::Method(m) = member else {
+                    continue;
+                };
+                if m.is_static {
+                    continue;
+                }
+                let key = static_key(&m.key)?;
+                let saved = core::mem::replace(&mut self.current, cenv.clone());
+                let f = self.make_function(&m.value.params, Body::Block(&m.value.body), false);
+                self.current = saved;
+                match m.kind {
+                    MethodKind::Method => {
+                        self.realm.set_property(instance, &key, f);
+                    }
+                    MethodKind::Get => {
+                        self.realm
+                            .define_accessor(instance, &key, f, NanBox::undefined());
+                    }
+                    MethodKind::Set => {
+                        self.realm
+                            .define_accessor(instance, &key, NanBox::undefined(), f);
+                    }
+                    MethodKind::Constructor => {}
                 }
             }
         }
@@ -2043,12 +2084,34 @@ impl<'a> Interp<'a> {
                     return Ok(self.realm.get_element(handle, i));
                 }
                 let name = self.realm.to_display_string(k);
-                Ok(self.member_value(handle, &name))
+                self.read_member(handle, &name)
             }
-            PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(self.member_value(handle, s)),
-            PropertyKey::Number(n) => Ok(self.member_value(handle, &alloc::format!("{n}"))),
+            PropertyKey::Ident(s) | PropertyKey::Str(s) => self.read_member(handle, s),
+            PropertyKey::Number(n) => self.read_member(handle, &alloc::format!("{n}")),
             PropertyKey::Private(_) => Err(ExecError::Unsupported("private member")),
         }
+    }
+
+    /// Reads a named member, honoring class statics and accessor getters before
+    /// ordinary property/length access.
+    fn read_member(
+        &mut self,
+        handle: crate::heap::Handle,
+        name: &str,
+    ) -> Result<NanBox, ExecError> {
+        if let Some((cid, _)) = self.realm.class_at(handle)
+            && let Some(v) = self.class_statics[cid as usize].get(name)
+        {
+            return Ok(*v);
+        }
+        if let Some((getter, _)) = self.realm.accessor(handle, name) {
+            if matches!(getter.unpack(), Unpacked::Undefined) {
+                return Ok(NanBox::undefined());
+            }
+            let this = NanBox::handle(handle.to_raw());
+            return self.call_with_this(getter, this, &[]);
+        }
+        Ok(self.member_value(handle, name))
     }
 
     fn member_value(&self, handle: crate::heap::Handle, key: &str) -> NanBox {
@@ -2123,6 +2186,16 @@ impl<'a> Interp<'a> {
         property: &'a PropertyKey,
         new: NanBox,
     ) -> Result<(), ExecError> {
+        // An accessor setter takes precedence for a named property.
+        if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property
+            && let Some((_, setter)) = self.realm.accessor(handle, s)
+        {
+            if !matches!(setter.unpack(), Unpacked::Undefined) {
+                let this = NanBox::handle(handle.to_raw());
+                self.call_with_this(setter, this, &[new])?;
+            }
+            return Ok(());
+        }
         match property {
             PropertyKey::Number(n) if as_index(*n).is_some() => {
                 self.realm.set_element(handle, as_index(*n).unwrap(), new);
@@ -2623,6 +2696,44 @@ mod tests {
         assert_eq!(
             run("let C = class { constructor() { this.k = 9; } }; new C().k"),
             "9"
+        );
+    }
+
+    #[test]
+    fn class_getters_setters_statics() {
+        // A getter computes from instance state.
+        assert_eq!(
+            run("class C { constructor(w, h) { this.w = w; this.h = h; }
+                   get area() { return this.w * this.h; } }
+                 new C(3, 4).area"),
+            "12"
+        );
+        // A setter mutates instance state.
+        assert_eq!(
+            run("class Temp {
+                   constructor() { this.c = 0; }
+                   get fahrenheit() { return this.c * 9 / 5 + 32; }
+                   set fahrenheit(f) { this.c = (f - 32) * 5 / 9; }
+                 }
+                 let t = new Temp(); t.fahrenheit = 212; t.c"),
+            "100"
+        );
+        // Static methods and fields.
+        assert_eq!(
+            run(
+                "class MathX { static square(n) { return n * n; } static pi = 3; }
+                 MathX.square(5) + MathX.pi"
+            ),
+            "28"
+        );
+        // A static factory returning an instance.
+        assert_eq!(
+            run("class Point {
+                   constructor(x) { this.x = x; }
+                   static origin() { return new Point(0); }
+                 }
+                 Point.origin().x"),
+            "0"
         );
     }
 

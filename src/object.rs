@@ -22,10 +22,14 @@ use crate::shape::Shape;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
-/// A property-bearing object: a hidden-class shape plus its value slots.
+/// A property-bearing object: a hidden-class shape plus its value slots, with an
+/// optional side list of accessor (getter/setter) properties.
 pub struct Object {
     shape: Rc<Shape>,
     slots: Vec<NanBox>,
+    /// Accessor properties: `(name, getter, setter)`, both held as value
+    /// handles (`undefined` when absent). Kept out of the shape's slot layout.
+    accessors: Vec<(alloc::boxed::Box<str>, NanBox, NanBox)>,
 }
 
 impl Object {
@@ -37,7 +41,37 @@ impl Object {
         Self {
             shape: root,
             slots: Vec::new(),
+            accessors: Vec::new(),
         }
+    }
+
+    /// Defines an accessor property `name` with `getter`/`setter` (either may be
+    /// `undefined`). Replaces an existing accessor of the same name.
+    pub fn define_accessor(&mut self, name: &str, getter: NanBox, setter: NanBox) {
+        if let Some(a) = self
+            .accessors
+            .iter_mut()
+            .find(|(k, _, _)| k.as_ref() == name)
+        {
+            if !matches!(getter.unpack(), crate::nanbox::Unpacked::Undefined) {
+                a.1 = getter;
+            }
+            if !matches!(setter.unpack(), crate::nanbox::Unpacked::Undefined) {
+                a.2 = setter;
+            }
+        } else {
+            self.accessors
+                .push((alloc::boxed::Box::from(name), getter, setter));
+        }
+    }
+
+    /// The `(getter, setter)` of accessor `name`, if defined.
+    #[must_use]
+    pub fn accessor(&self, name: &str) -> Option<(NanBox, NanBox)> {
+        self.accessors
+            .iter()
+            .find(|(k, _, _)| k.as_ref() == name)
+            .map(|(_, g, s)| (*g, *s))
     }
 
     /// The object's current shape (its hidden class).
@@ -95,6 +129,13 @@ impl Object {
         for slot in &self.slots {
             if let Some(raw) = slot.as_handle() {
                 visit(crate::heap::Handle::from_raw(raw));
+            }
+        }
+        for (_, g, s) in &self.accessors {
+            for v in [g, s] {
+                if let Some(raw) = v.as_handle() {
+                    visit(crate::heap::Handle::from_raw(raw));
+                }
             }
         }
     }
