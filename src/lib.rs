@@ -94,6 +94,10 @@ pub mod rope;
 #[cfg(feature = "alloc")]
 pub mod realm;
 
+/// Shared, `alloc`-only `JSON.parse` / `JSON.stringify` over realm values.
+#[cfg(feature = "alloc")]
+pub mod json;
+
 /// A minimal register VM over the `Realm`/`NanBox` representation — the proof
 /// that the performance object model executes code. Needs `alloc`.
 #[cfg(feature = "alloc")]

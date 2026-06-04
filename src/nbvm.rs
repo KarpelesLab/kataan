@@ -106,6 +106,14 @@ pub enum Op {
     GetElem { dst: Reg, arr: Reg, index: Reg },
     /// `arr[index] = src` (grows the array if needed).
     SetElem { arr: Reg, index: Reg, src: Reg },
+    /// `dst = obj[key]` — dynamic access: array element for a numeric key on an
+    /// array, else a string property.
+    GetKey { dst: Reg, obj: Reg, key: Reg },
+    /// `obj[key] = src` — the dynamic mirror of `GetKey`.
+    SetKey { obj: Reg, key: Reg, src: Reg },
+    /// Copies the own properties (or array elements) of `src` into object `dst`
+    /// (an object-literal `...spread`).
+    ObjectSpread { dst: Reg, src: Reg },
     /// `dst = arr.length` (array length or string character count).
     ArrayLen { dst: Reg, arr: Reg },
     /// `dst = coll.size` (a `Map`/`Set`'s entry count).
@@ -222,6 +230,8 @@ const NB_OBJECT_KEYS: u16 = 15;
 const NB_OBJECT_VALUES: u16 = 16;
 const NB_OBJECT_ENTRIES: u16 = 17;
 const NB_OBJECT_ASSIGN: u16 = 18;
+const NB_JSON_STRINGIFY: u16 = 19;
+const NB_JSON_PARSE: u16 = 20;
 
 /// A compiled function: its instruction stream, register-file size, and the
 /// number of leading registers that receive call arguments.
@@ -529,6 +539,53 @@ fn run_frame(
                 let handle = object_handle(regs[*arr as usize])?;
                 let i = num(regs[*index as usize])? as usize;
                 ctx.realm.set_element(handle, i, regs[*src as usize]);
+            }
+            Op::GetKey { dst, obj, key } => {
+                let handle = object_handle(regs[*obj as usize])?;
+                let k = regs[*key as usize];
+                regs[*dst as usize] = match k.as_number() {
+                    Some(n) if ctx.realm.is_array(handle) => {
+                        ctx.realm.get_element(handle, n as usize)
+                    }
+                    _ => {
+                        let ks = ctx.realm.to_display_string(k);
+                        ctx.realm
+                            .get_property(handle, &ks)
+                            .unwrap_or(NanBox::undefined())
+                    }
+                };
+            }
+            Op::SetKey { obj, key, src } => {
+                let handle = object_handle(regs[*obj as usize])?;
+                let k = regs[*key as usize];
+                match k.as_number() {
+                    Some(n) if ctx.realm.is_array(handle) => {
+                        ctx.realm
+                            .set_element(handle, n as usize, regs[*src as usize]);
+                    }
+                    _ => {
+                        let ks = ctx.realm.to_display_string(k);
+                        ctx.realm.set_property(handle, &ks, regs[*src as usize]);
+                    }
+                }
+            }
+            Op::ObjectSpread { dst, src } => {
+                let target = object_handle(regs[*dst as usize])?;
+                if let Some(sh) = regs[*src as usize].as_handle().map(Handle::from_raw) {
+                    if let Some(elems) = ctx.realm.array_elements(sh).map(<[_]>::to_vec) {
+                        for (i, e) in elems.into_iter().enumerate() {
+                            ctx.realm.set_property(target, &alloc::format!("{i}"), e);
+                        }
+                    } else {
+                        for k in ctx.realm.object_keys(sh).unwrap_or_default() {
+                            let v = ctx
+                                .realm
+                                .get_property(sh, &k)
+                                .unwrap_or(NanBox::undefined());
+                            ctx.realm.set_property(target, &k, v);
+                        }
+                    }
+                }
             }
             Op::ArrayLen { dst, arr } => {
                 let handle = object_handle(regs[*arr as usize])?;
@@ -1209,6 +1266,19 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             }
             NanBox::handle(ctx.realm.new_array(out).to_raw())
         }
+        NB_JSON_STRINGIFY => {
+            let v = args.first().copied().unwrap_or(NanBox::undefined());
+            match crate::json::stringify(ctx.realm, v) {
+                Some(s) => NanBox::handle(ctx.realm.new_string(&s).to_raw()),
+                None => NanBox::undefined(),
+            }
+        }
+        NB_JSON_PARSE => {
+            let s = ctx
+                .realm
+                .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
+            crate::json::parse(ctx.realm, &s).unwrap_or(NanBox::undefined())
+        }
         NB_OBJECT_ASSIGN => {
             let target = args.first().copied().unwrap_or(NanBox::undefined());
             if let Some(t) = target.as_handle().map(Handle::from_raw) {
@@ -1482,6 +1552,8 @@ fn native_call(callee: &Expr) -> Option<u16> {
         ("Object", "values") => Some(NB_OBJECT_VALUES),
         ("Object", "entries") => Some(NB_OBJECT_ENTRIES),
         ("Object", "assign") => Some(NB_OBJECT_ASSIGN),
+        ("JSON", "stringify") => Some(NB_JSON_STRINGIFY),
+        ("JSON", "parse") => Some(NB_JSON_PARSE),
         _ => None,
     }
 }
@@ -2872,16 +2944,47 @@ impl Compiler {
                 let dst = self.alloc();
                 self.ops.push(Op::NewObject { dst });
                 for m in members {
-                    let ObjectMember::Property { key, value, .. } = m else {
-                        return Err(CompileError::Unsupported("object member"));
-                    };
-                    let key = static_key(key)?;
-                    let v = self.expr(value)?;
-                    self.ops.push(Op::SetProp {
-                        obj: dst,
-                        key,
-                        src: v,
-                    });
+                    match m {
+                        ObjectMember::Property { key, value, .. } => {
+                            let v = self.expr(value)?;
+                            match key {
+                                PropertyKey::Computed(e) => {
+                                    let k = self.expr(e)?;
+                                    self.ops.push(Op::SetKey {
+                                        obj: dst,
+                                        key: k,
+                                        src: v,
+                                    });
+                                }
+                                _ => self.ops.push(Op::SetProp {
+                                    obj: dst,
+                                    key: static_key(key)?,
+                                    src: v,
+                                }),
+                            }
+                        }
+                        ObjectMember::Spread { value, .. } => {
+                            let src = self.expr(value)?;
+                            self.ops.push(Op::ObjectSpread { dst, src });
+                        }
+                        ObjectMember::Accessor {
+                            is_getter,
+                            key,
+                            value,
+                            ..
+                        } => {
+                            let key = static_key(key)?;
+                            let f = self.make_closure(&value.params, &value.body)?;
+                            let undef = self.constant(NanBox::undefined())?;
+                            let (getter, setter) = if *is_getter { (f, undef) } else { (undef, f) };
+                            self.ops.push(Op::DefineAccessor {
+                                obj: dst,
+                                key,
+                                getter,
+                                setter,
+                            });
+                        }
+                    }
                 }
                 Ok(dst)
             }
@@ -3056,20 +3159,7 @@ impl Compiler {
                         } else {
                             v
                         };
-                        match property {
-                            PropertyKey::Computed(e) => {
-                                let index = self.expr(e)?;
-                                self.ops.push(Op::SetElem {
-                                    arr: obj,
-                                    index,
-                                    src,
-                                });
-                            }
-                            _ => {
-                                let key = static_key(property)?;
-                                self.ops.push(Op::SetProp { obj, key, src });
-                            }
-                        }
+                        self.member_write(obj, property, src)?;
                         Ok(src)
                     }
                     _ => Err(CompileError::Unsupported("assignment target")),
@@ -3477,12 +3567,8 @@ impl Compiler {
         let dst = self.alloc();
         match property {
             PropertyKey::Computed(e) => {
-                let index = self.expr(e)?;
-                self.ops.push(Op::GetElem {
-                    dst,
-                    arr: obj,
-                    index,
-                });
+                let key = self.expr(e)?;
+                self.ops.push(Op::GetKey { dst, obj, key });
             }
             _ => {
                 let key = static_key(property)?;
@@ -3507,12 +3593,8 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         match property {
             PropertyKey::Computed(e) => {
-                let index = self.expr(e)?;
-                self.ops.push(Op::SetElem {
-                    arr: obj,
-                    index,
-                    src,
-                });
+                let key = self.expr(e)?;
+                self.ops.push(Op::SetKey { obj, key, src });
             }
             _ => {
                 let key = static_key(property)?;
@@ -4098,6 +4180,41 @@ mod tests {
                 class C extends B { constructor() { super(); this.c = 3; } }
                 let o = new C(); o.a + o.b + o.c"),
             "6"
+        );
+    }
+
+    #[test]
+    fn bytecode_json_and_object_features() {
+        // JSON round-trip.
+        assert_eq!(
+            bc("JSON.stringify({ a: 1, b: [2, 3], c: 'x' })"),
+            "{\"a\":1,\"b\":[2,3],\"c\":\"x\"}"
+        );
+        assert_eq!(bc("JSON.parse('{\"x\": 42}').x"), "42");
+        assert_eq!(bc("JSON.parse('[1, 2, 3]')[1]"), "2");
+        assert_eq!(
+            bc("let o = JSON.parse(JSON.stringify({ n: 7, s: 'hi' })); o.n + o.s"),
+            "7hi"
+        );
+        // Object spread (merge + override).
+        assert_eq!(
+            bc("let a = { x: 1, y: 2 }; let b = { ...a, y: 9, z: 3 }; b.x + ',' + b.y + ',' + b.z"),
+            "1,9,3"
+        );
+        // Computed object keys.
+        assert_eq!(
+            bc("let k = 'dyn'; let o = { [k]: 5, ['a' + 'b']: 6 }; o.dyn + o.ab"),
+            "11"
+        );
+        // Object-literal getter.
+        assert_eq!(
+            bc("let o = { _v: 10, get v() { return this._v * 2; } }; o.v"),
+            "20"
+        );
+        // Dynamic string-keyed access.
+        assert_eq!(
+            bc("let o = { foo: 1, bar: 2 }; let key = 'bar'; o[key] = 9; o['foo'] + o.bar"),
+            "10"
         );
     }
 
