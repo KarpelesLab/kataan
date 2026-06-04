@@ -56,6 +56,12 @@ impl Scope {
         self.0.borrow_mut().vars.insert(String::from(name), value);
     }
 
+    /// Whether `name` is bound in *this* scope (not the enclosing chain).
+    #[must_use]
+    pub fn has_local(&self, name: &str) -> bool {
+        self.0.borrow().vars.contains_key(name)
+    }
+
     /// Looks up `name`, walking outward through enclosing scopes.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<NanBox> {

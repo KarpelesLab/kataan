@@ -1242,7 +1242,7 @@ impl<'a> Interp<'a> {
     /// Runs a whole program, returning the value of its last expression
     /// statement (or `undefined`).
     pub fn run(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
-        self.hoist(&program.body)?;
+        self.hoist_with(&program.body, true)?;
         let mut last = NanBox::undefined();
         for stmt in &program.body {
             match self.exec(stmt)? {
@@ -1264,7 +1264,22 @@ impl<'a> Interp<'a> {
     /// Pre-declares hoisted `function` declarations in the current scope, so a
     /// declaration is callable before its textual position (and mutual
     /// recursion works).
-    fn hoist(&mut self, stmts: &'a [Stmt]) -> Result<(), ExecError> {
+    /// Hoists a statement sequence. Function declarations are always hoisted;
+    /// `var` names hoist only at a function/program boundary (`hoist_vars`), not
+    /// per-block, since `var` is function-scoped.
+    fn hoist_with(&mut self, stmts: &'a [Stmt], hoist_vars: bool) -> Result<(), ExecError> {
+        // `var` names hoist to the function/program scope as `undefined` (so a
+        // read before the declaration yields `undefined`, not a ReferenceError).
+        // Done first; a same-named function declaration then overwrites it.
+        if hoist_vars {
+            let mut var_names: Vec<&str> = Vec::new();
+            collect_var_names(stmts, &mut var_names);
+            for name in var_names {
+                if !self.current.has_local(name) {
+                    self.current.declare(name, NanBox::undefined());
+                }
+            }
+        }
         for stmt in stmts {
             if let Stmt::Function(func) = stmt
                 && let Some(id) = &func.id
@@ -1280,6 +1295,12 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Block-level hoisting: function declarations only (`var` is function-scoped
+    /// and hoisted at the function/program boundary instead).
+    fn hoist(&mut self, stmts: &'a [Stmt]) -> Result<(), ExecError> {
+        self.hoist_with(stmts, false)
     }
 
     /// Registers a function definition and allocates a closure capturing the
@@ -1604,7 +1625,13 @@ impl<'a> Interp<'a> {
     ) -> Result<NanBox, ExecError> {
         let call_scope = captured.child();
         let saved = core::mem::replace(&mut self.current, call_scope);
-        let saved_this = core::mem::replace(&mut self.this_val, this_val);
+        // An arrow has no own `this` — it inherits the enclosing one lexically,
+        // so leave `self.this_val` unchanged.
+        let saved_this = if def.is_arrow {
+            self.this_val
+        } else {
+            core::mem::replace(&mut self.this_val, this_val)
+        };
         let saved_home = core::mem::replace(&mut self.current_home, def.home_class);
         // A generator body runs eagerly into a fresh yield buffer.
         let saved_sink = if def.is_generator {
@@ -3227,7 +3254,7 @@ impl<'a> Interp<'a> {
         match body {
             Body::Expr(e) => self.eval(e),
             Body::Block(stmts) => {
-                self.hoist(stmts)?;
+                self.hoist_with(stmts, true)?;
                 for stmt in stmts {
                     match self.exec(stmt)? {
                         Flow::Return(v) => return Ok(v),
@@ -3420,11 +3447,25 @@ impl<'a> Interp<'a> {
     }
 
     fn exec_var(&mut self, decl: &'a VarDecl) -> Result<(), ExecError> {
+        let is_var = matches!(decl.kind, crate::ast::VarDeclKind::Var);
         for d in &decl.declarations {
+            // A bare `var x;` (no initializer) must not clobber the value a
+            // hoisted binding may already hold from an earlier assignment.
+            if is_var && d.init.is_none() {
+                continue;
+            }
             let value = match &d.init {
                 Some(e) => self.eval(e)?,
                 None => NanBox::undefined(),
             };
+            // `var` assigns to its hoisted binding (in the function/program
+            // scope), so a declaration inside a block updates the same variable.
+            if is_var && let BindingTarget::Ident(Ident { name, .. }) = &d.target {
+                if !self.current.set(name, value) {
+                    self.current.declare(name, value);
+                }
+                continue;
+            }
             self.bind_pattern(&d.target, value)?;
         }
         Ok(())
@@ -4971,6 +5012,79 @@ impl<'a> Interp<'a> {
     }
 }
 
+/// Collects `var`-declared identifier names in `stmts`, recursing through nested
+/// statements but NOT into nested function bodies (which have their own scope) —
+/// for hoisting `var` bindings to the enclosing function/program scope.
+fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
+    use crate::ast::VarDeclKind;
+    fn from_decl<'a>(decl: &'a crate::ast::VarDecl, out: &mut Vec<&'a str>) {
+        if matches!(decl.kind, VarDeclKind::Var) {
+            for d in &decl.declarations {
+                if let BindingTarget::Ident(id) = &d.target {
+                    out.push(&id.name);
+                }
+            }
+        }
+    }
+    for stmt in stmts {
+        match stmt {
+            Stmt::Var(decl) => from_decl(decl, out),
+            Stmt::Block { body, .. } => collect_var_names(body, out),
+            Stmt::If {
+                consequent,
+                alternate,
+                ..
+            } => {
+                collect_var_names(core::slice::from_ref(consequent), out);
+                if let Some(alt) = alternate {
+                    collect_var_names(core::slice::from_ref(alt), out);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Labeled { body, .. } => {
+                collect_var_names(core::slice::from_ref(body), out);
+            }
+            Stmt::For { init, body, .. } => {
+                if let Some(crate::ast::ForInit::Var(decl)) = init {
+                    from_decl(decl, out);
+                }
+                collect_var_names(core::slice::from_ref(body), out);
+            }
+            Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
+                if let crate::ast::ForLeft::Decl {
+                    kind: VarDeclKind::Var,
+                    target: BindingTarget::Ident(id),
+                    ..
+                } = left
+                {
+                    out.push(&id.name);
+                }
+                collect_var_names(core::slice::from_ref(body), out);
+            }
+            Stmt::Switch { cases, .. } => {
+                for c in cases {
+                    collect_var_names(&c.body, out);
+                }
+            }
+            Stmt::Try {
+                block,
+                handler,
+                finalizer,
+                ..
+            } => {
+                collect_var_names(block, out);
+                if let Some(h) = handler {
+                    collect_var_names(&h.body, out);
+                }
+                if let Some(f) = finalizer {
+                    collect_var_names(f, out);
+                }
+            }
+            // `Stmt::Function` bodies have their own scope — not traversed.
+            _ => {}
+        }
+    }
+}
+
 /// The binary operator underlying a compound assignment (`+=` → `+`).
 fn compound_op(op: AssignOp) -> Result<BinaryOp, ExecError> {
     Ok(match op {
@@ -6227,6 +6341,34 @@ mod tests {
         // name from a declaration and a named function expression.
         assert_eq!(run("function greet(){} greet.name"), "greet");
         assert_eq!(run("let g = function inner(){}; g.name"), "inner");
+    }
+
+    #[test]
+    fn var_hoisting() {
+        // A `var` read before its declaration line yields `undefined`.
+        assert_eq!(
+            run("function f(){ var a = b; var b = 5; return String(a); } f()"),
+            "undefined"
+        );
+        assert_eq!(
+            run("function f(){ return typeof later; var later = 1; } f()"),
+            "undefined"
+        );
+        // A var inside a block still hoists to the function scope.
+        assert_eq!(run("function f(){ { var x = 9; } return x; } f()"), "9");
+    }
+
+    #[test]
+    fn arrow_inherits_lexical_this() {
+        assert_eq!(
+            run("let o = { v: 42, m: function(){ let f = () => this.v; return f(); } }; o.m()"),
+            "42"
+        );
+        // Nested arrows keep inheriting.
+        assert_eq!(
+            run("let o = { v: 7, m: function(){ return (() => (() => this.v)())(); } }; o.m()"),
+            "7"
+        );
     }
 
     #[test]
