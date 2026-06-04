@@ -285,6 +285,23 @@ pub enum Op {
     },
     ReturnUndefined,
 
+    // --- closures ---
+    /// `dst = a closure over chunk `chunk``, capturing the `count` cells in
+    /// registers `upvals_base .. upvals_base+count` as its upvalues. Each
+    /// captured value is a one-element "cell" array shared with the enclosing
+    /// scope, so writes through a captured variable are visible on both sides.
+    MakeClosure {
+        dst: Reg,
+        chunk: u32,
+        upvals_base: Reg,
+        count: u16,
+    },
+    /// `dst = the current frame's upvalue #`idx`` (the captured cell).
+    GetUpvalue {
+        dst: Reg,
+        idx: u16,
+    },
+
     // --- exceptions ---
     /// Throw the value in `src`.
     Throw {

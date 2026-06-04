@@ -48,9 +48,11 @@ impl CompileError {
 /// Compiles a program to a module whose entry chunk (#0) returns the value of
 /// the final expression statement (REPL-style).
 pub fn compile_program(body: &[Stmt]) -> Result<Module, CompileError> {
+    // Top-level locals can be captured by functions too.
+    let captured = captured_names(&[], &FnBody::Block(body));
     let mut c = Compiler {
         module: alloc::vec![Chunk::new("<main>")],
-        funcs: alloc::vec![FnState::new(0, Vec::new())],
+        funcs: alloc::vec![FnState::new(0, captured)],
     };
     c.compile_body(body, true)?;
     let main = c.funcs.pop().expect("entry function state");
@@ -58,27 +60,68 @@ pub fn compile_program(body: &[Stmt]) -> Result<Module, CompileError> {
     Ok(Module { chunks: c.module })
 }
 
+/// A local binding: its name, backing register, and whether that register holds
+/// a "cell" (a one-element array shared with closures that capture it) rather
+/// than the value directly.
+#[derive(Clone)]
+struct Local {
+    name: String,
+    reg: Reg,
+    is_cell: bool,
+}
+
+/// How a function reaches one of its upvalues at closure-creation time.
+#[derive(Clone, Copy)]
+enum UpvalSource {
+    /// A cell in an enclosing function's local register.
+    ParentLocal(Reg),
+    /// An upvalue of the enclosing function (transitive capture).
+    ParentUpval(u16),
+}
+
+/// An upvalue captured by a function: the captured name and where its cell
+/// comes from in the immediately enclosing function.
+#[derive(Clone)]
+struct Upvalue {
+    name: String,
+    source: UpvalSource,
+}
+
+/// How a referenced name resolves in the current function.
+enum Binding {
+    /// A local register; `cell` means the value lives in `reg[0]` of a cell.
+    Local { reg: Reg, cell: bool },
+    /// An upvalue (captured variable) at the given index.
+    Upvalue(u16),
+    /// A global variable.
+    Global,
+}
+
 /// Per-function compilation state.
 struct FnState {
     chunk_idx: usize,
     next_reg: Reg,
-    /// In-scope locals → backing register (innermost last; shadowing wins).
-    locals: Vec<(String, Reg)>,
-    /// Names visible from enclosing functions, to detect (unsupported) captures.
-    enclosing: Vec<String>,
+    /// In-scope locals (innermost last; shadowing wins).
+    locals: Vec<Local>,
+    /// Names of this function's locals/params that are captured by nested
+    /// functions and so are stored in cells (computed before compiling).
+    captured: alloc::collections::BTreeSet<String>,
+    /// Upvalues captured from enclosing functions, in capture order.
+    upvalues: Vec<Upvalue>,
     /// The enclosing-loop stack, for resolving `break`/`continue` jumps.
     loops: Vec<LoopCtx>,
 }
 
 impl FnState {
-    fn new(chunk_idx: usize, enclosing: Vec<String>) -> Self {
+    fn new(chunk_idx: usize, captured: alloc::collections::BTreeSet<String>) -> Self {
         Self {
             chunk_idx,
             // Register 0 is reserved for `this` (bound by the VM on each call);
             // parameters and locals start at register 1.
             next_reg: 1,
             locals: Vec::new(),
-            enclosing,
+            captured,
+            upvalues: Vec::new(),
             loops: Vec::new(),
         }
     }
@@ -125,31 +168,188 @@ impl Compiler {
         f.next_reg += 1;
         r
     }
-    fn resolve(&self, name: &str) -> Option<Reg> {
+    /// Looks up a local in the current function (innermost wins).
+    fn resolve(&self, name: &str) -> Option<Local> {
         self.funcs
             .last()
             .expect("a current function")
             .locals
             .iter()
             .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, r)| *r)
+            .find(|l| l.name == name)
+            .cloned()
     }
-    fn declare_local(&mut self, name: String, reg: Reg) {
+    /// Declares a local backed by `reg`; `is_cell` marks a captured (boxed) one.
+    fn declare_local_cell(&mut self, name: String, reg: Reg, is_cell: bool) {
         self.funcs
             .last_mut()
             .expect("a current function")
             .locals
-            .push((name, reg));
+            .push(Local { name, reg, is_cell });
     }
-    /// Whether `name` is a local of an enclosing function (an upvalue capture).
-    fn is_capture(&self, name: &str) -> bool {
+    /// Declares a plain (non-captured) local.
+    fn declare_local(&mut self, name: String, reg: Reg) {
+        self.declare_local_cell(name, reg, false);
+    }
+    /// Whether `name` is captured by nested functions in the current function
+    /// (and so must be stored in a cell).
+    fn is_captured_here(&self, name: &str) -> bool {
         self.funcs
             .last()
             .expect("a current function")
-            .enclosing
+            .captured
+            .contains(name)
+    }
+
+    // --- name resolution (locals / upvalues / globals) ------------------
+
+    /// Resolves a name to a binding, threading upvalue capture through the
+    /// enclosing functions as needed.
+    fn lookup_binding(&mut self, name: &str) -> Result<Binding, CompileError> {
+        if let Some(local) = self.resolve(name) {
+            return Ok(Binding::Local {
+                reg: local.reg,
+                cell: local.is_cell,
+            });
+        }
+        let top = self.funcs.len() - 1;
+        if let Some(idx) = self.resolve_upvalue(top, name)? {
+            return Ok(Binding::Upvalue(idx));
+        }
+        Ok(Binding::Global)
+    }
+
+    /// Resolves `name` as an upvalue of function `fi`, recording the capture
+    /// chain. Returns the upvalue index, or `None` if it is not an enclosing
+    /// local. A reference to an enclosing local that was *not* boxed (the
+    /// capture analysis missed it) is reported as unsupported so the caller
+    /// falls back to the tree-walker.
+    fn resolve_upvalue(&mut self, fi: usize, name: &str) -> Result<Option<u16>, CompileError> {
+        if fi == 0 {
+            return Ok(None);
+        }
+        let parent = fi - 1;
+        // A local of the enclosing function?
+        if let Some(local) = self.funcs[parent]
+            .locals
             .iter()
-            .any(|n| n == name)
+            .rev()
+            .find(|l| l.name == name)
+            .cloned()
+        {
+            if !local.is_cell {
+                return Err(CompileError::unsupported("captured (closure) variable"));
+            }
+            return Ok(Some(self.add_upvalue(
+                fi,
+                name,
+                UpvalSource::ParentLocal(local.reg),
+            )));
+        }
+        // An upvalue of the enclosing function (transitive capture)?
+        if let Some(pidx) = self.resolve_upvalue(parent, name)? {
+            return Ok(Some(self.add_upvalue(
+                fi,
+                name,
+                UpvalSource::ParentUpval(pidx),
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Adds (or reuses) an upvalue on function `fi`, returning its index.
+    fn add_upvalue(&mut self, fi: usize, name: &str, source: UpvalSource) -> u16 {
+        let ups = &mut self.funcs[fi].upvalues;
+        for (i, up) in ups.iter().enumerate() {
+            if up.name == name {
+                return i as u16;
+            }
+        }
+        ups.push(Upvalue {
+            name: name.into(),
+            source,
+        });
+        (ups.len() - 1) as u16
+    }
+
+    /// Reads the binding `b` into a fresh register and returns it.
+    fn read_binding(&mut self, b: &Binding, name: &str) -> Reg {
+        match *b {
+            Binding::Local { reg, cell: false } => {
+                let dst = self.reg();
+                self.emit(Op::Move { dst, src: reg });
+                dst
+            }
+            Binding::Local { reg, cell: true } => self.cell_get(reg),
+            Binding::Upvalue(idx) => {
+                let cell = self.reg();
+                self.emit(Op::GetUpvalue { dst: cell, idx });
+                self.cell_get(cell)
+            }
+            Binding::Global => {
+                let dst = self.reg();
+                let k = self.add_const(Const::Str(name.into()));
+                self.emit(Op::GetGlobal { dst, name: k });
+                dst
+            }
+        }
+    }
+
+    /// Writes `value` into the binding `b`.
+    fn write_binding(&mut self, b: &Binding, name: &str, value: Reg) {
+        match *b {
+            Binding::Local { reg, cell: false } => {
+                self.emit(Op::Move {
+                    dst: reg,
+                    src: value,
+                });
+            }
+            Binding::Local { reg, cell: true } => self.cell_set(reg, value),
+            Binding::Upvalue(idx) => {
+                let cell = self.reg();
+                self.emit(Op::GetUpvalue { dst: cell, idx });
+                self.cell_set(cell, value);
+            }
+            Binding::Global => {
+                let k = self.add_const(Const::Str(name.into()));
+                self.emit(Op::SetGlobal {
+                    name: k,
+                    src: value,
+                });
+            }
+        }
+    }
+
+    /// `dst = cell[0]` — reads the value held in a cell.
+    fn cell_get(&mut self, cell: Reg) -> Reg {
+        let idx = self.reg();
+        self.emit(Op::LoadInt { dst: idx, value: 0 });
+        let dst = self.reg();
+        self.emit(Op::GetElem {
+            dst,
+            obj: cell,
+            index: idx,
+        });
+        dst
+    }
+
+    /// `cell[0] = value` — stores a value into a cell.
+    fn cell_set(&mut self, cell: Reg, value: Reg) {
+        let idx = self.reg();
+        self.emit(Op::LoadInt { dst: idx, value: 0 });
+        self.emit(Op::SetElem {
+            obj: cell,
+            index: idx,
+            src: value,
+        });
+    }
+
+    /// Creates a fresh cell holding `value`, returning the cell register.
+    fn new_cell(&mut self, value: Reg) -> Reg {
+        let cell = self.reg();
+        self.emit(Op::NewArray { dst: cell, len: 1 });
+        self.cell_set(cell, value);
+        cell
     }
 
     // --- statements -----------------------------------------------------
@@ -430,12 +630,19 @@ impl Compiler {
     fn bind_pattern(&mut self, target: &BindingTarget, value_reg: Reg) -> Result<(), CompileError> {
         match target {
             BindingTarget::Ident(id) => {
-                let slot = self.reg();
-                self.emit(Op::Move {
-                    dst: slot,
-                    src: value_reg,
-                });
-                self.declare_local(id.name.clone().into_string(), slot);
+                let name = id.name.clone().into_string();
+                if self.is_captured_here(&name) {
+                    // Captured by a nested function: box it in a cell.
+                    let cell = self.new_cell(value_reg);
+                    self.declare_local_cell(name, cell, true);
+                } else {
+                    let slot = self.reg();
+                    self.emit(Op::Move {
+                        dst: slot,
+                        src: value_reg,
+                    });
+                    self.declare_local(name, slot);
+                }
                 Ok(())
             }
             BindingTarget::Array(pat) => {
@@ -779,7 +986,14 @@ impl Compiler {
         let Some(id) = &func.id else {
             return Err(CompileError::unsupported("anonymous function declaration"));
         };
-        let chunk_idx = self.compile_function(&func.params, FnBody::Block(&func.body), &id.name)?;
+        let (chunk_idx, upvalues) =
+            self.compile_function(&func.params, FnBody::Block(&func.body), &id.name)?;
+        // Hoisted function declarations are bound before later locals exist, so
+        // a declaration that captures an enclosing variable can't build its
+        // closure here — fall back to the tree-walker.
+        if !upvalues.is_empty() {
+            return Err(CompileError::unsupported("captured function declaration"));
+        }
         let dst = self.reg();
         let k = self.add_const(Const::Func(chunk_idx as u32));
         self.emit(Op::LoadConst { dst, k });
@@ -788,27 +1002,27 @@ impl Compiler {
         Ok(())
     }
 
-    /// Compiles a function body into a new chunk; returns the chunk index.
+    /// Compiles a function body into a new chunk; returns the chunk index and
+    /// the upvalues it captured (so the caller can build a closure over it).
     fn compile_function(
         &mut self,
         params: &[Param],
         body: FnBody,
         name: &str,
-    ) -> Result<usize, CompileError> {
+    ) -> Result<(usize, Vec<Upvalue>), CompileError> {
         // Rest parameters (variadic) aren't supported yet.
         if params.iter().any(|p| p.rest) {
             return Err(CompileError::unsupported("rest parameter"));
         }
 
-        let outer = self.funcs.last().expect("fn");
-        let mut enclosing = outer.enclosing.clone();
-        enclosing.extend(outer.locals.iter().map(|(n, _)| n.clone()));
-
         let chunk_idx = self.module.len();
         self.module.push(Chunk::new(name));
         self.module[chunk_idx].param_count = params.len() as u16;
 
-        let mut state = FnState::new(chunk_idx, enclosing);
+        // Pre-pass: which of this function's params/locals are captured by
+        // nested functions (and so must be boxed in cells)?
+        let captured = captured_names(params, &body);
+        let mut state = FnState::new(chunk_idx, captured);
         // Reserve a positional register per parameter (the VM binds args here).
         let mut param_slots = Vec::new();
         for _ in params {
@@ -818,12 +1032,15 @@ impl Compiler {
         }
         self.funcs.push(state);
 
-        // Bind each parameter: a plain identifier maps to its slot directly;
-        // defaults and destructuring patterns are lowered like declarations.
+        // Bind each parameter: a plain (non-captured) identifier maps to its
+        // slot directly; defaults, captures, and patterns go through the
+        // general binding path.
         for (p, slot) in params.iter().zip(param_slots) {
             let bound = self.apply_default(slot, p.default.as_ref())?;
             match &p.target {
-                BindingTarget::Ident(id) if p.default.is_none() => {
+                BindingTarget::Ident(id)
+                    if p.default.is_none() && !self.is_captured_here(&id.name) =>
+                {
                     self.declare_local(id.name.clone().into_string(), slot);
                 }
                 _ => self.bind_pattern(&p.target, bound)?,
@@ -841,7 +1058,42 @@ impl Compiler {
 
         let finished = self.funcs.pop().expect("fn");
         self.module[chunk_idx].register_count = finished.next_reg;
-        Ok(chunk_idx)
+        Ok((chunk_idx, finished.upvalues))
+    }
+
+    /// Emits the value for a compiled function: a plain function constant when
+    /// it has no upvalues, or a `MakeClosure` capturing the upvalue cells.
+    fn emit_closure(&mut self, chunk_idx: usize, upvalues: &[Upvalue]) -> Reg {
+        if upvalues.is_empty() {
+            let dst = self.reg();
+            let k = self.add_const(Const::Func(chunk_idx as u32));
+            self.emit(Op::LoadConst { dst, k });
+            return dst;
+        }
+        // Gather the captured cells into a contiguous register window.
+        let base = self.funcs.last().expect("fn").next_reg;
+        for up in upvalues {
+            let slot = self.reg();
+            match up.source {
+                UpvalSource::ParentLocal(reg) => {
+                    self.emit(Op::Move {
+                        dst: slot,
+                        src: reg,
+                    });
+                }
+                UpvalSource::ParentUpval(idx) => {
+                    self.emit(Op::GetUpvalue { dst: slot, idx });
+                }
+            }
+        }
+        let dst = self.reg();
+        self.emit(Op::MakeClosure {
+            dst,
+            chunk: chunk_idx as u32,
+            upvals_base: base,
+            count: upvalues.len() as u16,
+        });
+        dst
     }
 
     fn patch_to_here(&mut self, idx: usize) {
@@ -912,6 +1164,12 @@ impl Compiler {
                 op, target, value, ..
             } => self.assign(*op, target, value),
             Expr::Unary { op, argument, .. } => self.unary(*op, argument),
+            Expr::Update {
+                op,
+                prefix,
+                argument,
+                ..
+            } => self.update(*op, *prefix, argument),
             Expr::Binary {
                 op, left, right, ..
             } => self.binary(*op, left, right),
@@ -941,15 +1199,12 @@ impl Compiler {
                 self.call(callee, arguments)
             }
             Expr::Function(func) => {
-                let idx = self.compile_function(
+                let (idx, upvalues) = self.compile_function(
                     &func.params,
                     FnBody::Block(&func.body),
                     func.id.as_ref().map_or("<anonymous>", |id| &id.name),
                 )?;
-                let dst = self.reg();
-                let k = self.add_const(Const::Func(idx as u32));
-                self.emit(Op::LoadConst { dst, k });
-                Ok(dst)
+                Ok(self.emit_closure(idx, &upvalues))
             }
             Expr::Arrow(arrow) => self.arrow(arrow),
             Expr::New {
@@ -1206,11 +1461,8 @@ impl Compiler {
             ArrowBody::Expr(e) => FnBody::Expr(e),
             ArrowBody::Block(b) => FnBody::Block(b),
         };
-        let idx = self.compile_function(&arrow.params, body, "<arrow>")?;
-        let dst = self.reg();
-        let k = self.add_const(Const::Func(idx as u32));
-        self.emit(Op::LoadConst { dst, k });
-        Ok(dst)
+        let (idx, upvalues) = self.compile_function(&arrow.params, body, "<arrow>")?;
+        Ok(self.emit_closure(idx, &upvalues))
     }
 
     /// Reads `name` (local copy, or global) into a fresh register; a reference
@@ -1221,18 +1473,8 @@ impl Compiler {
             self.emit(Op::LoadUndefined { dst });
             return Ok(dst);
         }
-        if let Some(slot) = self.resolve(name) {
-            let dst = self.reg();
-            self.emit(Op::Move { dst, src: slot });
-            return Ok(dst);
-        }
-        if self.is_capture(name) {
-            return Err(CompileError::unsupported("captured (closure) variable"));
-        }
-        let dst = self.reg();
-        let k = self.add_const(Const::Str(name.into()));
-        self.emit(Op::GetGlobal { dst, name: k });
-        Ok(dst)
+        let binding = self.lookup_binding(name)?;
+        Ok(self.read_binding(&binding, name))
     }
 
     fn assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> Result<Reg, CompileError> {
@@ -1264,20 +1506,8 @@ impl Compiler {
                 dst
             }
         };
-        if let Some(slot) = self.resolve(name) {
-            self.emit(Op::Move {
-                dst: slot,
-                src: result,
-            });
-        } else if self.is_capture(name) {
-            return Err(CompileError::unsupported("captured (closure) variable"));
-        } else {
-            let nk = self.add_const(Const::Str(name.into()));
-            self.emit(Op::SetGlobal {
-                name: nk,
-                src: result,
-            });
-        }
+        let binding = self.lookup_binding(name)?;
+        self.write_binding(&binding, name, result);
         Ok(result)
     }
 
@@ -1337,6 +1567,102 @@ impl Compiler {
             }),
         };
         Ok(result)
+    }
+
+    /// Compiles `++x` / `x++` / `--x` / `x--` on an identifier or member.
+    fn update(
+        &mut self,
+        op: crate::ast::UpdateOp,
+        prefix: bool,
+        argument: &Expr,
+    ) -> Result<Reg, CompileError> {
+        use crate::ast::UpdateOp;
+        let binop = match op {
+            UpdateOp::Inc => BinaryOp::Add,
+            UpdateOp::Dec => BinaryOp::Sub,
+        };
+        // Read the current value (coerced to a number via `cur - 0` is implicit
+        // in the arithmetic), compute the updated value, write it back, and
+        // yield the new value (prefix) or the original numeric value (postfix).
+        match argument {
+            Expr::Ident(id) => {
+                let binding = self.lookup_binding(&id.name)?;
+                let cur = self.read_binding(&binding, &id.name);
+                let old = self.coerce_number(cur);
+                let one = self.reg();
+                self.emit(Op::LoadInt { dst: one, value: 1 });
+                let updated = self.reg();
+                self.emit_binop(binop, updated, old, one)?;
+                self.write_binding(&binding, &id.name, updated);
+                Ok(if prefix { updated } else { old })
+            }
+            Expr::Member {
+                object,
+                property,
+                optional: false,
+                ..
+            } => {
+                let obj = self.expr(object)?;
+                let key = match property {
+                    PropertyKey::Ident(name) => {
+                        PropertySlot::Const(self.add_const(Const::Str(name.clone().into_string())))
+                    }
+                    PropertyKey::Str(s) => {
+                        PropertySlot::Const(self.add_const(Const::Str(s.clone().into_string())))
+                    }
+                    PropertyKey::Computed(e) => PropertySlot::Index(self.expr(e)?),
+                    _ => return Err(CompileError::unsupported("update member key")),
+                };
+                let cur = self.reg();
+                match key {
+                    PropertySlot::Const(k) => self.emit(Op::GetProp {
+                        dst: cur,
+                        obj,
+                        key: k,
+                    }),
+                    PropertySlot::Index(idx) => self.emit(Op::GetElem {
+                        dst: cur,
+                        obj,
+                        index: idx,
+                    }),
+                };
+                let old = self.coerce_number(cur);
+                let one = self.reg();
+                self.emit(Op::LoadInt { dst: one, value: 1 });
+                let updated = self.reg();
+                self.emit_binop(binop, updated, old, one)?;
+                match key {
+                    PropertySlot::Const(k) => self.emit(Op::SetProp {
+                        obj,
+                        key: k,
+                        src: updated,
+                    }),
+                    PropertySlot::Index(idx) => self.emit(Op::SetElem {
+                        obj,
+                        index: idx,
+                        src: updated,
+                    }),
+                };
+                Ok(if prefix { updated } else { old })
+            }
+            _ => Err(CompileError::unsupported("update target")),
+        }
+    }
+
+    /// Coerces a register to a number via `value - 0`, returning a fresh reg.
+    fn coerce_number(&mut self, value: Reg) -> Reg {
+        let zero = self.reg();
+        self.emit(Op::LoadInt {
+            dst: zero,
+            value: 0,
+        });
+        let dst = self.reg();
+        self.emit(Op::Sub {
+            dst,
+            a: value,
+            b: zero,
+        });
+        dst
     }
 
     fn unary(&mut self, op: UnaryOp, argument: &Expr) -> Result<Reg, CompileError> {
@@ -1415,12 +1741,9 @@ impl Compiler {
     /// non-throwing form so `typeof unbound === 'undefined'`.
     fn type_of(&mut self, argument: &Expr) -> Result<Reg, CompileError> {
         if let Expr::Ident(id) = argument
-            && self.resolve(&id.name).is_none()
             && id.name.as_ref() != "undefined"
+            && matches!(self.lookup_binding(&id.name)?, Binding::Global)
         {
-            if self.is_capture(&id.name) {
-                return Err(CompileError::unsupported("captured (closure) variable"));
-            }
             let dst = self.reg();
             let name = self.add_const(Const::Str(id.name.clone().into_string()));
             self.emit(Op::TypeOfGlobal { dst, name });
@@ -1667,5 +1990,395 @@ fn compound_binop(op: AssignOp) -> Option<BinaryOp> {
         AssignOp::ModAssign => Some(BinaryOp::Mod),
         AssignOp::ExpAssign => Some(BinaryOp::Exp),
         _ => None,
+    }
+}
+
+// --- capture analysis (which locals must be boxed in cells) ---------------
+//
+// Incompleteness here is safe: a missed capture leaves an enclosing local
+// un-boxed, so the closure's reference resolves to a non-cell local and the
+// whole program falls back to the tree-walker; an over-reported capture just
+// boxes a local that didn't need it (still correct).
+
+use alloc::collections::BTreeSet;
+
+/// The names of `params`/body locals that are referenced inside nested
+/// functions (and so must be stored in cells so closures can share them).
+fn captured_names(params: &[Param], body: &FnBody) -> BTreeSet<String> {
+    let mut declared = BTreeSet::new();
+    for p in params {
+        binding_names(&p.target, &mut declared);
+    }
+    let mut nested = BTreeSet::new();
+    match body {
+        FnBody::Block(stmts) => {
+            for s in *stmts {
+                declared_in_stmt(s, &mut declared);
+                idents_in_stmt(s, &mut nested, true);
+            }
+        }
+        FnBody::Expr(e) => idents_in_expr(e, &mut nested, true),
+    }
+    declared.intersection(&nested).cloned().collect()
+}
+
+/// Collects the names bound by a binding target (pattern).
+fn binding_names(t: &BindingTarget, out: &mut BTreeSet<String>) {
+    use crate::ast::ArrayPatternElement;
+    match t {
+        BindingTarget::Ident(id) => {
+            out.insert(id.name.clone().into_string());
+        }
+        BindingTarget::Array(p) => {
+            for el in &p.elements {
+                match el {
+                    ArrayPatternElement::Item { target, .. }
+                    | ArrayPatternElement::Rest { target, .. } => binding_names(target, out),
+                    ArrayPatternElement::Hole => {}
+                }
+            }
+        }
+        BindingTarget::Object(p) => {
+            for prop in &p.properties {
+                binding_names(&prop.value, out);
+            }
+            if let Some(rest) = &p.rest {
+                binding_names(rest, out);
+            }
+        }
+    }
+}
+
+/// Collects names declared directly in a statement (recursing through control
+/// flow but not into nested functions).
+fn declared_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
+    use crate::ast::{ForInit, ForLeft};
+    match s {
+        Stmt::Var(d) => {
+            for decl in &d.declarations {
+                binding_names(&decl.target, out);
+            }
+        }
+        Stmt::Function(f) => {
+            if let Some(id) = &f.id {
+                out.insert(id.name.clone().into_string());
+            }
+        }
+        Stmt::Block { body, .. } => {
+            for st in body {
+                declared_in_stmt(st, out);
+            }
+        }
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            declared_in_stmt(consequent, out);
+            if let Some(a) = alternate {
+                declared_in_stmt(a, out);
+            }
+        }
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::Var(d)) = init {
+                for decl in &d.declarations {
+                    binding_names(&decl.target, out);
+                }
+            }
+            declared_in_stmt(body, out);
+        }
+        Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
+            if let ForLeft::Decl { target, .. } = left {
+                binding_names(target, out);
+            }
+            declared_in_stmt(body, out);
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Labeled { body, .. } => {
+            declared_in_stmt(body, out);
+        }
+        Stmt::Switch { cases, .. } => {
+            for c in cases {
+                for st in &c.body {
+                    declared_in_stmt(st, out);
+                }
+            }
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            for st in block {
+                declared_in_stmt(st, out);
+            }
+            if let Some(h) = handler {
+                for st in &h.body {
+                    declared_in_stmt(st, out);
+                }
+            }
+            if let Some(f) = finalizer {
+                for st in f {
+                    declared_in_stmt(st, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collects identifier references in a statement. With `nested_only`, only the
+/// identifiers that appear *inside nested functions* are collected (entering a
+/// function flips `nested_only` off so its whole body is collected).
+fn idents_in_stmt(s: &Stmt, out: &mut BTreeSet<String>, nested_only: bool) {
+    use crate::ast::{ForInit, ForLeft};
+    match s {
+        Stmt::Expr { expression, .. } => idents_in_expr(expression, out, nested_only),
+        Stmt::Block { body, .. } => {
+            for st in body {
+                idents_in_stmt(st, out, nested_only);
+            }
+        }
+        Stmt::Var(d) => {
+            for decl in &d.declarations {
+                if let Some(init) = &decl.init {
+                    idents_in_expr(init, out, nested_only);
+                }
+            }
+        }
+        Stmt::Function(f) => {
+            // A nested function declaration: collect everything inside it.
+            for p in &f.params {
+                if let Some(def) = &p.default {
+                    idents_in_expr(def, out, false);
+                }
+            }
+            for st in &f.body {
+                idents_in_stmt(st, out, false);
+            }
+        }
+        Stmt::If {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            idents_in_expr(test, out, nested_only);
+            idents_in_stmt(consequent, out, nested_only);
+            if let Some(a) = alternate {
+                idents_in_stmt(a, out, nested_only);
+            }
+        }
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+            ..
+        } => {
+            match init {
+                Some(ForInit::Var(d)) => {
+                    for decl in &d.declarations {
+                        if let Some(i) = &decl.init {
+                            idents_in_expr(i, out, nested_only);
+                        }
+                    }
+                }
+                Some(ForInit::Expr(e)) => idents_in_expr(e, out, nested_only),
+                None => {}
+            }
+            if let Some(t) = test {
+                idents_in_expr(t, out, nested_only);
+            }
+            if let Some(u) = update {
+                idents_in_expr(u, out, nested_only);
+            }
+            idents_in_stmt(body, out, nested_only);
+        }
+        Stmt::ForIn {
+            left, right, body, ..
+        }
+        | Stmt::ForOf {
+            left, right, body, ..
+        } => {
+            if let ForLeft::Target(e) = left {
+                idents_in_expr(e, out, nested_only);
+            }
+            idents_in_expr(right, out, nested_only);
+            idents_in_stmt(body, out, nested_only);
+        }
+        Stmt::While { test, body, .. } | Stmt::DoWhile { body, test, .. } => {
+            idents_in_expr(test, out, nested_only);
+            idents_in_stmt(body, out, nested_only);
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+            ..
+        } => {
+            idents_in_expr(discriminant, out, nested_only);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    idents_in_expr(t, out, nested_only);
+                }
+                for st in &c.body {
+                    idents_in_stmt(st, out, nested_only);
+                }
+            }
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            for st in block {
+                idents_in_stmt(st, out, nested_only);
+            }
+            if let Some(h) = handler {
+                for st in &h.body {
+                    idents_in_stmt(st, out, nested_only);
+                }
+            }
+            if let Some(f) = finalizer {
+                for st in f {
+                    idents_in_stmt(st, out, nested_only);
+                }
+            }
+        }
+        Stmt::Return {
+            argument: Some(e), ..
+        }
+        | Stmt::Throw { argument: e, .. } => idents_in_expr(e, out, nested_only),
+        Stmt::Labeled { body, .. } => idents_in_stmt(body, out, nested_only),
+        _ => {}
+    }
+}
+
+/// Collects identifier references in an expression (see [`idents_in_stmt`]).
+fn idents_in_expr(e: &Expr, out: &mut BTreeSet<String>, nested_only: bool) {
+    use crate::ast::{Argument, ArrayElement, ArrowBody, ObjectMember};
+    match e {
+        Expr::Ident(id) => {
+            if !nested_only {
+                out.insert(id.name.clone().into_string());
+            }
+        }
+        Expr::Member {
+            object, property, ..
+        } => {
+            idents_in_expr(object, out, nested_only);
+            if let PropertyKey::Computed(k) = property {
+                idents_in_expr(k, out, nested_only);
+            }
+        }
+        Expr::Call {
+            callee, arguments, ..
+        }
+        | Expr::New {
+            callee, arguments, ..
+        } => {
+            idents_in_expr(callee, out, nested_only);
+            for a in arguments {
+                match a {
+                    Argument::Item(x) | Argument::Spread(x) => idents_in_expr(x, out, nested_only),
+                }
+            }
+        }
+        Expr::Unary { argument, .. }
+        | Expr::Update { argument, .. }
+        | Expr::Await { argument, .. } => idents_in_expr(argument, out, nested_only),
+        Expr::Yield {
+            argument: Some(a), ..
+        } => idents_in_expr(a, out, nested_only),
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            idents_in_expr(left, out, nested_only);
+            idents_in_expr(right, out, nested_only);
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            idents_in_expr(test, out, nested_only);
+            idents_in_expr(consequent, out, nested_only);
+            idents_in_expr(alternate, out, nested_only);
+        }
+        Expr::Assign { target, value, .. } => {
+            idents_in_expr(target, out, nested_only);
+            idents_in_expr(value, out, nested_only);
+        }
+        Expr::Sequence { expressions, .. } => {
+            for x in expressions {
+                idents_in_expr(x, out, nested_only);
+            }
+        }
+        Expr::Array { elements, .. } => {
+            for el in elements {
+                match el {
+                    ArrayElement::Item(x) | ArrayElement::Spread(x) => {
+                        idents_in_expr(x, out, nested_only);
+                    }
+                    ArrayElement::Hole => {}
+                }
+            }
+        }
+        Expr::Object { members, .. } => {
+            for m in members {
+                match m {
+                    ObjectMember::Property { key, value, .. } => {
+                        if let PropertyKey::Computed(k) = key {
+                            idents_in_expr(k, out, nested_only);
+                        }
+                        idents_in_expr(value, out, nested_only);
+                    }
+                    ObjectMember::Spread { value, .. } => idents_in_expr(value, out, nested_only),
+                    ObjectMember::Accessor { value, .. } => {
+                        for st in &value.body {
+                            idents_in_stmt(st, out, false);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Template(t) => {
+            for x in &t.expressions {
+                idents_in_expr(x, out, nested_only);
+            }
+        }
+        Expr::TaggedTemplate { tag, quasi, .. } => {
+            idents_in_expr(tag, out, nested_only);
+            for x in &quasi.expressions {
+                idents_in_expr(x, out, nested_only);
+            }
+        }
+        // Entering a function: collect *all* identifiers inside it.
+        Expr::Function(f) => {
+            for p in &f.params {
+                if let Some(def) = &p.default {
+                    idents_in_expr(def, out, false);
+                }
+            }
+            for st in &f.body {
+                idents_in_stmt(st, out, false);
+            }
+        }
+        Expr::Arrow(a) => {
+            for p in &a.params {
+                if let Some(def) = &p.default {
+                    idents_in_expr(def, out, false);
+                }
+            }
+            match &a.body {
+                ArrowBody::Block(b) => {
+                    for st in b {
+                        idents_in_stmt(st, out, false);
+                    }
+                }
+                ArrowBody::Expr(x) => idents_in_expr(x, out, false),
+            }
+        }
+        _ => {}
     }
 }

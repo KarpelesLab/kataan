@@ -192,6 +192,8 @@ mod tag {
     pub(super) const DELETE_MEMBER: u8 = 42;
     pub(super) const ITER_VALUES: u8 = 43;
     pub(super) const ITER_KEYS: u8 = 44;
+    pub(super) const MAKE_CLOSURE: u8 = 45;
+    pub(super) const GET_UPVALUE: u8 = 46;
 }
 
 fn write_op(w: &mut Writer, op: &Op) {
@@ -262,6 +264,23 @@ fn write_op(w: &mut Writer, op: &Op) {
             w.raw(tag::ITER_KEYS);
             w.u16(*dst);
             w.u16(*src);
+        }
+        Op::MakeClosure {
+            dst,
+            chunk,
+            upvals_base,
+            count,
+        } => {
+            w.raw(tag::MAKE_CLOSURE);
+            w.u16(*dst);
+            w.u32(*chunk);
+            w.u16(*upvals_base);
+            w.u16(*count);
+        }
+        Op::GetUpvalue { dst, idx } => {
+            w.raw(tag::GET_UPVALUE);
+            w.u16(*dst);
+            w.u16(*idx);
         }
         Op::TypeOfGlobal { dst, name } => {
             w.raw(tag::TYPE_OF_GLOBAL);
@@ -491,6 +510,16 @@ fn read_op(r: &mut Reader) -> Result<Op, BytecodeError> {
         tag::ITER_KEYS => Op::IterKeys {
             dst: r.u16()?,
             src: r.u16()?,
+        },
+        tag::MAKE_CLOSURE => Op::MakeClosure {
+            dst: r.u16()?,
+            chunk: r.u32()?,
+            upvals_base: r.u16()?,
+            count: r.u16()?,
+        },
+        tag::GET_UPVALUE => Op::GetUpvalue {
+            dst: r.u16()?,
+            idx: r.u16()?,
         },
         tag::TYPE_OF_GLOBAL => Op::TypeOfGlobal {
             dst: r.u16()?,

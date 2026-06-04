@@ -26,7 +26,7 @@ impl<'a> Interp<'a> {
         body: &[crate::ast::Stmt],
     ) -> Result<Completion<'a, Value<'a>>, super::compiler::CompileError> {
         let module = Rc::new(super::compiler::compile_program(body)?);
-        Ok(self.run_chunk(&module, 0, Value::Undefined, Vec::new()))
+        Ok(self.run_chunk(&module, 0, Value::Undefined, Vec::new(), &[]))
     }
 
     /// Runs a program through the bytecode VM, draining the event loop
@@ -37,7 +37,7 @@ impl<'a> Interp<'a> {
     pub fn run_with_vm(&mut self, program: &'a crate::ast::Program) -> Completion<'a, Value<'a>> {
         match super::compiler::compile_program(&program.body) {
             Ok(module) => {
-                let result = self.run_chunk(&Rc::new(module), 0, Value::Undefined, Vec::new());
+                let result = self.run_chunk(&Rc::new(module), 0, Value::Undefined, Vec::new(), &[]);
                 self.run_event_loop();
                 result
             }
@@ -51,27 +51,31 @@ impl<'a> Interp<'a> {
     /// this is the export/reload path: a module can be compiled once, persisted,
     /// and later reloaded and run without the source.
     pub fn run_module(&mut self, module: Rc<Module>) -> Completion<'a, Value<'a>> {
-        self.run_chunk(&module, 0, Value::Undefined, Vec::new())
+        self.run_chunk(&module, 0, Value::Undefined, Vec::new(), &[])
     }
 
-    /// Calls a bytecode function value (dispatched from `call_with_this`).
+    /// Calls a bytecode function value (dispatched from `call_with_this`). Its
+    /// captured upvalues are made available to `GetUpvalue`.
     pub(super) fn call_bytecode_fn(
         &mut self,
         func: &Rc<BytecodeFn<'a>>,
         this: Value<'a>,
         args: Vec<Value<'a>>,
     ) -> Completion<'a, Value<'a>> {
-        self.run_chunk(&func.module, func.chunk, this, args)
+        let captures = func.captures.clone();
+        self.run_chunk(&func.module, func.chunk, this, args, &captures)
     }
 
-    /// Executes chunk `chunk_idx` of `module` with `this` in register 0 and
-    /// `args` bound to the parameter registers (1..), returning its value.
+    /// Executes chunk `chunk_idx` of `module` with `this` in register 0,
+    /// `args` bound to the parameter registers (1..), and `captures` exposed as
+    /// the frame's upvalues, returning its value.
     fn run_chunk(
         &mut self,
         module: &Rc<Module>,
         chunk_idx: u32,
         this: Value<'a>,
         args: Vec<Value<'a>>,
+        captures: &[Value<'a>],
     ) -> Completion<'a, Value<'a>> {
         let chunk: &Chunk = &module.chunks[chunk_idx as usize];
         let mut regs: Vec<Value<'a>> = alloc::vec![Value::Undefined; chunk.register_count as usize];
@@ -105,6 +109,23 @@ impl<'a> Interp<'a> {
                             // value over the same module.
                             Const::Func(idx) => Value::Object(make_bytecode_fn(module, *idx)),
                         };
+                    }
+                    Op::MakeClosure {
+                        dst,
+                        chunk: target,
+                        upvals_base,
+                        count,
+                    } => {
+                        let base = *upvals_base as usize;
+                        let captured: Vec<Value<'a>> = regs[base..base + *count as usize].to_vec();
+                        regs[*dst as usize] =
+                            Value::Object(make_closure(module, *target, captured));
+                    }
+                    Op::GetUpvalue { dst, idx } => {
+                        regs[*dst as usize] = captures
+                            .get(*idx as usize)
+                            .cloned()
+                            .unwrap_or(Value::Undefined);
                     }
                     Op::LoadUndefined { dst } => regs[*dst as usize] = Value::Undefined,
                     Op::LoadNull { dst } => regs[*dst as usize] = Value::Null,
@@ -321,11 +342,16 @@ impl<'a> Interp<'a> {
 
 /// Builds a bytecode-function value (an object carrying the compiled function).
 fn make_bytecode_fn<'a>(module: &Rc<Module>, chunk: u32) -> Rc<Obj<'a>> {
+    make_closure(module, chunk, Vec::new())
+}
+
+/// Builds a closure value over `chunk`, carrying its captured upvalue cells.
+fn make_closure<'a>(module: &Rc<Module>, chunk: u32, captures: Vec<Value<'a>>) -> Rc<Obj<'a>> {
     let obj = Obj::object();
     obj.set_bytecode_fn(Rc::new(BytecodeFn {
         module: Rc::clone(module),
         chunk,
-        captures: Vec::new(),
+        captures,
     }));
     obj
 }

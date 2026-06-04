@@ -317,6 +317,81 @@ fn bytecode_vm_for_of() {
 }
 
 #[test]
+fn bytecode_vm_closures() {
+    // A counter closing over a mutable local (shared cell).
+    assert_eq!(
+        eval_bc(
+            "function makeCounter() { let c = 0; return () => ++c; }
+             let inc = makeCounter();
+             inc(); inc(); inc()"
+        ),
+        "3"
+    );
+    // Read-only capture in a higher-order call.
+    assert_eq!(
+        eval_bc("let base = 100; [1, 2, 3].map(x => x + base).join(',')"),
+        "101,102,103"
+    );
+    // Curried function expression.
+    assert_eq!(
+        eval_bc("function adder(n) { return function (x) { return x + n; }; } adder(10)(5)"),
+        "15"
+    );
+    // Two closures sharing the same captured cell.
+    assert_eq!(
+        eval_bc(
+            "function makePair() {
+               let v = 0;
+               return { inc: () => { v += 1; return v; }, get: () => v };
+             }
+             let p = makePair();
+             p.inc(); p.inc();
+             p.get()"
+        ),
+        "2"
+    );
+    // Capture of a function parameter.
+    assert_eq!(
+        eval_bc(
+            "function sumWith(offset) { return arr => arr.reduce((a, b) => a + b + offset, 0); }
+             sumWith(1)([10, 20, 30])"
+        ),
+        "63" // 10+1 + 20+1 + 30+1
+    );
+    // Transitive capture through nested arrows.
+    assert_eq!(eval_bc("let f = a => b => c => a + b + c; f(1)(2)(3)"), "6");
+    // A captured variable mutated after the closure is created is observed.
+    assert_eq!(eval_bc("let x = 1; let get = () => x; x = 42; get()"), "42");
+    // A closure survives the serialize → reload → run round-trip.
+    assert_eq!(
+        eval_bc_reloaded(
+            "function adder(n) { return x => x + n; } let add5 = adder(5); add5(add5(0))"
+        ),
+        "10"
+    );
+}
+
+#[test]
+fn bytecode_vm_update_operator() {
+    // Prefix and postfix, increment and decrement, on locals.
+    assert_eq!(eval_bc("let x = 5; ++x"), "6");
+    assert_eq!(eval_bc("let x = 5; x++"), "5"); // postfix yields the old value
+    assert_eq!(eval_bc("let x = 5; x++; x"), "6");
+    assert_eq!(eval_bc("let x = 5; --x"), "4");
+    assert_eq!(eval_bc("let x = 5; x--; x"), "4");
+    // As a loop step.
+    assert_eq!(
+        eval_bc("let s = 0; for (let i = 0; i < 5; i++) s += i; s"),
+        "10"
+    );
+    // On a member.
+    assert_eq!(eval_bc("let o = { n: 10 }; o.n++; o.n"), "11");
+    assert_eq!(eval_bc("let a = [1, 2, 3]; ++a[1]; a[1]"), "3");
+    // String coercion: '5' becomes 5 then increments.
+    assert_eq!(eval_bc("let x = '5'; x++; x"), "6");
+}
+
+#[test]
 fn bytecode_vm_array_spread() {
     assert_eq!(eval_bc("[...[1, 2, 3]].length"), "3");
     assert_eq!(eval_bc("[0, ...[1, 2], 3].join(',')"), "0,1,2,3");
@@ -618,11 +693,10 @@ fn bytecode_vm_loops() {
 }
 
 #[test]
-fn bytecode_vm_falls_back_on_captures() {
-    // A closure over an enclosing local is reported as unsupported, so a caller
-    // can fall back to the tree-walker.
-    let program =
-        Parser::parse_program("function outer() { let x = 1; return () => x; } outer()").unwrap();
+fn bytecode_vm_falls_back_on_unsupported() {
+    // A class declaration is still outside the bytecode compiler's subset, so it
+    // is reported as unsupported and the caller falls back to the tree-walker.
+    let program = Parser::parse_program("class C { m() { return 1; } } new C().m()").unwrap();
     let mut interp = Interp::new();
     assert!(interp.eval_via_bytecode(&program.body).is_err());
 }

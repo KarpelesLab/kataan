@@ -55,6 +55,13 @@ fn render_op(op: &Op) -> String {
         Op::DeleteMember { dst, obj, key } => format!("DeleteMbr   r{dst}, r{obj}[r{key}]"),
         Op::IterValues { dst, src } => format!("IterValues  r{dst}, r{src}"),
         Op::IterKeys { dst, src } => format!("IterKeys    r{dst}, r{src}"),
+        Op::MakeClosure {
+            dst,
+            chunk,
+            upvals_base,
+            count,
+        } => format!("MakeClosure r{dst}, #{chunk}, r{upvals_base}..+{count}"),
+        Op::GetUpvalue { dst, idx } => format!("GetUpvalue  r{dst}, ^{idx}"),
         Op::TypeOfGlobal { dst, name } => format!("TypeOfGlbl  r{dst}, k{name}"),
         Op::Eq { dst, a, b } => format!("Eq          r{dst}, r{a}, r{b}"),
         Op::StrictEq { dst, a, b } => format!("StrictEq    r{dst}, r{a}, r{b}"),
