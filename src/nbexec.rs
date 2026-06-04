@@ -1746,6 +1746,22 @@ impl<'a> Interp<'a> {
                     };
                     Some(self.new_str(&pad_start(&s, target, &pad)))
                 }
+                "padEnd" => {
+                    let target = self.realm.to_number(arg(0)) as usize;
+                    let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        String::from(" ")
+                    } else {
+                        self.realm.to_display_string(arg(1))
+                    };
+                    Some(self.new_str(&pad_end(&s, target, &pad)))
+                }
+                "lastIndexOf" => {
+                    let needle = self.realm.to_display_string(arg(0));
+                    let idx = s
+                        .rfind(&needle)
+                        .map_or(-1.0, |b| s[..b].chars().count() as f64);
+                    Some(NanBox::number(idx))
+                }
                 _ => None,
             };
             if out.is_some() {
@@ -1832,6 +1848,27 @@ impl<'a> Interp<'a> {
                     }
                     for (i, e) in elems.iter().enumerate().skip(start) {
                         acc = self.call(f, &[acc, *e, NanBox::number(i as f64)])?;
+                    }
+                    return Ok(Some(acc));
+                }
+                // `reduceRight` — like `reduce` but right-to-left.
+                "reduceRight" => {
+                    let f = arg(0);
+                    let mut acc;
+                    let mut idx = elems.len();
+                    if args.len() >= 2 {
+                        acc = arg(1);
+                    } else if elems.is_empty() {
+                        return Err(ExecError::Throw(
+                            self.new_str("Reduce of empty array with no initial value"),
+                        ));
+                    } else {
+                        idx -= 1;
+                        acc = elems[idx];
+                    }
+                    while idx > 0 {
+                        idx -= 1;
+                        acc = self.call(f, &[acc, elems[idx], NanBox::number(idx as f64)])?;
                     }
                     return Ok(Some(acc));
                 }
@@ -3077,6 +3114,20 @@ impl<'a> Interp<'a> {
         handle: crate::heap::Handle,
         name: &str,
     ) -> Result<NanBox, ExecError> {
+        // `Number.*` static constants.
+        if self.realm.native_at(handle) == Some(N_NUMBER) {
+            match name {
+                "MAX_SAFE_INTEGER" => return Ok(NanBox::number(9_007_199_254_740_991.0)),
+                "MIN_SAFE_INTEGER" => return Ok(NanBox::number(-9_007_199_254_740_991.0)),
+                "MAX_VALUE" => return Ok(NanBox::number(f64::MAX)),
+                "MIN_VALUE" => return Ok(NanBox::number(f64::MIN_POSITIVE)),
+                "EPSILON" => return Ok(NanBox::number(f64::EPSILON)),
+                "POSITIVE_INFINITY" => return Ok(NanBox::number(f64::INFINITY)),
+                "NEGATIVE_INFINITY" => return Ok(NanBox::number(f64::NEG_INFINITY)),
+                "NaN" => return Ok(NanBox::number(f64::NAN)),
+                _ => {}
+            }
+        }
         if let Some((cid, _)) = self.realm.class_at(handle)
             && let Some(v) = self.class_statics[cid as usize].get(name)
         {
@@ -3454,6 +3505,21 @@ fn pad_start(s: &str, target: usize, pad: &str) -> String {
     }
     let filler: String = filler.chars().take(need).collect();
     filler + s
+}
+
+/// `String.prototype.padEnd`: append `pad` (repeated) until length `target`.
+fn pad_end(s: &str, target: usize, pad: &str) -> String {
+    let len = s.chars().count();
+    if len >= target || pad.is_empty() {
+        return String::from(s);
+    }
+    let need = target - len;
+    let mut filler = String::new();
+    while filler.chars().count() < need {
+        filler.push_str(pad);
+    }
+    let filler: String = filler.chars().take(need).collect();
+    String::from(s) + &filler
 }
 
 /// Quotes and escapes a string as a JSON string literal.
@@ -3893,6 +3959,25 @@ mod tests {
         assert_eq!(run("[0, 0, 0].fill(7).join(',')"), "7,7,7");
         assert_eq!(run("[1, 2, 3, 4].fill(9, 1, 3).join(',')"), "1,9,9,4");
         assert_eq!(run("[1, 2, 3, 4, 5].fill(0, -2).join(',')"), "1,2,3,0,0");
+        // reduceRight folds right-to-left, with and without a seed.
+        assert_eq!(
+            run("['a','b','c'].reduceRight(function(acc,x){ return acc + x; })"),
+            "cba"
+        );
+        assert_eq!(
+            run("[1,2,3].reduceRight(function(a,x){ return a + x; }, 10)"),
+            "16"
+        );
+    }
+
+    #[test]
+    fn string_pad_lastindexof_and_number_statics() {
+        assert_eq!(run("'5'.padEnd(3, '-')"), "5--");
+        assert_eq!(run("'ab'.padEnd(5)"), "ab   ");
+        assert_eq!(run("'a-b-c'.lastIndexOf('-')"), "3");
+        assert_eq!(run("'abc'.lastIndexOf('x')"), "-1");
+        assert_eq!(run("Number.MAX_SAFE_INTEGER"), "9007199254740991");
+        assert_eq!(run("Number.POSITIVE_INFINITY"), "Infinity");
     }
 
     #[test]
