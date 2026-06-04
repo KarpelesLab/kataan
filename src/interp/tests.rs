@@ -257,6 +257,16 @@ fn bytecode_vm_typeof_void() {
     // Unary plus coerces to number.
     assert_eq!(eval_bc("+'42'"), "42");
     assert_eq!(eval_bc("+true"), "1");
+    // delete removes a property and returns a boolean.
+    assert_eq!(
+        eval_bc("let o = { a: 1, b: 2 }; delete o.a; o.a === undefined && o.b === 2"),
+        "true"
+    );
+    assert_eq!(
+        eval_bc("let o = { x: 1 }; delete o['x']; 'x' in o"),
+        "false"
+    );
+    assert_eq!(eval_bc("delete ({}).missing"), "true");
 }
 
 #[test]

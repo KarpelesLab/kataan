@@ -189,6 +189,7 @@ mod tag {
     pub(super) const BINARY: u8 = 39;
     pub(super) const TYPE_OF: u8 = 40;
     pub(super) const TYPE_OF_GLOBAL: u8 = 41;
+    pub(super) const DELETE_MEMBER: u8 = 42;
 }
 
 fn write_op(w: &mut Writer, op: &Op) {
@@ -243,6 +244,12 @@ fn write_op(w: &mut Writer, op: &Op) {
             w.raw(tag::TYPE_OF);
             w.u16(*dst);
             w.u16(*src);
+        }
+        Op::DeleteMember { dst, obj, key } => {
+            w.raw(tag::DELETE_MEMBER);
+            w.u16(*dst);
+            w.u16(*obj);
+            w.u16(*key);
         }
         Op::TypeOfGlobal { dst, name } => {
             w.raw(tag::TYPE_OF_GLOBAL);
@@ -459,6 +466,11 @@ fn read_op(r: &mut Reader) -> Result<Op, BytecodeError> {
         tag::TYPE_OF => Op::TypeOf {
             dst: r.u16()?,
             src: r.u16()?,
+        },
+        tag::DELETE_MEMBER => Op::DeleteMember {
+            dst: r.u16()?,
+            obj: r.u16()?,
+            key: r.u16()?,
         },
         tag::TYPE_OF_GLOBAL => Op::TypeOfGlobal {
             dst: r.u16()?,

@@ -223,6 +223,12 @@ pub enum Op {
         index: Reg,
         src: Reg,
     },
+    /// `dst = delete obj[key]` (`key` is a register holding the key value).
+    DeleteMember {
+        dst: Reg,
+        obj: Reg,
+        key: Reg,
+    },
 
     // --- control flow ---
     Jump {

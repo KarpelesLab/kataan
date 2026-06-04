@@ -124,6 +124,13 @@ impl<'a> Interp<'a> {
                     Op::TypeOf { dst, src } => {
                         regs[*dst as usize] = Value::str(regs[*src as usize].type_of());
                     }
+                    Op::DeleteMember { dst, obj, key } => {
+                        let removed = match &regs[*obj as usize] {
+                            Value::Object(o) => o.delete_key(&regs[*key as usize].to_js_string()),
+                            _ => true,
+                        };
+                        regs[*dst as usize] = Value::Bool(removed);
+                    }
                     Op::TypeOfGlobal { dst, name } => {
                         let key = const_str(chunk, *name);
                         // An unbound global yields "undefined" (no throw).

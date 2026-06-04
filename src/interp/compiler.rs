@@ -1009,9 +1009,10 @@ impl Compiler {
     }
 
     fn unary(&mut self, op: UnaryOp, argument: &Expr) -> Result<Reg, CompileError> {
-        // `typeof` and `void` need to handle the operand specially.
+        // `typeof`, `void`, and `delete` handle the operand specially.
         match op {
             UnaryOp::Typeof => return self.type_of(argument),
+            UnaryOp::Delete => return self.delete(argument),
             UnaryOp::Void => {
                 self.expr(argument)?; // evaluate for side effects, discard
                 let dst = self.reg();
@@ -1039,6 +1040,43 @@ impl Compiler {
             UnaryOp::Not => self.emit(Op::Not { dst, src }),
             _ => return Err(CompileError::unsupported("unary operator")),
         };
+        Ok(dst)
+    }
+
+    /// Compiles `delete argument`. `delete obj.prop` / `delete obj[k]` removes
+    /// the member; deleting anything else evaluates to `true`.
+    fn delete(&mut self, argument: &Expr) -> Result<Reg, CompileError> {
+        if let Expr::Member {
+            object,
+            property,
+            optional: false,
+            ..
+        } = argument
+        {
+            let obj = self.expr(object)?;
+            let key = match property {
+                PropertyKey::Ident(name) => {
+                    let r = self.reg();
+                    let k = self.add_const(Const::Str(name.clone().into_string()));
+                    self.emit(Op::LoadConst { dst: r, k });
+                    r
+                }
+                PropertyKey::Str(s) => {
+                    let r = self.reg();
+                    let k = self.add_const(Const::Str(s.clone().into_string()));
+                    self.emit(Op::LoadConst { dst: r, k });
+                    r
+                }
+                PropertyKey::Computed(e) => self.expr(e)?,
+                _ => return Err(CompileError::unsupported("delete key")),
+            };
+            let dst = self.reg();
+            self.emit(Op::DeleteMember { dst, obj, key });
+            return Ok(dst);
+        }
+        // `delete <non-member>` → true.
+        let dst = self.reg();
+        self.emit(Op::LoadBool { dst, value: true });
         Ok(dst)
     }
 
