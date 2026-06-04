@@ -3543,6 +3543,38 @@ impl<'a> Interp<'a> {
                 .unwrap_or_default();
             return Ok(elems.into_iter().skip(idx).collect());
         }
+        // A custom iterable: call `obj[Symbol.iterator]()` and drain `.next()`.
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
+        let iter_fn = self.realm.get_property(h, &iter_key);
+        if let Some(f) = iter_fn
+            && f.as_handle()
+                .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
+        {
+            let iterator = self.call_with_this(f, v, &[])?;
+            let Some(ih) = iterator.as_handle().map(Handle::from_raw) else {
+                return Err(ExecError::Throw(self.new_str("iterator is not an object")));
+            };
+            let mut out = Vec::new();
+            loop {
+                let next_fn = self.read_member(ih, "next")?;
+                let res = self.call_with_this(next_fn, iterator, &[])?;
+                let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                    return Err(ExecError::Throw(
+                        self.new_str("iterator result is not an object"),
+                    ));
+                };
+                let done = self.read_member(rh, "done")?;
+                if self.realm.truthy(done) {
+                    break;
+                }
+                out.push(self.read_member(rh, "value")?);
+                if out.len() > GEN_CAP {
+                    return Err(ExecError::Throw(self.new_str("iterator did not terminate")));
+                }
+            }
+            return Ok(out);
+        }
         Err(ExecError::Throw(self.new_str("value is not iterable")))
     }
 
@@ -6104,6 +6136,19 @@ mod tests {
             run("JSON.stringify({...{x:1},...{y:2},x:9})"),
             "{\"x\":9,\"y\":2}"
         );
+    }
+
+    #[test]
+    fn custom_symbol_iterator() {
+        // for-of and spread drive a user `[Symbol.iterator]`.
+        let src = "let o = { [Symbol.iterator]() { let i = 0; return { next() { return i < 3 ? { value: i++, done: false } : { value: undefined, done: true }; } }; } };";
+        assert_eq!(
+            run(&alloc::format!(
+                "{src} let s=[]; for (let x of o) s.push(x); s.join(',')"
+            )),
+            "0,1,2"
+        );
+        assert_eq!(run(&alloc::format!("{src} [...o].join('-')")), "0-1-2");
     }
 
     #[test]

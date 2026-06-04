@@ -857,11 +857,22 @@ impl<'src> Parser<'src> {
             });
         }
 
-        // Computed key `[expr]: value`.
+        // Computed key `[expr]: value` or computed method `[expr]() { … }`.
         if self.at(TokenKind::LBracket) {
             self.bump();
             let key_expr = self.without_no_in(Self::parse_assignment)?;
             self.expect(TokenKind::RBracket)?;
+            // Computed method shorthand `[expr]() { … }`.
+            if self.at(TokenKind::LParen) {
+                let func = self.parse_method_tail(false, false)?;
+                let span = start.to(self.prev_span());
+                return Ok(ObjectMember::Property {
+                    key: PropertyKey::Computed(Box::new(key_expr)),
+                    value: Box::new(Expr::Function(func)),
+                    shorthand: false,
+                    span,
+                });
+            }
             self.expect(TokenKind::Colon)?;
             let value = self.parse_assignment()?;
             let span = start.to(value.span());
