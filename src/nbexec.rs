@@ -1173,6 +1173,11 @@ impl<'a> Interp<'a> {
         self.realm.native_at(handle).is_some()
             || self.realm.function_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
+            // A proxy is callable iff its target is.
+            || self
+                .realm
+                .proxy_at(handle)
+                .is_some_and(|(t, _)| self.is_callable(t))
     }
 
     /// Calls `callee` with an explicit `this` (a method receiver, or `undefined`
@@ -1187,6 +1192,28 @@ impl<'a> Interp<'a> {
             return Err(ExecError::NotCallable);
         };
         let handle = Handle::from_raw(raw);
+        // A callable proxy: route through its `apply` trap, or call the target.
+        if let Some((target, handler)) = self.realm.proxy_at(handle) {
+            let trap = self
+                .realm
+                .get_property(handler, "apply")
+                .unwrap_or(NanBox::undefined());
+            if trap
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let arr = self.realm.new_array(args.to_vec());
+                return self.call(
+                    trap,
+                    &[
+                        NanBox::handle(target.to_raw()),
+                        this_val,
+                        NanBox::handle(arr.to_raw()),
+                    ],
+                );
+            }
+            return self.call_with_this(NanBox::handle(target.to_raw()), this_val, args);
+        }
         // A built-in function dispatches directly.
         if let Some(id) = self.realm.native_at(handle) {
             return self.call_native(id, args);
@@ -1275,6 +1302,23 @@ impl<'a> Interp<'a> {
             return Err(ExecError::NotCallable);
         };
         let handle = Handle::from_raw(raw);
+        // `new someProxy(...)`: route through the `construct` trap, or construct
+        // the target.
+        if let Some((target, handler)) = self.realm.proxy_at(handle) {
+            let trap = self
+                .realm
+                .get_property(handler, "construct")
+                .unwrap_or(NanBox::undefined());
+            if trap
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let arr = self.realm.new_array(args.to_vec());
+                let target_box = NanBox::handle(target.to_raw());
+                return self.call(trap, &[target_box, NanBox::handle(arr.to_raw()), callee]);
+            }
+            return self.construct(NanBox::handle(target.to_raw()), args);
+        }
         // `new UserClass(...)`.
         if let Some((class_id, env)) = self.realm.class_at(handle) {
             return self.instantiate(class_id, &env, args);
@@ -5647,6 +5691,32 @@ mod tests {
         assert_eq!(
             run("let p=new Proxy({x:1},{}); let r = 'x' in p; delete p.x; '' + r + ('x' in p)"),
             "truefalse"
+        );
+    }
+
+    #[test]
+    fn proxy_apply_construct_traps() {
+        // apply trap intercepts a call; typeof a function proxy is "function".
+        assert_eq!(
+            run(
+                "function f(a,b){return a+b;} let p=new Proxy(f,{apply:function(t,th,a){return a[0]*a[1];}}); p(3,4) + ':' + typeof p"
+            ),
+            "12:function"
+        );
+        assert_eq!(
+            run("function f(a){return a+1;} let p=new Proxy(f,{}); p(9)"),
+            "10"
+        );
+        // construct trap intercepts `new`.
+        assert_eq!(
+            run(
+                "function B(v){this.v=v;} let p=new Proxy(B,{construct:function(t,a){return {v:a[0]*2};}}); (new p(5)).v"
+            ),
+            "10"
+        );
+        assert_eq!(
+            run("function B(v){this.v=v;} let p=new Proxy(B,{}); (new p(7)).v"),
+            "7"
         );
     }
 

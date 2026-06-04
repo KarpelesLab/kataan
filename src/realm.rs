@@ -930,10 +930,14 @@ impl Realm {
     #[must_use]
     pub fn type_of_value(&self, v: NanBox) -> &'static str {
         match v.as_handle() {
-            Some(raw) => self
-                .heap
-                .get(Handle::from_raw(raw))
-                .map_or("undefined", Cell::type_of),
+            Some(raw) => {
+                let h = Handle::from_raw(raw);
+                // A proxy reflects its target's `typeof` (function vs object).
+                if let Some((target, _)) = self.proxy_at(h) {
+                    return self.type_of(target).unwrap_or("object");
+                }
+                self.heap.get(h).map_or("undefined", Cell::type_of)
+            }
             None => v.type_of(),
         }
     }
