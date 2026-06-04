@@ -449,24 +449,23 @@ fn run_frame(
                 args,
             } => {
                 let recv_val = regs[*recv as usize];
-                let robj = object_handle(recv_val)?;
-                let f = ctx
-                    .realm
-                    .get_property(robj, key)
-                    .unwrap_or(NanBox::undefined());
-                let fh = object_handle(f)?;
-                let id = ctx
-                    .realm
-                    .get_element(fh, 0)
-                    .as_number()
-                    .ok_or(VmError::NotAnObject)? as usize;
-                let n_caps = ctx.realm.array_length(fh).unwrap_or(1).saturating_sub(1);
-                let caps: Vec<NanBox> = (0..n_caps)
-                    .map(|i| ctx.realm.get_element(fh, i + 1))
-                    .collect();
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                // Bind `this` to the receiver.
-                match call_with(ctx, funcs, id, &argv, &caps, recv_val) {
+                // A user method is a closure property on an object; otherwise try
+                // a built-in `Array`/`String` method on the fast path.
+                let user_method = recv_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| ctx.realm.get_property(h, key))
+                    .filter(|p| p.as_handle().is_some());
+                let outcome = match user_method {
+                    Some(closure) => call_closure(ctx, funcs, closure, &argv, recv_val),
+                    None => match builtin_method(ctx, funcs, recv_val, key, &argv) {
+                        Some(r) => r,
+                        // Unknown method → fall back to the tree-walker.
+                        None => return Err(VmError::NotAnObject),
+                    },
+                };
+                match outcome {
                     Ok(ret) => regs[*dst as usize] = ret,
                     Err(VmError::Thrown(v)) => match handlers.pop() {
                         Some((target, reg)) => {
@@ -515,6 +514,273 @@ fn run_frame(
         }
     }
     Ok(None)
+}
+
+/// Invokes a closure value (`[func_id, cell…]`) with `args` and `this_val`.
+fn call_closure(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    closure: NanBox,
+    args: &[NanBox],
+    this_val: NanBox,
+) -> Result<NanBox, VmError> {
+    let fh = closure
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    let id = ctx
+        .realm
+        .get_element(fh, 0)
+        .as_number()
+        .ok_or(VmError::NotAnObject)? as usize;
+    let n_caps = ctx.realm.array_length(fh).unwrap_or(1).saturating_sub(1);
+    let caps: Vec<NanBox> = (0..n_caps)
+        .map(|i| ctx.realm.get_element(fh, i + 1))
+        .collect();
+    call_with(ctx, funcs, id, args, &caps, this_val)
+}
+
+/// Dispatches a built-in `Array`/`String` instance method on the fast path.
+/// Returns `None` when `key` isn't a recognized method (the caller then routes
+/// the program to the tree-walker).
+fn builtin_method(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: &str,
+    args: &[NanBox],
+) -> Option<Result<NanBox, VmError>> {
+    use crate::nanbox::Unpacked;
+    let h = recv.as_handle().map(Handle::from_raw)?;
+    let arg0 = || args.first().copied().unwrap_or(NanBox::undefined());
+
+    // --- array methods ---
+    if ctx.realm.is_array(h) {
+        let elems = |ctx: &Ctx| {
+            ctx.realm
+                .array_elements(h)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default()
+        };
+        let result = match key {
+            "push" => {
+                let mut len = ctx.realm.array_length(h).unwrap_or(0);
+                for a in args {
+                    ctx.realm.set_element(h, len, *a);
+                    len += 1;
+                }
+                NanBox::number(len as f64)
+            }
+            "pop" => ctx.realm.array_pop(h),
+            "join" => {
+                let sep = if matches!(arg0().unpack(), Unpacked::Undefined) {
+                    String::from(",")
+                } else {
+                    ctx.realm.to_display_string(arg0())
+                };
+                let parts: Vec<String> = elems(ctx)
+                    .iter()
+                    .map(|e| match e.unpack() {
+                        Unpacked::Undefined | Unpacked::Null => String::new(),
+                        _ => ctx.realm.to_display_string(*e),
+                    })
+                    .collect();
+                NanBox::handle(ctx.realm.new_string(&parts.join(&sep)).to_raw())
+            }
+            "includes" => {
+                let t = arg0();
+                NanBox::boolean(elems(ctx).iter().any(|e| ctx.realm.strict_equals(*e, t)))
+            }
+            "indexOf" => {
+                let t = arg0();
+                let i = elems(ctx)
+                    .iter()
+                    .position(|e| ctx.realm.strict_equals(*e, t));
+                NanBox::number(i.map_or(-1.0, |i| i as f64))
+            }
+            "map" => {
+                let f = arg0();
+                let mut out = Vec::new();
+                for (i, e) in elems(ctx).iter().enumerate() {
+                    match call_closure(
+                        ctx,
+                        funcs,
+                        f,
+                        &[*e, NanBox::number(i as f64)],
+                        NanBox::undefined(),
+                    ) {
+                        Ok(v) => out.push(v),
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                NanBox::handle(ctx.realm.new_array(out).to_raw())
+            }
+            "filter" => {
+                let f = arg0();
+                let mut out = Vec::new();
+                for (i, e) in elems(ctx).iter().enumerate() {
+                    match call_closure(
+                        ctx,
+                        funcs,
+                        f,
+                        &[*e, NanBox::number(i as f64)],
+                        NanBox::undefined(),
+                    ) {
+                        Ok(v) if v.to_boolean() => out.push(*e),
+                        Ok(_) => {}
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                NanBox::handle(ctx.realm.new_array(out).to_raw())
+            }
+            "forEach" => {
+                let f = arg0();
+                for (i, e) in elems(ctx).iter().enumerate() {
+                    if let Err(e) = call_closure(
+                        ctx,
+                        funcs,
+                        f,
+                        &[*e, NanBox::number(i as f64)],
+                        NanBox::undefined(),
+                    ) {
+                        return Some(Err(e));
+                    }
+                }
+                NanBox::undefined()
+            }
+            "reduce" => {
+                let f = arg0();
+                let mut acc = args.get(1).copied();
+                for (i, e) in elems(ctx).iter().enumerate() {
+                    match acc {
+                        None => acc = Some(*e), // first element seeds the accumulator
+                        Some(a) => match call_closure(
+                            ctx,
+                            funcs,
+                            f,
+                            &[a, *e, NanBox::number(i as f64)],
+                            NanBox::undefined(),
+                        ) {
+                            Ok(v) => acc = Some(v),
+                            Err(e) => return Some(Err(e)),
+                        },
+                    }
+                }
+                acc.unwrap_or(NanBox::undefined())
+            }
+            "find" => {
+                let f = arg0();
+                let mut found = NanBox::undefined();
+                for (i, e) in elems(ctx).iter().enumerate() {
+                    match call_closure(
+                        ctx,
+                        funcs,
+                        f,
+                        &[*e, NanBox::number(i as f64)],
+                        NanBox::undefined(),
+                    ) {
+                        Ok(v) if v.to_boolean() => {
+                            found = *e;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                found
+            }
+            "some" | "every" => {
+                let want_all = key == "every";
+                let f = arg0();
+                let mut acc = want_all;
+                for (i, e) in elems(ctx).iter().enumerate() {
+                    let ok = match call_closure(
+                        ctx,
+                        funcs,
+                        f,
+                        &[*e, NanBox::number(i as f64)],
+                        NanBox::undefined(),
+                    ) {
+                        Ok(v) => v.to_boolean(),
+                        Err(e) => return Some(Err(e)),
+                    };
+                    if want_all && !ok {
+                        acc = false;
+                        break;
+                    }
+                    if !want_all && ok {
+                        acc = true;
+                        break;
+                    }
+                }
+                NanBox::boolean(acc)
+            }
+            "concat" => {
+                let mut out = elems(ctx);
+                for a in args {
+                    match a.as_handle().map(Handle::from_raw) {
+                        Some(ah) if ctx.realm.is_array(ah) => out.extend(
+                            ctx.realm
+                                .array_elements(ah)
+                                .map(<[_]>::to_vec)
+                                .unwrap_or_default(),
+                        ),
+                        _ => out.push(*a),
+                    }
+                }
+                NanBox::handle(ctx.realm.new_array(out).to_raw())
+            }
+            "reverse" => {
+                let mut out = elems(ctx);
+                out.reverse();
+                NanBox::handle(ctx.realm.new_array(out).to_raw())
+            }
+            _ => return None,
+        };
+        return Some(Ok(result));
+    }
+
+    // --- string methods ---
+    if let Some(s) = ctx.realm.string_value(h) {
+        let result = match key {
+            "toUpperCase" => NanBox::handle(ctx.realm.new_string(&s.to_uppercase()).to_raw()),
+            "toLowerCase" => NanBox::handle(ctx.realm.new_string(&s.to_lowercase()).to_raw()),
+            "trim" => NanBox::handle(ctx.realm.new_string(s.trim()).to_raw()),
+            "includes" => NanBox::boolean(s.contains(&ctx.realm.to_display_string(arg0()))),
+            "startsWith" => NanBox::boolean(s.starts_with(&ctx.realm.to_display_string(arg0()))),
+            "endsWith" => NanBox::boolean(s.ends_with(&ctx.realm.to_display_string(arg0()))),
+            "indexOf" => {
+                let needle = ctx.realm.to_display_string(arg0());
+                let i = s.find(&needle).map(|b| s[..b].chars().count());
+                NanBox::number(i.map_or(-1.0, |i| i as f64))
+            }
+            "repeat" => {
+                let n = ctx.realm.to_number(arg0()).max(0.0) as usize;
+                NanBox::handle(ctx.realm.new_string(&s.repeat(n)).to_raw())
+            }
+            "charAt" => {
+                let i = ctx.realm.to_number(arg0()) as usize;
+                let c = s.chars().nth(i).map(String::from).unwrap_or_default();
+                NanBox::handle(ctx.realm.new_string(&c).to_raw())
+            }
+            "split" => {
+                let sep = ctx.realm.to_display_string(arg0());
+                let parts: Vec<NanBox> = if sep.is_empty() {
+                    s.chars()
+                        .map(|c| NanBox::handle(ctx.realm.new_string(&String::from(c)).to_raw()))
+                        .collect()
+                } else {
+                    s.split(&sep)
+                        .map(|p| NanBox::handle(ctx.realm.new_string(p).to_raw()))
+                        .collect()
+                };
+                NanBox::handle(ctx.realm.new_array(parts).to_raw())
+            }
+            _ => return None,
+        };
+        return Some(Ok(result));
+    }
+    None
 }
 
 /// Invokes a built-in by id (`console.log` writes to `ctx.output`; `Math.*`
@@ -2746,6 +3012,52 @@ mod tests {
                 let o = new C(); o.a + o.b + o.c"),
             "6"
         );
+    }
+
+    #[test]
+    fn bytecode_array_and_string_methods() {
+        // Higher-order array methods with closures, all on the bytecode path.
+        assert_eq!(bc("[1, 2, 3, 4].map((x) => x * 2).join(',')"), "2,4,6,8");
+        assert_eq!(
+            bc("[1, 2, 3, 4, 5].filter((x) => x % 2 === 0).join(',')"),
+            "2,4"
+        );
+        assert_eq!(bc("[1, 2, 3, 4].reduce((a, b) => a + b, 0)"), "10");
+        assert_eq!(bc("[1, 2, 3].reduce((a, b) => a + b)"), "6"); // no seed
+        assert_eq!(
+            bc("let s = 0; [10, 20, 30].forEach((x) => { s += x; }); s"),
+            "60"
+        );
+        assert_eq!(bc("[5, 8, 2].find((x) => x > 6)"), "8");
+        assert_eq!(
+            bc("'' + [1, 2, 3].some((x) => x > 2) + ',' + [1, 2, 3].every((x) => x > 0)"),
+            "true,true"
+        );
+        // Mutation + non-callback methods.
+        assert_eq!(
+            bc("let a = [1, 2]; a.push(3); a.push(4); a.join('')"),
+            "1234"
+        );
+        assert_eq!(bc("let a = [1, 2, 3]; a.pop(); a.join('')"), "12");
+        assert_eq!(
+            bc("[1, 2, 3].includes(2) + ',' + [1, 2, 3].indexOf(3)"),
+            "true,2"
+        );
+        assert_eq!(bc("[1, 2].concat([3, 4], 5).join('')"), "12345");
+        assert_eq!(bc("[1, 2, 3].reverse().join('')"), "321");
+        // A map → filter → reduce pipeline in bytecode.
+        assert_eq!(
+            bc("[1, 2, 3, 4, 5].map((x) => x * x).filter((x) => x > 4).reduce((a, b) => a + b, 0)"),
+            "50"
+        );
+        // String methods.
+        assert_eq!(bc("'Hello'.toUpperCase()"), "HELLO");
+        assert_eq!(bc("'WORLD'.toLowerCase()"), "world");
+        assert_eq!(bc("'  hi  '.trim()"), "hi");
+        assert_eq!(bc("'a,b,c'.split(',').join('|')"), "a|b|c");
+        assert_eq!(bc("'abcabc'.indexOf('c')"), "2");
+        assert_eq!(bc("'ab'.repeat(3)"), "ababab");
+        assert_eq!(bc("'hello world'.includes('world')"), "true");
     }
 
     #[test]
