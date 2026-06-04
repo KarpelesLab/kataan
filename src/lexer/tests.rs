@@ -231,6 +231,23 @@ fn unicode_identifiers() {
     assert_eq!(kinds("π = 3.14"), &[Identifier, Eq, Number]);
     let toks = Lexer::new("café").tokenize().unwrap();
     assert_eq!(toks[0].text("café"), "café");
+    // Letters from various scripts and combining marks continue identifiers.
+    assert_eq!(
+        kinds("日本語 λ naïve _x$"),
+        &[Identifier, Identifier, Identifier, Identifier]
+    );
+}
+
+// `ID_Start` precision needs the Unicode property tables (the `intl` feature):
+// a currency symbol is not a valid identifier and is rejected (not swallowed as
+// a one-char identifier).
+#[cfg(feature = "intl")]
+#[test]
+fn rejects_non_identifier_unicode() {
+    assert!(Lexer::new("let € = 1;").tokenize().is_err());
+    assert!(Lexer::new("°").tokenize().is_err());
+    // But a valid identifier with a trailing combining mark is fine.
+    assert!(Lexer::new("e\u{0301}").tokenize().is_ok());
 }
 
 #[test]

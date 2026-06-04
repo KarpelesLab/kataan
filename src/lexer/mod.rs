@@ -166,12 +166,18 @@ impl<'src> Lexer<'src> {
             b'#' => self.read_private_name()?,
             b'0'..=b'9' => self.read_number()?,
             _ => {
-                if is_identifier_start_byte(c) || c >= 0x80 {
+                if is_identifier_start_byte(c)
+                    || (c >= 0x80 && self.peek_char().is_some_and(is_identifier_start_char))
+                {
                     self.read_identifier_or_keyword()?
                 } else {
-                    self.advance();
+                    // Consume the whole (possibly multi-byte) char before
+                    // reporting, so the span is correct and `advance` isn't
+                    // mid-codepoint.
+                    let ch = self.peek_char().unwrap_or(c as char);
+                    self.advance_char(ch);
                     return Err(Error::syntax(
-                        alloc::format!("unexpected character {:?}", c as char),
+                        alloc::format!("unexpected character {ch:?}"),
                         Span::new(start as u32, self.pos as u32),
                     ));
                 }
@@ -714,7 +720,10 @@ impl<'src> Lexer<'src> {
         let start = self.pos;
         self.advance(); // `#`
         match self.peek() {
-            Some(c) if is_identifier_start_byte(c) || c >= 0x80 => {
+            Some(c)
+                if is_identifier_start_byte(c)
+                    || (c >= 0x80 && self.peek_char().is_some_and(is_identifier_start_char)) =>
+            {
                 self.read_identifier_tail();
                 Ok(TokenKind::PrivateName)
             }
@@ -854,7 +863,8 @@ impl<'src> Lexer<'src> {
     /// (`3in` is an error, not `3 in`).
     fn reject_identifier_after_number(&mut self, start: usize) -> Result<()> {
         if let Some(c) = self.peek()
-            && (is_identifier_start_byte(c) || c >= 0x80)
+            && (is_identifier_start_byte(c)
+                || (c >= 0x80 && self.peek_char().is_some_and(is_identifier_start_char)))
         {
             return Err(Error::syntax(
                 "identifier directly after numeric literal",
@@ -1020,17 +1030,54 @@ fn is_identifier_part_byte(c: u8) -> bool {
     is_identifier_start_byte(c) || c.is_ascii_digit()
 }
 
-/// Whether a non-ASCII char may continue an identifier. This is a pragmatic
-/// approximation of `ID_Continue` (any alphanumeric or connector-ish char, plus
-/// ZWNJ/ZWJ) sufficient for Phase A; the exact Unicode property tables land
-/// with the parser. ASCII is rejected here and routed through the byte
+/// Whether a non-ASCII char may *start* an identifier (`ID_Start`: letters and
+/// letter-numbers). With the `intl` feature this uses the Unicode property
+/// tables; otherwise it falls back to a pragmatic `is_alphabetic` approximation.
+#[inline]
+pub(crate) fn is_identifier_start_char(ch: char) -> bool {
+    if ch.is_ascii() {
+        return is_identifier_start_byte(ch as u8);
+    }
+    #[cfg(feature = "intl")]
+    {
+        use intl::unicode::category::GeneralCategory as Gc;
+        let gc = intl::unicode::general_category(ch);
+        gc.is_letter() || gc == Gc::LetterNumber
+    }
+    #[cfg(not(feature = "intl"))]
+    {
+        ch.is_alphabetic()
+    }
+}
+
+/// Whether a non-ASCII char may continue an identifier (`ID_Continue`:
+/// `ID_Start` plus marks, decimal digits, connector punctuation, and ZWNJ/ZWJ).
+/// With the `intl` feature this uses the Unicode property tables; otherwise a
+/// pragmatic `is_alphanumeric` approximation. ASCII is routed through the byte
 /// classifiers.
 #[inline]
 fn is_identifier_part_char(ch: char) -> bool {
     if ch.is_ascii() {
         return is_identifier_part_byte(ch as u8);
     }
-    ch.is_alphanumeric() || ch == '\u{200C}' || ch == '\u{200D}'
+    if ch == '\u{200C}' || ch == '\u{200D}' {
+        return true; // ZWNJ / ZWJ
+    }
+    #[cfg(feature = "intl")]
+    {
+        use intl::unicode::category::GeneralCategory as Gc;
+        let gc = intl::unicode::general_category(ch);
+        gc.is_letter()
+            || gc.is_mark()
+            || matches!(
+                gc,
+                Gc::LetterNumber | Gc::DecimalNumber | Gc::ConnectorPunctuation
+            )
+    }
+    #[cfg(not(feature = "intl"))]
+    {
+        ch.is_alphanumeric()
+    }
 }
 
 /// Whether a char is ECMAScript whitespace (the `WhiteSpace` production):
