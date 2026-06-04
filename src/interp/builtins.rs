@@ -1397,6 +1397,24 @@ fn string_method<'a>(s: &str, name: &str, args: &[Value<'a>]) -> Option<Value<'a
     let result = match name {
         "toUpperCase" => Value::str(s.to_uppercase()),
         "toLowerCase" => Value::str(s.to_lowercase()),
+        // `str.normalize(form)` — Unicode normalization (NFC default), via the
+        // pure-Rust `intl` crate.
+        #[cfg(feature = "intl")]
+        "normalize" => {
+            use intl::unicode::normalize::{nfc, nfd, nfkc, nfkd};
+            let form = match arg(args, 0) {
+                Value::Undefined => String::from("NFC"),
+                other => other.to_js_string(),
+            };
+            let normalized: String = match form.as_str() {
+                "NFC" => nfc(s.chars()).collect(),
+                "NFD" => nfd(s.chars()).collect(),
+                "NFKC" => nfkc(s.chars()).collect(),
+                "NFKD" => nfkd(s.chars()).collect(),
+                _ => s.to_string(), // unknown form: leave unchanged (lenient)
+            };
+            Value::str(normalized)
+        }
         "trim" => Value::str(s.trim().to_string()),
         "includes" => Value::Bool(s.contains(&arg(args, 0).to_js_string())),
         "startsWith" => Value::Bool(s.starts_with(&arg(args, 0).to_js_string())),

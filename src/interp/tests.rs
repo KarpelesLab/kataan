@@ -2198,6 +2198,23 @@ fn array_methods() {
     assert_eq!(eval("Array.isArray('nope')"), "false");
 }
 
+#[cfg(feature = "intl")]
+#[test]
+fn string_normalize() {
+    // "é" as a precomposed character vs. "e" + combining acute accent.
+    assert_eq!(eval("'\\u00e9'.length"), "1"); // composed
+    assert_eq!(eval("'e\\u0301'.length"), "2"); // decomposed
+    // NFC composes; NFD decomposes.
+    assert_eq!(eval("'e\\u0301'.normalize('NFC') === '\\u00e9'"), "true");
+    assert_eq!(eval("'\\u00e9'.normalize('NFD') === 'e\\u0301'"), "true");
+    // The default form is NFC.
+    assert_eq!(eval("'e\\u0301'.normalize().length"), "1");
+    // NFKC folds compatibility characters (full-width ASCII → ASCII).
+    assert_eq!(eval("'\\uff21\\uff22\\uff23'.normalize('NFKC')"), "ABC");
+    // A plain ASCII string is unchanged.
+    assert_eq!(eval("'hello'.normalize('NFC')"), "hello");
+}
+
 #[test]
 fn string_methods() {
     assert_eq!(eval("'hello'.toUpperCase()"), "HELLO");

@@ -42,9 +42,10 @@ alloc = []
 # --- module gates (wired as each layer lands) ---
 # In-house regular-expression engine (no foreign code).
 regex = []
-# In-house Intl-lite (collation, casing, number/date formatting) over an
-# embedded trimmed CLDR table.
-intl = []
+# Unicode/Intl primitives (NFC/NFD/NFKC/NFKD normalization, Unicode case
+# mapping/folding, character properties) over the pure-Rust `intl` crate — a
+# no_std ICU analog.
+intl = ["alloc", "dep:intl"]
 # ESM + CommonJS module loader/linker.
 module = []
 # Host runtime: event loop, timers, console, encoding, URL, streams, process.
@@ -71,6 +72,11 @@ cli = ["std", "regex", "module", "host"]
 # (`purecrypto-tls`) so the "no foreign code" charter holds end to end.
 rsurl = { version = "0.0", optional = true, default-features = false, features = ["purecrypto-tls"] }
 purecrypto = { version = "0.6", optional = true, default-features = false, features = ["rng", "hash", "cipher"] }
+# Pure-Rust, no_std Unicode/Intl primitives (a pure-Rust ICU analog). `full`
+# selects supplementary planes so JS strings (full Unicode) are covered. Path
+# dependency while the crate is co-developed alongside Kataan; switch to a
+# published `version` once it ships the `unicode::normalize` API.
+intl = { path = "../unicoders", optional = true, default-features = false, features = ["full"] }
 
 [lints.rust]
 # Keep the foundation documented and the API surface honest.
