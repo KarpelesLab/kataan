@@ -383,6 +383,10 @@ fn more_string_number_methods() {
     assert_eq!(eval("'a-b-c'.replace('-', '+')"), "a+b-c");
     assert_eq!(eval("'a-b-c'.replaceAll('-', '+')"), "a+b+c");
     assert_eq!(eval("'hello'.at(-1)"), "o");
+    assert_eq!(eval("(1234.5678).toExponential(2)"), "1.23e+3");
+    assert_eq!(eval("(0.00012).toExponential()"), "1.2e-4");
+    assert_eq!(eval("(123.456).toPrecision(4)"), "123.5");
+    assert_eq!(eval("(255).toString(16)"), "ff");
 }
 
 #[test]

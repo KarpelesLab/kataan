@@ -1374,9 +1374,43 @@ fn number_method<'a>(n: f64, name: &str, args: &[Value<'a>]) -> Option<Value<'a>
                 Value::str(to_radix_string(n, radix as u32))
             }
         }
+        "toExponential" => {
+            let raw = if matches!(arg(args, 0), Value::Undefined) {
+                alloc::format!("{n:e}")
+            } else {
+                let d = arg(args, 0).to_number().max(0.0) as usize;
+                alloc::format!("{n:.d$e}")
+            };
+            Value::str(js_exponent(&raw))
+        }
+        "toPrecision" => {
+            if matches!(arg(args, 0), Value::Undefined) {
+                Value::str(Value::Number(n).to_js_string())
+            } else {
+                // `toPrecision(p)`: p significant digits.
+                let p = (arg(args, 0).to_number() as usize).max(1);
+                let int_digits = if n == 0.0 {
+                    1
+                } else {
+                    n.abs().log10().floor() as i64 + 1
+                };
+                let frac = (p as i64 - int_digits).max(0) as usize;
+                Value::str(alloc::format!("{n:.frac$}"))
+            }
+        }
+        "valueOf" => Value::Number(n),
         _ => return None,
     };
     Some(result)
+}
+
+/// Normalizes Rust's `{:e}` output (`1.2e3`) to JavaScript's exponential form
+/// (`1.2e+3`); negative exponents already carry their sign.
+fn js_exponent(s: &str) -> String {
+    match s.split_once('e') {
+        Some((mantissa, exp)) if !exp.starts_with('-') => alloc::format!("{mantissa}e+{exp}"),
+        _ => s.to_string(),
+    }
 }
 
 /// Renders an integer-valued number in the given radix (2–36); fractional
