@@ -649,6 +649,21 @@ fn optimize_ops(ops: &[Op]) -> Vec<Op> {
                 NanBox::boolean(x < y)
             })
             .unwrap_or_else(|| op.clone()),
+            // `+` over two number constants is plain addition (no string can be
+            // involved — only `LoadConst` primitives are tracked).
+            Op::AddValue { dst, a, b } => fold2(*dst, num(&consts, a), num(&consts, b), |x, y| {
+                NanBox::number(x + y)
+            })
+            .unwrap_or_else(|| op.clone()),
+            // Loose `==`/`!=` over two number constants is numeric equality
+            // (matching the realm's `loose_equals` for two numbers).
+            Op::ValueBin { dst, op: vop, a, b } if matches!(*vop, VB_LOOSE_EQ | VB_LOOSE_NEQ) => {
+                let eq = matches!(*vop, VB_LOOSE_EQ);
+                fold2(*dst, num(&consts, a), num(&consts, b), move |x, y| {
+                    NanBox::boolean((x == y) == eq)
+                })
+                .unwrap_or_else(|| op.clone())
+            }
             Op::Neg { dst, a } => match num(&consts, a) {
                 Some(x) => Op::LoadConst {
                     dst: *dst,
@@ -5808,6 +5823,46 @@ mod tests {
             }
             other => panic!("expected a folded LoadConst, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn optimizer_folds_addvalue_and_loose_eq() {
+        // `+` over two number constants folds to addition.
+        let ops = alloc::vec![
+            Op::LoadConst {
+                dst: 0,
+                value: NanBox::number(40.0)
+            },
+            Op::LoadConst {
+                dst: 1,
+                value: NanBox::number(2.0)
+            },
+            Op::AddValue { dst: 2, a: 0, b: 1 },
+            Op::Return { src: 2 },
+        ];
+        let opt = optimize_ops(&ops);
+        assert!(matches!(&opt[2], Op::LoadConst { value, .. } if value.as_number() == Some(42.0)));
+
+        // Loose `==` over two number constants folds to a boolean.
+        let ops = alloc::vec![
+            Op::LoadConst {
+                dst: 0,
+                value: NanBox::number(3.0)
+            },
+            Op::LoadConst {
+                dst: 1,
+                value: NanBox::number(3.0)
+            },
+            Op::ValueBin {
+                dst: 2,
+                op: VB_LOOSE_EQ,
+                a: 0,
+                b: 1
+            },
+            Op::Return { src: 2 },
+        ];
+        let opt = optimize_ops(&ops);
+        assert!(matches!(&opt[2], Op::LoadConst { value, .. } if value.to_boolean()));
     }
 
     #[test]
