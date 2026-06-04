@@ -2108,6 +2108,45 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::number(len as f64)));
                 }
                 "pop" => return Ok(Some(self.realm.array_pop(handle))),
+                // `splice(start, deleteCount?, ...items)` — mutate in place,
+                // return the removed elements as a new array.
+                "shift" => {
+                    if elems.is_empty() {
+                        return Ok(Some(NanBox::undefined()));
+                    }
+                    let first = elems[0];
+                    self.realm.array_set_all(handle, elems[1..].to_vec());
+                    return Ok(Some(first));
+                }
+                "unshift" => {
+                    let mut next: Vec<NanBox> = args.to_vec();
+                    next.extend_from_slice(&elems);
+                    let len = next.len();
+                    self.realm.array_set_all(handle, next);
+                    return Ok(Some(NanBox::number(len as f64)));
+                }
+                "splice" => {
+                    let len = elems.len();
+                    let start = {
+                        let s = self.realm.to_number(arg(0));
+                        if s < 0.0 {
+                            (len as f64 + s).max(0.0) as usize
+                        } else {
+                            (s as usize).min(len)
+                        }
+                    };
+                    let delete = if args.len() < 2 {
+                        len - start
+                    } else {
+                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(len - start)
+                    };
+                    let removed: Vec<NanBox> = elems[start..start + delete].to_vec();
+                    let mut next: Vec<NanBox> = elems[..start].to_vec();
+                    next.extend_from_slice(&args[2.min(args.len())..]);
+                    next.extend_from_slice(&elems[start + delete..]);
+                    self.realm.array_set_all(handle, next);
+                    return Ok(Some(NanBox::handle(self.realm.new_array(removed).to_raw())));
+                }
                 "join" => {
                     let sep = if matches!(arg(0).unpack(), Unpacked::Undefined) {
                         String::from(",")
@@ -4702,6 +4741,17 @@ mod tests {
         assert_eq!(run("[1, 2, 3].includes(2)"), "true");
         assert_eq!(run("[1, 2, 3].indexOf(3)"), "2");
         assert_eq!(run("['a', 'b', 'c'].join(', ')"), "a, b, c");
+        // splice (remove + insert), unshift, shift.
+        assert_eq!(
+            run("let a=[1,2,3,4]; a.splice(1,2,'x'); a.join(',')"),
+            "1,x,4"
+        );
+        assert_eq!(run("[1,2,3,4].splice(1,2).join(',')"), "2,3");
+        assert_eq!(run("let a=[2,3]; a.unshift(0,1); a.join(',')"), "0,1,2,3");
+        assert_eq!(
+            run("let a=[1,2,3]; let f=a.shift(); f + ':' + a.join(',')"),
+            "1:2,3"
+        );
         // fill: whole array, a [start,end) range, and a negative start.
         assert_eq!(run("[0, 0, 0].fill(7).join(',')"), "7,7,7");
         assert_eq!(run("[1, 2, 3, 4].fill(9, 1, 3).join(',')"), "1,9,9,4");

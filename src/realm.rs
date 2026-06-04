@@ -407,6 +407,18 @@ impl Realm {
         Some(a.len())
     }
 
+    /// Replaces the whole contents of the array at `handle` (for in-place
+    /// mutators like `splice`/`unshift`/`shift`). Returns whether it was an array.
+    pub fn array_set_all(&mut self, handle: Handle, elems: Vec<NanBox>) -> bool {
+        match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
+            Some(a) => {
+                *a = elems;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// `arr.pop()` — removes and returns the last element (`undefined` if empty
     /// or not an array).
     pub fn array_pop(&mut self, handle: Handle) -> NanBox {
