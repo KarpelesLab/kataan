@@ -335,6 +335,52 @@ fn error_objects() {
 }
 
 #[test]
+fn maps() {
+    assert_eq!(
+        eval("let m = new Map(); m.set('a', 1); m.set('b', 2); m.get('a') + m.get('b')"),
+        "3"
+    );
+    assert_eq!(eval("let m = new Map(); m.set('x', 9); m.has('x')"), "true");
+    assert_eq!(
+        eval("let m = new Map(); m.set('x', 1); m.delete('x'); m.size"),
+        "0"
+    );
+    assert_eq!(eval("new Map([['a', 1], ['b', 2]]).size"), "2");
+    assert_eq!(
+        eval("let m = new Map([['a', 1], ['b', 2]]); let s = 0; m.forEach(v => s += v); s"),
+        "3"
+    );
+    // NaN keys are SameValueZero-equal.
+    assert_eq!(
+        eval("let m = new Map(); m.set(0 / 0, 'x'); m.get(0 / 0)"),
+        "x"
+    );
+}
+
+#[test]
+fn sets() {
+    assert_eq!(
+        eval("let s = new Set(); s.add(1); s.add(1); s.add(2); s.size"),
+        "2"
+    );
+    assert_eq!(eval("new Set([1, 2, 2, 3, 3, 3]).size"), "3");
+    assert_eq!(eval("let s = new Set([1, 2]); s.has(2)"), "true");
+    assert_eq!(
+        eval("let s = new Set([1, 2, 3]); s.delete(2); s.has(2)"),
+        "false"
+    );
+    assert_eq!(
+        eval("let s = new Set([1, 2, 3]); let t = 0; s.forEach(v => t += v); t"),
+        "6"
+    );
+    // Dedup an array via a Set.
+    assert_eq!(
+        eval("let s = new Set([3, 1, 3, 2, 1]); s.values().join(',')"),
+        "3,1,2"
+    );
+}
+
+#[test]
 fn in_operator() {
     assert_eq!(eval("'a' in { a: 1 }"), "true");
     assert_eq!(eval("'b' in { a: 1 }"), "false");

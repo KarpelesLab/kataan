@@ -70,6 +70,16 @@ pub struct Obj<'a> {
     props: RefCell<Vec<(Box<str>, Value<'a>)>>,
     array: Option<RefCell<Vec<Value<'a>>>>,
     proto: RefCell<Option<Rc<Obj<'a>>>>,
+    collection: Option<RefCell<Collection<'a>>>,
+}
+
+/// The backing store of a `Map` or `Set`: insertion-ordered key/value entries
+/// compared by SameValueZero. For a `Set`, the value equals the key.
+pub struct Collection<'a> {
+    /// Whether this is a `Set` (vs a `Map`) — affects `forEach`/iteration.
+    pub is_set: bool,
+    /// The entries, in insertion order.
+    pub entries: Vec<(Value<'a>, Value<'a>)>,
 }
 
 impl<'a> Obj<'a> {
@@ -80,6 +90,7 @@ impl<'a> Obj<'a> {
             props: RefCell::new(Vec::new()),
             array: None,
             proto: RefCell::new(None),
+            collection: None,
         })
     }
 
@@ -90,6 +101,7 @@ impl<'a> Obj<'a> {
             props: RefCell::new(Vec::new()),
             array: None,
             proto: RefCell::new(Some(proto)),
+            collection: None,
         })
     }
 
@@ -100,7 +112,28 @@ impl<'a> Obj<'a> {
             props: RefCell::new(Vec::new()),
             array: Some(RefCell::new(elements)),
             proto: RefCell::new(None),
+            collection: None,
         })
+    }
+
+    /// Creates an empty `Map` (`is_set = false`) or `Set` (`is_set = true`).
+    #[must_use]
+    pub fn collection(is_set: bool) -> Rc<Obj<'a>> {
+        Rc::new(Obj {
+            props: RefCell::new(Vec::new()),
+            array: None,
+            proto: RefCell::new(None),
+            collection: Some(RefCell::new(Collection {
+                is_set,
+                entries: Vec::new(),
+            })),
+        })
+    }
+
+    /// The `Map`/`Set` backing store, if this object is one.
+    #[must_use]
+    pub fn as_collection(&self) -> Option<&RefCell<Collection<'a>>> {
+        self.collection.as_ref()
     }
 
     /// Whether this is an array.
@@ -437,6 +470,18 @@ pub fn strict_equals<'a>(a: &Value<'a>, b: &Value<'a>) -> bool {
         (Value::Class(x), Value::Class(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
+}
+
+/// SameValueZero — strict equality except that `NaN` equals `NaN` (the
+/// comparison `Map`/`Set` and `Array.prototype.includes` use).
+#[must_use]
+pub fn same_value_zero<'a>(a: &Value<'a>, b: &Value<'a>) -> bool {
+    if let (Value::Number(x), Value::Number(y)) = (a, b) {
+        if x.is_nan() && y.is_nan() {
+            return true;
+        }
+    }
+    strict_equals(a, b)
 }
 
 /// Abstract (loose) equality (`==`) for the primitive value set.

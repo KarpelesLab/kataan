@@ -1182,6 +1182,10 @@ impl<'a> Interp<'a> {
     /// `undefined`.
     fn get_member(&self, obj: &Value<'a>, key: &str) -> Completion<'a, Value<'a>> {
         match obj {
+            // `Map`/`Set` expose `size` as an accessor.
+            Value::Object(o) if key == "size" && o.as_collection().is_some() => Ok(Value::Number(
+                o.as_collection().unwrap().borrow().entries.len() as f64,
+            )),
             Value::Object(o) => Ok(o.get(key)),
             Value::Str(s) => Ok(if key == "length" {
                 Value::Number(s.chars().count() as f64)

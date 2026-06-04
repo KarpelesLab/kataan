@@ -41,6 +41,42 @@ impl<'a> Interp<'a> {
         self.install_array_ctor();
         self.install_number_globals();
         self.install_errors();
+        self.install_collections();
+    }
+
+    fn install_collections(&self) {
+        // `new Map([[k, v], …])`
+        self.define_global(
+            "Map",
+            native("Map", |a| {
+                let map = Obj::collection(false);
+                if let Value::Object(init) = arg(a, 0) {
+                    if let Some(elems) = init.elements() {
+                        for entry in elems.borrow().iter() {
+                            if let Value::Object(pair) = entry {
+                                collection_set(&map, pair.get("0"), pair.get("1"));
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Object(map))
+            }),
+        );
+        // `new Set([v, …])`
+        self.define_global(
+            "Set",
+            native("Set", |a| {
+                let set = Obj::collection(true);
+                if let Value::Object(init) = arg(a, 0) {
+                    if let Some(elems) = init.elements() {
+                        for v in elems.borrow().iter() {
+                            collection_set(&set, v.clone(), v.clone());
+                        }
+                    }
+                }
+                Ok(Value::Object(set))
+            }),
+        );
     }
 
     fn install_errors(&self) {
@@ -249,9 +285,97 @@ impl<'a> Interp<'a> {
     ) -> Completion<'a, Option<Value<'a>>> {
         match recv {
             Value::Object(o) if o.is_array() => self.array_method(o, name, args),
+            Value::Object(o) if o.as_collection().is_some() => {
+                self.collection_method(o, name, args)
+            }
             Value::Str(s) => Ok(string_method(s, name, args)),
             _ => Ok(None),
         }
+    }
+
+    /// `Map`/`Set` prototype methods.
+    fn collection_method(
+        &mut self,
+        obj: &Rc<Obj<'a>>,
+        name: &str,
+        args: &[Value<'a>],
+    ) -> Completion<'a, Option<Value<'a>>> {
+        use super::value::same_value_zero;
+        let cell = obj.as_collection().expect("collection");
+        let result = match name {
+            // Map.set(k, v) / Set.add(v)
+            "set" => {
+                collection_set(obj, arg(args, 0), arg(args, 1));
+                Value::Object(Rc::clone(obj))
+            }
+            "add" => {
+                collection_set(obj, arg(args, 0), arg(args, 0));
+                Value::Object(Rc::clone(obj))
+            }
+            "get" => {
+                let key = arg(args, 0);
+                cell.borrow()
+                    .entries
+                    .iter()
+                    .find(|(k, _)| same_value_zero(k, &key))
+                    .map_or(Value::Undefined, |(_, v)| v.clone())
+            }
+            "has" => {
+                let key = arg(args, 0);
+                Value::Bool(
+                    cell.borrow()
+                        .entries
+                        .iter()
+                        .any(|(k, _)| same_value_zero(k, &key)),
+                )
+            }
+            "delete" => {
+                let key = arg(args, 0);
+                let mut c = cell.borrow_mut();
+                let before = c.entries.len();
+                c.entries.retain(|(k, _)| !same_value_zero(k, &key));
+                Value::Bool(c.entries.len() != before)
+            }
+            "clear" => {
+                cell.borrow_mut().entries.clear();
+                Value::Undefined
+            }
+            "keys" => {
+                let ks: Vec<Value<'a>> = cell
+                    .borrow()
+                    .entries
+                    .iter()
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                Value::Object(Obj::array(ks))
+            }
+            "values" => {
+                let vs: Vec<Value<'a>> = cell
+                    .borrow()
+                    .entries
+                    .iter()
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                Value::Object(Obj::array(vs))
+            }
+            "forEach" => {
+                let callback = arg(args, 0);
+                let is_set = cell.borrow().is_set;
+                let snapshot: Vec<(Value<'a>, Value<'a>)> = cell.borrow().entries.clone();
+                for (k, v) in snapshot {
+                    // Map: (value, key, map); Set: (value, value, set).
+                    let call_args = if is_set {
+                        alloc::vec![k.clone(), k, Value::Object(Rc::clone(obj))]
+                    } else {
+                        alloc::vec![v, k, Value::Object(Rc::clone(obj))]
+                    };
+                    self.call_with_this(callback.clone(), Value::Undefined, call_args)?;
+                }
+                Value::Undefined
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(result))
     }
 
     fn array_method(
@@ -399,6 +523,18 @@ impl<'a> Interp<'a> {
             acc = self.call_with_this(callback.clone(), Value::Undefined, call_args)?;
         }
         Ok(acc)
+    }
+}
+
+/// Inserts or updates `(key, value)` in a `Map`/`Set` (SameValueZero key).
+fn collection_set<'a>(obj: &Rc<Obj<'a>>, key: Value<'a>, value: Value<'a>) {
+    use super::value::same_value_zero;
+    let cell = obj.as_collection().expect("collection");
+    let mut c = cell.borrow_mut();
+    if let Some(slot) = c.entries.iter_mut().find(|(k, _)| same_value_zero(k, &key)) {
+        slot.1 = value;
+    } else {
+        c.entries.push((key, value));
     }
 }
 
