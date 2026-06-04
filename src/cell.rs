@@ -87,6 +87,8 @@ pub enum Cell {
     },
     /// A `Promise` (its shared settlement state).
     Promise(Rc<RefCell<PromiseState>>),
+    /// A `Date`: milliseconds since the Unix epoch (UTC).
+    Date(f64),
     /// A class constructor: an index into the interpreter's class table plus the
     /// scope it was defined in.
     Class {
@@ -186,6 +188,15 @@ impl Cell {
         }
     }
 
+    /// The timestamp (ms since epoch), if this cell is a `Date`.
+    #[must_use]
+    pub fn as_date(&self) -> Option<f64> {
+        match self {
+            Cell::Date(ms) => Some(*ms),
+            _ => None,
+        }
+    }
+
     /// The `(class_id, captured env)`, if this cell is a class.
     #[must_use]
     pub fn as_class(&self) -> Option<(u32, &Scope)> {
@@ -223,9 +234,11 @@ impl Cell {
             | Cell::Native(_)
             | Cell::BoundNative { .. }
             | Cell::Class { .. } => "function",
-            Cell::Object(_) | Cell::Array(_) | Cell::Collection { .. } | Cell::Promise(_) => {
-                "object"
-            }
+            Cell::Object(_)
+            | Cell::Array(_)
+            | Cell::Collection { .. }
+            | Cell::Promise(_)
+            | Cell::Date(_) => "object",
         }
     }
 }
@@ -271,8 +284,8 @@ impl Trace for Cell {
             }
             // A bound native keeps its target reachable.
             Cell::BoundNative { target, .. } => visit(*target),
-            // Strings and native functions reference no handles.
-            Cell::Str(_) | Cell::Native(_) => {}
+            // Strings, native functions, and dates reference no handles.
+            Cell::Str(_) | Cell::Native(_) | Cell::Date(_) => {}
         }
     }
 }

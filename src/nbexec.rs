@@ -135,6 +135,7 @@ const N_OBJECT_ENTRIES: u16 = 19;
 const N_ARRAY_FROM: u16 = 20;
 const N_ARRAY_OF: u16 = 21;
 const N_PROMISE: u16 = 22;
+const N_DATE: u16 = 25;
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
@@ -197,6 +198,10 @@ impl<'a> Interp<'a> {
         let promise_ctor = self.realm.new_native(N_PROMISE);
         self.current
             .declare("Promise", NanBox::handle(promise_ctor.to_raw()));
+        // `Date` is a native constructor; `Date.now()` is a static.
+        let date_ctor = self.realm.new_native(N_DATE);
+        self.current
+            .declare("Date", NanBox::handle(date_ctor.to_raw()));
         install_namespace(self, "JSON", &[("stringify", N_JSON_STRINGIFY)]);
         install_namespace(
             self,
@@ -754,6 +759,15 @@ impl<'a> Interp<'a> {
             }
             return Ok(NanBox::handle(promise.to_raw()));
         }
+        // `new Date(ms)` (or `new Date()` for "now").
+        if id == N_DATE {
+            let ms = match args.first() {
+                Some(a) => self.realm.to_number(*a),
+                None => now_ms(),
+            };
+            let d = self.realm.new_date(ms);
+            return Ok(NanBox::handle(d.to_raw()));
+        }
         let is_set = match id {
             N_SET => true,
             N_MAP => false,
@@ -964,6 +978,30 @@ impl<'a> Interp<'a> {
         };
         let handle = Handle::from_raw(raw);
 
+        // --- `Date.now()` static ---
+        if self.realm.native_at(handle) == Some(N_DATE) && method == "now" {
+            return Ok(Some(NanBox::number(now_ms())));
+        }
+        // --- Date instance methods ---
+        if let Some(ms) = self.realm.date_at(handle) {
+            let t = ms as i64;
+            let day = t.div_euclid(86_400_000);
+            let tod = t.rem_euclid(86_400_000);
+            let (y, mo, d) = crate::realm::civil_from_days(day);
+            return Ok(Some(match method {
+                "getTime" | "valueOf" => NanBox::number(ms),
+                "getFullYear" => NanBox::number(y as f64),
+                "getMonth" => NanBox::number((mo - 1) as f64), // 0-based
+                "getDate" => NanBox::number(d as f64),
+                "getDay" => NanBox::number((day.rem_euclid(7) + 4).rem_euclid(7) as f64),
+                "getHours" => NanBox::number((tod / 3_600_000) as f64),
+                "getMinutes" => NanBox::number((tod / 60_000 % 60) as f64),
+                "getSeconds" => NanBox::number((tod / 1000 % 60) as f64),
+                "getMilliseconds" => NanBox::number((tod % 1000) as f64),
+                "toISOString" | "toJSON" => self.new_str(&crate::realm::date_to_iso(ms)),
+                _ => return Ok(None),
+            }));
+        }
         // --- `Promise.resolve` / `Promise.reject` statics (on the constructor) ---
         if self.realm.native_at(handle) == Some(N_PROMISE) {
             match method {
@@ -2196,6 +2234,22 @@ fn json_quote(s: &str) -> String {
     out
 }
 
+/// The current time in milliseconds since the Unix epoch (`0.0` without `std`,
+/// which has no clock).
+fn now_ms() -> f64 {
+    #[cfg(feature = "std")]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        0.0
+    }
+}
+
 /// A minimal `parseInt`: skips leading whitespace, reads an optional sign and
 /// the leading decimal digits, and returns `NaN` if there are none.
 fn parse_int(s: &str) -> f64 {
@@ -2695,6 +2749,32 @@ mod tests {
         // typeof an async function is function; its call returns a promise.
         assert_eq!(run("async function a() {} typeof a"), "function");
         assert_eq!(run("async function a() { return 1; } typeof a()"), "object");
+    }
+
+    #[test]
+    fn dates() {
+        // A fixed timestamp (2021-06-15T12:30:45.500Z = 1623760245500 ms).
+        let ts = "1623760245500";
+        assert_eq!(
+            run(&alloc::format!("new Date({ts}).getTime()")),
+            "1623760245500"
+        );
+        assert_eq!(run(&alloc::format!("new Date({ts}).getFullYear()")), "2021");
+        assert_eq!(run(&alloc::format!("new Date({ts}).getMonth()")), "5"); // June, 0-based
+        assert_eq!(run(&alloc::format!("new Date({ts}).getDate()")), "15");
+        assert_eq!(run(&alloc::format!("new Date({ts}).getHours()")), "12");
+        assert_eq!(run(&alloc::format!("new Date({ts}).getMinutes()")), "30");
+        assert_eq!(run(&alloc::format!("new Date({ts}).getSeconds()")), "45");
+        assert_eq!(run(&alloc::format!("new Date({ts}).getDay()")), "2"); // Tuesday
+        assert_eq!(
+            run(&alloc::format!("new Date({ts}).toISOString()")),
+            "2021-06-15T12:30:45.500Z"
+        );
+        // The epoch.
+        assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+        assert_eq!(run("new Date(0).getDay()"), "4"); // Thursday
+        // typeof a date is object.
+        assert_eq!(run("typeof new Date(0)"), "object");
     }
 
     #[test]

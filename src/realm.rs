@@ -202,6 +202,17 @@ impl Realm {
         self.heap.alloc(Cell::BoundNative { id, target })
     }
 
+    /// Allocates a `Date` from a millisecond timestamp.
+    pub fn new_date(&mut self, ms: f64) -> Handle {
+        self.heap.alloc(Cell::Date(ms))
+    }
+
+    /// The timestamp (ms) of the `Date` at `handle`, if it is one.
+    #[must_use]
+    pub fn date_at(&self, handle: Handle) -> Option<f64> {
+        self.heap.get(handle)?.as_date()
+    }
+
     /// Allocates a pending `Promise`.
     pub fn new_promise(&mut self) -> Handle {
         self.heap
@@ -422,6 +433,7 @@ impl Realm {
                 }
                 Some(Cell::BoundNative { .. }) => "function () { … }".into(),
                 Some(Cell::Promise(_)) => "[object Promise]".into(),
+                Some(Cell::Date(ms)) => date_to_iso(*ms),
                 None => "undefined".into(), // stale handle
             },
         }
@@ -705,6 +717,39 @@ impl Realm {
             _ => a.strict_equals(b),
         }
     }
+}
+
+/// The civil date `(year, month [1-12], day [1-31])` for a day count `z` since
+/// the Unix epoch — Howard Hinnant's `civil_from_days` algorithm (pure integer
+/// arithmetic, so `core`-clean).
+#[must_use]
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Renders a millisecond timestamp as an ISO-8601 UTC string.
+#[must_use]
+pub(crate) fn date_to_iso(ms: f64) -> alloc::string::String {
+    let total_ms = ms as i64;
+    let day = total_ms.div_euclid(86_400_000);
+    let tod = total_ms.rem_euclid(86_400_000); // [0, 86_400_000)
+    let (y, mo, d) = civil_from_days(day);
+    let (h, min, s, milli) = (
+        tod / 3_600_000,
+        (tod / 60_000) % 60,
+        (tod / 1000) % 60,
+        tod % 1000,
+    );
+    alloc::format!("{y:04}-{mo:02}-{d:02}T{h:02}:{min:02}:{s:02}.{milli:03}Z")
 }
 
 #[cfg(test)]
