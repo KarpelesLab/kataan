@@ -463,6 +463,18 @@ impl Compiler {
                 self.patch(jf);
                 Ok(None)
             }
+            Stmt::DoWhile { body, test, .. } => {
+                let top = self.ops.len();
+                self.stmt(body)?;
+                let cond = self.expr(test)?;
+                // Loop back to the top while the condition holds: jump if the
+                // *negated* condition is false (i.e. while the condition is true).
+                let not = self.alloc();
+                self.ops.push(Op::Not { dst: not, a: cond });
+                let jf = self.emit_jump_if_false(not);
+                self.patch_to(jf, top);
+                Ok(None)
+            }
             Stmt::For {
                 init,
                 test,
@@ -534,30 +546,7 @@ impl Compiler {
             } => {
                 let a = self.expr(left)?;
                 let b = self.expr(right)?;
-                let dst = self.alloc();
-                match op {
-                    BinaryOp::Add => self.ops.push(Op::AddValue { dst, a, b }),
-                    BinaryOp::Sub => self.ops.push(Op::Sub { dst, a, b }),
-                    BinaryOp::Mul => self.ops.push(Op::Mul { dst, a, b }),
-                    BinaryOp::Div => self.ops.push(Op::Div { dst, a, b }),
-                    BinaryOp::Lt => self.ops.push(Op::Lt { dst, a, b }),
-                    BinaryOp::Gt => self.ops.push(Op::Lt { dst, a: b, b: a }),
-                    BinaryOp::LtEq => {
-                        self.ops.push(Op::Lt { dst, a: b, b: a });
-                        self.ops.push(Op::Not { dst, a: dst });
-                    }
-                    BinaryOp::GtEq => {
-                        self.ops.push(Op::Lt { dst, a, b });
-                        self.ops.push(Op::Not { dst, a: dst });
-                    }
-                    BinaryOp::EqEqEq => self.ops.push(Op::StrictEq { dst, a, b }),
-                    BinaryOp::NotEqEq => {
-                        self.ops.push(Op::StrictEq { dst, a, b });
-                        self.ops.push(Op::Not { dst, a: dst });
-                    }
-                    _ => return Err(CompileError::Unsupported("binary operator")),
-                }
-                Ok(dst)
+                self.emit_binop(*op, a, b)
             }
             Expr::Logical {
                 op, left, right, ..
@@ -667,42 +656,83 @@ impl Compiler {
             Expr::Assign {
                 op, target, value, ..
             } => {
-                if !matches!(op, crate::ast::AssignOp::Assign) {
-                    return Err(CompileError::Unsupported("compound assignment"));
-                }
+                use crate::ast::AssignOp;
+                let compound = !matches!(op, AssignOp::Assign);
                 match &**target {
                     Expr::Ident(id) => {
-                        let v = self.expr(value)?;
                         let slot = self
                             .lookup(&id.name)
                             .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
-                        self.ops.push(Op::Move { dst: slot, src: v });
+                        let v = self.expr(value)?;
+                        let src = if compound {
+                            self.emit_binop(Self::compound_binop(*op)?, slot, v)?
+                        } else {
+                            v
+                        };
+                        self.ops.push(Op::Move { dst: slot, src });
                         Ok(slot)
                     }
-                    // `obj.k = v` / `arr[i] = v`.
+                    // `obj.k (op)= v` / `arr[i] (op)= v`.
                     Expr::Member {
                         object, property, ..
                     } => {
                         let obj = self.expr(object)?;
                         let v = self.expr(value)?;
+                        let src = if compound {
+                            let cur = self.member_read(obj, property)?;
+                            self.emit_binop(Self::compound_binop(*op)?, cur, v)?
+                        } else {
+                            v
+                        };
                         match property {
                             PropertyKey::Computed(e) => {
                                 let index = self.expr(e)?;
                                 self.ops.push(Op::SetElem {
                                     arr: obj,
                                     index,
-                                    src: v,
+                                    src,
                                 });
                             }
                             _ => {
                                 let key = static_key(property)?;
-                                self.ops.push(Op::SetProp { obj, key, src: v });
+                                self.ops.push(Op::SetProp { obj, key, src });
                             }
                         }
-                        Ok(v)
+                        Ok(src)
                     }
                     _ => Err(CompileError::Unsupported("assignment target")),
                 }
+            }
+            // `x++` / `++x` / `x--` / `--x` on a local variable.
+            Expr::Update {
+                op,
+                prefix,
+                argument,
+                ..
+            } => {
+                let Expr::Ident(id) = &**argument else {
+                    return Err(CompileError::Unsupported("update target"));
+                };
+                let slot = self
+                    .lookup(&id.name)
+                    .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                let one = self.constant(NanBox::number(1.0))?;
+                let bop = match op {
+                    crate::ast::UpdateOp::Inc => BinaryOp::Add,
+                    crate::ast::UpdateOp::Dec => BinaryOp::Sub,
+                };
+                // Keep the pre-update value for a postfix result.
+                let old = self.alloc();
+                self.ops.push(Op::Move {
+                    dst: old,
+                    src: slot,
+                });
+                let next = self.emit_binop(bop, slot, one)?;
+                self.ops.push(Op::Move {
+                    dst: slot,
+                    src: next,
+                });
+                Ok(if *prefix { slot } else { old })
             }
             _ => Err(CompileError::Unsupported("expression")),
         }
@@ -712,6 +742,46 @@ impl Compiler {
         let r = self.alloc();
         self.ops.push(Op::LoadConst { dst: r, value });
         Ok(r)
+    }
+
+    /// Emits the op(s) for `a <op> b` into a fresh register, returning it.
+    fn emit_binop(&mut self, op: BinaryOp, a: Reg, b: Reg) -> Result<Reg, CompileError> {
+        let dst = self.alloc();
+        match op {
+            BinaryOp::Add => self.ops.push(Op::AddValue { dst, a, b }),
+            BinaryOp::Sub => self.ops.push(Op::Sub { dst, a, b }),
+            BinaryOp::Mul => self.ops.push(Op::Mul { dst, a, b }),
+            BinaryOp::Div => self.ops.push(Op::Div { dst, a, b }),
+            BinaryOp::Lt => self.ops.push(Op::Lt { dst, a, b }),
+            BinaryOp::Gt => self.ops.push(Op::Lt { dst, a: b, b: a }),
+            BinaryOp::LtEq => {
+                self.ops.push(Op::Lt { dst, a: b, b: a });
+                self.ops.push(Op::Not { dst, a: dst });
+            }
+            BinaryOp::GtEq => {
+                self.ops.push(Op::Lt { dst, a, b });
+                self.ops.push(Op::Not { dst, a: dst });
+            }
+            BinaryOp::EqEqEq => self.ops.push(Op::StrictEq { dst, a, b }),
+            BinaryOp::NotEqEq => {
+                self.ops.push(Op::StrictEq { dst, a, b });
+                self.ops.push(Op::Not { dst, a: dst });
+            }
+            _ => return Err(CompileError::Unsupported("binary operator")),
+        }
+        Ok(dst)
+    }
+
+    /// The arithmetic operator underlying a compound assignment (`+=` → `+`).
+    fn compound_binop(op: crate::ast::AssignOp) -> Result<BinaryOp, CompileError> {
+        use crate::ast::AssignOp;
+        Ok(match op {
+            AssignOp::AddAssign => BinaryOp::Add,
+            AssignOp::SubAssign => BinaryOp::Sub,
+            AssignOp::MulAssign => BinaryOp::Mul,
+            AssignOp::DivAssign => BinaryOp::Div,
+            _ => return Err(CompileError::Unsupported("compound assignment operator")),
+        })
     }
 
     /// Compiles a member read `obj.key` / `obj[i]` (with `.length` mapped to the
@@ -755,6 +825,11 @@ impl Compiler {
     /// Backpatches the jump at `idx` to land at the current instruction.
     fn patch(&mut self, idx: usize) {
         let target = self.ops.len();
+        self.patch_to(idx, target);
+    }
+
+    /// Backpatches the jump at `idx` to land at `target`.
+    fn patch_to(&mut self, idx: usize, target: usize) {
         match &mut self.ops[idx] {
             Op::JumpIfFalse { target: t, .. } | Op::Jump { target: t } => *t = target,
             _ => unreachable!("patch a non-jump"),
@@ -821,6 +896,32 @@ mod tests {
             ),
             "55"
         );
+    }
+
+    #[test]
+    fn bytecode_compound_update_and_do_while() {
+        // Compound assignment on a local.
+        assert_eq!(bc("let x = 10; x += 5; x"), "15");
+        assert_eq!(bc("let x = 10; x -= 3; x *= 2; x"), "14");
+        // Compound assignment on a member.
+        assert_eq!(bc("let o = { n: 1 }; o.n += 9; o.n"), "10");
+        assert_eq!(bc("let a = [1, 2, 3]; a[1] *= 10; a[1]"), "20");
+        // Update operators (prefix / postfix).
+        assert_eq!(bc("let i = 5; i++; i"), "6");
+        assert_eq!(bc("let i = 5; let a = i++; a + ',' + i"), "5,6");
+        assert_eq!(bc("let i = 5; let a = ++i; a + ',' + i"), "6,6");
+        assert_eq!(bc("let i = 5; --i; i"), "4");
+        // A for loop using `++` in its update — a common shape, in bytecode.
+        assert_eq!(
+            bc("let s = 0; for (let i = 0; i < 5; i++) { s += i; } s"),
+            "10"
+        );
+        // do/while runs the body at least once.
+        assert_eq!(
+            bc("let n = 0; let s = 0; do { s += n; n++; } while (n < 4); s"),
+            "6"
+        );
+        assert_eq!(bc("let r = 0; do { r++; } while (false); r"), "1");
     }
 
     #[test]
