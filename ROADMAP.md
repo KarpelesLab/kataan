@@ -493,10 +493,19 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   layer ahead of the migration: NaN-boxed values (`src/nanbox.rs`), hidden
   classes with a transition tree (`src/shape.rs`), a generational handle table
   (`src/heap.rs`), the shape+slots `Object` (`src/object.rs`), and a
-  mark-and-sweep tracing GC that reclaims cycles (`src/gc.rs`). **Next:** inline
-  caches over shapes, then migrating the VM's values/objects onto this
-  representation (NaN-boxed registers, heap-allocated objects under the GC) — the
-  point at which the first broad Test262 numbers land.
+  mark-and-sweep tracing GC that reclaims cycles (`src/gc.rs`). Inline caches
+  over shapes (`src/ic.rs`), interned-key atoms (`src/atom.rs`), and rope string
+  values (`src/rope.rs`) are in; the heap holds the core reference types — object
+  / string / array — as `cell::Cell`, all traced uniformly by the GC. A `Realm`
+  (`src/realm.rs`) bundles heap + root shape + atoms behind the allocate / get·set
+  property / collect API, and now carries the **value semantics** a VM runs over
+  the new representation: `+` (numeric or rope concat), `-`/`*`/`/`/`%`/`**`,
+  unary `-`, `<`/`<=`/`>`/`>=`, `===`/`==`, and `ToNumber`/`ToString`/`ToBoolean`.
+  A minimal register VM (`src/nbvm.rs`) executes arithmetic, control flow,
+  objects, strings, and equality end-to-end on this model. **Next:** migrating
+  the *production* bytecode VM's values/objects onto the `Cell`/`Realm`/GC
+  representation (calls, closures, exceptions, the stdlib) — the point at which
+  the first broad Test262 numbers land.
 
 - **Phase D — Bytecode VM** 🚧 **started**
   AST→register-bytecode compiler, the interpreter loop, inline caches,
