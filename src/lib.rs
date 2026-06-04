@@ -42,6 +42,11 @@ pub mod lexer;
 pub mod nanbox;
 pub mod parser;
 
+/// The managed heap (generational handle table) that NaN-boxed handles index
+/// into — groundwork for the object model & GC. Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod heap;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
