@@ -2286,6 +2286,28 @@ impl<'a> Interp<'a> {
                         .collect();
                     return Ok(Some(NanBox::handle(self.realm.new_array(keys).to_raw())));
                 }
+                "values" => {
+                    // A Set yields its elements; a Map yields its values.
+                    let is_set = self.realm.collection_is_set(handle) == Some(true);
+                    let vals: Vec<NanBox> = self
+                        .realm
+                        .collection_entries(handle)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, v)| if is_set { k } else { v })
+                        .collect();
+                    return Ok(Some(NanBox::handle(self.realm.new_array(vals).to_raw())));
+                }
+                "entries" => {
+                    let pairs = self.realm.collection_entries(handle).unwrap_or_default();
+                    let arr: Vec<NanBox> = pairs
+                        .into_iter()
+                        .map(|(k, v)| {
+                            NanBox::handle(self.realm.new_array(alloc::vec![k, v]).to_raw())
+                        })
+                        .collect();
+                    return Ok(Some(NanBox::handle(self.realm.new_array(arr).to_raw())));
+                }
                 _ => {
                     let _ = size;
                 }
@@ -4730,6 +4752,23 @@ mod tests {
             run("class C { #s = 1; constructor(){ this.p = 2; } } Object.keys(new C()).join(',')"),
             "p"
         );
+    }
+
+    #[test]
+    fn collection_iterators() {
+        // Map keys/values/entries.
+        assert_eq!(
+            run("[...new Map([['a',1],['b',2]]).keys()].join(',')"),
+            "a,b"
+        );
+        assert_eq!(
+            run("[...new Map([['a',1],['b',2]]).values()].join(',')"),
+            "1,2"
+        );
+        assert_eq!(run("new Map([['a',1],['b',2]]).entries().length"), "2");
+        // Set values/keys are its elements.
+        assert_eq!(run("[...new Set([1,2,3,2]).values()].join(',')"), "1,2,3");
+        assert_eq!(run("[...new Set([5,6]).keys()].join(',')"), "5,6");
     }
 
     #[test]
