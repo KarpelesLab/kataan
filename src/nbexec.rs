@@ -74,6 +74,8 @@ struct FnDef<'a> {
     params: &'a [Param],
     body: Body<'a>,
     is_async: bool,
+    /// The class this is a method of (for `super.method()`), if any.
+    home_class: Option<u32>,
 }
 
 /// A tree-walking interpreter over the performance object model.
@@ -87,10 +89,14 @@ pub struct Interp<'a> {
     classes: Vec<&'a Class>,
     /// Per-class static members (`Class.foo`), parallel to `classes`.
     class_statics: Vec<alloc::collections::BTreeMap<String, NanBox>>,
+    /// Per-class captured definition scope, parallel to `classes`.
+    class_envs: Vec<Scope>,
     /// The current `this` binding (method/constructor receiver).
     this_val: NanBox,
     /// The superclass to invoke for `super(...)` inside the running constructor.
     pending_super: Option<(u32, Scope)>,
+    /// The class of the currently-running method (for `super.method()`).
+    current_home: Option<u32>,
     /// The promise-reaction microtask queue, drained after the script.
     microtasks: Vec<Job>,
     /// Captured `console.log` output (a line per call).
@@ -154,8 +160,10 @@ impl<'a> Interp<'a> {
             functions: Vec::new(),
             classes: Vec::new(),
             class_statics: Vec::new(),
+            class_envs: Vec::new(),
             this_val: NanBox::undefined(),
             pending_super: None,
+            current_home: None,
             microtasks: Vec::new(),
             output: String::new(),
         };
@@ -662,11 +670,22 @@ impl<'a> Interp<'a> {
     /// Registers a function definition and allocates a closure capturing the
     /// current scope.
     fn make_function(&mut self, params: &'a [Param], body: Body<'a>, is_async: bool) -> NanBox {
+        self.make_method(params, body, is_async, None)
+    }
+
+    fn make_method(
+        &mut self,
+        params: &'a [Param],
+        body: Body<'a>,
+        is_async: bool,
+        home_class: Option<u32>,
+    ) -> NanBox {
         let func_id = self.functions.len() as u32;
         self.functions.push(FnDef {
             params,
             body,
             is_async,
+            home_class,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
         NanBox::handle(handle.to_raw())
@@ -872,6 +891,7 @@ impl<'a> Interp<'a> {
         let call_scope = captured.child();
         let saved = core::mem::replace(&mut self.current, call_scope);
         let saved_this = core::mem::replace(&mut self.this_val, this_val);
+        let saved_home = core::mem::replace(&mut self.current_home, def.home_class);
         let result = (|| {
             for (i, param) in def.params.iter().enumerate() {
                 let value = if param.rest {
@@ -892,6 +912,7 @@ impl<'a> Interp<'a> {
         })();
         self.current = saved;
         self.this_val = saved_this;
+        self.current_home = saved_home;
         // An `async` function returns a promise of its result (rejected on throw).
         if def.is_async {
             let promise = self.realm.new_promise();
@@ -1021,6 +1042,7 @@ impl<'a> Interp<'a> {
             }
         }
         self.class_statics.push(statics);
+        self.class_envs.push(self.current.clone());
         let handle = self.realm.new_class(class_id, self.current.clone());
         NanBox::handle(handle.to_raw())
     }
@@ -1077,7 +1099,12 @@ impl<'a> Interp<'a> {
                 }
                 let key = static_key(&m.key)?;
                 let saved = core::mem::replace(&mut self.current, cenv.clone());
-                let f = self.make_function(&m.value.params, Body::Block(&m.value.body), false);
+                let f = self.make_method(
+                    &m.value.params,
+                    Body::Block(&m.value.body),
+                    false,
+                    Some(*cid),
+                );
                 self.current = saved;
                 match m.kind {
                     MethodKind::Method => {
@@ -1096,6 +1123,7 @@ impl<'a> Interp<'a> {
             }
         }
 
+        self.realm.set_class_tag(instance, class_id);
         let saved_this = core::mem::replace(&mut self.this_val, this_val);
         let result = self.run_constructor(class_id, env, instance, args);
         self.this_val = saved_this;
@@ -1174,7 +1202,10 @@ impl<'a> Interp<'a> {
         for a in arguments {
             match a {
                 Argument::Item(e) => args.push(self.eval(e)?),
-                Argument::Spread(_) => return Err(ExecError::Unsupported("call spread")),
+                Argument::Spread(e) => {
+                    let v = self.eval(e)?;
+                    args.extend(self.iterate_values(v)?);
+                }
             }
         }
         Ok(args)
@@ -1954,6 +1985,23 @@ impl<'a> Interp<'a> {
         Ok(Flow::Normal(NanBox::undefined()))
     }
 
+    /// Reads the current value of an assignment target (identifier or member).
+    fn read_target(&mut self, target: &'a Expr) -> Result<NanBox, ExecError> {
+        match target {
+            Expr::Ident(id) => Ok(self.current.get(&id.name).unwrap_or(NanBox::undefined())),
+            Expr::Member {
+                object, property, ..
+            } => {
+                let obj = self.eval(object)?;
+                match obj.as_handle() {
+                    Some(raw) => self.member(Handle::from_raw(raw), property),
+                    None => Ok(NanBox::undefined()),
+                }
+            }
+            _ => Err(ExecError::Unsupported("assignment target")),
+        }
+    }
+
     /// Assigns `value` to an existing target (an identifier or member).
     fn assign_to(&mut self, target: &'a Expr, value: NanBox) -> Result<(), ExecError> {
         match target {
@@ -2074,14 +2122,40 @@ impl<'a> Interp<'a> {
                 "undefined" => Ok(NanBox::undefined()),
                 "NaN" => Ok(NanBox::number(f64::NAN)),
                 "Infinity" => Ok(NanBox::number(f64::INFINITY)),
-                name => self
-                    .current
-                    .get(name)
-                    .ok_or_else(|| ExecError::NotDefined(String::from(name))),
+                name => match self.current.get(name) {
+                    Some(v) => Ok(v),
+                    // An unresolved reference throws a catchable ReferenceError.
+                    None => {
+                        let msg = self.new_str(&alloc::format!("{name} is not defined"));
+                        Err(ExecError::Throw(msg))
+                    }
+                },
             },
             Expr::Regex { pattern, flags, .. } => Ok(NanBox::handle(
                 self.realm.new_regexp(pattern, flags).to_raw(),
             )),
+            // A template literal: interleave cooked quasis with interpolations.
+            Expr::Template(t) => {
+                let mut out = String::new();
+                for (i, quasi) in t.quasis.iter().enumerate() {
+                    if let Some(cooked) = &quasi.cooked {
+                        out.push_str(cooked);
+                    }
+                    if let Some(e) = t.expressions.get(i) {
+                        let v = self.eval(e)?;
+                        out.push_str(&self.realm.to_display_string(v));
+                    }
+                }
+                Ok(self.new_str(&out))
+            }
+            // The comma operator: evaluate all, yield the last.
+            Expr::Sequence { expressions, .. } => {
+                let mut last = NanBox::undefined();
+                for e in expressions {
+                    last = self.eval(e)?;
+                }
+                Ok(last)
+            }
             Expr::This(_) => Ok(self.this_val),
             Expr::Await { argument, .. } => {
                 let v = self.eval(argument)?;
@@ -2091,8 +2165,56 @@ impl<'a> Interp<'a> {
             Expr::Arrow(arrow) => Ok(self.eval_arrow(arrow)),
             Expr::Class(class) => Ok(self.make_class(class)),
             Expr::Unary { op, argument, .. } => {
+                // `delete obj.x` removes a property; `typeof undefinedVar` must
+                // not throw — both inspect the operand rather than its value.
+                match op {
+                    UnaryOp::Delete => {
+                        if let Expr::Member {
+                            object, property, ..
+                        } = &**argument
+                        {
+                            let obj = self.eval(object)?;
+                            if let Some(raw) = obj.as_handle() {
+                                let h = Handle::from_raw(raw);
+                                if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property {
+                                    self.realm.delete_property(h, s);
+                                } else if let PropertyKey::Computed(e) = property {
+                                    let k = self.eval(e)?;
+                                    let name = self.realm.to_display_string(k);
+                                    self.realm.delete_property(h, &name);
+                                }
+                            }
+                        }
+                        return Ok(NanBox::boolean(true));
+                    }
+                    UnaryOp::Typeof => {
+                        if let Expr::Ident(id) = &**argument
+                            && self.current.get(&id.name).is_none()
+                            && !matches!(&*id.name, "undefined" | "NaN" | "Infinity")
+                        {
+                            return Ok(self.new_str("undefined"));
+                        }
+                    }
+                    _ => {}
+                }
                 let v = self.eval(argument)?;
                 self.unary(*op, v)
+            }
+            // `x++` / `++x` / `x--` / `--x` on an identifier or member.
+            Expr::Update {
+                op,
+                prefix,
+                argument,
+                ..
+            } => {
+                let current = self.read_target(argument)?;
+                let old = self.realm.to_number(current);
+                let next = match op {
+                    crate::ast::UpdateOp::Inc => old + 1.0,
+                    crate::ast::UpdateOp::Dec => old - 1.0,
+                };
+                self.assign_to(argument, NanBox::number(next))?;
+                Ok(NanBox::number(if *prefix { next } else { old }))
             }
             Expr::Binary {
                 op, left, right, ..
@@ -2146,6 +2268,20 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(NanBox::undefined());
                 }
+                // `super.method(args)` — invoke the base-class method with the
+                // current `this`.
+                if let Expr::Member {
+                    object, property, ..
+                } = &**callee
+                    && matches!(&**object, Expr::Super(_))
+                {
+                    let (PropertyKey::Ident(name) | PropertyKey::Str(name)) = property else {
+                        return Err(ExecError::Unsupported("computed super member"));
+                    };
+                    let args = self.eval_args(arguments)?;
+                    let f = self.resolve_super_method(name)?;
+                    return self.call_with_this(f, self.this_val, &args);
+                }
                 // A `recv.method(args)` call: try a built-in method on the
                 // receiver before falling back to a property-valued function.
                 if let Expr::Member {
@@ -2190,8 +2326,9 @@ impl<'a> Interp<'a> {
                     match el {
                         ArrayElement::Hole => items.push(NanBox::undefined()),
                         ArrayElement::Item(e) => items.push(self.eval(e)?),
-                        ArrayElement::Spread(_) => {
-                            return Err(ExecError::Unsupported("array spread"));
+                        ArrayElement::Spread(e) => {
+                            let v = self.eval(e)?;
+                            items.extend(self.iterate_values(v)?);
                         }
                     }
                 }
@@ -2201,12 +2338,44 @@ impl<'a> Interp<'a> {
             Expr::Object { members, .. } => {
                 let handle = self.realm.new_object();
                 for m in members {
-                    let ObjectMember::Property { key, value, .. } = m else {
-                        return Err(ExecError::Unsupported("object member"));
-                    };
-                    let k = static_key(key)?;
-                    let v = self.eval(value)?;
-                    self.realm.set_property(handle, &k, v);
+                    match m {
+                        ObjectMember::Property { key, value, .. } => {
+                            let k = static_key(key)?;
+                            let v = self.eval(value)?;
+                            self.realm.set_property(handle, &k, v);
+                        }
+                        // `{ ...src }` — copy own enumerable properties.
+                        ObjectMember::Spread { value, .. } => {
+                            let src = self.eval(value)?;
+                            if let Some(sh) = src.as_handle().map(Handle::from_raw) {
+                                for key in self.realm.object_keys(sh).unwrap_or_default() {
+                                    let pv = self
+                                        .realm
+                                        .get_property(sh, &key)
+                                        .unwrap_or(NanBox::undefined());
+                                    self.realm.set_property(handle, &key, pv);
+                                }
+                            }
+                        }
+                        // `{ get x() {} }` / `{ set x(v) {} }`.
+                        ObjectMember::Accessor {
+                            key,
+                            is_getter,
+                            value,
+                            ..
+                        } => {
+                            let k = static_key(key)?;
+                            let f =
+                                self.make_function(&value.params, Body::Block(&value.body), false);
+                            if *is_getter {
+                                self.realm
+                                    .define_accessor(handle, &k, f, NanBox::undefined());
+                            } else {
+                                self.realm
+                                    .define_accessor(handle, &k, NanBox::undefined(), f);
+                            }
+                        }
+                    }
                 }
                 Ok(NanBox::handle(handle.to_raw()))
             }
@@ -2314,6 +2483,25 @@ impl<'a> Interp<'a> {
         target: &'a Expr,
         value: &'a Expr,
     ) -> Result<NanBox, ExecError> {
+        // Logical assignment (`&&=`/`||=`/`??=`) short-circuits: the right side
+        // is evaluated and stored only when the current value warrants it.
+        if matches!(
+            op,
+            AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign
+        ) {
+            let current = self.read_target(target)?;
+            let assign = match op {
+                AssignOp::AndAssign => current.to_boolean(),
+                AssignOp::OrAssign => !current.to_boolean(),
+                _ => matches!(current.unpack(), Unpacked::Undefined | Unpacked::Null),
+            };
+            if !assign {
+                return Ok(current);
+            }
+            let rhs = self.eval(value)?;
+            self.assign_to(target, rhs)?;
+            return Ok(rhs);
+        }
         let rhs = self.eval(value)?;
         match target {
             Expr::Ident(id) => {
@@ -2448,10 +2636,80 @@ impl<'a> Interp<'a> {
             | BinaryOp::BitAnd
             | BinaryOp::BitOr
             | BinaryOp::BitXor => return Err(ExecError::Unsupported("** / bitwise need std")),
-            BinaryOp::In | BinaryOp::Instanceof => {
-                return Err(ExecError::Unsupported("in / instanceof"));
+            BinaryOp::In => {
+                let key = self.realm.to_display_string(a);
+                let present = b
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| self.realm.has_own(h, &key) || self.realm.is_array(h));
+                NanBox::boolean(present)
             }
+            BinaryOp::Instanceof => NanBox::boolean(self.instance_of(a, b)?),
         })
+    }
+
+    /// Finds `name` as a method in the superclass chain of the currently-running
+    /// method's home class, returning a callable bound to the base definition.
+    fn resolve_super_method(&mut self, name: &str) -> Result<NanBox, ExecError> {
+        let home = self
+            .current_home
+            .ok_or(ExecError::Unsupported("super outside a method"))?;
+        let mut cur = self.resolve_super(
+            self.classes[home as usize],
+            &self.class_envs[home as usize].clone(),
+        )?;
+        while let Some((pid, penv)) = cur {
+            let class = self.classes[pid as usize];
+            for member in &class.body {
+                if let ClassMember::Method(m) = member
+                    && !m.is_static
+                    && m.kind == MethodKind::Method
+                    && static_key(&m.key).ok().as_deref() == Some(name)
+                {
+                    let saved = core::mem::replace(&mut self.current, penv.clone());
+                    let f = self.make_method(
+                        &m.value.params,
+                        Body::Block(&m.value.body),
+                        false,
+                        Some(pid),
+                    );
+                    self.current = saved;
+                    return Ok(f);
+                }
+            }
+            cur = self.resolve_super(class, &penv)?;
+        }
+        Err(ExecError::Throw(
+            self.new_str(&alloc::format!("super method {name} not found")),
+        ))
+    }
+
+    /// `obj instanceof Ctor`: true when `obj` was constructed from `Ctor`'s
+    /// class or one of its subclasses (via the instance's class tag and the
+    /// `extends` chain).
+    fn instance_of(&mut self, obj: NanBox, ctor: NanBox) -> Result<bool, ExecError> {
+        let (Some(oh), Some(ch)) = (
+            obj.as_handle().map(Handle::from_raw),
+            ctor.as_handle().map(Handle::from_raw),
+        ) else {
+            return Ok(false);
+        };
+        let (Some(tag), Some((target_id, _))) = (self.realm.class_tag(oh), self.realm.class_at(ch))
+        else {
+            return Ok(false);
+        };
+        // Walk the instance's class chain (its class, then each `extends`).
+        let mut cur = Some(tag);
+        while let Some(cid) = cur {
+            if cid == target_id {
+                return Ok(true);
+            }
+            let class = self.classes[cid as usize];
+            // Resolve the superclass in the class's own captured scope.
+            let env = self.class_envs[cid as usize].clone();
+            cur = self.resolve_super(class, &env)?.map(|(pid, _)| pid);
+        }
+        Ok(false)
     }
 }
 

@@ -351,6 +351,39 @@ impl Realm {
         self.heap.get(handle)?.as_object()?.get(key)
     }
 
+    /// Tags the object at `handle` with the class it was constructed from.
+    pub fn set_class_tag(&mut self, handle: Handle, class_id: u32) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.set_class_tag(class_id);
+        }
+    }
+
+    /// The class tag of the object at `handle`, if any.
+    #[must_use]
+    pub fn class_tag(&self, handle: Handle) -> Option<u32> {
+        self.heap.get(handle)?.as_object()?.class_tag()
+    }
+
+    /// Deletes own property `key` from the object at `handle`; returns whether
+    /// anything was removed.
+    pub fn delete_property(&mut self, handle: Handle, key: &str) -> bool {
+        let root = Rc::clone(&self.root_shape);
+        match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            Some(o) => o.delete(root, key),
+            None => false,
+        }
+    }
+
+    /// Whether the object at `handle` has an own property `key` (including
+    /// accessors) — the `in` operator.
+    #[must_use]
+    pub fn has_own(&self, handle: Handle, key: &str) -> bool {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_object)
+            .is_some_and(|o| o.contains(key) || o.accessor(key).is_some())
+    }
+
     /// Defines an accessor (getter/setter) property on the object at `handle`.
     pub fn define_accessor(&mut self, handle: Handle, key: &str, getter: NanBox, setter: NanBox) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {

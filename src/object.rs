@@ -30,6 +30,8 @@ pub struct Object {
     /// Accessor properties: `(name, getter, setter)`, both held as value
     /// handles (`undefined` when absent). Kept out of the shape's slot layout.
     accessors: Vec<(alloc::boxed::Box<str>, NanBox, NanBox)>,
+    /// The class this object was instantiated from (for `instanceof`), if any.
+    class_tag: Option<u32>,
 }
 
 impl Object {
@@ -42,7 +44,19 @@ impl Object {
             shape: root,
             slots: Vec::new(),
             accessors: Vec::new(),
+            class_tag: None,
         }
+    }
+
+    /// Tags this object with the class it was constructed from.
+    pub fn set_class_tag(&mut self, class_id: u32) {
+        self.class_tag = Some(class_id);
+    }
+
+    /// The class this object was constructed from, if any.
+    #[must_use]
+    pub fn class_tag(&self) -> Option<u32> {
+        self.class_tag
     }
 
     /// Defines an accessor property `name` with `getter`/`setter` (either may be
@@ -120,6 +134,30 @@ impl Object {
     #[must_use]
     pub fn keys(&self) -> Vec<&str> {
         self.shape.keys()
+    }
+
+    /// Deletes own property `key`, rebuilding the shape/slots from `root` without
+    /// it (also drops a same-named accessor). Returns whether anything was
+    /// removed.
+    pub fn delete(&mut self, root: Rc<Shape>, key: &str) -> bool {
+        let had_accessor = self.accessors.iter().any(|(k, _, _)| k.as_ref() == key);
+        self.accessors.retain(|(k, _, _)| k.as_ref() != key);
+        if !self.shape.contains(key) {
+            return had_accessor;
+        }
+        let kept: Vec<(alloc::string::String, NanBox)> = self
+            .shape
+            .keys()
+            .into_iter()
+            .filter(|k| *k != key)
+            .map(|k| (alloc::string::String::from(k), self.get(k).unwrap()))
+            .collect();
+        self.shape = root;
+        self.slots.clear();
+        for (k, v) in kept {
+            self.set(&k, v);
+        }
+        true
     }
 
     /// Calls `visit` for every heap [`Handle`](crate::heap::Handle) this object
