@@ -975,6 +975,16 @@ fn run_frame(
                                 .unwrap_or(NanBox::undefined());
                             ctx.realm.set_property(target, &k, v);
                         }
+                        // Accessor (getter) properties are enumerable too.
+                        let recv = regs[*src as usize];
+                        for k in ctx.realm.object_accessor_keys(sh) {
+                            if let Some((getter, _)) = ctx.realm.accessor(sh, &k)
+                                && getter.as_handle().is_some()
+                            {
+                                let v = call_closure(ctx, funcs, getter, &[], recv)?;
+                                ctx.realm.set_property(target, &k, v);
+                            }
+                        }
                     }
                 }
             }

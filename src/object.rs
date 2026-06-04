@@ -102,6 +102,12 @@ impl Object {
         }
     }
 
+    /// The names of this object's accessor (getter/setter) properties.
+    #[must_use]
+    pub fn accessor_keys(&self) -> Vec<&str> {
+        self.accessors.iter().map(|(k, _, _)| k.as_ref()).collect()
+    }
+
     /// The `(getter, setter)` of accessor `name`, if defined.
     #[must_use]
     pub fn accessor(&self, name: &str) -> Option<(NanBox, NanBox)> {

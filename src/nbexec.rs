@@ -4200,11 +4200,12 @@ impl<'a> Interp<'a> {
                         ObjectMember::Spread { value, .. } => {
                             let src = self.eval(value)?;
                             if let Some(sh) = src.as_handle().map(Handle::from_raw) {
-                                for key in self.realm.object_keys(sh).unwrap_or_default() {
-                                    let pv = self
-                                        .realm
-                                        .get_property(sh, &key)
-                                        .unwrap_or(NanBox::undefined());
+                                let mut keys = self.realm.object_keys(sh).unwrap_or_default();
+                                // Accessor (getter) properties are enumerable too.
+                                keys.extend(self.realm.object_accessor_keys(sh));
+                                for key in keys {
+                                    // `read_member` invokes a getter where present.
+                                    let pv = self.read_member(sh, &key)?;
                                     self.realm.set_property(handle, &key, pv);
                                 }
                             }
@@ -6087,6 +6088,21 @@ mod tests {
         assert_eq!(
             run("let k='go'; class C { [k](){ return 42; } } new C().go()"),
             "42"
+        );
+    }
+
+    #[test]
+    fn object_spread_invokes_getters() {
+        assert_eq!(
+            run(
+                "let s={a:1, get b(){ return this.a + 1; }}; let c={...s, d:3}; c.a + ',' + c.b + ',' + c.d"
+            ),
+            "1,2,3"
+        );
+        // Later keys win; both sources merged.
+        assert_eq!(
+            run("JSON.stringify({...{x:1},...{y:2},x:9})"),
+            "{\"x\":9,\"y\":2}"
         );
     }
 
