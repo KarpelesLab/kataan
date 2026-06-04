@@ -13,15 +13,19 @@
 
 mod expr;
 mod function;
+mod pattern;
 mod stmt;
 
 pub use expr::{
     Argument, ArrayElement, Expr, ObjectMember, PropertyKey, TemplateElement, TemplateLiteral,
 };
 pub use function::{Arrow, ArrowBody, Function, Param};
+pub use pattern::{
+    ArrayPattern, ArrayPatternElement, BindingTarget, ObjectPattern, ObjectPatternProp,
+};
 pub use stmt::{
-    BindingTarget, CatchClause, ForInit, ForLeft, Program, SourceType, Stmt, SwitchCase, VarDecl,
-    VarDeclKind, VarDeclarator,
+    CatchClause, ForInit, ForLeft, Program, SourceType, Stmt, SwitchCase, VarDecl, VarDeclKind,
+    VarDeclarator,
 };
 
 use crate::common::Span;

@@ -2,10 +2,11 @@
 //! Insertion. These are methods on [`Parser`](super::Parser); the expression
 //! grammar lives in the parent module.
 
-use super::Parser;
+use super::{Parser, cook};
 use crate::ast::{
-    BindingTarget, CatchClause, Expr, ForInit, ForLeft, Ident, Program, SourceType, Stmt,
-    SwitchCase, VarDecl, VarDeclKind, VarDeclarator,
+    ArrayPattern, ArrayPatternElement, BindingTarget, CatchClause, Expr, ForInit, ForLeft, Ident,
+    ObjectPattern, ObjectPatternProp, Program, PropertyKey, SourceType, Stmt, SwitchCase, VarDecl,
+    VarDeclKind, VarDeclarator,
 };
 use crate::common::Span;
 use crate::error::Result;
@@ -196,7 +197,8 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// A binding name. Array/object destructuring patterns are deferred.
+    /// A binding target: an identifier or an array/object destructuring
+    /// pattern.
     pub(super) fn parse_binding_target(&mut self) -> Result<BindingTarget> {
         let tok = self.peek_tok();
         match tok.kind {
@@ -211,10 +213,156 @@ impl<'src> Parser<'src> {
                 self.bump();
                 Ok(BindingTarget::Ident(Ident::new(kw.as_str(), tok.span)))
             }
-            TokenKind::LBracket | TokenKind::LBrace => {
-                Err(self.err("destructuring patterns are added in a later increment"))
-            }
+            TokenKind::LBracket => self.parse_array_pattern(),
+            TokenKind::LBrace => self.parse_object_pattern(),
             _ => Err(self.err(format!("expected a binding name, found {:?}", tok.kind))),
+        }
+    }
+
+    /// An array destructuring pattern: `[a, , b = 1, ...rest]`.
+    fn parse_array_pattern(&mut self) -> Result<BindingTarget> {
+        let start = self.expect(TokenKind::LBracket)?.span;
+        let mut elements = Vec::new();
+        while !self.at(TokenKind::RBracket) {
+            if self.at(TokenKind::Comma) {
+                self.bump();
+                elements.push(ArrayPatternElement::Hole);
+                continue;
+            }
+            if self.at(TokenKind::DotDotDot) {
+                let rest_start = self.bump().span;
+                let target = self.parse_binding_target()?;
+                elements.push(ArrayPatternElement::Rest {
+                    span: rest_start.to(self.prev_span()),
+                    target,
+                });
+                break; // a rest element must be last
+            }
+            let el_start = self.cur_span();
+            let target = self.parse_binding_target()?;
+            let default = self.parse_optional_default()?;
+            elements.push(ArrayPatternElement::Item {
+                target,
+                default,
+                span: el_start.to(self.prev_span()),
+            });
+            if !self.at(TokenKind::RBracket) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        let end = self.expect(TokenKind::RBracket)?.span;
+        Ok(BindingTarget::Array(ArrayPattern {
+            elements,
+            span: start.to(end),
+        }))
+    }
+
+    /// An object destructuring pattern: `{ a, b: c, d = 1, [k]: e, ...rest }`.
+    fn parse_object_pattern(&mut self) -> Result<BindingTarget> {
+        let start = self.expect(TokenKind::LBrace)?.span;
+        let mut properties = Vec::new();
+        let mut rest = None;
+        while !self.at(TokenKind::RBrace) {
+            if self.at(TokenKind::DotDotDot) {
+                self.bump();
+                rest = Some(Box::new(self.parse_binding_target()?));
+                break; // a rest element must be last
+            }
+            properties.push(self.parse_object_pattern_prop()?);
+            if !self.at(TokenKind::RBrace) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        let end = self.expect(TokenKind::RBrace)?.span;
+        Ok(BindingTarget::Object(ObjectPattern {
+            properties,
+            rest,
+            span: start.to(end),
+        }))
+    }
+
+    fn parse_object_pattern_prop(&mut self) -> Result<ObjectPatternProp> {
+        let start = self.cur_span();
+
+        // Computed key `[expr]: target`.
+        if self.at(TokenKind::LBracket) {
+            self.bump();
+            let key_expr = self.without_no_in(Self::parse_assignment)?;
+            self.expect(TokenKind::RBracket)?;
+            self.expect(TokenKind::Colon)?;
+            let value = self.parse_binding_target()?;
+            let default = self.parse_optional_default()?;
+            return Ok(ObjectPatternProp {
+                key: PropertyKey::Computed(Box::new(key_expr)),
+                value,
+                default,
+                shorthand: false,
+                span: start.to(self.prev_span()),
+            });
+        }
+
+        let tok = self.peek_tok();
+        // String/number literal key — always `key: target`.
+        if matches!(tok.kind, TokenKind::String | TokenKind::Number) {
+            self.bump();
+            let key = if tok.kind == TokenKind::String {
+                PropertyKey::Str(cook::string(tok.text(self.source), tok.span)?.into())
+            } else {
+                PropertyKey::Number(cook::number(tok.text(self.source)))
+            };
+            self.expect(TokenKind::Colon)?;
+            let value = self.parse_binding_target()?;
+            let default = self.parse_optional_default()?;
+            return Ok(ObjectPatternProp {
+                key,
+                value,
+                default,
+                shorthand: false,
+                span: start.to(self.prev_span()),
+            });
+        }
+
+        // Identifier-name key: `name`, `name: target`, with optional default.
+        let (name, can_shorthand): (Box<str>, bool) = match tok.kind {
+            TokenKind::Identifier => (tok.text(self.source).into(), true),
+            TokenKind::Keyword(kw) if kw.is_contextual() => (kw.as_str().into(), true),
+            TokenKind::Keyword(kw) => (kw.as_str().into(), false),
+            _ => return Err(self.err(format!("expected a property key, found {:?}", tok.kind))),
+        };
+        self.bump();
+
+        if self.eat(TokenKind::Colon) {
+            let value = self.parse_binding_target()?;
+            let default = self.parse_optional_default()?;
+            return Ok(ObjectPatternProp {
+                key: PropertyKey::Ident(name),
+                value,
+                default,
+                shorthand: false,
+                span: start.to(self.prev_span()),
+            });
+        }
+
+        if !can_shorthand {
+            return Err(self.err_at(tok.span, "reserved word cannot be a shorthand binding"));
+        }
+        let value = BindingTarget::Ident(Ident::new(name.clone(), tok.span));
+        let default = self.parse_optional_default()?;
+        Ok(ObjectPatternProp {
+            key: PropertyKey::Ident(name),
+            value,
+            default,
+            shorthand: true,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// Parses an optional `= default` initializer used in patterns.
+    fn parse_optional_default(&mut self) -> Result<Option<Expr>> {
+        if self.eat(TokenKind::Eq) {
+            Ok(Some(self.parse_assignment()?))
+        } else {
+            Ok(None)
         }
     }
 

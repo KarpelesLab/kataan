@@ -6,11 +6,60 @@
 
 use super::Parser;
 use crate::ast::{
-    Argument, ArrayElement, ArrowBody, BindingTarget, Expr, ForInit, ForLeft, Function,
-    ObjectMember, Param, Program, PropertyKey, Stmt, TemplateLiteral, VarDeclarator,
+    Argument, ArrayElement, ArrayPatternElement, ArrowBody, BindingTarget, Expr, ForInit, ForLeft,
+    Function, ObjectMember, Param, Program, PropertyKey, Stmt, TemplateLiteral, VarDeclarator,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
+
+/// Renders a binding target (identifier or destructuring pattern).
+fn sexpr_target(t: &BindingTarget) -> String {
+    use alloc::format;
+    match t {
+        BindingTarget::Ident(id) => id.name.clone().into_string(),
+        BindingTarget::Array(p) => {
+            let parts: Vec<String> = p
+                .elements
+                .iter()
+                .map(|el| match el {
+                    ArrayPatternElement::Hole => "hole".into(),
+                    ArrayPatternElement::Rest { target, .. } => {
+                        format!("...{}", sexpr_target(target))
+                    }
+                    ArrayPatternElement::Item {
+                        target, default, ..
+                    } => match default {
+                        Some(d) => format!("{}={}", sexpr_target(target), sexpr(d)),
+                        None => sexpr_target(target),
+                    },
+                })
+                .collect();
+            format!("[{}]", parts.join(" "))
+        }
+        BindingTarget::Object(p) => {
+            let mut parts: Vec<String> = p
+                .properties
+                .iter()
+                .map(|pr| {
+                    let k = sexpr_key(&pr.key);
+                    let base = if pr.shorthand {
+                        k
+                    } else {
+                        format!("{k}:{}", sexpr_target(&pr.value))
+                    };
+                    match &pr.default {
+                        Some(d) => format!("{base}={}", sexpr(d)),
+                        None => base,
+                    }
+                })
+                .collect();
+            if let Some(r) = &p.rest {
+                parts.push(format!("...{}", sexpr_target(r)));
+            }
+            format!("{{{}}}", parts.join(" "))
+        }
+    }
+}
 
 /// Parses a single expression (asserting the whole input is consumed).
 fn parse(src: &str) -> Expr {
@@ -169,8 +218,7 @@ fn params(ps: &[Param]) -> String {
     let parts: Vec<String> = ps
         .iter()
         .map(|p| {
-            let BindingTarget::Ident(id) = &p.target;
-            let mut s = id.name.clone().into_string();
+            let mut s = sexpr_target(&p.target);
             if p.rest {
                 s = format!("...{s}");
             }
@@ -507,10 +555,7 @@ fn sexpr_stmt(s: &Stmt) -> String {
             ..
         } => {
             let h = handler.as_ref().map_or("_".into(), |c| {
-                let p = match &c.param {
-                    Some(BindingTarget::Ident(id)) => id.name.clone().into_string(),
-                    None => "_".into(),
-                };
+                let p = c.param.as_ref().map_or("_".into(), sexpr_target);
                 format!("(catch {p} {})", stmts(&c.body))
             });
             let f = finalizer
@@ -548,10 +593,10 @@ fn stmts(body: &[Stmt]) -> String {
 
 fn sexpr_declarator(d: &VarDeclarator) -> String {
     use alloc::format;
-    let BindingTarget::Ident(id) = &d.target;
+    let target = sexpr_target(&d.target);
     match &d.init {
-        Some(e) => format!("({} {})", id.name, sexpr(e)),
-        None => id.name.clone().into_string(),
+        Some(e) => format!("({target} {})", sexpr(e)),
+        None => target,
     }
 }
 
@@ -559,8 +604,7 @@ fn sexpr_for_left(left: &ForLeft) -> String {
     use alloc::format;
     match left {
         ForLeft::Decl { kind, target, .. } => {
-            let BindingTarget::Ident(id) = target;
-            format!("({} {})", kind.as_str(), id.name)
+            format!("({} {})", kind.as_str(), sexpr_target(target))
         }
         ForLeft::Target(e) => sexpr(e),
     }
@@ -581,7 +625,6 @@ fn declarations() {
     assert_eq!(prog("var a, b = 2, c;"), "(var a (b 2) c)");
     assert_eq!(prog("const k = 0;"), "(const (k 0))");
     assert!(sperr("const k;").contains("must be initialized"));
-    assert!(sperr("let [a] = b;").contains("destructuring"));
 }
 
 #[test]
@@ -765,4 +808,45 @@ fn iife() {
         "(expr (call (fn  () (block (return 1)))))"
     );
     assert_eq!(prog("(() => 1)();"), "(expr (call (arrow () 1)))");
+}
+
+// === destructuring patterns ============================================
+
+#[test]
+fn array_destructuring() {
+    assert_eq!(prog("let [a, b] = xs;"), "(let ([a b] xs))");
+    assert_eq!(prog("let [a, , c] = xs;"), "(let ([a hole c] xs))");
+    assert_eq!(
+        prog("let [a = 1, ...rest] = xs;"),
+        "(let ([a=1 ...rest] xs))"
+    );
+    assert_eq!(prog("const [[a], [b]] = m;"), "(const ([[a] [b]] m))");
+}
+
+#[test]
+fn object_destructuring() {
+    assert_eq!(prog("let {a, b} = o;"), "(let ({a b} o))");
+    assert_eq!(prog("let {a: x, b: y} = o;"), "(let ({a:x b:y} o))");
+    assert_eq!(prog("let {a = 1} = o;"), "(let ({a=1} o))");
+    assert_eq!(prog("let {a, ...rest} = o;"), "(let ({a ...rest} o))");
+    assert_eq!(prog("let {[k]: v} = o;"), "(let ({[k]:v} o))");
+    // Nested object/array patterns.
+    assert_eq!(prog("let {a: [b, c]} = o;"), "(let ({a:[b c]} o))");
+}
+
+#[test]
+fn destructuring_in_params_and_catch() {
+    assert_eq!(
+        prog("function f({a, b}, [c]) {}"),
+        "(fn f ({a b} [c]) (block ))"
+    );
+    assert_eq!(sx("({a, b}) => a + b"), "(arrow ({a b}) (+ a b))");
+    assert_eq!(
+        prog("try {} catch ({message}) {}"),
+        "(try () (catch {message} ) _)"
+    );
+    assert_eq!(
+        prog("for (const [k, v] of m) ;"),
+        "(for-of (const [k v]) m (empty))"
+    );
 }

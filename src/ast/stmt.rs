@@ -1,6 +1,6 @@
 //! Statement, declaration, and program nodes.
 
-use super::{Expr, Function, Ident};
+use super::{BindingTarget, Expr, Function, Ident};
 use crate::common::Span;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -193,17 +193,6 @@ pub struct VarDeclarator {
     pub init: Option<Expr>,
     /// The span of this declarator.
     pub span: Span,
-}
-
-/// A binding target — what a declaration or `catch`/`for` head binds to.
-///
-/// Only plain identifier bindings are modeled in this increment; array and
-/// object destructuring patterns are added with the pattern grammar (the enum
-/// keeps that addition source-compatible).
-#[derive(Clone, Debug, PartialEq)]
-#[allow(missing_docs)]
-pub enum BindingTarget {
-    Ident(Ident),
 }
 
 /// The initializer of a C-style `for` loop header.
