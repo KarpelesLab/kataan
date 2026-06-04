@@ -1425,7 +1425,12 @@ impl<'a> Interp<'a> {
     }
 
     /// Writes `value` to property `key` of `obj`.
-    fn set_member(&self, obj: &Value<'a>, key: &str, value: Value<'a>) -> Completion<'a, ()> {
+    pub(super) fn set_member(
+        &self,
+        obj: &Value<'a>,
+        key: &str,
+        value: Value<'a>,
+    ) -> Completion<'a, ()> {
         match obj {
             Value::Object(o) => {
                 o.set(key, value);

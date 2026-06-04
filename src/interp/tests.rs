@@ -156,6 +156,31 @@ fn bytecode_vm_functions() {
 }
 
 #[test]
+fn bytecode_vm_object_array_literals() {
+    // Array literals and indexing.
+    assert_eq!(eval_bc("let a = [10, 20, 30]; a[1]"), "20");
+    assert_eq!(eval_bc("[1, 2, 3].length"), "3");
+    assert_eq!(eval_bc("let a = [1, 2]; a[2] = 9; a[2]"), "9");
+    // Object literals (identifier, string, numeric, computed keys).
+    assert_eq!(eval_bc("let o = { x: 1, y: 2 }; o.x + o.y"), "3");
+    assert_eq!(eval_bc("let o = { 'a-b': 7 }; o['a-b']"), "7");
+    assert_eq!(eval_bc("let k = 'key'; let o = { [k]: 42 }; o.key"), "42");
+    // Property writes and a small computed build.
+    assert_eq!(eval_bc("let o = {}; o.n = 5; o.n += 10; o.n"), "15");
+    assert_eq!(
+        eval_bc(
+            "let a = []; let i = 0; while (i < 4) { a[i] = i * i; i += 1; } a[3] + ',' + a.length"
+        ),
+        "9,4"
+    );
+    // Nested structures.
+    assert_eq!(
+        eval_bc("let o = { list: [1, 2, { v: 3 }] }; o.list[2].v"),
+        "3"
+    );
+}
+
+#[test]
 fn bytecode_vm_falls_back_on_captures() {
     // A closure over an enclosing local is reported as unsupported, so a caller
     // can fall back to the tree-walker.

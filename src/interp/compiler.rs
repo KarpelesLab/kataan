@@ -404,8 +404,95 @@ impl Compiler {
                 Ok(dst)
             }
             Expr::Arrow(arrow) => self.arrow(arrow),
+            Expr::Array { elements, .. } => self.array_literal(elements),
+            Expr::Object { members, .. } => self.object_literal(members),
             _ => Err(CompileError::unsupported("expression")),
         }
+    }
+
+    fn array_literal(
+        &mut self,
+        elements: &[crate::ast::ArrayElement],
+    ) -> Result<Reg, CompileError> {
+        use crate::ast::ArrayElement;
+        let dst = self.reg();
+        self.emit(Op::NewArray {
+            dst,
+            len: elements.len() as u32,
+        });
+        for (i, el) in elements.iter().enumerate() {
+            let value = match el {
+                ArrayElement::Item(e) => self.expr(e)?,
+                ArrayElement::Hole => continue,
+                ArrayElement::Spread(_) => return Err(CompileError::unsupported("array spread")),
+            };
+            let index = self.reg();
+            self.emit(Op::LoadInt {
+                dst: index,
+                value: i as i32,
+            });
+            self.emit(Op::SetElem {
+                obj: dst,
+                index,
+                src: value,
+            });
+        }
+        Ok(dst)
+    }
+
+    fn object_literal(
+        &mut self,
+        members: &[crate::ast::ObjectMember],
+    ) -> Result<Reg, CompileError> {
+        use crate::ast::ObjectMember;
+        let dst = self.reg();
+        self.emit(Op::NewObject { dst });
+        for member in members {
+            let ObjectMember::Property { key, value, .. } = member else {
+                return Err(CompileError::unsupported("object spread/accessor"));
+            };
+            let val = self.expr(value)?;
+            match key {
+                PropertyKey::Ident(name) => {
+                    let k = self.add_const(Const::Str(name.clone().into_string()));
+                    self.emit(Op::SetProp {
+                        obj: dst,
+                        key: k,
+                        src: val,
+                    });
+                }
+                PropertyKey::Str(s) => {
+                    let k = self.add_const(Const::Str(s.clone().into_string()));
+                    self.emit(Op::SetProp {
+                        obj: dst,
+                        key: k,
+                        src: val,
+                    });
+                }
+                PropertyKey::Number(n) => {
+                    let index = self.reg();
+                    let k = self.add_const(Const::Number(*n));
+                    self.emit(Op::LoadConst { dst: index, k });
+                    self.emit(Op::SetElem {
+                        obj: dst,
+                        index,
+                        src: val,
+                    });
+                }
+                PropertyKey::Computed(expr) => {
+                    let index = self.expr(expr)?;
+                    self.emit(Op::SetElem {
+                        obj: dst,
+                        index,
+                        src: val,
+                    });
+                }
+                PropertyKey::Private(_) => {
+                    return Err(CompileError::unsupported("private object key"));
+                }
+            }
+        }
+        Ok(dst)
     }
 
     fn arrow(&mut self, arrow: &Arrow) -> Result<Reg, CompileError> {
@@ -443,30 +530,106 @@ impl Compiler {
     }
 
     fn assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> Result<Reg, CompileError> {
-        let Expr::Ident(id) = target else {
-            return Err(CompileError::unsupported("assignment target"));
-        };
+        match target {
+            Expr::Ident(id) => self.assign_ident(op, &id.name, value),
+            Expr::Member {
+                object,
+                property,
+                optional: false,
+                ..
+            } => self.assign_member(op, object, property, value),
+            _ => Err(CompileError::unsupported("assignment target")),
+        }
+    }
+
+    fn assign_ident(
+        &mut self,
+        op: AssignOp,
+        name: &str,
+        value: &Expr,
+    ) -> Result<Reg, CompileError> {
         let rhs = self.expr(value)?;
         let result = match compound_binop(op) {
             None => rhs,
             Some(binop) => {
-                let cur = self.read_ident(&id.name)?;
+                let cur = self.read_ident(name)?;
                 let dst = self.reg();
                 self.emit_binop(binop, dst, cur, rhs)?;
                 dst
             }
         };
-        if let Some(slot) = self.resolve(&id.name) {
+        if let Some(slot) = self.resolve(name) {
             self.emit(Op::Move {
                 dst: slot,
                 src: result,
             });
-        } else if self.is_capture(&id.name) {
+        } else if self.is_capture(name) {
             return Err(CompileError::unsupported("captured (closure) variable"));
         } else {
-            let name = self.add_const(Const::Str(id.name.clone().into_string()));
-            self.emit(Op::SetGlobal { name, src: result });
+            let nk = self.add_const(Const::Str(name.into()));
+            self.emit(Op::SetGlobal {
+                name: nk,
+                src: result,
+            });
         }
+        Ok(result)
+    }
+
+    /// Compiles `obj.prop OP= value` / `obj[key] OP= value`.
+    fn assign_member(
+        &mut self,
+        op: AssignOp,
+        object: &Expr,
+        property: &PropertyKey,
+        value: &Expr,
+    ) -> Result<Reg, CompileError> {
+        let obj = self.expr(object)?;
+        // Resolve the property to either a string-constant key or an index reg.
+        let key: PropertySlot = match property {
+            PropertyKey::Ident(name) => {
+                PropertySlot::Const(self.add_const(Const::Str(name.clone().into_string())))
+            }
+            PropertyKey::Str(s) => {
+                PropertySlot::Const(self.add_const(Const::Str(s.clone().into_string())))
+            }
+            PropertyKey::Computed(expr) => PropertySlot::Index(self.expr(expr)?),
+            _ => return Err(CompileError::unsupported("member assignment key")),
+        };
+        let rhs = self.expr(value)?;
+        let result = match compound_binop(op) {
+            None => rhs,
+            Some(binop) => {
+                // Read the current member, fold, and write the result back.
+                let cur = self.reg();
+                match key {
+                    PropertySlot::Const(k) => self.emit(Op::GetProp {
+                        dst: cur,
+                        obj,
+                        key: k,
+                    }),
+                    PropertySlot::Index(idx) => self.emit(Op::GetElem {
+                        dst: cur,
+                        obj,
+                        index: idx,
+                    }),
+                };
+                let dst = self.reg();
+                self.emit_binop(binop, dst, cur, rhs)?;
+                dst
+            }
+        };
+        match key {
+            PropertySlot::Const(k) => self.emit(Op::SetProp {
+                obj,
+                key: k,
+                src: result,
+            }),
+            PropertySlot::Index(idx) => self.emit(Op::SetElem {
+                obj,
+                index: idx,
+                src: result,
+            }),
+        };
         Ok(result)
     }
 
@@ -583,6 +746,13 @@ impl Compiler {
         });
         Ok(dst)
     }
+}
+
+/// How a member-assignment property was lowered: a string-constant key (for
+/// `SetProp`) or a computed index register (for `SetElem`).
+enum PropertySlot {
+    Const(ConstIdx),
+    Index(Reg),
 }
 
 /// A function body source: a block of statements or a single expression (arrow).

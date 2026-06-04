@@ -154,15 +154,24 @@ impl<'a> Interp<'a> {
                 Op::Return { src } => return Ok(regs[*src as usize].clone()),
                 Op::ReturnUndefined => return Ok(Value::Undefined),
 
-                // Object/array construction is added with a later compiler slice.
-                Op::NewObject { .. }
-                | Op::NewArray { .. }
-                | Op::SetProp { .. }
-                | Op::SetElem { .. } => {
-                    return Err(super::eval::make_error(
-                        "InternalError",
-                        "bytecode op not yet implemented in the VM",
-                    ));
+                Op::NewObject { dst } => {
+                    regs[*dst as usize] = Value::Object(Obj::object());
+                }
+                Op::NewArray { dst, len } => {
+                    regs[*dst as usize] =
+                        Value::Object(Obj::array(alloc::vec![Value::Undefined; *len as usize]));
+                }
+                Op::SetProp { obj, key, src } => {
+                    let k = const_str(chunk, *key);
+                    let target = regs[*obj as usize].clone();
+                    let value = regs[*src as usize].clone();
+                    self.set_member(&target, &k, value)?;
+                }
+                Op::SetElem { obj, index, src } => {
+                    let target = regs[*obj as usize].clone();
+                    let key = regs[*index as usize].to_js_string();
+                    let value = regs[*src as usize].clone();
+                    self.set_member(&target, &key, value)?;
                 }
             }
         }
