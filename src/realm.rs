@@ -322,11 +322,11 @@ impl Realm {
         Some(
             obj.enumerable_keys()
                 .iter()
-                // Private fields are stored under a `#`-prefixed key and are
-                // never enumerable (so they stay out of `Object.keys`, spread,
-                // `for-in`, and JSON). Methods are marked hidden via
-                // `enumerable_keys`.
-                .filter(|s| !s.starts_with('#'))
+                // Private fields (`#`-prefixed) and symbol/internal keys
+                // (`\0`-prefixed) are never enumerable, so they stay out of
+                // `Object.keys`, spread, `for-in`, and JSON. Methods are marked
+                // hidden via `enumerable_keys`.
+                .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
                 .map(|s| alloc::string::String::from(*s))
                 .collect(),
         )

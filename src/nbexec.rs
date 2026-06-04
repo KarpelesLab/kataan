@@ -3191,15 +3191,29 @@ impl<'a> Interp<'a> {
     }
 
     /// Resolves an object/class property key to its string name, evaluating a
-    /// `[computed]` key expression (coerced to a string) where present.
+    /// `[computed]` key expression where present (a symbol maps to its identity
+    /// key, any other value to its string form).
     fn eval_prop_key(&mut self, key: &'a PropertyKey) -> Result<String, ExecError> {
         match key {
             PropertyKey::Computed(e) => {
                 let v = self.eval(e)?;
-                Ok(self.realm.to_display_string(v))
+                Ok(self.member_key(v))
             }
             _ => static_key(key),
         }
+    }
+
+    /// The storage key for a property access value: a symbol becomes a unique,
+    /// non-enumerable `"\0sym:<id>"` key (so symbol-keyed properties keep their
+    /// identity and stay out of string enumeration); anything else is its string
+    /// form.
+    fn member_key(&self, k: NanBox) -> String {
+        if let Some(raw) = k.as_handle()
+            && let Some((_, id)) = self.realm.symbol_at(Handle::from_raw(raw))
+        {
+            return alloc::format!("\u{0}sym:{id}");
+        }
+        self.realm.to_display_string(k)
     }
 
     fn eval(&mut self, expr: &'a Expr) -> Result<NanBox, ExecError> {
@@ -3320,7 +3334,7 @@ impl<'a> Interp<'a> {
                                     self.realm.delete_property(h, s);
                                 } else if let PropertyKey::Computed(e) = property {
                                     let k = self.eval(e)?;
-                                    let name = self.realm.to_display_string(k);
+                                    let name = self.member_key(k);
                                     self.realm.delete_property(h, &name);
                                 }
                             }
@@ -3595,7 +3609,7 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(self.realm.get_element(handle, i));
                 }
-                let name = self.realm.to_display_string(k);
+                let name = self.member_key(k);
                 self.read_member(handle, &name)
             }
             PropertyKey::Ident(s) | PropertyKey::Str(s) => self.read_member(handle, s),
@@ -3793,7 +3807,7 @@ impl<'a> Interp<'a> {
                 {
                     self.realm.set_element(handle, i, new);
                 } else {
-                    let name = self.realm.to_display_string(k);
+                    let name = self.member_key(k);
                     self.realm.set_property(handle, &name, new);
                 }
             }
@@ -3994,7 +4008,7 @@ impl<'a> Interp<'a> {
             | BinaryOp::BitOr
             | BinaryOp::BitXor => return Err(ExecError::Unsupported("** / bitwise need std")),
             BinaryOp::In => {
-                let key = self.realm.to_display_string(a);
+                let key = self.member_key(a);
                 let present = b
                     .as_handle()
                     .map(Handle::from_raw)
@@ -5201,6 +5215,26 @@ mod tests {
         assert_eq!(run("Symbol.for('k') === Symbol.for('k')"), "true");
         assert_eq!(run("Symbol.keyFor(Symbol.for('k2'))"), "k2");
         assert_eq!(run("typeof Symbol.iterator"), "symbol");
+    }
+
+    #[test]
+    fn symbol_keyed_properties() {
+        // Distinct symbols are distinct keys; symbol keys are non-enumerable.
+        assert_eq!(
+            run(
+                "let a=Symbol('k'),b=Symbol('k'),o={}; o[a]=1; o[b]=2; o.p=3; '' + o[a] + o[b] + Object.keys(o).join('')"
+            ),
+            "12p"
+        );
+        assert_eq!(run("let s=Symbol(); let o={}; o[s]='v'; s in o"), "true");
+        assert_eq!(
+            run("let s=Symbol(); let o={}; o[s]=1; delete o[s]; o[s]"),
+            "undefined"
+        );
+        assert_eq!(
+            run("let o={}; o[Symbol.iterator]='it'; o[Symbol.iterator]"),
+            "it"
+        );
     }
 
     #[test]
