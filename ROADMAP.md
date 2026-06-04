@@ -487,11 +487,16 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   `test`/`exec` and the `String` regex methods), and `Promise`
   (`then`/`catch`/`finally`, `resolve`/`reject`/`all`/`race`, thenable
   adoption) over a microtask queue drained after the script are now in; the C
-  ABI's `kt_eval` runs a script end-to-end. **Next:** generators and
-  `async`/`await` (which need suspendable frames), timers/the event loop, then
-  the *real* object model — NaN-boxed `Value`, shapes/inline caches, and the
-  GC — which is also the
-  gateway to the Phase-D bytecode VM. First Test262 numbers land here.
+  ABI's `kt_eval` runs a script end-to-end. Generators, `async`/`await`, and
+  timers/the event loop are now done (on the VM's suspendable frames). The
+  *real* object-model foundation is now in place as a tested, self-contained
+  layer ahead of the migration: NaN-boxed values (`src/nanbox.rs`), hidden
+  classes with a transition tree (`src/shape.rs`), a generational handle table
+  (`src/heap.rs`), the shape+slots `Object` (`src/object.rs`), and a
+  mark-and-sweep tracing GC that reclaims cycles (`src/gc.rs`). **Next:** inline
+  caches over shapes, then migrating the VM's values/objects onto this
+  representation (NaN-boxed registers, heap-allocated objects under the GC) — the
+  point at which the first broad Test262 numbers land.
 
 - **Phase D — Bytecode VM** 🚧 **started**
   AST→register-bytecode compiler, the interpreter loop, inline caches,
