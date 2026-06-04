@@ -426,6 +426,24 @@ fn sets() {
 }
 
 #[test]
+fn tagged_templates() {
+    assert_eq!(
+        eval("function t(s, ...v) { return s.join('|') + '#' + v.join(','); } t`a${1}b${2}c`"),
+        "a|b|c#1,2"
+    );
+    // The cooked strings array and its `raw` sibling.
+    assert_eq!(
+        eval("function t(s) { return s.length + ':' + s[0] + ':' + s.raw[0]; } t`x\\ny`"),
+        "1:x\ny:x\\ny"
+    );
+    // Substitution values arrive after the strings array.
+    assert_eq!(
+        eval("function sum(s, a, b) { return a + b; } sum`${10}+${20}`"),
+        "30"
+    );
+}
+
+#[test]
 fn getters_and_setters() {
     // Object-literal accessors.
     assert_eq!(

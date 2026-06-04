@@ -813,9 +813,32 @@ impl<'a> Interp<'a> {
             }
             Expr::Class(def) => self.eval_class(def, env),
             Expr::Regex { .. } => Err(Value::str("RegExp is not yet supported at runtime")),
-            Expr::TaggedTemplate { .. } => Err(Value::str(
-                "tagged templates are not yet supported at runtime",
-            )),
+            Expr::TaggedTemplate { tag, quasi, .. } => {
+                let tag_fn = self.eval_expr(tag, env)?;
+                // The strings array carries the cooked quasis and a `raw`
+                // sibling array.
+                let cooked: Vec<Value<'a>> = quasi
+                    .quasis
+                    .iter()
+                    .map(|q| {
+                        q.cooked
+                            .as_ref()
+                            .map_or(Value::Undefined, |c| Value::str(c.clone()))
+                    })
+                    .collect();
+                let raw: Vec<Value<'a>> = quasi
+                    .quasis
+                    .iter()
+                    .map(|q| Value::str(q.raw.clone()))
+                    .collect();
+                let strings = Obj::array(cooked);
+                strings.set("raw", Value::Object(Obj::array(raw)));
+                let mut args = alloc::vec![Value::Object(strings)];
+                for e in &quasi.expressions {
+                    args.push(self.eval_expr(e, env)?);
+                }
+                self.call_with_this(tag_fn, Value::Undefined, args)
+            }
             Expr::Super(_) => Err(Value::str("`super` is not yet supported at runtime")),
             Expr::Yield { .. } | Expr::Await { .. } => Err(Value::str(
                 "generators/async are not yet supported at runtime",
