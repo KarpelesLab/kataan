@@ -188,6 +188,7 @@ const N_OBJECT_IS_FROZEN: u16 = 36;
 const N_OBJECT_GET_OWN_NAMES: u16 = 37;
 const N_SYMBOL: u16 = 38;
 const N_BIGINT: u16 = 39;
+const N_PROXY: u16 = 106;
 const N_PARSE_FLOAT: u16 = 31;
 const N_IS_NAN: u16 = 32;
 const N_IS_FINITE: u16 = 33;
@@ -352,6 +353,7 @@ impl<'a> Interp<'a> {
             ("Set", N_SET),
             ("Symbol", N_SYMBOL),
             ("BigInt", N_BIGINT),
+            ("Proxy", N_PROXY),
         ] {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -1212,6 +1214,19 @@ impl<'a> Interp<'a> {
             .realm
             .native_at(handle)
             .ok_or(ExecError::Unsupported("new on this value"))?;
+        // `new Proxy(target, handler)`.
+        if id == N_PROXY {
+            let target = args.first().copied().unwrap_or(NanBox::undefined());
+            let h = args.get(1).copied().unwrap_or(NanBox::undefined());
+            let (Some(tr), Some(hr)) = (target.as_handle(), h.as_handle()) else {
+                let msg = self.new_str("Cannot create proxy with a non-object target or handler");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(msg))));
+            };
+            let p = self
+                .realm
+                .new_proxy(Handle::from_raw(tr), Handle::from_raw(hr));
+            return Ok(NanBox::handle(p.to_raw()));
+        }
         // `new Promise(executor)`: run executor(resolve, reject).
         if id == N_PROMISE {
             let promise = self.realm.new_promise();
@@ -3706,6 +3721,22 @@ impl<'a> Interp<'a> {
         handle: crate::heap::Handle,
         name: &str,
     ) -> Result<NanBox, ExecError> {
+        // Proxy `get` trap (or forward the read to the target).
+        if let Some((target, handler)) = self.realm.proxy_at(handle) {
+            let trap = self
+                .realm
+                .get_property(handler, "get")
+                .unwrap_or(NanBox::undefined());
+            if trap
+                .as_handle()
+                .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
+            {
+                let key = self.new_str(name);
+                let recv = NanBox::handle(handle.to_raw());
+                return self.call(trap, &[NanBox::handle(target.to_raw()), key, recv]);
+            }
+            return self.read_member(target, name);
+        }
         // Well-known `Symbol.iterator` / `Symbol.asyncIterator` (lazily created).
         if self.realm.native_at(handle) == Some(N_SYMBOL)
             && matches!(
@@ -3864,6 +3895,24 @@ impl<'a> Interp<'a> {
         property: &'a PropertyKey,
         new: NanBox,
     ) -> Result<(), ExecError> {
+        // Proxy `set` trap (or forward the write to the target).
+        if let Some((target, handler)) = self.realm.proxy_at(handle) {
+            let trap = self
+                .realm
+                .get_property(handler, "set")
+                .unwrap_or(NanBox::undefined());
+            if trap
+                .as_handle()
+                .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
+            {
+                let key = self.eval_prop_key(property)?;
+                let key_box = self.new_str(&key);
+                let recv = NanBox::handle(handle.to_raw());
+                self.call(trap, &[NanBox::handle(target.to_raw()), key_box, new, recv])?;
+                return Ok(());
+            }
+            return self.assign_member(target, property, new);
+        }
         // An accessor setter takes precedence for a named property.
         if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property
             && let Some((_, setter)) = self.realm.accessor(handle, s)
@@ -5307,6 +5356,29 @@ mod tests {
             run("let r='ok'; try { 1n + 1; } catch (e) { r = 'threw'; } r"),
             "threw"
         );
+    }
+
+    #[test]
+    fn proxy_get_set_traps() {
+        // get trap with fallthrough; set trap transforming the value.
+        assert_eq!(
+            run(
+                "let t={a:1}; let p=new Proxy(t,{get:function(o,k){return k in o?o[k]:'def';}}); p.a + ':' + p.zzz"
+            ),
+            "1:def"
+        );
+        assert_eq!(
+            run(
+                "let t={}; let p=new Proxy(t,{set:function(o,k,v){o[k]=v*3;return true;}}); p.n=4; t.n"
+            ),
+            "12"
+        );
+        // No-trap handler forwards to the target.
+        assert_eq!(
+            run("let p=new Proxy({x:5},{}); p.y=6; '' + p.x + p.y"),
+            "56"
+        );
+        assert_eq!(run("typeof new Proxy({}, {})"), "object");
     }
 
     #[test]

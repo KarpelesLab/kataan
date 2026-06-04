@@ -125,6 +125,14 @@ pub enum Cell {
     /// A `BigInt` primitive. Backed by `i128` (a bounded approximation of
     /// arbitrary precision — sufficient for the common ±2^127 range).
     BigInt(i128),
+    /// A `Proxy`: wraps a `target` object, routing property operations through a
+    /// `handler` object's traps (`get`/`set`/`has`/`deleteProperty`).
+    Proxy {
+        /// The proxied object.
+        target: Handle,
+        /// The trap handler.
+        handler: Handle,
+    },
 }
 
 impl Cell {
@@ -269,7 +277,8 @@ impl Cell {
             | Cell::Collection { .. }
             | Cell::Promise(_)
             | Cell::Date(_)
-            | Cell::RegExp { .. } => "object",
+            | Cell::RegExp { .. }
+            | Cell::Proxy { .. } => "object",
         }
     }
 
@@ -287,6 +296,15 @@ impl Cell {
     pub fn as_bigint(&self) -> Option<i128> {
         match self {
             Cell::BigInt(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// The `(target, handler)` if this cell is a `Proxy`.
+    #[must_use]
+    pub fn as_proxy(&self) -> Option<(Handle, Handle)> {
+        match self {
+            Cell::Proxy { target, handler } => Some((*target, *handler)),
             _ => None,
         }
     }
@@ -333,6 +351,11 @@ impl Trace for Cell {
             }
             // A bound native keeps its target reachable.
             Cell::BoundNative { target, .. } => visit(*target),
+            // A proxy keeps its target and handler reachable.
+            Cell::Proxy { target, handler } => {
+                visit(*target);
+                visit(*handler);
+            }
             // Strings, native functions, dates, and regexes reference no handles.
             Cell::Str(_)
             | Cell::Native(_)
@@ -372,6 +395,10 @@ impl crate::gc::Relocate for Cell {
                 }
             }
             Cell::BoundNative { target, .. } => *target = forward(*target),
+            Cell::Proxy { target, handler } => {
+                *target = forward(*target);
+                *handler = forward(*handler);
+            }
             Cell::Str(_)
             | Cell::Native(_)
             | Cell::Date(_)

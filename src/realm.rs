@@ -101,6 +101,17 @@ impl Realm {
         self.heap.alloc(Cell::BigInt(n))
     }
 
+    /// Allocates a `Proxy` wrapping `target` with trap `handler`.
+    pub fn new_proxy(&mut self, target: Handle, handler: Handle) -> Handle {
+        self.heap.alloc(Cell::Proxy { target, handler })
+    }
+
+    /// The `(target, handler)` of the proxy at `handle`, if it is one.
+    #[must_use]
+    pub fn proxy_at(&self, handle: Handle) -> Option<(Handle, Handle)> {
+        self.heap.get(handle)?.as_proxy()
+    }
+
     /// The `i128` value of the `BigInt` at `handle`, if it is one.
     #[must_use]
     pub fn bigint_at(&self, handle: Handle) -> Option<i128> {
@@ -696,6 +707,10 @@ impl Realm {
                 Some(Cell::RegExp { source, flags }) => alloc::format!("/{source}/{flags}"),
                 Some(Cell::Symbol { description, .. }) => alloc::format!("Symbol({description})"),
                 Some(Cell::BigInt(n)) => alloc::format!("{n}"),
+                // A proxy renders as its target would.
+                Some(Cell::Proxy { target, .. }) => {
+                    self.to_display_string(NanBox::handle(target.to_raw()))
+                }
                 None => "undefined".into(), // stale handle
             },
         }
