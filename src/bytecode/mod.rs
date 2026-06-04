@@ -133,7 +133,7 @@ pub enum Op {
         src: Reg,
     },
     /// A generic binary op (`dst = a OP b`) for operators without a dedicated
-    /// instruction — bitwise/shift, `in`, `instanceof`. `op` is a [`BinOp`]
+    /// instruction — bitwise/shift, `in`, `instanceof`. `op` is a [`binop`]
     /// code.
     Binary {
         dst: Reg,
