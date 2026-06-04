@@ -13,7 +13,6 @@
 //! kataan --version
 //! ```
 
-use kataan::interp::Interp;
 use kataan::lexer::{Lexer, TokenKind};
 use kataan::parser::Parser;
 use std::process::ExitCode;
@@ -65,22 +64,6 @@ fn main() -> ExitCode {
             }
         },
         ["repl"] => run_repl(),
-        ["disasm", "-e", source] => run_disasm(source, "<argv>"),
-        ["disasm", path] => match std::fs::read_to_string(path) {
-            Ok(source) => run_disasm(&source, path),
-            Err(e) => {
-                eprintln!("kataan: cannot read {path}: {e}");
-                ExitCode::FAILURE
-            }
-        },
-        ["bcrun", "-e", source] => run_eval_vm(source, "<argv>"),
-        ["bcrun", path] => match std::fs::read_to_string(path) {
-            Ok(source) => run_eval_vm(&source, path),
-            Err(e) => {
-                eprintln!("kataan: cannot read {path}: {e}");
-                ExitCode::FAILURE
-            }
-        },
         _ => {
             eprintln!("kataan: unrecognized arguments: {}", args.join(" "));
             eprintln!("try `kataan --help`");
@@ -154,69 +137,21 @@ fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
     }
 }
 
-fn run_eval_vm(source: &str, origin: &str) -> ExitCode {
-    let program = match Parser::parse_program(source) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("kataan: {origin}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut interp = Interp::new();
-    install_console(&interp);
-    match interp.run_with_vm(&program) {
-        Ok(value) => {
-            if !matches!(value, kataan::interp::Value::Undefined) {
-                println!("{}", value.to_js_string());
-            }
-            ExitCode::SUCCESS
-        }
-        Err(thrown) => {
-            eprintln!("kataan: {origin}: Uncaught {}", thrown.to_js_string());
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Compiles `source` to bytecode and prints its disassembly. Falls back with a
-/// message for constructs outside the bytecode compiler's current subset.
-fn run_disasm(source: &str, origin: &str) -> ExitCode {
-    use kataan::interp::compile_program;
-
-    let program = match Parser::parse_program(source) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("kataan: {origin}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match compile_program(&program.body) {
-        Ok(module) => {
-            print!("{}", module.disassemble());
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("kataan: {origin}: {}", e.message);
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Runs a read-eval-print loop. Each entered line is parsed to an owned
-/// `Program` which is leaked to `&'static` so the persistent interpreter (and
-/// the values stored in its globals) can reference it across iterations — fine
-/// for an interactive session.
+/// Runs a read-eval-print loop on the new-representation tree-walker
+/// (`nbexec::Interp`), which carries its own `console` and persists globals
+/// across lines. Each line's AST is leaked to `&'static` so values the
+/// persistent interpreter keeps in its globals can reference it.
 fn run_repl() -> ExitCode {
     use std::io::{self, BufRead, Write};
 
-    let mut interp: Interp<'static> = Interp::new();
-    install_console(&interp);
+    let mut interp: kataan::nbexec::Interp<'static> = kataan::nbexec::Interp::new();
     println!(
         "kataan {} REPL — type JavaScript, Ctrl-D to exit",
         kataan::VERSION
     );
 
     let stdin = io::stdin();
+    let mut shown = 0usize; // bytes of `console` output already printed
     loop {
         print!("> ");
         let _ = io::stdout().flush();
@@ -243,46 +178,22 @@ fn run_repl() -> ExitCode {
         let program: &'static kataan::ast::Program = Box::leak(Box::new(program));
         match interp.run(program) {
             Ok(value) => {
-                if !matches!(value, kataan::interp::Value::Undefined) {
-                    println!("{value:?}");
+                // Flush any new `console` output, then the completion value.
+                let out = interp.output();
+                if out.len() > shown {
+                    print!("{}", &out[shown..]);
+                    shown = out.len();
+                }
+                let disp = interp.display(value);
+                if !disp.is_empty() && disp != "undefined" {
+                    println!("{disp}");
                 }
             }
-            Err(thrown) => eprintln!("Uncaught {}", thrown.to_js_string()),
+            Err(e) => eprintln!("Uncaught {e:?}"),
         }
     }
     println!();
     ExitCode::SUCCESS
-}
-
-/// Installs a minimal `console` global (`log`/`info`/`warn`/`error`) that
-/// prints its arguments space-separated. This is the first sliver of the host
-/// runtime; a fuller one arrives in Phase F.
-fn install_console(interp: &Interp) {
-    use kataan::interp::{NativeFn, Obj, Value};
-    use std::rc::Rc;
-
-    let console = Obj::object();
-    for name in ["log", "info", "warn", "error"] {
-        let to_stderr = matches!(name, "warn" | "error");
-        let native = Value::Native(Rc::new(NativeFn {
-            name,
-            call: Box::new(move |args: &[Value]| {
-                let line = args
-                    .iter()
-                    .map(Value::to_js_string)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if to_stderr {
-                    eprintln!("{line}");
-                } else {
-                    println!("{line}");
-                }
-                Ok(Value::Undefined)
-            }),
-        }));
-        console.set(name, native);
-    }
-    interp.define_global("console", Value::Object(console));
 }
 
 fn print_usage() {
@@ -297,9 +208,7 @@ fn print_usage() {
          kataan eval <FILE>        evaluate a program (prints completion value)\n    \
          kataan eval -e <SOURCE>   evaluate a source string\n    \
          kataan repl               start an interactive REPL\n    \
-         kataan disasm <FILE>      compile to bytecode and print the disassembly\n    \
-         kataan bcrun <FILE>       run via the bytecode VM (tree-walker fallback)\n    \
-         kataan nbrun <FILE>       run via the new-representation engine (ROADMAP.md \u{a7}3)\n    \
+         kataan nbrun <FILE>       alias for `run` (the new-representation engine)\n    \
          kataan nbrun -e <SOURCE>  run a source string on the new engine\n    \
          kataan --version          print the version\n    \
          kataan --help             show this help\n\

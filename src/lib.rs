@@ -125,13 +125,6 @@ pub mod nbexec;
 #[cfg(feature = "regex")]
 pub mod regex;
 
-/// The tree-walking interpreter (Phase-C semantics MVP). Gated on `std` for
-/// now because it uses floating-point math routines (`powf`, `trunc`, …) that
-/// live in the standard library; the float-math dependency will be revisited
-/// (`libm` vs `std`) when the bytecode VM lands.
-#[cfg(feature = "std")]
-pub mod interp;
-
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
