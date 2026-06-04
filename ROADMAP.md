@@ -483,10 +483,11 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   and a substantial standard library (Math, JSON parse/stringify, Object
   statics, the full Array/String/Number method sets, the Number globals).
   `kataan run app.js` with a minimal `console`, plus an interactive `repl`.
-  **Next:** `Date`, `RegExp` (over the in-house regex engine), generators and
-  `Promise` + a microtask queue, then the *real* object model — NaN-boxed
-  `Value`, shapes/inline caches, and the GC — which is also the gateway to the
-  Phase-D bytecode VM. First Test262 numbers land here.
+  `Date` (in-house calendar) and `RegExp` (over the in-house regex engine, with
+  `test`/`exec` and the `String` regex methods) are now in. **Next:**
+  generators and `Promise` + a microtask queue, then the *real* object model —
+  NaN-boxed `Value`, shapes/inline caches, and the GC — which is also the
+  gateway to the Phase-D bytecode VM. First Test262 numbers land here.
 
 - **Phase D — Bytecode VM**
   AST→register-bytecode compiler, the interpreter loop, inline caches,
