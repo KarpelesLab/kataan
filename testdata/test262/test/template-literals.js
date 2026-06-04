@@ -1,9 +1,11 @@
 /*---
-description: Template literals interpolate and concatenate
+description: Template literals with expressions, nesting, and escapes
 esid: sec-template-literals
 ---*/
 var name = "world";
-assert.sameValue(`hello ${name}`, "hello world");
-assert.sameValue(`${1 + 2} = ${"three"}`, "3 = three");
-var n = 3;
-assert.sameValue(`${n} item${n === 1 ? "" : "s"}`, "3 items");
+assert.sameValue(`hello ${name}!`, "hello world!");
+assert.sameValue(`1 + 2 = ${1 + 2}`, "1 + 2 = 3");
+var a = 5, b = 3;
+assert.sameValue(`${a > b ? "big" : "small"}`, "big");
+assert.sameValue(`outer ${`inner ${a}`}`, "outer inner 5", "nested templates");
+assert.sameValue(`line1\nline2`, "line1\nline2");
