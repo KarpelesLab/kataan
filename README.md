@@ -7,17 +7,22 @@ tri-modal model proven out in the sibling projects
 [`purecrypto`](https://github.com/KarpelesLab/purecrypto) (cryptography) and
 [`rsurl`](https://github.com/KarpelesLab/rsurl) (HTTP/curl).
 
-> **Status: early but running (Phase C/E/F).** The lexer and the full
-> ECMAScript parser are complete, and a tree-walking interpreter already
-> executes real programs — functions/closures, classes with inheritance,
-> objects/arrays, destructuring, getters/setters, `Map`/`Set`, error handling,
-> an in-house `RegExp` engine, `Date`, `Promise` with a microtask queue, and a
-> basic event loop (`setTimeout`), plus a substantial standard library (Math,
-> JSON, Object/Array/String/Number). It runs as a CLI/REPL, a Rust library, and
-> a C library (`kt_eval`). The performance-oriented object model (NaN-boxing,
-> hidden classes, GC), the bytecode VM and JIT tiers, the full host runtime,
-> and the WASM engine are being built out per the [roadmap](ROADMAP.md).
-> Generators and `async`/`await` await the bytecode VM's suspendable frames.
+> **Status: early but running (Phases C–F).** The lexer and the full
+> ECMAScript parser are complete, and a tree-walking interpreter executes real
+> programs — functions/closures, classes with inheritance, objects/arrays,
+> destructuring, getters/setters, `Map`/`Set`, error handling, an in-house
+> `RegExp` engine, `Date`, `Promise` with a microtask queue, and a basic event
+> loop (`setTimeout`), plus a substantial standard library (Math, JSON,
+> Object/Array/String/Number). A **register bytecode VM** runs a broad subset
+> directly — every operator, objects/arrays, method calls, `new`, all loops +
+> `for-of`/`switch`/`try-catch`, and functions/recursion — falling back to the
+> tree-walker for the rest (`kataan bcrun`); compiled bytecode can be
+> serialized, reloaded, and run without the source. Kataan works as a CLI/REPL,
+> a Rust library, and a C library (`kt_eval`). The performance-oriented object
+> model (NaN-boxing, hidden classes, GC), VM closures + JIT tiers, the full host
+> runtime, and the WASM engine are being built out per the
+> [roadmap](ROADMAP.md). Generators and `async`/`await` await the VM's
+> suspendable frames.
 
 ## Why
 
