@@ -334,6 +334,95 @@ impl Realm {
         NanBox::number(-self.to_number(a))
     }
 
+    /// Unary `!a` (logical negation via `ToBoolean`).
+    #[must_use]
+    pub fn logical_not(&self, a: NanBox) -> NanBox {
+        NanBox::boolean(!a.to_boolean())
+    }
+
+    /// The `typeof` string for any value: primitives via the box
+    /// (`"undefined"`/`"boolean"`/`"number"`/`"object"` for null), and heap
+    /// values via their cell (`"string"` for strings, `"object"` otherwise).
+    #[must_use]
+    pub fn type_of_value(&self, v: NanBox) -> &'static str {
+        match v.as_handle() {
+            Some(raw) => self
+                .heap
+                .get(Handle::from_raw(raw))
+                .map_or("undefined", Cell::type_of),
+            None => v.type_of(),
+        }
+    }
+
+    /// ECMAScript `ToInt32`. Needs `std` for the `trunc` float intrinsic.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn to_int32(&self, v: NanBox) -> i32 {
+        let n = self.to_number(v);
+        if !n.is_finite() || n == 0.0 {
+            return 0;
+        }
+        // Reduce trunc(n) modulo 2^32 into [0, 2^32), then reinterpret as i32.
+        let m = n.trunc().rem_euclid(4_294_967_296.0);
+        m as u32 as i32
+    }
+
+    /// ECMAScript `ToUint32`. Needs `std` for the `trunc` float intrinsic.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn to_uint32(&self, v: NanBox) -> u32 {
+        self.to_int32(v) as u32
+    }
+
+    /// `a & b` (bitwise AND over `ToInt32`). Needs `std`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn bit_and(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(f64::from(self.to_int32(a) & self.to_int32(b)))
+    }
+
+    /// `a | b` (bitwise OR). Needs `std`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn bit_or(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(f64::from(self.to_int32(a) | self.to_int32(b)))
+    }
+
+    /// `a ^ b` (bitwise XOR). Needs `std`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn bit_xor(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(f64::from(self.to_int32(a) ^ self.to_int32(b)))
+    }
+
+    /// `~a` (bitwise NOT). Needs `std`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn bit_not(&self, a: NanBox) -> NanBox {
+        NanBox::number(f64::from(!self.to_int32(a)))
+    }
+
+    /// `a << b` (left shift; `b` masked to 5 bits, per spec). Needs `std`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn shl(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(f64::from(self.to_int32(a) << (self.to_uint32(b) & 31)))
+    }
+
+    /// `a >> b` (sign-propagating right shift). Needs `std`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn shr(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(f64::from(self.to_int32(a) >> (self.to_uint32(b) & 31)))
+    }
+
+    /// `a >>> b` (zero-fill right shift; result is unsigned). Needs `std`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn ushr(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(f64::from(self.to_uint32(a) >> (self.to_uint32(b) & 31)))
+    }
+
     /// ECMAScript abstract equality (`==`) — strict equality plus coercion:
     /// `null == undefined`; a boolean is compared as its number; a number and a
     /// string compare numerically; two references use [`strict_equals`] (string
@@ -632,6 +721,47 @@ mod tests {
         assert!(realm.loose_equals(a, b));
         let o1 = NanBox::handle(realm.new_object().to_raw());
         assert!(!realm.loose_equals(o1, n(0.0))); // object != 0 (ToNumber→NaN)
+    }
+
+    #[test]
+    fn typeof_and_logical_not() {
+        let mut realm = Realm::new();
+        assert_eq!(realm.type_of_value(NanBox::undefined()), "undefined");
+        assert_eq!(realm.type_of_value(NanBox::null()), "object");
+        assert_eq!(realm.type_of_value(NanBox::boolean(true)), "boolean");
+        assert_eq!(realm.type_of_value(NanBox::number(1.0)), "number");
+        let s = NanBox::handle(realm.new_string("hi").to_raw());
+        assert_eq!(realm.type_of_value(s), "string");
+        let o = NanBox::handle(realm.new_object().to_raw());
+        assert_eq!(realm.type_of_value(o), "object");
+        // ToBoolean-based negation.
+        assert_eq!(
+            realm.logical_not(NanBox::number(0.0)).as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            realm.logical_not(NanBox::number(1.0)).as_boolean(),
+            Some(false)
+        );
+        assert_eq!(realm.logical_not(s).as_boolean(), Some(false)); // objects truthy
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bitwise_operators() {
+        let realm = Realm::new();
+        let n = NanBox::number;
+        assert_eq!(realm.bit_and(n(12.0), n(10.0)).as_number(), Some(8.0));
+        assert_eq!(realm.bit_or(n(12.0), n(10.0)).as_number(), Some(14.0));
+        assert_eq!(realm.bit_xor(n(12.0), n(10.0)).as_number(), Some(6.0));
+        assert_eq!(realm.bit_not(n(0.0)).as_number(), Some(-1.0));
+        assert_eq!(realm.shl(n(1.0), n(4.0)).as_number(), Some(16.0));
+        assert_eq!(realm.shr(n(-8.0), n(1.0)).as_number(), Some(-4.0)); // sign-propagating
+        assert_eq!(realm.ushr(n(-1.0), n(0.0)).as_number(), Some(4294967295.0)); // zero-fill
+        // ToInt32 truncates fractional and wraps modulo 2^32.
+        assert_eq!(realm.to_int32(n(3.9)), 3);
+        assert_eq!(realm.to_int32(n(4294967297.0)), 1);
+        assert_eq!(realm.to_int32(n(f64::NAN)), 0);
     }
 
     #[test]
