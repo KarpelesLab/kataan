@@ -182,10 +182,15 @@ fn run_compile(path: &str, out: &str) -> ExitCode {
 /// Loads and runs a compiled `.ktbc` bytecode artifact (the inverse of
 /// `compile`), printing any `console` output and a non-empty completion value.
 fn run_bytecode(bytes: &[u8], origin: &str) -> ExitCode {
-    let protos = match kataan::bytecode::deserialize(bytes) {
+    // Decode *and* verify — a `.ktbc` file is untrusted input.
+    let protos = match kataan::bytecode::deserialize_verified(bytes) {
         Ok(p) => p,
-        Err(e) => {
+        Err(Err(e)) => {
             eprintln!("kataan: {origin}: invalid bytecode artifact: {e:?}");
+            return ExitCode::FAILURE;
+        }
+        Err(Ok(e)) => {
+            eprintln!("kataan: {origin}: bytecode failed verification: {e:?}");
             return ExitCode::FAILURE;
         }
     };

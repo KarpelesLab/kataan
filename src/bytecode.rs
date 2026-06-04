@@ -166,6 +166,236 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Why a (well-decoded) artifact failed verification — a reference outside its
+/// declared bounds, which an untrusted artifact must not be allowed to run with.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum VerifyError {
+    /// A register index `>= n_regs`.
+    Register(Reg),
+    /// A function index `>= the function-table length`.
+    Function(u32),
+    /// A jump/handler target outside `0..=ops.len()`.
+    Target(usize),
+}
+
+/// Verifies a decoded program is **safe to run**: every register reference is in
+/// `0..n_regs`, every function index addresses a real function, and every jump /
+/// handler target is a valid instruction index. This is the untrusted-load
+/// check (`ROADMAP.md` Phase D′) — a corrupt or malicious artifact is rejected
+/// here instead of causing an out-of-bounds access during execution.
+///
+/// # Errors
+/// Returns the first [`VerifyError`] found.
+pub fn verify(protos: &[FnProto]) -> Result<(), VerifyError> {
+    let num_funcs = protos.len();
+    for p in protos {
+        for op in &p.ops {
+            verify_op(op, p.n_regs, num_funcs, p.ops.len())?;
+        }
+    }
+    Ok(())
+}
+
+/// Decodes *and* verifies an artifact in one step — the safe entry point for
+/// loading untrusted bytecode.
+///
+/// # Errors
+/// `Err(Ok(VerifyError))` if it decodes but fails verification; `Err(Err(..))`
+/// if decoding itself fails.
+#[allow(clippy::result_large_err)]
+pub fn deserialize_verified(
+    bytes: &[u8],
+) -> Result<Vec<FnProto>, Result<VerifyError, DecodeError>> {
+    let protos = deserialize(bytes).map_err(Err)?;
+    verify(&protos).map_err(Ok)?;
+    Ok(protos)
+}
+
+fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(), VerifyError> {
+    let reg = |r: Reg| {
+        if (r as usize) < n_regs {
+            Ok(())
+        } else {
+            Err(VerifyError::Register(r))
+        }
+    };
+    let func = |f: u32| {
+        if (f as usize) < num_funcs {
+            Ok(())
+        } else {
+            Err(VerifyError::Function(f))
+        }
+    };
+    let target = |t: usize| {
+        if t <= n_ops {
+            Ok(())
+        } else {
+            Err(VerifyError::Target(t))
+        }
+    };
+    let regs = |rs: &[Reg]| -> Result<(), VerifyError> { rs.iter().try_for_each(|r| reg(*r)) };
+    match op {
+        Op::Add { dst, a, b }
+        | Op::Sub { dst, a, b }
+        | Op::Mul { dst, a, b }
+        | Op::Div { dst, a, b }
+        | Op::Mod { dst, a, b }
+        | Op::Lt { dst, a, b }
+        | Op::AddValue { dst, a, b }
+        | Op::StrictEq { dst, a, b }
+        | Op::ValueBin { dst, a, b, .. } => {
+            reg(*dst)?;
+            reg(*a)?;
+            reg(*b)
+        }
+        Op::HasProp { dst, key, obj } | Op::DeleteProp { dst, obj, key } => {
+            reg(*dst)?;
+            reg(*key)?;
+            reg(*obj)
+        }
+        Op::GetElem {
+            dst,
+            arr: a,
+            index: b,
+        }
+        | Op::ArraySliceFrom {
+            dst,
+            src: a,
+            from: b,
+        }
+        | Op::GetKey {
+            dst,
+            obj: a,
+            key: b,
+        } => {
+            reg(*dst)?;
+            reg(*a)?;
+            reg(*b)
+        }
+        Op::SetElem {
+            arr: a,
+            index: b,
+            src: c,
+        }
+        | Op::SetKey {
+            obj: a,
+            key: b,
+            src: c,
+        } => {
+            reg(*a)?;
+            reg(*b)?;
+            reg(*c)
+        }
+        Op::DefineAccessor {
+            obj,
+            getter,
+            setter,
+            ..
+        } => {
+            reg(*obj)?;
+            reg(*getter)?;
+            reg(*setter)
+        }
+        Op::LoadConst { dst, .. }
+        | Op::NewString { dst, .. }
+        | Op::NewArray { dst, .. }
+        | Op::NewRegExp { dst, .. }
+        | Op::NewObject { dst } => reg(*dst),
+        Op::IsBuiltin { dst, obj, .. }
+        | Op::InstanceOf { dst, obj, .. }
+        | Op::ObjectSpread { dst, src: obj }
+        | Op::EnumKeys { dst, obj }
+        | Op::ArrayLen { dst, arr: obj }
+        | Op::CollectionSize { dst, recv: obj }
+        | Op::ObjectRest { dst, src: obj, .. }
+        | Op::TypeOf { dst, a: obj }
+        | Op::BitNot { dst, a: obj }
+        | Op::Neg { dst, a: obj }
+        | Op::Not { dst, a: obj }
+        | Op::Move { dst, src: obj }
+        | Op::GetProp { dst, obj, .. } => {
+            reg(*dst)?;
+            reg(*obj)
+        }
+        Op::ArrayPush { arr: a, src: b } | Op::ArrayExtend { arr: a, src: b } => {
+            reg(*a)?;
+            reg(*b)
+        }
+        Op::SetProp { obj, src, .. } => {
+            reg(*obj)?;
+            reg(*src)
+        }
+        Op::SetClassTag { obj, .. } => reg(*obj),
+        Op::NewCollection { dst, seed, .. } => {
+            reg(*dst)?;
+            seed.map_or(Ok(()), reg)
+        }
+        Op::JumpIfFalse { cond, target: t } => {
+            reg(*cond)?;
+            target(*t)
+        }
+        Op::Jump { target: t } => target(*t),
+        Op::PushHandler { target: t, reg: r } => {
+            target(*t)?;
+            reg(*r)
+        }
+        Op::Call { dst, func: f, args } => {
+            reg(*dst)?;
+            func(*f)?;
+            regs(args)
+        }
+        Op::LoadFunc { dst, func: f } => {
+            reg(*dst)?;
+            func(*f)
+        }
+        Op::MakeClosure {
+            dst,
+            func: f,
+            captures,
+        } => {
+            reg(*dst)?;
+            func(*f)?;
+            regs(captures)
+        }
+        Op::CallValue { dst, callee, args } => {
+            reg(*dst)?;
+            reg(*callee)?;
+            regs(args)
+        }
+        Op::CallValueThis {
+            dst,
+            callee,
+            recv,
+            args,
+        } => {
+            reg(*dst)?;
+            reg(*callee)?;
+            reg(*recv)?;
+            regs(args)
+        }
+        Op::CallMethod {
+            dst, recv, args, ..
+        } => {
+            reg(*dst)?;
+            reg(*recv)?;
+            regs(args)
+        }
+        Op::CallCtor {
+            ctor, recv, args, ..
+        } => {
+            func(*ctor)?;
+            reg(*recv)?;
+            regs(args)
+        }
+        Op::CallNative { dst, args, .. } => {
+            reg(*dst)?;
+            regs(args)
+        }
+        Op::Throw { src } | Op::Return { src } => reg(*src),
+        Op::PopHandler => Ok(()),
+    }
+}
+
 /// The 64-bit FNV-1a content hash of an artifact — the key a content-addressed
 /// store uses so identical bytecode dedups to a single entry.
 #[must_use]
@@ -864,6 +1094,53 @@ mod tests {
         let k1b = store.put(&lib);
         assert_eq!(k1b, k1, "content addressing is stable across reload");
         assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn verifier_accepts_valid_and_rejects_out_of_bounds() {
+        // A normally-compiled program verifies.
+        let program = Parser::parse_program("function f(x){ return x * x; } f(6)").unwrap();
+        let mut protos = crate::nbvm::compile_program(&program).unwrap();
+        assert_eq!(verify(&protos), Ok(()));
+
+        // Tamper: an out-of-range register reference is rejected.
+        let bad_reg = protos[0].n_regs as Reg + 5;
+        protos[0].ops.push(Op::Return { src: bad_reg });
+        assert_eq!(verify(&protos), Err(VerifyError::Register(bad_reg)));
+
+        // Tamper: a call to a non-existent function index is rejected.
+        let mut p2 = crate::nbvm::compile_program(
+            &Parser::parse_program("function g(){ return 1; } g()").unwrap(),
+        )
+        .unwrap();
+        let nf = p2.len() as u32;
+        p2[0].ops.push(Op::Call {
+            dst: 0,
+            func: nf + 9,
+            args: alloc::vec![],
+        });
+        assert_eq!(verify(&p2), Err(VerifyError::Function(nf + 9)));
+
+        // Tamper: a jump past the end is rejected.
+        let mut p3 =
+            crate::nbvm::compile_program(&Parser::parse_program("let x = 1; x").unwrap()).unwrap();
+        let beyond = p3[0].ops.len() + 100;
+        p3[0].ops.push(Op::Jump { target: beyond });
+        assert_eq!(verify(&p3), Err(VerifyError::Target(beyond)));
+    }
+
+    #[test]
+    fn deserialize_verified_round_trips_and_runs() {
+        let program = Parser::parse_program(
+            "function fib(n){ return n < 2 ? n : fib(n-1)+fib(n-2); } fib(10)",
+        )
+        .unwrap();
+        let bytes = serialize(&crate::nbvm::compile_program(&program).unwrap());
+        let protos = deserialize_verified(&bytes).expect("decode+verify");
+        let mut realm = Realm::new();
+        let (value, _) =
+            crate::nbvm::run_program_capturing(&mut realm, &protos, 0, &[]).expect("run");
+        assert_eq!(realm.to_display_string(value), "55");
     }
 
     #[test]
