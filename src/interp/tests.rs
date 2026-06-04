@@ -2155,6 +2155,25 @@ fn json() {
         eval("JSON.stringify({ a: 1 }, null, '__').split('\\n')[1]"),
         "__\"a\": 1"
     );
+    // `toJSON` is honoured (a Date serializes as its ISO string).
+    assert_eq!(
+        eval("JSON.stringify({ d: new Date(0) })"),
+        "{\"d\":\"1970-01-01T00:00:00.000Z\"}"
+    );
+    assert_eq!(
+        eval("JSON.stringify(new Date(0))"),
+        "\"1970-01-01T00:00:00.000Z\""
+    );
+    // Getter accessors are invoked during serialization.
+    assert_eq!(
+        eval("JSON.stringify({ _v: 5, get v() { return this._v * 2; } })"),
+        "{\"_v\":5,\"v\":10}"
+    );
+    // undefined-valued and function properties are still omitted.
+    assert_eq!(
+        eval("JSON.stringify({ a: 1, b: undefined, c: () => 1, d: 2 })"),
+        "{\"a\":1,\"d\":2}"
+    );
 }
 
 #[test]

@@ -291,16 +291,19 @@ fn make_date<'a>(ms: f64, proto: &Rc<Obj<'a>>) -> Rc<Obj<'a>> {
     field!("getMinutes", |ms: f64| civil_from_ms(ms).minute as f64);
     field!("getSeconds", |ms: f64| civil_from_ms(ms).second as f64);
     field!("getMilliseconds", |ms: f64| civil_from_ms(ms).millis as f64);
+    let iso = move || {
+        let c = civil_from_ms(ms);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            c.year, c.month, c.day, c.hour, c.minute, c.second, c.millis
+        )
+    };
     date.set(
         "toISOString",
-        native("toISOString", move |_| {
-            let c = civil_from_ms(ms);
-            Ok(Value::str(format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-                c.year, c.month, c.day, c.hour, c.minute, c.second, c.millis
-            )))
-        }),
+        native("toISOString", move |_| Ok(Value::str(iso()))),
     );
+    // `toJSON` lets `JSON.stringify` serialize a Date as its ISO string.
+    date.set("toJSON", native("toJSON", move |_| Ok(Value::str(iso()))));
     date
 }
 
@@ -906,6 +909,55 @@ impl<'a> Interp<'a> {
             Value::Str(s) => Ok(string_method(s, name, args)),
             Value::Number(n) => Ok(number_method(*n, name, args)),
             _ => Ok(None),
+        }
+    }
+
+    /// Interp-aware `JSON.stringify`: honours `toJSON()` methods (e.g. `Date`)
+    /// and getter accessors, which the free-function serializer can't invoke.
+    pub(super) fn json_stringify_value(
+        &mut self,
+        value: &Value<'a>,
+        indent: Option<&str>,
+        depth: usize,
+    ) -> Completion<'a, Option<String>> {
+        // `toJSON()` substitutes a replacement value before serialization.
+        if let Value::Object(o) = value
+            && o.get("toJSON").is_callable()
+        {
+            let replacement = self.call_member(value.clone(), "toJSON", Vec::new())?;
+            return self.json_stringify_value(&replacement, indent, depth);
+        }
+        match value {
+            Value::Object(o) if o.is_array() => {
+                let len = o.elements().expect("array").borrow().len();
+                let mut parts = Vec::with_capacity(len);
+                for i in 0..len {
+                    let v = o.elements().expect("array").borrow()[i].clone();
+                    let s = self
+                        .json_stringify_value(&v, indent, depth + 1)?
+                        .unwrap_or_else(|| "null".into());
+                    parts.push(s);
+                }
+                Ok(Some(wrap_json('[', ']', &parts, indent, depth)))
+            }
+            Value::Object(_) => {
+                let sep = if indent.is_some() { ": " } else { ":" };
+                let keys = match value {
+                    Value::Object(o) => o.own_keys(),
+                    _ => Vec::new(),
+                };
+                let mut parts = Vec::new();
+                for k in keys {
+                    // `get_property` invokes a getter accessor if present.
+                    let v = self.get_property(value, &k)?;
+                    if let Some(s) = self.json_stringify_value(&v, indent, depth + 1)? {
+                        parts.push(format!("{}{sep}{s}", json_quote(&k)));
+                    }
+                }
+                Ok(Some(wrap_json('{', '}', &parts, indent, depth)))
+            }
+            // Primitives use the existing pure serializer.
+            other => Ok(json_stringify(other, indent, depth)),
         }
     }
 

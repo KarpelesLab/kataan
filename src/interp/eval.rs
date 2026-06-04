@@ -1716,6 +1716,18 @@ impl<'a> Interp<'a> {
         key: &str,
         args: Vec<Value<'a>>,
     ) -> Completion<'a, Value<'a>> {
+        // `JSON.stringify` is intercepted so it can honour `toJSON()` and getter
+        // accessors (the underlying native can't call back into the evaluator).
+        if key == "stringify"
+            && let Value::Object(o) = &obj
+            && o.get("parse").is_callable()
+            && o.get("stringify").is_callable()
+        {
+            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            let indent = json_indent(args.get(2));
+            let s = self.json_stringify_value(&value, indent.as_deref(), 0)?;
+            return Ok(s.map_or(Value::Undefined, Value::str));
+        }
         // `Function.prototype.bind(thisArg, …partial)` on a callable receiver.
         if obj.is_callable() && key == "bind" {
             let bound_this = args.first().cloned().unwrap_or(Value::Undefined);
@@ -1871,6 +1883,16 @@ impl<'a> Interp<'a> {
 /// Builds a thrown error value (an object with `name` + `message`) so that a
 /// `catch` clause can read `e.message` / `e.name`. (These objects are not yet
 /// linked to the `Error` prototype, so `instanceof Error` is not supported.)
+/// Resolves the `space` argument of `JSON.stringify` to an indentation unit: a
+/// number → that many spaces (max 10), a string → its first 10 chars.
+fn json_indent<'a>(space: Option<&Value<'a>>) -> Option<String> {
+    match space {
+        Some(Value::Number(n)) if *n >= 1.0 => Some(" ".repeat((*n as usize).min(10))),
+        Some(Value::Str(s)) if !s.is_empty() => Some(s.chars().take(10).collect()),
+        _ => None,
+    }
+}
+
 /// Whether `name` is a built-in error type (used for `instanceof` matching of
 /// engine-thrown errors).
 fn is_error_name(name: &str) -> bool {
