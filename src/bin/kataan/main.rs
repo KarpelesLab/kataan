@@ -164,10 +164,11 @@ fn run_eval(source: &str, origin: &str) -> ExitCode {
 /// Parses and evaluates `source` through the **bytecode VM** (falling back to
 /// the tree-walker for unsupported constructs), printing the completion value.
 /// (Kept as an explicit subcommand; `run`/`eval` use the same path now.)
-/// Runs `source` through the new-representation engine (`kataan::nbexec`),
-/// printing its captured `console` output and a non-empty completion value.
+/// Runs `source` through the new-representation engine — the bytecode VM with a
+/// tree-walker fallback (`kataan::nbvm::execute`) — printing its captured
+/// `console` output and a non-empty completion value.
 fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
-    match kataan::nbexec::eval_source(source) {
+    match kataan::nbvm::execute(source) {
         Ok((output, completion)) => {
             print!("{output}");
             if !completion.is_empty() && completion != "undefined" {

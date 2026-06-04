@@ -543,6 +543,33 @@ pub fn compile_run_output(
         .map_err(|_| CompileError::Unsupported("runtime fault"))
 }
 
+/// Runs `source` on the **bytecode VM**, falling back to the tree-walker
+/// ([`crate::nbexec::eval_source`]) for any construct the bytecode compiler does
+/// not yet handle — the production execution model (a fast bytecode path with a
+/// complete-semantics safety net). Returns the captured `console` output and the
+/// completion value (as a display string).
+///
+/// # Errors
+/// Returns a parse or execution error message.
+#[cfg(feature = "std")]
+pub fn execute(source: &str) -> Result<(String, String), String> {
+    let program =
+        crate::parser::Parser::parse_program(source).map_err(|e| alloc::format!("{e}"))?;
+    // Compile to bytecode; an unsupported construct routes the whole program to
+    // the tree-walker (compilation happens before execution, so no output has
+    // been produced yet — the fallback is clean).
+    let Ok(protos) = compile_program(&program) else {
+        return crate::nbexec::eval_source(source);
+    };
+    let mut realm = Realm::new();
+    match run_program_capturing(&mut realm, &protos, 0, &[]) {
+        Ok((value, output)) => Ok((output, realm.to_display_string(value))),
+        // A runtime fault on the bytecode path (an unsupported coercion, etc.):
+        // re-run on the reference tree-walker.
+        Err(_) => crate::nbexec::eval_source(source),
+    }
+}
+
 /// Compiles `program` to a function table (function 0 is the top-level body).
 ///
 /// # Errors
@@ -2171,6 +2198,38 @@ mod tests {
             ),
             "5"
         );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn execute_bytecode_first_with_tree_walker_fallback() {
+        // A program the bytecode VM compiles fully (closures, loops, output).
+        let (out, _) = execute(
+            "function makeCounter() { let c = 0; return function() { c += 1; return c; }; }
+             let n = makeCounter(); console.log(n()); console.log(n());",
+        )
+        .expect("ok");
+        assert_eq!(out, "1\n2\n");
+
+        // A program using classes — not yet compiled by the bytecode path, so it
+        // must fall back to the tree-walker and still run correctly.
+        let (out, _) = execute(
+            "class Point { constructor(x, y) { this.x = x; this.y = y; }
+               sum() { return this.x + this.y; } }
+             console.log(new Point(3, 4).sum());",
+        )
+        .expect("ok");
+        assert_eq!(out, "7\n");
+
+        // The completion value is surfaced for an expression program.
+        let (_, completion) = execute("1 + 2 * 3").expect("ok");
+        assert_eq!(completion, "7");
+
+        // Both engines agree on a shared program (sanity).
+        let src = "let s = 0; for (let i = 1; i <= 5; i++) { s += i; } console.log(s);";
+        let (bc, _) = execute(src).expect("ok");
+        let (tw, _) = crate::nbexec::eval_source(src).expect("ok");
+        assert_eq!(bc, tw);
     }
 
     #[test]
