@@ -3511,9 +3511,37 @@ pub fn eval_source(source: &str) -> Result<(String, String), String> {
     let program =
         crate::parser::Parser::parse_program(source).map_err(|e| alloc::format!("{e}"))?;
     let mut interp = Interp::new();
-    let value = interp.run(&program).map_err(|e| alloc::format!("{e:?}"))?;
+    let value = match interp.run(&program) {
+        Ok(v) => v,
+        // Render an uncaught throw readably: an error object as `name: message`,
+        // any other thrown value via its display string.
+        Err(ExecError::Throw(thrown)) => return Err(format_thrown(&interp, thrown)),
+        Err(other) => return Err(alloc::format!("{other:?}")),
+    };
     let completion = interp.display(value);
     Ok((String::from(interp.output()), completion))
+}
+
+/// Formats an uncaught thrown value for an error message: `name: message` for an
+/// error-shaped object, otherwise the value's display string.
+fn format_thrown(interp: &Interp, thrown: NanBox) -> String {
+    if let Some(raw) = thrown.as_handle() {
+        let h = Handle::from_raw(raw);
+        let realm = interp.realm();
+        if let Some(name) = realm.get_property(h, "name") {
+            let name = realm.to_display_string(name);
+            let message = realm
+                .get_property(h, "message")
+                .map(|m| realm.to_display_string(m))
+                .unwrap_or_default();
+            return if message.is_empty() {
+                name
+            } else {
+                alloc::format!("{name}: {message}")
+            };
+        }
+    }
+    interp.display(thrown)
 }
 
 /// The current time in milliseconds since the Unix epoch (`0.0` without `std`,
