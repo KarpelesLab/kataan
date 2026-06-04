@@ -854,6 +854,60 @@ impl Compiler {
                 self.exit_loop(top); // `continue` re-tests
                 Ok(None)
             }
+            // `for (const x of arr)` over an array, indexed by a hidden counter.
+            Stmt::ForOf {
+                left, right, body, ..
+            } => {
+                use crate::ast::ForLeft;
+                let ForLeft::Decl {
+                    target: BindingTarget::Ident(Ident { name, .. }),
+                    ..
+                } = left
+                else {
+                    return Err(CompileError::Unsupported("for-of binding"));
+                };
+                self.scopes.push(alloc::collections::BTreeMap::new());
+                let arr = self.expr(right)?;
+                let len = self.alloc();
+                self.ops.push(Op::ArrayLen { dst: len, arr });
+                let i = self.alloc();
+                self.ops.push(Op::LoadConst {
+                    dst: i,
+                    value: NanBox::number(0.0),
+                });
+                let elem = self.declare(name); // the loop variable
+                let top = self.ops.len();
+                let cond = self.alloc();
+                self.ops.push(Op::Lt {
+                    dst: cond,
+                    a: i,
+                    b: len,
+                });
+                let jf = self.emit_jump_if_false(cond);
+                self.ops.push(Op::GetElem {
+                    dst: elem,
+                    arr,
+                    index: i,
+                });
+                self.enter_loop();
+                self.stmt(body)?;
+                let cont = self.ops.len(); // `continue` advances the index
+                let one = self.alloc();
+                self.ops.push(Op::LoadConst {
+                    dst: one,
+                    value: NanBox::number(1.0),
+                });
+                self.ops.push(Op::Add {
+                    dst: i,
+                    a: i,
+                    b: one,
+                });
+                self.ops.push(Op::Jump { target: top });
+                self.patch(jf);
+                self.exit_loop(cont);
+                self.scopes.pop();
+                Ok(None)
+            }
             Stmt::DoWhile { body, test, .. } => {
                 let top = self.ops.len();
                 self.enter_loop();
@@ -1492,6 +1546,34 @@ mod tests {
             "6"
         );
         assert_eq!(bc("let r = 0; do { r++; } while (false); r"), "1");
+    }
+
+    #[test]
+    fn bytecode_for_of_arrays() {
+        // Sum an array with for-of.
+        assert_eq!(
+            bc("let s = 0; for (const x of [3, 1, 4, 1, 5]) { s += x; } s"),
+            "14"
+        );
+        // for-of with the loop variable used in an expression.
+        assert_eq!(
+            bc("let p = 1; for (const n of [1, 2, 3, 4]) { p *= n; } p"),
+            "24"
+        );
+        // break / continue inside a for-of.
+        assert_eq!(
+            bc(
+                "let s = 0; for (const x of [1, 2, 3, 4, 5]) { if (x === 4) { break; } if (x === 2) { continue; } s += x; } s"
+            ),
+            "4"
+        );
+        // for-of over an array built from a function result.
+        assert_eq!(
+            bc(
+                "function pair(a, b) { return [a, b]; } let s = ''; for (const v of pair('x', 'y')) { s += v; } s"
+            ),
+            "xy"
+        );
     }
 
     #[test]
