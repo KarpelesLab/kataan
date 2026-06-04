@@ -2225,6 +2225,30 @@ impl<'a> Interp<'a> {
                 let key = self.realm.to_display_string(arg(0));
                 return Ok(Some(NanBox::boolean(self.realm.has_own(handle, &key))));
             }
+            // An error object (`name` + `message`, no own `toString`) renders as
+            // `"Name: message"` (or just `"Name"` when the message is empty).
+            "toString"
+                if self.realm.has_own(handle, "name")
+                    && self.realm.has_own(handle, "message")
+                    && !self.realm.has_own(handle, "toString") =>
+            {
+                let name = self
+                    .realm
+                    .get_property(handle, "name")
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default();
+                let msg = self
+                    .realm
+                    .get_property(handle, "message")
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default();
+                let s = if msg.is_empty() {
+                    name
+                } else {
+                    alloc::format!("{name}: {msg}")
+                };
+                return Ok(Some(self.new_str(&s)));
+            }
             _ => {}
         }
 
@@ -6637,6 +6661,18 @@ mod tests {
         );
         assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
         assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
+    }
+
+    #[test]
+    fn error_to_string() {
+        assert_eq!(run("new Error('boom').toString()"), "Error: boom");
+        assert_eq!(run("new TypeError('bad').toString()"), "TypeError: bad");
+        assert_eq!(run("new Error().toString()"), "Error");
+        // A user toString still wins.
+        assert_eq!(
+            run("({ name:'X', message:'y', toString(){ return 'custom'; } }).toString()"),
+            "custom"
+        );
     }
 
     #[test]
