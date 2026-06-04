@@ -74,8 +74,10 @@ fn bytecode_runs_and_compiles_real_fixtures() {
     assert_eq!(ran_ok, FIXTURES.len(), "a fixture failed to run");
     // Ratchet: at least this many whole real-world programs compile fully to
     // bytecode (no fallback). Raise as the fold widens; never let it regress.
-    assert!(
-        compiled_fully >= 9,
-        "bytecode coverage regressed: only {compiled_fully} fixtures compile fully"
+    assert_eq!(
+        compiled_fully,
+        FIXTURES.len(),
+        "bytecode coverage regressed: only {compiled_fully}/{} fixtures compile fully",
+        FIXTURES.len(),
     );
 }

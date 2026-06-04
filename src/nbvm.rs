@@ -261,6 +261,40 @@ const NB_STRING_FROM_CHAR_CODE: u16 = 26;
 const NB_ARRAY_FROM: u16 = 27;
 const NB_ARRAY_IS_ARRAY: u16 = 28;
 const NB_OBJECT_FROM_ENTRIES: u16 = 29;
+const NB_PROMISE_RESOLVE: u16 = 30;
+const NB_PROMISE_REJECT: u16 = 31;
+
+/// Built-in globals the tree-walker provides as bare values. An unknown
+/// identifier that is *not* one of these throws a `ReferenceError` at runtime
+/// (correct JS); one that *is* falls back so the tree-walker resolves it.
+const KNOWN_GLOBALS: &[&str] = &[
+    "Math",
+    "console",
+    "Promise",
+    "Date",
+    "RegExp",
+    "JSON",
+    "Object",
+    "Array",
+    "String",
+    "Number",
+    "Boolean",
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "isFinite",
+    "Map",
+    "Set",
+    "Symbol",
+    "globalThis",
+    "Error",
+    "TypeError",
+    "RangeError",
+    "SyntaxError",
+    "ReferenceError",
+    "EvalError",
+    "URIError",
+];
 
 /// A compiled function: its instruction stream, register-file size, and the
 /// number of leading registers that receive call arguments.
@@ -279,13 +313,26 @@ pub struct FnProto {
     /// parameters before it; the caller gathers any further arguments into an
     /// array placed in register `fixed`.
     pub rest_from: Option<usize>,
+    /// An `async` function: its completion is wrapped in a settled `Promise`.
+    pub is_async: bool,
 }
 
-/// Execution context shared across activations: the heap and the captured
-/// `console` output sink.
+/// A queued promise reaction: run `handler(value)` then settle `result` with
+/// the outcome (`fulfilled` indicates which settlement the value came from, for
+/// pass-through reactions where `handler` is `undefined`).
+struct Microtask {
+    handler: NanBox,
+    value: NanBox,
+    result: Handle,
+    fulfilled: bool,
+}
+
+/// Execution context shared across activations: the heap, the captured
+/// `console` output sink, and the promise microtask queue (the event loop).
 struct Ctx<'a> {
     realm: &'a mut Realm,
     output: String,
+    microtasks: alloc::collections::VecDeque<Microtask>,
 }
 
 /// Runs function `id` of `funcs` with `args`, allocating in `realm`. Calls
@@ -303,8 +350,11 @@ pub fn run_program(
     let mut ctx = Ctx {
         realm,
         output: String::new(),
+        microtasks: alloc::collections::VecDeque::new(),
     };
-    call(&mut ctx, funcs, id, args)
+    let value = call(&mut ctx, funcs, id, args)?;
+    drain_microtasks(&mut ctx, funcs)?;
+    Ok(value)
 }
 
 /// Like [`run_program`], also returning the captured `console` output.
@@ -320,8 +370,11 @@ pub fn run_program_capturing(
     let mut ctx = Ctx {
         realm,
         output: String::new(),
+        microtasks: alloc::collections::VecDeque::new(),
     };
     let value = call(&mut ctx, funcs, id, args)?;
+    // Run the promise event loop before returning (then-callbacks, async tails).
+    drain_microtasks(&mut ctx, funcs)?;
     Ok((value, ctx.output))
 }
 
@@ -368,6 +421,18 @@ fn call_with(
     if let Some(slot) = regs.get_mut(proto.n_params + proto.n_captures) {
         *slot = this_val;
     }
+    // An `async` function: its synchronous body runs to completion, and its
+    // result (or thrown value) settles a returned `Promise`. (No `await` yet —
+    // a body that awaits falls back at compile time.)
+    if proto.is_async {
+        let p = ctx.realm.new_promise();
+        match run_frame(ctx, funcs, &proto.ops, &mut regs) {
+            Ok(ret) => settle(ctx, p, ret.unwrap_or(NanBox::undefined()), true),
+            Err(VmError::Thrown(e)) => settle(ctx, p, e, false),
+            Err(other) => return Err(other),
+        }
+        return Ok(NanBox::handle(p.to_raw()));
+    }
     Ok(run_frame(ctx, funcs, &proto.ops, &mut regs)?.unwrap_or(NanBox::undefined()))
 }
 
@@ -391,8 +456,106 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
     let mut ctx = Ctx {
         realm,
         output: String::new(),
+        microtasks: alloc::collections::VecDeque::new(),
     };
     Ok(run_frame(&mut ctx, &[], program, &mut regs)?.unwrap_or(NanBox::undefined()))
+}
+
+/// Builds an error value `{ name, message }` in the realm (for runtime throws).
+fn make_error(realm: &mut Realm, name: &str, message: &str) -> NanBox {
+    let obj = realm.new_object();
+    let n = NanBox::handle(realm.new_string(name).to_raw());
+    realm.set_property(obj, "name", n);
+    let m = NanBox::handle(realm.new_string(message).to_raw());
+    realm.set_property(obj, "message", m);
+    NanBox::handle(obj.to_raw())
+}
+
+/// Settles promise `p` with `value` (fulfilled or rejected), queueing its
+/// pending reactions as microtasks. A no-op if already settled or not a promise.
+fn settle(ctx: &mut Ctx, p: Handle, value: NanBox, fulfilled: bool) {
+    use crate::cell::PromiseStatus;
+    let Some(state) = ctx.realm.promise_state(p) else {
+        return;
+    };
+    let reactions = {
+        let mut s = state.borrow_mut();
+        if s.status != PromiseStatus::Pending {
+            return;
+        }
+        s.status = if fulfilled {
+            PromiseStatus::Fulfilled
+        } else {
+            PromiseStatus::Rejected
+        };
+        s.value = value;
+        core::mem::take(&mut s.reactions)
+    };
+    for r in reactions {
+        let handler = if fulfilled {
+            r.on_fulfilled
+        } else {
+            r.on_rejected
+        };
+        ctx.microtasks.push_back(Microtask {
+            handler,
+            value,
+            result: r.result,
+            fulfilled,
+        });
+    }
+}
+
+/// `promise.then(on_fulfilled, on_rejected)` — registers reactions and returns
+/// the dependent promise.
+fn promise_then(ctx: &mut Ctx, p: Handle, on_f: NanBox, on_r: NanBox) -> Handle {
+    use crate::cell::{PromiseStatus, Reaction};
+    let result = ctx.realm.new_promise();
+    let Some(state) = ctx.realm.promise_state(p) else {
+        return result;
+    };
+    let (status, value) = {
+        let s = state.borrow();
+        (s.status, s.value)
+    };
+    match status {
+        PromiseStatus::Pending => state.borrow_mut().reactions.push(Reaction {
+            on_fulfilled: on_f,
+            on_rejected: on_r,
+            result,
+        }),
+        PromiseStatus::Fulfilled => ctx.microtasks.push_back(Microtask {
+            handler: on_f,
+            value,
+            result,
+            fulfilled: true,
+        }),
+        PromiseStatus::Rejected => ctx.microtasks.push_back(Microtask {
+            handler: on_r,
+            value,
+            result,
+            fulfilled: false,
+        }),
+    }
+    result
+}
+
+/// Runs the promise microtask queue to completion (the event loop).
+fn drain_microtasks(ctx: &mut Ctx, funcs: &[FnProto]) -> Result<(), VmError> {
+    while let Some(task) = ctx.microtasks.pop_front() {
+        if task.handler.as_handle().is_some() {
+            // A handler runs and its result settles the dependent promise.
+            match call_closure(ctx, funcs, task.handler, &[task.value], NanBox::undefined()) {
+                Ok(ret) => settle(ctx, task.result, ret, true),
+                Err(VmError::Thrown(e)) => settle(ctx, task.result, e, false),
+                Err(other) => return Err(other),
+            }
+        } else {
+            // Pass-through: settle the dependent promise with the same value.
+            settle(ctx, task.result, task.value, task.fulfilled);
+        }
+    }
+    Ok(())
 }
 
 /// Executes one function body (`program`) against the register file `regs`.
@@ -781,21 +944,47 @@ fn run_frame(
                 }
             }
             Op::GetProp { dst, obj, key } => {
-                let handle = object_handle(regs[*obj as usize])?;
                 let recv = regs[*obj as usize];
-                // A getter accessor takes precedence over a data slot.
-                match ctx.realm.accessor(handle, key) {
-                    Some((getter, _)) if getter.as_handle().is_some() => {
-                        match call_closure(ctx, funcs, getter, &[], recv) {
-                            Ok(v) => regs[*dst as usize] = v,
-                            Err(e) => handle_throw!(e),
+                match recv.as_handle().map(Handle::from_raw) {
+                    None => {
+                        use crate::nanbox::Unpacked;
+                        match recv.unpack() {
+                            // Property access on null/undefined throws a TypeError.
+                            Unpacked::Null | Unpacked::Undefined => {
+                                let what = if matches!(recv.unpack(), Unpacked::Null) {
+                                    "null"
+                                } else {
+                                    "undefined"
+                                };
+                                let e = make_error(
+                                    ctx.realm,
+                                    "TypeError",
+                                    &alloc::format!(
+                                        "Cannot read properties of {what} (reading '{key}')"
+                                    ),
+                                );
+                                handle_throw!(VmError::Thrown(e));
+                            }
+                            // Other primitives: a missing property reads `undefined`.
+                            _ => regs[*dst as usize] = NanBox::undefined(),
                         }
                     }
-                    _ => {
-                        regs[*dst as usize] = ctx
-                            .realm
-                            .get_property(handle, key)
-                            .unwrap_or(NanBox::undefined());
+                    Some(handle) => {
+                        // A getter accessor takes precedence over a data slot.
+                        match ctx.realm.accessor(handle, key) {
+                            Some((getter, _)) if getter.as_handle().is_some() => {
+                                match call_closure(ctx, funcs, getter, &[], recv) {
+                                    Ok(v) => regs[*dst as usize] = v,
+                                    Err(e) => handle_throw!(e),
+                                }
+                            }
+                            _ => {
+                                regs[*dst as usize] = ctx
+                                    .realm
+                                    .get_property(handle, key)
+                                    .unwrap_or(NanBox::undefined());
+                            }
+                        }
                     }
                 }
             }
@@ -1345,6 +1534,23 @@ fn builtin_method(
         return Some(Ok(result));
     }
 
+    // --- Promise methods (`then`/`catch`/`finally`) ---
+    if ctx.realm.promise_state(h).is_some() {
+        let result = match key {
+            "then" => promise_then(
+                ctx,
+                h,
+                arg0(),
+                args.get(1).copied().unwrap_or(NanBox::undefined()),
+            ),
+            "catch" => promise_then(ctx, h, NanBox::undefined(), arg0()),
+            // Simplified: run the callback on either settlement, value passes through.
+            "finally" => promise_then(ctx, h, arg0(), arg0()),
+            _ => return None,
+        };
+        return Some(Ok(NanBox::handle(result.to_raw())));
+    }
+
     // --- Map / Set methods ---
     if let Some(is_set) = ctx.realm.collection_is_set(h) {
         let result = match key {
@@ -1581,6 +1787,12 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                 _ => Vec::new(),
             };
             NanBox::handle(ctx.realm.new_array(items).to_raw())
+        }
+        NB_PROMISE_RESOLVE | NB_PROMISE_REJECT => {
+            let p = ctx.realm.new_promise();
+            let v = args.first().copied().unwrap_or(NanBox::undefined());
+            settle(ctx, p, v, native == NB_PROMISE_RESOLVE);
+            NanBox::handle(p.to_raw())
         }
         NB_OBJECT_FROM_ENTRIES => {
             let obj = ctx.realm.new_object();
@@ -1824,6 +2036,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
         n_params: 0,
         n_captures: 0,
         rest_from: None,
+        is_async: false,
     };
     // Reserve slots: main (0), top-level functions (1..=N), then class members
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
@@ -1834,8 +2047,19 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
     let main = Compiler::compile_fn(&fn_ids, &classes, &protos, &[], &[], &program.body, true)?;
     protos.borrow_mut()[0] = main;
     for (i, f) in decls.iter().enumerate() {
-        let proto =
-            Compiler::compile_fn(&fn_ids, &classes, &protos, &f.params, &[], &f.body, false)?;
+        let proto = Compiler::compile_fn_inner(
+            &fn_ids,
+            &classes,
+            &protos,
+            &f.params,
+            &[],
+            &f.body,
+            false,
+            None,
+            &[],
+            None,
+            f.is_async,
+        )?;
         protos.borrow_mut()[i + 1] = proto;
     }
     for job in &class_jobs {
@@ -1856,6 +2080,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
             super_ctor,
             &job.fields,
             job.super_of.clone(),
+            false,
         )?;
         protos.borrow_mut()[job.id as usize] = proto;
     }
@@ -1904,6 +2129,8 @@ fn native_call(callee: &Expr) -> Option<u16> {
         ("String", "fromCharCode") => Some(NB_STRING_FROM_CHAR_CODE),
         ("Array", "from") => Some(NB_ARRAY_FROM),
         ("Array", "isArray") => Some(NB_ARRAY_IS_ARRAY),
+        ("Promise", "resolve") => Some(NB_PROMISE_RESOLVE),
+        ("Promise", "reject") => Some(NB_PROMISE_REJECT),
         _ => None,
     }
 }
@@ -2482,6 +2709,7 @@ impl Compiler {
             None,
             &[],
             None,
+            false,
         )
     }
 
@@ -2497,6 +2725,7 @@ impl Compiler {
         super_ctor: Option<u32>,
         fields: &[(String, Option<&crate::ast::Expr>)],
         super_class: Option<String>,
+        is_async: bool,
     ) -> Result<FnProto, CompileError> {
         // Which of this function's own names are captured by nested functions →
         // must be cells.
@@ -2605,6 +2834,7 @@ impl Compiler {
             n_params: params.len(),
             n_captures: captures.len(),
             rest_from,
+            is_async,
             ops: c.ops,
         })
     }
@@ -3316,7 +3546,17 @@ impl Compiler {
                         "undefined" => self.constant(NanBox::undefined()),
                         "NaN" => self.constant(NanBox::number(f64::NAN)),
                         "Infinity" => self.constant(NanBox::number(f64::INFINITY)),
-                        _ => Err(CompileError::Undefined(String::from(&*id.name))),
+                        // A built-in the tree-walker provides as a bare value:
+                        // fall back so it resolves correctly.
+                        n if KNOWN_GLOBALS.contains(&n) => {
+                            Err(CompileError::Undefined(String::from(n)))
+                        }
+                        // A genuinely undefined identifier throws a ReferenceError
+                        // at runtime (matching JS), so a `try`/`catch` sees it.
+                        _ => {
+                            let msg = alloc::format!("{} is not defined", id.name);
+                            Ok(self.emit_throw_error("ReferenceError", &msg))
+                        }
                     }
                 }
             }
@@ -3575,7 +3815,7 @@ impl Compiler {
                             ..
                         } => {
                             let key = static_key(key)?;
-                            let f = self.make_closure(&value.params, &value.body)?;
+                            let f = self.make_closure(&value.params, &value.body, false)?;
                             let undef = self.constant(NanBox::undefined())?;
                             let (getter, setter) = if *is_getter { (f, undef) } else { (undef, f) };
                             self.ops.push(Op::DefineAccessor {
@@ -4090,7 +4330,7 @@ impl Compiler {
             }
             // A function expression / arrow → a closure capturing its free
             // variables (as shared cells).
-            Expr::Function(f) => self.make_closure(&f.params, &f.body),
+            Expr::Function(f) => self.make_closure(&f.params, &f.body, f.is_async),
             Expr::Arrow(a) => {
                 let body: Vec<Stmt> = match &a.body {
                     crate::ast::ArrowBody::Block(b) => b.clone(),
@@ -4099,7 +4339,7 @@ impl Compiler {
                         span: crate::common::Span::point(0),
                     }],
                 };
-                self.make_closure(&a.params, &body)
+                self.make_closure(&a.params, &body, a.is_async)
             }
             _ => Err(CompileError::Unsupported("expression")),
         }
@@ -4111,6 +4351,7 @@ impl Compiler {
         &mut self,
         params: &[crate::ast::Param],
         body: &[Stmt],
+        is_async: bool,
     ) -> Result<Reg, CompileError> {
         // Captures = free variables that resolve to an enclosing binding (others
         // are top-level functions / globals, reached directly).
@@ -4128,10 +4369,11 @@ impl Compiler {
                 n_params: 0,
                 n_captures: 0,
                 rest_from: None,
+                is_async: false,
             });
             (p.len() - 1) as u32
         };
-        let proto = Compiler::compile_fn(
+        let proto = Compiler::compile_fn_inner(
             &self.fn_ids,
             &self.classes,
             &self.protos,
@@ -4139,6 +4381,10 @@ impl Compiler {
             &captures,
             body,
             false,
+            None,
+            &[],
+            None,
+            is_async,
         )?;
         self.protos.borrow_mut()[id as usize] = proto;
         // Capture the cell registers for each free variable (in the same sorted
@@ -4160,6 +4406,28 @@ impl Compiler {
         let r = self.alloc();
         self.ops.push(Op::LoadConst { dst: r, value });
         Ok(r)
+    }
+
+    /// Emits the construction of an error object `{ name, message }` and a
+    /// `Throw` of it; returns a dummy register (the throw unwinds, so the value
+    /// is never read).
+    fn emit_throw_error(&mut self, error_name: &str, message: &str) -> Reg {
+        let obj = self.alloc();
+        self.ops.push(Op::NewObject { dst: obj });
+        let name = self.constant_str(error_name);
+        self.ops.push(Op::SetProp {
+            obj,
+            key: String::from("name"),
+            src: name,
+        });
+        let msg = self.constant_str(message);
+        self.ops.push(Op::SetProp {
+            obj,
+            key: String::from("message"),
+            src: msg,
+        });
+        self.ops.push(Op::Throw { src: obj });
+        obj
     }
 
     /// A fresh register holding a new heap string.
@@ -4847,6 +5115,41 @@ mod tests {
             ),
             "1,99"
         );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bytecode_async_promise_and_runtime_errors() {
+        use crate::nbvm::execute;
+        // async function returns a promise; .then runs in the microtask drain.
+        let (out, _) = execute(
+            "async function f() { return 7; } f().then((v) => { console.log('async:' + v); });",
+        )
+        .expect("ok");
+        assert_eq!(out, "async:7\n");
+        // Promise.resolve + chained then.
+        let (out, _) = execute(
+            "Promise.resolve(1).then((v) => v + 1).then((v) => { console.log('chain:' + v); });",
+        )
+        .expect("ok");
+        assert_eq!(out, "chain:2\n");
+        // Promise.reject + catch.
+        let (out, _) =
+            execute("Promise.reject('boom').catch((e) => { console.log('caught:' + e); });")
+                .expect("ok");
+        assert_eq!(out, "caught:boom\n");
+        // Runtime ReferenceError on an undefined identifier (caught).
+        assert_eq!(
+            bc("let r = ''; try { undefinedXYZ; } catch (e) { r = e.name; } r"),
+            "ReferenceError"
+        );
+        // Runtime TypeError on null property access (caught).
+        assert_eq!(
+            bc("let r = ''; try { null.field; } catch (e) { r = e.name; } r"),
+            "TypeError"
+        );
+        // A known global (Math) is NOT a ReferenceError — it works.
+        assert_eq!(bc("Math.max(3, 7)"), "7");
     }
 
     #[test]
