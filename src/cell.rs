@@ -132,6 +132,9 @@ pub enum Cell {
         target: Handle,
         /// The trap handler.
         handler: Handle,
+        /// Whether the proxy has been revoked (`Proxy.revocable`); a revoked
+        /// proxy throws on every operation.
+        revoked: bool,
     },
 }
 
@@ -304,8 +307,26 @@ impl Cell {
     #[must_use]
     pub fn as_proxy(&self) -> Option<(Handle, Handle)> {
         match self {
-            Cell::Proxy { target, handler } => Some((*target, *handler)),
+            Cell::Proxy {
+                target, handler, ..
+            } => Some((*target, *handler)),
             _ => None,
+        }
+    }
+
+    /// Whether this proxy has been revoked, if it is a proxy.
+    #[must_use]
+    pub fn proxy_revoked(&self) -> Option<bool> {
+        match self {
+            Cell::Proxy { revoked, .. } => Some(*revoked),
+            _ => None,
+        }
+    }
+
+    /// Marks this proxy revoked (no-op if not a proxy).
+    pub fn revoke_proxy(&mut self) {
+        if let Cell::Proxy { revoked, .. } = self {
+            *revoked = true;
         }
     }
 }
@@ -352,7 +373,9 @@ impl Trace for Cell {
             // A bound native keeps its target reachable.
             Cell::BoundNative { target, .. } => visit(*target),
             // A proxy keeps its target and handler reachable.
-            Cell::Proxy { target, handler } => {
+            Cell::Proxy {
+                target, handler, ..
+            } => {
                 visit(*target);
                 visit(*handler);
             }
@@ -395,7 +418,9 @@ impl crate::gc::Relocate for Cell {
                 }
             }
             Cell::BoundNative { target, .. } => *target = forward(*target),
-            Cell::Proxy { target, handler } => {
+            Cell::Proxy {
+                target, handler, ..
+            } => {
                 *target = forward(*target);
                 *handler = forward(*handler);
             }

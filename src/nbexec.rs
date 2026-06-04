@@ -204,6 +204,8 @@ const N_REFLECT_OWN_KEYS: u16 = 117;
 const N_REFLECT_DELETE: u16 = 118;
 const N_REFLECT_APPLY: u16 = 119;
 const N_REFLECT_CONSTRUCT: u16 = 120;
+/// Bound native: the `revoke` function from `Proxy.revocable` (carries the proxy).
+const N_PROXY_REVOKE: u16 = 122;
 const N_SYMBOL: u16 = 38;
 const N_BIGINT: u16 = 39;
 const N_PROXY: u16 = 106;
@@ -1265,6 +1267,16 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Throws a `TypeError` if `handle` is a revoked proxy (used to guard every
+    /// proxy operation).
+    fn guard_revoked(&mut self, handle: Handle) -> Result<(), ExecError> {
+        if self.realm.proxy_revoked(handle) {
+            let m = self.new_str("Cannot perform operation on a revoked proxy");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        Ok(())
+    }
+
     fn is_callable(&self, handle: Handle) -> bool {
         self.realm.native_at(handle).is_some()
             || self.realm.function_at(handle).is_some()
@@ -1326,6 +1338,7 @@ impl<'a> Interp<'a> {
         }
         // A callable proxy: route through its `apply` trap, or call the target.
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
+            self.guard_revoked(handle)?;
             let trap = self
                 .realm
                 .get_property(handler, "apply")
@@ -1356,6 +1369,8 @@ impl<'a> Interp<'a> {
             match id {
                 N_RESOLVE => self.resolve_with(target, arg0),
                 N_REJECT => self.settle(target, arg0, false),
+                // The `revoke` function from `Proxy.revocable`.
+                N_PROXY_REVOKE => self.realm.revoke_proxy(target),
                 _ => {}
             }
             return Ok(NanBox::undefined());
@@ -1444,6 +1459,7 @@ impl<'a> Interp<'a> {
         // `new someProxy(...)`: route through the `construct` trap, or construct
         // the target.
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
+            self.guard_revoked(handle)?;
             let trap = self
                 .realm
                 .get_property(handler, "construct")
@@ -1961,6 +1977,23 @@ impl<'a> Interp<'a> {
         // --- `Date.now()` static ---
         if self.realm.native_at(handle) == Some(N_DATE) && method == "now" {
             return Ok(Some(NanBox::number(now_ms())));
+        }
+        // --- `Proxy.revocable(target, handler)` → `{ proxy, revoke }` ---
+        if self.realm.native_at(handle) == Some(N_PROXY) && method == "revocable" {
+            let (Some(tr), Some(hr)) = (arg(0).as_handle(), arg(1).as_handle()) else {
+                let m = self.new_str("Cannot create proxy with a non-object target or handler");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            };
+            let proxy = self
+                .realm
+                .new_proxy(Handle::from_raw(tr), Handle::from_raw(hr));
+            let revoke = self.realm.new_bound_native(N_PROXY_REVOKE, proxy);
+            let result = self.realm.new_object();
+            self.realm
+                .set_property(result, "proxy", NanBox::handle(proxy.to_raw()));
+            self.realm
+                .set_property(result, "revoke", NanBox::handle(revoke.to_raw()));
+            return Ok(Some(NanBox::handle(result.to_raw())));
         }
         // --- `Symbol.for` / `Symbol.keyFor` (the global symbol registry) ---
         if self.realm.native_at(handle) == Some(N_SYMBOL) {
@@ -3769,6 +3802,7 @@ impl<'a> Interp<'a> {
                                 if let Some(name) = name {
                                     // Proxy `deleteProperty` trap, or forward.
                                     if let Some((target, handler)) = self.realm.proxy_at(h) {
+                                        self.guard_revoked(h)?;
                                         let trap = self
                                             .realm
                                             .get_property(handler, "deleteProperty")
@@ -4100,6 +4134,7 @@ impl<'a> Interp<'a> {
     ) -> Result<NanBox, ExecError> {
         // Proxy `get` trap (or forward the read to the target).
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
+            self.guard_revoked(handle)?;
             let trap = self
                 .realm
                 .get_property(handler, "get")
@@ -4314,6 +4349,7 @@ impl<'a> Interp<'a> {
     ) -> Result<(), ExecError> {
         // Proxy `set` trap (or forward the write to the target).
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
+            self.guard_revoked(handle)?;
             let trap = self
                 .realm
                 .get_property(handler, "set")
@@ -4559,6 +4595,7 @@ impl<'a> Interp<'a> {
                     // Proxy `has` trap, or forward to the target.
                     Some(h) if self.realm.proxy_at(h).is_some() => {
                         let (target, handler) = self.realm.proxy_at(h).unwrap();
+                        self.guard_revoked(h)?;
                         let trap = self
                             .realm
                             .get_property(handler, "has")
@@ -5976,6 +6013,21 @@ mod tests {
         assert_eq!(
             run("let s=new WeakSet(); let o={}; s.add(o); s.has(o) + ':' + s.has({})"),
             "true:false"
+        );
+    }
+
+    #[test]
+    fn proxy_revocable() {
+        // Works before revoke; every operation throws after.
+        assert_eq!(
+            run(
+                "let r=Proxy.revocable({a:1},{get:function(t,k){return t[k];}}); let b=r.proxy.a; r.revoke(); let after='ok'; try { r.proxy.a; } catch(e){ after='threw'; } b + ':' + after"
+            ),
+            "1:threw"
+        );
+        assert_eq!(
+            run("let r=Proxy.revocable({},{}); typeof r.proxy + ',' + typeof r.revoke"),
+            "object,function"
         );
     }
 

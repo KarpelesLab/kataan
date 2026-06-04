@@ -103,13 +103,33 @@ impl Realm {
 
     /// Allocates a `Proxy` wrapping `target` with trap `handler`.
     pub fn new_proxy(&mut self, target: Handle, handler: Handle) -> Handle {
-        self.heap.alloc(Cell::Proxy { target, handler })
+        self.heap.alloc(Cell::Proxy {
+            target,
+            handler,
+            revoked: false,
+        })
     }
 
     /// The `(target, handler)` of the proxy at `handle`, if it is one.
     #[must_use]
     pub fn proxy_at(&self, handle: Handle) -> Option<(Handle, Handle)> {
         self.heap.get(handle)?.as_proxy()
+    }
+
+    /// Whether the proxy at `handle` has been revoked.
+    #[must_use]
+    pub fn proxy_revoked(&self, handle: Handle) -> bool {
+        self.heap
+            .get(handle)
+            .and_then(Cell::proxy_revoked)
+            .unwrap_or(false)
+    }
+
+    /// Revokes the proxy at `handle` (`Proxy.revocable().revoke`).
+    pub fn revoke_proxy(&mut self, handle: Handle) {
+        if let Some(c) = self.heap.get_mut(handle) {
+            c.revoke_proxy();
+        }
     }
 
     /// The `i128` value of the `BigInt` at `handle`, if it is one.
