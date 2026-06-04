@@ -215,6 +215,10 @@ const GEN_CAP: usize = 1_000_000;
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
+const N_MATH_HYPOT: u16 = 102;
+const N_MATH_CBRT: u16 = 103;
+const N_MATH_LOG2: u16 = 104;
+const N_MATH_LOG10: u16 = 105;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib.
@@ -282,6 +286,10 @@ impl<'a> Interp<'a> {
                 ("sqrt", N_MATH_SQRT),
                 ("pow", N_MATH_POW),
                 ("sign", N_MATH_SIGN),
+                ("hypot", N_MATH_HYPOT),
+                ("cbrt", N_MATH_CBRT),
+                ("log2", N_MATH_LOG2),
+                ("log10", N_MATH_LOG10),
                 ("trunc", N_MATH_TRUNC),
             ],
         );
@@ -601,6 +609,21 @@ impl<'a> Interp<'a> {
             N_MATH_TRUNC => NanBox::number(self.realm.to_number(arg(0)).trunc()),
             #[cfg(not(feature = "std"))]
             N_MATH_TRUNC => return Err(ExecError::Unsupported("Math.trunc needs std")),
+            #[cfg(feature = "std")]
+            N_MATH_HYPOT => {
+                let sum: f64 = args.iter().map(|a| self.realm.to_number(*a).powi(2)).sum();
+                NanBox::number(sum.sqrt())
+            }
+            #[cfg(feature = "std")]
+            N_MATH_CBRT => NanBox::number(self.realm.to_number(arg(0)).cbrt()),
+            #[cfg(feature = "std")]
+            N_MATH_LOG2 => NanBox::number(self.realm.to_number(arg(0)).log2()),
+            #[cfg(feature = "std")]
+            N_MATH_LOG10 => NanBox::number(self.realm.to_number(arg(0)).log10()),
+            #[cfg(not(feature = "std"))]
+            N_MATH_HYPOT | N_MATH_CBRT | N_MATH_LOG2 | N_MATH_LOG10 => {
+                return Err(ExecError::Unsupported("Math fns need std"));
+            }
             N_PARSE_FLOAT => {
                 let s = self.realm.to_display_string(arg(0));
                 NanBox::number(parse_float_prefix(s.trim()))
@@ -1539,6 +1562,24 @@ impl<'a> Interp<'a> {
                 "toFixed" => {
                     let digits = self.realm.to_number(arg(0)) as usize;
                     Some(self.new_str(&alloc::format!("{n:.digits$}")))
+                }
+                // `toExponential(d)` — exponential notation with `d` fractional
+                // digits and a signed exponent (`1.23e+3`).
+                "toExponential" => {
+                    let raw = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                        alloc::format!("{n:e}")
+                    } else {
+                        let d = self.realm.to_number(arg(0)) as usize;
+                        alloc::format!("{n:.d$e}")
+                    };
+                    // Rust prints `1.23e3`; JS wants `1.23e+3`.
+                    let fixed = match raw.find('e') {
+                        Some(i) if !raw[i + 1..].starts_with('-') => {
+                            alloc::format!("{}e+{}", &raw[..i], &raw[i + 1..])
+                        }
+                        _ => raw,
+                    };
+                    Some(self.new_str(&fixed))
                 }
                 // `toPrecision(p)` — p significant digits (no arg → default
                 // string form).
@@ -4781,6 +4822,19 @@ mod tests {
         // copyWithin (in place) and flat(depth).
         assert_eq!(run("[1,2,3,4,5].copyWithin(0,3).join(',')"), "4,5,3,4,5");
         assert_eq!(run("[1,[2,[3,[4]]]].flat(2).join(',')"), "1,2,3,4");
+    }
+
+    #[test]
+    fn math_extras_and_number_coercion() {
+        assert_eq!(run("Math.hypot(3, 4)"), "5");
+        assert_eq!(run("Math.cbrt(27)"), "3");
+        assert_eq!(run("Math.log2(8)"), "3");
+        assert_eq!(run("Math.log10(1000)"), "3");
+        assert_eq!(run("(1234.5).toExponential(2)"), "1.23e+3");
+        // Radix-prefixed string coercion (shared `to_number`, both engines).
+        assert_eq!(run("Number('0x1F')"), "31");
+        assert_eq!(run("+'0b101'"), "5");
+        assert_eq!(run("'0o17' * 1"), "15");
     }
 
     #[test]

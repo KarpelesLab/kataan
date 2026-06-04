@@ -753,10 +753,19 @@ impl Realm {
                         let s = rope.materialize();
                         let t = s.trim();
                         if t.is_empty() {
-                            0.0
-                        } else {
-                            t.parse::<f64>().unwrap_or(f64::NAN)
+                            return 0.0;
                         }
+                        // `0x`/`0o`/`0b`-prefixed integer strings parse by radix.
+                        let radixed = match t.get(0..2) {
+                            Some("0x" | "0X") => Some((16, &t[2..])),
+                            Some("0o" | "0O") => Some((8, &t[2..])),
+                            Some("0b" | "0B") => Some((2, &t[2..])),
+                            _ => None,
+                        };
+                        if let Some((radix, body)) = radixed {
+                            return i64::from_str_radix(body, radix).map_or(f64::NAN, |n| n as f64);
+                        }
+                        t.parse::<f64>().unwrap_or(f64::NAN)
                     }
                     None => f64::NAN, // object/array/stale
                 }
