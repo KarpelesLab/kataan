@@ -30,6 +30,15 @@ impl<'src> Parser<'src> {
         Ok(Expr::Function(function))
     }
 
+    /// Parses a function declaration whose name is *optional* (for
+    /// `export default function …`).
+    pub(super) fn parse_default_function(&mut self) -> Result<Stmt> {
+        let start = self.cur_span();
+        let is_async = self.eat(TokenKind::Keyword(Kw::Async));
+        let function = self.parse_function(start, is_async, false)?;
+        Ok(Stmt::Function(function))
+    }
+
     /// Shared function parser. Expects the cursor at `function`. `require_name`
     /// distinguishes declarations (name required) from expressions (optional).
     fn parse_function(

@@ -7,13 +7,14 @@
 //! the AST itself is thrown away after compilation and is optimized for clarity
 //! over compactness.
 //!
-//! This module currently models the **expression** grammar (Phase B,
-//! increment 1). Statements, declarations, functions, classes, destructuring
-//! patterns, and modules are added in subsequent increments.
+//! This module models the full ECMAScript grammar (Phase B): expressions,
+//! statements and declarations, functions and arrows, destructuring patterns,
+//! classes, and module `import`/`export`.
 
 mod class;
 mod expr;
 mod function;
+mod module;
 mod pattern;
 mod stmt;
 
@@ -22,6 +23,7 @@ pub use expr::{
     Argument, ArrayElement, Expr, ObjectMember, PropertyKey, TemplateElement, TemplateLiteral,
 };
 pub use function::{Arrow, ArrowBody, Function, Param};
+pub use module::{ExportDecl, ExportSpecifier, ImportDecl, ImportSpecifier, ModuleExportName};
 pub use pattern::{
     ArrayPattern, ArrayPatternElement, BindingTarget, ObjectPattern, ObjectPatternProp,
 };

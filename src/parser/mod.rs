@@ -12,6 +12,7 @@
 mod class;
 mod cook;
 mod function;
+mod module;
 mod stmt;
 
 #[cfg(test)]

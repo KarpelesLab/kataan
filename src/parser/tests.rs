@@ -7,8 +7,8 @@
 use super::Parser;
 use crate::ast::{
     Argument, ArrayElement, ArrayPatternElement, ArrowBody, BindingTarget, Class, ClassMember,
-    Expr, ForInit, ForLeft, Function, MethodKind, ObjectMember, Param, Program, PropertyKey, Stmt,
-    TemplateLiteral, VarDeclarator,
+    ExportDecl, Expr, ForInit, ForLeft, Function, ImportSpecifier, MethodKind, ModuleExportName,
+    ObjectMember, Param, Program, PropertyKey, Stmt, TemplateLiteral, VarDeclarator,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -515,8 +515,6 @@ fn deferred_features() {
     // Assignment-target destructuring (`[a,b] = c` as an expression) is not yet
     // reinterpreted from an array literal.
     assert!(perr("[a, b] = c").contains("invalid assignment target"));
-    // Module syntax is still deferred (program context).
-    assert!(sperr("import x from 'm';").contains("import/export"));
 }
 
 // === statements =========================================================
@@ -650,6 +648,65 @@ fn sexpr_stmt(s: &Stmt) -> String {
         }
         Stmt::Function(f) => sexpr_function(f),
         Stmt::Class(c) => sexpr_class(c),
+        Stmt::Import(i) => {
+            let specs: Vec<String> = i
+                .specifiers
+                .iter()
+                .map(|sp| match sp {
+                    ImportSpecifier::Default(id) => id.name.clone().into_string(),
+                    ImportSpecifier::Namespace(id) => format!("*as {}", id.name),
+                    ImportSpecifier::Named { imported, local } => {
+                        format!("{}as {}", mod_name(imported), local.name)
+                    }
+                })
+                .collect();
+            format!("(import [{}] {:?})", specs.join(" "), i.source)
+        }
+        Stmt::Export(e) => sexpr_export(e),
+    }
+}
+
+fn mod_name(n: &ModuleExportName) -> String {
+    use alloc::format;
+    match n {
+        ModuleExportName::Ident(s) => s.clone().into_string(),
+        ModuleExportName::Str(s) => format!("{s:?}"),
+    }
+}
+
+fn sexpr_export(e: &ExportDecl) -> String {
+    use alloc::format;
+    match e {
+        ExportDecl::Named {
+            specifiers, source, ..
+        } => {
+            let specs: Vec<String> = specifiers
+                .iter()
+                .map(|s| {
+                    if s.local == s.exported {
+                        mod_name(&s.local)
+                    } else {
+                        format!("{}as {}", mod_name(&s.local), mod_name(&s.exported))
+                    }
+                })
+                .collect();
+            match source {
+                Some(src) => format!("(export [{}] from {src:?})", specs.join(" ")),
+                None => format!("(export [{}])", specs.join(" ")),
+            }
+        }
+        ExportDecl::All {
+            exported, source, ..
+        } => match exported {
+            Some(n) => format!("(export * as {} from {source:?})", mod_name(n)),
+            None => format!("(export * from {source:?})"),
+        },
+        ExportDecl::Default { declaration, .. } => {
+            format!("(export-default {})", sexpr_stmt(declaration))
+        }
+        ExportDecl::Decl { declaration, .. } => {
+            format!("(export {})", sexpr_stmt(declaration))
+        }
     }
 }
 
@@ -1018,5 +1075,71 @@ fn async_generator_method() {
     assert_eq!(
         prog("class C { async *m() { yield await x; } }"),
         "(class C (async-*method m () (block (expr (yield (await x))))))"
+    );
+}
+
+// === modules ============================================================
+
+#[test]
+fn imports() {
+    assert_eq!(
+        prog("import \"side-effect\";"),
+        "(import [] \"side-effect\")"
+    );
+    assert_eq!(prog("import x from \"m\";"), "(import [x] \"m\")");
+    assert_eq!(
+        prog("import * as ns from \"m\";"),
+        "(import [*as ns] \"m\")"
+    );
+    assert_eq!(
+        prog("import { a, b as c } from \"m\";"),
+        "(import [aas a bas c] \"m\")"
+    );
+    assert_eq!(
+        prog("import def, { a } from \"m\";"),
+        "(import [def aas a] \"m\")"
+    );
+    assert_eq!(
+        prog("import def, * as ns from \"m\";"),
+        "(import [def *as ns] \"m\")"
+    );
+}
+
+#[test]
+fn exports() {
+    assert_eq!(prog("export { a, b as c };"), "(export [a bas c])");
+    assert_eq!(prog("export { a } from \"m\";"), "(export [a] from \"m\")");
+    assert_eq!(prog("export * from \"m\";"), "(export * from \"m\")");
+    assert_eq!(
+        prog("export * as ns from \"m\";"),
+        "(export * as ns from \"m\")"
+    );
+    assert_eq!(prog("export const x = 1;"), "(export (const (x 1)))");
+    assert_eq!(
+        prog("export function f() {}"),
+        "(export (fn f () (block )))"
+    );
+    assert_eq!(
+        prog("export default 1 + 2;"),
+        "(export-default (expr (+ 1 2)))"
+    );
+    assert_eq!(
+        prog("export default function () {}"),
+        "(export-default (fn  () (block )))"
+    );
+    assert_eq!(prog("export default class {}"), "(export-default (class ))");
+}
+
+#[test]
+fn module_source_type_inferred() {
+    assert_eq!(
+        Parser::parse_program("export const x = 1;")
+            .unwrap()
+            .source_type,
+        crate::ast::SourceType::Module
+    );
+    assert_eq!(
+        Parser::parse_program("const x = 1;").unwrap().source_type,
+        crate::ast::SourceType::Script
     );
 }

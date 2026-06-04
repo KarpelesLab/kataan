@@ -27,14 +27,25 @@ enum ForHead {
 }
 
 impl<'src> Parser<'src> {
-    /// Parses a whole compilation unit as a script.
+    /// Parses a whole compilation unit. The goal symbol is inferred: a unit
+    /// containing a top-level `import`/`export` is a module, otherwise a
+    /// script. (Strict-mode and top-level-only semantics are validated in a
+    /// later phase.)
     pub fn parse_program(source: &'src str) -> Result<Program> {
         let mut p = Parser::new(source)?;
         let body = p.parse_statement_list(TokenKind::Eof)?;
         p.expect(TokenKind::Eof)?;
+        let source_type = if body
+            .iter()
+            .any(|s| matches!(s, Stmt::Import(_) | Stmt::Export(_)))
+        {
+            SourceType::Module
+        } else {
+            SourceType::Script
+        };
         Ok(Program {
             body,
-            source_type: SourceType::Script,
+            source_type,
             span: Span::new(0, source.len() as u32),
         })
     }
@@ -80,9 +91,14 @@ impl<'src> Parser<'src> {
                 self.parse_function_declaration()
             }
             TokenKind::Keyword(Kw::Class) => self.parse_class_declaration(),
-            TokenKind::Keyword(Kw::Import | Kw::Export) => {
-                Err(self.err("module import/export is added in a later increment"))
+            // `import(` / `import.` are expression forms (dynamic import /
+            // import.meta), handled as expressions, not import declarations.
+            TokenKind::Keyword(Kw::Import)
+                if !matches!(self.nth_kind(1), TokenKind::LParen | TokenKind::Dot) =>
+            {
+                self.parse_import()
             }
+            TokenKind::Keyword(Kw::Export) => self.parse_export(),
             // Labeled statement: `ident :`.
             TokenKind::Identifier if self.nth_kind(1) == TokenKind::Colon => self.parse_labeled(),
             TokenKind::Keyword(kw)

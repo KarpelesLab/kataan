@@ -24,6 +24,13 @@ impl<'src> Parser<'src> {
         Ok(Expr::Class(class))
     }
 
+    /// Parses a class declaration whose name is *optional* (for
+    /// `export default class …`).
+    pub(super) fn parse_default_class(&mut self) -> Result<Stmt> {
+        let class = self.parse_class(false)?;
+        Ok(Stmt::Class(class))
+    }
+
     /// Shared class parser. `require_name` distinguishes declarations from
     /// expressions.
     fn parse_class(&mut self, require_name: bool) -> Result<Class> {

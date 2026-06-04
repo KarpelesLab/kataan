@@ -1,6 +1,6 @@
 //! Statement, declaration, and program nodes.
 
-use super::{BindingTarget, Class, Expr, Function, Ident};
+use super::{BindingTarget, Class, ExportDecl, Expr, Function, Ident, ImportDecl};
 use crate::common::Span;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -123,6 +123,10 @@ pub enum Stmt {
     Function(Function),
     /// A class declaration: `class C { … }`.
     Class(Class),
+    /// An `import` declaration (module top level).
+    Import(ImportDecl),
+    /// An `export` declaration (module top level).
+    Export(ExportDecl),
 }
 
 impl Stmt {
@@ -151,6 +155,8 @@ impl Stmt {
             Stmt::Var(decl) => decl.span,
             Stmt::Function(f) => f.span,
             Stmt::Class(c) => c.span,
+            Stmt::Import(i) => i.span,
+            Stmt::Export(e) => e.span(),
         }
     }
 }
