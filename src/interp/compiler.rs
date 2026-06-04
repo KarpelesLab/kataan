@@ -79,10 +79,13 @@ impl FnState {
 /// The register holding the current function's `this` value.
 const THIS_REG: Reg = 0;
 
-/// Unresolved `break`/`continue` jump sites for one loop.
+/// Unresolved `break`/`continue` jump sites for one loop or switch.
 struct LoopCtx {
     break_jumps: Vec<usize>,
     continue_jumps: Vec<usize>,
+    /// True for real loops (a `continue` target); false for `switch` (only
+    /// `break` applies).
+    is_loop: bool,
 }
 
 struct Compiler {
@@ -295,6 +298,11 @@ impl Compiler {
                 finalizer,
                 ..
             } => self.compile_try(block, handler.as_ref(), finalizer.as_deref()),
+            Stmt::Switch {
+                discriminant,
+                cases,
+                ..
+            } => self.compile_switch(discriminant, cases),
             Stmt::Break { label: None, .. } => {
                 let j = self.emit(Op::Jump { offset: 0 });
                 self.add_break(j)?;
@@ -411,12 +419,73 @@ impl Compiler {
         Ok(None)
     }
 
+    /// Compiles a `switch` statement: each case test is compared (`===`) to the
+    /// discriminant, dispatching to the matching clause; clauses fall through,
+    /// `break` exits, and `default` catches non-matches.
+    fn compile_switch(
+        &mut self,
+        discriminant: &Expr,
+        cases: &[crate::ast::SwitchCase],
+    ) -> Result<Option<Reg>, CompileError> {
+        let disc = self.expr(discriminant)?;
+        // Emit the dispatch ladder: for each `case`, `JumpIfTrue` to its body.
+        let mut case_jumps = Vec::new();
+        let mut default_jump = None;
+        for case in cases {
+            match &case.test {
+                Some(test) => {
+                    let t = self.expr(test)?;
+                    let eq = self.reg();
+                    self.emit(Op::StrictEq {
+                        dst: eq,
+                        a: disc,
+                        b: t,
+                    });
+                    case_jumps.push(self.emit(Op::JumpIfTrue {
+                        cond: eq,
+                        offset: 0,
+                    }));
+                }
+                None => case_jumps.push(usize::MAX), // placeholder for `default`
+            }
+        }
+        // No case matched: jump to `default` (if any) or past the switch.
+        let fallthrough = self.emit(Op::Jump { offset: 0 });
+
+        self.push_ctx(false); // a switch is a `break` target only
+        let mark = self.funcs.last().expect("fn").locals.len();
+        for (i, case) in cases.iter().enumerate() {
+            let body_pc = self.code_len();
+            if case.test.is_some() {
+                self.patch_jump(case_jumps[i], body_pc);
+            } else {
+                default_jump = Some(body_pc);
+            }
+            for s in &case.body {
+                self.stmt(s)?;
+            }
+        }
+        self.funcs.last_mut().expect("fn").locals.truncate(mark);
+        // Patch the no-match jump to `default` (or to the end).
+        let end = self.code_len();
+        self.patch_jump(fallthrough, default_jump.unwrap_or(end));
+        let ctx = self.pop_loop();
+        for j in &ctx.break_jumps {
+            self.patch_jump(*j, end);
+        }
+        Ok(None)
+    }
+
     // --- loop context (break/continue) ----------------------------------
 
     fn push_loop(&mut self) {
+        self.push_ctx(true);
+    }
+    fn push_ctx(&mut self, is_loop: bool) {
         self.funcs.last_mut().expect("fn").loops.push(LoopCtx {
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
+            is_loop,
         });
     }
     fn pop_loop(&mut self) -> LoopCtx {
@@ -433,11 +502,20 @@ impl Compiler {
                 l.break_jumps.push(idx);
                 Ok(())
             }
-            None => Err(CompileError::unsupported("`break` outside a loop")),
+            None => Err(CompileError::unsupported("`break` outside a loop/switch")),
         }
     }
     fn add_continue(&mut self, idx: usize) -> Result<(), CompileError> {
-        match self.funcs.last_mut().expect("fn").loops.last_mut() {
+        // `continue` targets the nearest enclosing *loop* (skipping switches).
+        match self
+            .funcs
+            .last_mut()
+            .expect("fn")
+            .loops
+            .iter_mut()
+            .rev()
+            .find(|l| l.is_loop)
+        {
             Some(l) => {
                 l.continue_jumps.push(idx);
                 Ok(())

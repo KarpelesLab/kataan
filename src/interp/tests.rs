@@ -238,6 +238,47 @@ fn bytecode_vm_bitwise_in_instanceof() {
 }
 
 #[test]
+fn bytecode_vm_switch() {
+    let sw = |n: &str| {
+        alloc::format!(
+            "let r = '?'; switch ({n}) {{ \
+               case 1: r = 'one'; break; \
+               case 2: r = 'two'; break; \
+               default: r = 'other'; \
+             }} r"
+        )
+    };
+    assert_eq!(eval_bc(&sw("1")), "one");
+    assert_eq!(eval_bc(&sw("2")), "two");
+    assert_eq!(eval_bc(&sw("9")), "other");
+    // Fall-through (no break).
+    assert_eq!(
+        eval_bc(
+            "let r = ''; switch (2) { case 1: r += 'a'; case 2: r += 'b'; case 3: r += 'c'; break; case 4: r += 'd'; } r"
+        ),
+        "bc"
+    );
+    // `continue` inside a switch targets the enclosing loop, not the switch.
+    assert_eq!(
+        eval_bc(
+            "let out = '';
+             for (let i = 0; i < 4; i += 1) {
+               switch (i) { case 1: continue; case 2: out += 'two'; break; default: out += i; }
+             }
+             out"
+        ),
+        "0two3"
+    );
+    // String discriminant.
+    assert_eq!(
+        eval_bc(
+            "let x = 'b'; let r = 0; switch (x) { case 'a': r = 1; break; case 'b': r = 2; break; } r"
+        ),
+        "2"
+    );
+}
+
+#[test]
 fn bytecode_vm_new_operator() {
     // Built-in constructors via `new`.
     assert_eq!(eval_bc("let m = new Map(); m.set('k', 1); m.get('k')"), "1");
