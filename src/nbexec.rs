@@ -451,6 +451,49 @@ impl<'a> Interp<'a> {
                     let n = if n >= 0.0 { n as usize } else { 0 };
                     Some(self.new_str(&s.repeat(n)))
                 }
+                "startsWith" => Some(NanBox::boolean(
+                    s.starts_with(&self.realm.to_display_string(arg(0))),
+                )),
+                "endsWith" => Some(NanBox::boolean(
+                    s.ends_with(&self.realm.to_display_string(arg(0))),
+                )),
+                "slice" => {
+                    let chars: Vec<char> = s.chars().collect();
+                    let (a, b) = slice_bounds(
+                        self.realm.to_number(arg(0)),
+                        arg(1),
+                        &self.realm,
+                        chars.len(),
+                    );
+                    Some(self.new_str(&chars[a..b].iter().collect::<String>()))
+                }
+                "split" => {
+                    let sep = self.realm.to_display_string(arg(0));
+                    let parts: Vec<NanBox> = if sep.is_empty() {
+                        let chars: Vec<char> = s.chars().collect();
+                        chars
+                            .iter()
+                            .map(|c| self.new_str(&String::from(*c)))
+                            .collect()
+                    } else {
+                        s.split(&sep).map(|p| self.new_str(p)).collect()
+                    };
+                    Some(NanBox::handle(self.realm.new_array(parts).to_raw()))
+                }
+                "replace" => {
+                    let from = self.realm.to_display_string(arg(0));
+                    let to = self.realm.to_display_string(arg(1));
+                    Some(self.new_str(&s.replacen(&from, &to, 1)))
+                }
+                "padStart" => {
+                    let target = self.realm.to_number(arg(0)) as usize;
+                    let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        String::from(" ")
+                    } else {
+                        self.realm.to_display_string(arg(1))
+                    };
+                    Some(self.new_str(&pad_start(&s, target, &pad)))
+                }
                 _ => None,
             };
             if out.is_some() {
@@ -540,6 +583,79 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(Some(acc));
                 }
+                "slice" => {
+                    let (a, b) = slice_bounds(
+                        self.realm.to_number(arg(0)),
+                        arg(1),
+                        &self.realm,
+                        elems.len(),
+                    );
+                    let h = self.realm.new_array(elems[a..b].to_vec());
+                    return Ok(Some(NanBox::handle(h.to_raw())));
+                }
+                "concat" => {
+                    let mut out = elems.clone();
+                    for a in args {
+                        if let Some(other) = a
+                            .as_handle()
+                            .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
+                            .map(<[_]>::to_vec)
+                        {
+                            out.extend(other);
+                        } else {
+                            out.push(*a);
+                        }
+                    }
+                    let h = self.realm.new_array(out);
+                    return Ok(Some(NanBox::handle(h.to_raw())));
+                }
+                "reverse" => {
+                    let mut out = elems.clone();
+                    out.reverse();
+                    let h = self.realm.new_array(out);
+                    return Ok(Some(NanBox::handle(h.to_raw())));
+                }
+                "find" => {
+                    let f = arg(0);
+                    for (i, e) in elems.iter().enumerate() {
+                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                            return Ok(Some(*e));
+                        }
+                    }
+                    return Ok(Some(NanBox::undefined()));
+                }
+                "findIndex" => {
+                    let f = arg(0);
+                    for (i, e) in elems.iter().enumerate() {
+                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                            return Ok(Some(NanBox::number(i as f64)));
+                        }
+                    }
+                    return Ok(Some(NanBox::number(-1.0)));
+                }
+                "some" => {
+                    let f = arg(0);
+                    for (i, e) in elems.iter().enumerate() {
+                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                            return Ok(Some(NanBox::boolean(true)));
+                        }
+                    }
+                    return Ok(Some(NanBox::boolean(false)));
+                }
+                "every" => {
+                    let f = arg(0);
+                    for (i, e) in elems.iter().enumerate() {
+                        if !self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                            return Ok(Some(NanBox::boolean(false)));
+                        }
+                    }
+                    return Ok(Some(NanBox::boolean(true)));
+                }
+                "sort" => {
+                    let sorted = self.sort_array(elems, arg(0))?;
+                    let h = self.realm.new_array(sorted);
+                    return Ok(Some(NanBox::handle(h.to_raw())));
+                }
                 _ => {}
             }
         }
@@ -549,6 +665,46 @@ impl<'a> Interp<'a> {
     /// Allocates a heap string and returns its boxed handle.
     fn new_str(&mut self, s: &str) -> NanBox {
         NanBox::handle(self.realm.new_string(s).to_raw())
+    }
+
+    /// Sorts `elems` with a JS comparator (a negative result orders `a` before
+    /// `b`); without one, by the elements' string forms. Insertion sort, so the
+    /// comparator can call back into the interpreter.
+    fn sort_array(
+        &mut self,
+        mut elems: Vec<NanBox>,
+        cmp: NanBox,
+    ) -> Result<Vec<NanBox>, ExecError> {
+        let has_cmp = cmp.as_handle().is_some_and(|raw| {
+            let h = Handle::from_raw(raw);
+            self.realm.native_at(h).is_some() || self.realm.function_at(h).is_some()
+        });
+        for i in 1..elems.len() {
+            let mut j = i;
+            while j > 0 {
+                let order = if has_cmp {
+                    let r = self.call(cmp, &[elems[j - 1], elems[j]])?;
+                    self.realm.to_number(r)
+                } else {
+                    let a = self.realm.to_display_string(elems[j - 1]);
+                    let b = self.realm.to_display_string(elems[j]);
+                    if a < b {
+                        -1.0
+                    } else if a > b {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                };
+                if order > 0.0 {
+                    elems.swap(j - 1, j);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(elems)
     }
 
     fn run_body(&mut self, body: Body<'a>) -> Result<NanBox, ExecError> {
@@ -1092,6 +1248,39 @@ fn compound_op(op: AssignOp) -> Result<BinaryOp, ExecError> {
     })
 }
 
+/// Computes `[start, end)` char indices for `slice`, handling negative indices
+/// (from the end) and an `undefined` end (to the length), clamped to `[0, len]`.
+fn slice_bounds(start: f64, end_arg: NanBox, realm: &Realm, len: usize) -> (usize, usize) {
+    let clamp = |n: f64| -> usize {
+        if n < 0.0 {
+            (len as f64 + n).max(0.0) as usize
+        } else {
+            (n as usize).min(len)
+        }
+    };
+    let a = clamp(start);
+    let b = match end_arg.unpack() {
+        Unpacked::Undefined => len,
+        _ => clamp(realm.to_number(end_arg)),
+    };
+    (a, b.max(a))
+}
+
+/// `padStart`: left-pads `s` with `pad` (repeated/truncated) to `target` chars.
+fn pad_start(s: &str, target: usize, pad: &str) -> String {
+    let len = s.chars().count();
+    if len >= target || pad.is_empty() {
+        return String::from(s);
+    }
+    let need = target - len;
+    let mut filler = String::new();
+    while filler.chars().count() < need {
+        filler.push_str(pad);
+    }
+    let filler: String = filler.chars().take(need).collect();
+    filler + s
+}
+
 /// Quotes and escapes a string as a JSON string literal.
 fn json_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -1392,6 +1581,37 @@ mod tests {
         assert_eq!(run("Math.ceil(3.2)"), "4");
         assert_eq!(run("Math.round(3.5)"), "4");
         assert_eq!(run("Math.sqrt(144)"), "12");
+    }
+
+    #[test]
+    fn more_string_methods() {
+        assert_eq!(run("'hello world'.slice(0, 5)"), "hello");
+        assert_eq!(run("'hello'.slice(-3)"), "llo");
+        assert_eq!(run("'a,b,c'.split(',').join('|')"), "a|b|c");
+        assert_eq!(run("'hello'.startsWith('he')"), "true");
+        assert_eq!(run("'hello'.endsWith('lo')"), "true");
+        assert_eq!(run("'a-b-a'.replace('a', 'X')"), "X-b-a"); // first only
+        assert_eq!(run("'5'.padStart(3, '0')"), "005");
+    }
+
+    #[test]
+    fn more_array_methods() {
+        assert_eq!(run("[1, 2, 3, 4].slice(1, 3).join(',')"), "2,3");
+        assert_eq!(run("[1, 2].concat([3, 4], 5).join(',')"), "1,2,3,4,5");
+        assert_eq!(run("[1, 2, 3].reverse().join(',')"), "3,2,1");
+        assert_eq!(run("[1, 2, 3, 4].find(x => x > 2)"), "3");
+        assert_eq!(run("[1, 2, 3, 4].findIndex(x => x > 2)"), "2");
+        assert_eq!(run("[1, 2, 3].some(x => x === 2)"), "true");
+        assert_eq!(run("[1, 2, 3].every(x => x > 0)"), "true");
+        assert_eq!(run("[1, 2, 3].every(x => x > 1)"), "false");
+        // Default sort (string order) and comparator sort.
+        assert_eq!(run("[3, 1, 2].sort().join(',')"), "1,2,3");
+        assert_eq!(run("[10, 9, 100].sort().join(',')"), "10,100,9"); // string order
+        assert_eq!(
+            run("[10, 9, 100].sort((a, b) => a - b).join(',')"),
+            "9,10,100"
+        );
+        assert_eq!(run("[3, 1, 2].sort((a, b) => b - a).join(',')"), "3,2,1");
     }
 
     #[test]
