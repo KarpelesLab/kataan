@@ -2189,6 +2189,29 @@ impl<'a> Interp<'a> {
         };
         let handle = Handle::from_raw(raw);
 
+        // --- universal `Object.prototype` methods (own/inherited reflection) ---
+        match method {
+            "hasOwnProperty" => {
+                let key = self.realm.to_display_string(arg(0));
+                return Ok(Some(NanBox::boolean(self.realm.has_own(handle, &key))));
+            }
+            "isPrototypeOf" => {
+                let mut cur = arg(0).as_handle().map(Handle::from_raw);
+                while let Some(p) = cur.and_then(|h| self.realm.object_proto(h)) {
+                    if p == handle {
+                        return Ok(Some(NanBox::boolean(true)));
+                    }
+                    cur = Some(p);
+                }
+                return Ok(Some(NanBox::boolean(false)));
+            }
+            "propertyIsEnumerable" => {
+                let key = self.realm.to_display_string(arg(0));
+                return Ok(Some(NanBox::boolean(self.realm.has_own(handle, &key))));
+            }
+            _ => {}
+        }
+
         // --- `Function.prototype.call`/`apply`/`bind` on a callable receiver ---
         if self.is_callable(handle) {
             match method {
@@ -2380,6 +2403,27 @@ impl<'a> Interp<'a> {
                     .filter_map(|a| char::from_u32(self.realm.to_number(*a) as u32))
                     .collect();
                 return Ok(Some(self.new_str(&s)));
+            }
+            // `String.raw(strings, ...subs)` — interleave `strings.raw[i]` with
+            // each substitution (the cooked-escape-free template form).
+            Some(N_STRING) if method == "raw" => {
+                let raw = arg(0)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.get_property(h, "raw"))
+                    .and_then(|r| r.as_handle())
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
+                    .unwrap_or_default();
+                let subs = &args[1.min(args.len())..];
+                let mut out = String::new();
+                for (i, piece) in raw.iter().enumerate() {
+                    out.push_str(&self.realm.to_display_string(*piece));
+                    if let Some(s) = subs.get(i) {
+                        out.push_str(&self.realm.to_display_string(*s));
+                    }
+                }
+                return Ok(Some(self.new_str(&out)));
             }
             _ => {}
         }
@@ -4103,6 +4147,9 @@ impl<'a> Interp<'a> {
                     .iter()
                     .map(|q| self.new_str(q.cooked.as_deref().unwrap_or("")))
                     .collect();
+                // NOTE: the strings object should also carry a `.raw` array, but
+                // arrays can't hold named properties yet (`Cell::Array` has no
+                // object part) — see `[[latent-engine-conformance-bugs]]`.
                 let strings_arr = NanBox::handle(self.realm.new_array(strings).to_raw());
                 let mut args = alloc::vec![strings_arr];
                 for e in &quasi.expressions {
@@ -4588,10 +4635,17 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
-        if let Some((cid, _)) = self.realm.class_at(handle)
-            && let Some(v) = self.class_statics[cid as usize].get(name)
-        {
-            return Ok(*v);
+        // A class static — walking the `extends` chain for inherited statics.
+        if let Some((cid, _)) = self.realm.class_at(handle) {
+            let mut cur = Some(cid);
+            while let Some(c) = cur {
+                if let Some(v) = self.class_statics[c as usize].get(name) {
+                    return Ok(*v);
+                }
+                let class = self.classes[c as usize];
+                let env = self.class_envs[c as usize].clone();
+                cur = self.resolve_super(class, &env)?.map(|(pid, _)| pid);
+            }
         }
         if let Some((getter, _)) = self.realm.accessor(handle, name) {
             if matches!(getter.unpack(), Unpacked::Undefined) {
@@ -6482,6 +6536,26 @@ mod tests {
         );
         assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
         assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
+    }
+
+    #[test]
+    fn object_reflection_and_static_inheritance() {
+        assert_eq!(run("({a:1}).hasOwnProperty('a')"), "true");
+        assert_eq!(run("({a:1}).hasOwnProperty('b')"), "false");
+        // Static methods are inherited down the `extends` chain.
+        assert_eq!(
+            run("class A { static make(){ return 'made'; } } class B extends A {} B.make()"),
+            "made"
+        );
+        // `static m(){ return new this(); }` uses the receiver class.
+        assert_eq!(
+            run(
+                "class A { static create(){ return new this(); } get tag(){ return 'a'; } } class B extends A {} B.create().tag"
+            ),
+            "a"
+        );
+        // String.raw interleaves a raw-bearing object with substitutions.
+        assert_eq!(run("String.raw({ raw: ['a','b','c'] }, 1, 2)"), "a1b2c");
     }
 
     #[test]
