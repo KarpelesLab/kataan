@@ -107,6 +107,14 @@ pub enum Op {
         callee: Reg,
         args: Vec<Reg>,
     },
+    /// `dst = recv[key](args…)` — a method call: reads the closure at
+    /// `recv[key]` and invokes it with `this` bound to `recv`.
+    CallMethod {
+        dst: Reg,
+        recv: Reg,
+        key: String,
+        args: Vec<Reg>,
+    },
     /// `dst = native#id(args…)` — invoke a built-in (`console.log`, `Math.*`).
     CallNative {
         dst: Reg,
@@ -198,17 +206,19 @@ pub fn run_program_capturing(
 }
 
 fn call(ctx: &mut Ctx, funcs: &[FnProto], id: usize, args: &[NanBox]) -> Result<NanBox, VmError> {
-    call_with_captures(ctx, funcs, id, args, &[])
+    call_with(ctx, funcs, id, args, &[], NanBox::undefined())
 }
 
-/// Calls function `id` with `args` (registers `0..n_params`) and `captures`
-/// (registers `n_params..n_params + n_captures`).
-fn call_with_captures(
+/// Calls function `id` with `args` (registers `0..n_params`), `captures`
+/// (registers `n_params..n_params + n_captures`), and `this_val` (the register
+/// right after).
+fn call_with(
     ctx: &mut Ctx,
     funcs: &[FnProto],
     id: usize,
     args: &[NanBox],
     captures: &[NanBox],
+    this_val: NanBox,
 ) -> Result<NanBox, VmError> {
     let proto = &funcs[id];
     let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
@@ -217,6 +227,10 @@ fn call_with_captures(
     }
     for (i, c) in captures.iter().enumerate().take(proto.n_captures) {
         regs[proto.n_params + i] = *c;
+    }
+    // The `this` slot sits right after the captures.
+    if let Some(slot) = regs.get_mut(proto.n_params + proto.n_captures) {
+        *slot = this_val;
     }
     Ok(run_frame(ctx, funcs, &proto.ops, &mut regs)?.unwrap_or(NanBox::undefined()))
 }
@@ -409,7 +423,43 @@ fn run_frame(
                     .map(|i| ctx.realm.get_element(handle, i + 1))
                     .collect();
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                match call_with_captures(ctx, funcs, id, &argv, &caps) {
+                match call_with(ctx, funcs, id, &argv, &caps, NanBox::undefined()) {
+                    Ok(ret) => regs[*dst as usize] = ret,
+                    Err(VmError::Thrown(v)) => match handlers.pop() {
+                        Some((target, reg)) => {
+                            regs[reg as usize] = v;
+                            pc = target;
+                        }
+                        None => return Err(VmError::Thrown(v)),
+                    },
+                    Err(other) => return Err(other),
+                }
+            }
+            Op::CallMethod {
+                dst,
+                recv,
+                key,
+                args,
+            } => {
+                let recv_val = regs[*recv as usize];
+                let robj = object_handle(recv_val)?;
+                let f = ctx
+                    .realm
+                    .get_property(robj, key)
+                    .unwrap_or(NanBox::undefined());
+                let fh = object_handle(f)?;
+                let id = ctx
+                    .realm
+                    .get_element(fh, 0)
+                    .as_number()
+                    .ok_or(VmError::NotAnObject)? as usize;
+                let n_caps = ctx.realm.array_length(fh).unwrap_or(1).saturating_sub(1);
+                let caps: Vec<NanBox> = (0..n_caps)
+                    .map(|i| ctx.realm.get_element(fh, i + 1))
+                    .collect();
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                // Bind `this` to the receiver.
+                match call_with(ctx, funcs, id, &argv, &caps, recv_val) {
                     Ok(ret) => regs[*dst as usize] = ret,
                     Err(VmError::Thrown(v)) => match handlers.pop() {
                         Some((target, reg)) => {
@@ -998,6 +1048,9 @@ struct Compiler {
     /// Names in *this* function that are captured by a nested function and so
     /// must be stored as cells.
     cell_names: alloc::collections::BTreeSet<String>,
+    /// The register holding `this` (seeded by the caller at `n_params +
+    /// n_captures`).
+    this_reg: Reg,
     /// Per enclosing loop/switch: `break` jump indices awaiting the exit target
     /// (loops and `switch` both push here).
     break_sites: Vec<Vec<usize>>,
@@ -1030,10 +1083,12 @@ impl Compiler {
             ..Compiler::default()
         };
         c.scopes.push(alloc::collections::BTreeMap::new());
-        // The VM places arguments in registers `0..n_params` and captured cells
-        // in `n_params..n_params + n_captures`, so reserve those slots first…
+        // The VM places arguments in registers `0..n_params`, captured cells in
+        // `n_params..n_params + n_captures`, and `this` right after, so reserve
+        // those slots first…
         let arg_regs: Vec<Reg> = params.iter().map(|_| c.alloc()).collect();
         let cap_regs: Vec<Reg> = captures.iter().map(|_| c.alloc()).collect();
+        c.this_reg = c.alloc(); // = n_params + n_captures
         // …then bind. A captured parameter is boxed into a fresh cell (preserving
         // the incoming argument value); a captured local that's a parameter must
         // share the cell so mutations are visible.
@@ -1638,6 +1693,24 @@ impl Compiler {
                     self.ops.push(Op::Call { dst, func, args });
                     return Ok(dst);
                 }
+                // A method call `recv.method(args)` (named, non-computed
+                // property) binds `this` to the receiver.
+                if let Expr::Member {
+                    object,
+                    property: PropertyKey::Ident(key) | PropertyKey::Str(key),
+                    ..
+                } = &**callee
+                {
+                    let recv = self.expr(object)?;
+                    let dst = self.alloc();
+                    self.ops.push(Op::CallMethod {
+                        dst,
+                        recv,
+                        key: String::from(&**key),
+                        args,
+                    });
+                    return Ok(dst);
+                }
                 // Otherwise an indirect call through a function *value* (a local
                 // holding a function, or any callee expression).
                 let callee_reg = self.expr(callee)?;
@@ -1726,6 +1799,7 @@ impl Compiler {
                 self.write_var(b, next);
                 Ok(if *prefix { next } else { old })
             }
+            Expr::This(_) => Ok(self.this_reg),
             // A template literal: interleave cooked quasis with interpolations,
             // concatenating via the realm's `+` (ToString on each value).
             Expr::Template(t) => {
@@ -2263,6 +2337,41 @@ mod tests {
         let (bc, _) = execute(src).expect("ok");
         let (tw, _) = crate::nbexec::eval_source(src).expect("ok");
         assert_eq!(bc, tw);
+    }
+
+    #[test]
+    fn bytecode_this_and_methods() {
+        // A method using `this` on an object literal.
+        assert_eq!(
+            bc("let o = { x: 10, getX: function() { return this.x; } }; o.getX()"),
+            "10"
+        );
+        // A method mutating instance state via `this`.
+        assert_eq!(
+            bc(
+                "let c = { n: 0, inc: function() { this.n += 1; return this.n; } };
+                c.inc(); c.inc(); c.inc()"
+            ),
+            "3"
+        );
+        // A method calling another method on `this`.
+        assert_eq!(
+            bc("let calc = {
+                  v: 5,
+                  dbl: function() { return this.v * 2; },
+                  quad: function() { return this.dbl() * 2; }
+                };
+                calc.quad()"),
+            "20"
+        );
+        // `this` flows through nested object method calls.
+        assert_eq!(
+            bc(
+                "let acc = { total: 0, add: function(n) { this.total += n; return this; } };
+                acc.add(3); acc.add(4); acc.total"
+            ),
+            "7"
+        );
     }
 
     #[test]
