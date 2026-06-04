@@ -59,6 +59,9 @@ pub enum Op {
     ValueBin { dst: Reg, op: u8, a: Reg, b: Reg },
     /// `dst = (key in obj)` — own-property / array-index membership.
     HasProp { dst: Reg, key: Reg, obj: Reg },
+    /// `dst = obj is a built-in of `kind`` (`0`=RegExp, `1`=Array, `2`=Map,
+    /// `3`=Set) — for `instanceof RegExp`/`Array`/`Map`/`Set`.
+    IsBuiltin { dst: Reg, obj: Reg, kind: u8 },
     /// `dst = delete obj[key]` — removes own property `key`, yielding `true`.
     DeleteProp { dst: Reg, obj: Reg, key: Reg },
     /// Tags the object in `obj` with `class_id` (for `instanceof`).
@@ -141,6 +144,12 @@ pub enum Op {
         dst: Reg,
         is_set: bool,
         seed: Option<Reg>,
+    },
+    /// `dst = /source/flags` — a new `RegExp` value.
+    NewRegExp {
+        dst: Reg,
+        source: String,
+        flags: String,
     },
     /// `dst = a new empty object` (allocated in the realm's heap).
     NewObject { dst: Reg },
@@ -465,6 +474,19 @@ fn run_frame(
                 };
                 regs[*dst as usize] = NanBox::boolean(present);
             }
+            Op::IsBuiltin { dst, obj, kind } => {
+                let yes = regs[*obj as usize]
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| match kind {
+                        0 => ctx.realm.regexp_at(h).is_some(),
+                        1 => ctx.realm.is_array(h),
+                        2 => ctx.realm.collection_is_set(h) == Some(false),
+                        3 => ctx.realm.collection_is_set(h) == Some(true),
+                        _ => false,
+                    });
+                regs[*dst as usize] = NanBox::boolean(yes);
+            }
             Op::DeleteProp { dst, obj, key } => {
                 let removed = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
                     Some(h) => {
@@ -733,6 +755,10 @@ fn run_frame(
                     .unwrap_or_default();
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(rest).to_raw());
             }
+            Op::NewRegExp { dst, source, flags } => {
+                let h = ctx.realm.new_regexp(source, flags);
+                regs[*dst as usize] = NanBox::handle(h.to_raw());
+            }
             Op::NewObject { dst } => {
                 let handle = ctx.realm.new_object();
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
@@ -952,6 +978,129 @@ fn call_closure(
 /// Dispatches a built-in `Array`/`String` instance method on the fast path.
 /// Returns `None` when `key` isn't a recognized method (the caller then routes
 /// the program to the tree-walker).
+/// Builds a regex match result object `{ 0: whole, 1: g1, …, index, input,
+/// length }` (the shape `RegExp.exec` / `String.match` return).
+#[cfg(feature = "regex")]
+fn regex_match_object(realm: &mut Realm, text: &str, caps: &crate::regex::Captures) -> NanBox {
+    let obj = realm.new_object();
+    for (i, g) in caps.groups.iter().enumerate() {
+        let v = match g {
+            Some((s, e)) => NanBox::handle(realm.new_string(&text[*s..*e]).to_raw()),
+            None => NanBox::undefined(),
+        };
+        realm.set_property(obj, &alloc::format!("{i}"), v);
+    }
+    let index = caps.groups.first().and_then(|g| *g).map_or(0, |(s, _)| s);
+    realm.set_property(obj, "index", NanBox::number(index as f64));
+    let input = NanBox::handle(realm.new_string(text).to_raw());
+    realm.set_property(obj, "input", input);
+    realm.set_property(obj, "length", NanBox::number(caps.groups.len() as f64));
+    NanBox::handle(obj.to_raw())
+}
+
+/// Dispatches `RegExp` instance methods (`test`/`exec`) and the regex-backed
+/// `String` methods (`match`/`replace`/`replaceAll`/`split`/`search` when given
+/// a `RegExp`). Returns `None` if `key`/`recv` aren't a regex operation.
+#[cfg(feature = "regex")]
+fn regex_method(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    key: &str,
+    args: &[NanBox],
+) -> Option<Result<NanBox, VmError>> {
+    use crate::regex::Regex;
+    let h = recv.as_handle().map(Handle::from_raw)?;
+    let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
+
+    // `re.test(s)` / `re.exec(s)`.
+    if let Some((source, flags)) = ctx.realm.regexp_at(h) {
+        if !matches!(key, "test" | "exec") {
+            return None;
+        }
+        let text = ctx.realm.to_display_string(arg0);
+        let Ok(re) = Regex::new(&source, &flags) else {
+            return Some(Ok(NanBox::null()));
+        };
+        return Some(Ok(match key {
+            "test" => NanBox::boolean(re.is_match(&text)),
+            _ => match re.captures_from(&text, 0) {
+                Some(caps) => regex_match_object(ctx.realm, &text, &caps),
+                None => NanBox::null(),
+            },
+        }));
+    }
+
+    // `str.match/replace/replaceAll/split/search(re)` — only when the argument
+    // is a RegExp (string-argument forms stay in `builtin_method`).
+    let text = ctx.realm.string_value(h)?;
+    if !matches!(key, "match" | "replace" | "replaceAll" | "split" | "search") {
+        return None;
+    }
+    let (src, flags) = arg0
+        .as_handle()
+        .map(Handle::from_raw)
+        .and_then(|rh| ctx.realm.regexp_at(rh))?;
+    let Ok(re) = Regex::new(&src, &flags) else {
+        return Some(Ok(NanBox::null()));
+    };
+    let global = flags.contains('g');
+    let result = match key {
+        "search" => {
+            let i = re
+                .find_from(&text, 0)
+                .map_or(-1.0, |(s, _)| text[..s].chars().count() as f64);
+            NanBox::number(i)
+        }
+        "match" if !global => match re.captures_from(&text, 0) {
+            Some(caps) => regex_match_object(ctx.realm, &text, &caps),
+            None => NanBox::null(),
+        },
+        "match" => {
+            // Global match → an array of the whole matches.
+            let mut out = Vec::new();
+            let mut pos = 0;
+            while let Some((s, e)) = re.find_from(&text, pos) {
+                out.push(NanBox::handle(ctx.realm.new_string(&text[s..e]).to_raw()));
+                pos = if e > s { e } else { e + 1 };
+            }
+            if out.is_empty() {
+                NanBox::null()
+            } else {
+                NanBox::handle(ctx.realm.new_array(out).to_raw())
+            }
+        }
+        "replace" | "replaceAll" => {
+            let repl = ctx
+                .realm
+                .to_display_string(args.get(1).copied().unwrap_or(NanBox::undefined()));
+            NanBox::handle(ctx.realm.new_string(&re.replace(&text, &repl)).to_raw())
+        }
+        // "split"
+        _ => {
+            let mut out = Vec::new();
+            let mut last = 0;
+            let mut pos = 0;
+            while let Some((s, e)) = re.find_from(&text, pos) {
+                if e == s {
+                    pos = e + 1;
+                    if pos > text.len() {
+                        break;
+                    }
+                    continue;
+                }
+                out.push(NanBox::handle(
+                    ctx.realm.new_string(&text[last..s]).to_raw(),
+                ));
+                last = e;
+                pos = e;
+            }
+            out.push(NanBox::handle(ctx.realm.new_string(&text[last..]).to_raw()));
+            NanBox::handle(ctx.realm.new_array(out).to_raw())
+        }
+    };
+    Some(Ok(result))
+}
+
 fn builtin_method(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -962,6 +1111,12 @@ fn builtin_method(
     use crate::nanbox::Unpacked;
     let h = recv.as_handle().map(Handle::from_raw)?;
     let arg0 = || args.first().copied().unwrap_or(NanBox::undefined());
+
+    // --- RegExp / regex-backed String methods (when the `regex` feature is on) ---
+    #[cfg(feature = "regex")]
+    if let Some(r) = regex_method(ctx, recv, key, args) {
+        return Some(r);
+    }
 
     // --- array methods ---
     if ctx.realm.is_array(h) {
@@ -3298,6 +3453,23 @@ impl Compiler {
                     }
                     return Ok(dst);
                 }
+                // `x instanceof RegExp/Array/Map/Set` (built-in heap types).
+                if matches!(op, BinaryOp::Instanceof)
+                    && let Expr::Ident(cls) = &**right
+                    && let Some(kind) = match &*cls.name {
+                        "RegExp" => Some(0u8),
+                        "Array" => Some(1),
+                        "Map" => Some(2),
+                        "Set" => Some(3),
+                        _ => None,
+                    }
+                    && self.classes.get(&*cls.name).is_none()
+                {
+                    let obj = self.expr(left)?;
+                    let dst = self.alloc();
+                    self.ops.push(Op::IsBuiltin { dst, obj, kind });
+                    return Ok(dst);
+                }
                 let a = self.expr(left)?;
                 let b = self.expr(right)?;
                 if matches!(op, BinaryOp::In) {
@@ -3668,6 +3840,16 @@ impl Compiler {
                 Ok(if *prefix { next } else { old })
             }
             Expr::This(_) => Ok(self.this_reg),
+            // A regex literal `/source/flags`.
+            Expr::Regex { pattern, flags, .. } => {
+                let dst = self.alloc();
+                self.ops.push(Op::NewRegExp {
+                    dst,
+                    source: String::from(&**pattern),
+                    flags: String::from(&**flags),
+                });
+                Ok(dst)
+            }
             // A comma sequence: evaluate all, yield the last.
             Expr::Sequence { expressions, .. } => {
                 let mut last = self.constant(NanBox::undefined())?;
@@ -3759,6 +3941,24 @@ impl Compiler {
                         src: msg,
                     });
                     return Ok(dst);
+                }
+                // `new RegExp(source, flags)` (string-literal args) → a regex.
+                if &*id.name == "RegExp" && self.classes.get("RegExp").is_none() {
+                    let lit = |a: Option<&crate::ast::Argument>| match a {
+                        Some(crate::ast::Argument::Item(Expr::Str { value, .. })) => {
+                            Some(String::from(&**value))
+                        }
+                        None => Some(String::new()),
+                        _ => None,
+                    };
+                    if let (Some(source), Some(flags)) =
+                        (lit(arguments.first()), lit(arguments.get(1)))
+                    {
+                        let dst = self.alloc();
+                        self.ops.push(Op::NewRegExp { dst, source, flags });
+                        return Ok(dst);
+                    }
+                    return Err(CompileError::Unsupported("new RegExp with dynamic args"));
                 }
                 // `new Array(...items)` → an array of the arguments.
                 if &*id.name == "Array" && self.classes.get("Array").is_none() {
@@ -4873,6 +5073,36 @@ mod tests {
             bc("[{ n: 1 }, { n: 2 }, { n: 3 }].map(({ n }) => n * 10).join(',')"),
             "10,20,30"
         );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn bytecode_regex() {
+        // test / exec.
+        assert_eq!(bc(r"/^\d{4}-\d{2}-\d{2}$/.test('2026-06-04')"), "true");
+        assert_eq!(bc(r"/^\d+$/.test('12a')"), "false");
+        assert_eq!(bc(r"/(\w+)\s+(\w+)/.exec('hello world')[2]"), "world");
+        assert_eq!(bc(r"/(\w+)\s+(\w+)/.exec('hello world').index"), "0");
+        // String.match (single + global).
+        assert_eq!(bc(r"'a1b2c3'.match(/\d/g).join('')"), "123");
+        assert_eq!(bc(r"'key=value'.match(/(\w+)=(\w+)/)[2]"), "value");
+        // String.replace with captures + global.
+        assert_eq!(
+            bc(r"'John Smith'.replace(/(\w+)\s(\w+)/, '$2, $1')"),
+            "Smith, John"
+        );
+        assert_eq!(bc(r"'aaa'.replace(/a/g, 'b')"), "bbb");
+        // split / search.
+        assert_eq!(bc(r"'1, 2,3 ,4'.split(/\s*,\s*/).join('|')"), "1|2|3|4");
+        assert_eq!(bc(r"'find the needle'.search(/needle/)"), "9");
+        assert_eq!(bc(r"'nope'.search(/xyz/)"), "-1");
+        // new RegExp + instanceof RegExp.
+        assert_eq!(bc(r#"new RegExp('\\d+', 'g').test('abc123')"#), "true");
+        assert_eq!(bc(r"/x/ instanceof RegExp"), "true");
+        assert_eq!(bc(r"[] instanceof Array"), "true");
+        assert_eq!(bc(r"new Map() instanceof Map"), "true");
+        assert_eq!(bc(r"new Set() instanceof Set"), "true");
+        assert_eq!(bc(r"[] instanceof Map"), "false");
     }
 
     #[test]
