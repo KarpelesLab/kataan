@@ -30,6 +30,9 @@ pub struct Object {
     /// Accessor properties: `(name, getter, setter)`, both held as value
     /// handles (`undefined` when absent). Kept out of the shape's slot layout.
     accessors: Vec<(alloc::boxed::Box<str>, NanBox, NanBox)>,
+    /// Own keys that are **non-enumerable** (e.g. class methods): present in the
+    /// slots and readable, but hidden from `Object.keys`/spread/`for-in`/JSON.
+    hidden: Vec<alloc::boxed::Box<str>>,
     /// The class this object was instantiated from (for `instanceof`), if any.
     class_tag: Option<u32>,
 }
@@ -44,6 +47,7 @@ impl Object {
             shape: root,
             slots: Vec::new(),
             accessors: Vec::new(),
+            hidden: Vec::new(),
             class_tag: None,
         }
     }
@@ -134,6 +138,29 @@ impl Object {
     #[must_use]
     pub fn keys(&self) -> Vec<&str> {
         self.shape.keys()
+    }
+
+    /// The own **enumerable** property names (excludes keys marked hidden).
+    #[must_use]
+    pub fn enumerable_keys(&self) -> Vec<&str> {
+        self.shape
+            .keys()
+            .into_iter()
+            .filter(|k| !self.is_hidden(k))
+            .collect()
+    }
+
+    /// Marks own property `key` non-enumerable (idempotent).
+    pub fn set_hidden(&mut self, key: &str) {
+        if !self.is_hidden(key) {
+            self.hidden.push(alloc::boxed::Box::from(key));
+        }
+    }
+
+    /// Whether own property `key` is non-enumerable.
+    #[must_use]
+    pub fn is_hidden(&self, key: &str) -> bool {
+        self.hidden.iter().any(|k| k.as_ref() == key)
     }
 
     /// Deletes own property `key`, rebuilding the shape/slots from `root` without

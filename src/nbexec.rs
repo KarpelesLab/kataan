@@ -1272,7 +1272,8 @@ impl<'a> Interp<'a> {
                 self.current = saved;
                 match m.kind {
                     MethodKind::Method => {
-                        self.realm.set_property(instance, &key, f);
+                        // Methods are callable but non-enumerable.
+                        self.realm.set_hidden_property(instance, &key, f);
                     }
                     MethodKind::Get => {
                         self.realm
@@ -4247,6 +4248,24 @@ mod tests {
         assert_eq!(
             run("class C { #s = 1; constructor(){ this.p = 2; } } Object.keys(new C()).join(',')"),
             "p"
+        );
+    }
+
+    #[test]
+    fn class_methods_are_non_enumerable() {
+        // Methods are callable but absent from enumeration (only public fields
+        // show up), and `{...obj}` spread skips them too.
+        assert_eq!(
+            run(
+                "class C { m(){ return 1; } constructor(){ this.a = 1; this.b = 2; } } Object.keys(new C()).join(',')"
+            ),
+            "a,b"
+        );
+        assert_eq!(
+            run(
+                "class C { greet(){ return 'hi'; } } let c = new C(); c.greet() + ':' + Object.keys({ ...c }).length"
+            ),
+            "hi:0"
         );
     }
 

@@ -13,4 +13,4 @@ assert.sameValue(b.read(), 42, "private field round-trips");
 
 b.pub = 7;
 // The private field never appears in enumeration.
-assert.sameValue(Object.keys(b).indexOf("#value"), -1, "private field is hidden");
+assert.sameValue(Object.keys(b).join(","), "pub", "private field and methods are non-enumerable");

@@ -287,11 +287,12 @@ impl Realm {
     pub fn object_keys(&self, handle: Handle) -> Option<Vec<alloc::string::String>> {
         let obj = self.heap.get(handle)?.as_object()?;
         Some(
-            obj.keys()
+            obj.enumerable_keys()
                 .iter()
                 // Private fields are stored under a `#`-prefixed key and are
                 // never enumerable (so they stay out of `Object.keys`, spread,
-                // `for-in`, and JSON).
+                // `for-in`, and JSON). Methods are marked hidden via
+                // `enumerable_keys`.
                 .filter(|s| !s.starts_with('#'))
                 .map(|s| alloc::string::String::from(*s))
                 .collect(),
@@ -415,6 +416,21 @@ impl Realm {
         match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             Some(obj) => {
                 obj.set(key, value);
+                self.write_barrier(handle, value);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Sets own property `key` to `value` but marks it **non-enumerable** — used
+    /// for class methods, which are callable but must stay out of `Object.keys`,
+    /// spread, `for-in`, and JSON.
+    pub fn set_hidden_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
+        match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            Some(obj) => {
+                obj.set(key, value);
+                obj.set_hidden(key);
                 self.write_barrier(handle, value);
                 true
             }
