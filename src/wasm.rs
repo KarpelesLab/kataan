@@ -8,7 +8,8 @@
 //! numeric kernel can be handed to a Wasm runtime instead of interpreted.
 //!
 //! It lowers `let`/assignment locals (incl. compound `+=`/`-=`/`*=`/`/=` and
-//! `++`/`--`), arithmetic, `%`, comparisons, `Math.*`, ternaries, `if`/`else`,
+//! `++`/`--`), arithmetic, `%`, int32 bitwise ops (`&`/`|`/`^`/`<<`/`>>`/`>>>`/
+//! `~`, via f64↔i32 conversion), comparisons, `Math.*`, ternaries, `if`/`else`,
 //! `while`/`for`/`do-while` loops (as structured `block`/`loop`/`br_if`, with
 //! `break`/`continue` in any loop lowered to the right `br` target — `for`/
 //! `do-while` use an inner `continue`-block so `continue` still runs the update/
@@ -334,6 +335,46 @@ fn emit_expr(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmErro
         } => {
             emit_expr(argument, out, depth)?;
             out.push_str(&format!("{pad}f64.neg\n"));
+        }
+        // `~a` → ToInt32, `xor -1`, widen back to f64.
+        Expr::Unary {
+            op: UnaryOp::BitNot,
+            argument,
+            ..
+        } => {
+            emit_expr(argument, out, depth)?;
+            out.push_str(&format!(
+                "{pad}i32.trunc_sat_f64_s\n{pad}i32.const -1\n{pad}i32.xor\n{pad}f64.convert_i32_s\n"
+            ));
+        }
+        // Bitwise ops: JS coerces both sides to int32, operates, and returns an
+        // int32 (`>>>` unsigned). Lower as f64→i32, the i32 op, then i32→f64.
+        Expr::Binary {
+            op:
+                op @ (BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::Ushr),
+            left,
+            right,
+            ..
+        } => {
+            emit_expr(left, out, depth)?;
+            out.push_str(&format!("{pad}i32.trunc_sat_f64_s\n"));
+            emit_expr(right, out, depth)?;
+            out.push_str(&format!("{pad}i32.trunc_sat_f64_s\n"));
+            let (mnemonic, widen) = match op {
+                BinaryOp::BitAnd => ("i32.and", "f64.convert_i32_s"),
+                BinaryOp::BitOr => ("i32.or", "f64.convert_i32_s"),
+                BinaryOp::BitXor => ("i32.xor", "f64.convert_i32_s"),
+                BinaryOp::Shl => ("i32.shl", "f64.convert_i32_s"),
+                BinaryOp::Shr => ("i32.shr_s", "f64.convert_i32_s"),
+                // `>>>` is unsigned: widen the result as unsigned.
+                _ => ("i32.shr_u", "f64.convert_i32_u"),
+            };
+            out.push_str(&format!("{pad}{mnemonic}\n{pad}{widen}\n"));
         }
         // `a % b` has no native f64 instruction; compute `a - trunc(a/b) * b`.
         // (Operands are re-emitted; in the numeric subset they are side-effect
@@ -904,6 +945,47 @@ fn emit_expr_bin(
             emit_expr_bin(argument, locals, fns, out)?;
             out.push(0x9a); // f64.neg
         }
+        // `~a` → ToInt32, `xor -1`, widen back to f64.
+        Expr::Unary {
+            op: UnaryOp::BitNot,
+            argument,
+            ..
+        } => {
+            emit_expr_bin(argument, locals, fns, out)?;
+            out.extend_from_slice(&[0xfc, 0x02]); // i32.trunc_sat_f64_s
+            out.push(0x41); // i32.const
+            out.push(0x7f); // -1 as signed LEB128
+            out.push(0x73); // i32.xor
+            out.push(0xb7); // f64.convert_i32_s
+        }
+        // Bitwise ops: f64→i32 (saturating), the i32 op, then i32→f64.
+        Expr::Binary {
+            op:
+                op @ (BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::Ushr),
+            left,
+            right,
+            ..
+        } => {
+            emit_expr_bin(left, locals, fns, out)?;
+            out.extend_from_slice(&[0xfc, 0x02]); // i32.trunc_sat_f64_s
+            emit_expr_bin(right, locals, fns, out)?;
+            out.extend_from_slice(&[0xfc, 0x02]);
+            let (opcode, widen) = match op {
+                BinaryOp::BitAnd => (0x71u8, 0xb7u8), // i32.and, f64.convert_i32_s
+                BinaryOp::BitOr => (0x72, 0xb7),
+                BinaryOp::BitXor => (0x73, 0xb7),
+                BinaryOp::Shl => (0x74, 0xb7),
+                BinaryOp::Shr => (0x75, 0xb7), // i32.shr_s
+                _ => (0x76, 0xb8),             // i32.shr_u, f64.convert_i32_u (>>>)
+            };
+            out.push(opcode);
+            out.push(widen);
+        }
         // `a % b` = `a - trunc(a/b) * b` (no native f64 rem).
         Expr::Binary {
             op: BinaryOp::Mod,
@@ -1221,6 +1303,21 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_bitwise_operators() {
+        let src =
+            "function f(a, b) { return (a & b) + (a | b) + (a ^ b) + (a << 1) + (b >> 1) + (~a); }";
+        let wat = module(src);
+        assert!(wat.contains("i32.and"));
+        assert!(wat.contains("i32.trunc_sat_f64_s"));
+        assert!(wat.contains("f64.convert_i32_s"));
+        assert_well_formed(&wat);
+        let wasm = binary(src);
+        assert!(wasm.windows(2).any(|w| w == [0xfc, 0x02])); // i32.trunc_sat_f64_s
+        assert!(wasm.contains(&0x71)); // i32.and
+        section_ids(&wasm);
     }
 
     #[test]
