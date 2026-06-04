@@ -58,6 +58,8 @@ struct FnState {
     locals: Vec<(String, Reg)>,
     /// Names visible from enclosing functions, to detect (unsupported) captures.
     enclosing: Vec<String>,
+    /// The enclosing-loop stack, for resolving `break`/`continue` jumps.
+    loops: Vec<LoopCtx>,
 }
 
 impl FnState {
@@ -67,8 +69,15 @@ impl FnState {
             next_reg: 0,
             locals: Vec::new(),
             enclosing,
+            loops: Vec::new(),
         }
     }
+}
+
+/// Unresolved `break`/`continue` jump sites for one loop.
+struct LoopCtx {
+    break_jumps: Vec<usize>,
+    continue_jumps: Vec<usize>,
 }
 
 struct Compiler {
@@ -230,13 +239,142 @@ impl Compiler {
                 let top = self.code_len();
                 let cond = self.expr(test)?;
                 let jf = self.emit(Op::JumpIfFalse { cond, offset: 0 });
+                self.push_loop();
                 self.stmt(body)?;
+                let ctx = self.pop_loop();
+                // `continue` re-evaluates the test.
+                for j in &ctx.continue_jumps {
+                    self.patch_jump(*j, top);
+                }
                 let back = self.emit(Op::Jump { offset: 0 });
                 self.patch_jump(back, top);
                 self.patch_to_here(jf);
+                for j in &ctx.break_jumps {
+                    self.patch_to_here(*j);
+                }
+                Ok(None)
+            }
+            Stmt::DoWhile { body, test, .. } => {
+                let top = self.code_len();
+                self.push_loop();
+                self.stmt(body)?;
+                let ctx = self.pop_loop();
+                // `continue` jumps to the post-body test.
+                let test_pos = self.code_len();
+                for j in &ctx.continue_jumps {
+                    self.patch_jump(*j, test_pos);
+                }
+                let cond = self.expr(test)?;
+                let back = self.emit(Op::JumpIfTrue { cond, offset: 0 });
+                self.patch_jump(back, top);
+                for j in &ctx.break_jumps {
+                    self.patch_to_here(*j);
+                }
+                Ok(None)
+            }
+            Stmt::For {
+                init,
+                test,
+                update,
+                body,
+                ..
+            } => self.compile_for(init.as_ref(), test.as_deref(), update.as_deref(), body),
+            Stmt::Break { label: None, .. } => {
+                let j = self.emit(Op::Jump { offset: 0 });
+                self.add_break(j)?;
+                Ok(None)
+            }
+            Stmt::Continue { label: None, .. } => {
+                let j = self.emit(Op::Jump { offset: 0 });
+                self.add_continue(j)?;
                 Ok(None)
             }
             _ => Err(CompileError::unsupported("statement in bytecode mode")),
+        }
+    }
+
+    /// Compiles a C-style `for (init; test; update) body`.
+    fn compile_for(
+        &mut self,
+        init: Option<&crate::ast::ForInit>,
+        test: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Stmt,
+    ) -> Result<Option<Reg>, CompileError> {
+        use crate::ast::ForInit;
+        let mark = self.funcs.last().expect("fn").locals.len();
+        match init {
+            Some(ForInit::Var(decl)) => {
+                self.stmt(&Stmt::Var(decl.clone()))?;
+            }
+            Some(ForInit::Expr(e)) => {
+                self.expr(e)?;
+            }
+            None => {}
+        }
+        let top = self.code_len();
+        let exit = match test {
+            Some(t) => {
+                let cond = self.expr(t)?;
+                Some(self.emit(Op::JumpIfFalse { cond, offset: 0 }))
+            }
+            None => None,
+        };
+        self.push_loop();
+        self.stmt(body)?;
+        let ctx = self.pop_loop();
+        // `continue` runs the update step.
+        let update_pos = self.code_len();
+        for j in &ctx.continue_jumps {
+            self.patch_jump(*j, update_pos);
+        }
+        if let Some(u) = update {
+            self.expr(u)?;
+        }
+        let back = self.emit(Op::Jump { offset: 0 });
+        self.patch_jump(back, top);
+        if let Some(ej) = exit {
+            self.patch_to_here(ej);
+        }
+        for j in &ctx.break_jumps {
+            self.patch_to_here(*j);
+        }
+        self.funcs.last_mut().expect("fn").locals.truncate(mark);
+        Ok(None)
+    }
+
+    // --- loop context (break/continue) ----------------------------------
+
+    fn push_loop(&mut self) {
+        self.funcs.last_mut().expect("fn").loops.push(LoopCtx {
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
+        });
+    }
+    fn pop_loop(&mut self) -> LoopCtx {
+        self.funcs
+            .last_mut()
+            .expect("fn")
+            .loops
+            .pop()
+            .expect("a current loop")
+    }
+    fn add_break(&mut self, idx: usize) -> Result<(), CompileError> {
+        match self.funcs.last_mut().expect("fn").loops.last_mut() {
+            Some(l) => {
+                l.break_jumps.push(idx);
+                Ok(())
+            }
+            None => Err(CompileError::unsupported("`break` outside a loop")),
+        }
+    }
+    fn add_continue(&mut self, idx: usize) -> Result<(), CompileError> {
+        match self.funcs.last_mut().expect("fn").loops.last_mut() {
+            Some(l) => {
+                l.continue_jumps.push(idx);
+                Ok(())
+            }
+            None => Err(CompileError::unsupported("`continue` outside a loop")),
         }
     }
 

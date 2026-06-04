@@ -181,6 +181,46 @@ fn bytecode_vm_object_array_literals() {
 }
 
 #[test]
+fn bytecode_vm_loops() {
+    // C-style for loop.
+    assert_eq!(
+        eval_bc("let s = 0; for (let i = 0; i < 5; i += 1) s += i; s"),
+        "10"
+    );
+    // for with break.
+    assert_eq!(
+        eval_bc(
+            "let out = 0; for (let i = 0; i < 100; i += 1) { if (i === 7) { out = i; break; } } out"
+        ),
+        "7"
+    );
+    // for with continue (sum of evens 0..10).
+    assert_eq!(
+        eval_bc(
+            "let s = 0; for (let i = 0; i < 10; i += 1) { if (i % 2 === 1) continue; s += i; } s"
+        ),
+        "20"
+    );
+    // while with break/continue.
+    assert_eq!(
+        eval_bc(
+            "let n = 0; let i = 0; while (i < 10) { i += 1; if (i % 2 === 1) continue; n += 1; } n"
+        ),
+        "5"
+    );
+    // do-while runs the body at least once.
+    assert_eq!(
+        eval_bc("let i = 0; let count = 0; do { count += 1; i += 1; } while (i < 3); count"),
+        "3"
+    );
+    // A factorial via a for loop calling nothing.
+    assert_eq!(
+        eval_bc("let f = 1; for (let i = 1; i <= 5; i += 1) f *= i; f"),
+        "120"
+    );
+}
+
+#[test]
 fn bytecode_vm_falls_back_on_captures() {
     // A closure over an enclosing local is reported as unsupported, so a caller
     // can fall back to the tree-walker.
