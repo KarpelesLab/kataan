@@ -1,7 +1,7 @@
 //! The abstract syntax tree produced by the [`parser`](crate::parser).
 //!
 //! The AST is a conventional boxed-enum tree: every node carries a source
-//! [`Span`], and child nodes are owned via [`Box`]/[`Vec`]. It is deliberately
+//! [`Span`], and child nodes are owned via `Box`/`Vec`. It is deliberately
 //! *transient* — the compiler lowers it to position-independent bytecode (which
 //! is the artifact that gets serialized and cached, see `ROADMAP.md` §2.2), so
 //! the AST itself is thrown away after compilation and is optimized for clarity

@@ -342,11 +342,22 @@ impl<'a> Interp<'a> {
         let iterable = self.eval_expr(right, env)?;
         let items: Vec<Value<'a>> = match &iterable {
             Value::Object(o) if o.is_array() => o.elements().expect("array").borrow().clone(),
+            Value::Object(o) if o.as_collection().is_some() => {
+                let c = o.as_collection().unwrap().borrow();
+                if c.is_set {
+                    c.entries.iter().map(|(k, _)| k.clone()).collect()
+                } else {
+                    c.entries
+                        .iter()
+                        .map(|(k, v)| Value::Object(Obj::array(alloc::vec![k.clone(), v.clone()])))
+                        .collect()
+                }
+            }
             Value::Str(s) => s
                 .chars()
                 .map(|c| Value::str(alloc::string::String::from(c)))
                 .collect(),
-            _ => return Err(Value::str("value is not iterable (for-of)")),
+            _ => return Err(make_error("TypeError", "value is not iterable (for-of)")),
         };
         for item in items {
             let scope = Scope::child(env);
@@ -1287,6 +1298,18 @@ impl<'a> Interp<'a> {
                 out.extend(o.elements().expect("array").borrow().iter().cloned());
                 Ok(())
             }
+            // A `Set` spreads its values; a `Map` spreads `[key, value]` pairs.
+            Value::Object(o) if o.as_collection().is_some() => {
+                let c = o.as_collection().unwrap().borrow();
+                if c.is_set {
+                    out.extend(c.entries.iter().map(|(k, _)| k.clone()));
+                } else {
+                    out.extend(c.entries.iter().map(|(k, v)| {
+                        Value::Object(Obj::array(alloc::vec![k.clone(), v.clone()]))
+                    }));
+                }
+                Ok(())
+            }
             Value::Str(s) => {
                 out.extend(
                     s.chars()
@@ -1294,7 +1317,7 @@ impl<'a> Interp<'a> {
                 );
                 Ok(())
             }
-            _ => Err(Value::str("value is not iterable (spread)")),
+            _ => Err(make_error("TypeError", "value is not iterable (spread)")),
         }
     }
 

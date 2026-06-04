@@ -2,12 +2,14 @@
 //!
 //! Kataan uses a hand-written recursive-descent parser with a precedence
 //! ladder for binary operators (predictable performance, good diagnostics, no
-//! parser-generator dependency). This module currently implements the
-//! **expression** grammar (Phase B, increment 1); statements, declarations,
-//! functions, classes, destructuring patterns, and modules follow.
+//! parser-generator dependency). It covers the full ECMAScript grammar —
+//! expressions, statements and declarations, functions/arrows, destructuring
+//! patterns, classes, generators/async, and module `import`/`export` — split
+//! across the `stmt`, `function`, `class`, and `module` submodules.
 //!
 //! The parser pre-tokenizes the whole input via the [`Lexer`], so it walks a
-//! `Vec<Token>` with O(1) lookahead. Literal values are decoded by [`cook`].
+//! `Vec<Token>` with O(1) lookahead. Literal values are decoded by the `cook`
+//! submodule.
 
 mod class;
 mod cook;

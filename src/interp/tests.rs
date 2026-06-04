@@ -413,6 +413,16 @@ fn sets() {
         eval("let s = new Set([3, 1, 3, 2, 1]); s.values().join(',')"),
         "3,1,2"
     );
+    // Spread and for-of over a Set / Map.
+    assert_eq!(eval("[...new Set([1, 1, 2, 3])].join(',')"), "1,2,3");
+    assert_eq!(
+        eval("let t = 0; for (const x of new Set([4, 5])) t += x; t"),
+        "9"
+    );
+    assert_eq!(
+        eval("let out = ''; for (const [k, v] of new Map([['a', 1], ['b', 2]])) out += k + v; out"),
+        "a1b2"
+    );
 }
 
 #[test]

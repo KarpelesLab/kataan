@@ -467,15 +467,21 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
 
 - **Phase C — Tree-walk MVP → object model** 🚧 **in progress**
   A correct (not yet fast) evaluator to validate semantics, *then* the
-  performance-oriented object model. **Done so far:** the tree-walking
-  interpreter (`src/interp/`) — primitives + full operator/coercion set,
-  control flow, functions/closures/`this`, a provisional object/array model,
-  member access, destructuring, `for-of`/`for-in`, and a first standard-library
-  slice (Math, JSON, Object statics, Array/String prototype methods, the Number
-  globals); `kataan run app.js` with a minimal `console`. **Next:** classes &
-  `new` at runtime, `Error`/`Symbol`/`Map`/`Set`/`Date`/`RegExp` and `Promise`,
-  then the *real* object model — NaN-boxed `Value`, shapes/inline caches, and
-  the GC — plus the first Test262 numbers.
+  performance-oriented object model. **Done so far:** a broad tree-walking
+  interpreter (`src/interp/`) that runs real programs — primitives + the full
+  operator/coercion set, all control flow, functions/closures/arrows with
+  `this`, a provisional `Rc`-based object/array model with prototype chains,
+  member access + getters/setters, classes with fields/methods/statics/static
+  blocks, single inheritance with `super(...)`/`super.method()`, `new`,
+  `instanceof`, `in`, destructuring everywhere, `for-of`/`for-in`, Error
+  objects (engine-raised TypeError/ReferenceError are catchable), `Map`/`Set`,
+  and a substantial standard library (Math, JSON parse/stringify, Object
+  statics, the full Array/String/Number method sets, the Number globals).
+  `kataan run app.js` with a minimal `console`, plus an interactive `repl`.
+  **Next:** `Date`, `RegExp` (over the in-house regex engine), generators and
+  `Promise` + a microtask queue, then the *real* object model — NaN-boxed
+  `Value`, shapes/inline caches, and the GC — which is also the gateway to the
+  Phase-D bytecode VM. First Test262 numbers land here.
 
 - **Phase D — Bytecode VM**
   AST→register-bytecode compiler, the interpreter loop, inline caches,

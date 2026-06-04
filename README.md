@@ -7,10 +7,14 @@ tri-modal model proven out in the sibling projects
 [`purecrypto`](https://github.com/KarpelesLab/purecrypto) (cryptography) and
 [`rsurl`](https://github.com/KarpelesLab/rsurl) (HTTP/curl).
 
-> **Status: early development (Phase A).** The lexer and the crate/C-ABI
-> scaffolding are in place and tested. The parser, bytecode VM, garbage
-> collector, and standard library are being built out per the
-> [roadmap](ROADMAP.md).
+> **Status: early but running (Phase C).** The lexer and the full ECMAScript
+> parser are complete, and a tree-walking interpreter already executes real
+> programs — functions/closures, classes with inheritance, objects/arrays,
+> destructuring, getters/setters, `Map`/`Set`, error handling, and a
+> substantial standard library (Math, JSON, Object/Array/String/Number). The
+> performance-oriented object model (NaN-boxing, hidden classes, GC), the
+> bytecode VM and JIT tiers, the host runtime, and the WASM engine are being
+> built out per the [roadmap](ROADMAP.md).
 
 ## Why
 
@@ -51,31 +55,42 @@ opt back in with a scoped `#[allow(unsafe_code)]` and a safety comment.
 
 ## Try it
 
-The CLI currently exposes the lexer (the first pipeline stage):
+The CLI runs JavaScript today:
 
 ```console
-$ cargo run -- lex -e 'const f = (x) => `n=${x * 2}`;'
-   0..5    Keyword(Const)           "const"
-   6..7    Identifier               "f"
-   8..9    Eq                       "="
-  10..11   LParen                   "("
-  11..12   Identifier               "x"
-  12..13   RParen                   ")"
-  14..16   Arrow                    "=>"
-  17..21   TemplateHead             "`n=${"
-  21..22   Identifier               "x"
-  23..24   Star                     "*"
-  25..26   Number                   "2"
-  26..28   TemplateTail             "}`"
-  28..29   Semicolon                ";"
-  29..29   Eof
+$ cargo run -- run -e '
+class Animal { constructor(n){ this.n = n } speak(){ return `${this.n} makes a sound` } }
+class Dog extends Animal { speak(){ return `${this.n} barks` } }
+console.log(new Dog("Rex").speak());
+console.log([1,2,3,4].filter(x => x % 2).map(x => x*x).reduce((a,b)=>a+b, 0));
+console.log(JSON.stringify({ ok: true, items: [...new Set([1,1,2,3])] }));
+'
+Rex barks
+10
+{"ok":true,"items":[1,2,3]}
 ```
 
+It also exposes each pipeline stage, and an interactive REPL:
+
 ```console
+$ cargo run -- lex   -e 'x => x * 2'   # token stream
+$ cargo run -- parse -e 'x => x * 2'   # AST dump
+$ cargo run -- repl                    # interactive session
 $ cargo run -- --help
 ```
 
 ## Use as a Rust library
+
+```rust
+use kataan::parser::Parser;
+use kataan::interp::Interp;
+
+let program = Parser::parse_program("const sq = x => x * x; sq(8)").unwrap();
+let mut interp = Interp::new();
+assert_eq!(interp.run(&program).unwrap().to_js_string(), "64");
+```
+
+The lower stages are available directly too:
 
 ```rust
 use kataan::lexer::{Lexer, TokenKind};
