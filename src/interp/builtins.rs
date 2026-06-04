@@ -1436,6 +1436,15 @@ fn string_method<'a>(s: &str, name: &str, args: &[Value<'a>]) -> Option<Value<'a
                 .get(i)
                 .map_or(Value::Number(f64::NAN), |c| Value::Number(*c as u32 as f64))
         }
+        // Kataan strings are sequences of Unicode scalar values (one `char` per
+        // index), so `codePointAt` returns the full code point at the index; out
+        // of range yields `undefined` (per spec, unlike `charCodeAt`'s `NaN`).
+        "codePointAt" => {
+            let i = arg(args, 0).to_number() as usize;
+            chars
+                .get(i)
+                .map_or(Value::Undefined, |c| Value::Number(*c as u32 as f64))
+        }
         "indexOf" => {
             let needle = arg(args, 0).to_js_string();
             Value::Number(

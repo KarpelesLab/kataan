@@ -2241,6 +2241,11 @@ fn string_methods() {
     assert_eq!(eval("'ab'.repeat(3)"), "ababab");
     assert_eq!(eval("'hello'.charAt(1)"), "e");
     assert_eq!(eval("'hello'.startsWith('he')"), "true");
+    // codePointAt returns the full code point; out of range is undefined.
+    assert_eq!(eval("'ABC'.codePointAt(0)"), "65");
+    assert_eq!(eval("'\\u{1F600}'.codePointAt(0)"), "128512");
+    assert_eq!(eval("'x'.codePointAt(5)"), "undefined");
+    assert_eq!(eval("String.fromCodePoint(72, 105)"), "Hi");
     // substring clamps to [0, len] and swaps when start > end.
     assert_eq!(eval("'hello'.substring(1, 3)"), "el");
     assert_eq!(eval("'hello'.substring(3, 1)"), "el");
