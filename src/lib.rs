@@ -100,6 +100,12 @@ pub mod nbvm;
 #[cfg(feature = "alloc")]
 pub mod nbeval;
 
+/// Executes real statements (variables, scope, control flow, assignment) over
+/// the `Realm`/`NanBox` model — the imperative core on the new representation.
+/// Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod nbexec;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
