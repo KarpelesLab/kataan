@@ -87,8 +87,10 @@ pub enum Op {
     GetElem { dst: Reg, arr: Reg, index: Reg },
     /// `arr[index] = src` (grows the array if needed).
     SetElem { arr: Reg, index: Reg, src: Reg },
-    /// `dst = arr.length`.
+    /// `dst = arr.length` (array length or string character count).
     ArrayLen { dst: Reg, arr: Reg },
+    /// `dst = coll.size` (a `Map`/`Set`'s entry count).
+    CollectionSize { dst: Reg, recv: Reg },
     /// Appends the value in `src` to array `arr` (grows it).
     ArrayPush { arr: Reg, src: Reg },
     /// Appends every element of the array in `src` to `arr` (a spread).
@@ -96,6 +98,13 @@ pub enum Op {
     /// `dst = src.slice(from)` — a new array of `src`'s elements from index
     /// `from` (a numeric register) onward (for a rest pattern).
     ArraySliceFrom { dst: Reg, src: Reg, from: Reg },
+    /// `dst = a new `Map`/`Set``, optionally seeded from the iterable array in
+    /// `seed` (a `Set` from its elements, a `Map` from `[k, v]` pairs).
+    NewCollection {
+        dst: Reg,
+        is_set: bool,
+        seed: Option<Reg>,
+    },
     /// `dst = a new empty object` (allocated in the realm's heap).
     NewObject { dst: Reg },
     /// `obj[key] = src` (own property set through the object's shape).
@@ -442,8 +451,26 @@ fn run_frame(
             }
             Op::ArrayLen { dst, arr } => {
                 let handle = object_handle(regs[*arr as usize])?;
-                let len = ctx.realm.array_length(handle).unwrap_or(0);
+                // `.length` on an array, or a string's character count.
+                let len = ctx.realm.array_length(handle).unwrap_or_else(|| {
+                    ctx.realm
+                        .string_value(handle)
+                        .map_or(0, |s| s.chars().count())
+                });
                 regs[*dst as usize] = NanBox::number(len as f64);
+            }
+            Op::CollectionSize { dst, recv } => {
+                let h = object_handle(regs[*recv as usize])?;
+                let n = ctx
+                    .realm
+                    .collection_size(h)
+                    .or_else(|| {
+                        ctx.realm
+                            .get_property(h, "size")
+                            .and_then(|v| v.as_number().map(|n| n as usize))
+                    })
+                    .unwrap_or(0);
+                regs[*dst as usize] = NanBox::number(n as f64);
             }
             Op::ArrayPush { arr, src } => {
                 let handle = object_handle(regs[*arr as usize])?;
@@ -462,6 +489,29 @@ fn run_frame(
                 for (i, e) in elems.into_iter().enumerate() {
                     ctx.realm.set_element(handle, start + i, e);
                 }
+            }
+            Op::NewCollection { dst, is_set, seed } => {
+                let coll = ctx.realm.new_collection(*is_set);
+                if let Some(seed) = seed
+                    && let Some(sh) = regs[*seed as usize].as_handle().map(Handle::from_raw)
+                {
+                    let items = ctx
+                        .realm
+                        .array_elements(sh)
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_default();
+                    for item in items {
+                        if *is_set {
+                            ctx.realm.collection_set(coll, item, item);
+                        } else if let Some(ih) = item.as_handle().map(Handle::from_raw) {
+                            // A `[key, value]` pair.
+                            let k = ctx.realm.get_element(ih, 0);
+                            let v = ctx.realm.get_element(ih, 1);
+                            ctx.realm.collection_set(coll, k, v);
+                        }
+                    }
+                }
+                regs[*dst as usize] = NanBox::handle(coll.to_raw());
             }
             Op::ArraySliceFrom { dst, src, from } => {
                 let srch = object_handle(regs[*src as usize])?;
@@ -885,6 +935,51 @@ fn builtin_method(
                         .collect()
                 };
                 NanBox::handle(ctx.realm.new_array(parts).to_raw())
+            }
+            _ => return None,
+        };
+        return Some(Ok(result));
+    }
+
+    // --- Map / Set methods ---
+    if let Some(is_set) = ctx.realm.collection_is_set(h) {
+        let result = match key {
+            "set" if !is_set => {
+                let v = args.get(1).copied().unwrap_or(NanBox::undefined());
+                ctx.realm.collection_set(h, arg0(), v);
+                recv // chainable
+            }
+            "add" if is_set => {
+                ctx.realm.collection_set(h, arg0(), arg0());
+                recv
+            }
+            "get" => ctx
+                .realm
+                .collection_get(h, arg0())
+                .unwrap_or(NanBox::undefined()),
+            "has" => NanBox::boolean(ctx.realm.collection_has(h, arg0())),
+            "delete" => NanBox::boolean(ctx.realm.collection_delete(h, arg0())),
+            "forEach" => {
+                let f = arg0();
+                for (k, v) in ctx.realm.collection_entries(h).unwrap_or_default() {
+                    // Callback receives (value, key) per the JS signature.
+                    if let Err(e) = call_closure(ctx, funcs, f, &[v, k], NanBox::undefined()) {
+                        return Some(Err(e));
+                    }
+                }
+                NanBox::undefined()
+            }
+            "keys" | "values" | "entries" => {
+                let entries = ctx.realm.collection_entries(h).unwrap_or_default();
+                let items: Vec<NanBox> = entries
+                    .into_iter()
+                    .map(|(k, v)| match key {
+                        "keys" => k,
+                        "values" => v,
+                        _ => NanBox::handle(ctx.realm.new_array(alloc::vec![k, v]).to_raw()),
+                    })
+                    .collect();
+                NanBox::handle(ctx.realm.new_array(items).to_raw())
             }
             _ => return None,
         };
@@ -2727,6 +2822,19 @@ impl Compiler {
                 let Expr::Ident(id) = &**callee else {
                     return Err(CompileError::Unsupported("new on non-class"));
                 };
+                // Built-in `new Map()` / `new Set()` (optionally seeded).
+                if (&*id.name == "Map" || &*id.name == "Set")
+                    && self.classes.get(&*id.name).is_none()
+                {
+                    let is_set = &*id.name == "Set";
+                    let seed = match arguments.first() {
+                        Some(crate::ast::Argument::Item(e)) => Some(self.expr(e)?),
+                        _ => None,
+                    };
+                    let dst = self.alloc();
+                    self.ops.push(Op::NewCollection { dst, is_set, seed });
+                    return Ok(dst);
+                }
                 let Some(info) = self.classes.get(&*id.name).cloned() else {
                     return Err(CompileError::Unsupported("new on unknown class"));
                 };
@@ -3067,6 +3175,8 @@ impl Compiler {
                 let key = static_key(property)?;
                 if key == "length" {
                     self.ops.push(Op::ArrayLen { dst, arr: obj });
+                } else if key == "size" {
+                    self.ops.push(Op::CollectionSize { dst, recv: obj });
                 } else {
                     self.ops.push(Op::GetProp { dst, obj, key });
                 }
@@ -3563,6 +3673,42 @@ mod tests {
                 let o = new C(); o.a + o.b + o.c"),
             "6"
         );
+    }
+
+    #[test]
+    fn bytecode_map_and_set() {
+        // Map: set/get/has/size, chaining, delete.
+        assert_eq!(
+            bc("let m = new Map(); m.set('a', 1).set('b', 2); m.get('a') + m.get('b')"),
+            "3"
+        );
+        assert_eq!(
+            bc("let m = new Map(); m.set('k', 9); '' + m.has('k') + ',' + m.size"),
+            "true,1"
+        );
+        assert_eq!(
+            bc("let m = new Map(); m.set('x', 1); m.delete('x'); m.size"),
+            "0"
+        );
+        // Map seeded from pairs; iterate entries.
+        assert_eq!(
+            bc(
+                "let m = new Map([['a', 1], ['b', 2]]); let s = 0; m.forEach((v) => { s += v; }); s"
+            ),
+            "3"
+        );
+        assert_eq!(
+            bc("let m = new Map([['a', 1], ['b', 2]]); m.keys().join(',')"),
+            "a,b"
+        );
+        // Set: add/has/size, dedup, seeded.
+        assert_eq!(bc("let s = new Set(); s.add(1).add(2).add(1); s.size"), "2");
+        assert_eq!(
+            bc("let s = new Set([1, 2, 3, 2, 1]); s.size + ',' + s.has(3)"),
+            "3,true"
+        );
+        // String .length on the bytecode path.
+        assert_eq!(bc("'hello'.length"), "5");
     }
 
     #[test]
