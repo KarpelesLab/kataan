@@ -179,6 +179,12 @@ impl Realm {
         Some(self.heap.get(handle)?.as_collection()?.1.to_vec())
     }
 
+    /// Whether the collection at `handle` is a `Set` (vs a `Map`).
+    #[must_use]
+    pub fn collection_is_set(&self, handle: Handle) -> Option<bool> {
+        Some(self.heap.get(handle)?.as_collection()?.0)
+    }
+
     /// The native-function id at `handle`, or `None` if it is not a native.
     #[must_use]
     pub fn native_at(&self, handle: Handle) -> Option<u16> {

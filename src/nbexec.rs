@@ -1415,6 +1415,25 @@ impl<'a> Interp<'a> {
                 finalizer,
                 ..
             } => self.exec_try(block, handler.as_ref(), finalizer.as_deref()),
+            Stmt::ForOf {
+                left, right, body, ..
+            } => {
+                let iterable = self.eval(right)?;
+                let values = self.iterate_values(iterable)?;
+                self.exec_for_each(left, body, values)
+            }
+            Stmt::ForIn {
+                left, right, body, ..
+            } => {
+                let obj = self.eval(right)?;
+                let keys = self.iterate_keys(obj);
+                self.exec_for_each(left, body, keys)
+            }
+            Stmt::Switch {
+                discriminant,
+                cases,
+                ..
+            } => self.exec_switch(discriminant, cases),
             _ => Err(ExecError::Unsupported("statement")),
         }
     }
@@ -1557,6 +1576,152 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The values iterated by `for-of`: array elements, string chars, `Set`
+    /// values, or `Map` `[key, value]` pairs.
+    fn iterate_values(&mut self, v: NanBox) -> Result<Vec<NanBox>, ExecError> {
+        let Some(h) = v.as_handle().map(Handle::from_raw) else {
+            return Err(ExecError::Throw(self.new_str("value is not iterable")));
+        };
+        if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
+            return Ok(elems);
+        }
+        if let Some(s) = self.realm.string_value(h) {
+            let chars: Vec<char> = s.chars().collect();
+            return Ok(chars
+                .iter()
+                .map(|c| self.new_str(&String::from(*c)))
+                .collect());
+        }
+        if let Some(entries) = self.realm.collection_entries(h) {
+            if self.realm.collection_is_set(h) == Some(true) {
+                return Ok(entries.iter().map(|(k, _)| *k).collect());
+            }
+            let mut out = Vec::with_capacity(entries.len());
+            for (k, v) in entries {
+                out.push(NanBox::handle(
+                    self.realm.new_array(alloc::vec![k, v]).to_raw(),
+                ));
+            }
+            return Ok(out);
+        }
+        Err(ExecError::Throw(self.new_str("value is not iterable")))
+    }
+
+    /// The keys iterated by `for-in`: object property names or array indices,
+    /// as strings.
+    fn iterate_keys(&mut self, v: NanBox) -> Vec<NanBox> {
+        let Some(h) = v.as_handle().map(Handle::from_raw) else {
+            return Vec::new();
+        };
+        if let Some(len) = self.realm.array_length(h) {
+            return (0..len)
+                .map(|i| self.new_str(&alloc::format!("{i}")))
+                .collect();
+        }
+        self.realm
+            .object_keys(h)
+            .unwrap_or_default()
+            .iter()
+            .map(|k| self.new_str(k))
+            .collect()
+    }
+
+    /// Runs `body` once per `item`, binding the loop variable (a fresh scope per
+    /// iteration for a declared head).
+    fn exec_for_each(
+        &mut self,
+        left: &'a crate::ast::ForLeft,
+        body: &'a Stmt,
+        items: Vec<NanBox>,
+    ) -> Result<Flow, ExecError> {
+        use crate::ast::ForLeft;
+        for item in items {
+            let child = self.current.child();
+            let saved = core::mem::replace(&mut self.current, child);
+            let r = (|| {
+                match left {
+                    ForLeft::Decl { target, .. } => self.bind_pattern(target, item)?,
+                    ForLeft::Target(expr) => {
+                        self.assign_to(expr, item)?;
+                    }
+                }
+                self.exec(body)
+            })();
+            self.current = saved;
+            match r? {
+                Flow::Break => break,
+                Flow::Return(v) => return Ok(Flow::Return(v)),
+                Flow::Normal(_) | Flow::Continue => {}
+            }
+        }
+        Ok(Flow::Normal(NanBox::undefined()))
+    }
+
+    /// Assigns `value` to an existing target (an identifier or member).
+    fn assign_to(&mut self, target: &'a Expr, value: NanBox) -> Result<(), ExecError> {
+        match target {
+            Expr::Ident(id) => {
+                if !self.current.set(&id.name, value) {
+                    self.current.declare(&id.name, value);
+                }
+                Ok(())
+            }
+            Expr::Member {
+                object, property, ..
+            } => {
+                let obj = self.eval(object)?;
+                if let Some(raw) = obj.as_handle() {
+                    self.assign_member(Handle::from_raw(raw), property, value)?;
+                }
+                Ok(())
+            }
+            _ => Err(ExecError::Unsupported("assignment target")),
+        }
+    }
+
+    fn exec_switch(
+        &mut self,
+        discriminant: &'a Expr,
+        cases: &'a [crate::ast::SwitchCase],
+    ) -> Result<Flow, ExecError> {
+        let value = self.eval(discriminant)?;
+        // Find the first matching `case` (strict equality), else `default`.
+        let mut start = None;
+        for (i, case) in cases.iter().enumerate() {
+            if let Some(test) = &case.test {
+                let t = self.eval(test)?;
+                if self.realm.strict_equals(value, t) {
+                    start = Some(i);
+                    break;
+                }
+            }
+        }
+        if start.is_none() {
+            start = cases.iter().position(|c| c.test.is_none());
+        }
+        let Some(start) = start else {
+            return Ok(Flow::Normal(NanBox::undefined()));
+        };
+        // Run from the matched clause, falling through until `break`.
+        let child = self.current.child();
+        let saved = core::mem::replace(&mut self.current, child);
+        let result = (|| {
+            for case in &cases[start..] {
+                for stmt in &case.body {
+                    match self.exec(stmt)? {
+                        Flow::Break => return Ok(Flow::Normal(NanBox::undefined())),
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Continue => return Ok(Flow::Continue),
+                        Flow::Normal(_) => {}
+                    }
+                }
+            }
+            Ok(Flow::Normal(NanBox::undefined()))
+        })();
+        self.current = saved;
+        result
     }
 
     fn exec_for(
@@ -2530,6 +2695,55 @@ mod tests {
         // typeof an async function is function; its call returns a promise.
         assert_eq!(run("async function a() {} typeof a"), "function");
         assert_eq!(run("async function a() { return 1; } typeof a()"), "object");
+    }
+
+    #[test]
+    fn for_of_for_in_switch() {
+        // for-of over an array, a string, a Set, and a Map.
+        assert_eq!(run("let s = 0; for (const x of [1, 2, 3]) s += x; s"), "6");
+        assert_eq!(
+            run("let r = ''; for (const c of 'abc') r += c + '.'; r"),
+            "a.b.c."
+        );
+        assert_eq!(
+            run("let s = 0; for (const v of new Set([1, 2, 3, 2])) s += v; s"),
+            "6"
+        );
+        assert_eq!(
+            run("let r = ''; for (const [k, v] of new Map([['a', 1], ['b', 2]])) r += k + v; r"),
+            "a1b2"
+        );
+        // for-of with break/continue.
+        assert_eq!(
+            run("let s = 0; for (const x of [1, 2, 3, 4]) { if (x === 3) break; s += x; } s"),
+            "3"
+        );
+        // for-in over object keys and array indices.
+        assert_eq!(
+            run("let r = ''; for (const k in { a: 1, b: 2 }) r += k; r"),
+            "ab"
+        );
+        assert_eq!(
+            run("let r = ''; for (const i in ['x', 'y', 'z']) r += i; r"),
+            "012"
+        );
+        // for-of binding to an existing variable (no declaration).
+        assert_eq!(run("let x; let s = 0; for (x of [10, 20]) s += x; s"), "30");
+        // switch with fall-through and default.
+        assert_eq!(
+            run("function f(n) {
+                   let r = '';
+                   switch (n) {
+                     case 1: r += 'one';
+                     case 2: r += 'two'; break;
+                     case 3: r += 'three'; break;
+                     default: r += 'other';
+                   }
+                   return r;
+                 }
+                 f(1) + '|' + f(2) + '|' + f(3) + '|' + f(9)"),
+            "onetwo|two|three|other"
+        );
     }
 
     #[test]
