@@ -1,0 +1,88 @@
+//! End-to-end validation of the WebAssembly binary emitter: compile JS numeric
+//! functions to a `.wasm` module, then instantiate and run it on a *real*
+//! WebAssembly engine (Node's) and check the results.
+//!
+//! This proves the emitted bytes are not just well-framed but genuinely valid,
+//! executable WebAssembly. It is skipped (passing) when `node` is unavailable,
+//! so it never blocks environments without it.
+
+use kataan::parser::Parser;
+use std::process::Command;
+
+/// Whether a `node` with `WebAssembly` is on PATH.
+fn node_available() -> bool {
+    Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn emitted_wasm_runs_on_a_real_engine() {
+    if !node_available() {
+        eprintln!("wasm_exec: node unavailable — skipping the runtime validation");
+        return;
+    }
+
+    let src = "
+        function add(a, b) { return a + b; }
+        function max(a, b) { return a > b ? a : b; }
+        function fib(n) {
+          let a = 0; let b = 1; let i = 0;
+          while (i < n) { let t = a + b; a = b; b = t; i = i + 1; }
+          return a;
+        }
+        function sq(x) { return x * x; }
+        function hyp2(a, b) { return sq(a) + sq(b); }
+    ";
+    let program = Parser::parse_program(src).expect("parse");
+    let wasm = kataan::wasm::compile_module_binary(&program).expect("compile to wasm");
+
+    let dir = std::env::temp_dir();
+    let wasm_path = dir.join("kataan_wasm_exec_test.wasm");
+    std::fs::write(&wasm_path, &wasm).expect("write wasm");
+
+    // A Node driver that instantiates the module and prints the results we check.
+    let driver = format!(
+        r#"
+        const fs = require('fs');
+        const buf = fs.readFileSync({path:?});
+        WebAssembly.instantiate(buf).then(({{ instance }}) => {{
+          const e = instance.exports;
+          const out = [
+            e.add(2, 3),
+            e.max(4, 9),
+            e.max(9, 4),
+            e.fib(10),
+            e.fib(20),
+            e.hyp2(3, 4),
+          ];
+          console.log(out.join(','));
+        }}).catch(err => {{ console.error('INVALID:' + err.message); process.exit(1); }});
+        "#,
+        path = wasm_path.to_string_lossy()
+    );
+    let driver_path = dir.join("kataan_wasm_exec_driver.js");
+    std::fs::write(&driver_path, driver).expect("write driver");
+
+    let output = Command::new("node")
+        .arg(&driver_path)
+        .output()
+        .expect("run node");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "node failed to run the emitted wasm: {stderr}"
+    );
+    // add=5, max(4,9)=9, max(9,4)=9, fib(10)=55, fib(20)=6765, hyp2(3,4)=25.
+    assert_eq!(
+        stdout.trim(),
+        "5,9,9,55,6765,25",
+        "wasm produced wrong results"
+    );
+
+    let _ = std::fs::remove_file(&wasm_path);
+    let _ = std::fs::remove_file(&driver_path);
+}
