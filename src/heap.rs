@@ -21,6 +21,10 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+/// The base of the high generation range reserved for compaction-produced
+/// slots, kept disjoint from the low generations that free/reuse produce.
+const COMPACT_GEN_BASE: u16 = 0x8000;
+
 /// A stable reference to a heap slot: an index plus the generation it was live
 /// in. Comparing the stored generation against the slot's detects staleness.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -71,6 +75,12 @@ pub struct Heap<T> {
     free: Vec<u32>,
     /// The number of live (occupied) slots.
     live: usize,
+    /// The generation stamped on slots produced by the next compaction. Drawn
+    /// from a high range (`>= COMPACT_GEN_BASE`) disjoint from the low
+    /// generations free/reuse produces, so a *new* (forwarded) handle can never
+    /// equal an *old* handle key — which keeps reference fix-up idempotent even
+    /// for shared, off-heap structures (closure scopes) visited more than once.
+    compact_gen: u16,
     /// The **remembered set**: slot indices of old-generation objects that have
     /// been written with a young pointer since the last minor collection (the
     /// write barrier records them). A minor collection scans only these as old
@@ -92,6 +102,7 @@ impl<T> Heap<T> {
             slots: Vec::new(),
             free: Vec::new(),
             live: 0,
+            compact_gen: COMPACT_GEN_BASE,
             remembered: BTreeSet::new(),
         }
     }
@@ -261,6 +272,53 @@ impl<T> Heap<T> {
     /// generation boundary).
     pub fn clear_remembered(&mut self) {
         self.remembered.clear();
+    }
+
+    /// Compacts the `keep` (live) objects to the front of the slot table,
+    /// discarding everything else, and returns the forwarding map
+    /// `(old_handle → new_handle)`. Slot generations reset to `0`, so every
+    /// pre-compaction handle is invalid *except* via the returned map — the
+    /// moving collector uses it to fix up references. Ages (generations
+    /// survived) are preserved; the free list and remembered set are cleared.
+    pub fn compact_to(&mut self, keep: &BTreeSet<Handle>) -> Vec<(Handle, Handle)> {
+        // A fresh high-range generation for this compaction's slots, disjoint
+        // from any old handle's generation.
+        let new_gen = self.compact_gen;
+        self.compact_gen = self.compact_gen.wrapping_add(1).max(COMPACT_GEN_BASE);
+
+        let old_slots = core::mem::take(&mut self.slots);
+        self.free.clear();
+        self.remembered.clear();
+        let mut new_slots: Vec<Slot<T>> = Vec::new();
+        let mut map: Vec<(Handle, Handle)> = Vec::new();
+        for (i, slot) in old_slots.into_iter().enumerate() {
+            if let Slot::Occupied {
+                generation,
+                age,
+                value,
+            } = slot
+            {
+                let old = Handle {
+                    index: i as u32,
+                    generation,
+                };
+                if keep.contains(&old) {
+                    let new = Handle {
+                        index: new_slots.len() as u32,
+                        generation: new_gen,
+                    };
+                    new_slots.push(Slot::Occupied {
+                        generation: new_gen,
+                        age,
+                        value,
+                    });
+                    map.push((old, new));
+                }
+            }
+        }
+        self.slots = new_slots;
+        self.live = self.slots.len();
+        map
     }
 
     /// Frees the slot behind `handle`, returning its value. The slot's

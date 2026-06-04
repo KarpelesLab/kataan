@@ -160,6 +160,27 @@ impl Object {
         true
     }
 
+    /// Rewrites every outgoing handle through `forward` — the mutating mirror of
+    /// [`trace_handles`](Object::trace_handles), used by a moving collector to
+    /// fix up references after relocation.
+    pub fn relocate_handles(
+        &mut self,
+        forward: &dyn Fn(crate::heap::Handle) -> crate::heap::Handle,
+    ) {
+        let fwd = |v: &mut NanBox| {
+            if let Some(raw) = v.as_handle() {
+                *v = NanBox::handle(forward(crate::heap::Handle::from_raw(raw)).to_raw());
+            }
+        };
+        for slot in &mut self.slots {
+            fwd(slot);
+        }
+        for (_, g, s) in &mut self.accessors {
+            fwd(g);
+            fwd(s);
+        }
+    }
+
     /// Calls `visit` for every heap [`Handle`](crate::heap::Handle) this object
     /// references through a slot — the outgoing edges a tracing collector
     /// follows.

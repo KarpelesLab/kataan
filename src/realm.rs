@@ -455,6 +455,14 @@ impl Realm {
         gc::collect_minor(&mut self.heap, roots)
     }
 
+    /// Runs a **moving (compacting)** collection: keeps everything reachable from
+    /// `roots`, relocates the survivors to the front of the heap (defragmenting
+    /// the slot table), and rewrites every reference — including the caller's
+    /// `roots`, updated in place — to the new locations. Returns the statistics.
+    pub fn compact(&mut self, roots: &mut [Handle]) -> Stats {
+        gc::compact(&mut self.heap, roots)
+    }
+
     // --- value operations (the VM's `+`, `ToString`, `===` over heap values) ---
 
     /// Whether `v` is a heap string.
@@ -1200,6 +1208,41 @@ mod tests {
         assert_eq!(stats.swept, 1); // the unreachable string
         assert!(realm.is_live(obj) && realm.is_live(name) && realm.is_live(items));
         assert_eq!(realm.string_value(name).as_deref(), Some("widget"));
+    }
+
+    #[test]
+    fn compaction_defragments_and_fixes_up_the_object_graph() {
+        let mut realm = Realm::new();
+        // obj.name -> string; obj.items -> array; array[0] -> obj (a cycle),
+        // with unreachable garbage interleaved to create gaps.
+        let _g0 = realm.new_string("garbage0");
+        let obj = realm.new_object();
+        let name = realm.new_string("widget");
+        let _g1 = realm.new_object();
+        let items = realm.new_array(alloc::vec![NanBox::handle(obj.to_raw())]);
+        realm.set_property(obj, "name", NanBox::handle(name.to_raw()));
+        realm.set_property(obj, "items", NanBox::handle(items.to_raw()));
+        assert_eq!(realm.object_count(), 5);
+
+        let mut roots = [obj];
+        let stats = realm.compact(&mut roots);
+        assert_eq!(stats.marked, 3); // obj, name, items
+        assert_eq!(stats.swept, 2); // the two garbage objects
+        assert_eq!(realm.object_count(), 3); // slot table defragmented
+
+        // The root was rewritten; the whole graph resolves through new handles.
+        let obj2 = roots[0];
+        let name2 = realm.get_property(obj2, "name").unwrap();
+        assert_eq!(
+            realm
+                .string_value(Handle::from_raw(name2.as_handle().unwrap()))
+                .as_deref(),
+            Some("widget")
+        );
+        let items2 = realm.get_property(obj2, "items").unwrap();
+        let arr = Handle::from_raw(items2.as_handle().unwrap());
+        // array[0] still points back at the (relocated) object — the cycle held.
+        assert_eq!(realm.get_element(arr, 0).as_handle(), Some(obj2.to_raw()));
     }
 
     #[test]

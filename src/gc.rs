@@ -28,6 +28,14 @@ pub trait Trace {
     fn trace(&self, visit: &mut dyn FnMut(Handle));
 }
 
+/// A heap object whose outgoing handles can be **rewritten** — needed by a
+/// moving (compacting) collector, which relocates objects and then fixes up
+/// every reference to point at the new location.
+pub trait Relocate {
+    /// Replaces each outgoing handle `h` with `forward(h)`.
+    fn relocate(&mut self, forward: &dyn Fn(Handle) -> Handle);
+}
+
 /// Statistics from a [`collect`] cycle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Stats {
@@ -125,6 +133,38 @@ pub fn collect_minor<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
     }
 }
 
+/// Runs a **moving (compacting)** collection: marks from `roots`, relocates the
+/// live objects to the front of the heap's slot table (eliminating the gaps that
+/// sweeping leaves), and rewrites every reference — inside surviving objects and
+/// in `roots` (updated in place) — to the new locations.
+///
+/// Compaction restores allocation locality and lets the slot table shrink, at
+/// the cost of rewriting pointers; it pairs with the tracing collector above.
+pub fn compact<T: Trace + Relocate>(heap: &mut Heap<T>, roots: &mut [Handle]) -> Stats {
+    let before = heap.len();
+    let marked = mark(heap, roots.iter().copied());
+
+    // Relocate live objects densely; `map` forwards old handle → new handle.
+    let map: alloc::collections::BTreeMap<Handle, Handle> =
+        heap.compact_to(&marked).into_iter().collect();
+    let forward = |h: Handle| map.get(&h).copied().unwrap_or(h);
+
+    // Fix up every reference: inside each relocated object, then the roots.
+    for handle in heap.live_handles() {
+        if let Some(obj) = heap.get_mut(handle) {
+            obj.relocate(&forward);
+        }
+    }
+    for r in roots.iter_mut() {
+        *r = forward(*r);
+    }
+
+    Stats {
+        marked: marked.len(),
+        swept: before - marked.len(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +188,14 @@ mod tests {
         fn trace(&self, visit: &mut dyn FnMut(Handle)) {
             for &e in &self.edges {
                 visit(e);
+            }
+        }
+    }
+
+    impl Relocate for Node {
+        fn relocate(&mut self, forward: &dyn Fn(Handle) -> Handle) {
+            for e in &mut self.edges {
+                *e = forward(*e);
             }
         }
     }
@@ -267,6 +315,52 @@ mod tests {
         let stats = collect_minor(&mut heap, &[old]);
         assert_eq!(stats.swept, 1);
         assert!(!heap.is_live(young));
+    }
+
+    #[test]
+    fn compaction_relocates_survivors_and_fixes_references() {
+        // a -> b, and a gap (c) between them; d is unreachable garbage.
+        let mut heap: Heap<Node> = Heap::new();
+        let b = heap.alloc(Node::new(2));
+        let _c = heap.alloc(Node::new(3)); // becomes garbage (a gap)
+        let mut a_node = Node::new(1);
+        a_node.edges.push(b);
+        let a = heap.alloc(a_node);
+        let _d = heap.alloc(Node::new(4)); // garbage
+
+        let mut roots = [a];
+        let stats = compact(&mut heap, &mut roots);
+        assert_eq!(stats.marked, 2);
+        assert_eq!(stats.swept, 2);
+
+        // The roots were rewritten to the new locations; the graph is intact.
+        let a2 = roots[0];
+        assert_eq!(heap.get(a2).unwrap().tag, 1);
+        let b2 = heap.get(a2).unwrap().edges[0];
+        assert_eq!(heap.get(b2).unwrap().tag, 2);
+        // The slot table is dense (only the 2 survivors remain).
+        assert_eq!(heap.len(), 2);
+        assert_eq!(heap.live_handles().len(), 2);
+    }
+
+    #[test]
+    fn compaction_preserves_a_reachable_cycle() {
+        let mut heap: Heap<Node> = Heap::new();
+        let x = heap.alloc(Node::new(1));
+        let y = heap.alloc(Node::new(2));
+        heap.get_mut(x).unwrap().edges.push(y);
+        heap.get_mut(y).unwrap().edges.push(x);
+        let _garbage = heap.alloc(Node::new(9));
+
+        let mut roots = [x];
+        let stats = compact(&mut heap, &mut roots);
+        assert_eq!(stats.marked, 2);
+        assert_eq!(stats.swept, 1);
+        // The cycle survives with references fixed up.
+        let x2 = roots[0];
+        let y2 = heap.get(x2).unwrap().edges[0];
+        let back = heap.get(y2).unwrap().edges[0];
+        assert_eq!(back, x2);
     }
 
     #[test]

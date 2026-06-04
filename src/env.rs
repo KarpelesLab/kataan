@@ -93,6 +93,22 @@ impl Scope {
             p.for_each_handle(visit);
         }
     }
+
+    /// Rewrites every handle binding in this scope chain through `forward` — the
+    /// mutating mirror of [`for_each_handle`](Scope::for_each_handle), for a
+    /// moving collector. (A shared parent is visited once per referrer, which is
+    /// idempotent: `forward` maps an already-forwarded handle to itself.)
+    pub fn relocate_handles(&self, forward: &dyn Fn(Handle) -> Handle) {
+        let mut data = self.0.borrow_mut();
+        for v in data.vars.values_mut() {
+            if let Some(raw) = v.as_handle() {
+                *v = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
+            }
+        }
+        if let Some(p) = &data.parent {
+            p.relocate_handles(forward);
+        }
+    }
 }
 
 #[cfg(test)]

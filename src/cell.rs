@@ -308,6 +308,39 @@ impl Trace for Cell {
     }
 }
 
+impl crate::gc::Relocate for Cell {
+    fn relocate(&mut self, forward: &dyn Fn(Handle) -> Handle) {
+        // Rewrites a handle-bearing value through `forward` (no-op otherwise).
+        let fwd = |v: &mut NanBox| {
+            if let Some(raw) = v.as_handle() {
+                *v = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
+            }
+        };
+        match self {
+            Cell::Object(o) => o.relocate_handles(forward),
+            Cell::Array(elems) => elems.iter_mut().for_each(fwd),
+            Cell::Function { env, .. } | Cell::Class { env, .. } => env.relocate_handles(forward),
+            Cell::Collection { entries, .. } => {
+                for (k, v) in entries {
+                    fwd(k);
+                    fwd(v);
+                }
+            }
+            Cell::Promise(p) => {
+                let mut s = p.borrow_mut();
+                fwd(&mut s.value);
+                for r in &mut s.reactions {
+                    fwd(&mut r.on_fulfilled);
+                    fwd(&mut r.on_rejected);
+                    r.result = forward(r.result);
+                }
+            }
+            Cell::BoundNative { target, .. } => *target = forward(*target),
+            Cell::Str(_) | Cell::Native(_) | Cell::Date(_) | Cell::RegExp { .. } => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
