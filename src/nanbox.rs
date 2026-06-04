@@ -190,6 +190,71 @@ impl NanBox {
             _ => Unpacked::Handle(self.0 & HANDLE_MASK),
         }
     }
+
+    // --- ECMAScript abstract operations (the primitive fast paths a VM needs
+    //     on every conditional branch and comparison) ---
+
+    /// ECMAScript `ToBoolean`. Heap objects are always truthy; `undefined`,
+    /// `null`, `false`, `+0`/`-0`, and `NaN` are falsy, everything else truthy.
+    #[must_use]
+    pub fn to_boolean(self) -> bool {
+        match self.unpack() {
+            Unpacked::Undefined | Unpacked::Null => false,
+            Unpacked::Bool(b) => b,
+            Unpacked::Number(n) => n != 0.0 && !n.is_nan(),
+            Unpacked::Handle(_) => true,
+        }
+    }
+
+    /// ECMAScript strict equality (`===`) for the cases decidable without the
+    /// heap: numbers compare by IEEE-754 value (so `NaN !== NaN` and
+    /// `+0 === -0`); everything else compares by encoding, which is identity for
+    /// handles and equality for the singletons. (String/object value equality
+    /// that needs heap contents layers on top.)
+    #[must_use]
+    pub fn strict_equals(self, other: Self) -> bool {
+        if self.is_number() && other.is_number() {
+            f64::from_bits(self.0) == f64::from_bits(other.0)
+        } else {
+            self.0 == other.0
+        }
+    }
+
+    /// ECMAScript `SameValue` (`Object.is`): like [`strict_equals`] but
+    /// `NaN` is the same as `NaN` and `+0` is *not* the same as `-0`.
+    ///
+    /// [`strict_equals`]: NanBox::strict_equals
+    #[must_use]
+    pub fn same_value(self, other: Self) -> bool {
+        if self.is_number() && other.is_number() {
+            let a = f64::from_bits(self.0);
+            let b = f64::from_bits(other.0);
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == 0.0 && b == 0.0 {
+                return a.is_sign_negative() == b.is_sign_negative();
+            }
+            a == b
+        } else {
+            self.0 == other.0
+        }
+    }
+
+    /// The `typeof` string for the cases decidable without the heap. Note
+    /// `typeof null === "object"`. A handle is reported as `"object"` here —
+    /// distinguishing a callable (`"function"`) requires inspecting the heap
+    /// object, so that refinement lives with the heap, not the box.
+    #[must_use]
+    pub fn type_of(self) -> &'static str {
+        match self.unpack() {
+            Unpacked::Undefined => "undefined",
+            Unpacked::Null => "object",
+            Unpacked::Bool(_) => "boolean",
+            Unpacked::Number(_) => "number",
+            Unpacked::Handle(_) => "object",
+        }
+    }
 }
 
 impl core::fmt::Debug for NanBox {
@@ -308,6 +373,64 @@ mod tests {
             assert_eq!(NanBox::from_bits(b.to_bits()), b);
             assert_eq!(NanBox::from_bits(b.to_bits()).to_bits(), b.to_bits());
         }
+    }
+
+    #[test]
+    fn to_boolean_follows_spec() {
+        assert!(!NanBox::undefined().to_boolean());
+        assert!(!NanBox::null().to_boolean());
+        assert!(NanBox::boolean(true).to_boolean());
+        assert!(!NanBox::boolean(false).to_boolean());
+        assert!(!NanBox::number(0.0).to_boolean());
+        assert!(!NanBox::number(-0.0).to_boolean());
+        assert!(!NanBox::number(f64::NAN).to_boolean());
+        assert!(NanBox::number(1.0).to_boolean());
+        assert!(NanBox::number(-1.0).to_boolean());
+        assert!(NanBox::number(f64::INFINITY).to_boolean());
+        assert!(NanBox::handle(0).to_boolean()); // objects are truthy
+    }
+
+    #[test]
+    fn strict_equals_follows_spec() {
+        // Numbers: value equality, NaN != NaN, +0 === -0.
+        assert!(NanBox::number(1.0).strict_equals(NanBox::number(1.0)));
+        assert!(!NanBox::number(1.0).strict_equals(NanBox::number(2.0)));
+        assert!(!NanBox::number(f64::NAN).strict_equals(NanBox::number(f64::NAN)));
+        assert!(NanBox::number(0.0).strict_equals(NanBox::number(-0.0)));
+        // Singletons.
+        assert!(NanBox::undefined().strict_equals(NanBox::undefined()));
+        assert!(NanBox::null().strict_equals(NanBox::null()));
+        assert!(!NanBox::undefined().strict_equals(NanBox::null()));
+        assert!(NanBox::boolean(true).strict_equals(NanBox::boolean(true)));
+        assert!(!NanBox::boolean(true).strict_equals(NanBox::boolean(false)));
+        // Handles: identity.
+        assert!(NanBox::handle(7).strict_equals(NanBox::handle(7)));
+        assert!(!NanBox::handle(7).strict_equals(NanBox::handle(8)));
+        // Cross-kind.
+        assert!(!NanBox::number(0.0).strict_equals(NanBox::null()));
+        assert!(!NanBox::handle(0).strict_equals(NanBox::number(0.0)));
+    }
+
+    #[test]
+    fn same_value_differs_from_strict_on_nan_and_zero() {
+        // Object.is: NaN is the same as NaN, +0 is not the same as -0.
+        assert!(NanBox::number(f64::NAN).same_value(NanBox::number(f64::NAN)));
+        assert!(!NanBox::number(0.0).same_value(NanBox::number(-0.0)));
+        assert!(NanBox::number(0.0).same_value(NanBox::number(0.0)));
+        assert!(NanBox::number(-0.0).same_value(NanBox::number(-0.0)));
+        assert!(NanBox::number(3.0).same_value(NanBox::number(3.0)));
+        assert!(NanBox::handle(1).same_value(NanBox::handle(1)));
+        assert!(!NanBox::handle(1).same_value(NanBox::handle(2)));
+    }
+
+    #[test]
+    fn type_of_follows_spec() {
+        assert_eq!(NanBox::undefined().type_of(), "undefined");
+        assert_eq!(NanBox::null().type_of(), "object"); // the classic quirk
+        assert_eq!(NanBox::boolean(true).type_of(), "boolean");
+        assert_eq!(NanBox::number(1.0).type_of(), "number");
+        assert_eq!(NanBox::number(f64::NAN).type_of(), "number");
+        assert_eq!(NanBox::handle(0).type_of(), "object");
     }
 
     #[test]
