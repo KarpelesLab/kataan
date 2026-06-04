@@ -506,15 +506,17 @@ writing: **A ✅ done · B ✅ done · C 🚧 in progress.**
   `!=`/`!==`), `&&`/`||`/`??`, unary `-`/`!`, the ternary, template literals,
   object/array literals + member/index reads and writes, assignment (incl.
   compound, on identifiers and members), `if`/`else`, `while`/`do-while`/`for`
-  with `break`/`continue`, blocks, `return`, **functions** (declarations
-  hoisted, function/arrow expressions, positional params, recursion + mutual
-  recursion), and **method calls** with correct `this` plus built-in
-  prototype-method dispatch (`[…].map(…)`, `'…'.toUpperCase()`). Calls recurse
-  through the shared call path, so bytecode/native/tree-walker callees
-  interoperate; the VM reuses the tree-walker's value semantics. **Next:**
-  closures/upvalues (capture currently triggers a tree-walker fallback),
-  exceptions/`try-finally`, object/array literals + property writes, then the
-  remaining statements — and making the VM the primary execution path.
+  with `break`/`continue`, `switch`, `try`/`catch`/`throw`, blocks, `return`,
+  the `new` operator, bitwise/shift + `in`/`instanceof`, **functions**
+  (declarations hoisted, function/arrow expressions, positional params,
+  recursion + mutual recursion), and **method calls** with correct `this` plus
+  built-in prototype-method dispatch (`[…].map(…)`, `'…'.toUpperCase()`). Calls
+  recurse through the shared call path, so bytecode/native/tree-walker callees
+  interoperate; the VM reuses the tree-walker's value semantics, and the whole
+  instruction set survives the serialize → reload → run round-trip (D′).
+  **Next:** closures/upvalues (capture currently triggers a tree-walker
+  fallback), `finally`, for-in/for-of, destructuring, classes — and making the
+  VM the primary execution path.
 
 - **Phase D′ — Serializable bytecode & code cache** (`serialize` feature)
   🚧 **started** — the container codec is in: `serialize`/`deserialize` with a
