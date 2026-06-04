@@ -80,6 +80,10 @@ pub enum Op {
     SetElem { arr: Reg, index: Reg, src: Reg },
     /// `dst = arr.length`.
     ArrayLen { dst: Reg, arr: Reg },
+    /// Appends the value in `src` to array `arr` (grows it).
+    ArrayPush { arr: Reg, src: Reg },
+    /// Appends every element of the array in `src` to `arr` (a spread).
+    ArrayExtend { arr: Reg, src: Reg },
     /// `dst = a new empty object` (allocated in the realm's heap).
     NewObject { dst: Reg },
     /// `obj[key] = src` (own property set through the object's shape).
@@ -362,6 +366,24 @@ fn run_frame(
                 let handle = object_handle(regs[*arr as usize])?;
                 let len = ctx.realm.array_length(handle).unwrap_or(0);
                 regs[*dst as usize] = NanBox::number(len as f64);
+            }
+            Op::ArrayPush { arr, src } => {
+                let handle = object_handle(regs[*arr as usize])?;
+                let len = ctx.realm.array_length(handle).unwrap_or(0);
+                ctx.realm.set_element(handle, len, regs[*src as usize]);
+            }
+            Op::ArrayExtend { arr, src } => {
+                let handle = object_handle(regs[*arr as usize])?;
+                let srch = object_handle(regs[*src as usize])?;
+                let elems = ctx
+                    .realm
+                    .array_elements(srch)
+                    .map(<[_]>::to_vec)
+                    .ok_or(VmError::NotAnObject)?;
+                let start = ctx.realm.array_length(handle).unwrap_or(0);
+                for (i, e) in elems.into_iter().enumerate() {
+                    ctx.realm.set_element(handle, start + i, e);
+                }
             }
             Op::NewObject { dst } => {
                 let handle = ctx.realm.new_object();
@@ -2169,22 +2191,25 @@ impl Compiler {
                 Ok(dst)
             }
             Expr::Array { elements, .. } => {
+                // Build incrementally (empty + push/extend) so spreads and holes
+                // work uniformly.
                 let dst = self.alloc();
-                self.ops.push(Op::NewArray {
-                    dst,
-                    len: elements.len(),
-                });
-                for (i, el) in elements.iter().enumerate() {
-                    let ArrayElement::Item(e) = el else {
-                        return Err(CompileError::Unsupported("array hole/spread"));
-                    };
-                    let v = self.expr(e)?;
-                    let idx = self.constant(NanBox::number(i as f64))?;
-                    self.ops.push(Op::SetElem {
-                        arr: dst,
-                        index: idx,
-                        src: v,
-                    });
+                self.ops.push(Op::NewArray { dst, len: 0 });
+                for el in elements {
+                    match el {
+                        ArrayElement::Item(e) => {
+                            let v = self.expr(e)?;
+                            self.ops.push(Op::ArrayPush { arr: dst, src: v });
+                        }
+                        ArrayElement::Hole => {
+                            let u = self.constant(NanBox::undefined())?;
+                            self.ops.push(Op::ArrayPush { arr: dst, src: u });
+                        }
+                        ArrayElement::Spread(e) => {
+                            let s = self.expr(e)?;
+                            self.ops.push(Op::ArrayExtend { arr: dst, src: s });
+                        }
+                    }
                 }
                 Ok(dst)
             }
@@ -2206,10 +2231,28 @@ impl Compiler {
                 Ok(dst)
             }
             Expr::Member {
-                object, property, ..
+                object,
+                property,
+                optional,
+                ..
             } => {
                 let obj = self.expr(object)?;
-                self.member_read(obj, property)
+                if *optional {
+                    // `obj?.prop` — short-circuit to `undefined` when nullish.
+                    let dst = self.alloc();
+                    self.ops.push(Op::LoadConst {
+                        dst,
+                        value: NanBox::undefined(),
+                    });
+                    let go = self.emit_not_nullish(obj)?;
+                    let jf = self.emit_jump_if_false(go);
+                    let v = self.member_read(obj, property)?;
+                    self.ops.push(Op::Move { dst, src: v });
+                    self.patch(jf);
+                    Ok(dst)
+                } else {
+                    self.member_read(obj, property)
+                }
             }
             Expr::Call {
                 callee, arguments, ..
@@ -2510,6 +2553,51 @@ impl Compiler {
         let r = self.alloc();
         self.ops.push(Op::LoadConst { dst: r, value });
         Ok(r)
+    }
+
+    /// Emits `!(v === null || v === undefined)` into a fresh register.
+    fn emit_not_nullish(&mut self, v: Reg) -> Result<Reg, CompileError> {
+        let null = self.constant(NanBox::null())?;
+        let undef = self.constant(NanBox::undefined())?;
+        let is_null = self.alloc();
+        self.ops.push(Op::StrictEq {
+            dst: is_null,
+            a: v,
+            b: null,
+        });
+        let is_undef = self.alloc();
+        self.ops.push(Op::StrictEq {
+            dst: is_undef,
+            a: v,
+            b: undef,
+        });
+        // nullish = is_null || is_undef; go = !nullish.
+        let go = self.alloc();
+        // `is_null ? true : is_undef` collapses to `is_null || is_undef`; here
+        // compute via Not(Not(is_null) && Not(is_undef))? Simpler: go = is_null
+        // false-path. Use a small sequence.
+        let not_null = self.alloc();
+        self.ops.push(Op::Not {
+            dst: not_null,
+            a: is_null,
+        });
+        let not_undef = self.alloc();
+        self.ops.push(Op::Not {
+            dst: not_undef,
+            a: is_undef,
+        });
+        // go = not_null && not_undef (both must hold to access).
+        self.ops.push(Op::Move {
+            dst: go,
+            src: not_null,
+        });
+        let jf = self.emit_jump_if_false(go);
+        self.ops.push(Op::Move {
+            dst: go,
+            src: not_undef,
+        });
+        self.patch(jf);
+        Ok(go)
     }
 
     /// Compiles a statement list in a fresh lexical scope.
@@ -3075,6 +3163,29 @@ mod tests {
                 class C extends B { constructor() { super(); this.c = 3; } }
                 let o = new C(); o.a + o.b + o.c"),
             "6"
+        );
+    }
+
+    #[test]
+    fn bytecode_array_spread_and_optional_chaining() {
+        // Array spread.
+        assert_eq!(bc("let a = [1, 2, 3]; [...a].join(',')"), "1,2,3");
+        assert_eq!(bc("let a = [2, 3]; [1, ...a, 4].join(',')"), "1,2,3,4");
+        assert_eq!(
+            bc("let a = [1]; let b = [2, 3]; [...a, ...b].join(',')"),
+            "1,2,3"
+        );
+        assert_eq!(bc("[...[1, 2], ...[3, 4], 5].length"), "5");
+        // Optional chaining on a member.
+        assert_eq!(bc("let o = { x: { y: 7 } }; o?.x?.y"), "7");
+        assert_eq!(bc("let o = { x: null }; '' + (o?.x?.y)"), "undefined");
+        assert_eq!(bc("let o = null; '' + (o?.x)"), "undefined");
+        // Optional chaining with a fallback via ??-style (|| here).
+        assert_eq!(bc("let o = {}; o?.missing || 'default'"), "default");
+        // Spread of a function-returned array.
+        assert_eq!(
+            bc("function nums() { return [10, 20]; } [...nums(), 30].join(',')"),
+            "10,20,30"
         );
     }
 
