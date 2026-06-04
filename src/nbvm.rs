@@ -1656,6 +1656,81 @@ impl Compiler {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
     }
 
+    /// Binds a (possibly destructuring) target to the value in `value_reg`,
+    /// declaring the names it introduces. Array/object patterns read elements/
+    /// properties via `GetElem`/`GetProp` with `=`-defaults; rest patterns fall
+    /// back.
+    fn bind_pattern(&mut self, target: &BindingTarget, value_reg: Reg) -> Result<(), CompileError> {
+        match target {
+            BindingTarget::Ident(Ident { name, .. }) => {
+                let b = self.declare(name);
+                self.write_var(b, value_reg);
+                Ok(())
+            }
+            BindingTarget::Array(pat) => {
+                use crate::ast::ArrayPatternElement;
+                for (i, el) in pat.elements.iter().enumerate() {
+                    match el {
+                        ArrayPatternElement::Hole => {}
+                        ArrayPatternElement::Item {
+                            target, default, ..
+                        } => {
+                            let idx = self.constant(NanBox::number(i as f64))?;
+                            let v = self.alloc();
+                            self.ops.push(Op::GetElem {
+                                dst: v,
+                                arr: value_reg,
+                                index: idx,
+                            });
+                            self.apply_default(v, default.as_ref())?;
+                            self.bind_pattern(target, v)?;
+                        }
+                        ArrayPatternElement::Rest { .. } => {
+                            return Err(CompileError::Unsupported("rest pattern"));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            BindingTarget::Object(pat) => {
+                if pat.rest.is_some() {
+                    return Err(CompileError::Unsupported("object rest pattern"));
+                }
+                for prop in &pat.properties {
+                    let key = static_key(&prop.key)?;
+                    let v = self.alloc();
+                    self.ops.push(Op::GetProp {
+                        dst: v,
+                        obj: value_reg,
+                        key,
+                    });
+                    self.apply_default(v, prop.default.as_ref())?;
+                    self.bind_pattern(&prop.value, v)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// If `reg` holds `undefined` and a `default` exists, overwrites `reg` with
+    /// the default's value.
+    fn apply_default(&mut self, reg: Reg, default: Option<&Expr>) -> Result<(), CompileError> {
+        let Some(e) = default else { return Ok(()) };
+        let undef = self.constant(NanBox::undefined())?;
+        let is_undef = self.alloc();
+        self.ops.push(Op::StrictEq {
+            dst: is_undef,
+            a: reg,
+            b: undef,
+        });
+        // Skip the default unless the value is `undefined`.
+        let jf = self.emit_jump_if_false(is_undef);
+        let d = self.expr(e)?;
+        self.ops.push(Op::Move { dst: reg, src: d });
+        self.patch(jf);
+        Ok(())
+    }
+
     /// Emits a read of `name` into a register and returns it (a cell read goes
     /// through `GetElem`).
     fn read_var(&mut self, b: Binding) -> Reg {
@@ -1832,22 +1907,11 @@ impl Compiler {
             Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
             Stmt::Var(decl) => {
                 for d in &decl.declarations {
-                    let BindingTarget::Ident(Ident { name, .. }) = &d.target else {
-                        return Err(CompileError::Unsupported("destructuring binding"));
-                    };
                     let value = match &d.init {
                         Some(e) => self.expr(e)?,
-                        None => {
-                            let r = self.alloc();
-                            self.ops.push(Op::LoadConst {
-                                dst: r,
-                                value: NanBox::undefined(),
-                            });
-                            r
-                        }
+                        None => self.constant(NanBox::undefined())?,
                     };
-                    let slot = self.declare(name);
-                    self.write_var(slot, value);
+                    self.bind_pattern(&d.target, value)?;
                 }
                 Ok(None)
             }
@@ -3011,6 +3075,30 @@ mod tests {
                 class C extends B { constructor() { super(); this.c = 3; } }
                 let o = new C(); o.a + o.b + o.c"),
             "6"
+        );
+    }
+
+    #[test]
+    fn bytecode_destructuring() {
+        // Array destructuring with defaults, holes, and nesting.
+        assert_eq!(bc("let [a, b] = [1, 2]; a + b"), "3");
+        assert_eq!(bc("let [a, , c] = [1, 2, 3]; a + c"), "4");
+        assert_eq!(bc("let [a, b = 9] = [1]; a + b"), "10");
+        assert_eq!(bc("let [[a], [b]] = [[1], [2]]; a + b"), "3");
+        // Object destructuring with shorthand, rename, and default.
+        assert_eq!(bc("let { x, y } = { x: 1, y: 2 }; x + y"), "3");
+        assert_eq!(bc("let { a: p, b: q } = { a: 10, b: 20 }; p + q"), "30");
+        assert_eq!(bc("let { m = 7 } = {}; m"), "7");
+        assert_eq!(bc("let { p: { q } } = { p: { q: 42 } }; q"), "42");
+        // Destructuring a function result / swap-via-array.
+        assert_eq!(
+            bc("function pair() { return [3, 4]; } let [a, b] = pair(); a * b"),
+            "12"
+        );
+        // Destructuring inside a loop body.
+        assert_eq!(
+            bc("let s = 0; for (const p of [[1, 2], [3, 4]]) { let [a, b] = p; s += a * b; } s"),
+            "14"
         );
     }
 
