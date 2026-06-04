@@ -195,6 +195,15 @@ const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
 const N_OBJECT_DEFINE_PROP: u16 = 110;
 const N_OBJECT_GET_OWN_DESC: u16 = 111;
+const N_WEAKMAP: u16 = 112;
+const N_WEAKSET: u16 = 113;
+const N_REFLECT_GET: u16 = 114;
+const N_REFLECT_SET: u16 = 115;
+const N_REFLECT_HAS: u16 = 116;
+const N_REFLECT_OWN_KEYS: u16 = 117;
+const N_REFLECT_DELETE: u16 = 118;
+const N_REFLECT_APPLY: u16 = 119;
+const N_REFLECT_CONSTRUCT: u16 = 120;
 const N_SYMBOL: u16 = 38;
 const N_BIGINT: u16 = 39;
 const N_PROXY: u16 = 106;
@@ -359,6 +368,19 @@ impl<'a> Interp<'a> {
                 ("of", N_ARRAY_OF),
             ],
         );
+        install_namespace(
+            self,
+            "Reflect",
+            &[
+                ("get", N_REFLECT_GET),
+                ("set", N_REFLECT_SET),
+                ("has", N_REFLECT_HAS),
+                ("ownKeys", N_REFLECT_OWN_KEYS),
+                ("deleteProperty", N_REFLECT_DELETE),
+                ("apply", N_REFLECT_APPLY),
+                ("construct", N_REFLECT_CONSTRUCT),
+            ],
+        );
         for (name, id) in [
             ("String", N_STRING),
             ("Number", N_NUMBER),
@@ -372,6 +394,8 @@ impl<'a> Interp<'a> {
             ("Symbol", N_SYMBOL),
             ("BigInt", N_BIGINT),
             ("Proxy", N_PROXY),
+            ("WeakMap", N_WEAKMAP),
+            ("WeakSet", N_WEAKSET),
         ] {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -534,6 +558,67 @@ impl<'a> Interp<'a> {
                     }
                 }
                 arg(0)
+            }
+            // --- Reflect.* ---
+            N_REFLECT_GET => {
+                if let Some(raw) = arg(0).as_handle() {
+                    let key = self.member_key(arg(1));
+                    return self.read_member(Handle::from_raw(raw), &key);
+                }
+                NanBox::undefined()
+            }
+            N_REFLECT_SET => {
+                if let Some(raw) = arg(0).as_handle() {
+                    let key = self.member_key(arg(1));
+                    self.realm.set_property(Handle::from_raw(raw), &key, arg(2));
+                }
+                NanBox::boolean(true)
+            }
+            N_REFLECT_HAS => {
+                let key = self.member_key(arg(1));
+                NanBox::boolean(
+                    arg(0)
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .is_some_and(|h| self.realm.has_own(h, &key) || self.realm.is_array(h)),
+                )
+            }
+            N_REFLECT_DELETE => {
+                if let Some(raw) = arg(0).as_handle() {
+                    let key = self.member_key(arg(1));
+                    self.realm.delete_property(Handle::from_raw(raw), &key);
+                }
+                NanBox::boolean(true)
+            }
+            N_REFLECT_OWN_KEYS => {
+                let names = arg(0)
+                    .as_handle()
+                    .and_then(|raw| self.realm.own_property_names(Handle::from_raw(raw)))
+                    .unwrap_or_default();
+                let boxed: Vec<NanBox> = names.iter().map(|k| self.new_str(k)).collect();
+                NanBox::handle(self.realm.new_array(boxed).to_raw())
+            }
+            N_REFLECT_APPLY => {
+                let list = match arg(2).as_handle().map(Handle::from_raw) {
+                    Some(h) => self
+                        .realm
+                        .array_elements(h)
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                return self.call_with_this(arg(0), arg(1), &list);
+            }
+            N_REFLECT_CONSTRUCT => {
+                let list = match arg(1).as_handle().map(Handle::from_raw) {
+                    Some(h) => self
+                        .realm
+                        .array_elements(h)
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                return self.construct(arg(0), &list);
             }
             N_OBJECT_GET_OWN_DESC => {
                 let mut result = NanBox::undefined();
@@ -1455,9 +1540,10 @@ impl<'a> Interp<'a> {
         if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
             return Ok(self.make_error(id, args.first().copied()));
         }
+        // `WeakMap`/`WeakSet` reuse the collection cell (no true weak refs here).
         let is_set = match id {
-            N_SET => true,
-            N_MAP => false,
+            N_SET | N_WEAKSET => true,
+            N_MAP | N_WEAKMAP => false,
             _ => return Err(ExecError::Unsupported("new on this constructor")),
         };
         let handle = self.realm.new_collection(is_set);
@@ -5861,6 +5947,35 @@ mod tests {
         assert_eq!(
             run("let p=new Proxy({x:1},{}); let r = 'x' in p; delete p.x; '' + r + ('x' in p)"),
             "truefalse"
+        );
+    }
+
+    #[test]
+    fn reflect_and_weak_collections() {
+        // Reflect mirrors the fundamental operations.
+        assert_eq!(run("let o={a:1}; Reflect.get(o,'a')"), "1");
+        assert_eq!(run("let o={}; Reflect.set(o,'x',5); o.x"), "5");
+        assert_eq!(
+            run("Reflect.has({a:1},'a') + ':' + Reflect.has({a:1},'z')"),
+            "true:false"
+        );
+        assert_eq!(run("Reflect.ownKeys({a:1,b:2,c:3}).length"), "3");
+        assert_eq!(
+            run("function f(a,b){return a+b+this.n;} Reflect.apply(f,{n:10},[1,2])"),
+            "13"
+        );
+        assert_eq!(
+            run("function B(v){this.v=v;} Reflect.construct(B,[9]).v"),
+            "9"
+        );
+        // WeakMap / WeakSet (object-keyed; bounded — no true weakness).
+        assert_eq!(
+            run("let k={}; let m=new WeakMap(); m.set(k,'v'); m.get(k) + ':' + m.has(k)"),
+            "v:true"
+        );
+        assert_eq!(
+            run("let s=new WeakSet(); let o={}; s.add(o); s.has(o) + ':' + s.has({})"),
+            "true:false"
         );
     }
 
