@@ -181,6 +181,20 @@ fn bytecode_vm_object_array_literals() {
 }
 
 #[test]
+fn bytecode_vm_inequality_and_nullish() {
+    assert_eq!(eval_bc("1 != 2"), "true");
+    assert_eq!(eval_bc("1 != 1"), "false");
+    assert_eq!(eval_bc("1 !== '1'"), "true");
+    assert_eq!(eval_bc("2 !== 2"), "false");
+    assert_eq!(eval_bc("null ?? 'default'"), "default");
+    assert_eq!(eval_bc("undefined ?? 'd'"), "d");
+    assert_eq!(eval_bc("0 ?? 'd'"), "0"); // 0 is not nullish
+    assert_eq!(eval_bc("'' ?? 'd'"), ""); // empty string is not nullish
+    assert_eq!(eval_bc("let o = { a: 0 }; o.a ?? 99"), "0");
+    assert_eq!(eval_bc("let o = {}; o.missing ?? 99"), "99");
+}
+
+#[test]
 fn bytecode_vm_ternary_and_templates() {
     // Ternary chooses a branch value.
     assert_eq!(eval_bc("3 > 2 ? 'yes' : 'no'"), "yes");

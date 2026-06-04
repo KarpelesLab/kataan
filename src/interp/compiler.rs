@@ -867,6 +867,17 @@ impl Compiler {
     }
 
     fn emit_binop(&mut self, op: BinaryOp, dst: Reg, a: Reg, b: Reg) -> Result<(), CompileError> {
+        // `!=` / `!==` compose as the negation of `==` / `===`.
+        if matches!(op, BinaryOp::NotEq | BinaryOp::NotEqEq) {
+            let eq = if op == BinaryOp::NotEq {
+                Op::Eq { dst, a, b }
+            } else {
+                Op::StrictEq { dst, a, b }
+            };
+            self.emit(eq);
+            self.emit(Op::Not { dst, src: dst });
+            return Ok(());
+        }
         let inst = match op {
             BinaryOp::Add => Op::Add { dst, a, b },
             BinaryOp::Sub => Op::Sub { dst, a, b },
@@ -899,7 +910,23 @@ impl Compiler {
                 cond: dst,
                 offset: 0,
             }),
-            LogicalOp::Nullish => return Err(CompileError::unsupported("`??` operator")),
+            LogicalOp::Nullish => {
+                // `a ?? b`: take `b` only when `a` is null/undefined. Loose
+                // `a == null` is true for exactly those two values.
+                let nullreg = self.reg();
+                self.emit(Op::LoadNull { dst: nullreg });
+                let is_nullish = self.reg();
+                self.emit(Op::Eq {
+                    dst: is_nullish,
+                    a: dst,
+                    b: nullreg,
+                });
+                // If not nullish, jump past the `b` branch (keep `a`).
+                self.emit(Op::JumpIfFalse {
+                    cond: is_nullish,
+                    offset: 0,
+                })
+            }
         };
         let r = self.expr(right)?;
         self.emit(Op::Move { dst, src: r });
