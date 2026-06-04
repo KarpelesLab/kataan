@@ -47,6 +47,11 @@ pub mod parser;
 #[cfg(feature = "alloc")]
 pub mod heap;
 
+/// Hidden classes ("shapes"): shared property-layout descriptors with a
+/// transition tree — groundwork for the object model. Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod shape;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
