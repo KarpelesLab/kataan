@@ -78,6 +78,12 @@ pub mod atom;
 #[cfg(feature = "alloc")]
 pub mod rope;
 
+/// The object-model context (`Realm`) bundling the heap, the shared root shape,
+/// and the atom table behind the allocate/get/set/collect API a VM uses. Needs
+/// `alloc`.
+#[cfg(feature = "alloc")]
+pub mod realm;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
