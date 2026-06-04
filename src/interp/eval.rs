@@ -730,6 +730,15 @@ impl<'a> Interp<'a> {
                     return Ok(Value::Undefined);
                 }
                 let key = self.member_key(property, env)?;
+                // A getter accessor is invoked with the object as `this`.
+                if let Value::Object(o) = &obj {
+                    if let Some(acc) = o.find_accessor(&key) {
+                        return match acc.get {
+                            Some(getter) => self.call_with_this(getter, obj.clone(), Vec::new()),
+                            None => Ok(Value::Undefined),
+                        };
+                    }
+                }
                 self.get_member(&obj, &key)
             }
             Expr::Array { elements, .. } => {
@@ -761,6 +770,23 @@ impl<'a> Interp<'a> {
                                 for key in src.own_keys() {
                                     obj.set(&key, src.get(&key));
                                 }
+                            }
+                        }
+                        crate::ast::ObjectMember::Accessor {
+                            is_getter,
+                            key,
+                            value,
+                            ..
+                        } => {
+                            let k = self.member_key(key, env)?;
+                            let func = Value::Function(Rc::new(Closure {
+                                def: Callable::Function(value),
+                                env: Rc::clone(env),
+                            }));
+                            if *is_getter {
+                                obj.define_getter(&k, func);
+                            } else {
+                                obj.define_setter(&k, func);
                             }
                         }
                     }
@@ -826,12 +852,21 @@ impl<'a> Interp<'a> {
                         def: Callable::Function(&m.value),
                         env: Rc::clone(&method_env),
                     }));
-                    if matches!(m.kind, MethodKind::Constructor) {
-                        *class.ctor.borrow_mut() = Some(closure);
-                    } else {
-                        let key = self.member_key(&m.key, &method_env)?;
-                        let target = if m.is_static { &statics } else { &prototype };
-                        target.set(&key, closure);
+                    let target = if m.is_static { &statics } else { &prototype };
+                    match m.kind {
+                        MethodKind::Constructor => *class.ctor.borrow_mut() = Some(closure),
+                        MethodKind::Get => {
+                            let key = self.member_key(&m.key, &method_env)?;
+                            target.define_getter(&key, closure);
+                        }
+                        MethodKind::Set => {
+                            let key = self.member_key(&m.key, &method_env)?;
+                            target.define_setter(&key, closure);
+                        }
+                        MethodKind::Method => {
+                            let key = self.member_key(&m.key, &method_env)?;
+                            target.set(&key, closure);
+                        }
                     }
                 }
                 ClassMember::Field(f) if f.is_static => {
@@ -1053,6 +1088,15 @@ impl<'a> Interp<'a> {
             } => {
                 let obj = self.eval_expr(object, env)?;
                 let key = self.member_key(property, env)?;
+                // A setter accessor is invoked with the object as `this`.
+                if let Value::Object(o) = &obj {
+                    if let Some(acc) = o.find_accessor(&key) {
+                        if let Some(setter) = acc.set {
+                            self.call_with_this(setter, obj.clone(), alloc::vec![value])?;
+                        }
+                        return Ok(());
+                    }
+                }
                 self.set_member(&obj, &key, value)
             }
             _ => Err(Value::str("invalid assignment target")),

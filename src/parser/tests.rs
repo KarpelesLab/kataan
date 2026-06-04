@@ -113,6 +113,10 @@ fn sexpr(e: &Expr) -> String {
             for m in members {
                 parts.push(match m {
                     ObjectMember::Spread { value, .. } => format!("(... {})", sexpr(value)),
+                    ObjectMember::Accessor { is_getter, key, .. } => {
+                        let kw = if *is_getter { "get" } else { "set" };
+                        format!("({kw} {})", sexpr_key(key))
+                    }
                     ObjectMember::Property {
                         key,
                         value,
@@ -497,6 +501,12 @@ fn object_literals() {
     // Reserved word allowed as a `key: value` key but not as shorthand.
     assert_eq!(sx("{if: 1}"), "(object (if 1))");
     assert!(perr("{if}").contains("shorthand"));
+    // Getters / setters vs. methods/properties named get/set.
+    assert_eq!(sx("{get x() {}, set x(v) {}}"), "(object (get x) (set x))");
+    assert_eq!(
+        sx("{get: 1, set() {}}"),
+        "(object (get 1) (set (fn  () (block ))))"
+    );
 }
 
 #[test]

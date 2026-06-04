@@ -244,6 +244,14 @@ pub enum ObjectMember {
     },
     /// A spread member `...expr`.
     Spread { value: Box<Expr>, span: Span },
+    /// A getter/setter accessor: `get x() { … }` / `set x(v) { … }`.
+    Accessor {
+        /// True for a getter, false for a setter.
+        is_getter: bool,
+        key: PropertyKey,
+        value: super::Function,
+        span: Span,
+    },
 }
 
 /// A template literal: alternating string *quasis* and interpolated

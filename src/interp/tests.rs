@@ -416,6 +416,35 @@ fn sets() {
 }
 
 #[test]
+fn getters_and_setters() {
+    // Object-literal accessors.
+    assert_eq!(
+        eval(
+            "let o = { _n: 1, get n() { return this._n; }, set n(v) { this._n = v * 2; } }; o.n = 5; o.n"
+        ),
+        "10"
+    );
+    assert_eq!(
+        eval(
+            "let o = { first: 'Ada', last: 'L', get full() { return this.first + ' ' + this.last; } }; o.full"
+        ),
+        "Ada L"
+    );
+    // Class accessors (on the prototype, inherited by instances).
+    assert_eq!(
+        eval(
+            "class C { constructor() { this._x = 0; } get x() { return this._x; } set x(v) { this._x = v + 1; } } let c = new C(); c.x = 9; c.x"
+        ),
+        "10"
+    );
+    // Inherited accessor through extends.
+    assert_eq!(
+        eval("class A { get v() { return 42; } } class B extends A {} new B().v"),
+        "42"
+    );
+}
+
+#[test]
 fn in_operator() {
     assert_eq!(eval("'a' in { a: 1 }"), "true");
     assert_eq!(eval("'b' in { a: 1 }"), "false");

@@ -831,6 +831,30 @@ impl<'src> Parser<'src> {
             });
         }
 
+        // `get key() { … }` / `set key(v) { … }` — accessors. (When `get`/`set`
+        // is directly followed by `(`, `:`, or a member terminator it is an
+        // ordinary property/method *named* `get`/`set` instead.)
+        if let TokenKind::Keyword(kw @ (Kw::Get | Kw::Set)) = self.peek() {
+            if !matches!(
+                self.nth_kind(1),
+                TokenKind::LParen
+                    | TokenKind::Colon
+                    | TokenKind::Comma
+                    | TokenKind::RBrace
+                    | TokenKind::Eq
+            ) {
+                self.bump(); // `get` / `set`
+                let key = self.parse_class_key()?;
+                let func = self.parse_method_tail(false, false)?;
+                return Ok(ObjectMember::Accessor {
+                    is_getter: kw == Kw::Get,
+                    key,
+                    value: func,
+                    span: start.to(self.prev_span()),
+                });
+            }
+        }
+
         // Computed key `[expr]: value`.
         if self.at(TokenKind::LBracket) {
             self.bump();

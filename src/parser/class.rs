@@ -167,7 +167,7 @@ impl<'src> Parser<'src> {
 
     /// A class member key: a private name, a computed `[expr]`, a string/number
     /// literal, or any identifier name.
-    fn parse_class_key(&mut self) -> Result<PropertyKey> {
+    pub(super) fn parse_class_key(&mut self) -> Result<PropertyKey> {
         let tok = self.peek_tok();
         match tok.kind {
             TokenKind::PrivateName => {

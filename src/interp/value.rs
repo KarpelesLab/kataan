@@ -71,6 +71,16 @@ pub struct Obj<'a> {
     array: Option<RefCell<Vec<Value<'a>>>>,
     proto: RefCell<Option<Rc<Obj<'a>>>>,
     collection: Option<RefCell<Collection<'a>>>,
+    accessors: RefCell<Vec<(Box<str>, Accessor<'a>)>>,
+}
+
+/// A getter/setter accessor property.
+#[derive(Clone, Default)]
+pub struct Accessor<'a> {
+    /// The getter function, invoked on read.
+    pub get: Option<Value<'a>>,
+    /// The setter function, invoked on write.
+    pub set: Option<Value<'a>>,
 }
 
 /// The backing store of a `Map` or `Set`: insertion-ordered key/value entries
@@ -91,6 +101,7 @@ impl<'a> Obj<'a> {
             array: None,
             proto: RefCell::new(None),
             collection: None,
+            accessors: RefCell::new(Vec::new()),
         })
     }
 
@@ -102,6 +113,7 @@ impl<'a> Obj<'a> {
             array: None,
             proto: RefCell::new(Some(proto)),
             collection: None,
+            accessors: RefCell::new(Vec::new()),
         })
     }
 
@@ -113,6 +125,7 @@ impl<'a> Obj<'a> {
             array: Some(RefCell::new(elements)),
             proto: RefCell::new(None),
             collection: None,
+            accessors: RefCell::new(Vec::new()),
         })
     }
 
@@ -127,6 +140,7 @@ impl<'a> Obj<'a> {
                 is_set,
                 entries: Vec::new(),
             })),
+            accessors: RefCell::new(Vec::new()),
         })
     }
 
@@ -134,6 +148,54 @@ impl<'a> Obj<'a> {
     #[must_use]
     pub fn as_collection(&self) -> Option<&RefCell<Collection<'a>>> {
         self.collection.as_ref()
+    }
+
+    /// Defines (or extends) the getter for `key`.
+    pub fn define_getter(&self, key: &str, getter: Value<'a>) {
+        let mut accs = self.accessors.borrow_mut();
+        if let Some(slot) = accs.iter_mut().find(|(k, _)| **k == *key) {
+            slot.1.get = Some(getter);
+        } else {
+            accs.push((
+                key.into(),
+                Accessor {
+                    get: Some(getter),
+                    set: None,
+                },
+            ));
+        }
+    }
+
+    /// Defines (or extends) the setter for `key`.
+    pub fn define_setter(&self, key: &str, setter: Value<'a>) {
+        let mut accs = self.accessors.borrow_mut();
+        if let Some(slot) = accs.iter_mut().find(|(k, _)| **k == *key) {
+            slot.1.set = Some(setter);
+        } else {
+            accs.push((
+                key.into(),
+                Accessor {
+                    get: None,
+                    set: Some(setter),
+                },
+            ));
+        }
+    }
+
+    /// Finds an accessor for `key`, walking the prototype chain.
+    #[must_use]
+    pub fn find_accessor(&self, key: &str) -> Option<Accessor<'a>> {
+        if let Some((_, acc)) = self.accessors.borrow().iter().find(|(k, _)| **k == *key) {
+            return Some(acc.clone());
+        }
+        let mut proto = self.proto();
+        while let Some(p) = proto {
+            if let Some((_, acc)) = p.accessors.borrow().iter().find(|(k, _)| **k == *key) {
+                return Some(acc.clone());
+            }
+            proto = p.proto();
+        }
+        None
     }
 
     /// Whether this is an array.
@@ -218,6 +280,7 @@ impl<'a> Obj<'a> {
             }
         }
         self.props.borrow().iter().any(|(k, _)| **k == *key)
+            || self.accessors.borrow().iter().any(|(k, _)| **k == *key)
     }
 
     /// Sets a property by string key, growing the array (with holes filled by
@@ -254,6 +317,9 @@ impl<'a> Obj<'a> {
             }
         }
         for (k, _) in self.props.borrow().iter() {
+            keys.push(k.as_ref().into());
+        }
+        for (k, _) in self.accessors.borrow().iter() {
             keys.push(k.as_ref().into());
         }
         keys
