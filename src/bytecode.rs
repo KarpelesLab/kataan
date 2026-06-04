@@ -166,6 +166,84 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// The 64-bit FNV-1a content hash of an artifact — the key a content-addressed
+/// store uses so identical bytecode dedups to a single entry.
+#[must_use]
+pub fn content_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    h
+}
+
+/// A **content-addressed store** of compiled bytecode artifacts (`ROADMAP.md`
+/// §2.2 / Phase D′): an artifact is keyed by its content hash, so byte-identical
+/// bytecode — e.g. the same library loaded by many tenants — is stored once and
+/// shared. Read-only artifacts are held behind an `Rc`, cheap to hand out across
+/// contexts. Supports the load → run → evict → reload churn of a multi-tenant
+/// cache.
+#[derive(Default)]
+pub struct ContentStore {
+    entries: alloc::collections::BTreeMap<u64, Rc<[u8]>>,
+}
+
+impl ContentStore {
+    /// An empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts `artifact` (deduplicating on content) and returns its key. A
+    /// second insert of identical bytes is a no-op that returns the same key.
+    pub fn put(&mut self, artifact: &[u8]) -> u64 {
+        let key = content_hash(artifact);
+        self.entries
+            .entry(key)
+            .or_insert_with(|| Rc::from(artifact));
+        key
+    }
+
+    /// The shared artifact bytes for `key`, if present.
+    #[must_use]
+    pub fn get(&self, key: u64) -> Option<Rc<[u8]>> {
+        self.entries.get(&key).cloned()
+    }
+
+    /// Loads and decodes the artifact at `key` to a runnable function table.
+    ///
+    /// # Errors
+    /// Returns [`DecodeError`] if the stored bytes are corrupt; `None` if absent.
+    pub fn load(&self, key: u64) -> Option<Result<Vec<FnProto>, DecodeError>> {
+        self.entries.get(&key).map(|bytes| deserialize(bytes))
+    }
+
+    /// Whether an artifact with `key` is present.
+    #[must_use]
+    pub fn contains(&self, key: u64) -> bool {
+        self.entries.contains_key(&key)
+    }
+
+    /// Evicts `key`, returning whether it was present.
+    pub fn evict(&mut self, key: u64) -> bool {
+        self.entries.remove(&key).is_some()
+    }
+
+    /// The number of distinct artifacts held (post-dedup).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the store holds no artifacts.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// Serializes a compiled program (the function table) to a `KTBC` artifact.
 #[must_use]
 pub fn serialize(protos: &[FnProto]) -> Vec<u8> {
@@ -748,6 +826,44 @@ mod tests {
             "9,16"
         );
         assert_eq!(roundtrip_run("`hi ${'a' + 'b'}`"), "hi ab");
+    }
+
+    fn compile(src: &str) -> Vec<u8> {
+        let program = Parser::parse_program(src).expect("parse");
+        serialize(&crate::nbvm::compile_program(&program).expect("compile"))
+    }
+
+    #[test]
+    fn content_store_dedups_and_supports_churn() {
+        let mut store = ContentStore::new();
+
+        // Two "tenants" compile the *same* library → one stored entry (dedup).
+        let lib = compile("function v(){ return 42; } v()");
+        let k1 = store.put(&lib);
+        let k2 = store.put(&compile("function v(){ return 42; } v()"));
+        assert_eq!(k1, k2, "identical bytecode hashes the same");
+        assert_eq!(store.len(), 1, "cross-tenant dedup");
+
+        // A different program is a distinct key/entry.
+        let other = compile("function w(){ return 7; } w()");
+        let k3 = store.put(&other);
+        assert_ne!(k1, k3);
+        assert_eq!(store.len(), 2);
+
+        // Load → run the stored artifact.
+        let protos = store.load(k1).expect("present").expect("decoded");
+        let mut realm = Realm::new();
+        let (value, _) =
+            crate::nbvm::run_program_capturing(&mut realm, &protos, 0, &[]).expect("run");
+        assert_eq!(realm.to_display_string(value), "42");
+
+        // Evict → reload churn: gone after evict, same key on re-put.
+        assert!(store.evict(k1));
+        assert!(!store.contains(k1) && store.get(k1).is_none());
+        assert_eq!(store.len(), 1);
+        let k1b = store.put(&lib);
+        assert_eq!(k1b, k1, "content addressing is stable across reload");
+        assert_eq!(store.len(), 2);
     }
 
     #[test]
