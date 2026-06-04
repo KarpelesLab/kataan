@@ -113,10 +113,57 @@ fn collect_locals(body: &[Stmt], out: &mut Vec<String>) -> Result<(), WasmError>
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
                 collect_locals(core::slice::from_ref(body), out)?;
             }
+            Stmt::For { init, body, .. } => {
+                if let Some(crate::ast::ForInit::Var(decl)) = init {
+                    for d in &decl.declarations {
+                        let BindingTarget::Ident(id) = &d.target else {
+                            return Err(WasmError("destructuring binding"));
+                        };
+                        out.push(id.name.to_string());
+                    }
+                }
+                collect_locals(core::slice::from_ref(body), out)?;
+            }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Emits a statement-position expression for its side effect (assignment or
+/// `++`/`--`), discarding any value.
+fn emit_effect(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmError> {
+    let pad = "  ".repeat(depth);
+    match expr {
+        Expr::Assign {
+            op: crate::ast::AssignOp::Assign,
+            target,
+            value,
+            ..
+        } => {
+            let Expr::Ident(id) = &**target else {
+                return Err(WasmError("assignment target"));
+            };
+            emit_expr(value, out, depth)?;
+            out.push_str(&format!("{pad}local.set ${}\n", id.name));
+            Ok(())
+        }
+        Expr::Update { op, argument, .. } => {
+            let Expr::Ident(id) = &**argument else {
+                return Err(WasmError("update target"));
+            };
+            let mnemonic = match op {
+                crate::ast::UpdateOp::Inc => "f64.add",
+                crate::ast::UpdateOp::Dec => "f64.sub",
+            };
+            out.push_str(&format!(
+                "{pad}local.get ${0}\n{pad}f64.const 1\n{pad}{mnemonic}\n{pad}local.set ${0}\n",
+                id.name
+            ));
+            Ok(())
+        }
+        _ => Err(WasmError("expression statement")),
+    }
 }
 
 /// Emits a statement's instructions into `out` at the given indent depth.
@@ -146,22 +193,38 @@ fn emit_stmt(stmt: &Stmt, out: &mut String, depth: usize) -> Result<(), WasmErro
             }
             Ok(())
         }
-        // `x = expr;` — store into a local.
-        Stmt::Expr { expression, .. } => {
-            let Expr::Assign {
-                op: crate::ast::AssignOp::Assign,
-                target,
-                value,
-                ..
-            } = &**expression
-            else {
-                return Err(WasmError("expression statement"));
-            };
-            let Expr::Ident(id) = &**target else {
-                return Err(WasmError("assignment target"));
-            };
-            emit_expr(value, out, depth)?;
-            out.push_str(&format!("{pad}local.set ${}\n", id.name));
+        // `x = expr;` / `i++;` — a statement-position effect.
+        Stmt::Expr { expression, .. } => emit_effect(expression, out, depth),
+        // `for (init; test; update) body` → init, then a `while`-style loop with
+        // the update at the bottom.
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+            ..
+        } => {
+            match init {
+                Some(crate::ast::ForInit::Var(decl)) => {
+                    emit_stmt(&Stmt::Var(decl.clone()), out, depth)?;
+                }
+                Some(crate::ast::ForInit::Expr(e)) => emit_effect(e, out, depth)?,
+                None => {}
+            }
+            let inner = "  ".repeat(depth + 1);
+            let inner2 = "  ".repeat(depth + 2);
+            out.push_str(&format!("{pad}block\n{inner}loop\n"));
+            // No test → always true (an `1` constant is non-zero).
+            match test {
+                Some(t) => emit_cond(t, out, depth + 2)?,
+                None => out.push_str(&format!("{inner2}i32.const 1\n")),
+            }
+            out.push_str(&format!("{inner2}i32.eqz\n{inner2}br_if 1\n"));
+            emit_stmt(body, out, depth + 2)?;
+            if let Some(u) = update {
+                emit_effect(u, out, depth + 2)?;
+            }
+            out.push_str(&format!("{inner2}br 0\n{inner}end\n{pad}end\n"));
             Ok(())
         }
         Stmt::If {
@@ -536,6 +599,49 @@ fn local_idx(
     locals.get(name).copied().ok_or(WasmError("unknown local"))
 }
 
+/// Binary mirror of `emit_effect`: a statement-position assignment or `++`/`--`.
+fn emit_effect_bin(
+    expr: &Expr,
+    locals: &alloc::collections::BTreeMap<String, u32>,
+    fns: &alloc::collections::BTreeMap<&str, u32>,
+    out: &mut Vec<u8>,
+) -> Result<(), WasmError> {
+    match expr {
+        Expr::Assign {
+            op: crate::ast::AssignOp::Assign,
+            target,
+            value,
+            ..
+        } => {
+            let Expr::Ident(id) = &**target else {
+                return Err(WasmError("assignment target"));
+            };
+            emit_expr_bin(value, locals, fns, out)?;
+            out.push(0x21); // local.set
+            leb_u(local_idx(&id.name, locals)?, out);
+            Ok(())
+        }
+        Expr::Update { op, argument, .. } => {
+            let Expr::Ident(id) = &**argument else {
+                return Err(WasmError("update target"));
+            };
+            let idx = local_idx(&id.name, locals)?;
+            out.push(0x20); // local.get
+            leb_u(idx, out);
+            out.push(0x44); // f64.const 1
+            out.extend_from_slice(&1f64.to_le_bytes());
+            out.push(match op {
+                crate::ast::UpdateOp::Inc => 0xa0, // f64.add
+                crate::ast::UpdateOp::Dec => 0xa1, // f64.sub
+            });
+            out.push(0x21); // local.set
+            leb_u(idx, out);
+            Ok(())
+        }
+        _ => Err(WasmError("expression statement")),
+    }
+}
+
 fn emit_stmt_bin(
     stmt: &Stmt,
     locals: &alloc::collections::BTreeMap<String, u32>,
@@ -567,22 +673,43 @@ fn emit_stmt_bin(
             }
             Ok(())
         }
-        Stmt::Expr { expression, .. } => {
-            let Expr::Assign {
-                op: crate::ast::AssignOp::Assign,
-                target,
-                value,
-                ..
-            } = &**expression
-            else {
-                return Err(WasmError("expression statement"));
-            };
-            let Expr::Ident(id) = &**target else {
-                return Err(WasmError("assignment target"));
-            };
-            emit_expr_bin(value, locals, fns, out)?;
-            out.push(0x21); // local.set
-            leb_u(local_idx(&id.name, locals)?, out);
+        Stmt::Expr { expression, .. } => emit_effect_bin(expression, locals, fns, out),
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+            ..
+        } => {
+            match init {
+                Some(crate::ast::ForInit::Var(decl)) => {
+                    emit_stmt_bin(&Stmt::Var(decl.clone()), locals, fns, out)?;
+                }
+                Some(crate::ast::ForInit::Expr(e)) => emit_effect_bin(e, locals, fns, out)?,
+                None => {}
+            }
+            out.push(0x02); // block
+            out.push(0x40);
+            out.push(0x03); // loop
+            out.push(0x40);
+            match test {
+                Some(t) => emit_cond_bin(t, locals, fns, out)?,
+                None => {
+                    out.push(0x41); // i32.const
+                    leb_u(1, out);
+                }
+            }
+            out.push(0x45); // i32.eqz
+            out.push(0x0d); // br_if
+            leb_u(1, out);
+            emit_stmt_bin(body, locals, fns, out)?;
+            if let Some(u) = update {
+                emit_effect_bin(u, locals, fns, out)?;
+            }
+            out.push(0x0c); // br
+            leb_u(0, out);
+            out.push(0x0b); // end loop
+            out.push(0x0b); // end block
             Ok(())
         }
         Stmt::If {
@@ -962,6 +1089,23 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_for_loop_with_increment() {
+        // `for (let i = 0; i < n; i++)` with a body accumulating into `s`.
+        let src =
+            "function sumTo(n) { let s = 0; for (let i = 0; i < n; i++) { s = s + i; } return s; }";
+        let wat = module(src);
+        assert!(wat.contains("local.set $i")); // init
+        assert!(wat.contains("block") && wat.contains("loop"));
+        assert!(wat.contains("br_if 1")); // exit
+        assert!(wat.contains("f64.add")); // i++ and s+i
+        assert_well_formed(&wat);
+        let wasm = binary(src);
+        // structured control opcodes + i++ (local.get/add/local.set sequence).
+        assert!(wasm.contains(&0x02) && wasm.contains(&0x03) && wasm.contains(&0x0d));
+        section_ids(&wasm);
     }
 
     #[test]
