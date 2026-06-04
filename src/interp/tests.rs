@@ -2014,6 +2014,15 @@ fn string_methods() {
     assert_eq!(eval("'ab'.repeat(3)"), "ababab");
     assert_eq!(eval("'hello'.charAt(1)"), "e");
     assert_eq!(eval("'hello'.startsWith('he')"), "true");
+    // substring clamps to [0, len] and swaps when start > end.
+    assert_eq!(eval("'hello'.substring(1, 3)"), "el");
+    assert_eq!(eval("'hello'.substring(3, 1)"), "el");
+    assert_eq!(eval("'hello'.substring(2)"), "llo");
+    assert_eq!(eval("'hello'.substring(-5, 3)"), "hel");
+    // substr(start, length); a negative start counts from the end.
+    assert_eq!(eval("'hello'.substr(1, 3)"), "ell");
+    assert_eq!(eval("'hello'.substr(-2)"), "lo");
+    assert_eq!(eval("'hello'.substr(2)"), "llo");
 }
 
 #[test]

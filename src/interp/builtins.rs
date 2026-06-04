@@ -1377,6 +1377,46 @@ fn string_method<'a>(s: &str, name: &str, args: &[Value<'a>]) -> Option<Value<'a
             let (start, end) = slice_bounds(args, chars.len());
             Value::str(chars[start..end].iter().collect::<String>())
         }
+        "substring" => {
+            // Clamps each index to [0, len] (negatives/NaN → 0) and swaps so
+            // start <= end.
+            let len = chars.len();
+            let clamp = |v: &Value<'a>, default: usize| -> usize {
+                if matches!(v, Value::Undefined) {
+                    return default;
+                }
+                let n = v.to_number();
+                if n.is_nan() || n < 0.0 {
+                    0
+                } else if n > len as f64 {
+                    len
+                } else {
+                    n as usize
+                }
+            };
+            let mut start = clamp(&arg(args, 0), 0);
+            let mut end = clamp(&arg(args, 1), len);
+            if start > end {
+                core::mem::swap(&mut start, &mut end);
+            }
+            Value::str(chars[start..end].iter().collect::<String>())
+        }
+        "substr" => {
+            // `substr(start, length)`: start may be negative (from the end).
+            let len = chars.len();
+            let raw = arg(args, 0).to_number();
+            let start = if raw < 0.0 {
+                (len as f64 + raw).max(0.0) as usize
+            } else {
+                (raw as usize).min(len)
+            };
+            let count = if matches!(arg(args, 1), Value::Undefined) {
+                len - start
+            } else {
+                (arg(args, 1).to_number().max(0.0) as usize).min(len - start)
+            };
+            Value::str(chars[start..start + count].iter().collect::<String>())
+        }
         "split" => {
             let sep = arg(args, 0);
             let parts: Vec<Value<'a>> = match sep {
