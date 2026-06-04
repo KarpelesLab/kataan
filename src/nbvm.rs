@@ -12,7 +12,7 @@
 //! migrating the full bytecode VM onto this representation.
 //!
 //! It also carries the first slices of the **bytecode-VM fold**: an AST →
-//! bytecode [`compile_and_run`] that lowers a growing JavaScript subset
+//! bytecode `compile_and_run` that lowers a growing JavaScript subset
 //! (arithmetic, control flow, arrays/objects, `for` loops, and now functions
 //! with recursion via a per-activation register window) onto these ops, with no
 //! tree-walking. Closures, exceptions, and first-class function values arrive
