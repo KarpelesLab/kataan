@@ -62,6 +62,7 @@ fn render_op(op: &Op) -> String {
             count,
         } => format!("MakeClosure r{dst}, #{chunk}, r{upvals_base}..+{count}"),
         Op::GetUpvalue { dst, idx } => format!("GetUpvalue  r{dst}, ^{idx}"),
+        Op::Yield { value, dst } => format!("Yield       r{value} -> r{dst}"),
         Op::TypeOfGlobal { dst, name } => format!("TypeOfGlbl  r{dst}, k{name}"),
         Op::Eq { dst, a, b } => format!("Eq          r{dst}, r{a}, r{b}"),
         Op::StrictEq { dst, a, b } => format!("StrictEq    r{dst}, r{a}, r{b}"),

@@ -68,7 +68,7 @@ impl<'a> Interp<'a> {
 
     /// Executes chunk `chunk_idx` of `module` with `this` in register 0,
     /// `args` bound to the parameter registers (1..), and `captures` exposed as
-    /// the frame's upvalues, returning its value.
+    /// the frame's upvalues, running it to completion and returning its value.
     fn run_chunk(
         &mut self,
         module: &Rc<Module>,
@@ -77,44 +77,34 @@ impl<'a> Interp<'a> {
         args: Vec<Value<'a>>,
         captures: &[Value<'a>],
     ) -> Completion<'a, Value<'a>> {
-        let chunk: &Chunk = &module.chunks[chunk_idx as usize];
-        let mut regs: Vec<Value<'a>> = alloc::vec![Value::Undefined; chunk.register_count as usize];
-        // Register 0 holds `this`; parameters occupy registers 1.. (extras
-        // ignored, missing stay `undefined`).
-        if !regs.is_empty() {
-            regs[0] = this;
+        let mut frame = make_frame(module, chunk_idx, this, args, captures.to_vec());
+        match self.run_frame(&mut frame)? {
+            FrameStep::Return(v) => Ok(v),
+            // A bare yield in a non-generator chunk never happens (the compiler
+            // only emits `Yield` inside generators).
+            FrameStep::Yield { .. } => Ok(Value::Undefined),
         }
-        // With a rest parameter, the fixed params bind positionally and the
-        // remaining arguments collect into an array in the rest register.
-        let fixed = if chunk.has_rest {
-            (chunk.param_count as usize).saturating_sub(1)
-        } else {
-            chunk.param_count as usize
-        };
-        let mut args_iter = args.into_iter();
-        for slot in 1..=fixed {
-            match args_iter.next() {
-                Some(arg) if slot < regs.len() => regs[slot] = arg,
-                Some(_) | None => break,
-            }
-        }
-        if chunk.has_rest {
-            let rest: Vec<Value<'a>> = args_iter.collect();
-            let slot = fixed + 1;
-            if slot < regs.len() {
-                regs[slot] = Value::Object(Obj::array(rest));
-            }
-        }
-        let mut pc = 0usize;
-        // Installed exception handlers: `(catch_pc, error_register)`.
-        let mut handlers: Vec<(usize, Reg)> = Vec::new();
-        loop {
+    }
+
+    /// Runs a frame until it returns or yields (a generator suspension). The
+    /// frame's registers/pc/handlers are saved back so it can be resumed.
+    pub(super) fn run_frame(&mut self, frame: &mut Frame<'a>) -> Completion<'a, FrameStep<'a>> {
+        let module = Rc::clone(&frame.module);
+        let chunk: &Chunk = &module.chunks[frame.chunk as usize];
+        // Move the frame state into locals so the op loop can borrow them freely
+        // (and `self`) without conflicting with the `&mut frame`; saved back on
+        // exit for a later resume.
+        let mut regs = core::mem::take(&mut frame.regs);
+        let mut pc = frame.pc;
+        let mut handlers = core::mem::take(&mut frame.handlers);
+        let captures = core::mem::take(&mut frame.captures);
+        let outcome: Completion<'a, FrameStep<'a>> = loop {
             let op = &chunk.code[pc];
             pc += 1;
             // Run one op inside a closure so a thrown `Err` (from a fallible
             // op or an explicit `Throw`) can be caught and routed to the
-            // nearest installed handler. `Ok(Some(v))` is a `Return`.
-            let outcome: Completion<'a, Option<Value<'a>>> = (|| {
+            // nearest installed handler. `Ok(Some(step))` returns/yields.
+            let outcome: Completion<'a, Option<FrameStep<'a>>> = (|| {
                 match op {
                     Op::LoadConst { dst, k } => {
                         regs[*dst as usize] = match &chunk.constants[*k as usize] {
@@ -122,7 +112,7 @@ impl<'a> Interp<'a> {
                             Const::Str(s) => Value::str(s.clone()),
                             // A function constant materializes a bytecode-function
                             // value over the same module.
-                            Const::Func(idx) => Value::Object(make_bytecode_fn(module, *idx)),
+                            Const::Func(idx) => Value::Object(make_bytecode_fn(&module, *idx)),
                         };
                     }
                     Op::MakeClosure {
@@ -134,7 +124,7 @@ impl<'a> Interp<'a> {
                         let base = *upvals_base as usize;
                         let captured: Vec<Value<'a>> = regs[base..base + *count as usize].to_vec();
                         regs[*dst as usize] =
-                            Value::Object(make_closure(module, *target, captured));
+                            Value::Object(make_closure(&module, *target, captured));
                     }
                     Op::GetUpvalue { dst, idx } => {
                         regs[*dst as usize] = captures
@@ -291,8 +281,18 @@ impl<'a> Interp<'a> {
                         regs[*dst as usize] = self.call_member(receiver, &key, args)?;
                     }
 
-                    Op::Return { src } => return Ok(Some(regs[*src as usize].clone())),
-                    Op::ReturnUndefined => return Ok(Some(Value::Undefined)),
+                    Op::Return { src } => {
+                        return Ok(Some(FrameStep::Return(regs[*src as usize].clone())));
+                    }
+                    Op::ReturnUndefined => {
+                        return Ok(Some(FrameStep::Return(Value::Undefined)));
+                    }
+                    Op::Yield { value, dst } => {
+                        return Ok(Some(FrameStep::Yield {
+                            value: regs[*value as usize].clone(),
+                            dst: *dst,
+                        }));
+                    }
 
                     Op::Throw { src } => return Err(regs[*src as usize].clone()),
                     Op::PushHandler { catch, err } => {
@@ -325,7 +325,7 @@ impl<'a> Interp<'a> {
                 Ok(None)
             })();
             match outcome {
-                Ok(Some(value)) => return Ok(value),
+                Ok(Some(step)) => break Ok(step),
                 Ok(None) => {}
                 // Unwind to the nearest installed handler; if none, propagate.
                 Err(error) => match handlers.pop() {
@@ -333,10 +333,16 @@ impl<'a> Interp<'a> {
                         regs[err_reg as usize] = error;
                         pc = catch_pc;
                     }
-                    None => return Err(error),
+                    None => break Err(error),
                 },
             }
-        }
+        };
+        // Save the frame state so the generator can resume from here.
+        frame.regs = regs;
+        frame.pc = pc;
+        frame.handlers = handlers;
+        frame.captures = captures;
+        outcome
     }
 
     /// Applies a binary op to two registers, writing the result into `dst`.
@@ -352,6 +358,67 @@ impl<'a> Interp<'a> {
         let r = regs[b as usize].clone();
         regs[dst as usize] = self.eval_binary(op, l, r)?;
         Ok(())
+    }
+}
+
+/// A suspendable execution frame. Normal functions run one to completion;
+/// generators keep their frame across `next()` calls.
+pub(super) struct Frame<'a> {
+    pub module: Rc<Module>,
+    pub chunk: u32,
+    pub captures: Vec<Value<'a>>,
+    pub regs: Vec<Value<'a>>,
+    pub pc: usize,
+    pub handlers: Vec<(usize, Reg)>,
+}
+
+/// How a frame paused: it returned a value, or yielded one (recording the
+/// register the resumed value is placed into).
+pub(super) enum FrameStep<'a> {
+    Return(Value<'a>),
+    Yield { value: Value<'a>, dst: Reg },
+}
+
+/// Builds a fresh frame for `chunk`, binding `this` (register 0), the
+/// positional/rest parameters, and exposing `captures` as upvalues.
+pub(super) fn make_frame<'a>(
+    module: &Rc<Module>,
+    chunk_idx: u32,
+    this: Value<'a>,
+    args: Vec<Value<'a>>,
+    captures: Vec<Value<'a>>,
+) -> Frame<'a> {
+    let chunk = &module.chunks[chunk_idx as usize];
+    let mut regs: Vec<Value<'a>> = alloc::vec![Value::Undefined; chunk.register_count as usize];
+    if !regs.is_empty() {
+        regs[0] = this;
+    }
+    let fixed = if chunk.has_rest {
+        (chunk.param_count as usize).saturating_sub(1)
+    } else {
+        chunk.param_count as usize
+    };
+    let mut args_iter = args.into_iter();
+    for slot in 1..=fixed {
+        match args_iter.next() {
+            Some(arg) if slot < regs.len() => regs[slot] = arg,
+            Some(_) | None => break,
+        }
+    }
+    if chunk.has_rest {
+        let rest: Vec<Value<'a>> = args_iter.collect();
+        let slot = fixed + 1;
+        if slot < regs.len() {
+            regs[slot] = Value::Object(Obj::array(rest));
+        }
+    }
+    Frame {
+        module: Rc::clone(module),
+        chunk: chunk_idx,
+        captures,
+        regs,
+        pc: 0,
+        handlers: Vec::new(),
     }
 }
 

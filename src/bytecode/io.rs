@@ -195,6 +195,7 @@ mod tag {
     pub(super) const DELETE_MEMBER: u8 = 42;
     pub(super) const ITER_VALUES: u8 = 43;
     pub(super) const ITER_KEYS: u8 = 44;
+    pub(super) const YIELD: u8 = 47;
     pub(super) const MAKE_CLOSURE: u8 = 45;
     pub(super) const GET_UPVALUE: u8 = 46;
 }
@@ -284,6 +285,11 @@ fn write_op(w: &mut Writer, op: &Op) {
             w.raw(tag::GET_UPVALUE);
             w.u16(*dst);
             w.u16(*idx);
+        }
+        Op::Yield { value, dst } => {
+            w.raw(tag::YIELD);
+            w.u16(*value);
+            w.u16(*dst);
         }
         Op::TypeOfGlobal { dst, name } => {
             w.raw(tag::TYPE_OF_GLOBAL);
@@ -523,6 +529,10 @@ fn read_op(r: &mut Reader) -> Result<Op, BytecodeError> {
         tag::GET_UPVALUE => Op::GetUpvalue {
             dst: r.u16()?,
             idx: r.u16()?,
+        },
+        tag::YIELD => Op::Yield {
+            value: r.u16()?,
+            dst: r.u16()?,
         },
         tag::TYPE_OF_GLOBAL => Op::TypeOfGlobal {
             dst: r.u16()?,

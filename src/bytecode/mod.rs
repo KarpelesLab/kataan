@@ -317,6 +317,14 @@ pub enum Op {
     /// Remove the most recently installed handler (the guarded region completed
     /// normally).
     PopHandler,
+
+    // --- generators ---
+    /// Suspend the current generator frame, yielding `value`; on resume, the
+    /// value passed to `next(v)` is placed in `dst`.
+    Yield {
+        value: Reg,
+        dst: Reg,
+    },
 }
 
 /// A unit of compiled code: a flat instruction list, a constant pool, and
