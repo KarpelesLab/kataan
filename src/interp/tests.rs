@@ -37,6 +37,18 @@ fn eval_global(src: &str, name: &str) -> String {
         .map_or_else(|| String::from("<unbound>"), |v| v.to_js_string())
 }
 
+/// Like [`eval_global`] but executes through the bytecode VM (with tree-walker
+/// fallback) — needed for `async`/`await`, which only the VM drives.
+fn eval_global_vm(src: &str, name: &str) -> String {
+    let program = Parser::parse_program(src).expect("parse ok");
+    let mut interp = Interp::new();
+    interp.run_with_vm(&program).expect("run ok");
+    interp
+        .global()
+        .get(name)
+        .map_or_else(|| String::from("<unbound>"), |v| v.to_js_string())
+}
+
 /// Compiles a single-expression program to bytecode, runs it through the VM,
 /// and returns the result as a string. Panics if the expression is outside the
 /// bytecode compiler's supported subset or throws.
@@ -1140,12 +1152,76 @@ fn bytecode_vm_loops() {
 
 #[test]
 fn bytecode_vm_falls_back_on_unsupported() {
-    // An `async` function is still outside the bytecode compiler's subset
-    // (`await` needs the async driver), so it is reported as unsupported and the
-    // caller falls back to the tree-walker.
-    let program = Parser::parse_program("async function f() { return 1; } f()").unwrap();
+    // `yield*` delegation is still outside the bytecode compiler's subset, so it
+    // is reported as unsupported and the caller falls back to the tree-walker.
+    let program = Parser::parse_program("function* g() { yield* [1, 2]; } [...g()]").unwrap();
     let mut interp = Interp::new();
     assert!(interp.eval_via_bytecode(&program.body).is_err());
+}
+
+#[test]
+fn bytecode_vm_async_await() {
+    // An async function returns its value as a fulfilled promise.
+    assert_eq!(
+        eval_global_vm(
+            "async function f() { return 42; } f().then(v => r = v);",
+            "r"
+        ),
+        "42"
+    );
+    // `await` unwraps resolved promises.
+    assert_eq!(
+        eval_global_vm(
+            "async function g() { let a = await Promise.resolve(10); let b = await Promise.resolve(20); return a + b; }
+             g().then(v => r = v);",
+            "r"
+        ),
+        "30"
+    );
+    // `try`/`catch` around a rejected await (the throw is injected at the await).
+    assert_eq!(
+        eval_global_vm(
+            "async function h() { try { await Promise.reject('boom'); return 'no'; } catch (e) { return 'caught:' + e; } }
+             h().then(v => r = v);",
+            "r"
+        ),
+        "caught:boom"
+    );
+    // `await` inside a loop.
+    assert_eq!(
+        eval_global_vm(
+            "async function s() { let t = 0; for (let i = 1; i <= 4; i += 1) t += await Promise.resolve(i); return t; }
+             s().then(v => r = v);",
+            "r"
+        ),
+        "10"
+    );
+    // A throwing async function rejects.
+    assert_eq!(
+        eval_global_vm(
+            "async function t() { throw 'x'; } t().catch(e => r = 'rejected:' + e);",
+            "r"
+        ),
+        "rejected:x"
+    );
+    // Awaiting a plain (non-promise) value works.
+    assert_eq!(
+        eval_global_vm(
+            "async function p() { return (await 5) + 1; } p().then(v => r = v);",
+            "r"
+        ),
+        "6"
+    );
+    // One async function awaiting another.
+    assert_eq!(
+        eval_global_vm(
+            "async function inner() { return await Promise.resolve(7); }
+             async function outer() { return (await inner()) * 2; }
+             outer().then(v => r = v);",
+            "r"
+        ),
+        "14"
+    );
 }
 
 #[test]

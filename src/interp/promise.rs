@@ -47,7 +47,14 @@ struct Reaction<'a> {
     on_rejected: Value<'a>,
     resolve: Value<'a>,
     reject: Value<'a>,
+    /// An internal (Rust) reaction used by the async driver: invoked with
+    /// `(interp, fulfilled, value)` when the promise settles, bypassing the
+    /// JS-callable handlers. Lets `await` resume a suspended async frame.
+    internal: Option<InternalReaction<'a>>,
 }
+
+/// A Rust closure run when an awaited promise settles (the async driver).
+type InternalReaction<'a> = alloc::boxed::Box<dyn FnOnce(&mut Interp<'a>, bool, Value<'a>) + 'a>;
 
 type State<'a> = Rc<RefCell<PromiseState<'a>>>;
 
@@ -72,6 +79,91 @@ impl<'a> Interp<'a> {
         };
         settle(&state, status, value, &queue);
         Value::Object(obj)
+    }
+
+    /// Drives an `async` function: starts pumping its generator-style frame and
+    /// returns the promise that settles with the function's result.
+    pub(super) fn drive_async(
+        &mut self,
+        genstate: Rc<RefCell<super::vm::GeneratorState<'a>>>,
+    ) -> Value<'a> {
+        let proto = self.promise_prototype();
+        let queue = self.microtask_queue();
+        let (obj, state) = new_promise(&queue, &proto);
+        let (resolve, reject) = make_resolvers(&state, &queue);
+        self.async_step(genstate, resolve, reject, Value::Undefined, false);
+        Value::Object(obj)
+    }
+
+    /// One step of the async driver: resume the frame (with `send`, or injecting
+    /// a throw), then settle the result promise on return / chain on `await`.
+    fn async_step(
+        &mut self,
+        genstate: Rc<RefCell<super::vm::GeneratorState<'a>>>,
+        resolve: Value<'a>,
+        reject: Value<'a>,
+        send: Value<'a>,
+        is_throw: bool,
+    ) {
+        match self.generator_step(&genstate, send, is_throw) {
+            // The async function returned: fulfil with its value (adopting an
+            // inner promise if it returned one).
+            Ok((value, true)) => {
+                let _ = self.call_with_this(resolve, Value::Undefined, alloc::vec![value]);
+            }
+            // An `await`: continue when the awaited value settles.
+            Ok((awaited, false)) => {
+                self.await_settlement(
+                    awaited,
+                    Box::new(move |interp, fulfilled, v| {
+                        interp.async_step(genstate, resolve, reject, v, !fulfilled);
+                    }),
+                );
+            }
+            // The async function threw: reject.
+            Err(thrown) => {
+                let _ = self.call_with_this(reject, Value::Undefined, alloc::vec![thrown]);
+            }
+        }
+    }
+
+    /// Registers `on_settle` to run when `value` settles (a promise), or on the
+    /// next tick treating a plain value as already fulfilled.
+    fn await_settlement(&mut self, value: Value<'a>, on_settle: InternalReaction<'a>) {
+        let queue = self.microtask_queue();
+        if let Value::Object(o) = &value
+            && let Some(state) = o.promise_state()
+        {
+            register_reaction(
+                &state,
+                &queue,
+                Reaction {
+                    on_fulfilled: noop(),
+                    on_rejected: noop(),
+                    resolve: noop(),
+                    reject: noop(),
+                    internal: Some(on_settle),
+                },
+            );
+        } else {
+            let v = value.clone();
+            queue
+                .borrow_mut()
+                .push_back(Box::new(move |interp: &mut Interp<'a>| {
+                    on_settle(interp, true, v)
+                }));
+        }
+    }
+
+    /// The shared `Promise.prototype` object.
+    fn promise_prototype(&self) -> Rc<Obj<'a>> {
+        match self.global().get("Promise") {
+            Some(Value::Object(ctor)) => match ctor.get("prototype") {
+                Value::Object(p) => p,
+                _ => Obj::object(),
+            },
+            _ => Obj::object(),
+        }
     }
 
     pub(super) fn install_promise(&self) {
@@ -287,6 +379,7 @@ fn settle_element<'a>(
                 on_rejected,
                 resolve: noop(),
                 reject: noop(),
+                internal: None,
             },
         );
         return;
@@ -348,6 +441,7 @@ fn new_promise<'a>(queue: &MicrotaskQueue<'a>, proto: &Rc<Obj<'a>>) -> (Rc<Obj<'
                     on_rejected: on_r,
                     resolve,
                     reject,
+                    internal: None,
                 },
             );
             Ok(Value::Object(p2))
@@ -432,6 +526,7 @@ fn do_resolve<'a>(state: &State<'a>, queue: &MicrotaskQueue<'a>, value: Value<'a
                 on_rejected: Value::Undefined,
                 resolve,
                 reject,
+                internal: None,
             },
         );
         return;
@@ -483,8 +578,14 @@ fn enqueue_reaction<'a>(
             on_rejected,
             resolve,
             reject,
+            internal,
         } = reaction;
         let fulfilled = status == Status::Fulfilled;
+        // An async-driver reaction runs its Rust closure and is done.
+        if let Some(run) = internal {
+            run(interp, fulfilled, value);
+            return;
+        }
         let handler = if fulfilled { on_fulfilled } else { on_rejected };
         if handler.is_callable() {
             match interp.call_with_this(handler, Value::Undefined, alloc::vec![value]) {

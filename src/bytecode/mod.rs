@@ -344,6 +344,9 @@ pub struct Chunk {
     /// Whether this chunk is a generator function body (calling it produces a
     /// generator object rather than running the body).
     pub is_generator: bool,
+    /// Whether this chunk is an `async` function body (calling it drives the
+    /// frame as a coroutine and returns a promise).
+    pub is_async: bool,
     /// The constant pool.
     pub constants: Vec<Const>,
     /// The instructions.
@@ -360,6 +363,7 @@ impl Chunk {
             param_count: 0,
             has_rest: false,
             is_generator: false,
+            is_async: false,
             constants: Vec::new(),
             code: Vec::new(),
         }

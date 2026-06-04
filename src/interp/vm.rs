@@ -63,17 +63,23 @@ impl<'a> Interp<'a> {
         args: Vec<Value<'a>>,
     ) -> Completion<'a, Value<'a>> {
         let captures = func.captures.clone();
-        // Calling a generator function produces a generator object holding a
-        // *suspended* frame (the body runs on `next()`).
-        if func.module.chunks[func.chunk as usize].is_generator {
+        let chunk = &func.module.chunks[func.chunk as usize];
+        // Generator / async functions build a suspendable frame.
+        if chunk.is_generator || chunk.is_async {
             let frame = make_frame(&func.module, func.chunk, this, args, captures);
-            let obj = Obj::object();
-            obj.set_generator(Rc::new(core::cell::RefCell::new(GeneratorState {
+            let state = Rc::new(core::cell::RefCell::new(GeneratorState {
                 frame,
                 done: false,
                 pending_dst: 0,
                 started: false,
-            })));
+            }));
+            // A generator returns its object (driven by `next()`); an async
+            // function is pumped immediately and returns a promise.
+            if chunk.is_async {
+                return Ok(self.drive_async(state));
+            }
+            let obj = Obj::object();
+            obj.set_generator(state);
             return Ok(Value::Object(obj));
         }
         self.run_chunk(&func.module, func.chunk, this, args, &captures)
@@ -428,18 +434,50 @@ impl<'a> Interp<'a> {
         state: &Rc<core::cell::RefCell<GeneratorState<'a>>>,
         send: Value<'a>,
     ) -> Completion<'a, (Value<'a>, bool)> {
+        self.generator_step(state, send, false)
+    }
+
+    /// Resumes a generator/async frame. With `is_throw`, `send` is injected as a
+    /// thrown error at the suspension point (used by `await` on a rejected
+    /// promise): it unwinds to the frame's nearest handler, or finishes the
+    /// generator with that error if none.
+    pub(super) fn generator_step(
+        &mut self,
+        state: &Rc<core::cell::RefCell<GeneratorState<'a>>>,
+        send: Value<'a>,
+        is_throw: bool,
+    ) -> Completion<'a, (Value<'a>, bool)> {
         {
             let mut s = state.borrow_mut();
             if s.done {
+                if is_throw {
+                    return Err(send);
+                }
                 return Ok((Value::Undefined, true));
             }
-            if s.started {
+            if !s.started {
+                s.started = true;
+            } else if is_throw {
+                // Inject the throw at the suspended point.
+                match s.frame.handlers.pop() {
+                    Some((catch_pc, err_reg)) => {
+                        let r = err_reg as usize;
+                        if r < s.frame.regs.len() {
+                            s.frame.regs[r] = send;
+                        }
+                        s.frame.pc = catch_pc;
+                    }
+                    None => {
+                        s.done = true;
+                        return Err(send);
+                    }
+                }
+            } else {
                 let dst = s.pending_dst as usize;
                 if dst < s.frame.regs.len() {
                     s.frame.regs[dst] = send;
                 }
             }
-            s.started = true;
         }
         // Run the frame (released the borrow so `self` calls can re-enter).
         let mut frame = {

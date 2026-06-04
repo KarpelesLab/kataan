@@ -88,6 +88,7 @@ fn write_chunk(w: &mut Writer, chunk: &Chunk) {
     w.u16(chunk.param_count);
     w.raw(u8::from(chunk.has_rest));
     w.raw(u8::from(chunk.is_generator));
+    w.raw(u8::from(chunk.is_async));
     w.u32(chunk.constants.len() as u32);
     for c in &chunk.constants {
         write_const(w, c);
@@ -104,6 +105,7 @@ fn read_chunk(r: &mut Reader) -> Result<Chunk, BytecodeError> {
     let param_count = r.u16()?;
     let has_rest = r.raw()? != 0;
     let is_generator = r.raw()? != 0;
+    let is_async = r.raw()? != 0;
     let const_count = r.u32()? as usize;
     let mut constants = Vec::with_capacity(const_count);
     for _ in 0..const_count {
@@ -120,6 +122,7 @@ fn read_chunk(r: &mut Reader) -> Result<Chunk, BytecodeError> {
         param_count,
         has_rest,
         is_generator,
+        is_async,
         constants,
         code,
     })
