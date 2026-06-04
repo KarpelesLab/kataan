@@ -933,10 +933,29 @@ impl<'src> Parser<'src> {
                 "reserved word cannot be used as a shorthand property",
             ));
         }
+        let ident_expr = Expr::Ident(Ident::new(name.clone(), tok.span));
+        // CoverInitializedName `{ name = default }` — only meaningful when the
+        // object is reinterpreted as a destructuring assignment target; the
+        // default lives in the property value as an assignment expression.
+        if self.eat(TokenKind::Eq) {
+            let default = self.parse_assignment()?;
+            let span = start.to(default.span());
+            return Ok(ObjectMember::Property {
+                key: PropertyKey::Ident(name),
+                value: Box::new(Expr::Assign {
+                    op: crate::ast::AssignOp::Assign,
+                    target: Box::new(ident_expr),
+                    value: Box::new(default),
+                    span,
+                }),
+                shorthand: true,
+                span,
+            });
+        }
         // Shorthand `{ name }`.
         Ok(ObjectMember::Property {
-            key: PropertyKey::Ident(name.clone()),
-            value: Box::new(Expr::Ident(Ident::new(name, tok.span))),
+            key: PropertyKey::Ident(name),
+            value: Box::new(ident_expr),
             shorthand: true,
             span: tok.span,
         })

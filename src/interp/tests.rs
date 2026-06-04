@@ -1181,6 +1181,15 @@ fn destructuring_assignment() {
         eval("let a, b, c; [a, [b, c]] = [1, [2, 3]]; a + ',' + b + ',' + c"),
         "1,2,3"
     );
+    // Object shorthand with default (CoverInitializedName) in assignment.
+    assert_eq!(
+        eval("let m, n; ({ m, n = 99 } = { m: 1 }); m + ',' + n"),
+        "1,99"
+    );
+    assert_eq!(
+        eval("let a, b; ({ a = 10, b = 20 } = { a: 5 }); a + ',' + b"),
+        "5,20"
+    );
 }
 
 #[test]
