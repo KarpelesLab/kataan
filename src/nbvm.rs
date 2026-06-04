@@ -84,6 +84,15 @@ pub enum Op {
     /// `dst = func(args…)` — call function `func` (an index into the program's
     /// function table) with the values in the `args` registers.
     Call { dst: Reg, func: u32, args: Vec<Reg> },
+    /// `dst = a first-class function value` wrapping function-table index `func`.
+    LoadFunc { dst: Reg, func: u32 },
+    /// `dst = callee(args…)` — an indirect call through a function value held in
+    /// the `callee` register.
+    CallValue {
+        dst: Reg,
+        callee: Reg,
+        args: Vec<Reg>,
+    },
     /// `dst = native#id(args…)` — invoke a built-in (`console.log`, `Math.*`).
     CallNative {
         dst: Reg,
@@ -317,6 +326,34 @@ fn run_frame(
                 // A throw from the callee is caught by this frame's nearest
                 // handler, else it keeps unwinding.
                 match call(ctx, funcs, *func as usize, &argv) {
+                    Ok(ret) => regs[*dst as usize] = ret,
+                    Err(VmError::Thrown(v)) => match handlers.pop() {
+                        Some((target, reg)) => {
+                            regs[reg as usize] = v;
+                            pc = target;
+                        }
+                        None => return Err(VmError::Thrown(v)),
+                    },
+                    Err(other) => return Err(other),
+                }
+            }
+            Op::LoadFunc { dst, func } => {
+                // A function value is a one-element heap array holding the
+                // function-table index (as a number).
+                let handle = ctx
+                    .realm
+                    .new_array(alloc::vec![NanBox::number(*func as f64)]);
+                regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            }
+            Op::CallValue { dst, callee, args } => {
+                let handle = object_handle(regs[*callee as usize])?;
+                let id = ctx
+                    .realm
+                    .get_element(handle, 0)
+                    .as_number()
+                    .ok_or(VmError::NotAnObject)? as usize;
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                match call(ctx, funcs, id, &argv) {
                     Ok(ret) => regs[*dst as usize] = ret,
                     Err(VmError::Thrown(v)) => match handlers.pop() {
                         Some((target, reg)) => {
@@ -797,9 +834,18 @@ impl Compiler {
                 });
                 Ok(r)
             }
-            Expr::Ident(id) => self
-                .lookup(&id.name)
-                .ok_or_else(|| CompileError::Undefined(String::from(&*id.name))),
+            Expr::Ident(id) => {
+                if let Some(reg) = self.lookup(&id.name) {
+                    Ok(reg)
+                } else if let Some(&func) = self.fn_ids.get(&*id.name) {
+                    // A function referenced as a value: materialize a closure.
+                    let dst = self.alloc();
+                    self.ops.push(Op::LoadFunc { dst, func });
+                    Ok(dst)
+                } else {
+                    Err(CompileError::Undefined(String::from(&*id.name)))
+                }
+            }
             Expr::Unary { op, argument, .. } => {
                 let a = self.expr(argument)?;
                 let dst = self.alloc();
@@ -917,17 +963,25 @@ impl Compiler {
                     self.ops.push(Op::CallNative { dst, native, args });
                     return Ok(dst);
                 }
-                // Otherwise a direct call to a hoisted function (static dispatch
-                // + recursion).
-                let Expr::Ident(id) = &**callee else {
-                    return Err(CompileError::Unsupported("indirect call"));
-                };
-                let func = *self
-                    .fn_ids
-                    .get(&*id.name)
-                    .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                // A direct call to a hoisted function by name (static dispatch +
+                // recursion), when the name isn't shadowed by a local.
+                if let Expr::Ident(id) = &**callee
+                    && self.lookup(&id.name).is_none()
+                    && let Some(&func) = self.fn_ids.get(&*id.name)
+                {
+                    let dst = self.alloc();
+                    self.ops.push(Op::Call { dst, func, args });
+                    return Ok(dst);
+                }
+                // Otherwise an indirect call through a function *value* (a local
+                // holding a function, or any callee expression).
+                let callee_reg = self.expr(callee)?;
                 let dst = self.alloc();
-                self.ops.push(Op::Call { dst, func, args });
+                self.ops.push(Op::CallValue {
+                    dst,
+                    callee: callee_reg,
+                    args,
+                });
                 Ok(dst)
             }
             Expr::Assign {
@@ -1326,6 +1380,35 @@ mod tests {
             "6"
         );
         assert_eq!(bc("let r = 0; do { r++; } while (false); r"), "1");
+    }
+
+    #[test]
+    fn bytecode_first_class_functions() {
+        // A function passed by name and called indirectly (higher-order).
+        assert_eq!(
+            bc(
+                "function apply(f, x) { return f(x); } function dbl(n) { return n * 2; } apply(dbl, 21)"
+            ),
+            "42"
+        );
+        // A function stored in a variable, then called via the variable.
+        assert_eq!(
+            bc("function inc(n) { return n + 1; } let g = inc; g(g(g(10)))"),
+            "13"
+        );
+        // Selecting one of several functions at runtime.
+        assert_eq!(
+            bc("function add(a, b) { return a + b; }
+                function mul(a, b) { return a * b; }
+                function pick(cond) { if (cond) { return add; } return mul; }
+                pick(true)(3, 4) + ',' + pick(false)(3, 4)"),
+            "7,12"
+        );
+        // A function value passed through an array element.
+        assert_eq!(
+            bc("function sq(n) { return n * n; } let ops = [sq]; ops[0](9)"),
+            "81"
+        );
     }
 
     #[test]
