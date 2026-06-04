@@ -9,7 +9,8 @@
 //!
 //! It lowers `let`/assignment locals (incl. compound `+=`/`-=`/`*=`/`/=` and
 //! `++`/`--`), arithmetic, `%`, comparisons, `Math.*`, ternaries, `if`/`else`,
-//! `while`/`for`/`do-while` loops (as structured `block`/`loop`/`br_if`), and
+//! `while`/`for`/`do-while` loops (as structured `block`/`loop`/`br_if`, with
+//! `break`/`continue` in `while` loops lowered to the right `br` target), and
 //! function calls — enough for iterative numeric kernels. Both targets are
 //! produced: `compile_module` emits WAT text, and `compile_module_binary` emits
 //! a complete `.wasm` binary module (verified to instantiate and run on a real
@@ -188,6 +189,18 @@ fn emit_effect(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmEr
 
 /// Emits a statement's instructions into `out` at the given indent depth.
 fn emit_stmt(stmt: &Stmt, out: &mut String, depth: usize) -> Result<(), WasmError> {
+    emit_stmt_ctx(stmt, out, depth, None)
+}
+
+/// `ctx` carries the `(break, continue)` `br` immediates for the enclosing
+/// `while` loop (incremented as control structures nest), so `break`/`continue`
+/// branch correctly.
+fn emit_stmt_ctx(
+    stmt: &Stmt,
+    out: &mut String,
+    depth: usize,
+    ctx: Option<(u32, u32)>,
+) -> Result<(), WasmError> {
     let pad = "  ".repeat(depth);
     match stmt {
         Stmt::Var(decl) => {
@@ -207,16 +220,28 @@ fn emit_stmt(stmt: &Stmt, out: &mut String, depth: usize) -> Result<(), WasmErro
             out.push_str(&format!("{pad}return\n"));
             Ok(())
         }
+        // `break` / `continue` (unlabeled) inside a `while` loop.
+        Stmt::Break { label: None, .. } => {
+            let (brk, _) = ctx.ok_or(WasmError("break outside a while loop"))?;
+            out.push_str(&format!("{pad}br {brk}\n"));
+            Ok(())
+        }
+        Stmt::Continue { label: None, .. } => {
+            let (_, cont) = ctx.ok_or(WasmError("continue outside a while loop"))?;
+            out.push_str(&format!("{pad}br {cont}\n"));
+            Ok(())
+        }
         Stmt::Block { body, .. } => {
             for s in body {
-                emit_stmt(s, out, depth)?;
+                emit_stmt_ctx(s, out, depth, ctx)?;
             }
             Ok(())
         }
         // `x = expr;` / `i++;` — a statement-position effect.
         Stmt::Expr { expression, .. } => emit_effect(expression, out, depth),
         // `for (init; test; update) body` → init, then a `while`-style loop with
-        // the update at the bottom.
+        // the update at the bottom. (`break`/`continue` inside a `for` are not
+        // lowered — the body is emitted with no loop context.)
         Stmt::For {
             init,
             test,
@@ -234,13 +259,12 @@ fn emit_stmt(stmt: &Stmt, out: &mut String, depth: usize) -> Result<(), WasmErro
             let inner = "  ".repeat(depth + 1);
             let inner2 = "  ".repeat(depth + 2);
             out.push_str(&format!("{pad}block\n{inner}loop\n"));
-            // No test → always true (an `1` constant is non-zero).
             match test {
                 Some(t) => emit_cond(t, out, depth + 2)?,
                 None => out.push_str(&format!("{inner2}i32.const 1\n")),
             }
             out.push_str(&format!("{inner2}i32.eqz\n{inner2}br_if 1\n"));
-            emit_stmt(body, out, depth + 2)?;
+            emit_stmt_ctx(body, out, depth + 2, None)?;
             if let Some(u) = update {
                 emit_effect(u, out, depth + 2)?;
             }
@@ -255,22 +279,25 @@ fn emit_stmt(stmt: &Stmt, out: &mut String, depth: usize) -> Result<(), WasmErro
         } => {
             emit_cond(test, out, depth)?;
             out.push_str(&format!("{pad}if\n"));
-            emit_stmt(consequent, out, depth + 1)?;
+            // An `if` adds one control level, shifting branch targets out by one.
+            let inner_ctx = ctx.map(|(b, c)| (b + 1, c + 1));
+            emit_stmt_ctx(consequent, out, depth + 1, inner_ctx)?;
             if let Some(alt) = alternate {
                 out.push_str(&format!("{pad}else\n"));
-                emit_stmt(alt, out, depth + 1)?;
+                emit_stmt_ctx(alt, out, depth + 1, inner_ctx)?;
             }
             out.push_str(&format!("{pad}end\n"));
             Ok(())
         }
-        // `while (cond) body` → a structured `block`/`loop` with `br_if`.
+        // `while (cond) body` → `block { loop { … } }`. From the body, `continue`
+        // is `br 0` (re-test) and `break` is `br 1` (exit).
         Stmt::While { test, body, .. } => {
             let inner = "  ".repeat(depth + 1);
             out.push_str(&format!("{pad}block\n{inner}loop\n"));
             emit_cond(test, out, depth + 2)?;
             let inner2 = "  ".repeat(depth + 2);
             out.push_str(&format!("{inner2}i32.eqz\n{inner2}br_if 1\n")); // exit when !cond
-            emit_stmt(body, out, depth + 2)?;
+            emit_stmt_ctx(body, out, depth + 2, Some((1, 0)))?;
             out.push_str(&format!("{inner2}br 0\n{inner}end\n{pad}end\n"));
             Ok(())
         }
@@ -279,7 +306,7 @@ fn emit_stmt(stmt: &Stmt, out: &mut String, depth: usize) -> Result<(), WasmErro
         Stmt::DoWhile { test, body, .. } => {
             let inner = "  ".repeat(depth + 1);
             out.push_str(&format!("{pad}loop\n"));
-            emit_stmt(body, out, depth + 1)?;
+            emit_stmt_ctx(body, out, depth + 1, None)?;
             emit_cond(test, out, depth + 1)?;
             out.push_str(&format!("{inner}br_if 0\n{pad}end\n")); // loop back while cond
             Ok(())
@@ -701,6 +728,18 @@ fn emit_stmt_bin(
     fns: &alloc::collections::BTreeMap<&str, u32>,
     out: &mut Vec<u8>,
 ) -> Result<(), WasmError> {
+    emit_stmt_bin_ctx(stmt, locals, fns, out, None)
+}
+
+/// Binary mirror of `emit_stmt_ctx`: `ctx` carries the `(break, continue)` `br`
+/// immediates for the enclosing `while` loop.
+fn emit_stmt_bin_ctx(
+    stmt: &Stmt,
+    locals: &alloc::collections::BTreeMap<String, u32>,
+    fns: &alloc::collections::BTreeMap<&str, u32>,
+    out: &mut Vec<u8>,
+    ctx: Option<(u32, u32)>,
+) -> Result<(), WasmError> {
     match stmt {
         Stmt::Var(decl) => {
             for d in &decl.declarations {
@@ -720,9 +759,21 @@ fn emit_stmt_bin(
             out.push(0x0f); // return
             Ok(())
         }
+        Stmt::Break { label: None, .. } => {
+            let (brk, _) = ctx.ok_or(WasmError("break outside a while loop"))?;
+            out.push(0x0c); // br
+            leb_u(brk, out);
+            Ok(())
+        }
+        Stmt::Continue { label: None, .. } => {
+            let (_, cont) = ctx.ok_or(WasmError("continue outside a while loop"))?;
+            out.push(0x0c); // br
+            leb_u(cont, out);
+            Ok(())
+        }
         Stmt::Block { body, .. } => {
             for s in body {
-                emit_stmt_bin(s, locals, fns, out)?;
+                emit_stmt_bin_ctx(s, locals, fns, out, ctx)?;
             }
             Ok(())
         }
@@ -755,7 +806,7 @@ fn emit_stmt_bin(
             out.push(0x45); // i32.eqz
             out.push(0x0d); // br_if
             leb_u(1, out);
-            emit_stmt_bin(body, locals, fns, out)?;
+            emit_stmt_bin_ctx(body, locals, fns, out, None)?;
             if let Some(u) = update {
                 emit_effect_bin(u, locals, fns, out)?;
             }
@@ -774,10 +825,11 @@ fn emit_stmt_bin(
             emit_cond_bin(test, locals, fns, out)?;
             out.push(0x04); // if
             out.push(0x40); // void blocktype
-            emit_stmt_bin(consequent, locals, fns, out)?;
+            let inner_ctx = ctx.map(|(b, c)| (b + 1, c + 1));
+            emit_stmt_bin_ctx(consequent, locals, fns, out, inner_ctx)?;
             if let Some(alt) = alternate {
                 out.push(0x05); // else
-                emit_stmt_bin(alt, locals, fns, out)?;
+                emit_stmt_bin_ctx(alt, locals, fns, out, inner_ctx)?;
             }
             out.push(0x0b); // end
             Ok(())
@@ -791,7 +843,7 @@ fn emit_stmt_bin(
             out.push(0x45); // i32.eqz
             out.push(0x0d); // br_if
             leb_u(1, out); // exit the block
-            emit_stmt_bin(body, locals, fns, out)?;
+            emit_stmt_bin_ctx(body, locals, fns, out, Some((1, 0)))?;
             out.push(0x0c); // br
             leb_u(0, out); // back-edge to loop
             out.push(0x0b); // end loop
@@ -802,7 +854,7 @@ fn emit_stmt_bin(
         Stmt::DoWhile { test, body, .. } => {
             out.push(0x03); // loop
             out.push(0x40);
-            emit_stmt_bin(body, locals, fns, out)?;
+            emit_stmt_bin_ctx(body, locals, fns, out, None)?;
             emit_cond_bin(test, locals, fns, out)?;
             out.push(0x0d); // br_if
             leb_u(0, out); // loop back while cond
@@ -1153,6 +1205,22 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_while_break_continue() {
+        // break exits the loop; continue (inside an if) re-tests.
+        let src = "function f(n) { let s = 0; let i = 0; while (i < n) { i += 1; if (i === 3) { continue; } if (i === 7) { break; } s += i; } return s; }";
+        let wat = module(src);
+        assert!(wat.contains("br 1")); // break → exit block
+        assert!(wat.contains("br 2")); // continue inside an if → re-test (1+1)
+        assert_well_formed(&wat);
+        let wasm = binary(src);
+        assert!(wasm.contains(&0x0c)); // br
+        section_ids(&wasm);
+        // break/continue outside a while loop is rejected.
+        let bad = Parser::parse_program("function g(){ break; }").unwrap();
+        assert!(compile_module(&bad).is_err());
     }
 
     #[test]

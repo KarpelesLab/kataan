@@ -43,6 +43,7 @@ fn emitted_wasm_runs_on_a_real_engine() {
         function factorial(n) { let f = 1; for (let i = 2; i <= n; i++) { f = f * i; } return f; }
         function poly(n) { let s = 0; let p = 1; for (let i = 1; i <= n; i++) { s += i; p *= 2; } return s + p; }
         function countdown(n) { let s = 0; do { s += n; n -= 1; } while (n > 0); return s; }
+        function skip3(n) { let s = 0; let i = 0; while (i < n) { i += 1; if (i === 3) { continue; } if (i === 7) { break; } s += i; } return s; }
     ";
     let program = Parser::parse_program(src).expect("parse");
     let wasm = kataan::wasm::compile_module_binary(&program).expect("compile to wasm");
@@ -74,6 +75,7 @@ fn emitted_wasm_runs_on_a_real_engine() {
             e.factorial(5),
             e.poly(4),
             e.countdown(4),
+            e.skip3(10),
           ];
           console.log(out.join(','));
         }}).catch(err => {{ console.error('INVALID:' + err.message); process.exit(1); }});
@@ -97,7 +99,7 @@ fn emitted_wasm_runs_on_a_real_engine() {
     // absdiff(2,9)=7 — including the native Math.sqrt/max/abs ops.
     assert_eq!(
         stdout.trim(),
-        "5,9,9,55,6765,25,5,7,2,1,0,55,120,26,10", // …, countdown(4)=4+3+2+1=10 (do-while)
+        "5,9,9,55,6765,25,5,7,2,1,0,55,120,26,10,18", // …, skip3(10)=1+2+4+5+6=18 (break/continue)
         "wasm produced wrong results"
     );
 
