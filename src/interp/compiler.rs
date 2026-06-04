@@ -17,9 +17,10 @@
 //! `break`/`continue`, `switch`, `try`/`catch`, `throw`, blocks, `return`,
 //! destructuring declarations + parameters (array/object patterns, defaults,
 //! array & object rest), **functions** (declarations hoisted, function/arrow
-//! expressions, rest parameters), and **closures** that capture enclosing
-//! variables (boxed in shared cells, with transitive capture). Not yet:
-//! `finally`, classes, generators, and captured (hoisted) function
+//! expressions, rest parameters), **closures** that capture enclosing variables
+//! (boxed in shared cells, with transitive capture), and **classes**
+//! (constructor, instance/static methods + fields). Not yet: `finally`, class
+//! `extends`/`super`/accessors, generators, and captured (hoisted) function
 //! *declarations* — these return a `CompileError` so the caller falls back to
 //! the tree-walker.
 
