@@ -521,6 +521,16 @@ impl<'a> Interp<'a> {
                 if pos != chars.len() {
                     return Err(ExecError::Throw(self.new_str("Unexpected token in JSON")));
                 }
+                // An optional `reviver` transforms each value bottom-up.
+                let reviver = arg(1);
+                if reviver
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    let holder = self.realm.new_object();
+                    self.realm.set_property(holder, "", value);
+                    return self.json_revive(holder, "", reviver);
+                }
                 value
             }
             N_OBJECT_KEYS => {
@@ -858,6 +868,47 @@ impl<'a> Interp<'a> {
     /// Serializes a value to JSON (`None` when the value is `undefined` or a
     /// function — which `JSON.stringify` omits / drops).
     /// Recursive-descent `JSON.parse` over a char slice, advancing `pos`.
+    /// `JSON.parse` reviver: transforms `holder[key]` bottom-up — children first,
+    /// then `reviver.call(holder, key, value)` (a `undefined` result deletes the
+    /// member). Mirrors `InternalizeJSONProperty`.
+    fn json_revive(
+        &mut self,
+        holder: crate::heap::Handle,
+        key: &str,
+        reviver: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let value = if self.realm.is_array(holder)
+            && let Ok(i) = key.parse::<usize>()
+        {
+            self.realm.get_element(holder, i)
+        } else {
+            self.realm
+                .get_property(holder, key)
+                .unwrap_or(NanBox::undefined())
+        };
+        if let Some(vh) = value.as_handle().map(Handle::from_raw) {
+            if self.realm.is_array(vh) {
+                let len = self.realm.array_length(vh).unwrap_or(0);
+                for i in 0..len {
+                    let ks = alloc::format!("{i}");
+                    let nv = self.json_revive(vh, &ks, reviver)?;
+                    self.realm.set_element(vh, i, nv);
+                }
+            } else if let Some(keys) = self.realm.object_keys(vh) {
+                for k in keys {
+                    let nv = self.json_revive(vh, &k, reviver)?;
+                    if matches!(nv.unpack(), Unpacked::Undefined) {
+                        self.realm.delete_property(vh, &k);
+                    } else {
+                        self.realm.set_property(vh, &k, nv);
+                    }
+                }
+            }
+        }
+        let kb = self.new_str(key);
+        self.call_with_this(reviver, NanBox::handle(holder.to_raw()), &[kb, value])
+    }
+
     fn json_parse(&mut self, c: &[char], pos: &mut usize) -> Result<NanBox, ExecError> {
         skip_ws(c, pos);
         let err = |s: &mut Self| ExecError::Throw(s.new_str("Unexpected end of JSON input"));
@@ -5481,6 +5532,28 @@ mod tests {
         let mut interp = Interp::new();
         interp.run(&program).unwrap();
         assert_eq!(interp.output(), "hi 42\narr: 1,2\n");
+    }
+
+    #[test]
+    fn json_parse_reviver() {
+        assert_eq!(
+            run(
+                "let o = JSON.parse('{\"a\":1,\"b\":2}', function(k,v){ return typeof v==='number'?v*2:v; }); o.a + ',' + o.b"
+            ),
+            "2,4"
+        );
+        assert_eq!(
+            run(
+                "let o = JSON.parse('{\"keep\":1,\"drop\":2}', function(k,v){ return k==='drop'?undefined:v; }); o.keep + ':' + ('drop' in o)"
+            ),
+            "1:false"
+        );
+        assert_eq!(
+            run(
+                "JSON.parse('[1,2,3]', function(k,v){ return typeof v==='number'?v+10:v; }).join(',')"
+            ),
+            "11,12,13"
+        );
     }
 
     #[test]
