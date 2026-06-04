@@ -16,12 +16,12 @@
 //! `if`/`else`, `while`/`do-while`/`for`/`for-of`/`for-in` with
 //! `break`/`continue`, `switch`, `try`/`catch`, `throw`, blocks, `return`,
 //! destructuring declarations + parameters (array/object patterns, defaults,
-//! array rest), **functions** (declarations hoisted, function/arrow
-//! expressions), and **closures** that capture enclosing variables (boxed in
-//! shared cells, with transitive capture). Not yet: `finally`, classes,
-//! generators, rest parameters, object rest patterns, and captured (hoisted)
-//! function *declarations* — these return a `CompileError` so the caller falls
-//! back to the tree-walker.
+//! array & object rest), **functions** (declarations hoisted, function/arrow
+//! expressions, rest parameters), and **closures** that capture enclosing
+//! variables (boxed in shared cells, with transitive capture). Not yet:
+//! `finally`, classes, generators, and captured (hoisted) function
+//! *declarations* — these return a `CompileError` so the caller falls back to
+//! the tree-walker.
 
 use crate::ast::{
     Arrow, ArrowBody, AssignOp, BinaryOp, BindingTarget, Expr, Function, LogicalOp, Param,
@@ -717,9 +717,6 @@ impl Compiler {
                 Ok(())
             }
             BindingTarget::Object(pat) => {
-                if pat.rest.is_some() {
-                    return Err(CompileError::unsupported("object rest pattern"));
-                }
                 for prop in &pat.properties {
                     let value = match &prop.key {
                         PropertyKey::Ident(name) => {
@@ -757,9 +754,69 @@ impl Compiler {
                     let value = self.apply_default(value, prop.default.as_ref())?;
                     self.bind_pattern(&prop.value, value)?;
                 }
+                // `{ a, ...rest }`: rest gets a copy of the source minus the
+                // already-bound keys.
+                if let Some(rest) = &pat.rest {
+                    let rest_obj = self.reg();
+                    self.emit(Op::NewObject { dst: rest_obj });
+                    self.emit_object_assign(rest_obj, value_reg);
+                    for prop in &pat.properties {
+                        let key_reg = match &prop.key {
+                            PropertyKey::Ident(name) => {
+                                let r = self.reg();
+                                let k = self.add_const(Const::Str(name.clone().into_string()));
+                                self.emit(Op::LoadConst { dst: r, k });
+                                r
+                            }
+                            PropertyKey::Str(s) => {
+                                let r = self.reg();
+                                let k = self.add_const(Const::Str(s.clone().into_string()));
+                                self.emit(Op::LoadConst { dst: r, k });
+                                r
+                            }
+                            // A computed excluded key can't be resolved
+                            // statically for the rest set.
+                            _ => return Err(CompileError::unsupported("computed key with rest")),
+                        };
+                        let removed = self.reg();
+                        self.emit(Op::DeleteMember {
+                            dst: removed,
+                            obj: rest_obj,
+                            key: key_reg,
+                        });
+                    }
+                    self.bind_pattern(rest, rest_obj)?;
+                }
                 Ok(())
             }
         }
+    }
+
+    /// Emits `Object.assign(dst, src)` (copies `src`'s own enumerable props into
+    /// `dst`, mutating it in place).
+    fn emit_object_assign(&mut self, dst: Reg, src: Reg) {
+        let object_global = self.reg();
+        let g = self.add_const(Const::Str(String::from("Object")));
+        self.emit(Op::GetGlobal {
+            dst: object_global,
+            name: g,
+        });
+        let key = self.reg();
+        let k = self.add_const(Const::Str(String::from("assign")));
+        self.emit(Op::LoadConst { dst: key, k });
+        let base = self.funcs.last().expect("fn").next_reg;
+        let s1 = self.reg();
+        self.emit(Op::Move { dst: s1, src: dst });
+        let s2 = self.reg();
+        self.emit(Op::Move { dst: s2, src });
+        let ret = self.reg();
+        self.emit(Op::CallMethod {
+            dst: ret,
+            recv: object_global,
+            key,
+            args_base: base,
+            argc: 2,
+        });
     }
 
     /// If `default` is present, replaces `value_reg` with the default when it is
@@ -1449,28 +1506,7 @@ impl Compiler {
             // `Object.assign(dst, src)` (which mutates and returns `dst`).
             if let ObjectMember::Spread { value, .. } = member {
                 let src = self.expr(value)?;
-                let object_global = self.reg();
-                let g = self.add_const(Const::Str(String::from("Object")));
-                self.emit(Op::GetGlobal {
-                    dst: object_global,
-                    name: g,
-                });
-                let key = self.reg();
-                let k = self.add_const(Const::Str(String::from("assign")));
-                self.emit(Op::LoadConst { dst: key, k });
-                let base = self.funcs.last().expect("fn").next_reg;
-                let s1 = self.reg();
-                self.emit(Op::Move { dst: s1, src: dst });
-                let s2 = self.reg();
-                self.emit(Op::Move { dst: s2, src });
-                let ret = self.reg();
-                self.emit(Op::CallMethod {
-                    dst: ret,
-                    recv: object_global,
-                    key,
-                    args_base: base,
-                    argc: 2,
-                });
+                self.emit_object_assign(dst, src);
                 continue;
             }
             let ObjectMember::Property { key, value, .. } = member else {

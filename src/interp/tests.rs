@@ -545,6 +545,26 @@ fn bytecode_vm_array_spread() {
 }
 
 #[test]
+fn bytecode_vm_object_rest_pattern() {
+    assert_eq!(
+        eval_bc(
+            "let { a, b, ...rest } = { a: 1, b: 2, c: 3, d: 4 }; a + ',' + b + ',' + rest.c + ',' + rest.d"
+        ),
+        "1,2,3,4"
+    );
+    // The rest object excludes the named keys.
+    assert_eq!(
+        eval_bc("let { x, ...others } = { x: 10, y: 20 }; ('x' in others) + ',' + others.y"),
+        "false,20"
+    );
+    // No remaining keys: an empty rest object.
+    assert_eq!(
+        eval_bc("let { a, ...rest } = { a: 1 }; Object.keys(rest).length"),
+        "0"
+    );
+}
+
+#[test]
 fn bytecode_vm_destructuring() {
     // Array destructuring.
     assert_eq!(eval_bc("let [a, b] = [1, 2]; a + b"), "3");
