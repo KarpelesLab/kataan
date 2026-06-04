@@ -87,6 +87,23 @@ impl Object {
     pub fn keys(&self) -> Vec<&str> {
         self.shape.keys()
     }
+
+    /// Calls `visit` for every heap [`Handle`](crate::heap::Handle) this object
+    /// references through a slot — the outgoing edges a tracing collector
+    /// follows.
+    pub fn trace_handles(&self, mut visit: impl FnMut(crate::heap::Handle)) {
+        for slot in &self.slots {
+            if let Some(raw) = slot.as_handle() {
+                visit(crate::heap::Handle::from_raw(raw));
+            }
+        }
+    }
+}
+
+impl crate::gc::Trace for Object {
+    fn trace(&self, visit: &mut dyn FnMut(crate::heap::Handle)) {
+        self.trace_handles(visit);
+    }
 }
 
 #[cfg(test)]

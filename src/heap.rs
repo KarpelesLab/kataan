@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 
 /// A stable reference to a heap slot: an index plus the generation it was live
 /// in. Comparing the stored generation against the slot's detects staleness.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Handle {
     index: u32,
     generation: u16,
@@ -142,6 +142,23 @@ impl<T> Heap<T> {
     #[must_use]
     pub fn is_live(&self, handle: Handle) -> bool {
         self.get(handle).is_some()
+    }
+
+    /// A handle to every currently-live slot (used by the collector to find the
+    /// sweep set). Order is by slot index.
+    #[must_use]
+    pub fn live_handles(&self) -> Vec<Handle> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| match slot {
+                Slot::Occupied { generation, .. } => Some(Handle {
+                    index: i as u32,
+                    generation: *generation,
+                }),
+                Slot::Free { .. } => None,
+            })
+            .collect()
     }
 
     /// Frees the slot behind `handle`, returning its value. The slot's

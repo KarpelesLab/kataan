@@ -58,6 +58,11 @@ pub mod shape;
 #[cfg(feature = "alloc")]
 pub mod object;
 
+/// A mark-and-sweep tracing garbage collector over [`heap::Heap`] — reclaims
+/// unreachable objects, including reference cycles. Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod gc;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
