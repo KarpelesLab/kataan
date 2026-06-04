@@ -26,4 +26,4 @@ mod tests;
 
 pub use env::{Env, Scope};
 pub use eval::{Completion, Interp};
-pub use value::{Callable, Closure, NativeFn, Obj, Value, loose_equals, strict_equals};
+pub use value::{Callable, ClassValue, Closure, NativeFn, Obj, Value, loose_equals, strict_equals};

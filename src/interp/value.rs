@@ -37,6 +37,29 @@ pub enum Value<'a> {
     Native(Rc<NativeFn<'a>>),
     /// An ordinary object or array.
     Object(Rc<Obj<'a>>),
+    /// A class (a constructor plus its shared prototype and statics).
+    Class(Rc<ClassValue<'a>>),
+}
+
+/// A class value: its AST definition, the environment it closed over, the
+/// shared instance `prototype` object (carrying the methods), the object
+/// holding its static members, and a resolved superclass for `extends`.
+pub struct ClassValue<'a> {
+    /// The class's AST definition.
+    pub def: &'a crate::ast::Class,
+    /// The captured environment.
+    pub env: Env<'a>,
+    /// The environment methods close over — the defining env plus a `%class%`
+    /// binding, so `super` resolves inside methods/the constructor.
+    pub method_env: Env<'a>,
+    /// The shared prototype object holding instance methods.
+    pub prototype: Rc<Obj<'a>>,
+    /// The object holding static members.
+    pub statics: Rc<Obj<'a>>,
+    /// The resolved superclass, if this class `extends` another.
+    pub super_class: Option<Rc<ClassValue<'a>>>,
+    /// The constructor closure, if the class declares one.
+    pub ctor: RefCell<Option<Value<'a>>>,
 }
 
 /// An ordinary object (or array) in the interpreter-era object model: an
@@ -46,6 +69,7 @@ pub enum Value<'a> {
 pub struct Obj<'a> {
     props: RefCell<Vec<(Box<str>, Value<'a>)>>,
     array: Option<RefCell<Vec<Value<'a>>>>,
+    proto: RefCell<Option<Rc<Obj<'a>>>>,
 }
 
 impl<'a> Obj<'a> {
@@ -55,6 +79,17 @@ impl<'a> Obj<'a> {
         Rc::new(Obj {
             props: RefCell::new(Vec::new()),
             array: None,
+            proto: RefCell::new(None),
+        })
+    }
+
+    /// Creates an empty object whose prototype is `proto`.
+    #[must_use]
+    pub fn with_proto(proto: Rc<Obj<'a>>) -> Rc<Obj<'a>> {
+        Rc::new(Obj {
+            props: RefCell::new(Vec::new()),
+            array: None,
+            proto: RefCell::new(Some(proto)),
         })
     }
 
@@ -64,6 +99,7 @@ impl<'a> Obj<'a> {
         Rc::new(Obj {
             props: RefCell::new(Vec::new()),
             array: Some(RefCell::new(elements)),
+            proto: RefCell::new(None),
         })
     }
 
@@ -79,16 +115,21 @@ impl<'a> Obj<'a> {
         self.array.as_ref()
     }
 
-    /// Gets a property by string key, resolving array indices and `length`.
-    /// Returns `undefined` for absent properties.
+    /// This object's prototype, if any.
     #[must_use]
-    pub fn get(&self, key: &str) -> Value<'a> {
+    pub fn proto(&self) -> Option<Rc<Obj<'a>>> {
+        self.proto.borrow().clone()
+    }
+
+    /// Looks up an *own* property only (no prototype walk).
+    #[must_use]
+    pub fn get_own(&self, key: &str) -> Option<Value<'a>> {
         if let Some(arr) = &self.array {
             if key == "length" {
-                return Value::Number(arr.borrow().len() as f64);
+                return Some(Value::Number(arr.borrow().len() as f64));
             }
             if let Ok(i) = key.parse::<usize>() {
-                return arr.borrow().get(i).cloned().unwrap_or(Value::Undefined);
+                return arr.borrow().get(i).cloned();
             }
         }
         self.props
@@ -96,7 +137,40 @@ impl<'a> Obj<'a> {
             .iter()
             .find(|(k, _)| **k == *key)
             .map(|(_, v)| v.clone())
-            .unwrap_or(Value::Undefined)
+    }
+
+    /// Gets a property by string key, walking the prototype chain. Returns
+    /// `undefined` for absent properties.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Value<'a> {
+        if let Some(v) = self.get_own(key) {
+            return v;
+        }
+        let mut proto = self.proto();
+        while let Some(p) = proto {
+            if let Some(v) = p.get_own(key) {
+                return v;
+            }
+            proto = p.proto();
+        }
+        Value::Undefined
+    }
+
+    /// Whether `key` is present on the object or anywhere in its prototype
+    /// chain (the `in` operator).
+    #[must_use]
+    pub fn has_property(&self, key: &str) -> bool {
+        if self.has(key) {
+            return true;
+        }
+        let mut proto = self.proto();
+        while let Some(p) = proto {
+            if p.has(key) {
+                return true;
+            }
+            proto = p.proto();
+        }
+        false
     }
 
     /// Whether the object has an own property with `key`.
@@ -193,12 +267,13 @@ impl<'a> Value<'a> {
             Value::Bool(_) => "boolean",
             Value::Number(_) => "number",
             Value::Str(_) => "string",
-            Value::Function(_) | Value::Native(_) => "function",
+            Value::Function(_) | Value::Native(_) | Value::Class(_) => "function",
             Value::Object(_) => "object",
         }
     }
 
-    /// Whether the value is callable.
+    /// Whether the value is callable (as a plain call). Classes are *not*
+    /// callable without `new`.
     #[must_use]
     pub fn is_callable(&self) -> bool {
         matches!(self, Value::Function(_) | Value::Native(_))
@@ -212,7 +287,7 @@ impl<'a> Value<'a> {
             Value::Bool(b) => *b,
             Value::Number(n) => *n != 0.0 && !n.is_nan(),
             Value::Str(s) => !s.is_empty(),
-            Value::Function(_) | Value::Native(_) | Value::Object(_) => true,
+            Value::Function(_) | Value::Native(_) | Value::Object(_) | Value::Class(_) => true,
         }
     }
 
@@ -225,7 +300,7 @@ impl<'a> Value<'a> {
             Value::Bool(b) => f64::from(u8::from(*b)),
             Value::Number(n) => *n,
             Value::Str(s) => string_to_number(s),
-            Value::Function(_) | Value::Native(_) => f64::NAN,
+            Value::Function(_) | Value::Native(_) | Value::Class(_) => f64::NAN,
             // ToPrimitive on an array yields its join; other objects → NaN.
             Value::Object(o) if o.is_array() => string_to_number(&self.to_js_string()),
             Value::Object(_) => f64::NAN,
@@ -249,6 +324,10 @@ impl<'a> Value<'a> {
                 Callable::Arrow(_) => "() => { … }".into(),
             },
             Value::Native(n) => alloc::format!("function {}() {{ [native code] }}", n.name),
+            Value::Class(c) => {
+                let name = c.def.id.as_ref().map_or("", |id| &id.name);
+                alloc::format!("class {name} {{ … }}")
+            }
             Value::Object(o) if o.is_array() => {
                 // Array `toString` is the elements joined by ",".
                 let elems = o.elements().expect("array");
@@ -344,6 +423,7 @@ pub fn strict_equals<'a>(a: &Value<'a>, b: &Value<'a>) -> bool {
         (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
         (Value::Native(x), Value::Native(y)) => Rc::ptr_eq(x, y),
         (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
+        (Value::Class(x), Value::Class(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }

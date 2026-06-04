@@ -7,14 +7,14 @@
 //! destructuring, and `for-of`/`for-in`.
 
 use super::env::{Env, Scope};
-use super::value::{Callable, Closure, Value, loose_equals, strict_equals};
+use super::value::{Callable, ClassValue, Closure, Obj, Value, loose_equals, strict_equals};
 use crate::ast::{
-    ArrowBody, AssignOp, BinaryOp, BindingTarget, Expr, LogicalOp, Param, Program, Stmt, UnaryOp,
-    UpdateOp, VarDeclKind,
+    ArrowBody, AssignOp, BinaryOp, BindingTarget, Class, ClassMember, Expr, LogicalOp, MethodKind,
+    Param, Program, Stmt, UnaryOp, UpdateOp, VarDeclKind,
 };
 use alloc::boxed::Box;
 use alloc::rc::Rc;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 /// The result of an evaluation: `Ok(T)` or a thrown JS [`Value`].
@@ -210,7 +210,13 @@ impl<'a> Interp<'a> {
                     other => Ok(other),
                 }
             }
-            Stmt::Class(_) => Err(Value::str("classes are not yet supported at runtime")),
+            Stmt::Class(def) => {
+                let value = self.eval_class(def, env)?;
+                if let Some(id) = &def.id {
+                    env.declare(&id.name, value, true);
+                }
+                Ok(Flow::Normal(Value::Undefined))
+            }
             Stmt::With { .. } => Err(Value::str("`with` is not supported")),
             Stmt::ForOf {
                 left, right, body, ..
@@ -647,6 +653,23 @@ impl<'a> Interp<'a> {
                 optional,
                 ..
             } => {
+                // `super(...)` — delegate to the superclass constructor on the
+                // current instance.
+                if matches!(&**callee, Expr::Super(_)) {
+                    let args = self.eval_arguments(arguments, env)?;
+                    return self.call_super_constructor(env, args);
+                }
+                // `super.method(...)` — call a superclass-prototype method with
+                // the current `this`.
+                if let Expr::Member {
+                    object, property, ..
+                } = &**callee
+                    && matches!(&**object, Expr::Super(_))
+                {
+                    let key = self.member_key(property, env)?;
+                    let args = self.eval_arguments(arguments, env)?;
+                    return self.call_super_method(env, &key, args);
+                }
                 // A call on a member expression supplies `this`, and falls back
                 // to the built-in prototype methods when there is no own
                 // property; a plain call has an undefined receiver.
@@ -741,10 +764,14 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Object(obj))
             }
-            Expr::New { .. } => Err(Value::str("`new` is not yet supported at runtime")),
-            Expr::Class(_) => Err(Value::str(
-                "class expressions are not yet supported at runtime",
-            )),
+            Expr::New {
+                callee, arguments, ..
+            } => {
+                let callee_val = self.eval_expr(callee, env)?;
+                let args = self.eval_arguments(arguments, env)?;
+                self.construct(callee_val, args)
+            }
+            Expr::Class(def) => self.eval_class(def, env),
             Expr::Regex { .. } => Err(Value::str("RegExp is not yet supported at runtime")),
             Expr::TaggedTemplate { .. } => Err(Value::str(
                 "tagged templates are not yet supported at runtime",
@@ -753,6 +780,177 @@ impl<'a> Interp<'a> {
             Expr::Yield { .. } | Expr::Await { .. } => Err(Value::str(
                 "generators/async are not yet supported at runtime",
             )),
+        }
+    }
+
+    // --- classes --------------------------------------------------------
+
+    /// Evaluates a class definition into a [`Value::Class`].
+    fn eval_class(&mut self, def: &'a Class, env: &Env<'a>) -> Completion<'a, Value<'a>> {
+        let super_class = match &def.super_class {
+            Some(e) => match self.eval_expr(e, env)? {
+                Value::Class(c) => Some(c),
+                Value::Null | Value::Undefined => None,
+                _ => return Err(Value::str("a class can only extend a class or null")),
+            },
+            None => None,
+        };
+        let prototype = match &super_class {
+            Some(s) => Obj::with_proto(Rc::clone(&s.prototype)),
+            None => Obj::object(),
+        };
+        let statics = match &super_class {
+            Some(s) => Obj::with_proto(Rc::clone(&s.statics)),
+            None => Obj::object(),
+        };
+        let method_env = Scope::child(env);
+        let class = Rc::new(ClassValue {
+            def,
+            env: Rc::clone(env),
+            method_env: Rc::clone(&method_env),
+            prototype: Rc::clone(&prototype),
+            statics: Rc::clone(&statics),
+            super_class,
+            ctor: core::cell::RefCell::new(None),
+        });
+        // `%class%` lets `super` resolve inside methods and the constructor.
+        method_env.declare("%class%", Value::Class(Rc::clone(&class)), false);
+
+        for member in &def.body {
+            match member {
+                ClassMember::Method(m) => {
+                    let closure = Value::Function(Rc::new(Closure {
+                        def: Callable::Function(&m.value),
+                        env: Rc::clone(&method_env),
+                    }));
+                    if matches!(m.kind, MethodKind::Constructor) {
+                        *class.ctor.borrow_mut() = Some(closure);
+                    } else {
+                        let key = self.member_key(&m.key, &method_env)?;
+                        let target = if m.is_static { &statics } else { &prototype };
+                        target.set(&key, closure);
+                    }
+                }
+                ClassMember::Field(f) if f.is_static => {
+                    let key = self.member_key(&f.key, &method_env)?;
+                    let scope = Scope::child(&method_env);
+                    scope.declare("this", Value::Class(Rc::clone(&class)), false);
+                    let v = match &f.value {
+                        Some(e) => self.eval_expr(e, &scope)?,
+                        None => Value::Undefined,
+                    };
+                    statics.set(&key, v);
+                }
+                ClassMember::Field(_) => {} // instance fields run at construction
+                ClassMember::StaticBlock { body, .. } => {
+                    let scope = Scope::child(&method_env);
+                    scope.declare("this", Value::Class(Rc::clone(&class)), false);
+                    self.hoist(body, &scope);
+                    self.eval_stmts(body, &scope)?;
+                }
+            }
+        }
+        Ok(Value::Class(class))
+    }
+
+    /// `new Callee(args)` — constructs from a class or an ordinary function.
+    fn construct(&mut self, callee: Value<'a>, args: Vec<Value<'a>>) -> Completion<'a, Value<'a>> {
+        match callee {
+            Value::Class(cv) => {
+                let instance = Obj::with_proto(Rc::clone(&cv.prototype));
+                let this = Value::Object(instance);
+                self.init_instance(&cv, &this, &args)?;
+                Ok(this)
+            }
+            Value::Function(_) => {
+                let this = Value::Object(Obj::object());
+                let r = self.call_with_this(callee, this.clone(), args)?;
+                // A constructor that returns an object replaces the instance.
+                Ok(if matches!(r, Value::Object(_)) {
+                    r
+                } else {
+                    this
+                })
+            }
+            _ => Err(Value::str(alloc::format!(
+                "{} is not a constructor",
+                callee.to_js_string()
+            ))),
+        }
+    }
+
+    /// Runs the instance field initializers and constructor of `cv` against an
+    /// existing `this` (also used by `super(...)`).
+    fn init_instance(
+        &mut self,
+        cv: &Rc<ClassValue<'a>>,
+        this: &Value<'a>,
+        args: &[Value<'a>],
+    ) -> Completion<'a, ()> {
+        let has_ctor = cv.ctor.borrow().is_some();
+        // With no explicit constructor, a derived class implicitly forwards to
+        // its superclass before running its own field initializers.
+        if !has_ctor && let Some(sup) = &cv.super_class {
+            self.init_instance(sup, this, args)?;
+        }
+        for member in &cv.def.body {
+            if let ClassMember::Field(f) = member
+                && !f.is_static
+            {
+                let key = self.member_key(&f.key, &cv.method_env)?;
+                let scope = Scope::child(&cv.method_env);
+                scope.declare("this", this.clone(), false);
+                let v = match &f.value {
+                    Some(e) => self.eval_expr(e, &scope)?,
+                    None => Value::Undefined,
+                };
+                self.set_member(this, &key, v)?;
+            }
+        }
+        if let Some(ctor) = cv.ctor.borrow().clone() {
+            self.call_with_this(ctor, this.clone(), args.to_vec())?;
+        }
+        Ok(())
+    }
+
+    /// Handles a `super(...)` call from inside a constructor.
+    fn call_super_constructor(
+        &mut self,
+        env: &Env<'a>,
+        args: Vec<Value<'a>>,
+    ) -> Completion<'a, Value<'a>> {
+        let class = self.current_class(env)?;
+        let sup = class
+            .super_class
+            .clone()
+            .ok_or_else(|| Value::str("'super' keyword unexpected (no superclass)"))?;
+        let this = env.get("this").unwrap_or(Value::Undefined);
+        self.init_instance(&sup, &this, &args)?;
+        Ok(Value::Undefined)
+    }
+
+    /// Handles a `super.method(...)` call.
+    fn call_super_method(
+        &mut self,
+        env: &Env<'a>,
+        key: &str,
+        args: Vec<Value<'a>>,
+    ) -> Completion<'a, Value<'a>> {
+        let class = self.current_class(env)?;
+        let sup = class
+            .super_class
+            .clone()
+            .ok_or_else(|| Value::str("'super' keyword unexpected (no superclass)"))?;
+        let method = sup.prototype.get(key);
+        let this = env.get("this").unwrap_or(Value::Undefined);
+        self.call_with_this(method, this, args)
+    }
+
+    /// The `%class%` binding in scope (the class whose method is executing).
+    fn current_class(&self, env: &Env<'a>) -> Completion<'a, Rc<ClassValue<'a>>> {
+        match env.get("%class%") {
+            Some(Value::Class(c)) => Ok(c),
+            _ => Err(Value::str("'super' keyword unexpected here")),
         }
     }
 
@@ -904,12 +1102,35 @@ impl<'a> Interp<'a> {
             Shl => Value::Number(f64::from(l.to_int32().wrapping_shl(r.to_uint32() & 31))),
             Shr => Value::Number(f64::from(l.to_int32().wrapping_shr(r.to_uint32() & 31))),
             Ushr => Value::Number(f64::from(l.to_uint32() >> (r.to_uint32() & 31))),
-            In | Instanceof => {
+            In => match &r {
+                Value::Object(o) => Value::Bool(o.has_property(&l.to_js_string())),
+                _ => return Err(Value::str("cannot use 'in' operator on a non-object")),
+            },
+            Instanceof => Value::Bool(self.instance_of(&l, &r)?),
+        })
+    }
+
+    /// `x instanceof C` — walks `x`'s prototype chain for `C.prototype`.
+    fn instance_of(&self, value: &Value<'a>, ctor: &Value<'a>) -> Completion<'a, bool> {
+        let target_proto = match ctor {
+            Value::Class(cv) => Rc::clone(&cv.prototype),
+            _ => {
                 return Err(Value::str(
-                    "`in`/`instanceof` need objects (not yet supported)",
+                    "right-hand side of 'instanceof' is not callable",
                 ));
             }
-        })
+        };
+        let mut proto = match value {
+            Value::Object(o) => o.proto(),
+            _ => None,
+        };
+        while let Some(p) = proto {
+            if Rc::ptr_eq(&p, &target_proto) {
+                return Ok(true);
+            }
+            proto = p.proto();
+        }
+        Ok(false)
     }
 
     fn relational(&self, op: BinaryOp, l: &Value<'a>, r: &Value<'a>) -> bool {
@@ -968,6 +1189,12 @@ impl<'a> Interp<'a> {
                 })
             } else {
                 Value::Undefined
+            }),
+            // Static members (and `name`) on a class.
+            Value::Class(cv) => Ok(if key == "name" {
+                Value::str(cv.def.id.as_ref().map_or("", |id| &id.name).to_string())
+            } else {
+                cv.statics.get(key)
             }),
             Value::Undefined | Value::Null => Err(Value::str(alloc::format!(
                 "cannot read properties of {} (reading '{key}')",

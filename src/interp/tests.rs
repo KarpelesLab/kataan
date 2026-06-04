@@ -258,6 +258,78 @@ fn for_of_and_for_in() {
 }
 
 #[test]
+fn classes_basic() {
+    assert_eq!(
+        eval(
+            "class Point { constructor(x, y) { this.x = x; this.y = y; } sum() { return this.x + this.y; } } new Point(3, 4).sum()"
+        ),
+        "7"
+    );
+    // Instance fields.
+    assert_eq!(
+        eval(
+            "class C { n = 10; bump() { this.n++; return this.n; } } let c = new C(); c.bump(); c.bump()"
+        ),
+        "12"
+    );
+    // Static members.
+    assert_eq!(
+        eval(
+            "class M { static origin() { return 0; } static label = 'M'; } M.origin() + ' ' + M.label"
+        ),
+        "0 M"
+    );
+    // typeof + instanceof.
+    assert_eq!(eval("class A {} typeof A"), "function");
+    assert_eq!(eval("class A {} new A() instanceof A"), "true");
+    assert_eq!(eval("class A {} class B {} new A() instanceof B"), "false");
+}
+
+#[test]
+fn classes_inheritance() {
+    assert_eq!(
+        eval(
+            "class Animal {
+               constructor(name) { this.name = name; }
+               speak() { return this.name + ' makes a sound'; }
+             }
+             class Dog extends Animal {
+               constructor(name) { super(name); }
+               speak() { return this.name + ' barks'; }
+             }
+             new Dog('Rex').speak()"
+        ),
+        "Rex barks"
+    );
+    // super.method() calls the parent implementation.
+    assert_eq!(
+        eval(
+            "class Base { greet() { return 'hello'; } }
+             class Sub extends Base { greet() { return super.greet() + ' world'; } }
+             new Sub().greet()"
+        ),
+        "hello world"
+    );
+    // instanceof walks the chain.
+    assert_eq!(
+        eval("class Base {} class Sub extends Base {} new Sub() instanceof Base"),
+        "true"
+    );
+    // Inherited methods.
+    assert_eq!(
+        eval("class A { m() { return 42; } } class B extends A {} new B().m()"),
+        "42"
+    );
+}
+
+#[test]
+fn in_operator() {
+    assert_eq!(eval("'a' in { a: 1 }"), "true");
+    assert_eq!(eval("'b' in { a: 1 }"), "false");
+    assert_eq!(eval("class A { m() {} } 'm' in new A()"), "true");
+}
+
+#[test]
 fn math_builtins() {
     assert_eq!(eval("Math.abs(-5)"), "5");
     assert_eq!(eval("Math.floor(3.7)"), "3");

@@ -482,7 +482,7 @@ fn object_entries<'a>(value: &Value<'a>, kind: EntryKind) -> Value<'a> {
 /// serialize to nothing at the top level (`undefined`, functions).
 fn json_stringify(value: &Value<'_>) -> Option<String> {
     match value {
-        Value::Undefined | Value::Function(_) | Value::Native(_) => None,
+        Value::Undefined | Value::Function(_) | Value::Native(_) | Value::Class(_) => None,
         Value::Null => Some("null".into()),
         Value::Bool(b) => Some(if *b { "true" } else { "false" }.into()),
         Value::Number(n) => Some(if n.is_finite() {
