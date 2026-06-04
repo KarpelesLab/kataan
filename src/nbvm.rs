@@ -57,6 +57,8 @@ pub enum Op {
     /// A realm-backed binary op (`**`, bitwise, loose `==`/`!=`) selected by a
     /// small op code — for operators that need full coercion / `i32` semantics.
     ValueBin { dst: Reg, op: u8, a: Reg, b: Reg },
+    /// `dst = (key in obj)` — own-property / array-index membership.
+    HasProp { dst: Reg, key: Reg, obj: Reg },
     /// `dst = typeof a` (a heap string).
     TypeOf { dst: Reg, a: Reg },
     /// `dst = ~a` (bitwise NOT, `i32` semantics).
@@ -91,6 +93,9 @@ pub enum Op {
     ArrayPush { arr: Reg, src: Reg },
     /// Appends every element of the array in `src` to `arr` (a spread).
     ArrayExtend { arr: Reg, src: Reg },
+    /// `dst = src.slice(from)` — a new array of `src`'s elements from index
+    /// `from` (a numeric register) onward (for a rest pattern).
+    ArraySliceFrom { dst: Reg, src: Reg, from: Reg },
     /// `dst = a new empty object` (allocated in the realm's heap).
     NewObject { dst: Reg },
     /// `obj[key] = src` (own property set through the object's shape).
@@ -178,6 +183,10 @@ const NB_PARSE_INT: u16 = 11;
 const NB_PARSE_FLOAT: u16 = 12;
 const NB_IS_NAN: u16 = 13;
 const NB_IS_FINITE: u16 = 14;
+const NB_OBJECT_KEYS: u16 = 15;
+const NB_OBJECT_VALUES: u16 = 16;
+const NB_OBJECT_ENTRIES: u16 = 17;
+const NB_OBJECT_ASSIGN: u16 = 18;
 
 /// A compiled function: its instruction stream, register-file size, and the
 /// number of leading registers that receive call arguments.
@@ -340,6 +349,20 @@ fn run_frame(
                 regs[*dst as usize] =
                     NanBox::number(num(regs[*a as usize])? % num(regs[*b as usize])?);
             }
+            Op::HasProp { dst, key, obj } => {
+                let present = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
+                    Some(h) => {
+                        let k = ctx.realm.to_display_string(regs[*key as usize]);
+                        ctx.realm.has_own(h, &k)
+                            || ctx
+                                .realm
+                                .array_length(h)
+                                .is_some_and(|len| k.parse::<usize>().is_ok_and(|i| i < len))
+                    }
+                    None => false,
+                };
+                regs[*dst as usize] = NanBox::boolean(present);
+            }
             Op::TypeOf { dst, a } => {
                 let t = ctx.realm.type_of_value(regs[*a as usize]);
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(t).to_raw());
@@ -439,6 +462,16 @@ fn run_frame(
                 for (i, e) in elems.into_iter().enumerate() {
                     ctx.realm.set_element(handle, start + i, e);
                 }
+            }
+            Op::ArraySliceFrom { dst, src, from } => {
+                let srch = object_handle(regs[*src as usize])?;
+                let from = num(regs[*from as usize])? as usize;
+                let rest: Vec<NanBox> = ctx
+                    .realm
+                    .array_elements(srch)
+                    .map(|e| e.get(from..).map(<[_]>::to_vec).unwrap_or_default())
+                    .unwrap_or_default();
+                regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(rest).to_raw());
             }
             Op::NewObject { dst } => {
                 let handle = ctx.realm.new_object();
@@ -934,6 +967,50 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                 .to_number(args.first().copied().unwrap_or(NanBox::undefined()))
                 .is_finite(),
         ),
+        NB_OBJECT_KEYS | NB_OBJECT_VALUES | NB_OBJECT_ENTRIES => {
+            let h = args
+                .first()
+                .and_then(|a| a.as_handle())
+                .map(Handle::from_raw);
+            let keys = h.and_then(|h| ctx.realm.object_keys(h)).unwrap_or_default();
+            let mut out = Vec::with_capacity(keys.len());
+            for k in keys {
+                let item = match native {
+                    NB_OBJECT_KEYS => NanBox::handle(ctx.realm.new_string(&k).to_raw()),
+                    NB_OBJECT_VALUES => ctx
+                        .realm
+                        .get_property(h.unwrap(), &k)
+                        .unwrap_or(NanBox::undefined()),
+                    _ => {
+                        let key = NanBox::handle(ctx.realm.new_string(&k).to_raw());
+                        let val = ctx
+                            .realm
+                            .get_property(h.unwrap(), &k)
+                            .unwrap_or(NanBox::undefined());
+                        NanBox::handle(ctx.realm.new_array(alloc::vec![key, val]).to_raw())
+                    }
+                };
+                out.push(item);
+            }
+            NanBox::handle(ctx.realm.new_array(out).to_raw())
+        }
+        NB_OBJECT_ASSIGN => {
+            let target = args.first().copied().unwrap_or(NanBox::undefined());
+            if let Some(t) = target.as_handle().map(Handle::from_raw) {
+                for src in args.iter().skip(1) {
+                    if let Some(sh) = src.as_handle().map(Handle::from_raw) {
+                        for k in ctx.realm.object_keys(sh).unwrap_or_default() {
+                            let v = ctx
+                                .realm
+                                .get_property(sh, &k)
+                                .unwrap_or(NanBox::undefined());
+                            ctx.realm.set_property(t, &k, v);
+                        }
+                    }
+                }
+            }
+            target
+        }
         _ => NanBox::undefined(),
     }
 }
@@ -1184,6 +1261,10 @@ fn native_call(callee: &Expr) -> Option<u16> {
         ("Math", "round") => Some(NB_MATH_ROUND),
         ("Math", "sqrt") => Some(NB_MATH_SQRT),
         ("Math", "pow") => Some(NB_MATH_POW),
+        ("Object", "keys") => Some(NB_OBJECT_KEYS),
+        ("Object", "values") => Some(NB_OBJECT_VALUES),
+        ("Object", "entries") => Some(NB_OBJECT_ENTRIES),
+        ("Object", "assign") => Some(NB_OBJECT_ASSIGN),
         _ => None,
     }
 }
@@ -1861,8 +1942,16 @@ impl Compiler {
                             self.apply_default(v, default.as_ref())?;
                             self.bind_pattern(target, v)?;
                         }
-                        ArrayPatternElement::Rest { .. } => {
-                            return Err(CompileError::Unsupported("rest pattern"));
+                        ArrayPatternElement::Rest { target, .. } => {
+                            // `...rest` = the source array sliced from here.
+                            let from = self.constant(NanBox::number(i as f64))?;
+                            let rest = self.alloc();
+                            self.ops.push(Op::ArraySliceFrom {
+                                dst: rest,
+                                src: value_reg,
+                                from,
+                            });
+                            self.bind_pattern(target, rest)?;
                         }
                     }
                 }
@@ -2332,6 +2421,15 @@ impl Compiler {
             } => {
                 let a = self.expr(left)?;
                 let b = self.expr(right)?;
+                if matches!(op, BinaryOp::In) {
+                    let dst = self.alloc();
+                    self.ops.push(Op::HasProp {
+                        dst,
+                        key: a,
+                        obj: b,
+                    });
+                    return Ok(dst);
+                }
                 self.emit_binop(*op, a, b)
             }
             Expr::Logical {
@@ -3468,6 +3566,32 @@ mod tests {
     }
 
     #[test]
+    fn bytecode_object_namespace_and_in() {
+        // Object.keys / values / entries.
+        assert_eq!(bc("Object.keys({ a: 1, b: 2 }).join(',')"), "a,b");
+        assert_eq!(bc("Object.values({ a: 1, b: 2 }).join(',')"), "1,2");
+        assert_eq!(
+            bc("Object.entries({ a: 1, b: 2 }).map((e) => e[0] + '=' + e[1]).join(',')"),
+            "a=1,b=2"
+        );
+        // Object.assign copies and returns the target.
+        assert_eq!(
+            bc("let t = Object.assign({}, { a: 1 }, { b: 2 }); t.a + t.b"),
+            "3"
+        );
+        // `in` operator on objects and arrays.
+        assert_eq!(bc("'x' in { x: 1 }"), "true");
+        assert_eq!(bc("'y' in { x: 1 }"), "false");
+        assert_eq!(bc("0 in [10, 20]"), "true");
+        assert_eq!(bc("5 in [10, 20]"), "false");
+        // `in` guarding access (memoization-style).
+        assert_eq!(
+            bc("let c = {}; c.k = 7; let r = ('k' in c) ? c.k : -1; r"),
+            "7"
+        );
+    }
+
+    #[test]
     fn bytecode_more_operators() {
         // `**`, `%`, bitwise, shifts.
         assert_eq!(bc("2 ** 10"), "1024");
@@ -3535,6 +3659,15 @@ mod tests {
         assert_eq!(bc("let [a, , c] = [1, 2, 3]; a + c"), "4");
         assert_eq!(bc("let [a, b = 9] = [1]; a + b"), "10");
         assert_eq!(bc("let [[a], [b]] = [[1], [2]]; a + b"), "3");
+        // Array rest pattern.
+        assert_eq!(
+            bc("let [h, ...t] = [1, 2, 3, 4]; h + '|' + t.join(',')"),
+            "1|2,3,4"
+        );
+        assert_eq!(
+            bc("let [, , ...rest] = [1, 2, 3, 4, 5]; rest.join(',')"),
+            "3,4,5"
+        );
         // Object destructuring with shorthand, rename, and default.
         assert_eq!(bc("let { x, y } = { x: 1, y: 2 }; x + y"), "3");
         assert_eq!(bc("let { a: p, b: q } = { a: 10, b: 20 }; p + q"), "30");
