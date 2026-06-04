@@ -73,6 +73,11 @@ pub mod ic;
 #[cfg(feature = "alloc")]
 pub mod atom;
 
+/// Rope strings: lazy O(1) concatenation so building a string piecewise is not
+/// quadratic. Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod rope;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
