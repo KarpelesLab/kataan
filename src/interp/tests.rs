@@ -516,6 +516,13 @@ fn math_builtins() {
     assert_eq!(eval("Math.pow(2, 10)"), "1024");
     assert_eq!(eval("Math.sqrt(144)"), "12");
     assert_eq!(eval("Math.round(2.5)"), "3");
+    assert_eq!(eval("Math.hypot(3, 4)"), "5");
+    assert_eq!(eval("Math.sign(-7)"), "-1");
+    assert_eq!(eval("Math.sign(0)"), "0");
+    assert_eq!(eval("Math.cbrt(27)"), "3");
+    assert_eq!(eval("Math.clz32(1)"), "31");
+    assert_eq!(eval("Math.atan2(0, -1).toFixed(5)"), "3.14159");
+    assert_eq!(eval("Math.trunc(-4.7)"), "-4");
 }
 
 #[cfg(feature = "regex")]

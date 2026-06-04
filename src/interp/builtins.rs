@@ -432,14 +432,47 @@ impl<'a> Interp<'a> {
         unary!("trunc", f64::trunc);
         unary!("sqrt", f64::sqrt);
         unary!("cbrt", f64::cbrt);
-        unary!("sign", f64::signum);
+        // JS `Math.sign`: NaN→NaN, ±0→±0, else ±1 (Rust's signum returns ±1 for 0).
+        unary!("sign", |n: f64| if n == 0.0 || n.is_nan() {
+            n
+        } else {
+            n.signum()
+        });
         unary!("exp", f64::exp);
+        unary!("expm1", f64::exp_m1);
         unary!("log", f64::ln);
+        unary!("log1p", f64::ln_1p);
         unary!("log2", f64::log2);
         unary!("log10", f64::log10);
         unary!("sin", f64::sin);
         unary!("cos", f64::cos);
         unary!("tan", f64::tan);
+        unary!("asin", f64::asin);
+        unary!("acos", f64::acos);
+        unary!("atan", f64::atan);
+        unary!("sinh", f64::sinh);
+        unary!("cosh", f64::cosh);
+        unary!("tanh", f64::tanh);
+        unary!("asinh", f64::asinh);
+        unary!("acosh", f64::acosh);
+        unary!("atanh", f64::atanh);
+        unary!("fround", |n: f64| n as f32 as f64);
+        unary!("clz32", |n: f64| (n as i64 as u32).leading_zeros() as f64);
+        math.set(
+            "atan2",
+            native("atan2", |a| {
+                Ok(Value::Number(
+                    arg(a, 0).to_number().atan2(arg(a, 1).to_number()),
+                ))
+            }),
+        );
+        math.set(
+            "hypot",
+            native("hypot", |a| {
+                let sum: f64 = a.iter().map(|v| v.to_number().powi(2)).sum();
+                Ok(Value::Number(sum.sqrt()))
+            }),
+        );
         math.set(
             "pow",
             native("pow", |a| {
