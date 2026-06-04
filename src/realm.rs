@@ -299,6 +299,40 @@ impl Realm {
         )
     }
 
+    /// All own string property names (including non-enumerable ones such as
+    /// methods, but not private `#` fields) — for `Object.getOwnPropertyNames`.
+    pub fn own_property_names(&self, handle: Handle) -> Option<Vec<alloc::string::String>> {
+        let obj = self.heap.get(handle)?.as_object()?;
+        Some(
+            obj.keys()
+                .iter()
+                .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                .map(|s| alloc::string::String::from(*s))
+                .collect(),
+        )
+    }
+
+    /// Freezes the object at `handle` (`Object.freeze`); returns whether it was
+    /// an object.
+    pub fn freeze_object(&mut self, handle: Handle) -> bool {
+        match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            Some(obj) => {
+                obj.freeze();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the value at `handle` is a frozen object.
+    #[must_use]
+    pub fn is_frozen(&self, handle: Handle) -> bool {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_object)
+            .is_some_and(crate::object::Object::is_frozen)
+    }
+
     /// The length of the array at `handle`, or `None` if it is not an array.
     #[must_use]
     pub fn array_length(&self, handle: Handle) -> Option<usize> {

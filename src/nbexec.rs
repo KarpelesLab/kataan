@@ -175,6 +175,9 @@ const N_MATH_POW: u16 = 28;
 const N_MATH_SIGN: u16 = 29;
 const N_MATH_TRUNC: u16 = 30;
 const N_OBJECT_FROM_ENTRIES: u16 = 34;
+const N_OBJECT_FREEZE: u16 = 35;
+const N_OBJECT_IS_FROZEN: u16 = 36;
+const N_OBJECT_GET_OWN_NAMES: u16 = 37;
 const N_PARSE_FLOAT: u16 = 31;
 const N_IS_NAN: u16 = 32;
 const N_IS_FINITE: u16 = 33;
@@ -295,6 +298,9 @@ impl<'a> Interp<'a> {
                 ("assign", N_OBJECT_ASSIGN),
                 ("entries", N_OBJECT_ENTRIES),
                 ("fromEntries", N_OBJECT_FROM_ENTRIES),
+                ("freeze", N_OBJECT_FREEZE),
+                ("isFrozen", N_OBJECT_IS_FROZEN),
+                ("getOwnPropertyNames", N_OBJECT_GET_OWN_NAMES),
             ],
         );
         install_namespace(
@@ -402,6 +408,25 @@ impl<'a> Interp<'a> {
                     .and_then(|raw| self.realm.object_keys(Handle::from_raw(raw)))
                     .unwrap_or_default();
                 let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_str(k)).collect();
+                NanBox::handle(self.realm.new_array(boxed).to_raw())
+            }
+            N_OBJECT_FREEZE => {
+                if let Some(raw) = arg(0).as_handle() {
+                    self.realm.freeze_object(Handle::from_raw(raw));
+                }
+                arg(0) // returns the (now frozen) object
+            }
+            N_OBJECT_IS_FROZEN => NanBox::boolean(
+                arg(0)
+                    .as_handle()
+                    .is_some_and(|raw| self.realm.is_frozen(Handle::from_raw(raw))),
+            ),
+            N_OBJECT_GET_OWN_NAMES => {
+                let names = arg(0)
+                    .as_handle()
+                    .and_then(|raw| self.realm.own_property_names(Handle::from_raw(raw)))
+                    .unwrap_or_default();
+                let boxed: Vec<NanBox> = names.iter().map(|k| self.new_str(k)).collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
             N_OBJECT_VALUES => {
@@ -3967,6 +3992,23 @@ mod tests {
         assert_eq!(
             run("[1,2,3].reduceRight(function(a,x){ return a + x; }, 10)"),
             "16"
+        );
+    }
+
+    #[test]
+    fn object_freeze_family() {
+        // Writes and new properties are no-ops on a frozen object.
+        assert_eq!(
+            run(
+                "let o = Object.freeze({ a: 1 }); o.a = 9; o.b = 2; o.a + ',' + (o.b === undefined)"
+            ),
+            "1,true"
+        );
+        assert_eq!(run("Object.isFrozen(Object.freeze({}))"), "true");
+        assert_eq!(run("Object.isFrozen({})"), "false");
+        assert_eq!(
+            run("Object.getOwnPropertyNames({ x: 1, y: 2 }).length"),
+            "2"
         );
     }
 

@@ -33,6 +33,9 @@ pub struct Object {
     /// Own keys that are **non-enumerable** (e.g. class methods): present in the
     /// slots and readable, but hidden from `Object.keys`/spread/`for-in`/JSON.
     hidden: Vec<alloc::boxed::Box<str>>,
+    /// Whether the object is frozen (`Object.freeze`): no new properties and no
+    /// writes to existing ones.
+    frozen: bool,
     /// The class this object was instantiated from (for `instanceof`), if any.
     class_tag: Option<u32>,
 }
@@ -48,6 +51,7 @@ impl Object {
             slots: Vec::new(),
             accessors: Vec::new(),
             hidden: Vec::new(),
+            frozen: false,
             class_tag: None,
         }
     }
@@ -124,8 +128,13 @@ impl Object {
     }
 
     /// Sets own property `key` to `value`: updates the slot in place if the
-    /// property exists, otherwise transitions the shape and appends a slot.
+    /// property exists, otherwise transitions the shape and appends a slot. A
+    /// no-op on a frozen object (matching `Object.freeze` semantics in
+    /// non-strict code).
     pub fn set(&mut self, key: &str, value: NanBox) {
+        if self.frozen {
+            return;
+        }
         if let Some(slot) = self.shape.lookup(key) {
             self.slots[slot as usize] = value;
         } else {
@@ -161,6 +170,17 @@ impl Object {
     #[must_use]
     pub fn is_hidden(&self, key: &str) -> bool {
         self.hidden.iter().any(|k| k.as_ref() == key)
+    }
+
+    /// Marks the object frozen (`Object.freeze`).
+    pub fn freeze(&mut self) {
+        self.frozen = true;
+    }
+
+    /// Whether the object is frozen.
+    #[must_use]
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
     }
 
     /// Deletes own property `key`, rebuilding the shape/slots from `root` without
