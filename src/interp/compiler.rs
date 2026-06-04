@@ -9,15 +9,17 @@
 //! Supported: literals, template literals, globals + block-scoped locals, the
 //! full operator set (arithmetic/comparison incl. `!=`/`!==`, bitwise/shift,
 //! `&&`/`||`/`??`, unary `-`/`+`/`!`, `typeof`/`void`/`delete`, the ternary,
-//! `in`, `instanceof`), object and array literals, member/index access and
-//! writes, calls and method calls (with `this` + built-in prototype dispatch),
-//! `new`, assignment (incl. compound, on identifiers and members), `if`/`else`,
-//! `while`/`do-while`/`for`/`for-of` with `break`/`continue`, `switch`,
-//! `try`/`catch`, `throw`, blocks, `return`, and **functions** (declarations
-//! hoisted, function/arrow expressions, positional parameters). Not yet:
-//! closures that capture an enclosing function's variable (an upvalue),
-//! `finally`, for-in, destructuring, classes, generators, and spread — these
-//! return a `CompileError` so the caller falls back to the tree-walker.
+//! `in`, `instanceof`), object and array literals (with array spread),
+//! member/index access and writes, calls and method calls (with `this` +
+//! built-in prototype dispatch), `new`, assignment (incl. compound, on
+//! identifiers and members), `if`/`else`, `while`/`do-while`/`for`/`for-of`/
+//! `for-in` with `break`/`continue`, `switch`, `try`/`catch`, `throw`, blocks,
+//! `return`, destructuring declarations + parameters (array/object patterns,
+//! defaults, array rest), and **functions** (declarations hoisted,
+//! function/arrow expressions). Not yet: closures that capture an enclosing
+//! function's variable (an upvalue), `finally`, classes, generators, call /
+//! object spread, rest parameters, and object rest patterns — these return a
+//! `CompileError` so the caller falls back to the tree-walker.
 
 use crate::ast::{
     Arrow, ArrowBody, AssignOp, BinaryOp, BindingTarget, Expr, Function, LogicalOp, Param,
