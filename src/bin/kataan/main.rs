@@ -47,9 +47,9 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        ["eval" | "run", "-e", source] => run_eval(source, "<argv>"),
+        ["eval" | "run", "-e", source] => run_eval_nb(source, "<argv>"),
         ["eval" | "run", path] => match std::fs::read_to_string(path) {
-            Ok(source) => run_eval(&source, path),
+            Ok(source) => run_eval_nb(&source, path),
             Err(e) => {
                 eprintln!("kataan: cannot read {path}: {e}");
                 ExitCode::FAILURE
@@ -127,35 +127,6 @@ fn run_parse(source: &str, origin: &str) -> ExitCode {
         }
         Err(e) => {
             eprintln!("kataan: {origin}: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Parses and evaluates `source`, printing the completion value (REPL-style).
-/// `origin` is shown in error messages.
-fn run_eval(source: &str, origin: &str) -> ExitCode {
-    let program = match Parser::parse_program(source) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("kataan: {origin}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut interp = Interp::new();
-    install_console(&interp);
-    // The bytecode VM is the primary execution path (it falls back to the
-    // tree-walker for constructs it doesn't yet compile).
-    match interp.run_with_vm(&program) {
-        Ok(value) => {
-            // Print non-undefined completion values, REPL-style.
-            if !matches!(value, kataan::interp::Value::Undefined) {
-                println!("{}", value.to_js_string());
-            }
-            ExitCode::SUCCESS
-        }
-        Err(thrown) => {
-            eprintln!("kataan: {origin}: Uncaught {}", thrown.to_js_string());
             ExitCode::FAILURE
         }
     }

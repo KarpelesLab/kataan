@@ -153,16 +153,8 @@ pub unsafe extern "C" fn kt_eval(
 /// the thrown value's string on an uncaught throw / parse error.
 #[cfg(feature = "std")]
 fn eval_to_string(src: &str) -> Result<alloc::string::String, alloc::string::String> {
-    use crate::interp::Interp;
-    use crate::parser::Parser;
-
-    let program = Parser::parse_program(src).map_err(|e| alloc::string::ToString::to_string(&e))?;
-    let mut interp = Interp::new();
-    // Run on the bytecode VM (with automatic tree-walker fallback).
-    match interp.run_with_vm(&program) {
-        Ok(value) => Ok(value.to_js_string()),
-        Err(thrown) => Err(thrown.to_js_string()),
-    }
+    // The new-representation engine: the bytecode VM with a tree-walker fallback.
+    crate::nbvm::execute(src).map(|(_output, completion)| completion)
 }
 
 /// Copies `data` into `out` per the in/out length convention.
