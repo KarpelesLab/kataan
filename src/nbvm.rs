@@ -1666,7 +1666,7 @@ fn builtin_method(
             }
             "split" => {
                 let sep = ctx.realm.to_display_string(arg0());
-                let parts: Vec<NanBox> = if sep.is_empty() {
+                let mut parts: Vec<NanBox> = if sep.is_empty() {
                     s.chars()
                         .map(|c| NanBox::handle(ctx.realm.new_string(&String::from(c)).to_raw()))
                         .collect()
@@ -1675,6 +1675,15 @@ fn builtin_method(
                         .map(|p| NanBox::handle(ctx.realm.new_string(p).to_raw()))
                         .collect()
                 };
+                // An optional limit caps the number of returned segments.
+                if let Some(lim) = args.get(1)
+                    && !matches!(lim.unpack(), Unpacked::Undefined)
+                {
+                    let limit = ctx.realm.to_number(*lim);
+                    if limit >= 0.0 {
+                        parts.truncate(limit as usize);
+                    }
+                }
                 NanBox::handle(ctx.realm.new_array(parts).to_raw())
             }
             _ => return None,

@@ -1507,6 +1507,16 @@ impl<'a> Interp<'a> {
                     let digits = self.realm.to_number(arg(0)) as usize;
                     Some(self.new_str(&alloc::format!("{n:.digits$}")))
                 }
+                // `toPrecision(p)` — p significant digits (no arg → default
+                // string form).
+                "toPrecision" => {
+                    if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                        Some(self.new_str(&self.realm.to_display_string(recv)))
+                    } else {
+                        let p = (self.realm.to_number(arg(0)) as usize).max(1);
+                        Some(self.new_str(&format_precision(n, p)))
+                    }
+                }
                 _ => None,
             });
         }
@@ -1792,7 +1802,7 @@ impl<'a> Interp<'a> {
                 }
                 "split" => {
                     let sep = self.realm.to_display_string(arg(0));
-                    let parts: Vec<NanBox> = if sep.is_empty() {
+                    let mut parts: Vec<NanBox> = if sep.is_empty() {
                         let chars: Vec<char> = s.chars().collect();
                         chars
                             .iter()
@@ -1801,6 +1811,13 @@ impl<'a> Interp<'a> {
                     } else {
                         s.split(&sep).map(|p| self.new_str(p)).collect()
                     };
+                    // An optional limit caps the number of returned segments.
+                    if !matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        let limit = self.realm.to_number(arg(1));
+                        if limit >= 0.0 {
+                            parts.truncate(limit as usize);
+                        }
+                    }
                     Some(NanBox::handle(self.realm.new_array(parts).to_raw()))
                 }
                 "replace" => {
@@ -2067,21 +2084,42 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
-                // One level of flattening (`[1, [2, 3]].flat()`).
+                // `flat(depth = 1)` — recursively flatten nested arrays.
                 "flat" => {
-                    let mut out = Vec::new();
-                    for e in &elems {
-                        match e
-                            .as_handle()
-                            .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
-                            .map(<[_]>::to_vec)
-                        {
-                            Some(inner) => out.extend(inner),
-                            None => out.push(*e),
-                        }
-                    }
+                    let depth = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                        1
+                    } else {
+                        self.realm.to_number(arg(0)) as i32
+                    };
+                    let out = self.flatten(&elems, depth);
                     let h = self.realm.new_array(out);
                     return Ok(Some(NanBox::handle(h.to_raw())));
+                }
+                // `copyWithin(target, start, end?)` — copy a slice within the
+                // array in place; negatives count from the end.
+                "copyWithin" => {
+                    let len = elems.len() as i64;
+                    let norm = |v: f64| -> i64 {
+                        let i = v as i64;
+                        if i < 0 { (len + i).max(0) } else { i.min(len) }
+                    };
+                    let target = norm(self.realm.to_number(arg(0)));
+                    let start = norm(self.realm.to_number(arg(1)));
+                    let end = if matches!(arg(2).unpack(), Unpacked::Undefined) {
+                        len
+                    } else {
+                        norm(self.realm.to_number(arg(2)))
+                    };
+                    let slice: Vec<NanBox> =
+                        elems[start as usize..end.max(start) as usize].to_vec();
+                    for (k, v) in slice.into_iter().enumerate() {
+                        let dst = target as usize + k;
+                        if dst >= elems.len() {
+                            break;
+                        }
+                        self.realm.set_element(handle, dst, v);
+                    }
+                    return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 // `map` then flatten one level.
                 "flatMap" => {
@@ -2581,6 +2619,24 @@ impl<'a> Interp<'a> {
 
     /// The values iterated by `for-of`: array elements, string chars, `Set`
     /// values, or `Map` `[key, value]` pairs.
+    /// Recursively flattens nested arrays up to `depth` levels (for `flat`).
+    fn flatten(&self, elems: &[NanBox], depth: i32) -> Vec<NanBox> {
+        let mut out = Vec::new();
+        for e in elems {
+            if depth > 0
+                && let Some(inner) = e
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
+            {
+                out.extend(self.flatten(&inner, depth - 1));
+            } else {
+                out.push(*e);
+            }
+        }
+        out
+    }
+
     fn iterate_values(&mut self, v: NanBox) -> Result<Vec<NanBox>, ExecError> {
         let Some(h) = v.as_handle().map(Handle::from_raw) else {
             return Err(ExecError::Throw(self.new_str("value is not iterable")));
@@ -3714,6 +3770,36 @@ fn pad_start(s: &str, target: usize, pad: &str) -> String {
     filler + s
 }
 
+/// `Number.prototype.toPrecision(p)`: render `n` with `p` significant digits,
+/// choosing fixed or exponential notation by magnitude (as the spec does).
+fn format_precision(n: f64, p: usize) -> String {
+    if n == 0.0 {
+        return alloc::format!("{:.*}", p - 1, 0.0);
+    }
+    if !n.is_finite() {
+        return if n.is_nan() {
+            String::from("NaN")
+        } else if n > 0.0 {
+            String::from("Infinity")
+        } else {
+            String::from("-Infinity")
+        };
+    }
+    // Derive the decimal exponent from the default scientific rendering (no
+    // `log10`, which isn't available in the no_std float set).
+    let sci = alloc::format!("{:e}", n.abs());
+    let e: i32 = sci
+        .rfind('e')
+        .and_then(|i| sci[i + 1..].parse().ok())
+        .unwrap_or(0);
+    if e < -6 || e >= p as i32 {
+        // Exponential notation with p-1 fractional digits.
+        return alloc::format!("{:.*e}", p - 1, n);
+    }
+    let decimals = (p as i32 - 1 - e).max(0) as usize;
+    alloc::format!("{:.*}", decimals, n)
+}
+
 /// `String.prototype.padEnd`: append `pad` (repeated) until length `target`.
 fn pad_end(s: &str, target: usize, pad: &str) -> String {
     let len = s.chars().count();
@@ -4188,6 +4274,17 @@ mod tests {
             run("[2,4,6].findLast(function(x){ return x > 9; })"),
             "undefined"
         );
+        // copyWithin (in place) and flat(depth).
+        assert_eq!(run("[1,2,3,4,5].copyWithin(0,3).join(',')"), "4,5,3,4,5");
+        assert_eq!(run("[1,[2,[3,[4]]]].flat(2).join(',')"), "1,2,3,4");
+    }
+
+    #[test]
+    fn split_limit_and_to_precision() {
+        assert_eq!(run("'a,b,c,d'.split(',', 2).length"), "2");
+        assert_eq!(run("'aXbXc'.split('X').join('-')"), "a-b-c");
+        assert_eq!(run("(123.456).toPrecision(4)"), "123.5");
+        assert_eq!(run("(255).toString(2)"), "11111111");
     }
 
     #[test]
