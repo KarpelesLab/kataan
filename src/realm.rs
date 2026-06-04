@@ -215,6 +215,86 @@ impl Realm {
         NanBox::number(f64::NAN)
     }
 
+    /// ECMAScript `ToNumber` (the cases this model covers): numbers pass
+    /// through; `true`/`false` → `1`/`0`; `null` → `0`; `undefined` → `NaN`; a
+    /// string is parsed (blank → `0`, a numeric literal → its value, else
+    /// `NaN`); objects/arrays → `NaN` (full `ToPrimitive` arrives later).
+    #[must_use]
+    pub fn to_number(&self, v: NanBox) -> f64 {
+        use crate::nanbox::Unpacked;
+        match v.unpack() {
+            Unpacked::Number(n) => n,
+            Unpacked::Bool(b) => {
+                if b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Unpacked::Null => 0.0,
+            Unpacked::Undefined => f64::NAN,
+            Unpacked::Handle(raw) => {
+                match self.heap.get(Handle::from_raw(raw)).and_then(Cell::as_str) {
+                    Some(rope) => {
+                        let s = rope.materialize();
+                        let t = s.trim();
+                        if t.is_empty() {
+                            0.0
+                        } else {
+                            t.parse::<f64>().unwrap_or(f64::NAN)
+                        }
+                    }
+                    None => f64::NAN, // object/array/stale
+                }
+            }
+        }
+    }
+
+    /// The ECMAScript abstract relational comparison `a < b`: if *both* operands
+    /// are strings they compare lexicographically by code point; otherwise both
+    /// are coerced with `ToNumber`. Returns `None` when the result is undefined
+    /// (a `NaN` operand) — the caller turns that into `false`.
+    #[must_use]
+    fn compare(&self, a: NanBox, b: NanBox) -> Option<core::cmp::Ordering> {
+        if self.is_string(a) && self.is_string(b) {
+            let sa = self.to_display_string(a);
+            let sb = self.to_display_string(b);
+            return Some(sa.cmp(&sb));
+        }
+        let (x, y) = (self.to_number(a), self.to_number(b));
+        x.partial_cmp(&y) // None on NaN
+    }
+
+    /// `a < b` (boolean).
+    #[must_use]
+    pub fn less_than(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::boolean(self.compare(a, b) == Some(core::cmp::Ordering::Less))
+    }
+
+    /// `a <= b` (boolean).
+    #[must_use]
+    pub fn less_equal(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::boolean(matches!(
+            self.compare(a, b),
+            Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
+        ))
+    }
+
+    /// `a > b` (boolean).
+    #[must_use]
+    pub fn greater_than(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::boolean(self.compare(a, b) == Some(core::cmp::Ordering::Greater))
+    }
+
+    /// `a >= b` (boolean).
+    #[must_use]
+    pub fn greater_equal(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::boolean(matches!(
+            self.compare(a, b),
+            Some(core::cmp::Ordering::Greater | core::cmp::Ordering::Equal)
+        ))
+    }
+
     /// ECMAScript strict equality (`===`) over heap values: primitives compare
     /// by value; two strings compare by *content* (strings are primitives, so
     /// distinct allocations of `"ab"` are equal); other references compare by
@@ -397,6 +477,54 @@ mod tests {
         let o2 = realm.new_object();
         assert!(realm.strict_equals(NanBox::handle(o1.to_raw()), NanBox::handle(o1.to_raw())));
         assert!(!realm.strict_equals(NanBox::handle(o1.to_raw()), NanBox::handle(o2.to_raw())));
+    }
+
+    #[test]
+    fn to_number_coerces() {
+        let mut realm = Realm::new();
+        assert_eq!(realm.to_number(NanBox::number(3.5)), 3.5);
+        assert_eq!(realm.to_number(NanBox::boolean(true)), 1.0);
+        assert_eq!(realm.to_number(NanBox::boolean(false)), 0.0);
+        assert_eq!(realm.to_number(NanBox::null()), 0.0);
+        assert!(realm.to_number(NanBox::undefined()).is_nan());
+        let s = realm.new_string("  42  ");
+        assert_eq!(realm.to_number(NanBox::handle(s.to_raw())), 42.0);
+        let blank = realm.new_string("");
+        assert_eq!(realm.to_number(NanBox::handle(blank.to_raw())), 0.0);
+        let bad = realm.new_string("nope");
+        assert!(realm.to_number(NanBox::handle(bad.to_raw())).is_nan());
+    }
+
+    #[test]
+    fn relational_operators_on_numbers_and_strings() {
+        let mut realm = Realm::new();
+        let one = NanBox::number(1.0);
+        let two = NanBox::number(2.0);
+        assert_eq!(realm.less_than(one, two).as_boolean(), Some(true));
+        assert_eq!(realm.less_than(two, one).as_boolean(), Some(false));
+        assert_eq!(realm.greater_than(two, one).as_boolean(), Some(true));
+        assert_eq!(realm.less_equal(two, two).as_boolean(), Some(true));
+        assert_eq!(realm.greater_equal(two, two).as_boolean(), Some(true));
+        // A NaN operand makes every comparison false.
+        let nan = NanBox::number(f64::NAN);
+        assert_eq!(realm.less_than(nan, one).as_boolean(), Some(false));
+        assert_eq!(realm.greater_than(nan, one).as_boolean(), Some(false));
+        // Two strings compare lexicographically: "10" < "9" (string order).
+        let s10 = realm.new_string("10");
+        let s9 = realm.new_string("9");
+        assert_eq!(
+            realm
+                .less_than(NanBox::handle(s10.to_raw()), NanBox::handle(s9.to_raw()))
+                .as_boolean(),
+            Some(true)
+        );
+        // Mixed string/number coerces to numeric: 10 < "9" is false (9 < 10).
+        assert_eq!(
+            realm
+                .less_than(NanBox::number(10.0), NanBox::handle(s9.to_raw()))
+                .as_boolean(),
+            Some(false)
+        );
     }
 
     #[test]
