@@ -34,9 +34,11 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod ast;
 pub mod common;
 pub mod error;
 pub mod lexer;
+pub mod parser;
 
 #[cfg(feature = "ffi")]
 pub mod ffi;

@@ -1,17 +1,18 @@
 //! The `kataan` command-line tool.
 //!
-//! At this stage (Phase A) the engine front end is the lexer, so the CLI can
-//! tokenize a script and print the token stream — useful for inspecting the
-//! lexer and as the first end-to-end demonstration of the pipeline. Later
-//! phases add `parse`, `run`, and a REPL (see `ROADMAP.md`).
+//! The engine front end is being built bottom-up, and the CLI exposes each
+//! stage as it lands: `lex` tokenizes, and `parse` produces an AST. Later
+//! phases add full-program parsing, `run`, and a REPL (see `ROADMAP.md`).
 //!
 //! ```text
-//! kataan lex FILE          # print the tokens of FILE
-//! kataan lex -e 'SOURCE'   # tokenize SOURCE from the command line
+//! kataan lex FILE            # print the tokens of FILE
+//! kataan lex -e 'SOURCE'     # tokenize SOURCE from the command line
+//! kataan parse -e 'EXPR'     # parse an expression and dump its AST
 //! kataan --version
 //! ```
 
 use kataan::lexer::{Lexer, TokenKind};
+use kataan::parser::Parser;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        ["parse", "-e", source] => run_parse(source, "<argv>"),
         _ => {
             eprintln!("kataan: unrecognized arguments: {}", args.join(" "));
             eprintln!("try `kataan --help`");
@@ -71,6 +73,21 @@ fn run_lex(source: &str, origin: &str) -> ExitCode {
     }
 }
 
+/// Parses `source` as a single expression and prints its AST. `origin` is
+/// shown in error messages.
+fn run_parse(source: &str, origin: &str) -> ExitCode {
+    match Parser::parse_expression_entry(source) {
+        Ok(expr) => {
+            println!("{expr:#?}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kataan: {origin}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn print_usage() {
     println!(
         "kataan {} — a JavaScript engine in pure Rust\n\
@@ -78,10 +95,11 @@ fn print_usage() {
          USAGE:\n    \
          kataan lex <FILE>         tokenize a script file\n    \
          kataan lex -e <SOURCE>    tokenize a source string\n    \
+         kataan parse -e <EXPR>    parse an expression and dump its AST\n    \
          kataan --version          print the version\n    \
          kataan --help             show this help\n\
          \n\
-         More subcommands (parse, run, repl) arrive in later phases — see ROADMAP.md.",
+         Full-program parsing, `run`, and a REPL arrive in later phases — see ROADMAP.md.",
         kataan::VERSION
     );
 }

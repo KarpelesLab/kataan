@@ -395,6 +395,16 @@ impl Keyword {
         }
     }
 
+    /// Whether this is a *contextual* keyword — one that is only reserved in
+    /// certain positions and is otherwise usable as an ordinary identifier
+    /// (e.g. `async`, `of`, `get`, `from`). The always-reserved words and the
+    /// strict-mode reserved words return `false`.
+    #[must_use]
+    pub fn is_contextual(self) -> bool {
+        use Keyword::*;
+        matches!(self, As | Async | From | Get | Of | Set | Target | Accessor)
+    }
+
     /// Whether, when this keyword is the previous significant token, a
     /// following `/` should be read as the start of a regex literal rather
     /// than division. Keywords that can end an expression (`this`, `super`,
