@@ -76,10 +76,26 @@ Rex barks
 It also exposes each pipeline stage, and an interactive REPL:
 
 ```console
-$ cargo run -- lex   -e 'x => x * 2'   # token stream
-$ cargo run -- parse -e 'x => x * 2'   # AST dump
+$ cargo run -- lex    -e 'x => x * 2'  # token stream
+$ cargo run -- parse  -e 'x => x * 2'  # AST dump
+$ cargo run -- disasm -e '1 + 2 * 3'   # register bytecode
 $ cargo run -- repl                    # interactive session
 $ cargo run -- --help
+```
+
+The `disasm` command shows the register bytecode the compiler emits (the
+front half of the Phase-D pipeline — see [`ROADMAP.md`](ROADMAP.md)):
+
+```console
+$ cargo run -- disasm -e 'let s = 0; let i = 0; while (i < 3) { s += i; i += 1; } s'
+chunk #0 "<main>"  (regs=14, params=0)
+     0  LoadInt     r0, 0
+     ...
+     6  Lt          r6, r4, r5
+     7  JumpIfFalse r6, +9
+     ...
+    16  Jump        -13
+    18  Return      r13
 ```
 
 ## Use as a Rust library
