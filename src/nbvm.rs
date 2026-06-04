@@ -11,14 +11,16 @@
 //! and object property reads/writes through shapes — end to end, ahead of
 //! migrating the full bytecode VM onto this representation.
 //!
-//! It also carries the first slices of the **bytecode-VM fold**: an AST →
-//! bytecode `compile_and_run` that lowers a growing JavaScript subset
-//! (arithmetic, control flow, arrays/objects, `for` loops, and now functions
-//! with recursion via a per-activation register window) onto these ops, with no
-//! tree-walking. Closures, exceptions, and first-class function values arrive
-//! with later slices; the point is that every value flowing through it is a
-//! single 64-bit word and every object is a GC-managed heap node, exactly as the
-//! production VM will work.
+//! It also carries the **bytecode-VM fold**: an AST → bytecode `compile_and_run`
+//! that lowers a growing JavaScript subset (arithmetic, control flow,
+//! arrays/objects, `for`/`do-while` loops, compound assignment and `++`/`--`,
+//! functions with recursion via a per-activation register window, and native
+//! `console.log`/`Math.*` calls) onto these ops, with no tree-walking — and it
+//! agrees with the tree-walker output for output (a cross-engine parity test).
+//! Closures, exceptions, and first-class function values arrive with later
+//! slices; the point is that every value flowing through it is a single 64-bit
+//! word and every object is a GC-managed heap node, exactly as the production VM
+//! will work.
 //!
 //! Pure, safe `alloc`-only Rust.
 
@@ -82,9 +84,21 @@ pub enum Op {
     /// `dst = func(args…)` — call function `func` (an index into the program's
     /// function table) with the values in the `args` registers.
     Call { dst: Reg, func: u32, args: Vec<Reg> },
+    /// `dst = native#id(args…)` — invoke a built-in (`console.log`, `Math.*`).
+    CallNative {
+        dst: Reg,
+        native: u16,
+        args: Vec<Reg>,
+    },
     /// Halt, yielding the value in `src`.
     Return { src: Reg },
 }
+
+// Native built-in ids for `Op::CallNative`.
+const NB_CONSOLE_LOG: u16 = 0;
+const NB_MATH_MAX: u16 = 1;
+const NB_MATH_MIN: u16 = 2;
+const NB_MATH_ABS: u16 = 3;
 
 /// A compiled function: its instruction stream, register-file size, and the
 /// number of leading registers that receive call arguments.
@@ -96,6 +110,13 @@ pub struct FnProto {
     pub n_regs: usize,
     /// Parameters, bound to registers `0..n_params` on entry.
     pub n_params: usize,
+}
+
+/// Execution context shared across activations: the heap and the captured
+/// `console` output sink.
+struct Ctx<'a> {
+    realm: &'a mut Realm,
+    output: String,
 }
 
 /// Runs function `id` of `funcs` with `args`, allocating in `realm`. Calls
@@ -110,15 +131,38 @@ pub fn run_program(
     id: usize,
     args: &[NanBox],
 ) -> Result<NanBox, VmError> {
+    let mut ctx = Ctx {
+        realm,
+        output: String::new(),
+    };
+    call(&mut ctx, funcs, id, args)
+}
+
+/// Like [`run_program`], also returning the captured `console` output.
+///
+/// # Errors
+/// Propagates a [`VmError`] from any faulting instruction.
+pub fn run_program_capturing(
+    realm: &mut Realm,
+    funcs: &[FnProto],
+    id: usize,
+    args: &[NanBox],
+) -> Result<(NanBox, String), VmError> {
+    let mut ctx = Ctx {
+        realm,
+        output: String::new(),
+    };
+    let value = call(&mut ctx, funcs, id, args)?;
+    Ok((value, ctx.output))
+}
+
+fn call(ctx: &mut Ctx, funcs: &[FnProto], id: usize, args: &[NanBox]) -> Result<NanBox, VmError> {
     let proto = &funcs[id];
     let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
     for (i, a) in args.iter().enumerate().take(proto.n_params) {
         regs[i] = *a;
     }
-    if let Some(v) = run_frame(realm, funcs, &proto.ops, &mut regs)? {
-        return Ok(v);
-    }
-    Ok(NanBox::undefined())
+    Ok(run_frame(ctx, funcs, &proto.ops, &mut regs)?.unwrap_or(NanBox::undefined()))
 }
 
 /// Why execution stopped abnormally.
@@ -136,15 +180,19 @@ pub enum VmError {
 /// programs; `Call` ops require [`run_program`]'s function table.)
 pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<NanBox, VmError> {
     let mut regs: Vec<NanBox> = vec![NanBox::undefined(); register_count];
-    Ok(run_frame(realm, &[], program, &mut regs)?.unwrap_or(NanBox::undefined()))
+    let mut ctx = Ctx {
+        realm,
+        output: String::new(),
+    };
+    Ok(run_frame(&mut ctx, &[], program, &mut regs)?.unwrap_or(NanBox::undefined()))
 }
 
 /// Executes one function body (`program`) against the register file `regs`.
 /// Returns `Some(value)` on `Return`, `None` if control falls off the end.
-/// `Call` ops dispatch into `funcs` via [`run_program`] (a fresh register
-/// window per activation).
+/// `Call` ops dispatch into `funcs` via [`call`] (a fresh register window per
+/// activation); `CallNative` dispatches to a built-in via [`call_native`].
 fn run_frame(
-    realm: &mut Realm,
+    ctx: &mut Ctx,
     funcs: &[FnProto],
     program: &[Op],
     regs: &mut [NanBox],
@@ -193,11 +241,13 @@ fn run_frame(
                     NanBox::boolean(num(regs[*a as usize])? < num(regs[*b as usize])?);
             }
             Op::AddValue { dst, a, b } => {
-                regs[*dst as usize] = realm.add(regs[*a as usize], regs[*b as usize]);
+                regs[*dst as usize] = ctx.realm.add(regs[*a as usize], regs[*b as usize]);
             }
             Op::StrictEq { dst, a, b } => {
-                regs[*dst as usize] =
-                    NanBox::boolean(realm.strict_equals(regs[*a as usize], regs[*b as usize]));
+                regs[*dst as usize] = NanBox::boolean(
+                    ctx.realm
+                        .strict_equals(regs[*a as usize], regs[*b as usize]),
+                );
             }
             Op::JumpIfFalse { cond, target } => {
                 if !regs[*cond as usize].to_boolean() {
@@ -206,51 +256,82 @@ fn run_frame(
             }
             Op::Jump { target } => pc = *target,
             Op::NewString { dst, value } => {
-                let handle = realm.new_string(value);
+                let handle = ctx.realm.new_string(value);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::NewArray { dst, len } => {
-                let handle = realm.new_array(vec![NanBox::undefined(); *len]);
+                let handle = ctx.realm.new_array(vec![NanBox::undefined(); *len]);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::GetElem { dst, arr, index } => {
                 let handle = object_handle(regs[*arr as usize])?;
                 let i = num(regs[*index as usize])? as usize;
-                regs[*dst as usize] = realm.get_element(handle, i);
+                regs[*dst as usize] = ctx.realm.get_element(handle, i);
             }
             Op::SetElem { arr, index, src } => {
                 let handle = object_handle(regs[*arr as usize])?;
                 let i = num(regs[*index as usize])? as usize;
-                realm.set_element(handle, i, regs[*src as usize]);
+                ctx.realm.set_element(handle, i, regs[*src as usize]);
             }
             Op::ArrayLen { dst, arr } => {
                 let handle = object_handle(regs[*arr as usize])?;
-                let len = realm.array_length(handle).unwrap_or(0);
+                let len = ctx.realm.array_length(handle).unwrap_or(0);
                 regs[*dst as usize] = NanBox::number(len as f64);
             }
             Op::NewObject { dst } => {
-                let handle = realm.new_object();
+                let handle = ctx.realm.new_object();
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::SetProp { obj, key, src } => {
                 let handle = object_handle(regs[*obj as usize])?;
-                realm.set_property(handle, key, regs[*src as usize]);
+                ctx.realm.set_property(handle, key, regs[*src as usize]);
             }
             Op::GetProp { dst, obj, key } => {
                 let handle = object_handle(regs[*obj as usize])?;
-                regs[*dst as usize] = realm
+                regs[*dst as usize] = ctx
+                    .realm
                     .get_property(handle, key)
                     .unwrap_or(NanBox::undefined());
             }
             Op::Call { dst, func, args } => {
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                let ret = run_program(realm, funcs, *func as usize, &argv)?;
+                let ret = call(ctx, funcs, *func as usize, &argv)?;
                 regs[*dst as usize] = ret;
+            }
+            Op::CallNative { dst, native, args } => {
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                regs[*dst as usize] = call_native(ctx, *native, &argv);
             }
             Op::Return { src } => return Ok(Some(regs[*src as usize])),
         }
     }
     Ok(None)
+}
+
+/// Invokes a built-in by id (`console.log` writes to `ctx.output`; `Math.*`
+/// fold over the numeric arguments).
+fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
+    match native {
+        NB_CONSOLE_LOG => {
+            let line: Vec<String> = args
+                .iter()
+                .map(|a| ctx.realm.to_display_string(*a))
+                .collect();
+            ctx.output.push_str(&line.join(" "));
+            ctx.output.push('\n');
+            NanBox::undefined()
+        }
+        NB_MATH_MAX | NB_MATH_MIN | NB_MATH_ABS => {
+            let mut nums = args.iter().filter_map(|a| a.as_number());
+            let val = match native {
+                NB_MATH_ABS => nums.next().map(f64::abs).unwrap_or(f64::NAN),
+                NB_MATH_MAX => nums.fold(f64::NEG_INFINITY, f64::max),
+                _ => nums.fold(f64::INFINITY, f64::min),
+            };
+            NanBox::number(val)
+        }
+        _ => NanBox::undefined(),
+    }
 }
 
 // --- AST → bytecode compiler (the first slice of the bytecode-VM fold) ---
@@ -280,8 +361,30 @@ pub enum CompileError {
 /// Returns [`CompileError`] for unsupported constructs and [`VmError`] (wrapped)
 /// for runtime faults.
 pub fn compile_and_run(realm: &mut Realm, program: &Program) -> Result<NanBox, CompileError> {
-    // Hoist top-level function declarations to ids 1.. (main is id 0), so calls
-    // — including recursion and forward references — resolve statically.
+    let protos = compile_program(program)?;
+    run_program(realm, &protos, 0, &[]).map_err(|_| CompileError::Unsupported("runtime fault"))
+}
+
+/// Compiles and runs `program`, returning its completion value and captured
+/// `console` output — the bytecode path's analogue of the tree-walker's
+/// `eval_source`.
+///
+/// # Errors
+/// Returns [`CompileError`] for unsupported constructs / runtime faults.
+pub fn compile_run_output(
+    realm: &mut Realm,
+    program: &Program,
+) -> Result<(NanBox, String), CompileError> {
+    let protos = compile_program(program)?;
+    run_program_capturing(realm, &protos, 0, &[])
+        .map_err(|_| CompileError::Unsupported("runtime fault"))
+}
+
+/// Compiles `program` to a function table (function 0 is the top-level body).
+///
+/// # Errors
+/// Returns [`CompileError`] for unsupported constructs.
+pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> {
     let decls: Vec<&crate::ast::Function> = program
         .body
         .iter()
@@ -296,14 +399,36 @@ pub fn compile_and_run(realm: &mut Realm, program: &Program) -> Result<NanBox, C
             fn_ids.insert(String::from(&*id.name), (i + 1) as u32);
         }
     }
-
     let mut protos = Vec::with_capacity(decls.len() + 1);
-    // Function 0 is the top-level program; its completion value is returned.
     protos.push(Compiler::compile_fn(&fn_ids, &[], &program.body, true)?);
     for f in &decls {
         protos.push(Compiler::compile_fn(&fn_ids, &f.params, &f.body, false)?);
     }
-    run_program(realm, &protos, 0, &[]).map_err(|_| CompileError::Unsupported("runtime fault"))
+    Ok(protos)
+}
+
+/// Maps a built-in namespace member call (`console.log`, `Math.max`/`min`/
+/// `abs`) to its native id, if the callee is such a member.
+fn native_call(callee: &Expr) -> Option<u16> {
+    let Expr::Member {
+        object, property, ..
+    } = callee
+    else {
+        return None;
+    };
+    let Expr::Ident(ns) = &**object else {
+        return None;
+    };
+    let (PropertyKey::Ident(method) | PropertyKey::Str(method)) = property else {
+        return None;
+    };
+    match (&*ns.name, &**method) {
+        ("console", "log") => Some(NB_CONSOLE_LOG),
+        ("Math", "max") => Some(NB_MATH_MAX),
+        ("Math", "min") => Some(NB_MATH_MIN),
+        ("Math", "abs") => Some(NB_MATH_ABS),
+        _ => None,
+    }
 }
 
 /// The static string key of a non-computed property key.
@@ -631,17 +756,10 @@ impl Compiler {
                 let obj = self.expr(object)?;
                 self.member_read(obj, property)
             }
-            // A direct call to a hoisted function (static dispatch + recursion).
             Expr::Call {
                 callee, arguments, ..
             } => {
-                let Expr::Ident(id) = &**callee else {
-                    return Err(CompileError::Unsupported("indirect call"));
-                };
-                let func = *self
-                    .fn_ids
-                    .get(&*id.name)
-                    .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                // Evaluate the argument registers (no spreads).
                 let mut args = Vec::with_capacity(arguments.len());
                 for a in arguments {
                     let crate::ast::Argument::Item(e) = a else {
@@ -649,6 +767,21 @@ impl Compiler {
                     };
                     args.push(self.expr(e)?);
                 }
+                // A built-in namespace call (`console.log`, `Math.max`, …).
+                if let Some(native) = native_call(callee) {
+                    let dst = self.alloc();
+                    self.ops.push(Op::CallNative { dst, native, args });
+                    return Ok(dst);
+                }
+                // Otherwise a direct call to a hoisted function (static dispatch
+                // + recursion).
+                let Expr::Ident(id) = &**callee else {
+                    return Err(CompileError::Unsupported("indirect call"));
+                };
+                let func = *self
+                    .fn_ids
+                    .get(&*id.name)
+                    .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
                 let dst = self.alloc();
                 self.ops.push(Op::Call { dst, func, args });
                 Ok(dst)
@@ -896,6 +1029,52 @@ mod tests {
             ),
             "55"
         );
+    }
+
+    /// Compiles + runs `src`, returning captured `console` output.
+    fn bc_out(src: &str) -> String {
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let mut realm = Realm::new();
+        let (_, output) = compile_run_output(&mut realm, &program).expect("compile+run");
+        output
+    }
+
+    #[test]
+    fn bytecode_console_and_math_natives() {
+        assert_eq!(bc_out("console.log('hello')"), "hello\n");
+        assert_eq!(bc_out("console.log(1 + 2, 'x')"), "3 x\n");
+        // console.log inside a loop, driven entirely by bytecode.
+        assert_eq!(
+            bc_out("for (let i = 1; i <= 3; i++) { console.log(i * i); }"),
+            "1\n4\n9\n"
+        );
+        // Math.* natives folded over the args.
+        assert_eq!(bc("Math.max(3, 9, 4)"), "9");
+        assert_eq!(bc("Math.min(3, -2, 8)"), "-2");
+        assert_eq!(bc("Math.abs(-7)"), "7");
+        // A function that logs, called from bytecode.
+        assert_eq!(
+            bc_out("function greet(n) { console.log('hi ' + n); } greet('ada'); greet('bob');"),
+            "hi ada\nhi bob\n"
+        );
+    }
+
+    #[test]
+    fn bytecode_matches_tree_walker() {
+        // Cross-engine parity: the bytecode VM and the tree-walker agree on the
+        // captured output for the same program (the migration's correctness bar).
+        let programs = [
+            "let s = 0; for (let i = 1; i <= 10; i++) { s += i; } console.log(s);",
+            "function fib(n) { if (n < 2) { return n; } return fib(n-1) + fib(n-2); } console.log(fib(15));",
+            "let a = [5, 3, 8]; let m = a[0]; for (let i = 1; i < a.length; i++) { if (a[i] > m) { m = a[i]; } } console.log(m);",
+        ];
+        for src in programs {
+            let program = crate::parser::Parser::parse_program(src).expect("parse");
+            let mut realm = Realm::new();
+            let (_, vm_out) = compile_run_output(&mut realm, &program).expect("bytecode");
+            let (tw_out, _) = crate::nbexec::eval_source(src).expect("tree-walker");
+            assert_eq!(vm_out, tw_out, "engines disagree on: {src}");
+        }
     }
 
     #[test]
