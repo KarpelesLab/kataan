@@ -101,6 +101,8 @@ struct FnDef<'a> {
     is_generator: bool,
     /// Whether this is an arrow function (no own `arguments` binding).
     is_arrow: bool,
+    /// The function's name (`fn.name`); empty for anonymous functions.
+    name: &'a str,
     /// The class this is a method of (for `super.method()`), if any.
     home_class: Option<u32>,
 }
@@ -975,6 +977,7 @@ impl<'a> Interp<'a> {
                     func.is_async,
                     func.is_generator,
                 );
+                self.set_fn_name(value, &id.name);
                 self.current.declare(&id.name, value);
             }
         }
@@ -1008,6 +1011,7 @@ impl<'a> Interp<'a> {
             is_async,
             is_generator,
             is_arrow: false,
+            name: "",
             home_class,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
@@ -3939,12 +3943,16 @@ impl<'a> Interp<'a> {
     }
 
     fn eval_fn_expr(&mut self, func: &'a Function) -> NanBox {
-        self.make_function(
+        let f = self.make_function(
             &func.params,
             Body::Block(&func.body),
             func.is_async,
             func.is_generator,
-        )
+        );
+        if let Some(id) = &func.id {
+            self.set_fn_name(f, &id.name);
+        }
+        f
     }
 
     fn eval_arrow(&mut self, arrow: &'a Arrow) -> NanBox {
@@ -3960,6 +3968,15 @@ impl<'a> Interp<'a> {
             self.functions[func_id as usize].is_arrow = true;
         }
         f
+    }
+
+    /// Records a function value's name (`fn.name`).
+    fn set_fn_name(&mut self, value: NanBox, name: &'a str) {
+        if let Some(raw) = value.as_handle()
+            && let Some((func_id, _)) = self.realm.function_at(Handle::from_raw(raw))
+        {
+            self.functions[func_id as usize].name = name;
+        }
     }
 
     fn member(
@@ -4031,6 +4048,22 @@ impl<'a> Interp<'a> {
             && name == "description"
         {
             return Ok(self.new_str(&desc));
+        }
+        // A function's `length` (params before a default/rest) and `name`.
+        if matches!(name, "length" | "name")
+            && let Some((func_id, _)) = self.realm.function_at(handle)
+        {
+            let def = self.functions[func_id as usize];
+            return Ok(if name == "length" {
+                let len = def
+                    .params
+                    .iter()
+                    .take_while(|p| p.default.is_none() && !p.rest)
+                    .count();
+                NanBox::number(len as f64)
+            } else {
+                self.new_str(def.name)
+            });
         }
         // `Number.*` static constants.
         if self.realm.native_at(handle) == Some(N_NUMBER) {
@@ -5706,6 +5739,18 @@ mod tests {
             run("let r='ok'; try { 1n + 1; } catch (e) { r = 'threw'; } r"),
             "threw"
         );
+    }
+
+    #[test]
+    fn function_length_and_name() {
+        assert_eq!(run("function f(a, b, c){} f.length"), "3");
+        assert_eq!(run("function f(){} f.length"), "0");
+        // length counts params before the first default/rest.
+        assert_eq!(run("function f(a, b = 1, c){} f.length"), "1");
+        assert_eq!(run("function f(a, ...r){} f.length"), "1");
+        // name from a declaration and a named function expression.
+        assert_eq!(run("function greet(){} greet.name"), "greet");
+        assert_eq!(run("let g = function inner(){}; g.name"), "inner");
     }
 
     #[test]
