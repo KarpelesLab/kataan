@@ -32,6 +32,18 @@ fn arg<'a>(args: &[Value<'a>], i: usize) -> Value<'a> {
     args.get(i).cloned().unwrap_or(Value::Undefined)
 }
 
+/// Builds a callable constructor *object* — invokable like a function (so
+/// `String(x)` / `new Map()` work) while also able to hold static members as
+/// ordinary properties (`Number.isInteger`, `String.fromCharCode`, …).
+fn constructor_object<'a>(
+    name: &'static str,
+    f: impl Fn(&[Value<'a>]) -> Completion<'a, Value<'a>> + 'a,
+) -> Rc<Obj<'a>> {
+    let obj = Obj::object();
+    obj.set_callable(native(name, f));
+    obj
+}
+
 impl<'a> Interp<'a> {
     /// Installs the standard-library globals into the global scope.
     pub(super) fn install_stdlib(&self) {
@@ -50,12 +62,12 @@ impl<'a> Interp<'a> {
             "Map",
             native("Map", |a| {
                 let map = Obj::collection(false);
-                if let Value::Object(init) = arg(a, 0) {
-                    if let Some(elems) = init.elements() {
-                        for entry in elems.borrow().iter() {
-                            if let Value::Object(pair) = entry {
-                                collection_set(&map, pair.get("0"), pair.get("1"));
-                            }
+                if let Value::Object(init) = arg(a, 0)
+                    && let Some(elems) = init.elements()
+                {
+                    for entry in elems.borrow().iter() {
+                        if let Value::Object(pair) = entry {
+                            collection_set(&map, pair.get("0"), pair.get("1"));
                         }
                     }
                 }
@@ -67,11 +79,11 @@ impl<'a> Interp<'a> {
             "Set",
             native("Set", |a| {
                 let set = Obj::collection(true);
-                if let Value::Object(init) = arg(a, 0) {
-                    if let Some(elems) = init.elements() {
-                        for v in elems.borrow().iter() {
-                            collection_set(&set, v.clone(), v.clone());
-                        }
+                if let Value::Object(init) = arg(a, 0)
+                    && let Some(elems) = init.elements()
+                {
+                    for v in elems.borrow().iter() {
+                        collection_set(&set, v.clone(), v.clone());
                     }
                 }
                 Ok(Value::Object(set))
@@ -294,24 +306,121 @@ impl<'a> Interp<'a> {
                 Ok(Value::Bool(arg(a, 0).to_number().is_finite()))
             }),
         );
-        self.define_global(
-            "Number",
-            native("Number", |a| Ok(Value::Number(arg(a, 0).to_number()))),
-        );
-        self.define_global(
-            "String",
-            native("String", |a| {
-                Ok(Value::str(if a.is_empty() {
-                    String::new()
-                } else {
-                    arg(a, 0).to_js_string()
-                }))
+        // `Number(x)` plus its statics.
+        let number = constructor_object("Number", |a| Ok(Value::Number(arg(a, 0).to_number())));
+        number.set(
+            "isInteger",
+            native("isInteger", |a| {
+                Ok(Value::Bool(
+                    matches!(arg(a, 0), Value::Number(n) if n.is_finite() && n.fract() == 0.0),
+                ))
             }),
         );
+        number.set(
+            "isFinite",
+            native("isFinite", |a| {
+                Ok(Value::Bool(
+                    matches!(arg(a, 0), Value::Number(n) if n.is_finite()),
+                ))
+            }),
+        );
+        number.set(
+            "isNaN",
+            native("isNaN", |a| {
+                Ok(Value::Bool(
+                    matches!(arg(a, 0), Value::Number(n) if n.is_nan()),
+                ))
+            }),
+        );
+        number.set(
+            "isSafeInteger",
+            native("isSafeInteger", |a| {
+                Ok(Value::Bool(matches!(arg(a, 0), Value::Number(n)
+                if n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0)))
+            }),
+        );
+        number.set(
+            "parseInt",
+            native("parseInt", |a| {
+                Ok(Value::Number(parse_int(
+                    arg(a, 0).to_js_string().trim(),
+                    arg(a, 1).to_number(),
+                )))
+            }),
+        );
+        number.set(
+            "parseFloat",
+            native("parseFloat", |a| {
+                Ok(Value::Number(parse_float(arg(a, 0).to_js_string().trim())))
+            }),
+        );
+        number.set("MAX_SAFE_INTEGER", Value::Number(9_007_199_254_740_991.0));
+        number.set("MIN_SAFE_INTEGER", Value::Number(-9_007_199_254_740_991.0));
+        number.set("MAX_VALUE", Value::Number(f64::MAX));
+        number.set("MIN_VALUE", Value::Number(f64::MIN_POSITIVE));
+        number.set("EPSILON", Value::Number(f64::EPSILON));
+        number.set("POSITIVE_INFINITY", Value::Number(f64::INFINITY));
+        number.set("NEGATIVE_INFINITY", Value::Number(f64::NEG_INFINITY));
+        number.set("NaN", Value::Number(f64::NAN));
+        self.define_global("Number", Value::Object(number));
+
+        // `Boolean(x)`.
         self.define_global(
             "Boolean",
-            native("Boolean", |a| Ok(Value::Bool(arg(a, 0).to_boolean()))),
+            Value::Object(constructor_object("Boolean", |a| {
+                Ok(Value::Bool(arg(a, 0).to_boolean()))
+            })),
         );
+
+        // `String(x)` plus its statics.
+        let string = constructor_object("String", |a| {
+            Ok(Value::str(if a.is_empty() {
+                String::new()
+            } else {
+                arg(a, 0).to_js_string()
+            }))
+        });
+        string.set(
+            "fromCharCode",
+            native("fromCharCode", |a| {
+                let s: String = a
+                    .iter()
+                    .filter_map(|v| char::from_u32(v.to_number() as u32))
+                    .collect();
+                Ok(Value::str(s))
+            }),
+        );
+        string.set(
+            "fromCodePoint",
+            native("fromCodePoint", |a| {
+                let s: String = a
+                    .iter()
+                    .filter_map(|v| char::from_u32(v.to_number() as u32))
+                    .collect();
+                Ok(Value::str(s))
+            }),
+        );
+        // `String.raw(strings, ...subs)` — joins the `raw` segments with the
+        // substitutions interleaved.
+        string.set(
+            "raw",
+            native("raw", |a| {
+                let mut out = String::new();
+                if let Value::Object(strings) = arg(a, 0)
+                    && let Value::Object(raw) = strings.get("raw")
+                    && let Some(parts) = raw.elements()
+                {
+                    for (i, p) in parts.borrow().iter().enumerate() {
+                        out.push_str(&p.to_js_string());
+                        if let Some(sub) = a.get(i + 1) {
+                            out.push_str(&sub.to_js_string());
+                        }
+                    }
+                }
+                Ok(Value::str(out))
+            }),
+        );
+        self.define_global("String", Value::Object(string));
     }
 
     /// Dispatches a method call on an array or string receiver. Returns

@@ -72,6 +72,10 @@ pub struct Obj<'a> {
     proto: RefCell<Option<Rc<Obj<'a>>>>,
     collection: Option<RefCell<Collection<'a>>>,
     accessors: RefCell<Vec<(Box<str>, Accessor<'a>)>>,
+    /// For built-in constructor objects (`String`, `Number`, …): the underlying
+    /// native invoked when the object is called or `new`'d. Lets a constructor
+    /// also carry static members as ordinary properties.
+    callable: RefCell<Option<Value<'a>>>,
 }
 
 /// A getter/setter accessor property.
@@ -102,6 +106,7 @@ impl<'a> Obj<'a> {
             proto: RefCell::new(None),
             collection: None,
             accessors: RefCell::new(Vec::new()),
+            callable: RefCell::new(None),
         })
     }
 
@@ -114,6 +119,7 @@ impl<'a> Obj<'a> {
             proto: RefCell::new(Some(proto)),
             collection: None,
             accessors: RefCell::new(Vec::new()),
+            callable: RefCell::new(None),
         })
     }
 
@@ -126,6 +132,7 @@ impl<'a> Obj<'a> {
             proto: RefCell::new(None),
             collection: None,
             accessors: RefCell::new(Vec::new()),
+            callable: RefCell::new(None),
         })
     }
 
@@ -141,6 +148,7 @@ impl<'a> Obj<'a> {
                 entries: Vec::new(),
             })),
             accessors: RefCell::new(Vec::new()),
+            callable: RefCell::new(None),
         })
     }
 
@@ -148,6 +156,18 @@ impl<'a> Obj<'a> {
     #[must_use]
     pub fn as_collection(&self) -> Option<&RefCell<Collection<'a>>> {
         self.collection.as_ref()
+    }
+
+    /// Marks this object as a callable constructor backed by `f`.
+    pub fn set_callable(&self, f: Value<'a>) {
+        *self.callable.borrow_mut() = Some(f);
+    }
+
+    /// The native this object delegates calls to, if it is a callable
+    /// constructor object.
+    #[must_use]
+    pub fn callable(&self) -> Option<Value<'a>> {
+        self.callable.borrow().clone()
     }
 
     /// Defines (or extends) the getter for `key`.
@@ -186,14 +206,14 @@ impl<'a> Obj<'a> {
     /// cleared to `undefined`. Returns `true` (deletion of an absent property is
     /// also `true`, per the spec for configurable/absent properties).
     pub fn delete_key(&self, key: &str) -> bool {
-        if let Some(arr) = &self.array {
-            if let Ok(i) = key.parse::<usize>() {
-                let mut v = arr.borrow_mut();
-                if i < v.len() {
-                    v[i] = Value::Undefined;
-                }
-                return true;
+        if let Some(arr) = &self.array
+            && let Ok(i) = key.parse::<usize>()
+        {
+            let mut v = arr.borrow_mut();
+            if i < v.len() {
+                v[i] = Value::Undefined;
             }
+            return true;
         }
         self.props.borrow_mut().retain(|(k, _)| **k != *key);
         self.accessors.borrow_mut().retain(|(k, _)| **k != *key);
@@ -390,10 +410,14 @@ impl<'a> Value<'a> {
     }
 
     /// Whether the value is callable (as a plain call). Classes are *not*
-    /// callable without `new`.
+    /// callable without `new`; a constructor *object* (`String`, …) is.
     #[must_use]
     pub fn is_callable(&self) -> bool {
-        matches!(self, Value::Function(_) | Value::Native(_))
+        match self {
+            Value::Function(_) | Value::Native(_) => true,
+            Value::Object(o) => o.callable().is_some(),
+            _ => false,
+        }
     }
 
     /// `ToBoolean` (the truthiness coercion).
@@ -560,10 +584,11 @@ pub fn strict_equals<'a>(a: &Value<'a>, b: &Value<'a>) -> bool {
 /// comparison `Map`/`Set` and `Array.prototype.includes` use).
 #[must_use]
 pub fn same_value_zero<'a>(a: &Value<'a>, b: &Value<'a>) -> bool {
-    if let (Value::Number(x), Value::Number(y)) = (a, b) {
-        if x.is_nan() && y.is_nan() {
-            return true;
-        }
+    if let (Value::Number(x), Value::Number(y)) = (a, b)
+        && x.is_nan()
+        && y.is_nan()
+    {
+        return true;
     }
     strict_equals(a, b)
 }

@@ -503,6 +503,24 @@ fn math_builtins() {
 }
 
 #[test]
+fn constructor_statics() {
+    // Number statics.
+    assert_eq!(eval("Number.isInteger(5)"), "true");
+    assert_eq!(eval("Number.isInteger(5.5)"), "false");
+    assert_eq!(eval("Number.isNaN(0 / 0)"), "true");
+    assert_eq!(eval("Number.isFinite(1 / 0)"), "false");
+    assert_eq!(eval("Number.MAX_SAFE_INTEGER"), "9007199254740991");
+    assert_eq!(eval("Number.parseInt('ff', 16)"), "255");
+    // String statics.
+    assert_eq!(eval("String.fromCharCode(72, 105)"), "Hi");
+    assert_eq!(eval("String.raw`a\\tb${1}c`"), "a\\tb1c");
+    // Callable-as-function still works.
+    assert_eq!(eval("String(42) + Number('8') + Boolean(0)"), "428false");
+    // And `new`-able where it builds an object (Map/Set).
+    assert_eq!(eval("let m = new Map(); m.set('k', 1); m.get('k')"), "1");
+}
+
+#[test]
 fn number_globals() {
     assert_eq!(eval("parseInt('42px')"), "42");
     assert_eq!(eval("parseInt('ff', 16)"), "255");

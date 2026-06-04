@@ -742,13 +742,13 @@ impl<'a> Interp<'a> {
                 }
                 let key = self.member_key(property, env)?;
                 // A getter accessor is invoked with the object as `this`.
-                if let Value::Object(o) = &obj {
-                    if let Some(acc) = o.find_accessor(&key) {
-                        return match acc.get {
-                            Some(getter) => self.call_with_this(getter, obj.clone(), Vec::new()),
-                            None => Ok(Value::Undefined),
-                        };
-                    }
+                if let Value::Object(o) = &obj
+                    && let Some(acc) = o.find_accessor(&key)
+                {
+                    return match acc.get {
+                        Some(getter) => self.call_with_this(getter, obj.clone(), Vec::new()),
+                        None => Ok(Value::Undefined),
+                    };
                 }
                 self.get_member(&obj, &key)
             }
@@ -944,8 +944,12 @@ impl<'a> Interp<'a> {
                     this
                 })
             }
-            // A native constructor (e.g. `Error`) builds and returns the object.
+            // A native or callable-object constructor (e.g. `Error`, `Map`)
+            // builds and returns the object.
             Value::Native(_) => self.call_with_this(callee, Value::Undefined, args),
+            Value::Object(ref o) if o.callable().is_some() => {
+                self.call_with_this(callee, Value::Undefined, args)
+            }
             _ => Err(make_error(
                 "TypeError",
                 alloc::format!("{} is not a constructor", callee.to_js_string()),
@@ -1138,13 +1142,13 @@ impl<'a> Interp<'a> {
                 let obj = self.eval_expr(object, env)?;
                 let key = self.member_key(property, env)?;
                 // A setter accessor is invoked with the object as `this`.
-                if let Value::Object(o) = &obj {
-                    if let Some(acc) = o.find_accessor(&key) {
-                        if let Some(setter) = acc.set {
-                            self.call_with_this(setter, obj.clone(), alloc::vec![value])?;
-                        }
-                        return Ok(());
+                if let Value::Object(o) = &obj
+                    && let Some(acc) = o.find_accessor(&key)
+                {
+                    if let Some(setter) = acc.set {
+                        self.call_with_this(setter, obj.clone(), alloc::vec![value])?;
                     }
+                    return Ok(());
                 }
                 self.set_member(&obj, &key, value)
             }
@@ -1387,6 +1391,12 @@ impl<'a> Interp<'a> {
     ) -> Completion<'a, Value<'a>> {
         match callee {
             Value::Native(n) => (n.call)(&args),
+            // A callable constructor object (`String`, `Number`, …) delegates
+            // to its backing native.
+            Value::Object(o) if o.callable().is_some() => {
+                let f = o.callable().expect("callable");
+                self.call_with_this(f, this, args)
+            }
             Value::Function(closure) => {
                 let scope = Scope::child(&closure.env);
                 match closure.def {
