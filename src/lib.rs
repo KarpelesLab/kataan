@@ -94,6 +94,12 @@ pub mod realm;
 #[cfg(feature = "alloc")]
 pub mod nbvm;
 
+/// Evaluates the real parser AST (the expression subset) over the
+/// `Realm`/`NanBox` model — the front-end → new-representation bridge. Needs
+/// `alloc`.
+#[cfg(feature = "alloc")]
+pub mod nbeval;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]
