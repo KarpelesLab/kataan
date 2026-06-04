@@ -1132,6 +1132,28 @@ fn bytecode_vm_falls_back_on_unsupported() {
 }
 
 #[test]
+fn optional_chaining_and_calls() {
+    // Optional member access.
+    assert_eq!(eval("const o = { a: { b: 42 } }; o?.a?.b"), "42");
+    assert_eq!(eval("const o = {}; String(o?.x?.y)"), "undefined");
+    assert_eq!(eval("const o = null; String(o?.a)"), "undefined");
+    // Optional call: present method runs; absent one yields undefined (no throw).
+    assert_eq!(eval("const o = { f() { return 7; } }; o.f?.()"), "7");
+    assert_eq!(eval("const o = {}; String(o.missing?.())"), "undefined");
+    assert_eq!(eval("const o = {}; o.missing?.() ?? 'none'"), "none");
+    // Optional call doesn't evaluate arguments when skipped.
+    assert_eq!(
+        eval(
+            "let calls = 0; const arg = () => { calls += 1; return 1; };
+             const o = {}; o.fn?.(arg()); calls"
+        ),
+        "0"
+    );
+    // Optional call on a plain (non-member) callee.
+    assert_eq!(eval("let f; String(f?.())"), "undefined");
+}
+
+#[test]
 fn bytecode_vm_recursive_and_mutual_closures() {
     // A closure that references itself in its own initializer (memoized fib).
     assert_eq!(

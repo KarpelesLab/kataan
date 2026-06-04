@@ -828,6 +828,16 @@ impl<'a> Interp<'a> {
                         return Ok(Value::Undefined);
                     }
                     let key = self.member_key(property, env)?;
+                    // An optional call `obj.m?.(…)` skips the call (and the
+                    // argument evaluation) when the method is null/undefined.
+                    if *optional {
+                        let member = self.get_property(&obj, &key)?;
+                        if matches!(member, Value::Undefined | Value::Null) {
+                            return Ok(Value::Undefined);
+                        }
+                        let args = self.eval_arguments(arguments, env)?;
+                        return self.call_with_this(member, obj, args);
+                    }
                     let args = self.eval_arguments(arguments, env)?;
                     return self.call_member(obj, &key, args);
                 }
