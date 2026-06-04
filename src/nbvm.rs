@@ -115,6 +115,13 @@ pub enum Op {
         key: String,
         args: Vec<Reg>,
     },
+    /// Runs constructor function `ctor` with `this = recv` and `args` (the
+    /// return value is discarded; `new` yields the instance).
+    CallCtor {
+        ctor: u32,
+        recv: Reg,
+        args: Vec<Reg>,
+    },
     /// `dst = native#id(args…)` — invoke a built-in (`console.log`, `Math.*`).
     CallNative {
         dst: Reg,
@@ -471,6 +478,21 @@ fn run_frame(
                     Err(other) => return Err(other),
                 }
             }
+            Op::CallCtor { ctor, recv, args } => {
+                let recv_val = regs[*recv as usize];
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                match call_with(ctx, funcs, *ctor as usize, &argv, &[], recv_val) {
+                    Ok(_) => {}
+                    Err(VmError::Thrown(v)) => match handlers.pop() {
+                        Some((target, reg)) => {
+                            regs[reg as usize] = v;
+                            pc = target;
+                        }
+                        None => return Err(VmError::Thrown(v)),
+                    },
+                    Err(other) => return Err(other),
+                }
+            }
             Op::CallNative { dst, native, args } => {
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
                 regs[*dst as usize] = call_native(ctx, *native, &argv);
@@ -640,25 +662,43 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
         }
     }
     let fn_ids = alloc::rc::Rc::new(fn_ids);
+    // Scan top-level classes, reserving constructor/method ids after the
+    // functions. Each `(id, params, body)` is compiled below.
+    let mut next_id = (decls.len() + 1) as u32;
+    let mut class_map = alloc::collections::BTreeMap::new();
+    let mut class_jobs: Vec<(u32, &[crate::ast::Param], &[Stmt])> = Vec::new();
+    for s in &program.body {
+        if let Stmt::Class(class) = s {
+            let Some(id) = &class.id else { continue };
+            let info = scan_class(class, &mut next_id, &mut class_jobs)?;
+            class_map.insert(String::from(&*id.name), info);
+        }
+    }
+    let classes = alloc::rc::Rc::new(class_map);
+
     let protos = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
-    // Reserve slots 0..=N: main is 0, the top-level functions are 1..=N. Nested
-    // function expressions append beyond N during compilation.
     let placeholder = || FnProto {
         ops: Vec::new(),
         n_regs: 0,
         n_params: 0,
         n_captures: 0,
     };
+    // Reserve slots: main (0), top-level functions (1..=N), then class members
+    // (N+1..next_id). Nested function expressions append beyond `next_id`.
     protos
         .borrow_mut()
-        .extend((0..=decls.len()).map(|_| placeholder()));
-    // Compile main (id 0), then each top-level function (ids 1..=N). Top-level
-    // functions don't capture (they live in the global function table).
-    let main = Compiler::compile_fn(&fn_ids, &protos, &[], &[], &program.body, true)?;
+        .extend((0..next_id).map(|_| placeholder()));
+    // Compile main (id 0), each top-level function, then each class member.
+    let main = Compiler::compile_fn(&fn_ids, &classes, &protos, &[], &[], &program.body, true)?;
     protos.borrow_mut()[0] = main;
     for (i, f) in decls.iter().enumerate() {
-        let proto = Compiler::compile_fn(&fn_ids, &protos, &f.params, &[], &f.body, false)?;
+        let proto =
+            Compiler::compile_fn(&fn_ids, &classes, &protos, &f.params, &[], &f.body, false)?;
         protos.borrow_mut()[i + 1] = proto;
+    }
+    for (id, params, body) in &class_jobs {
+        let proto = Compiler::compile_fn(&fn_ids, &classes, &protos, params, &[], body, false)?;
+        protos.borrow_mut()[*id as usize] = proto;
     }
     Ok(alloc::rc::Rc::try_unwrap(protos)
         .expect("unique proto table")
@@ -1025,6 +1065,54 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
     }
 }
 
+/// Scans a *plain* class (no `extends`, fields, statics, or accessors — those
+/// fall back to the tree-walker), reserving function ids for its constructor and
+/// methods and queueing them for compilation.
+fn scan_class<'a>(
+    class: &'a crate::ast::Class,
+    next_id: &mut u32,
+    jobs: &mut Vec<(u32, &'a [crate::ast::Param], &'a [Stmt])>,
+) -> Result<ClassInfo, CompileError> {
+    use crate::ast::{ClassMember, MethodKind};
+    if class.super_class.is_some() {
+        return Err(CompileError::Unsupported("class extends"));
+    }
+    let mut info = ClassInfo {
+        ctor: None,
+        methods: Vec::new(),
+    };
+    for member in &class.body {
+        match member {
+            ClassMember::Method(m) if !m.is_static && m.kind == MethodKind::Constructor => {
+                let id = *next_id;
+                *next_id += 1;
+                info.ctor = Some(id);
+                jobs.push((id, &m.value.params, &m.value.body));
+            }
+            ClassMember::Method(m) if !m.is_static && m.kind == MethodKind::Method => {
+                let id = *next_id;
+                *next_id += 1;
+                let name = static_key(&m.key)?;
+                info.methods.push((name, id));
+                jobs.push((id, &m.value.params, &m.value.body));
+            }
+            // Fields, statics, getters/setters → fall back.
+            _ => return Err(CompileError::Unsupported("class member")),
+        }
+    }
+    Ok(info)
+}
+
+/// A compiled (plain) class: its constructor and instance methods as
+/// function-table ids.
+#[derive(Clone)]
+struct ClassInfo {
+    /// The constructor's function id, if the class declares one.
+    ctor: Option<u32>,
+    /// `(method_name, function_id)` for each instance method.
+    methods: Vec<(String, u32)>,
+}
+
 /// A variable binding: the register holding it, and whether that register holds
 /// a *cell* (a one-element heap array) rather than the value directly. Captured
 /// variables are cells so closures share their mutations.
@@ -1043,6 +1131,8 @@ struct Compiler {
     next_reg: Reg,
     /// Function name → table id, for resolving calls.
     fn_ids: alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
+    /// Class name → its constructor/method function ids, for `new C(...)`.
+    classes: alloc::rc::Rc<alloc::collections::BTreeMap<String, ClassInfo>>,
     /// The shared function table; nested function expressions append to it.
     protos: alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
     /// Names in *this* function that are captured by a nested function and so
@@ -1067,6 +1157,7 @@ impl Compiler {
     /// returned.
     fn compile_fn(
         fn_ids: &alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
+        classes: &alloc::rc::Rc<alloc::collections::BTreeMap<String, ClassInfo>>,
         protos: &alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
         params: &[crate::ast::Param],
         captures: &[String],
@@ -1078,6 +1169,7 @@ impl Compiler {
         let cell_names = captured_names(params, body);
         let mut c = Compiler {
             fn_ids: alloc::rc::Rc::clone(fn_ids),
+            classes: alloc::rc::Rc::clone(classes),
             protos: alloc::rc::Rc::clone(protos),
             cell_names,
             ..Compiler::default()
@@ -1213,8 +1305,9 @@ impl Compiler {
     fn stmt(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
         match stmt {
             Stmt::Empty { .. } => Ok(None),
-            // Function declarations are hoisted into the table; nothing to emit.
-            Stmt::Function(_) => Ok(None),
+            // Function and (top-level) class declarations are compiled into the
+            // table up front; nothing to emit at the declaration site.
+            Stmt::Function(_) | Stmt::Class(_) => Ok(None),
             Stmt::Return { argument, .. } => {
                 let src = match argument {
                     Some(e) => self.expr(e)?,
@@ -1800,6 +1893,46 @@ impl Compiler {
                 Ok(if *prefix { next } else { old })
             }
             Expr::This(_) => Ok(self.this_reg),
+            // `new C(args)` for a known plain class: create the instance, install
+            // its methods, run the constructor with `this` = instance.
+            Expr::New {
+                callee, arguments, ..
+            } => {
+                let Expr::Ident(id) = &**callee else {
+                    return Err(CompileError::Unsupported("new on non-class"));
+                };
+                let Some(info) = self.classes.get(&*id.name).cloned() else {
+                    return Err(CompileError::Unsupported("new on unknown class"));
+                };
+                let mut args = Vec::with_capacity(arguments.len());
+                for a in arguments {
+                    let crate::ast::Argument::Item(e) = a else {
+                        return Err(CompileError::Unsupported("spread argument"));
+                    };
+                    args.push(self.expr(e)?);
+                }
+                let instance = self.alloc();
+                self.ops.push(Op::NewObject { dst: instance });
+                // Install each method as a closure property (methods don't
+                // capture — they use `this`/params).
+                for (name, mid) in &info.methods {
+                    let m = self.alloc();
+                    self.ops.push(Op::LoadFunc { dst: m, func: *mid });
+                    self.ops.push(Op::SetProp {
+                        obj: instance,
+                        key: name.clone(),
+                        src: m,
+                    });
+                }
+                if let Some(ctor) = info.ctor {
+                    self.ops.push(Op::CallCtor {
+                        ctor,
+                        recv: instance,
+                        args,
+                    });
+                }
+                Ok(instance)
+            }
             // A template literal: interleave cooked quasis with interpolations,
             // concatenating via the realm's `+` (ToString on each value).
             Expr::Template(t) => {
@@ -1875,8 +2008,15 @@ impl Compiler {
             });
             (p.len() - 1) as u32
         };
-        let proto =
-            Compiler::compile_fn(&self.fn_ids, &self.protos, params, &captures, body, false)?;
+        let proto = Compiler::compile_fn(
+            &self.fn_ids,
+            &self.classes,
+            &self.protos,
+            params,
+            &captures,
+            body,
+            false,
+        )?;
         self.protos.borrow_mut()[id as usize] = proto;
         // Capture the cell registers for each free variable (in the same sorted
         // order the callee binds them).
@@ -2318,8 +2458,7 @@ mod tests {
         .expect("ok");
         assert_eq!(out, "1\n2\n");
 
-        // A program using classes — not yet compiled by the bytecode path, so it
-        // must fall back to the tree-walker and still run correctly.
+        // Plain classes now compile to bytecode directly.
         let (out, _) = execute(
             "class Point { constructor(x, y) { this.x = x; this.y = y; }
                sum() { return this.x + this.y; } }
@@ -2327,6 +2466,15 @@ mod tests {
         )
         .expect("ok");
         assert_eq!(out, "7\n");
+
+        // A class feature the bytecode path doesn't compile (a getter) routes
+        // the program to the tree-walker, which still runs it correctly.
+        let (out, _) = execute(
+            "class Box { constructor(v) { this._v = v; } get value() { return this._v * 2; } }
+             console.log(new Box(21).value);",
+        )
+        .expect("ok");
+        assert_eq!(out, "42\n");
 
         // The completion value is surfaced for an expression program.
         let (_, completion) = execute("1 + 2 * 3").expect("ok");
@@ -2337,6 +2485,47 @@ mod tests {
         let (bc, _) = execute(src).expect("ok");
         let (tw, _) = crate::nbexec::eval_source(src).expect("ok");
         assert_eq!(bc, tw);
+    }
+
+    #[test]
+    fn bytecode_classes() {
+        // A class with a constructor and a method using `this`.
+        assert_eq!(
+            bc("class Point {
+                  constructor(x, y) { this.x = x; this.y = y; }
+                  sum() { return this.x + this.y; }
+                }
+                new Point(3, 4).sum()"),
+            "7"
+        );
+        // A mutable instance via methods.
+        assert_eq!(
+            bc("class Counter {
+                  constructor() { this.n = 0; }
+                  inc() { this.n += 1; return this.n; }
+                }
+                let c = new Counter(); c.inc(); c.inc(); c.inc()"),
+            "3"
+        );
+        // A method calling another via `this`.
+        assert_eq!(
+            bc("class Calc {
+                  constructor(v) { this.v = v; }
+                  dbl() { return this.v * 2; }
+                  quad() { return this.dbl() * 2; }
+                }
+                new Calc(5).quad()"),
+            "20"
+        );
+        // Two instances keep independent state.
+        assert_eq!(
+            bc(
+                "class Box { constructor(v) { this.v = v; } get() { return this.v; } }
+                let a = new Box(1); let b = new Box(99);
+                a.get() + ',' + b.get()"
+            ),
+            "1,99"
+        );
     }
 
     #[test]
