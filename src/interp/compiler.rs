@@ -1027,14 +1027,19 @@ impl Compiler {
         body: FnBody,
         name: &str,
     ) -> Result<(usize, Vec<Upvalue>), CompileError> {
-        // Rest parameters (variadic) aren't supported yet.
-        if params.iter().any(|p| p.rest) {
-            return Err(CompileError::unsupported("rest parameter"));
+        // Only a trailing rest parameter is supported (`f(a, ...rest)`), and it
+        // must be a simple identifier.
+        let has_rest = params.last().is_some_and(|p| p.rest);
+        if params.iter().enumerate().any(|(i, p)| {
+            p.rest && (i + 1 != params.len() || !matches!(p.target, BindingTarget::Ident(_)))
+        }) {
+            return Err(CompileError::unsupported("rest parameter form"));
         }
 
         let chunk_idx = self.module.len();
         self.module.push(Chunk::new(name));
         self.module[chunk_idx].param_count = params.len() as u16;
+        self.module[chunk_idx].has_rest = has_rest;
 
         // Pre-pass: which of this function's params/locals are captured by
         // nested functions (and so must be boxed in cells)?
@@ -1053,6 +1058,20 @@ impl Compiler {
         // slot directly; defaults, captures, and patterns go through the
         // general binding path.
         for (p, slot) in params.iter().zip(param_slots) {
+            // The rest parameter's slot already holds the collected array (the
+            // VM fills it); bind its name, boxing it if captured.
+            if p.rest {
+                if let BindingTarget::Ident(id) = &p.target {
+                    let rest_name = id.name.clone().into_string();
+                    if self.is_captured_here(&rest_name) {
+                        let cell = self.new_cell(slot);
+                        self.declare_local_cell(rest_name, cell, true);
+                    } else {
+                        self.declare_local(rest_name, slot);
+                    }
+                }
+                continue;
+            }
             let bound = self.apply_default(slot, p.default.as_ref())?;
             match &p.target {
                 BindingTarget::Ident(id)

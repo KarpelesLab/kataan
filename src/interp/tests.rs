@@ -426,6 +426,47 @@ fn bytecode_vm_update_operator() {
 }
 
 #[test]
+fn bytecode_vm_rest_parameters() {
+    // Pure variadic.
+    assert_eq!(
+        eval_bc(
+            "function sum(...nums) { let t = 0; for (const n of nums) t += n; return t; } sum(1, 2, 3, 4, 5)"
+        ),
+        "15"
+    );
+    // Leading fixed parameters then a rest.
+    assert_eq!(
+        eval_bc(
+            "function tail(first, ...rest) { return first + ':' + rest.join(','); } tail('a', 'b', 'c', 'd')"
+        ),
+        "a:b,c,d"
+    );
+    // Empty rest is an empty array.
+    assert_eq!(eval_bc("function f(...xs) { return xs.length; } f()"), "0");
+    assert_eq!(
+        eval_bc("function f(a, ...xs) { return xs.length; } f(1)"),
+        "0"
+    );
+    // Arrow with rest.
+    assert_eq!(
+        eval_bc("let count = (...xs) => xs.length; count(1, 2, 3)"),
+        "3"
+    );
+    // Rest + spread round-trips an argument list.
+    assert_eq!(
+        eval_bc("function relay(...args) { return Math.max(...args); } relay(3, 9, 2, 7)"),
+        "9"
+    );
+    // Rest survives the serialize → reload → run round-trip.
+    assert_eq!(
+        eval_bc_reloaded(
+            "function sum(...ns) { return ns.reduce((a, b) => a + b, 0); } sum(10, 20, 30)"
+        ),
+        "60"
+    );
+}
+
+#[test]
 fn bytecode_vm_object_spread() {
     assert_eq!(
         eval_bc("let b = { a: 1, b: 2 }; let m = { ...b, c: 3 }; m.a + m.b + m.c"),

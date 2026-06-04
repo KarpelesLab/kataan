@@ -84,10 +84,25 @@ impl<'a> Interp<'a> {
         if !regs.is_empty() {
             regs[0] = this;
         }
-        for (i, arg) in args.into_iter().enumerate() {
-            let slot = i + 1;
+        // With a rest parameter, the fixed params bind positionally and the
+        // remaining arguments collect into an array in the rest register.
+        let fixed = if chunk.has_rest {
+            (chunk.param_count as usize).saturating_sub(1)
+        } else {
+            chunk.param_count as usize
+        };
+        let mut args_iter = args.into_iter();
+        for slot in 1..=fixed {
+            match args_iter.next() {
+                Some(arg) if slot < regs.len() => regs[slot] = arg,
+                Some(_) | None => break,
+            }
+        }
+        if chunk.has_rest {
+            let rest: Vec<Value<'a>> = args_iter.collect();
+            let slot = fixed + 1;
             if slot < regs.len() {
-                regs[slot] = arg;
+                regs[slot] = Value::Object(Obj::array(rest));
             }
         }
         let mut pc = 0usize;

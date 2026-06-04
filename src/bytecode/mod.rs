@@ -327,8 +327,12 @@ pub struct Chunk {
     pub name: String,
     /// The number of registers this chunk uses.
     pub register_count: u16,
-    /// The number of declared parameters.
+    /// The number of declared parameters (including a trailing rest parameter,
+    /// if any).
     pub param_count: u16,
+    /// Whether the last parameter is a rest parameter (`...rest`): arguments
+    /// beyond the fixed ones are collected into an array in its register.
+    pub has_rest: bool,
     /// The constant pool.
     pub constants: Vec<Const>,
     /// The instructions.
@@ -343,6 +347,7 @@ impl Chunk {
             name: name.into(),
             register_count: 0,
             param_count: 0,
+            has_rest: false,
             constants: Vec::new(),
             code: Vec::new(),
         }
