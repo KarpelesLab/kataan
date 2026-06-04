@@ -1194,7 +1194,7 @@ impl<'a> Interp<'a> {
 
 /// Appends the iterable contents of `value` into `out` (arrays, strings,
 /// Sets/Maps, and array-likes with a numeric `length`).
-fn iterate_into<'a>(value: &Value<'a>, out: &mut Vec<Value<'a>>) {
+pub(super) fn iterate_into<'a>(value: &Value<'a>, out: &mut Vec<Value<'a>>) {
     match value {
         Value::Object(o) if o.is_array() => {
             out.extend(o.elements().expect("array").borrow().iter().cloned());

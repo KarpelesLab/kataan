@@ -114,9 +114,108 @@ impl<'a> Interp<'a> {
             }),
         );
 
+        // `Promise.all(iterable)` — resolves to an array of results, or rejects
+        // with the first rejection.
+        let q = queue.clone();
+        let p = Rc::clone(&proto);
+        ctor.set(
+            "all",
+            native("all", move |a| {
+                let (obj, state) = new_promise(&q, &p);
+                let (all_resolve, all_reject) = make_resolvers(&state, &q);
+                let mut elements = Vec::new();
+                super::builtins::iterate_into(
+                    &a.first().cloned().unwrap_or(Value::Undefined),
+                    &mut elements,
+                );
+                let n = elements.len();
+                if n == 0 {
+                    let _ = invoke(&all_resolve, &[Value::Object(Obj::array(Vec::new()))]);
+                    return Ok(Value::Object(obj));
+                }
+                let results = Rc::new(RefCell::new(alloc::vec![Value::Undefined; n]));
+                let remaining = Rc::new(RefCell::new(n));
+                for (i, element) in elements.into_iter().enumerate() {
+                    let results_c = Rc::clone(&results);
+                    let remaining_c = Rc::clone(&remaining);
+                    let resolve_all = all_resolve.clone();
+                    let on_fulfilled = native("", move |b| {
+                        results_c.borrow_mut()[i] = b.first().cloned().unwrap_or(Value::Undefined);
+                        *remaining_c.borrow_mut() -= 1;
+                        if *remaining_c.borrow() == 0 {
+                            let arr = Obj::array(results_c.borrow().clone());
+                            let _ = invoke(&resolve_all, &[Value::Object(arr)]);
+                        }
+                        Ok(Value::Undefined)
+                    });
+                    settle_element(&element, on_fulfilled, all_reject.clone(), &q);
+                }
+                Ok(Value::Object(obj))
+            }),
+        );
+
+        // `Promise.race(iterable)` — settles as the first element settles.
+        let q = queue.clone();
+        let p = Rc::clone(&proto);
+        ctor.set(
+            "race",
+            native("race", move |a| {
+                let (obj, state) = new_promise(&q, &p);
+                let (resolve, reject) = make_resolvers(&state, &q);
+                let mut elements = Vec::new();
+                super::builtins::iterate_into(
+                    &a.first().cloned().unwrap_or(Value::Undefined),
+                    &mut elements,
+                );
+                for element in elements {
+                    settle_element(&element, resolve.clone(), reject.clone(), &q);
+                }
+                Ok(Value::Object(obj))
+            }),
+        );
+
         ctor.set("prototype", Value::Object(proto));
         self.define_global("Promise", Value::Object(ctor));
     }
+}
+
+/// Routes one combinator element to `on_fulfilled`/`on_rejected`: registers a
+/// reaction if it is a thenable, otherwise fulfills immediately.
+fn settle_element<'a>(
+    element: &Value<'a>,
+    on_fulfilled: Value<'a>,
+    on_rejected: Value<'a>,
+    queue: &MicrotaskQueue<'a>,
+) {
+    if let Value::Object(o) = element
+        && let Some(state) = o.promise_state()
+    {
+        register_reaction(
+            &state,
+            queue,
+            Reaction {
+                on_fulfilled,
+                on_rejected,
+                resolve: noop(),
+                reject: noop(),
+            },
+        );
+        return;
+    }
+    // A plain value behaves like an already-resolved promise: its reaction is
+    // deferred one tick, so element order (not promise-vs-plain) decides
+    // ordering in `race`/`all`.
+    let element = element.clone();
+    queue
+        .borrow_mut()
+        .push_back(Box::new(move |interp: &mut Interp<'a>| {
+            let _ = interp.call_with_this(on_fulfilled, Value::Undefined, alloc::vec![element]);
+        }));
+}
+
+/// A native that ignores its arguments and returns `undefined`.
+fn noop<'a>() -> Value<'a> {
+    native("", |_| Ok(Value::Undefined))
 }
 
 /// Builds a native function value.

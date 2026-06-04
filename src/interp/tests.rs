@@ -618,6 +618,36 @@ fn promises() {
         ),
         "oops"
     );
+    // Promise.all preserves order and mixes plain values with promises.
+    assert_eq!(
+        eval_global(
+            "let r; Promise.all([Promise.resolve(1), 2, Promise.resolve(3)]).then(a => r = a.join(','));",
+            "r"
+        ),
+        "1,2,3"
+    );
+    // Promise.all rejects with the first rejection.
+    assert_eq!(
+        eval_global(
+            "let r; Promise.all([Promise.resolve(1), Promise.reject('e')]).catch(e => r = e);",
+            "r"
+        ),
+        "e"
+    );
+    assert_eq!(
+        eval_global("let r; Promise.all([]).then(a => r = a.length);", "r"),
+        "0"
+    );
+    // Promise.race settles with the first.
+    assert_eq!(
+        eval_global(
+            "let r; Promise.race([Promise.resolve('a'), 'b']).then(v => r = v);",
+            "r"
+        ),
+        "a"
+    );
+    // instanceof Promise.
+    assert_eq!(eval("Promise.resolve(1) instanceof Promise"), "true");
 }
 
 #[test]
