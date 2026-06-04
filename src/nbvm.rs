@@ -107,6 +107,13 @@ const NB_CONSOLE_LOG: u16 = 0;
 const NB_MATH_MAX: u16 = 1;
 const NB_MATH_MIN: u16 = 2;
 const NB_MATH_ABS: u16 = 3;
+const NB_MATH_FLOOR: u16 = 4;
+const NB_MATH_CEIL: u16 = 5;
+const NB_MATH_ROUND: u16 = 6;
+const NB_MATH_SQRT: u16 = 7;
+const NB_MATH_POW: u16 = 8;
+const NB_STRING: u16 = 9;
+const NB_NUMBER: u16 = 10;
 
 /// A compiled function: its instruction stream, register-file size, and the
 /// number of leading registers that receive call arguments.
@@ -367,6 +374,32 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             };
             NanBox::number(val)
         }
+        #[cfg(feature = "std")]
+        NB_MATH_FLOOR | NB_MATH_CEIL | NB_MATH_ROUND | NB_MATH_SQRT | NB_MATH_POW => {
+            let a = args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
+            let val = match native {
+                NB_MATH_FLOOR => a.floor(),
+                NB_MATH_CEIL => a.ceil(),
+                NB_MATH_ROUND => a.round(),
+                NB_MATH_SQRT => a.sqrt(),
+                _ => a.powf(args.get(1).and_then(|v| v.as_number()).unwrap_or(f64::NAN)),
+            };
+            NanBox::number(val)
+        }
+        #[cfg(not(feature = "std"))]
+        NB_MATH_FLOOR | NB_MATH_CEIL | NB_MATH_ROUND | NB_MATH_SQRT | NB_MATH_POW => {
+            NanBox::number(f64::NAN)
+        }
+        NB_STRING => {
+            let s = ctx
+                .realm
+                .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
+            NanBox::handle(ctx.realm.new_string(&s).to_raw())
+        }
+        NB_NUMBER => NanBox::number(
+            ctx.realm
+                .to_number(args.first().copied().unwrap_or(NanBox::undefined())),
+        ),
         _ => NanBox::undefined(),
     }
 }
@@ -464,6 +497,23 @@ fn native_call(callee: &Expr) -> Option<u16> {
         ("Math", "max") => Some(NB_MATH_MAX),
         ("Math", "min") => Some(NB_MATH_MIN),
         ("Math", "abs") => Some(NB_MATH_ABS),
+        ("Math", "floor") => Some(NB_MATH_FLOOR),
+        ("Math", "ceil") => Some(NB_MATH_CEIL),
+        ("Math", "round") => Some(NB_MATH_ROUND),
+        ("Math", "sqrt") => Some(NB_MATH_SQRT),
+        ("Math", "pow") => Some(NB_MATH_POW),
+        _ => None,
+    }
+}
+
+/// Maps a global function call (`String(x)`, `Number(x)`) to its native id.
+fn native_global(callee: &Expr) -> Option<u16> {
+    let Expr::Ident(id) = callee else {
+        return None;
+    };
+    match &*id.name {
+        "String" => Some(NB_STRING),
+        "Number" => Some(NB_NUMBER),
         _ => None,
     }
 }
@@ -861,8 +911,8 @@ impl Compiler {
                     };
                     args.push(self.expr(e)?);
                 }
-                // A built-in namespace call (`console.log`, `Math.max`, …).
-                if let Some(native) = native_call(callee) {
+                // A built-in call (`console.log`, `Math.max`, `String`, …).
+                if let Some(native) = native_call(callee).or_else(|| native_global(callee)) {
                     let dst = self.alloc();
                     self.ops.push(Op::CallNative { dst, native, args });
                     return Ok(dst);
@@ -1145,6 +1195,16 @@ mod tests {
         output
     }
 
+    #[cfg(feature = "std")]
+    #[test]
+    fn bytecode_math_float_natives() {
+        assert_eq!(bc("Math.floor(3.9)"), "3");
+        assert_eq!(bc("Math.ceil(3.1)"), "4");
+        assert_eq!(bc("Math.round(2.5)"), "3");
+        assert_eq!(bc("Math.sqrt(81)"), "9");
+        assert_eq!(bc("Math.pow(2, 10)"), "1024");
+    }
+
     #[test]
     fn bytecode_exceptions() {
         // throw caught by the local catch, binding the thrown value.
@@ -1214,6 +1274,9 @@ mod tests {
         assert_eq!(bc("Math.max(3, 9, 4)"), "9");
         assert_eq!(bc("Math.min(3, -2, 8)"), "-2");
         assert_eq!(bc("Math.abs(-7)"), "7");
+        // String / Number coercion globals.
+        assert_eq!(bc("String(42) + '!'"), "42!");
+        assert_eq!(bc("Number('15') + 5"), "20");
         // A function that logs, called from bytecode.
         assert_eq!(
             bc_out("function greet(n) { console.log('hi ' + n); } greet('ada'); greet('bob');"),

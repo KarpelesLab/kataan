@@ -22,6 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Fetch the intl crate (path-dependency sibling)
+        run: git clone --depth 1 https://github.com/KarpelesLab/intlrs.git ../unicoders
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -48,6 +51,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Fetch the intl crate (path-dependency sibling)
+        run: git clone --depth 1 https://github.com/KarpelesLab/intlrs.git ../unicoders
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -66,6 +72,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Fetch the intl crate (path-dependency sibling)
+        run: git clone --depth 1 https://github.com/KarpelesLab/intlrs.git ../unicoders
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -91,6 +100,9 @@ jobs:
       RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
     steps:
       - uses: actions/checkout@v6
+
+      - name: Fetch the intl crate (path-dependency sibling)
+        run: git clone --depth 1 https://github.com/KarpelesLab/intlrs.git ../unicoders
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
