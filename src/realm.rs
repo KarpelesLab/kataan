@@ -45,6 +45,11 @@ pub struct Realm {
     incremental: Option<gc::IncrementalMarker>,
     /// Monotonic counter giving each `Symbol` a unique identity.
     next_symbol_id: u64,
+    /// Lazily-created `.prototype` objects for constructor functions, keyed by
+    /// the closure's function id. (Keyed by id, not handle, so it survives a
+    /// moving collection; distinct closures sharing an id share a prototype — a
+    /// bounded approximation, see `[[latent-engine-conformance-bugs]]`.)
+    fn_protos: alloc::collections::BTreeMap<u32, Handle>,
 }
 
 impl Default for Realm {
@@ -63,7 +68,24 @@ impl Realm {
             atoms: AtomTable::new(),
             incremental: None,
             next_symbol_id: 1,
+            fn_protos: alloc::collections::BTreeMap::new(),
         }
+    }
+
+    /// The `.prototype` object for the constructor function with id `func_id`,
+    /// creating a fresh empty object on first access.
+    pub fn function_prototype(&mut self, func_id: u32) -> Handle {
+        if let Some(h) = self.fn_protos.get(&func_id) {
+            return *h;
+        }
+        let proto = self.new_object();
+        self.fn_protos.insert(func_id, proto);
+        proto
+    }
+
+    /// Reassigns a constructor function's `.prototype` (`Fn.prototype = obj`).
+    pub fn set_function_prototype(&mut self, func_id: u32, proto: Handle) {
+        self.fn_protos.insert(func_id, proto);
     }
 
     /// Allocates a fresh empty object in the heap and returns its handle.

@@ -1745,8 +1745,11 @@ impl<'a> Interp<'a> {
         // `new constructorFunction(...)`: bind a fresh object as `this`, run the
         // body, and return it — unless the function explicitly returned an object
         // (the spec's constructor return rule).
-        if self.realm.function_at(handle).is_some() {
-            let instance = self.realm.new_object();
+        if let Some((func_id, _)) = self.realm.function_at(handle) {
+            // The instance's `[[Prototype]]` is the constructor's `.prototype`,
+            // so inherited methods/getters resolve through the chain.
+            let proto = self.realm.function_prototype(func_id);
+            let instance = self.realm.new_object_with_proto(Some(proto));
             let this = NanBox::handle(instance.to_raw());
             // Record the constructor for `instanceof` (hidden, GC-traced slot).
             self.realm.set_hidden_property(instance, CTOR_KEY, callee);
@@ -4547,6 +4550,14 @@ impl<'a> Interp<'a> {
         {
             return Ok(self.new_str(&desc));
         }
+        // A constructor function's `.prototype` (lazily created), so
+        // `Fn.prototype.method = …` and prototype-chain inheritance work.
+        if name == "prototype"
+            && let Some((func_id, _)) = self.realm.function_at(handle)
+        {
+            let proto = self.realm.function_prototype(func_id);
+            return Ok(NanBox::handle(proto.to_raw()));
+        }
         // A function's `length` (params before a default/rest) and `name`.
         if matches!(name, "length" | "name")
             && let Some((func_id, _)) = self.realm.function_at(handle)
@@ -4776,6 +4787,13 @@ impl<'a> Interp<'a> {
                 if &**s == "length" && self.realm.is_array(handle) {
                     let n = self.realm.to_number(new).max(0.0) as usize;
                     self.realm.set_array_length(handle, n);
+                } else if &**s == "prototype"
+                    && let Some((func_id, _)) = self.realm.function_at(handle)
+                    && let Some(praw) = new.as_handle()
+                {
+                    // `Fn.prototype = obj` reassigns the constructor's prototype.
+                    self.realm
+                        .set_function_prototype(func_id, Handle::from_raw(praw));
                 } else {
                     self.realm.set_property(handle, s, new);
                 }
@@ -6464,6 +6482,26 @@ mod tests {
         );
         assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
         assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
+    }
+
+    #[test]
+    fn constructor_function_prototype() {
+        // Method on the prototype, resolved through the instance.
+        assert_eq!(
+            run(
+                "function A(n){this.n=n;} A.prototype.m=function(){return this.n*2;}; new A(5).m()"
+            ),
+            "10"
+        );
+        // Two-level prototype chain via Object.create.
+        assert_eq!(
+            run(
+                "function A(){} A.prototype.greet=function(){return 'hi';}; function B(){} B.prototype=Object.create(A.prototype); new B().greet()"
+            ),
+            "hi"
+        );
+        // `.prototype` is a stable object across reads.
+        assert_eq!(run("function A(){} A.prototype.x=1; A.prototype.x"), "1");
     }
 
     #[test]
