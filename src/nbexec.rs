@@ -2644,6 +2644,18 @@ impl<'a> Interp<'a> {
 
     // --- expressions ---
 
+    /// Resolves an object/class property key to its string name, evaluating a
+    /// `[computed]` key expression (coerced to a string) where present.
+    fn eval_prop_key(&mut self, key: &'a PropertyKey) -> Result<String, ExecError> {
+        match key {
+            PropertyKey::Computed(e) => {
+                let v = self.eval(e)?;
+                Ok(self.realm.to_display_string(v))
+            }
+            _ => static_key(key),
+        }
+    }
+
     fn eval(&mut self, expr: &'a Expr) -> Result<NanBox, ExecError> {
         match expr {
             Expr::Null(_) => Ok(NanBox::null()),
@@ -2906,7 +2918,7 @@ impl<'a> Interp<'a> {
                 for m in members {
                     match m {
                         ObjectMember::Property { key, value, .. } => {
-                            let k = static_key(key)?;
+                            let k = self.eval_prop_key(key)?;
                             let v = self.eval(value)?;
                             self.realm.set_property(handle, &k, v);
                         }
@@ -2930,7 +2942,7 @@ impl<'a> Interp<'a> {
                             value,
                             ..
                         } => {
-                            let k = static_key(key)?;
+                            let k = self.eval_prop_key(key)?;
                             let f =
                                 self.make_function(&value.params, Body::Block(&value.body), false);
                             if *is_getter {
@@ -4207,6 +4219,14 @@ mod tests {
         assert!(eval_source("throw 'boom'").is_err());
         // A parse error surfaces as an Err.
         assert!(eval_source("let = ;").is_err());
+    }
+
+    #[test]
+    fn computed_object_literal_keys() {
+        // `{ [expr]: v }` evaluates and coerces the key.
+        assert_eq!(run("let k = 'a' + 'b'; let o = { [k]: 7 }; o.ab"), "7");
+        // A numeric computed key coerces to its string form.
+        assert_eq!(run("let o = { [1 + 1]: 'two' }; o['2']"), "two");
     }
 
     #[test]
