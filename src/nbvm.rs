@@ -1871,7 +1871,24 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
         }
         NB_JSON_STRINGIFY => {
             let v = args.first().copied().unwrap_or(NanBox::undefined());
-            match crate::json::stringify(ctx.realm, v) {
+            // Optional `space` (arg 2): number → spaces, string → that string.
+            let space = args.get(2).copied().unwrap_or(NanBox::undefined());
+            let indent: String = if let Some(n) = space.as_number() {
+                " ".repeat((n.max(0.0) as usize).min(10))
+            } else if let Some(s) = space
+                .as_handle()
+                .and_then(|r| ctx.realm.string_value(Handle::from_raw(r)))
+            {
+                s.chars().take(10).collect()
+            } else {
+                String::new()
+            };
+            let result = if indent.is_empty() {
+                crate::json::stringify(ctx.realm, v)
+            } else {
+                crate::json::stringify_pretty(ctx.realm, v, &indent)
+            };
+            match result {
                 Some(s) => NanBox::handle(ctx.realm.new_string(&s).to_raw()),
                 None => NanBox::undefined(),
             }

@@ -52,6 +52,55 @@ pub fn stringify(realm: &Realm, v: NanBox) -> Option<String> {
     }
 }
 
+/// Serializes `v` with `indent` (the `JSON.stringify` `space` argument) applied
+/// per nesting level — newlines and indentation between members.
+#[must_use]
+pub fn stringify_pretty(realm: &Realm, v: NanBox, indent: &str) -> Option<String> {
+    stringify_at(realm, v, indent, "")
+}
+
+fn stringify_at(realm: &Realm, v: NanBox, indent: &str, cur: &str) -> Option<String> {
+    match v.unpack() {
+        Unpacked::Handle(raw) => {
+            let h = Handle::from_raw(raw);
+            if let Some(s) = realm.string_value(h) {
+                return Some(quote(&s));
+            }
+            let inner = alloc::format!("{cur}{indent}");
+            if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
+                if elems.is_empty() {
+                    return Some(String::from("[]"));
+                }
+                let parts: Vec<String> = elems
+                    .iter()
+                    .map(|e| {
+                        let s = stringify_at(realm, *e, indent, &inner)
+                            .unwrap_or_else(|| String::from("null"));
+                        alloc::format!("{inner}{s}")
+                    })
+                    .collect();
+                return Some(alloc::format!("[\n{}\n{cur}]", parts.join(",\n")));
+            }
+            if let Some(keys) = realm.object_keys(h) {
+                let mut parts = Vec::new();
+                for k in keys {
+                    let val = realm.get_property(h, &k).unwrap_or(NanBox::undefined());
+                    if let Some(s) = stringify_at(realm, val, indent, &inner) {
+                        parts.push(alloc::format!("{inner}{}: {}", quote(&k), s));
+                    }
+                }
+                if parts.is_empty() {
+                    return Some(String::from("{}"));
+                }
+                return Some(alloc::format!("{{\n{}\n{cur}}}", parts.join(",\n")));
+            }
+            None
+        }
+        // Primitives render the same with or without indentation.
+        _ => stringify(realm, v),
+    }
+}
+
 /// Quotes a string as a JSON string literal.
 #[must_use]
 pub fn quote(s: &str) -> String {

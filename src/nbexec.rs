@@ -488,10 +488,30 @@ impl<'a> Interp<'a> {
                 self.output.push('\n');
                 NanBox::undefined()
             }
-            N_JSON_STRINGIFY => match self.json_stringify(arg(0)) {
-                Some(s) => NanBox::handle(self.realm.new_string(&s).to_raw()),
-                None => NanBox::undefined(),
-            },
+            N_JSON_STRINGIFY => {
+                // Optional `space`: a number → that many spaces, a string → that
+                // string (both capped at 10), else compact output.
+                let space = arg(2);
+                let indent = if let Some(n) = space.as_number() {
+                    " ".repeat((n.max(0.0) as usize).min(10))
+                } else if let Some(s) = space
+                    .as_handle()
+                    .and_then(|r| self.realm.string_value(Handle::from_raw(r)))
+                {
+                    s.chars().take(10).collect()
+                } else {
+                    String::new()
+                };
+                let result = if indent.is_empty() {
+                    self.json_stringify(arg(0))
+                } else {
+                    crate::json::stringify_pretty(&self.realm, arg(0), &indent)
+                };
+                match result {
+                    Some(s) => NanBox::handle(self.realm.new_string(&s).to_raw()),
+                    None => NanBox::undefined(),
+                }
+            }
             N_JSON_PARSE => {
                 let text = self.realm.to_display_string(arg(0));
                 let chars: Vec<char> = text.chars().collect();
@@ -5478,6 +5498,14 @@ mod tests {
             run("JSON.stringify({ nested: { list: [1, true, null] } })"),
             "{\"nested\":{\"list\":[1,true,null]}}"
         );
+        // Indentation (the `space` argument): numeric and string, empties inline.
+        assert_eq!(
+            run("JSON.stringify({a:1,b:2}, null, 2)"),
+            "{\n  \"a\": 1,\n  \"b\": 2\n}"
+        );
+        assert_eq!(run("JSON.stringify([1,2], null, '--')"), "[\n--1,\n--2\n]");
+        assert_eq!(run("JSON.stringify({}, null, 2)"), "{}");
+        assert_eq!(run("JSON.stringify([], null, 4)"), "[]");
         // A quote in a string is escaped.
         assert_eq!(run("JSON.stringify('a\"b')"), "\"a\\\"b\"");
     }
