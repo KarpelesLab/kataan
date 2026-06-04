@@ -2007,6 +2007,17 @@ fn array_methods() {
     assert_eq!(eval("[1, 2, 3].join('-')"), "1-2-3");
     assert_eq!(eval("[1, 2, 3].includes(2)"), "true");
     assert_eq!(eval("[1, 2, 3].indexOf(3)"), "2");
+    // Array.from with a map callback, including the `{ length }` idiom.
+    assert_eq!(eval("Array.from([1, 2, 3], x => x * 2).join(',')"), "2,4,6");
+    assert_eq!(
+        eval("Array.from('abc', (c, i) => c + i).join(',')"),
+        "a0,b1,c2"
+    );
+    assert_eq!(
+        eval("Array.from({ length: 4 }, (_, i) => i * i).join(',')"),
+        "0,1,4,9"
+    );
+    assert_eq!(eval("Array.from(new Set([1, 1, 2, 3])).join(',')"), "1,2,3");
     // keys / values / entries (usable in for-of and spread).
     assert_eq!(eval("[...[10, 20, 30].keys()].join(',')"), "0,1,2");
     assert_eq!(eval("[...['a', 'b'].values()].join(',')"), "a,b");

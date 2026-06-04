@@ -1716,6 +1716,31 @@ impl<'a> Interp<'a> {
         key: &str,
         args: Vec<Value<'a>>,
     ) -> Completion<'a, Value<'a>> {
+        // `Array.from(items, mapFn)` is intercepted so the map callback can run
+        // (the underlying native can't call back into the evaluator).
+        if key == "from"
+            && let Value::Object(o) = &obj
+            && o.get("isArray").is_callable()
+        {
+            let mut items = Vec::new();
+            super::builtins::iterate_into(
+                &args.first().cloned().unwrap_or(Value::Undefined),
+                &mut items,
+            );
+            if let Some(map_fn) = args.get(1).filter(|v| v.is_callable()).cloned() {
+                let mut mapped = Vec::with_capacity(items.len());
+                for (i, item) in items.into_iter().enumerate() {
+                    let v = self.call_with_this(
+                        map_fn.clone(),
+                        Value::Undefined,
+                        alloc::vec![item, Value::Number(i as f64)],
+                    )?;
+                    mapped.push(v);
+                }
+                return Ok(Value::Object(Obj::array(mapped)));
+            }
+            return Ok(Value::Object(Obj::array(items)));
+        }
         // `JSON.stringify` is intercepted so it can honour `toJSON()` and getter
         // accessors (the underlying native can't call back into the evaluator).
         if key == "stringify"
