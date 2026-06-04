@@ -19,6 +19,7 @@
 mod builtins;
 mod env;
 mod eval;
+mod promise;
 mod value;
 
 #[cfg(test)]

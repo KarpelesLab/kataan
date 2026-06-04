@@ -281,6 +281,7 @@ impl<'a> Interp<'a> {
         self.install_errors();
         self.install_collections();
         self.install_date();
+        self.install_promise();
         #[cfg(feature = "regex")]
         self.install_regexp();
     }

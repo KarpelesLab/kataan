@@ -76,6 +76,8 @@ pub struct Obj<'a> {
     /// native invoked when the object is called or `new`'d. Lets a constructor
     /// also carry static members as ordinary properties.
     callable: RefCell<Option<Value<'a>>>,
+    /// For `Promise` instances: the internal settlement state.
+    promise: RefCell<Option<Rc<RefCell<super::promise::PromiseState<'a>>>>>,
 }
 
 /// A getter/setter accessor property.
@@ -107,6 +109,7 @@ impl<'a> Obj<'a> {
             collection: None,
             accessors: RefCell::new(Vec::new()),
             callable: RefCell::new(None),
+            promise: RefCell::new(None),
         })
     }
 
@@ -120,6 +123,7 @@ impl<'a> Obj<'a> {
             collection: None,
             accessors: RefCell::new(Vec::new()),
             callable: RefCell::new(None),
+            promise: RefCell::new(None),
         })
     }
 
@@ -133,6 +137,7 @@ impl<'a> Obj<'a> {
             collection: None,
             accessors: RefCell::new(Vec::new()),
             callable: RefCell::new(None),
+            promise: RefCell::new(None),
         })
     }
 
@@ -149,6 +154,7 @@ impl<'a> Obj<'a> {
             })),
             accessors: RefCell::new(Vec::new()),
             callable: RefCell::new(None),
+            promise: RefCell::new(None),
         })
     }
 
@@ -168,6 +174,17 @@ impl<'a> Obj<'a> {
     #[must_use]
     pub fn callable(&self) -> Option<Value<'a>> {
         self.callable.borrow().clone()
+    }
+
+    /// Marks this object as a `Promise` with the given internal state.
+    pub fn set_promise_state(&self, state: Rc<RefCell<super::promise::PromiseState<'a>>>) {
+        *self.promise.borrow_mut() = Some(state);
+    }
+
+    /// This object's promise state, if it is a `Promise`.
+    #[must_use]
+    pub fn promise_state(&self) -> Option<Rc<RefCell<super::promise::PromiseState<'a>>>> {
+        self.promise.borrow().clone()
     }
 
     /// Defines (or extends) the getter for `key`.

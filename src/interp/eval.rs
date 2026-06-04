@@ -43,9 +43,18 @@ enum LoopCtl<'a> {
     Propagate(Flow<'a>),
 }
 
+/// A deferred job on the microtask queue (drives Promise reactions).
+pub(super) type Microtask<'a> = Box<dyn FnOnce(&mut Interp<'a>) + 'a>;
+
+/// The shared microtask queue, cloned by Promise machinery so it can enqueue
+/// reactions without a reference to the interpreter.
+pub(super) type MicrotaskQueue<'a> =
+    Rc<core::cell::RefCell<alloc::collections::VecDeque<Microtask<'a>>>>;
+
 /// The tree-walking interpreter, holding the global scope.
 pub struct Interp<'a> {
     global: Env<'a>,
+    microtasks: MicrotaskQueue<'a>,
 }
 
 impl<'a> Default for Interp<'a> {
@@ -63,9 +72,29 @@ impl<'a> Interp<'a> {
         global.declare("undefined", Value::Undefined, false);
         global.declare("NaN", Value::Number(f64::NAN), false);
         global.declare("Infinity", Value::Number(f64::INFINITY), false);
-        let interp = Self { global };
+        let interp = Self {
+            global,
+            microtasks: Rc::new(core::cell::RefCell::new(alloc::collections::VecDeque::new())),
+        };
         interp.install_stdlib();
         interp
+    }
+
+    /// A handle to the shared microtask queue (for Promise machinery).
+    pub(super) fn microtask_queue(&self) -> MicrotaskQueue<'a> {
+        Rc::clone(&self.microtasks)
+    }
+
+    /// Runs all queued microtasks to completion (the Promise reaction jobs),
+    /// including any they enqueue in turn.
+    pub(super) fn drain_microtasks(&mut self) {
+        loop {
+            let job = self.microtasks.borrow_mut().pop_front();
+            match job {
+                Some(job) => job(self),
+                None => break,
+            }
+        }
     }
 
     /// The global scope, for injecting host bindings (e.g. `console`).
@@ -84,7 +113,11 @@ impl<'a> Interp<'a> {
     pub fn run(&mut self, program: &'a Program) -> Completion<'a, Value<'a>> {
         let global = Rc::clone(&self.global);
         self.hoist(&program.body, &global);
-        match self.eval_stmts(&program.body, &global)? {
+        let result = self.eval_stmts(&program.body, &global);
+        // Flush pending Promise reactions before returning (the script is the
+        // single macrotask; microtasks run to completion after it).
+        self.drain_microtasks();
+        match result? {
             Flow::Normal(v) | Flow::Return(v) => Ok(v),
             _ => Ok(Value::Undefined),
         }

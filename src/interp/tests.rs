@@ -24,6 +24,19 @@ fn eval_throw(src: &str) -> String {
     }
 }
 
+/// Runs a program (draining microtasks) and returns the string value of a
+/// top-level binding afterward — used to observe asynchronous (Promise)
+/// effects, since `run` flushes the microtask queue before returning.
+fn eval_global(src: &str, name: &str) -> String {
+    let program = Parser::parse_program(src).expect("parse ok");
+    let mut interp = Interp::new();
+    interp.run(&program).expect("run ok");
+    interp
+        .global()
+        .get(name)
+        .map_or_else(|| String::from("<unbound>"), |v| v.to_js_string())
+}
+
 #[test]
 fn arithmetic_and_precedence() {
     assert_eq!(eval("1 + 2 * 3"), "7");
@@ -543,6 +556,68 @@ fn regexp() {
     assert_eq!(eval(r"new RegExp('[a-z]+', 'i').test('ABC')"), "true");
     assert_eq!(eval(r"/x/ instanceof RegExp"), "true");
     assert_eq!(eval(r"/(\w)(\w)/.exec('hi')[2]"), "i");
+}
+
+#[test]
+fn promises() {
+    // Basic resolution.
+    assert_eq!(
+        eval_global("let r; Promise.resolve(40).then(v => r = v + 2);", "r"),
+        "42"
+    );
+    // `.then` chaining threads the return value.
+    assert_eq!(
+        eval_global(
+            "let r; Promise.resolve(1).then(v => v + 10).then(v => v * 2).then(v => r = v);",
+            "r"
+        ),
+        "22"
+    );
+    // Rejection flows to `.catch`.
+    assert_eq!(
+        eval_global(
+            "let r; Promise.reject('boom').catch(e => r = 'caught:' + e);",
+            "r"
+        ),
+        "caught:boom"
+    );
+    // The executor's resolve settles the promise.
+    assert_eq!(
+        eval_global("let r; new Promise(res => res(7)).then(v => r = v);", "r"),
+        "7"
+    );
+    // A throw in the executor rejects.
+    assert_eq!(
+        eval_global(
+            "let r; new Promise(() => { throw 'x'; }).catch(e => r = e);",
+            "r"
+        ),
+        "x"
+    );
+    // Thenable adoption: a handler returning a promise is awaited.
+    assert_eq!(
+        eval_global(
+            "let r; Promise.resolve(5).then(v => Promise.resolve(v * 4)).then(v => r = v);",
+            "r"
+        ),
+        "20"
+    );
+    // Microtasks run after synchronous code.
+    assert_eq!(
+        eval_global(
+            "let log = ''; Promise.resolve().then(() => log += 'async'); log += 'sync';",
+            "log"
+        ),
+        "syncasync"
+    );
+    // A throw in a handler is caught downstream.
+    assert_eq!(
+        eval_global(
+            "let r; Promise.resolve().then(() => { throw 'oops'; }).catch(e => r = e);",
+            "r"
+        ),
+        "oops"
+    );
 }
 
 #[test]
