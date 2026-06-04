@@ -73,6 +73,7 @@ enum Body<'a> {
 struct FnDef<'a> {
     params: &'a [Param],
     body: Body<'a>,
+    is_async: bool,
 }
 
 /// A tree-walking interpreter over the performance object model.
@@ -464,7 +465,8 @@ impl<'a> Interp<'a> {
             if let Stmt::Function(func) = stmt
                 && let Some(id) = &func.id
             {
-                let value = self.make_function(&func.params, Body::Block(&func.body));
+                let value =
+                    self.make_function(&func.params, Body::Block(&func.body), func.is_async);
                 self.current.declare(&id.name, value);
             }
         }
@@ -473,9 +475,13 @@ impl<'a> Interp<'a> {
 
     /// Registers a function definition and allocates a closure capturing the
     /// current scope.
-    fn make_function(&mut self, params: &'a [Param], body: Body<'a>) -> NanBox {
+    fn make_function(&mut self, params: &'a [Param], body: Body<'a>, is_async: bool) -> NanBox {
         let func_id = self.functions.len() as u32;
-        self.functions.push(FnDef { params, body });
+        self.functions.push(FnDef {
+            params,
+            body,
+            is_async,
+        });
         let handle = self.realm.new_function(func_id, self.current.clone());
         NanBox::handle(handle.to_raw())
     }
@@ -579,28 +585,54 @@ impl<'a> Interp<'a> {
     /// reaction to completion.
     fn drain_microtasks(&mut self) -> Result<(), ExecError> {
         while !self.microtasks.is_empty() {
-            let job = self.microtasks.remove(0);
-            if job
-                .handler
-                .as_handle()
-                .map(Handle::from_raw)
-                .is_some_and(|h| self.is_callable(h))
-            {
-                match self.call(job.handler, &[job.value]) {
-                    Ok(v) => self.resolve_with(job.result, v),
-                    Err(ExecError::Throw(e)) => self.settle(job.result, e, false),
-                    Err(other) => return Err(other),
-                }
-            } else {
-                // Passthrough: settle with the same status/value.
-                if job.fulfilled {
-                    self.resolve_with(job.result, job.value);
-                } else {
-                    self.settle(job.result, job.value, false);
-                }
-            }
+            self.run_one_microtask()?;
         }
         Ok(())
+    }
+
+    /// Runs the next queued promise reaction.
+    fn run_one_microtask(&mut self) -> Result<(), ExecError> {
+        let job = self.microtasks.remove(0);
+        if job
+            .handler
+            .as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| self.is_callable(h))
+        {
+            match self.call(job.handler, &[job.value]) {
+                Ok(v) => self.resolve_with(job.result, v),
+                Err(ExecError::Throw(e)) => self.settle(job.result, e, false),
+                Err(other) => return Err(other),
+            }
+        } else if job.fulfilled {
+            // Passthrough: settle with the same status/value.
+            self.resolve_with(job.result, job.value);
+        } else {
+            self.settle(job.result, job.value, false);
+        }
+        Ok(())
+    }
+
+    /// `await value` — for a promise, drains microtasks until it settles (this
+    /// model has no timers, so all promises settle via the queue), then yields
+    /// its value or throws its rejection. A non-promise passes through.
+    fn await_value(&mut self, value: NanBox) -> Result<NanBox, ExecError> {
+        use crate::cell::PromiseStatus::{Fulfilled, Pending, Rejected};
+        let Some(state) = value
+            .as_handle()
+            .and_then(|raw| self.realm.promise_state(Handle::from_raw(raw)))
+        else {
+            return Ok(value); // not a promise
+        };
+        while state.borrow().status == Pending && !self.microtasks.is_empty() {
+            self.run_one_microtask()?;
+        }
+        let s = state.borrow();
+        match s.status {
+            Fulfilled => Ok(s.value),
+            Rejected => Err(ExecError::Throw(s.value)),
+            Pending => Ok(NanBox::undefined()), // never settled (no timers)
+        }
     }
 
     fn is_callable(&self, handle: Handle) -> bool {
@@ -664,6 +696,16 @@ impl<'a> Interp<'a> {
         let result = self.run_body(def.body);
         self.current = saved;
         self.this_val = saved_this;
+        // An `async` function returns a promise of its result (rejected on throw).
+        if def.is_async {
+            let promise = self.realm.new_promise();
+            match result {
+                Ok(v) => self.resolve_with(promise, v),
+                Err(ExecError::Throw(e)) => self.settle(promise, e, false),
+                Err(other) => return Err(other),
+            }
+            return Ok(NanBox::handle(promise.to_raw()));
+        }
         result
     }
 
@@ -792,7 +834,7 @@ impl<'a> Interp<'a> {
                 {
                     let key = static_key(&m.key)?;
                     let saved = core::mem::replace(&mut self.current, cenv.clone());
-                    let f = self.make_function(&m.value.params, Body::Block(&m.value.body));
+                    let f = self.make_function(&m.value.params, Body::Block(&m.value.body), false);
                     self.current = saved;
                     self.realm.set_property(instance, &key, f);
                 }
@@ -1500,6 +1542,10 @@ impl<'a> Interp<'a> {
                     .ok_or_else(|| ExecError::NotDefined(String::from(name))),
             },
             Expr::This(_) => Ok(self.this_val),
+            Expr::Await { argument, .. } => {
+                let v = self.eval(argument)?;
+                self.await_value(v)
+            }
             Expr::Function(func) => Ok(self.eval_fn_expr(func)),
             Expr::Arrow(arrow) => Ok(self.eval_arrow(arrow)),
             Expr::Class(class) => Ok(self.make_class(class)),
@@ -1644,7 +1690,7 @@ impl<'a> Interp<'a> {
     }
 
     fn eval_fn_expr(&mut self, func: &'a Function) -> NanBox {
-        self.make_function(&func.params, Body::Block(&func.body))
+        self.make_function(&func.params, Body::Block(&func.body), func.is_async)
     }
 
     fn eval_arrow(&mut self, arrow: &'a Arrow) -> NanBox {
@@ -1652,7 +1698,7 @@ impl<'a> Interp<'a> {
             ArrowBody::Expr(e) => Body::Expr(e),
             ArrowBody::Block(b) => Body::Block(b),
         };
-        self.make_function(&arrow.params, body)
+        self.make_function(&arrow.params, body, arrow.is_async)
     }
 
     fn member(
@@ -2359,6 +2405,53 @@ mod tests {
         );
         // typeof a promise is object.
         assert_eq!(run("typeof Promise.resolve(1)"), "object");
+    }
+
+    #[test]
+    fn async_await() {
+        // observe results via console.log after the microtask drain.
+        let out = |src: &str| {
+            let program = Parser::parse_program(src).expect("parse");
+            let mut interp = Interp::new();
+            interp.run(&program).expect("exec");
+            String::from(interp.output())
+        };
+        // An async function returns a promise; awaiting unwraps values.
+        assert_eq!(
+            out(
+                "async function f() { let x = await Promise.resolve(10); return x + 5; }
+                 f().then(v => console.log(v));"
+            ),
+            "15\n"
+        );
+        // Awaiting in sequence.
+        assert_eq!(
+            out("async function g() {
+                   let a = await Promise.resolve(2);
+                   let b = await Promise.resolve(3);
+                   return a * b;
+                 }
+                 g().then(v => console.log(v));"),
+            "6\n"
+        );
+        // try/catch around a rejected await.
+        assert_eq!(
+            out("async function h() {
+                   try { await Promise.reject('boom'); return 'no'; }
+                   catch (e) { return 'caught:' + e; }
+                 }
+                 h().then(v => console.log(v));"),
+            "caught:boom\n"
+        );
+        // An async arrow, awaiting a plain value.
+        assert_eq!(
+            out("let f = async (x) => (await x) + 1;
+                 f(41).then(v => console.log(v));"),
+            "42\n"
+        );
+        // typeof an async function is function; its call returns a promise.
+        assert_eq!(run("async function a() {} typeof a"), "function");
+        assert_eq!(run("async function a() { return 1; } typeof a()"), "object");
     }
 
     #[test]
