@@ -16,7 +16,7 @@
 //! Unsupported constructs (objects, strings, `for-of`) are reported, not
 //! mis-compiled.
 
-use crate::ast::{BinaryOp, BindingTarget, Expr, Function, Stmt, UnaryOp};
+use crate::ast::{AssignOp, BinaryOp, BindingTarget, Expr, Function, Stmt, UnaryOp};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -160,6 +160,25 @@ fn emit_effect(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmEr
                 "{pad}local.get ${0}\n{pad}f64.const 1\n{pad}{mnemonic}\n{pad}local.set ${0}\n",
                 id.name
             ));
+            Ok(())
+        }
+        // Compound assignment `x op= expr` → `x = x op expr` over a local.
+        Expr::Assign {
+            op, target, value, ..
+        } => {
+            let Expr::Ident(id) = &**target else {
+                return Err(WasmError("assignment target"));
+            };
+            let mnemonic = match op {
+                AssignOp::AddAssign => "f64.add",
+                AssignOp::SubAssign => "f64.sub",
+                AssignOp::MulAssign => "f64.mul",
+                AssignOp::DivAssign => "f64.div",
+                _ => return Err(WasmError("compound assignment operator")),
+            };
+            out.push_str(&format!("{pad}local.get ${}\n", id.name));
+            emit_expr(value, out, depth)?;
+            out.push_str(&format!("{pad}{mnemonic}\n{pad}local.set ${}\n", id.name));
             Ok(())
         }
         _ => Err(WasmError("expression statement")),
@@ -638,6 +657,29 @@ fn emit_effect_bin(
             leb_u(idx, out);
             Ok(())
         }
+        // Compound assignment `x op= expr`.
+        Expr::Assign {
+            op, target, value, ..
+        } => {
+            let Expr::Ident(id) = &**target else {
+                return Err(WasmError("assignment target"));
+            };
+            let opcode = match op {
+                AssignOp::AddAssign => 0xa0u8,
+                AssignOp::SubAssign => 0xa1,
+                AssignOp::MulAssign => 0xa2,
+                AssignOp::DivAssign => 0xa3,
+                _ => return Err(WasmError("compound assignment operator")),
+            };
+            let idx = local_idx(&id.name, locals)?;
+            out.push(0x20); // local.get
+            leb_u(idx, out);
+            emit_expr_bin(value, locals, fns, out)?;
+            out.push(opcode);
+            out.push(0x21); // local.set
+            leb_u(idx, out);
+            Ok(())
+        }
         _ => Err(WasmError("expression statement")),
     }
 }
@@ -1089,6 +1131,20 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_compound_assignment() {
+        // `s += i` / `p *= k` over locals in a loop.
+        let src = "function poly(n) { let s = 0; let p = 1; for (let i = 1; i <= n; i++) { s += i; p *= 2; } return s + p; }";
+        let wat = module(src);
+        assert!(wat.contains("f64.add"));
+        assert!(wat.contains("f64.mul"));
+        assert_well_formed(&wat);
+        let wasm = binary(src);
+        // compound + (0xa0) and * (0xa2) opcodes present.
+        assert!(wasm.contains(&0xa0) && wasm.contains(&0xa2));
+        section_ids(&wasm);
     }
 
     #[test]

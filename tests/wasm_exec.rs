@@ -41,6 +41,7 @@ fn emitted_wasm_runs_on_a_real_engine() {
         function isEven(n) { return n % 2 === 0 ? 1 : 0; }
         function sumTo(n) { let s = 0; for (let i = 0; i <= n; i++) { s = s + i; } return s; }
         function factorial(n) { let f = 1; for (let i = 2; i <= n; i++) { f = f * i; } return f; }
+        function poly(n) { let s = 0; let p = 1; for (let i = 1; i <= n; i++) { s += i; p *= 2; } return s + p; }
     ";
     let program = Parser::parse_program(src).expect("parse");
     let wasm = kataan::wasm::compile_module_binary(&program).expect("compile to wasm");
@@ -70,6 +71,7 @@ fn emitted_wasm_runs_on_a_real_engine() {
             e.isEven(7),
             e.sumTo(10),
             e.factorial(5),
+            e.poly(4),
           ];
           console.log(out.join(','));
         }}).catch(err => {{ console.error('INVALID:' + err.message); process.exit(1); }});
@@ -93,7 +95,7 @@ fn emitted_wasm_runs_on_a_real_engine() {
     // absdiff(2,9)=7 — including the native Math.sqrt/max/abs ops.
     assert_eq!(
         stdout.trim(),
-        "5,9,9,55,6765,25,5,7,2,1,0,55,120", // …, sumTo(10)=55, factorial(5)=120
+        "5,9,9,55,6765,25,5,7,2,1,0,55,120,26", // …, poly(4)=10+16=26 (compound +=/*=)
         "wasm produced wrong results"
     );
 
