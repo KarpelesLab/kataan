@@ -243,6 +243,15 @@ const NB_OBJECT_ENTRIES: u16 = 17;
 const NB_OBJECT_ASSIGN: u16 = 18;
 const NB_JSON_STRINGIFY: u16 = 19;
 const NB_JSON_PARSE: u16 = 20;
+const NB_NUMBER_IS_INTEGER: u16 = 21;
+const NB_NUMBER_IS_FINITE: u16 = 22;
+const NB_NUMBER_IS_NAN: u16 = 23;
+const NB_NUMBER_PARSE_FLOAT: u16 = 24;
+const NB_NUMBER_PARSE_INT: u16 = 25;
+const NB_STRING_FROM_CHAR_CODE: u16 = 26;
+const NB_ARRAY_FROM: u16 = 27;
+const NB_ARRAY_IS_ARRAY: u16 = 28;
+const NB_OBJECT_FROM_ENTRIES: u16 = 29;
 
 /// A compiled function: its instruction stream, register-file size, and the
 /// number of leading registers that receive call arguments.
@@ -1342,6 +1351,104 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                 .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
             crate::json::parse(ctx.realm, &s).unwrap_or(NanBox::undefined())
         }
+        // `Number.*` predicates take a value WITHOUT coercion (unlike the globals).
+        NB_NUMBER_IS_INTEGER => {
+            let v = args.first().copied().unwrap_or(NanBox::undefined());
+            NanBox::boolean(
+                v.as_number()
+                    .is_some_and(|n| n.is_finite() && n % 1.0 == 0.0),
+            )
+        }
+        NB_NUMBER_IS_FINITE => {
+            let v = args.first().copied().unwrap_or(NanBox::undefined());
+            NanBox::boolean(v.as_number().is_some_and(f64::is_finite))
+        }
+        NB_NUMBER_IS_NAN => {
+            let v = args.first().copied().unwrap_or(NanBox::undefined());
+            NanBox::boolean(v.as_number().is_some_and(f64::is_nan))
+        }
+        NB_NUMBER_PARSE_FLOAT => {
+            let s = ctx
+                .realm
+                .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
+            NanBox::number(parse_float_prefix(s.trim()))
+        }
+        NB_NUMBER_PARSE_INT => {
+            let s = ctx
+                .realm
+                .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
+            let radix = args
+                .get(1)
+                .and_then(|r| r.as_number())
+                .map_or(0, |n| n as u32);
+            NanBox::number(parse_int(s.trim(), radix))
+        }
+        NB_STRING_FROM_CHAR_CODE => {
+            let s: String = args
+                .iter()
+                .filter_map(|a| a.as_number())
+                .filter_map(|n| char::from_u32(n as u32))
+                .collect();
+            NanBox::handle(ctx.realm.new_string(&s).to_raw())
+        }
+        NB_ARRAY_IS_ARRAY => {
+            let yes = args
+                .first()
+                .and_then(|a| a.as_handle())
+                .map(Handle::from_raw)
+                .is_some_and(|h| ctx.realm.is_array(h));
+            NanBox::boolean(yes)
+        }
+        NB_ARRAY_FROM => {
+            let arg = args.first().copied().unwrap_or(NanBox::undefined());
+            let items: Vec<NanBox> = match arg.as_handle().map(Handle::from_raw) {
+                Some(h) if ctx.realm.is_array(h) => ctx
+                    .realm
+                    .array_elements(h)
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default(),
+                // A `Map`/`Set`: its entries (Set → its elements).
+                Some(h) if ctx.realm.collection_is_set(h).is_some() => ctx
+                    .realm
+                    .collection_entries(h)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect(),
+                // A string: its characters.
+                Some(h) if ctx.realm.string_value(h).is_some() => ctx
+                    .realm
+                    .string_value(h)
+                    .unwrap_or_default()
+                    .chars()
+                    .map(|c| NanBox::handle(ctx.realm.new_string(&String::from(c)).to_raw()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            NanBox::handle(ctx.realm.new_array(items).to_raw())
+        }
+        NB_OBJECT_FROM_ENTRIES => {
+            let obj = ctx.realm.new_object();
+            if let Some(h) = args
+                .first()
+                .and_then(|a| a.as_handle())
+                .map(Handle::from_raw)
+            {
+                for pair in ctx
+                    .realm
+                    .array_elements(h)
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default()
+                {
+                    if let Some(ph) = pair.as_handle().map(Handle::from_raw) {
+                        let k = ctx.realm.to_display_string(ctx.realm.get_element(ph, 0));
+                        let v = ctx.realm.get_element(ph, 1);
+                        ctx.realm.set_property(obj, &k, v);
+                    }
+                }
+            }
+            NanBox::handle(obj.to_raw())
+        }
         NB_OBJECT_ASSIGN => {
             let target = args.first().copied().unwrap_or(NanBox::undefined());
             if let Some(t) = target.as_handle().map(Handle::from_raw) {
@@ -1617,8 +1724,17 @@ fn native_call(callee: &Expr) -> Option<u16> {
         ("Object", "values") => Some(NB_OBJECT_VALUES),
         ("Object", "entries") => Some(NB_OBJECT_ENTRIES),
         ("Object", "assign") => Some(NB_OBJECT_ASSIGN),
+        ("Object", "fromEntries") => Some(NB_OBJECT_FROM_ENTRIES),
         ("JSON", "stringify") => Some(NB_JSON_STRINGIFY),
         ("JSON", "parse") => Some(NB_JSON_PARSE),
+        ("Number", "isInteger") => Some(NB_NUMBER_IS_INTEGER),
+        ("Number", "isFinite") => Some(NB_NUMBER_IS_FINITE),
+        ("Number", "isNaN") => Some(NB_NUMBER_IS_NAN),
+        ("Number", "parseFloat") => Some(NB_NUMBER_PARSE_FLOAT),
+        ("Number", "parseInt") => Some(NB_NUMBER_PARSE_INT),
+        ("String", "fromCharCode") => Some(NB_STRING_FROM_CHAR_CODE),
+        ("Array", "from") => Some(NB_ARRAY_FROM),
+        ("Array", "isArray") => Some(NB_ARRAY_IS_ARRAY),
         _ => None,
     }
 }
@@ -4756,6 +4872,34 @@ mod tests {
         assert_eq!(
             bc("[{ n: 1 }, { n: 2 }, { n: 3 }].map(({ n }) => n * 10).join(',')"),
             "10,20,30"
+        );
+    }
+
+    #[test]
+    fn bytecode_number_string_array_object_statics() {
+        // Number.* predicates (no coercion).
+        assert_eq!(
+            bc("'' + Number.isInteger(42) + Number.isInteger(4.2)"),
+            "truefalse"
+        );
+        assert_eq!(
+            bc("'' + Number.isFinite(1) + Number.isNaN(0 / 0)"),
+            "truetrue"
+        );
+        // String.fromCharCode.
+        assert_eq!(bc("String.fromCharCode(75, 97)"), "Ka");
+        // Array.from (Set, array, string) and Array.isArray.
+        assert_eq!(bc("Array.from(new Set([1, 1, 2])).length"), "2");
+        assert_eq!(bc("Array.from('abc').join('-')"), "a-b-c");
+        assert_eq!(
+            bc("'' + Array.isArray([1]) + Array.isArray(5)"),
+            "truefalse"
+        );
+        // Object.fromEntries (round-trip with entries).
+        assert_eq!(bc("Object.fromEntries([['k', 'v'], ['n', 1]]).k"), "v");
+        assert_eq!(
+            bc("let o = Object.fromEntries(Object.entries({ a: 1, b: 2 })); o.a + o.b"),
+            "3"
         );
     }
 
