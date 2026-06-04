@@ -1172,6 +1172,9 @@ impl Compiler {
 
     /// Compiles a function declaration and binds it as a global.
     fn compile_function_decl(&mut self, func: &Function) -> Result<(), CompileError> {
+        if func.is_async && func.is_generator {
+            return Err(CompileError::unsupported("async generator"));
+        }
         let Some(id) = &func.id else {
             return Err(CompileError::unsupported("anonymous function declaration"));
         };
@@ -1819,6 +1822,9 @@ impl Compiler {
                 Ok(dst)
             }
             Expr::Function(func) => {
+                if func.is_async && func.is_generator {
+                    return Err(CompileError::unsupported("async generator"));
+                }
                 let (idx, upvalues) = self.compile_function(
                     &func.params,
                     FnBody::Block(&func.body),

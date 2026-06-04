@@ -1152,9 +1152,11 @@ fn bytecode_vm_loops() {
 
 #[test]
 fn bytecode_vm_falls_back_on_unsupported() {
-    // `yield*` delegation is still outside the bytecode compiler's subset, so it
-    // is reported as unsupported and the caller falls back to the tree-walker.
-    let program = Parser::parse_program("function* g() { yield* [1, 2]; } [...g()]").unwrap();
+    // An async generator (`async function*`) is still outside the bytecode
+    // compiler's subset, so it is reported as unsupported and the caller falls
+    // back to the tree-walker.
+    let program =
+        Parser::parse_program("async function* g() { yield 1; } g()").unwrap();
     let mut interp = Interp::new();
     assert!(interp.eval_via_bytecode(&program.body).is_err());
 }
