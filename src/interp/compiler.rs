@@ -3020,6 +3020,38 @@ fn captured_names(params: &[Param], body: &FnBody) -> BTreeSet<String> {
     declared.intersection(&nested).cloned().collect()
 }
 
+/// Adds a nested function's **free** variables to `out` — the identifiers it
+/// references minus its own parameters and locally-declared names. A function's
+/// own locals (e.g. its loop variable) must not count as capturing a same-named
+/// variable in an enclosing scope.
+fn add_free_vars(
+    params: &[Param],
+    block: Option<&[Stmt]>,
+    expr: Option<&Expr>,
+    out: &mut BTreeSet<String>,
+) {
+    let mut refs = BTreeSet::new();
+    let mut bound = BTreeSet::new();
+    for p in params {
+        binding_names(&p.target, &mut bound);
+        if let Some(d) = &p.default {
+            idents_in_expr(d, &mut refs, false);
+        }
+    }
+    if let Some(stmts) = block {
+        for s in stmts {
+            declared_in_stmt(s, &mut bound);
+            idents_in_stmt(s, &mut refs, false);
+        }
+    }
+    if let Some(e) = expr {
+        idents_in_expr(e, &mut refs, false);
+    }
+    for name in refs.difference(&bound) {
+        out.insert(name.clone());
+    }
+}
+
 /// Collects the names bound by a binding target (pattern).
 fn binding_names(t: &BindingTarget, out: &mut BTreeSet<String>) {
     use crate::ast::ArrayPatternElement;
@@ -3144,17 +3176,7 @@ fn idents_in_stmt(s: &Stmt, out: &mut BTreeSet<String>, nested_only: bool) {
                 }
             }
         }
-        Stmt::Function(f) => {
-            // A nested function declaration: collect everything inside it.
-            for p in &f.params {
-                if let Some(def) = &p.default {
-                    idents_in_expr(def, out, false);
-                }
-            }
-            for st in &f.body {
-                idents_in_stmt(st, out, false);
-            }
-        }
+        Stmt::Function(f) => add_free_vars(&f.params, Some(&f.body), None, out),
         Stmt::If {
             test,
             consequent,
@@ -3351,32 +3373,13 @@ fn idents_in_expr(e: &Expr, out: &mut BTreeSet<String>, nested_only: bool) {
                 idents_in_expr(x, out, nested_only);
             }
         }
-        // Entering a function: collect *all* identifiers inside it.
-        Expr::Function(f) => {
-            for p in &f.params {
-                if let Some(def) = &p.default {
-                    idents_in_expr(def, out, false);
-                }
-            }
-            for st in &f.body {
-                idents_in_stmt(st, out, false);
-            }
-        }
-        Expr::Arrow(a) => {
-            for p in &a.params {
-                if let Some(def) = &p.default {
-                    idents_in_expr(def, out, false);
-                }
-            }
-            match &a.body {
-                ArrowBody::Block(b) => {
-                    for st in b {
-                        idents_in_stmt(st, out, false);
-                    }
-                }
-                ArrowBody::Expr(x) => idents_in_expr(x, out, false),
-            }
-        }
+        // Entering a function: add its *free* variables (references minus its
+        // own bound names) — those are the ones it captures from outside.
+        Expr::Function(f) => add_free_vars(&f.params, Some(&f.body), None, out),
+        Expr::Arrow(a) => match &a.body {
+            ArrowBody::Block(b) => add_free_vars(&a.params, Some(b), None, out),
+            ArrowBody::Expr(e) => add_free_vars(&a.params, None, Some(e), out),
+        },
         _ => {}
     }
 }
