@@ -1787,6 +1787,14 @@ impl<'a> Interp<'a> {
                         .map_or(-1.0, |b| s[..b].chars().count() as f64);
                     Some(NanBox::number(idx))
                 }
+                // `concat` appends each argument's string form.
+                "concat" => {
+                    let mut out = s.clone();
+                    for a in args {
+                        out.push_str(&self.realm.to_display_string(*a));
+                    }
+                    Some(self.new_str(&out))
+                }
                 _ => None,
             };
             if out.is_some() {
@@ -2042,6 +2050,25 @@ impl<'a> Interp<'a> {
                 "findIndex" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
+                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                            return Ok(Some(NanBox::number(i as f64)));
+                        }
+                    }
+                    return Ok(Some(NanBox::number(-1.0)));
+                }
+                // `findLast`/`findLastIndex` — scan right-to-left.
+                "findLast" => {
+                    let f = arg(0);
+                    for (i, e) in elems.iter().enumerate().rev() {
+                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                            return Ok(Some(*e));
+                        }
+                    }
+                    return Ok(Some(NanBox::undefined()));
+                }
+                "findLastIndex" => {
+                    let f = arg(0);
+                    for (i, e) in elems.iter().enumerate().rev() {
                         if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
                             return Ok(Some(NanBox::number(i as f64)));
                         }
@@ -3993,6 +4020,19 @@ mod tests {
             run("[1,2,3].reduceRight(function(a,x){ return a + x; }, 10)"),
             "16"
         );
+        // findLast / findLastIndex scan right-to-left.
+        assert_eq!(
+            run("[1,2,3,4].findLast(function(x){ return x % 2 === 1; })"),
+            "3"
+        );
+        assert_eq!(
+            run("[1,2,3,4].findLastIndex(function(x){ return x % 2 === 1; })"),
+            "2"
+        );
+        assert_eq!(
+            run("[2,4,6].findLast(function(x){ return x > 9; })"),
+            "undefined"
+        );
     }
 
     #[test]
@@ -4020,6 +4060,7 @@ mod tests {
         assert_eq!(run("'abc'.lastIndexOf('x')"), "-1");
         assert_eq!(run("Number.MAX_SAFE_INTEGER"), "9007199254740991");
         assert_eq!(run("Number.POSITIVE_INFINITY"), "Infinity");
+        assert_eq!(run("'abc'.concat('def', '!')"), "abcdef!");
     }
 
     #[test]
