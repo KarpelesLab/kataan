@@ -64,16 +64,25 @@ fn install_harness(interp: &Interp<'_>) {
     });
 }
 
-/// Parses and runs one fixture, returning the uncaught throw message on
-/// failure.
+/// Parses and runs one fixture through both execution paths — the tree-walker
+/// and the bytecode VM (which falls back to the tree-walker for unsupported
+/// constructs) — returning an uncaught throw / mismatch message on failure.
 fn run_fixture(source: &str) -> Result<(), String> {
     let program = Parser::parse_program(source).map_err(|e| e.to_string())?;
-    let mut interp = Interp::new();
-    install_harness(&interp);
-    interp
-        .run(&program)
-        .map(|_| ())
-        .map_err(|thrown| thrown.to_js_string())
+
+    // Tree-walker (the reference).
+    let mut tree = Interp::new();
+    install_harness(&tree);
+    tree.run(&program)
+        .map_err(|thrown| format!("tree-walker: {}", thrown.to_js_string()))?;
+
+    // Bytecode VM (with automatic tree-walker fallback for unsupported syntax).
+    let mut vm = Interp::new();
+    install_harness(&vm);
+    vm.run_with_vm(&program)
+        .map_err(|thrown| format!("vm: {}", thrown.to_js_string()))?;
+
+    Ok(())
 }
 
 #[test]
