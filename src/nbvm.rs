@@ -11,8 +11,12 @@
 //! and object property reads/writes through shapes — end to end, ahead of
 //! migrating the full bytecode VM onto this representation.
 //!
-//! It is deliberately tiny (no calls, closures, or coercion — those arrive with
-//! the migration proper); the point is that every value flowing through it is a
+//! It also carries the first slices of the **bytecode-VM fold**: an AST →
+//! bytecode [`compile_and_run`] that lowers a growing JavaScript subset
+//! (arithmetic, control flow, arrays/objects, `for` loops, and now functions
+//! with recursion via a per-activation register window) onto these ops, with no
+//! tree-walking. Closures, exceptions, and first-class function values arrive
+//! with later slices; the point is that every value flowing through it is a
 //! single 64-bit word and every object is a GC-managed heap node, exactly as the
 //! production VM will work.
 //!
@@ -75,8 +79,46 @@ pub enum Op {
     SetProp { obj: Reg, key: String, src: Reg },
     /// `dst = obj[key]` (`undefined` if absent).
     GetProp { dst: Reg, obj: Reg, key: String },
+    /// `dst = func(args…)` — call function `func` (an index into the program's
+    /// function table) with the values in the `args` registers.
+    Call { dst: Reg, func: u32, args: Vec<Reg> },
     /// Halt, yielding the value in `src`.
     Return { src: Reg },
+}
+
+/// A compiled function: its instruction stream, register-file size, and the
+/// number of leading registers that receive call arguments.
+#[derive(Clone, Debug)]
+pub struct FnProto {
+    /// The instruction stream.
+    pub ops: Vec<Op>,
+    /// Total registers the body uses.
+    pub n_regs: usize,
+    /// Parameters, bound to registers `0..n_params` on entry.
+    pub n_params: usize,
+}
+
+/// Runs function `id` of `funcs` with `args`, allocating in `realm`. Calls
+/// recurse on the Rust stack — one register window per activation, exactly the
+/// frame model the production VM will use.
+///
+/// # Errors
+/// Propagates a [`VmError`] from any faulting instruction.
+pub fn run_program(
+    realm: &mut Realm,
+    funcs: &[FnProto],
+    id: usize,
+    args: &[NanBox],
+) -> Result<NanBox, VmError> {
+    let proto = &funcs[id];
+    let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
+    for (i, a) in args.iter().enumerate().take(proto.n_params) {
+        regs[i] = *a;
+    }
+    if let Some(v) = run_frame(realm, funcs, &proto.ops, &mut regs)? {
+        return Ok(v);
+    }
+    Ok(NanBox::undefined())
 }
 
 /// Why execution stopped abnormally.
@@ -90,9 +132,23 @@ pub enum VmError {
 
 /// Runs `program` with a register file of `register_count` slots (initialized to
 /// `undefined`), allocating objects in `realm`. Returns the `Return`ed value, or
-/// `undefined` if the program falls off the end.
+/// `undefined` if the program falls off the end. (Convenience for call-free
+/// programs; `Call` ops require [`run_program`]'s function table.)
 pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<NanBox, VmError> {
     let mut regs: Vec<NanBox> = vec![NanBox::undefined(); register_count];
+    Ok(run_frame(realm, &[], program, &mut regs)?.unwrap_or(NanBox::undefined()))
+}
+
+/// Executes one function body (`program`) against the register file `regs`.
+/// Returns `Some(value)` on `Return`, `None` if control falls off the end.
+/// `Call` ops dispatch into `funcs` via [`run_program`] (a fresh register
+/// window per activation).
+fn run_frame(
+    realm: &mut Realm,
+    funcs: &[FnProto],
+    program: &[Op],
+    regs: &mut [NanBox],
+) -> Result<Option<NanBox>, VmError> {
     let mut pc = 0;
 
     let num = |v: NanBox| v.as_number().ok_or(VmError::NotANumber);
@@ -186,10 +242,15 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
                     .get_property(handle, key)
                     .unwrap_or(NanBox::undefined());
             }
-            Op::Return { src } => return Ok(regs[*src as usize]),
+            Op::Call { dst, func, args } => {
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let ret = run_program(realm, funcs, *func as usize, &argv)?;
+                regs[*dst as usize] = ret;
+            }
+            Op::Return { src } => return Ok(Some(regs[*src as usize])),
         }
     }
-    Ok(NanBox::undefined())
+    Ok(None)
 }
 
 // --- AST → bytecode compiler (the first slice of the bytecode-VM fold) ---
@@ -219,25 +280,30 @@ pub enum CompileError {
 /// Returns [`CompileError`] for unsupported constructs and [`VmError`] (wrapped)
 /// for runtime faults.
 pub fn compile_and_run(realm: &mut Realm, program: &Program) -> Result<NanBox, CompileError> {
-    let mut c = Compiler::default();
-    c.scopes.push(alloc::collections::BTreeMap::new());
-    let mut last: Option<Reg> = None;
-    for stmt in &program.body {
-        if let Some(r) = c.stmt(stmt)? {
-            last = Some(r);
+    // Hoist top-level function declarations to ids 1.. (main is id 0), so calls
+    // — including recursion and forward references — resolve statically.
+    let decls: Vec<&crate::ast::Function> = program
+        .body
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Function(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    let mut fn_ids = alloc::collections::BTreeMap::new();
+    for (i, f) in decls.iter().enumerate() {
+        if let Some(id) = &f.id {
+            fn_ids.insert(String::from(&*id.name), (i + 1) as u32);
         }
     }
-    let src = last.unwrap_or_else(|| {
-        let r = c.alloc();
-        c.ops.push(Op::LoadConst {
-            dst: r,
-            value: NanBox::undefined(),
-        });
-        r
-    });
-    c.ops.push(Op::Return { src });
-    let reg_count = c.next_reg as usize;
-    run(realm, &c.ops, reg_count).map_err(|_| CompileError::Unsupported("runtime fault"))
+
+    let mut protos = Vec::with_capacity(decls.len() + 1);
+    // Function 0 is the top-level program; its completion value is returned.
+    protos.push(Compiler::compile_fn(&fn_ids, &[], &program.body, true)?);
+    for f in &decls {
+        protos.push(Compiler::compile_fn(&fn_ids, &f.params, &f.body, false)?);
+    }
+    run_program(realm, &protos, 0, &[]).map_err(|_| CompileError::Unsupported("runtime fault"))
 }
 
 /// The static string key of a non-computed property key.
@@ -256,6 +322,49 @@ struct Compiler {
     /// Lexical scopes mapping a name to the register holding its value.
     scopes: Vec<alloc::collections::BTreeMap<String, Reg>>,
     next_reg: Reg,
+    /// Function name → table id, for resolving calls.
+    fn_ids: alloc::collections::BTreeMap<String, u32>,
+}
+
+impl Compiler {
+    /// Compiles one function: binds `params` to registers `0..n`, compiles
+    /// `body`, and (for `is_main`) returns the last expression's value.
+    fn compile_fn(
+        fn_ids: &alloc::collections::BTreeMap<String, u32>,
+        params: &[crate::ast::Param],
+        body: &[Stmt],
+        is_main: bool,
+    ) -> Result<FnProto, CompileError> {
+        let mut c = Compiler {
+            fn_ids: fn_ids.clone(),
+            ..Compiler::default()
+        };
+        c.scopes.push(alloc::collections::BTreeMap::new());
+        for p in params {
+            let BindingTarget::Ident(Ident { name, .. }) = &p.target else {
+                return Err(CompileError::Unsupported("destructuring parameter"));
+            };
+            c.declare(name);
+        }
+        let mut last: Option<Reg> = None;
+        for stmt in body {
+            if let Some(r) = c.stmt(stmt)? {
+                last = Some(r);
+            }
+        }
+        if is_main {
+            let src = match last {
+                Some(r) => r,
+                None => c.constant(NanBox::undefined())?,
+            };
+            c.ops.push(Op::Return { src });
+        }
+        Ok(FnProto {
+            n_regs: c.next_reg as usize,
+            n_params: params.len(),
+            ops: c.ops,
+        })
+    }
 }
 
 impl Compiler {
@@ -283,6 +392,16 @@ impl Compiler {
     fn stmt(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
         match stmt {
             Stmt::Empty { .. } => Ok(None),
+            // Function declarations are hoisted into the table; nothing to emit.
+            Stmt::Function(_) => Ok(None),
+            Stmt::Return { argument, .. } => {
+                let src = match argument {
+                    Some(e) => self.expr(e)?,
+                    None => self.constant(NanBox::undefined())?,
+                };
+                self.ops.push(Op::Return { src });
+                Ok(None)
+            }
             Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
             Stmt::Var(decl) => {
                 for d in &decl.declarations {
@@ -523,6 +642,28 @@ impl Compiler {
                 let obj = self.expr(object)?;
                 self.member_read(obj, property)
             }
+            // A direct call to a hoisted function (static dispatch + recursion).
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                let Expr::Ident(id) = &**callee else {
+                    return Err(CompileError::Unsupported("indirect call"));
+                };
+                let func = *self
+                    .fn_ids
+                    .get(&*id.name)
+                    .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                let mut args = Vec::with_capacity(arguments.len());
+                for a in arguments {
+                    let crate::ast::Argument::Item(e) = a else {
+                        return Err(CompileError::Unsupported("spread argument"));
+                    };
+                    args.push(self.expr(e)?);
+                }
+                let dst = self.alloc();
+                self.ops.push(Op::Call { dst, func, args });
+                Ok(dst)
+            }
             Expr::Assign {
                 op, target, value, ..
             } => {
@@ -679,6 +820,36 @@ mod tests {
                 "let a = 0; let b = 1; let n = 10; while (n > 0) { let t = a + b; a = b; b = t; n = n - 1; } a"
             ),
             "55"
+        );
+    }
+
+    #[test]
+    fn bytecode_functions_and_recursion() {
+        // A simple call with arguments.
+        assert_eq!(bc("function add(a, b) { return a + b; } add(3, 4)"), "7");
+        // Recursion: factorial.
+        assert_eq!(
+            bc("function fact(n) { if (n <= 1) { return 1; } return n * fact(n - 1); } fact(6)"),
+            "720"
+        );
+        // Mutual / forward reference (isEven defined before isOdd is used).
+        assert_eq!(
+            bc(
+                "function fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fib(12)"
+            ),
+            "144"
+        );
+        // A function operating on an array argument.
+        assert_eq!(
+            bc(
+                "function sum(a) { let s = 0; for (let i = 0; i < a.length; i = i + 1) { s = s + a[i]; } return s; } sum([5, 10, 15])"
+            ),
+            "30"
+        );
+        // Local variables don't leak between activations.
+        assert_eq!(
+            bc("function f(x) { let y = x * 2; return y; } f(3) + f(10)"),
+            "26"
         );
     }
 
