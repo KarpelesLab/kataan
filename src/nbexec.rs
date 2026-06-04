@@ -86,6 +86,8 @@ pub struct Interp<'a> {
     classes: Vec<&'a Class>,
     /// The current `this` binding (method/constructor receiver).
     this_val: NanBox,
+    /// The superclass to invoke for `super(...)` inside the running constructor.
+    pending_super: Option<(u32, Scope)>,
     /// Captured `console.log` output (a line per call).
     output: String,
 }
@@ -126,6 +128,7 @@ impl<'a> Interp<'a> {
             functions: Vec::new(),
             classes: Vec::new(),
             this_val: NanBox::undefined(),
+            pending_super: None,
             output: String::new(),
         };
         interp.install_globals();
@@ -487,37 +490,116 @@ impl<'a> Interp<'a> {
         NanBox::handle(handle.to_raw())
     }
 
-    /// Instantiates `new Class(args)`: creates an object, installs the prototype
-    /// methods as own closures, runs the field initializers and the constructor
-    /// with `this` bound to the instance.
+    /// Resolves a class's `extends` superclass to `(class_id, env)`, if any.
+    fn resolve_super(
+        &mut self,
+        class: &'a Class,
+        env: &Scope,
+    ) -> Result<Option<(u32, Scope)>, ExecError> {
+        let Some(expr) = &class.super_class else {
+            return Ok(None);
+        };
+        let saved = core::mem::replace(&mut self.current, env.clone());
+        let value = self.eval(expr);
+        self.current = saved;
+        let raw = value?
+            .as_handle()
+            .ok_or(ExecError::Unsupported("extends a non-class"))?;
+        self.realm
+            .class_at(Handle::from_raw(raw))
+            .map(Some)
+            .ok_or(ExecError::Unsupported("extends a non-class"))
+    }
+
+    /// Instantiates `new Class(args)`: creates the object, installs the methods
+    /// of the whole `extends` chain (derived overriding base), then runs the
+    /// constructor (with `super(...)` reaching the base).
     fn instantiate(
         &mut self,
         class_id: u32,
         env: &Scope,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
-        let class = self.classes[class_id as usize];
         let instance = self.realm.new_object();
         let this_val = NanBox::handle(instance.to_raw());
 
-        // Install instance methods (closures over the class's scope).
-        for member in &class.body {
-            if let ClassMember::Method(m) = member
-                && !m.is_static
-                && m.kind == MethodKind::Method
-            {
-                let key = static_key(&m.key)?;
-                let saved = core::mem::replace(&mut self.current, env.clone());
-                let f = self.make_function(&m.value.params, Body::Block(&m.value.body));
-                self.current = saved;
-                self.realm.set_property(instance, &key, f);
+        // Walk the chain derived→base, then install methods base-first so a
+        // derived method overrides an inherited one.
+        let mut chain: Vec<(u32, Scope)> = Vec::new();
+        let mut cur = Some((class_id, env.clone()));
+        while let Some((cid, cenv)) = cur {
+            chain.push((cid, cenv.clone()));
+            cur = self.resolve_super(self.classes[cid as usize], &cenv)?;
+        }
+        for (cid, cenv) in chain.iter().rev() {
+            let class = self.classes[*cid as usize];
+            for member in &class.body {
+                if let ClassMember::Method(m) = member
+                    && !m.is_static
+                    && m.kind == MethodKind::Method
+                {
+                    let key = static_key(&m.key)?;
+                    let saved = core::mem::replace(&mut self.current, cenv.clone());
+                    let f = self.make_function(&m.value.params, Body::Block(&m.value.body));
+                    self.current = saved;
+                    self.realm.set_property(instance, &key, f);
+                }
             }
         }
 
-        // Run field initializers and the constructor with `this` = instance.
-        let saved_scope = core::mem::replace(&mut self.current, env.child());
         let saved_this = core::mem::replace(&mut self.this_val, this_val);
+        let result = self.run_constructor(class_id, env, instance, args);
+        self.this_val = saved_this;
+        result?;
+        Ok(this_val)
+    }
+
+    /// Runs one class's field initializers and constructor on `instance` (with
+    /// `this` already bound). `super(args)` reaches the base via `pending_super`.
+    fn run_constructor(
+        &mut self,
+        class_id: u32,
+        env: &Scope,
+        instance: Handle,
+        args: &[NanBox],
+    ) -> Result<(), ExecError> {
+        let class = self.classes[class_id as usize];
+        let parent = self.resolve_super(class, env)?;
+        let saved_super = core::mem::replace(&mut self.pending_super, parent.clone());
+        let saved_scope = core::mem::replace(&mut self.current, env.child());
         let result = (|| {
+            let ctor = class.body.iter().find_map(|m| match m {
+                ClassMember::Method(m) if m.kind == MethodKind::Constructor => Some(m),
+                _ => None,
+            });
+            match (ctor, &parent) {
+                (Some(ctor), _) => {
+                    let scope = self.current.child();
+                    for (i, param) in ctor.value.params.iter().enumerate() {
+                        if let BindingTarget::Ident(Ident { name, .. }) = &param.target {
+                            let v = args.get(i).copied().unwrap_or(NanBox::undefined());
+                            scope.declare(name, v);
+                        }
+                    }
+                    let saved = core::mem::replace(&mut self.current, scope);
+                    let r = (|| {
+                        for stmt in &ctor.value.body {
+                            if let Flow::Return(_) = self.exec(stmt)? {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    self.current = saved;
+                    r?;
+                }
+                // No own constructor but a base: implicit `super(args)`.
+                (None, Some((pid, penv))) => {
+                    self.run_constructor(*pid, &penv.clone(), instance, args)?;
+                }
+                (None, None) => {}
+            }
+            // Field initializers (after the constructor body / super).
             for member in &class.body {
                 if let ClassMember::Field(field) = member
                     && !field.is_static
@@ -530,30 +612,11 @@ impl<'a> Interp<'a> {
                     self.realm.set_property(instance, &key, v);
                 }
             }
-            if let Some(ctor) = class.body.iter().find_map(|m| match m {
-                ClassMember::Method(m) if m.kind == MethodKind::Constructor => Some(m),
-                _ => None,
-            }) {
-                let scope = self.current.child();
-                for (i, param) in ctor.value.params.iter().enumerate() {
-                    if let BindingTarget::Ident(Ident { name, .. }) = &param.target {
-                        scope.declare(name, args.get(i).copied().unwrap_or(NanBox::undefined()));
-                    }
-                }
-                let saved = core::mem::replace(&mut self.current, scope);
-                for stmt in &ctor.value.body {
-                    if let Flow::Return(_) = self.exec(stmt)? {
-                        break;
-                    }
-                }
-                self.current = saved;
-            }
             Ok(())
         })();
         self.current = saved_scope;
-        self.this_val = saved_this;
-        result?;
-        Ok(this_val)
+        self.pending_super = saved_super;
+        result
     }
 
     /// Evaluates a call's arguments.
@@ -1184,6 +1247,20 @@ impl<'a> Interp<'a> {
             Expr::Call {
                 callee, arguments, ..
             } => {
+                // `super(args)` — invoke the base constructor on the current
+                // instance.
+                if matches!(&**callee, Expr::Super(_)) {
+                    let args = self.eval_args(arguments)?;
+                    let Some((pid, penv)) = self.pending_super.clone() else {
+                        return Err(ExecError::Unsupported(
+                            "super outside a derived constructor",
+                        ));
+                    };
+                    if let Some(raw) = self.this_val.as_handle() {
+                        self.run_constructor(pid, &penv, Handle::from_raw(raw), &args)?;
+                    }
+                    return Ok(NanBox::undefined());
+                }
                 // A `recv.method(args)` call: try a built-in method on the
                 // receiver before falling back to a property-valued function.
                 if let Expr::Member {
@@ -1859,6 +1936,54 @@ mod tests {
         assert_eq!(
             run("let C = class { constructor() { this.k = 9; } }; new C().k"),
             "9"
+        );
+    }
+
+    #[test]
+    fn class_inheritance() {
+        // A subclass inherits a base method.
+        assert_eq!(
+            run("class Animal {
+                   constructor(name) { this.name = name; }
+                   describe() { return this.name; }
+                 }
+                 class Dog extends Animal {}
+                 new Dog('Rex').describe()"),
+            "Rex"
+        );
+        // `super(...)` calls the base constructor; the derived adds state.
+        assert_eq!(
+            run("class Animal {
+                   constructor(name) { this.name = name; }
+                 }
+                 class Dog extends Animal {
+                   constructor(name, breed) { super(name); this.breed = breed; }
+                   tag() { return this.name + ':' + this.breed; }
+                 }
+                 new Dog('Rex', 'Lab').tag()"),
+            "Rex:Lab"
+        );
+        // A derived method overrides the base.
+        assert_eq!(
+            run("class A { kind() { return 'A'; } }
+                 class B extends A { kind() { return 'B'; } }
+                 new B().kind() + new A().kind()"),
+            "BA"
+        );
+        // Implicit super (no derived constructor) forwards the args.
+        assert_eq!(
+            run("class Base { constructor(v) { this.v = v; } }
+                 class Sub extends Base { get() { return this.v; } }
+                 new Sub(7).get()"),
+            "7"
+        );
+        // Three-level chain.
+        assert_eq!(
+            run("class A { constructor() { this.a = 1; } }
+                 class B extends A { constructor() { super(); this.b = 2; } }
+                 class C extends B { constructor() { super(); this.c = 3; } }
+                 let o = new C(); o.a + o.b + o.c"),
+            "6"
         );
     }
 
