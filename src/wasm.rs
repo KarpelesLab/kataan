@@ -209,6 +209,22 @@ fn emit_expr(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmErro
             emit_expr(argument, out, depth)?;
             out.push_str(&format!("{pad}f64.neg\n"));
         }
+        // `a % b` has no native f64 instruction; compute `a - trunc(a/b) * b`.
+        // (Operands are re-emitted; in the numeric subset they are side-effect
+        // free, so this is sound.)
+        Expr::Binary {
+            op: BinaryOp::Mod,
+            left,
+            right,
+            ..
+        } => {
+            emit_expr(left, out, depth)?; // a
+            emit_expr(left, out, depth)?; // a
+            emit_expr(right, out, depth)?; // b
+            out.push_str(&format!("{pad}f64.div\n{pad}f64.trunc\n")); // trunc(a/b)
+            emit_expr(right, out, depth)?; // b
+            out.push_str(&format!("{pad}f64.mul\n{pad}f64.sub\n")); // a - trunc(a/b)*b
+        }
         Expr::Binary {
             op, left, right, ..
         } => {
@@ -629,6 +645,22 @@ fn emit_expr_bin(
             emit_expr_bin(argument, locals, fns, out)?;
             out.push(0x9a); // f64.neg
         }
+        // `a % b` = `a - trunc(a/b) * b` (no native f64 rem).
+        Expr::Binary {
+            op: BinaryOp::Mod,
+            left,
+            right,
+            ..
+        } => {
+            emit_expr_bin(left, locals, fns, out)?; // a
+            emit_expr_bin(left, locals, fns, out)?; // a
+            emit_expr_bin(right, locals, fns, out)?; // b
+            out.push(0xa3); // f64.div
+            out.push(0x9d); // f64.trunc
+            emit_expr_bin(right, locals, fns, out)?; // b
+            out.push(0xa2); // f64.mul
+            out.push(0xa1); // f64.sub
+        }
         Expr::Binary {
             op, left, right, ..
         } => {
@@ -930,6 +962,23 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_modulo() {
+        // `a % b` → a - trunc(a/b) * b.
+        let wat = module("function rem(a, b) { return a % b; }");
+        assert!(wat.contains("f64.div"));
+        assert!(wat.contains("f64.trunc"));
+        assert!(wat.contains("f64.mul"));
+        assert!(wat.contains("f64.sub"));
+        assert_well_formed(&wat);
+        let wasm = binary("function rem(a, b) { return a % b; }");
+        // div(0xa3), trunc(0x9d), mul(0xa2), sub(0xa1) all present.
+        for op in [0xa3u8, 0x9d, 0xa2, 0xa1] {
+            assert!(wasm.contains(&op), "opcode {op:#x} present");
+        }
+        section_ids(&wasm);
     }
 
     #[test]
