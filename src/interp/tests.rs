@@ -426,6 +426,36 @@ fn bytecode_vm_update_operator() {
 }
 
 #[test]
+fn bytecode_vm_object_spread() {
+    assert_eq!(
+        eval_bc("let b = { a: 1, b: 2 }; let m = { ...b, c: 3 }; m.a + m.b + m.c"),
+        "6"
+    );
+    // A later property overrides a spread one.
+    assert_eq!(
+        eval_bc("let b = { x: 1 }; let o = { ...b, x: 99 }; o.x"),
+        "99"
+    );
+    // A later spread overrides earlier keys.
+    assert_eq!(
+        eval_bc("let o = { a: 1, ...{ a: 2, b: 3 } }; o.a + ',' + o.b"),
+        "2,3"
+    );
+    // Spreading from a function result.
+    assert_eq!(
+        eval_bc(
+            "function defaults() { return { color: 'red', size: 1 }; } let o = { ...defaults(), size: 5 }; o.color + o.size"
+        ),
+        "red5"
+    );
+    // The original is not mutated.
+    assert_eq!(
+        eval_bc("let orig = { n: 1 }; let copy = { ...orig, n: 2 }; orig.n + ',' + copy.n"),
+        "1,2"
+    );
+}
+
+#[test]
 fn bytecode_vm_call_spread() {
     // Spread into a plain call, mixed with positional args.
     assert_eq!(

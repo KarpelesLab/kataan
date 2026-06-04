@@ -9,18 +9,19 @@
 //! Supported: literals, template literals, globals + block-scoped locals, the
 //! full operator set (arithmetic/comparison incl. `!=`/`!==`, bitwise/shift,
 //! `&&`/`||`/`??`, unary `-`/`+`/`!`, `typeof`/`void`/`delete`, `++`/`--`, the
-//! ternary, `in`, `instanceof`), object and array literals (with array spread),
-//! member/index access and writes, calls and method calls (with `this` +
-//! built-in prototype dispatch), `new`, assignment (incl. compound, on
-//! identifiers and members), `if`/`else`, `while`/`do-while`/`for`/`for-of`/
-//! `for-in` with `break`/`continue`, `switch`, `try`/`catch`, `throw`, blocks,
-//! `return`, destructuring declarations + parameters (array/object patterns,
-//! defaults, array rest), **functions** (declarations hoisted, function/arrow
+//! ternary, `in`, `instanceof`), object and array literals (with array/object
+//! spread), member/index access and writes, calls and method calls (with
+//! `this` + built-in prototype dispatch, `call`/`apply`, and call-argument
+//! spread), `new`, assignment (incl. compound, on identifiers and members),
+//! `if`/`else`, `while`/`do-while`/`for`/`for-of`/`for-in` with
+//! `break`/`continue`, `switch`, `try`/`catch`, `throw`, blocks, `return`,
+//! destructuring declarations + parameters (array/object patterns, defaults,
+//! array rest), **functions** (declarations hoisted, function/arrow
 //! expressions), and **closures** that capture enclosing variables (boxed in
 //! shared cells, with transitive capture). Not yet: `finally`, classes,
-//! generators, call/object spread, rest parameters, object rest patterns, and
-//! captured (hoisted) function *declarations* — these return a `CompileError`
-//! so the caller falls back to the tree-walker.
+//! generators, rest parameters, object rest patterns, and captured (hoisted)
+//! function *declarations* — these return a `CompileError` so the caller falls
+//! back to the tree-walker.
 
 use crate::ast::{
     Arrow, ArrowBody, AssignOp, BinaryOp, BindingTarget, Expr, Function, LogicalOp, Param,
@@ -1425,8 +1426,36 @@ impl Compiler {
         let dst = self.reg();
         self.emit(Op::NewObject { dst });
         for member in members {
+            // `{ ...src }` copies `src`'s own enumerable properties via
+            // `Object.assign(dst, src)` (which mutates and returns `dst`).
+            if let ObjectMember::Spread { value, .. } = member {
+                let src = self.expr(value)?;
+                let object_global = self.reg();
+                let g = self.add_const(Const::Str(String::from("Object")));
+                self.emit(Op::GetGlobal {
+                    dst: object_global,
+                    name: g,
+                });
+                let key = self.reg();
+                let k = self.add_const(Const::Str(String::from("assign")));
+                self.emit(Op::LoadConst { dst: key, k });
+                let base = self.funcs.last().expect("fn").next_reg;
+                let s1 = self.reg();
+                self.emit(Op::Move { dst: s1, src: dst });
+                let s2 = self.reg();
+                self.emit(Op::Move { dst: s2, src });
+                let ret = self.reg();
+                self.emit(Op::CallMethod {
+                    dst: ret,
+                    recv: object_global,
+                    key,
+                    args_base: base,
+                    argc: 2,
+                });
+                continue;
+            }
             let ObjectMember::Property { key, value, .. } = member else {
-                return Err(CompileError::unsupported("object spread/accessor"));
+                return Err(CompileError::unsupported("object accessor"));
             };
             let val = self.expr(value)?;
             match key {
