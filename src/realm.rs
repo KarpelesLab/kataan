@@ -936,6 +936,10 @@ impl Realm {
                 if let Some((target, _)) = self.proxy_at(h) {
                     return self.type_of(target).unwrap_or("object");
                 }
+                // A bound function (reserved `\0bnd_t` slot) is a function.
+                if self.get_property(h, "\u{0}bnd_t").is_some() {
+                    return "function";
+                }
                 self.heap.get(h).map_or("undefined", Cell::type_of)
             }
             None => v.type_of(),

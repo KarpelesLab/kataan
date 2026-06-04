@@ -215,6 +215,10 @@ const CTOR_KEY: &str = "\u{0}ctor";
 /// yielded values and the current `next()` cursor.
 const GEN_BUF: &str = "\u{0}gbuf";
 const GEN_IDX: &str = "\u{0}gidx";
+/// Reserved hidden keys for a bound function (`Function.prototype.bind`).
+const BOUND_TARGET: &str = "\u{0}bnd_t";
+const BOUND_THIS: &str = "\u{0}bnd_this";
+const BOUND_ARGS: &str = "\u{0}bnd_args";
 /// A safety cap on eagerly-collected `yield`s (an infinite generator would
 /// otherwise hang); exceeding it throws instead.
 const GEN_CAP: usize = 1_000_000;
@@ -1173,11 +1177,31 @@ impl<'a> Interp<'a> {
         self.realm.native_at(handle).is_some()
             || self.realm.function_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
+            // A bound function (`fn.bind(...)`) is callable.
+            || self.realm.get_property(handle, BOUND_TARGET).is_some()
             // A proxy is callable iff its target is.
             || self
                 .realm
                 .proxy_at(handle)
                 .is_some_and(|(t, _)| self.is_callable(t))
+    }
+
+    /// Builds a bound function (`Function.prototype.bind`): an object recording
+    /// the target, the bound `this`, and the leading bound arguments under
+    /// reserved hidden keys. Calling it forwards to the target.
+    fn make_bound_function(
+        &mut self,
+        target: NanBox,
+        this_val: NanBox,
+        bound: Vec<NanBox>,
+    ) -> NanBox {
+        let obj = self.realm.new_object();
+        self.realm.set_hidden_property(obj, BOUND_TARGET, target);
+        self.realm.set_hidden_property(obj, BOUND_THIS, this_val);
+        let arr = self.realm.new_array(bound);
+        self.realm
+            .set_hidden_property(obj, BOUND_ARGS, NanBox::handle(arr.to_raw()));
+        NanBox::handle(obj.to_raw())
     }
 
     /// Calls `callee` with an explicit `this` (a method receiver, or `undefined`
@@ -1192,6 +1216,22 @@ impl<'a> Interp<'a> {
             return Err(ExecError::NotCallable);
         };
         let handle = Handle::from_raw(raw);
+        // A bound function: prepend the bound `this`/args and forward.
+        if let Some(target) = self.realm.get_property(handle, BOUND_TARGET) {
+            let bthis = self
+                .realm
+                .get_property(handle, BOUND_THIS)
+                .unwrap_or(NanBox::undefined());
+            let mut all = self
+                .realm
+                .get_property(handle, BOUND_ARGS)
+                .and_then(|a| a.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
+                .unwrap_or_default();
+            all.extend_from_slice(args);
+            return self.call_with_this(target, bthis, &all);
+        }
         // A callable proxy: route through its `apply` trap, or call the target.
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             let trap = self
@@ -1743,6 +1783,35 @@ impl<'a> Interp<'a> {
             return Ok(None);
         };
         let handle = Handle::from_raw(raw);
+
+        // --- `Function.prototype.call`/`apply`/`bind` on a callable receiver ---
+        if self.is_callable(handle) {
+            match method {
+                "call" => {
+                    let this = arg(0);
+                    let rest: Vec<NanBox> = args.iter().skip(1).copied().collect();
+                    return self.call_with_this(recv, this, &rest).map(Some);
+                }
+                "apply" => {
+                    let this = arg(0);
+                    let list = match arg(1).as_handle().map(Handle::from_raw) {
+                        Some(h) => self
+                            .realm
+                            .array_elements(h)
+                            .map(<[_]>::to_vec)
+                            .unwrap_or_default(),
+                        None => Vec::new(),
+                    };
+                    return self.call_with_this(recv, this, &list).map(Some);
+                }
+                "bind" => {
+                    let this = arg(0);
+                    let bound: Vec<NanBox> = args.iter().skip(1).copied().collect();
+                    return Ok(Some(self.make_bound_function(recv, this, bound)));
+                }
+                _ => {}
+            }
+        }
 
         // --- generator iterator protocol (`next`/`return`) ---
         if let Some(buf) = self
@@ -5620,6 +5689,25 @@ mod tests {
             run("let r='ok'; try { 1n + 1; } catch (e) { r = 'threw'; } r"),
             "threw"
         );
+    }
+
+    #[test]
+    fn function_call_apply_bind() {
+        assert_eq!(
+            run("function f(p){return p + ':' + this.n;} f.call({n:7}, 'a')"),
+            "a:7"
+        );
+        assert_eq!(
+            run("function f(a,b){return a+b+this.n;} f.apply({n:1}, [2,3])"),
+            "6"
+        );
+        assert_eq!(
+            run(
+                "function f(a,b){return a+b+this.n;} let g=f.bind({n:10}, 5); g(20) + ':' + typeof g"
+            ),
+            "35:function"
+        );
+        assert_eq!(run("Math.max.apply(null, [3,9,2])"), "9");
     }
 
     #[test]
