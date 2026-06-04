@@ -99,6 +99,8 @@ struct FnDef<'a> {
     is_async: bool,
     /// Whether this is a generator (`function*`) — run eagerly into an iterator.
     is_generator: bool,
+    /// Whether this is an arrow function (no own `arguments` binding).
+    is_arrow: bool,
     /// The class this is a method of (for `super.method()`), if any.
     home_class: Option<u32>,
 }
@@ -1005,6 +1007,7 @@ impl<'a> Interp<'a> {
             body,
             is_async,
             is_generator,
+            is_arrow: false,
             home_class,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
@@ -1309,6 +1312,13 @@ impl<'a> Interp<'a> {
                     v
                 };
                 self.bind_pattern(&param.target, value)?;
+            }
+            // A non-arrow function gets an `arguments` array-like of its call
+            // arguments. (Arrows inherit the enclosing `arguments`.)
+            if !def.is_arrow {
+                let arr = self.realm.new_array(args.to_vec());
+                self.current
+                    .declare("arguments", NanBox::handle(arr.to_raw()));
             }
             self.run_body(def.body)
         })();
@@ -3942,7 +3952,14 @@ impl<'a> Interp<'a> {
             ArrowBody::Expr(e) => Body::Expr(e),
             ArrowBody::Block(b) => Body::Block(b),
         };
-        self.make_function(&arrow.params, body, arrow.is_async, false)
+        let f = self.make_function(&arrow.params, body, arrow.is_async, false);
+        // Arrows have no own `arguments` binding (they inherit the enclosing one).
+        if let Some(raw) = f.as_handle()
+            && let Some((func_id, _)) = self.realm.function_at(Handle::from_raw(raw))
+        {
+            self.functions[func_id as usize].is_arrow = true;
+        }
+        f
     }
 
     fn member(
@@ -5688,6 +5705,26 @@ mod tests {
         assert_eq!(
             run("let r='ok'; try { 1n + 1; } catch (e) { r = 'threw'; } r"),
             "threw"
+        );
+    }
+
+    #[test]
+    fn arguments_object() {
+        assert_eq!(
+            run(
+                "function s(){ var t=0; for (var i=0;i<arguments.length;i++) t+=arguments[i]; return t; } s(1,2,3,4)"
+            ),
+            "10"
+        );
+        assert_eq!(
+            run("function f(){ return arguments[1]; } f('a','b','c')"),
+            "b"
+        );
+        assert_eq!(run("function f(){ return arguments.length; } f()"), "0");
+        // An arrow inherits the enclosing `arguments`.
+        assert_eq!(
+            run("function outer(){ var a = () => arguments[0]; return a(); } outer('Z')"),
+            "Z"
         );
     }
 
