@@ -1432,6 +1432,21 @@ fn string_method<'a>(s: &str, name: &str, args: &[Value<'a>]) -> Option<Value<'a
             };
             Value::str(normalized)
         }
+        // `str.localeCompare(other)` — Unicode collation order (−1 / 0 / 1).
+        // With `intl` this uses the DUCET collator; otherwise code-point order.
+        "localeCompare" => {
+            use core::cmp::Ordering;
+            let other = arg(args, 0).to_js_string();
+            #[cfg(feature = "intl")]
+            let ordering = intl::unicode::collate::compare(s, &other);
+            #[cfg(not(feature = "intl"))]
+            let ordering = s.cmp(other.as_str());
+            Value::Number(match ordering {
+                Ordering::Less => -1.0,
+                Ordering::Equal => 0.0,
+                Ordering::Greater => 1.0,
+            })
+        }
         "trim" => Value::str(s.trim().to_string()),
         "includes" => Value::Bool(s.contains(&arg(args, 0).to_js_string())),
         "startsWith" => Value::Bool(s.starts_with(&arg(args, 0).to_js_string())),

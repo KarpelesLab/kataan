@@ -2226,6 +2226,23 @@ fn regex_unicode_case_folding() {
 
 #[cfg(feature = "intl")]
 #[test]
+fn string_locale_compare() {
+    // Sign of the comparison.
+    assert_eq!(eval("'a'.localeCompare('b')"), "-1");
+    assert_eq!(eval("'b'.localeCompare('a')"), "1");
+    assert_eq!(eval("'a'.localeCompare('a')"), "0");
+    // Collation order, not code-point order: 'Z' sorts after 'a' (code points
+    // would put 'Z' (0x5A) before 'a' (0x61)).
+    assert_eq!(eval("'Z'.localeCompare('a')"), "1");
+    // Sorting with localeCompare gives locale order (accents/case folded in).
+    assert_eq!(
+        eval("['banana','apple','Cherry'].sort((a,b) => a.localeCompare(b)).join(',')"),
+        "apple,banana,Cherry"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
 fn string_normalize() {
     // "é" as a precomposed character vs. "e" + combining acute accent.
     assert_eq!(eval("'\\u00e9'.length"), "1"); // composed
