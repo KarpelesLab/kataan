@@ -563,7 +563,7 @@ fn run_frame(
                 let srch = object_handle(regs[*src as usize])?;
                 let new_obj = ctx.realm.new_object();
                 for k in ctx.realm.object_keys(srch).unwrap_or_default() {
-                    if !exclude.iter().any(|e| *e == k) {
+                    if !exclude.contains(&k) {
                         let v = ctx
                             .realm
                             .get_property(srch, &k)
