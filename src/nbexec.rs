@@ -3425,12 +3425,38 @@ impl<'a> Interp<'a> {
                             let obj = self.eval(object)?;
                             if let Some(raw) = obj.as_handle() {
                                 let h = Handle::from_raw(raw);
-                                if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property {
-                                    self.realm.delete_property(h, s);
-                                } else if let PropertyKey::Computed(e) = property {
-                                    let k = self.eval(e)?;
-                                    let name = self.member_key(k);
-                                    self.realm.delete_property(h, &name);
+                                let name = match property {
+                                    PropertyKey::Ident(s) | PropertyKey::Str(s) => {
+                                        Some(String::from(&**s))
+                                    }
+                                    PropertyKey::Computed(e) => {
+                                        let k = self.eval(e)?;
+                                        Some(self.member_key(k))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(name) = name {
+                                    // Proxy `deleteProperty` trap, or forward.
+                                    if let Some((target, handler)) = self.realm.proxy_at(h) {
+                                        let trap = self
+                                            .realm
+                                            .get_property(handler, "deleteProperty")
+                                            .unwrap_or(NanBox::undefined());
+                                        if trap
+                                            .as_handle()
+                                            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                                        {
+                                            let kb = self.new_str(&name);
+                                            self.call(
+                                                trap,
+                                                &[NanBox::handle(target.to_raw()), kb],
+                                            )?;
+                                        } else {
+                                            self.realm.delete_property(target, &name);
+                                        }
+                                    } else {
+                                        self.realm.delete_property(h, &name);
+                                    }
                                 }
                             }
                         }
@@ -4138,10 +4164,28 @@ impl<'a> Interp<'a> {
             | BinaryOp::BitXor => return Err(ExecError::Unsupported("** / bitwise need std")),
             BinaryOp::In => {
                 let key = self.member_key(a);
-                let present = b
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .is_some_and(|h| self.realm.has_own(h, &key) || self.realm.is_array(h));
+                let present = match b.as_handle().map(Handle::from_raw) {
+                    // Proxy `has` trap, or forward to the target.
+                    Some(h) if self.realm.proxy_at(h).is_some() => {
+                        let (target, handler) = self.realm.proxy_at(h).unwrap();
+                        let trap = self
+                            .realm
+                            .get_property(handler, "has")
+                            .unwrap_or(NanBox::undefined());
+                        if trap
+                            .as_handle()
+                            .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
+                        {
+                            let kb = self.new_str(&key);
+                            let r = self.call(trap, &[NanBox::handle(target.to_raw()), kb])?;
+                            self.realm.truthy(r)
+                        } else {
+                            self.realm.has_own(target, &key) || self.realm.is_array(target)
+                        }
+                    }
+                    Some(h) => self.realm.has_own(h, &key) || self.realm.is_array(h),
+                    None => false,
+                };
                 NanBox::boolean(present)
             }
             BinaryOp::Instanceof => NanBox::boolean(self.instance_of(a, b)?),
@@ -5379,6 +5423,24 @@ mod tests {
             "56"
         );
         assert_eq!(run("typeof new Proxy({}, {})"), "object");
+        // has trap (for `in`) and deleteProperty trap (for `delete`).
+        assert_eq!(
+            run(
+                "let p=new Proxy({a:1},{has:function(t,k){return k==='magic'||k in t;}}); '' + ('a' in p) + ('magic' in p) + ('z' in p)"
+            ),
+            "truetruefalse"
+        );
+        assert_eq!(
+            run(
+                "let seen=''; let p=new Proxy({a:1},{deleteProperty:function(t,k){seen=k; delete t[k]; return true;}}); delete p.a; seen + ':' + ('a' in p)"
+            ),
+            "a:false"
+        );
+        // Forwarding `in`/`delete` with no traps.
+        assert_eq!(
+            run("let p=new Proxy({x:1},{}); let r = 'x' in p; delete p.x; '' + r + ('x' in p)"),
+            "truefalse"
+        );
     }
 
     #[test]
