@@ -712,6 +712,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
             job.body,
             false,
             super_ctor,
+            &job.fields,
         )?;
         protos.borrow_mut()[job.id as usize] = proto;
     }
@@ -1102,18 +1103,12 @@ fn scan_class<'a>(
         ctor: None,
         methods: Vec::new(),
     };
+    let mut ctor_member: Option<&crate::ast::ClassMethod> = None;
+    let mut fields: Vec<(String, Option<&'a Expr>)> = Vec::new();
     for member in &class.body {
         match member {
             ClassMember::Method(m) if !m.is_static && m.kind == MethodKind::Constructor => {
-                let id = *next_id;
-                *next_id += 1;
-                info.ctor = Some(id);
-                jobs.push(ClassJob {
-                    id,
-                    params: &m.value.params,
-                    body: &m.value.body,
-                    super_of: super_name.clone(),
-                });
+                ctor_member = Some(m);
             }
             ClassMember::Method(m) if !m.is_static && m.kind == MethodKind::Method => {
                 let id = *next_id;
@@ -1125,11 +1120,38 @@ fn scan_class<'a>(
                     params: &m.value.params,
                     body: &m.value.body,
                     super_of: None,
+                    fields: Vec::new(),
                 });
             }
-            // Fields, statics, getters/setters → fall back.
+            ClassMember::Field(f) if !f.is_static => {
+                fields.push((static_key(&f.key)?, f.value.as_ref()));
+            }
+            // Statics and getters/setters → fall back.
             _ => return Err(CompileError::Unsupported("class member")),
         }
+    }
+    // Field initializers run in the constructor; with `extends` their ordering
+    // relative to `super()` falls back for now.
+    if !fields.is_empty() && super_name.is_some() {
+        return Err(CompileError::Unsupported("fields with extends"));
+    }
+    // A constructor job (synthetic when only fields are present) runs the field
+    // initializers, then the declared constructor body.
+    if ctor_member.is_some() || !fields.is_empty() {
+        let id = *next_id;
+        *next_id += 1;
+        info.ctor = Some(id);
+        let (params, body): (&[crate::ast::Param], &[Stmt]) = match ctor_member {
+            Some(m) => (&m.value.params, &m.value.body),
+            None => (&[], &[]),
+        };
+        jobs.push(ClassJob {
+            id,
+            params,
+            body,
+            super_of: super_name.clone(),
+            fields,
+        });
     }
     Ok(info)
 }
@@ -1141,6 +1163,9 @@ struct ClassJob<'a> {
     params: &'a [crate::ast::Param],
     body: &'a [Stmt],
     super_of: Option<String>,
+    /// `(field_name, initializer)` to run at the start of the constructor (only
+    /// the constructor job carries these).
+    fields: Vec<(String, Option<&'a crate::ast::Expr>)>,
 }
 
 /// The nearest constructor up `name`'s `extends` chain (its own, else an
@@ -1223,7 +1248,15 @@ impl Compiler {
         is_main: bool,
     ) -> Result<FnProto, CompileError> {
         Self::compile_fn_inner(
-            fn_ids, classes, protos, params, captures, body, is_main, None,
+            fn_ids,
+            classes,
+            protos,
+            params,
+            captures,
+            body,
+            is_main,
+            None,
+            &[],
         )
     }
 
@@ -1237,6 +1270,7 @@ impl Compiler {
         body: &[Stmt],
         is_main: bool,
         super_ctor: Option<u32>,
+        fields: &[(String, Option<&crate::ast::Expr>)],
     ) -> Result<FnProto, CompileError> {
         // Which of this function's own names are captured by nested functions →
         // must be cells.
@@ -1292,6 +1326,19 @@ impl Compiler {
                     cell: true,
                 },
             );
+        }
+        // Field initializers run first (constructors only): `this.field = init`.
+        for (name, init) in fields {
+            let v = match init {
+                Some(e) => c.expr(e)?,
+                None => c.constant(NanBox::undefined())?,
+            };
+            let this = c.this_reg;
+            c.ops.push(Op::SetProp {
+                obj: this,
+                key: name.clone(),
+                src: v,
+            });
         }
         let mut last: Option<Reg> = None;
         for stmt in body {
@@ -2621,6 +2668,36 @@ mod tests {
                 a.get() + ',' + b.get()"
             ),
             "1,99"
+        );
+    }
+
+    #[test]
+    fn bytecode_class_fields() {
+        // A field initializer, no explicit constructor (synthetic ctor).
+        assert_eq!(
+            bc("class Box { value = 42; get() { return this.value; } } new Box().get()"),
+            "42"
+        );
+        // Fields run before the constructor body.
+        assert_eq!(
+            bc(
+                "class C { base = 10; constructor(n) { this.total = this.base + n; } }
+                new C(5).total"
+            ),
+            "15"
+        );
+        // A field with no initializer is `undefined`, then set in the ctor.
+        assert_eq!(
+            bc("class C { x; constructor() { this.x = 7; } } new C().x"),
+            "7"
+        );
+        // Multiple fields in declaration order.
+        assert_eq!(
+            bc(
+                "class P { a = 1; b = 2; c = 3; sum() { return this.a + this.b + this.c; } }
+                new P().sum()"
+            ),
+            "6"
         );
     }
 
