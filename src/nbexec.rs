@@ -221,6 +221,13 @@ impl<'a> Interp<'a> {
         &self.output
     }
 
+    /// Renders a result value as a display string (for surfacing a completion
+    /// value to a caller / REPL).
+    #[must_use]
+    pub fn display(&self, value: NanBox) -> String {
+        self.realm.to_display_string(value)
+    }
+
     /// Installs a small built-in library: the `Math` object and the global
     /// coercion/parse functions. (A token stdlib to prove the native-call path;
     /// the full port is the remaining migration work.)
@@ -3492,6 +3499,23 @@ fn skip_ws(c: &[char], pos: &mut usize) {
     }
 }
 
+/// Parses and runs `source` on the new representation, returning the captured
+/// `console` output and the program's completion value (as a display string).
+///
+/// This is the high-level entry point to the new-model engine — the bridge the
+/// production pipeline migrates onto.
+///
+/// # Errors
+/// Returns a parse or execution error message on failure.
+pub fn eval_source(source: &str) -> Result<(String, String), String> {
+    let program =
+        crate::parser::Parser::parse_program(source).map_err(|e| alloc::format!("{e}"))?;
+    let mut interp = Interp::new();
+    let value = interp.run(&program).map_err(|e| alloc::format!("{e:?}"))?;
+    let completion = interp.display(value);
+    Ok((String::from(interp.output()), completion))
+}
+
 /// The current time in milliseconds since the Unix epoch (`0.0` without `std`,
 /// which has no clock).
 fn now_ms() -> f64 {
@@ -4140,6 +4164,21 @@ mod tests {
         assert_eq!(run("new Date(0).getDay()"), "4"); // Thursday
         // typeof a date is object.
         assert_eq!(run("typeof new Date(0)"), "object");
+    }
+
+    #[test]
+    fn eval_source_entry_point() {
+        // Captured console output + completion value.
+        let (out, completion) = eval_source("console.log('hi'); 1 + 2").expect("ok");
+        assert_eq!(out, "hi\n");
+        assert_eq!(completion, "3");
+        // A program with no trailing expression yields `undefined`.
+        let (_, c) = eval_source("let x = 5;").expect("ok");
+        assert_eq!(c, "undefined");
+        // A thrown error surfaces as an Err.
+        assert!(eval_source("throw 'boom'").is_err());
+        // A parse error surfaces as an Err.
+        assert!(eval_source("let = ;").is_err());
     }
 
     #[test]

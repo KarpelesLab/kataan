@@ -55,6 +55,15 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Run through the new-representation engine (`ROADMAP.md` §3).
+        ["nbrun", "-e", source] => run_eval_nb(source, "<argv>"),
+        ["nbrun", path] => match std::fs::read_to_string(path) {
+            Ok(source) => run_eval_nb(&source, path),
+            Err(e) => {
+                eprintln!("kataan: cannot read {path}: {e}");
+                ExitCode::FAILURE
+            }
+        },
         ["repl"] => run_repl(),
         ["disasm", "-e", source] => run_disasm(source, "<argv>"),
         ["disasm", path] => match std::fs::read_to_string(path) {
@@ -155,6 +164,24 @@ fn run_eval(source: &str, origin: &str) -> ExitCode {
 /// Parses and evaluates `source` through the **bytecode VM** (falling back to
 /// the tree-walker for unsupported constructs), printing the completion value.
 /// (Kept as an explicit subcommand; `run`/`eval` use the same path now.)
+/// Runs `source` through the new-representation engine (`kataan::nbexec`),
+/// printing its captured `console` output and a non-empty completion value.
+fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
+    match kataan::nbexec::eval_source(source) {
+        Ok((output, completion)) => {
+            print!("{output}");
+            if !completion.is_empty() && completion != "undefined" {
+                println!("{completion}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kataan: {origin}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn run_eval_vm(source: &str, origin: &str) -> ExitCode {
     let program = match Parser::parse_program(source) {
         Ok(p) => p,
@@ -300,6 +327,8 @@ fn print_usage() {
          kataan repl               start an interactive REPL\n    \
          kataan disasm <FILE>      compile to bytecode and print the disassembly\n    \
          kataan bcrun <FILE>       run via the bytecode VM (tree-walker fallback)\n    \
+         kataan nbrun <FILE>       run via the new-representation engine (ROADMAP.md \u{a7}3)\n    \
+         kataan nbrun -e <SOURCE>  run a source string on the new engine\n    \
          kataan --version          print the version\n    \
          kataan --help             show this help\n\
          \n\
