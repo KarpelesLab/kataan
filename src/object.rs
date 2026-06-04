@@ -38,6 +38,9 @@ pub struct Object {
     frozen: bool,
     /// The class this object was instantiated from (for `instanceof`), if any.
     class_tag: Option<u32>,
+    /// The `[[Prototype]]` link (`Object.create`/`getPrototypeOf`), if any. A
+    /// property miss walks this chain.
+    proto: Option<crate::heap::Handle>,
 }
 
 impl Object {
@@ -53,7 +56,19 @@ impl Object {
             hidden: Vec::new(),
             frozen: false,
             class_tag: None,
+            proto: None,
         }
+    }
+
+    /// The `[[Prototype]]` handle, if any.
+    #[must_use]
+    pub fn proto(&self) -> Option<crate::heap::Handle> {
+        self.proto
+    }
+
+    /// Sets the `[[Prototype]]` link (`None` clears it to a null prototype).
+    pub fn set_proto(&mut self, proto: Option<crate::heap::Handle>) {
+        self.proto = proto;
     }
 
     /// Tags this object with the class it was constructed from.
@@ -226,6 +241,9 @@ impl Object {
             fwd(g);
             fwd(s);
         }
+        if let Some(p) = self.proto {
+            self.proto = Some(forward(p));
+        }
     }
 
     /// Calls `visit` for every heap [`Handle`](crate::heap::Handle) this object
@@ -243,6 +261,9 @@ impl Object {
                     visit(crate::heap::Handle::from_raw(raw));
                 }
             }
+        }
+        if let Some(p) = self.proto {
+            visit(p);
         }
     }
 }

@@ -186,6 +186,9 @@ const N_OBJECT_FROM_ENTRIES: u16 = 34;
 const N_OBJECT_FREEZE: u16 = 35;
 const N_OBJECT_IS_FROZEN: u16 = 36;
 const N_OBJECT_GET_OWN_NAMES: u16 = 37;
+const N_OBJECT_CREATE: u16 = 107;
+const N_OBJECT_GET_PROTO: u16 = 108;
+const N_OBJECT_SET_PROTO: u16 = 109;
 const N_SYMBOL: u16 = 38;
 const N_BIGINT: u16 = 39;
 const N_PROXY: u16 = 106;
@@ -330,6 +333,9 @@ impl<'a> Interp<'a> {
                 ("freeze", N_OBJECT_FREEZE),
                 ("isFrozen", N_OBJECT_IS_FROZEN),
                 ("getOwnPropertyNames", N_OBJECT_GET_OWN_NAMES),
+                ("create", N_OBJECT_CREATE),
+                ("getPrototypeOf", N_OBJECT_GET_PROTO),
+                ("setPrototypeOf", N_OBJECT_SET_PROTO),
             ],
         );
         install_namespace(
@@ -470,6 +476,23 @@ impl<'a> Interp<'a> {
                     self.realm.freeze_object(Handle::from_raw(raw));
                 }
                 arg(0) // returns the (now frozen) object
+            }
+            // `Object.create(proto)` — a new object with the given prototype
+            // (`null` → no prototype).
+            N_OBJECT_CREATE => {
+                let proto = arg(0).as_handle().map(Handle::from_raw);
+                NanBox::handle(self.realm.new_object_with_proto(proto).to_raw())
+            }
+            N_OBJECT_GET_PROTO => arg(0)
+                .as_handle()
+                .and_then(|raw| self.realm.object_proto(Handle::from_raw(raw)))
+                .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())),
+            N_OBJECT_SET_PROTO => {
+                if let Some(raw) = arg(0).as_handle() {
+                    let proto = arg(1).as_handle().map(Handle::from_raw);
+                    self.realm.set_object_proto(Handle::from_raw(raw), proto);
+                }
+                arg(0)
             }
             N_OBJECT_IS_FROZEN => NanBox::boolean(
                 arg(0)
@@ -3822,7 +3845,31 @@ impl<'a> Interp<'a> {
                 _ => self.member_value(handle, name),
             });
         }
-        Ok(self.member_value(handle, name))
+        // Own property (or a built-in like `length`) wins.
+        let direct = self.member_value(handle, name);
+        if !matches!(direct.unpack(), Unpacked::Undefined) || self.realm.has_own(handle, name) {
+            return Ok(direct);
+        }
+        // Otherwise walk the `[[Prototype]]` chain for an inherited property or
+        // accessor (the receiver stays `handle`).
+        let mut cur = self.realm.object_proto(handle);
+        while let Some(p) = cur {
+            if let Some((getter, _)) = self.realm.accessor(p, name) {
+                if matches!(getter.unpack(), Unpacked::Undefined) {
+                    return Ok(NanBox::undefined());
+                }
+                let this = NanBox::handle(handle.to_raw());
+                return self.call_with_this(getter, this, &[]);
+            }
+            if self.realm.has_own(p, name) {
+                return Ok(self
+                    .realm
+                    .get_property(p, name)
+                    .unwrap_or(NanBox::undefined()));
+            }
+            cur = self.realm.object_proto(p);
+        }
+        Ok(direct)
     }
 
     fn member_value(&self, handle: crate::heap::Handle, key: &str) -> NanBox {
@@ -5400,6 +5447,37 @@ mod tests {
             run("let r='ok'; try { 1n + 1; } catch (e) { r = 'threw'; } r"),
             "threw"
         );
+    }
+
+    #[test]
+    fn prototype_chains() {
+        // Inherited data property and method (this-bound), own shadows inherited.
+        assert_eq!(
+            run(
+                "let p={k:'base',m:function(){return this.n;}}; let o=Object.create(p); o.n=7; o.k + ':' + o.m()"
+            ),
+            "base:7"
+        );
+        // Object.keys excludes inherited; getPrototypeOf identity.
+        assert_eq!(
+            run("let p={a:1}; let o=Object.create(p); o.b=2; Object.keys(o).join(',')"),
+            "b"
+        );
+        assert_eq!(
+            run("let p={}; Object.getPrototypeOf(Object.create(p)) === p"),
+            "true"
+        );
+        assert_eq!(
+            run("Object.getPrototypeOf(Object.create(null)) === null"),
+            "true"
+        );
+        // Two-level chain: nearest prototype wins.
+        assert_eq!(
+            run("let a={x:1}; let b=Object.create(a); b.x=2; let c=Object.create(b); c.x"),
+            "2"
+        );
+        // setPrototypeOf installs the link.
+        assert_eq!(run("let o={}; Object.setPrototypeOf(o,{v:9}); o.v"), "9");
     }
 
     #[test]

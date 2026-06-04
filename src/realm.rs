@@ -356,6 +356,33 @@ impl Realm {
         )
     }
 
+    /// The `[[Prototype]]` handle of the object at `handle`, if any.
+    #[must_use]
+    pub fn object_proto(&self, handle: Handle) -> Option<Handle> {
+        self.heap.get(handle)?.as_object()?.proto()
+    }
+
+    /// Sets the `[[Prototype]]` of the object at `handle`.
+    pub fn set_object_proto(&mut self, handle: Handle, proto: Option<Handle>) -> bool {
+        match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            Some(obj) => {
+                obj.set_proto(proto);
+                if let Some(p) = proto {
+                    self.write_barrier(handle, NanBox::handle(p.to_raw()));
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Allocates an empty object whose `[[Prototype]]` is `proto` (`Object.create`).
+    pub fn new_object_with_proto(&mut self, proto: Option<Handle>) -> Handle {
+        let h = self.new_object();
+        self.set_object_proto(h, proto);
+        h
+    }
+
     /// Freezes the object at `handle` (`Object.freeze`); returns whether it was
     /// an object.
     pub fn freeze_object(&mut self, handle: Handle) -> bool {
