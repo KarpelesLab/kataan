@@ -872,6 +872,8 @@ impl<'a> Interp<'a> {
                     this
                 })
             }
+            // A native constructor (e.g. `Error`) builds and returns the object.
+            Value::Native(_) => self.call_with_this(callee, Value::Undefined, args),
             _ => Err(Value::str(alloc::format!(
                 "{} is not a constructor",
                 callee.to_js_string()

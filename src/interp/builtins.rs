@@ -40,6 +40,34 @@ impl<'a> Interp<'a> {
         self.install_object_ctor();
         self.install_array_ctor();
         self.install_number_globals();
+        self.install_errors();
+    }
+
+    fn install_errors(&self) {
+        for name in [
+            "Error",
+            "TypeError",
+            "RangeError",
+            "SyntaxError",
+            "ReferenceError",
+            "EvalError",
+            "URIError",
+        ] {
+            self.define_global(
+                name,
+                native(name, move |a| {
+                    let obj = Obj::object();
+                    obj.set("name", Value::str(name));
+                    let msg = if a.is_empty() {
+                        String::new()
+                    } else {
+                        arg(a, 0).to_js_string()
+                    };
+                    obj.set("message", Value::str(msg));
+                    Ok(Value::Object(obj))
+                }),
+            );
+        }
     }
 
     fn install_math(&self) {

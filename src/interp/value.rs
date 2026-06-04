@@ -341,7 +341,18 @@ impl<'a> Value<'a> {
                     .collect();
                 parts.join(",")
             }
-            Value::Object(_) => "[object Object]".into(),
+            // Error-like objects (own `name` + `message`) render `name: message`.
+            Value::Object(o) => match (o.get_own("name"), o.get_own("message")) {
+                (Some(name), Some(message)) => {
+                    let m = message.to_js_string();
+                    if m.is_empty() {
+                        name.to_js_string()
+                    } else {
+                        alloc::format!("{}: {m}", name.to_js_string())
+                    }
+                }
+                _ => "[object Object]".into(),
+            },
         }
     }
 

@@ -323,6 +323,18 @@ fn classes_inheritance() {
 }
 
 #[test]
+fn error_objects() {
+    assert_eq!(eval("let e = new Error('boom'); e.message"), "boom");
+    assert_eq!(eval("new TypeError('bad').name"), "TypeError");
+    assert_eq!(eval("String(new RangeError('out'))"), "RangeError: out");
+    assert_eq!(
+        eval("try { throw new Error('caught'); } catch (e) { e.message; }"),
+        "caught"
+    );
+    assert_eq!(eval("`${new Error('x')}`"), "Error: x");
+}
+
+#[test]
 fn in_operator() {
     assert_eq!(eval("'a' in { a: 1 }"), "true");
     assert_eq!(eval("'b' in { a: 1 }"), "false");
