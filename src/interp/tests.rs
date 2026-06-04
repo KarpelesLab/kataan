@@ -648,6 +648,22 @@ fn promises() {
     );
     // instanceof Promise.
     assert_eq!(eval("Promise.resolve(1) instanceof Promise"), "true");
+    // Promise.allSettled records every outcome and never rejects.
+    assert_eq!(
+        eval_global(
+            "let r; Promise.allSettled([Promise.resolve(1), Promise.reject('e')]).then(a => r = a.map(d => d.status).join(','));",
+            "r"
+        ),
+        "fulfilled,rejected"
+    );
+    // queueMicrotask runs after synchronous code.
+    assert_eq!(
+        eval_global(
+            "let log = 's'; queueMicrotask(() => log += 'm'); log += 'y';",
+            "log"
+        ),
+        "sym"
+    );
 }
 
 #[test]

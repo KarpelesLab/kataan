@@ -174,6 +174,74 @@ impl<'a> Interp<'a> {
             }),
         );
 
+        // `Promise.allSettled(iterable)` — never rejects; resolves to an array
+        // of `{ status, value }` / `{ status, reason }` descriptors.
+        let q = queue.clone();
+        let p = Rc::clone(&proto);
+        ctor.set(
+            "allSettled",
+            native("allSettled", move |a| {
+                let (obj, state) = new_promise(&q, &p);
+                let (resolve, _) = make_resolvers(&state, &q);
+                let mut elements = Vec::new();
+                super::builtins::iterate_into(
+                    &a.first().cloned().unwrap_or(Value::Undefined),
+                    &mut elements,
+                );
+                let n = elements.len();
+                if n == 0 {
+                    let _ = invoke(&resolve, &[Value::Object(Obj::array(Vec::new()))]);
+                    return Ok(Value::Object(obj));
+                }
+                let results = Rc::new(RefCell::new(alloc::vec![Value::Undefined; n]));
+                let remaining = Rc::new(RefCell::new(n));
+                for (i, element) in elements.into_iter().enumerate() {
+                    // A descriptor-recording handler for each settlement path.
+                    let mk = |status: &'static str, key: &'static str| {
+                        let results_c = Rc::clone(&results);
+                        let remaining_c = Rc::clone(&remaining);
+                        let resolve_c = resolve.clone();
+                        native("", move |b| {
+                            let desc = Obj::object();
+                            desc.set("status", Value::str(status));
+                            desc.set(key, b.first().cloned().unwrap_or(Value::Undefined));
+                            results_c.borrow_mut()[i] = Value::Object(desc);
+                            *remaining_c.borrow_mut() -= 1;
+                            if *remaining_c.borrow() == 0 {
+                                let arr = Obj::array(results_c.borrow().clone());
+                                let _ = invoke(&resolve_c, &[Value::Object(arr)]);
+                            }
+                            Ok(Value::Undefined)
+                        })
+                    };
+                    settle_element(
+                        &element,
+                        mk("fulfilled", "value"),
+                        mk("rejected", "reason"),
+                        &q,
+                    );
+                }
+                Ok(Value::Object(obj))
+            }),
+        );
+
+        // `queueMicrotask(callback)` — schedule a callback on the microtask
+        // queue.
+        let q = queue.clone();
+        self.define_global(
+            "queueMicrotask",
+            native("queueMicrotask", move |a| {
+                let callback = a.first().cloned().unwrap_or(Value::Undefined);
+                if callback.is_callable() {
+                    q.borrow_mut()
+                        .push_back(Box::new(move |interp: &mut Interp<'a>| {
+                            let _ = interp.call_with_this(callback, Value::Undefined, Vec::new());
+                        }));
+                }
+                Ok(Value::Undefined)
+            }),
+        );
+
         ctor.set("prototype", Value::Object(proto));
         self.define_global("Promise", Value::Object(ctor));
     }
