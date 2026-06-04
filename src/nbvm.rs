@@ -61,6 +61,14 @@ pub enum Op {
     HasProp { dst: Reg, key: Reg, obj: Reg },
     /// Tags the object in `obj` with `class_id` (for `instanceof`).
     SetClassTag { obj: Reg, class_id: u32 },
+    /// Defines accessor `key` on `obj` with `getter`/`setter` closure registers
+    /// (either may be `undefined`).
+    DefineAccessor {
+        obj: Reg,
+        key: String,
+        getter: Reg,
+        setter: Reg,
+    },
     /// `dst = (obj instanceof C)` — true iff `obj`'s class tag is one of `ids`
     /// (the queried class and all its subclasses, computed at compile time).
     InstanceOf {
@@ -342,6 +350,23 @@ fn run_frame(
             .ok_or(VmError::NotAnObject)
     };
 
+    // Routes a `VmError` to the innermost handler (or unwinds): on a `Thrown`,
+    // bind the value in the catch register and jump; otherwise propagate.
+    macro_rules! handle_throw {
+        ($e:expr) => {
+            match $e {
+                VmError::Thrown(v) => match handlers.pop() {
+                    Some((target, reg)) => {
+                        regs[reg as usize] = v;
+                        pc = target;
+                    }
+                    None => return Err(VmError::Thrown(v)),
+                },
+                other => return Err(other),
+            }
+        };
+    }
+
     while pc < program.len() {
         let op = &program[pc];
         pc += 1;
@@ -384,6 +409,21 @@ fn run_frame(
             Op::SetClassTag { obj, class_id } => {
                 if let Some(h) = regs[*obj as usize].as_handle().map(Handle::from_raw) {
                     ctx.realm.set_class_tag(h, *class_id);
+                }
+            }
+            Op::DefineAccessor {
+                obj,
+                key,
+                getter,
+                setter,
+            } => {
+                if let Some(h) = regs[*obj as usize].as_handle().map(Handle::from_raw) {
+                    ctx.realm.define_accessor(
+                        h,
+                        key,
+                        regs[*getter as usize],
+                        regs[*setter as usize],
+                    );
                 }
             }
             Op::InstanceOf { dst, obj, ids } => {
@@ -551,14 +591,39 @@ fn run_frame(
             }
             Op::SetProp { obj, key, src } => {
                 let handle = object_handle(regs[*obj as usize])?;
-                ctx.realm.set_property(handle, key, regs[*src as usize]);
+                let recv = regs[*obj as usize];
+                // A setter accessor takes precedence over a data slot.
+                match ctx.realm.accessor(handle, key) {
+                    Some((_, setter)) if setter.as_handle().is_some() => {
+                        if let Err(e) =
+                            call_closure(ctx, funcs, setter, &[regs[*src as usize]], recv)
+                        {
+                            handle_throw!(e);
+                        }
+                    }
+                    _ => {
+                        ctx.realm.set_property(handle, key, regs[*src as usize]);
+                    }
+                }
             }
             Op::GetProp { dst, obj, key } => {
                 let handle = object_handle(regs[*obj as usize])?;
-                regs[*dst as usize] = ctx
-                    .realm
-                    .get_property(handle, key)
-                    .unwrap_or(NanBox::undefined());
+                let recv = regs[*obj as usize];
+                // A getter accessor takes precedence over a data slot.
+                match ctx.realm.accessor(handle, key) {
+                    Some((getter, _)) if getter.as_handle().is_some() => {
+                        match call_closure(ctx, funcs, getter, &[], recv) {
+                            Ok(v) => regs[*dst as usize] = v,
+                            Err(e) => handle_throw!(e),
+                        }
+                    }
+                    _ => {
+                        regs[*dst as usize] = ctx
+                            .realm
+                            .get_property(handle, key)
+                            .unwrap_or(NanBox::undefined());
+                    }
+                }
             }
             Op::Call { dst, func, args } => {
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
@@ -1746,9 +1811,22 @@ fn scan_class<'a>(
         super_name: super_name.clone(),
         ctor: None,
         methods: Vec::new(),
+        accessors: Vec::new(),
     };
     let mut ctor_member: Option<&crate::ast::ClassMethod> = None;
     let mut fields: Vec<(String, Option<&'a Expr>)> = Vec::new();
+    // Records a getter/setter id against accessor `name`.
+    let add_accessor = |name: String,
+                        getter: Option<u32>,
+                        setter: Option<u32>,
+                        acc: &mut Vec<(String, Option<u32>, Option<u32>)>| {
+        if let Some(a) = acc.iter_mut().find(|(n, _, _)| *n == name) {
+            a.1 = a.1.or(getter);
+            a.2 = a.2.or(setter);
+        } else {
+            acc.push((name, getter, setter));
+        }
+    };
     for member in &class.body {
         match member {
             ClassMember::Method(m) if !m.is_static && m.kind == MethodKind::Constructor => {
@@ -1767,10 +1845,29 @@ fn scan_class<'a>(
                     fields: Vec::new(),
                 });
             }
+            ClassMember::Method(m)
+                if !m.is_static && matches!(m.kind, MethodKind::Get | MethodKind::Set) =>
+            {
+                let id = *next_id;
+                *next_id += 1;
+                let name = static_key(&m.key)?;
+                jobs.push(ClassJob {
+                    id,
+                    params: &m.value.params,
+                    body: &m.value.body,
+                    super_of: None,
+                    fields: Vec::new(),
+                });
+                if m.kind == MethodKind::Get {
+                    add_accessor(name, Some(id), None, &mut info.accessors);
+                } else {
+                    add_accessor(name, None, Some(id), &mut info.accessors);
+                }
+            }
             ClassMember::Field(f) if !f.is_static => {
                 fields.push((static_key(&f.key)?, f.value.as_ref()));
             }
-            // Statics and getters/setters → fall back.
+            // Statics → fall back.
             _ => return Err(CompileError::Unsupported("class member")),
         }
     }
@@ -1837,6 +1934,8 @@ struct ClassInfo {
     ctor: Option<u32>,
     /// `(method_name, function_id)` for each instance method.
     methods: Vec<(String, u32)>,
+    /// `(name, getter_id, setter_id)` for each accessor property.
+    accessors: Vec<(String, Option<u32>, Option<u32>)>,
 }
 
 /// A variable binding: the register holding it, and whether that register holds
@@ -2917,7 +3016,9 @@ impl Compiler {
                     chain.push(name);
                 }
                 for name in chain.iter().rev() {
-                    let methods = self.classes.get(name).expect("class").methods.clone();
+                    let cls = self.classes.get(name).expect("class");
+                    let methods = cls.methods.clone();
+                    let accessors = cls.accessors.clone();
                     for (mname, mid) in &methods {
                         let m = self.alloc();
                         self.ops.push(Op::LoadFunc { dst: m, func: *mid });
@@ -2925,6 +3026,25 @@ impl Compiler {
                             obj: instance,
                             key: mname.clone(),
                             src: m,
+                        });
+                    }
+                    // Install getter/setter accessors.
+                    for (aname, getter_id, setter_id) in &accessors {
+                        let load = |this: &mut Self, id: Option<u32>| match id {
+                            Some(fid) => {
+                                let r = this.alloc();
+                                this.ops.push(Op::LoadFunc { dst: r, func: fid });
+                                r
+                            }
+                            None => this.constant(NanBox::undefined()).expect("const"),
+                        };
+                        let getter = load(self, *getter_id);
+                        let setter = load(self, *setter_id);
+                        self.ops.push(Op::DefineAccessor {
+                            obj: instance,
+                            key: aname.clone(),
+                            getter,
+                            setter,
                         });
                     }
                 }
@@ -3655,6 +3775,40 @@ mod tests {
                 a.get() + ',' + b.get()"
             ),
             "1,99"
+        );
+    }
+
+    #[test]
+    fn bytecode_class_accessors() {
+        // A getter computed from instance state.
+        assert_eq!(
+            bc("class C { constructor(w, h) { this.w = w; this.h = h; }
+                  get area() { return this.w * this.h; } }
+                new C(3, 4).area"),
+            "12"
+        );
+        // A setter mutating instance state.
+        assert_eq!(
+            bc("class T { constructor() { this.c = 0; }
+                  get count() { return this.c; }
+                  set count(v) { this.c = v * 2; } }
+                let t = new T(); t.count = 5; t.count"),
+            "10"
+        );
+        // Getter/setter pair backing a private-ish field.
+        assert_eq!(
+            bc("class Box { constructor(v) { this._v = v; }
+                  get value() { return this._v; }
+                  set value(x) { this._v = x + 1; } }
+                let b = new Box(10); b.value = 20; b.value"),
+            "21"
+        );
+        // An inherited getter.
+        assert_eq!(
+            bc("class A { get kind() { return 'A'; } }
+                class B extends A {}
+                new B().kind"),
+            "A"
         );
     }
 
