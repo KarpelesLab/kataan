@@ -492,6 +492,18 @@ impl Realm {
         }
     }
 
+    /// Sets an array's `length` (`arr.length = n`): truncates if smaller, pads
+    /// with `undefined` if larger. Returns `false` if not an array.
+    pub fn set_array_length(&mut self, handle: Handle, len: usize) -> bool {
+        match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
+            Some(a) => {
+                a.resize(len, NanBox::undefined());
+                true
+            }
+            None => false,
+        }
+    }
+
     /// `arr.pop()` — removes and returns the last element (`undefined` if empty
     /// or not an array).
     pub fn array_pop(&mut self, handle: Handle) -> NanBox {

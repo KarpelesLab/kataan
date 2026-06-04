@@ -2323,6 +2323,15 @@ impl<'a> Interp<'a> {
                     .collect();
                 return Ok(Some(self.new_str(&s)));
             }
+            // `String.fromCodePoint(...cps)` — each argument is a full Unicode
+            // code point (may be astral).
+            Some(N_STRING) if method == "fromCodePoint" => {
+                let s: String = args
+                    .iter()
+                    .filter_map(|a| char::from_u32(self.realm.to_number(*a) as u32))
+                    .collect();
+                return Ok(Some(self.new_str(&s)));
+            }
             _ => {}
         }
         // --- Date instance methods ---
@@ -4358,16 +4367,28 @@ impl<'a> Interp<'a> {
     }
 
     fn eval_fn_expr(&mut self, func: &'a Function) -> NanBox {
-        let f = self.make_function(
+        // A named function expression binds its own name in an intermediate scope
+        // that the closure captures, so the body can recurse by that name.
+        if let Some(id) = &func.id {
+            let inner = self.current.child();
+            let saved = core::mem::replace(&mut self.current, inner);
+            let f = self.make_function(
+                &func.params,
+                Body::Block(&func.body),
+                func.is_async,
+                func.is_generator,
+            );
+            self.set_fn_name(f, &id.name);
+            self.current.declare(&id.name, f);
+            self.current = saved;
+            return f;
+        }
+        self.make_function(
             &func.params,
             Body::Block(&func.body),
             func.is_async,
             func.is_generator,
-        );
-        if let Some(id) = &func.id {
-            self.set_fn_name(f, &id.name);
-        }
-        f
+        )
     }
 
     fn eval_arrow(&mut self, arrow: &'a Arrow) -> NanBox {
@@ -4689,7 +4710,14 @@ impl<'a> Interp<'a> {
                 }
             }
             PropertyKey::Ident(s) | PropertyKey::Str(s) => {
-                self.realm.set_property(handle, s, new);
+                // `arr.length = n` resizes the array (truncate/pad), rather than
+                // storing a `length` property.
+                if &**s == "length" && self.realm.is_array(handle) {
+                    let n = self.realm.to_number(new).max(0.0) as usize;
+                    self.realm.set_array_length(handle, n);
+                } else {
+                    self.realm.set_property(handle, s, new);
+                }
             }
             PropertyKey::Number(n) => {
                 self.realm.set_property(handle, &alloc::format!("{n}"), new);
@@ -6341,6 +6369,31 @@ mod tests {
         // name from a declaration and a named function expression.
         assert_eq!(run("function greet(){} greet.name"), "greet");
         assert_eq!(run("let g = function inner(){}; g.name"), "inner");
+    }
+
+    #[test]
+    fn named_function_expression_recurses() {
+        assert_eq!(
+            run("let f = function fac(n){ return n <= 1 ? 1 : n * fac(n-1); }; f(5)"),
+            "120"
+        );
+        // The name is scoped to the expression, not visible outside.
+        assert_eq!(
+            run("let f = function self(n){ return n===0?0:n+self(n-1); }; f(4)"),
+            "10"
+        );
+    }
+
+    #[test]
+    fn array_length_assignment_resizes() {
+        assert_eq!(run("let a=[1,2,3,4,5]; a.length=3; a.join(',')"), "1,2,3");
+        assert_eq!(
+            run("let a=[1,2]; a.length=4; String(a[3]) + ':' + a.length"),
+            "undefined:4"
+        );
+        assert_eq!(run("let a=[1,2,3]; a.length=0; a.length"), "0");
+        // String.fromCodePoint.
+        assert_eq!(run("String.fromCodePoint(97, 98, 99)"), "abc");
     }
 
     #[test]
