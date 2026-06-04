@@ -189,6 +189,8 @@ const N_OBJECT_GET_OWN_NAMES: u16 = 37;
 const N_OBJECT_CREATE: u16 = 107;
 const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
+const N_OBJECT_DEFINE_PROP: u16 = 110;
+const N_OBJECT_GET_OWN_DESC: u16 = 111;
 const N_SYMBOL: u16 = 38;
 const N_BIGINT: u16 = 39;
 const N_PROXY: u16 = 106;
@@ -336,6 +338,8 @@ impl<'a> Interp<'a> {
                 ("create", N_OBJECT_CREATE),
                 ("getPrototypeOf", N_OBJECT_GET_PROTO),
                 ("setPrototypeOf", N_OBJECT_SET_PROTO),
+                ("defineProperty", N_OBJECT_DEFINE_PROP),
+                ("getOwnPropertyDescriptor", N_OBJECT_GET_OWN_DESC),
             ],
         );
         install_namespace(
@@ -493,6 +497,64 @@ impl<'a> Interp<'a> {
                     self.realm.set_object_proto(Handle::from_raw(raw), proto);
                 }
                 arg(0)
+            }
+            // `Object.defineProperty(obj, key, descriptor)` — a `value`
+            // descriptor sets the property; a `get`/`set` descriptor defines an
+            // accessor.
+            N_OBJECT_DEFINE_PROP => {
+                if let Some(oraw) = arg(0).as_handle()
+                    && let Some(draw) = arg(2).as_handle()
+                {
+                    let obj = Handle::from_raw(oraw);
+                    let desc = Handle::from_raw(draw);
+                    let key = self.realm.to_display_string(arg(1));
+                    let getter = self.realm.get_property(desc, "get");
+                    let setter = self.realm.get_property(desc, "set");
+                    if getter.is_some() || setter.is_some() {
+                        self.realm.define_accessor(
+                            obj,
+                            &key,
+                            getter.unwrap_or(NanBox::undefined()),
+                            setter.unwrap_or(NanBox::undefined()),
+                        );
+                    } else {
+                        let value = self
+                            .realm
+                            .get_property(desc, "value")
+                            .unwrap_or(NanBox::undefined());
+                        self.realm.set_property(obj, &key, value);
+                    }
+                }
+                arg(0)
+            }
+            N_OBJECT_GET_OWN_DESC => {
+                let mut result = NanBox::undefined();
+                if let Some(oraw) = arg(0).as_handle() {
+                    let obj = Handle::from_raw(oraw);
+                    let key = self.realm.to_display_string(arg(1));
+                    if let Some((g, s)) = self.realm.accessor(obj, &key) {
+                        let d = self.realm.new_object();
+                        self.realm.set_property(d, "get", g);
+                        self.realm.set_property(d, "set", s);
+                        let t = NanBox::boolean(true);
+                        self.realm.set_property(d, "enumerable", t);
+                        self.realm.set_property(d, "configurable", t);
+                        result = NanBox::handle(d.to_raw());
+                    } else if self.realm.has_own(obj, &key) {
+                        let v = self
+                            .realm
+                            .get_property(obj, &key)
+                            .unwrap_or(NanBox::undefined());
+                        let d = self.realm.new_object();
+                        self.realm.set_property(d, "value", v);
+                        let t = NanBox::boolean(true);
+                        self.realm.set_property(d, "writable", t);
+                        self.realm.set_property(d, "enumerable", t);
+                        self.realm.set_property(d, "configurable", t);
+                        result = NanBox::handle(d.to_raw());
+                    }
+                }
+                result
             }
             N_OBJECT_IS_FROZEN => NanBox::boolean(
                 arg(0)
@@ -2169,6 +2231,17 @@ impl<'a> Interp<'a> {
                 // `normalize()` — Unicode normalization; a no-op here (the engine
                 // stores strings as-is), sufficient for already-normal input.
                 "normalize" => Some(self.new_str(&s)),
+                // `localeCompare(other)` — ordering sign (code-point order; no
+                // locale tailoring).
+                "localeCompare" => {
+                    let other = self.realm.to_display_string(arg(0));
+                    let cmp = match s.as_str().cmp(other.as_str()) {
+                        core::cmp::Ordering::Less => -1.0,
+                        core::cmp::Ordering::Equal => 0.0,
+                        core::cmp::Ordering::Greater => 1.0,
+                    };
+                    Some(NanBox::number(cmp))
+                }
                 _ => None,
             };
             if out.is_some() {
@@ -2241,10 +2314,32 @@ impl<'a> Interp<'a> {
                 "includes" => {
                     let target = arg(0);
                     let from = array_from_index(&self.realm, arg(1), elems.len());
-                    let found = elems[from..]
-                        .iter()
-                        .any(|e| self.realm.strict_equals(*e, target));
+                    // SameValueZero: like `===` but `NaN` matches `NaN`.
+                    let t_nan = target.as_number().is_some_and(f64::is_nan);
+                    let found = elems[from..].iter().any(|e| {
+                        self.realm.strict_equals(*e, target)
+                            || (t_nan && e.as_number().is_some_and(f64::is_nan))
+                    });
                     return Ok(Some(NanBox::boolean(found)));
+                }
+                // `toSorted`/`toReversed`/`with` — non-mutating array methods.
+                "toReversed" => {
+                    let mut out = elems.clone();
+                    out.reverse();
+                    return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
+                }
+                "with" => {
+                    let mut out = elems.clone();
+                    let i = self.realm.to_number(arg(0));
+                    let idx = if i < 0.0 { out.len() as f64 + i } else { i } as usize;
+                    if idx < out.len() {
+                        out[idx] = arg(1);
+                    }
+                    return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
+                }
+                "toSorted" => {
+                    let sorted = self.sort_array(elems.clone(), arg(0))?;
+                    return Ok(Some(NanBox::handle(self.realm.new_array(sorted).to_raw())));
                 }
                 "indexOf" => {
                     let target = arg(0);
@@ -4933,6 +5028,40 @@ mod tests {
             run("let a=[1,2,3]; let f=a.shift(); f + ':' + a.join(',')"),
             "1:2,3"
         );
+        // Non-mutating: toSorted/toReversed/with leave the original.
+        assert_eq!(
+            run(
+                "let a=[3,1,2]; let s=a.toSorted(function(x,y){return x-y;}); s.join('')+'|'+a.join('')"
+            ),
+            "123|312"
+        );
+        assert_eq!(run("[1,2,3].toReversed().join(',')"), "3,2,1");
+        assert_eq!(run("[1,2,3].with(1,9).join(',')"), "1,9,3");
+        // includes uses SameValueZero (NaN matches).
+        assert_eq!(run("[NaN, 1].includes(NaN)"), "true");
+        assert_eq!(run("[1, 2].includes(NaN)"), "false");
+    }
+
+    #[test]
+    fn define_property_and_locale_compare() {
+        assert_eq!(
+            run("let o={}; Object.defineProperty(o,'x',{value:42}); o.x"),
+            "42"
+        );
+        assert_eq!(
+            run(
+                "let o={n:1}; Object.defineProperty(o,'d',{get:function(){return this.n+1;}}); o.d"
+            ),
+            "2"
+        );
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'x',{value:7}); Object.getOwnPropertyDescriptor(o,'x').value"
+            ),
+            "7"
+        );
+        assert_eq!(run("'apple'.localeCompare('banana') < 0"), "true");
+        assert_eq!(run("'x'.localeCompare('x')"), "0");
         // fill: whole array, a [start,end) range, and a negative start.
         assert_eq!(run("[0, 0, 0].fill(7).join(',')"), "7,7,7");
         assert_eq!(run("[1, 2, 3, 4].fill(9, 1, 3).join(',')"), "1,9,9,4");

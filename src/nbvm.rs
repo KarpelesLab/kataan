@@ -1498,7 +1498,12 @@ fn builtin_method(
             }
             "includes" => {
                 let t = arg0();
-                NanBox::boolean(elems(ctx).iter().any(|e| ctx.realm.strict_equals(*e, t)))
+                // SameValueZero: like `===` but `NaN` matches `NaN`.
+                let t_nan = t.as_number().is_some_and(f64::is_nan);
+                NanBox::boolean(elems(ctx).iter().any(|e| {
+                    ctx.realm.strict_equals(*e, t)
+                        || (t_nan && e.as_number().is_some_and(f64::is_nan))
+                }))
             }
             "indexOf" => {
                 let t = arg0();
