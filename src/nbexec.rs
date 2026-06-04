@@ -4102,6 +4102,42 @@ impl<'a> Interp<'a> {
         self.realm.to_display_string(k)
     }
 
+    /// ToPrimitive for a plain object (default hint): try a callable `valueOf`,
+    /// then `toString`, accepting the first that returns a non-object. Non-object
+    /// values (and strings/arrays) pass through unchanged.
+    fn coerce_primitive(&mut self, v: NanBox) -> Result<NanBox, ExecError> {
+        let Some(raw) = v.as_handle() else {
+            return Ok(v);
+        };
+        let h = Handle::from_raw(raw);
+        // Strings and arrays are handled by the arithmetic path directly.
+        if self.realm.string_value(h).is_some()
+            || self.realm.is_array(h)
+            || self.realm.object_keys(h).is_none()
+        {
+            return Ok(v);
+        }
+        let is_object = |this: &Self, r: NanBox| {
+            r.as_handle().is_some_and(|rr| {
+                let rh = Handle::from_raw(rr);
+                this.realm.string_value(rh).is_none()
+                    && (this.realm.object_keys(rh).is_some() || this.realm.is_array(rh))
+            })
+        };
+        for method in ["valueOf", "toString"] {
+            let m = self.read_member(h, method)?;
+            if m.as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let r = self.call_with_this(m, v, &[])?;
+                if !is_object(self, r) {
+                    return Ok(r);
+                }
+            }
+        }
+        Ok(v)
+    }
+
     /// Coerces `v` to a string, invoking a plain object's own/inherited
     /// `toString` method when it has a callable one (else the default form).
     fn coerce_to_string(&mut self, v: NanBox) -> Result<String, ExecError> {
@@ -5048,6 +5084,32 @@ impl<'a> Interp<'a> {
         {
             return Ok(r);
         }
+        // Arithmetic and relational operators apply ToPrimitive to object
+        // operands (`valueOf`/`toString`); equality/`instanceof`/`in` do not.
+        let coerces = matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::Exp
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::LtEq
+                | BinaryOp::GtEq
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::Ushr
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+        );
+        let (a, b) = if coerces && (a.as_handle().is_some() || b.as_handle().is_some()) {
+            (self.coerce_primitive(a)?, self.coerce_primitive(b)?)
+        } else {
+            (a, b)
+        };
         Ok(match op {
             BinaryOp::Add => self.realm.add(a, b),
             BinaryOp::Sub => self.realm.sub(a, b),
@@ -6575,6 +6637,20 @@ mod tests {
         );
         assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
         assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
+    }
+
+    #[test]
+    fn to_primitive_in_operators() {
+        assert_eq!(run("let o={valueOf(){return 42;}}; o + 8"), "50");
+        assert_eq!(run("let o={valueOf(){return 6;}}; o * 7"), "42");
+        assert_eq!(run("let o={toString(){return 'x';}}; '' + o"), "x");
+        // valueOf is preferred for the default/number hint.
+        assert_eq!(
+            run("let o={valueOf(){return 5;}, toString(){return 'five';}}; o + 1"),
+            "6"
+        );
+        // Identity comparison does not coerce.
+        assert_eq!(run("let o={valueOf(){return 1;}}; o === o"), "true");
     }
 
     #[test]
