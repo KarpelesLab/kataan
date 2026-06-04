@@ -7,14 +7,17 @@ tri-modal model proven out in the sibling projects
 [`purecrypto`](https://github.com/KarpelesLab/purecrypto) (cryptography) and
 [`rsurl`](https://github.com/KarpelesLab/rsurl) (HTTP/curl).
 
-> **Status: early but running (Phase C).** The lexer and the full ECMAScript
-> parser are complete, and a tree-walking interpreter already executes real
-> programs — functions/closures, classes with inheritance, objects/arrays,
-> destructuring, getters/setters, `Map`/`Set`, error handling, and a
-> substantial standard library (Math, JSON, Object/Array/String/Number). The
-> performance-oriented object model (NaN-boxing, hidden classes, GC), the
-> bytecode VM and JIT tiers, the host runtime, and the WASM engine are being
-> built out per the [roadmap](ROADMAP.md).
+> **Status: early but running (Phase C/E/F).** The lexer and the full
+> ECMAScript parser are complete, and a tree-walking interpreter already
+> executes real programs — functions/closures, classes with inheritance,
+> objects/arrays, destructuring, getters/setters, `Map`/`Set`, error handling,
+> an in-house `RegExp` engine, `Date`, `Promise` with a microtask queue, and a
+> basic event loop (`setTimeout`), plus a substantial standard library (Math,
+> JSON, Object/Array/String/Number). It runs as a CLI/REPL, a Rust library, and
+> a C library (`kt_eval`). The performance-oriented object model (NaN-boxing,
+> hidden classes, GC), the bytecode VM and JIT tiers, the full host runtime,
+> and the WASM engine are being built out per the [roadmap](ROADMAP.md).
+> Generators and `async`/`await` await the bytecode VM's suspendable frames.
 
 ## Why
 
