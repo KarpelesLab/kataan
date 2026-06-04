@@ -516,13 +516,23 @@ impl Realm {
         if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
             return NanBox::number(x + y);
         }
+        // A string operand keeps the O(1) rope concatenation path.
         if self.is_string(a) || self.is_string(b) {
             let combined = self.rope_of(a).concat(&self.rope_of(b));
             let handle = self.heap.alloc(Cell::Str(combined));
             return NanBox::handle(handle.to_raw());
         }
-        // No string and not both numbers: numeric fast path yields NaN.
-        NanBox::number(f64::NAN)
+        // Any other heap value (array, object): `+` is string concatenation
+        // after `ToPrimitive` — our arrays/objects stringify (`[1,2] + [3,4]`
+        // → "1,23,4", `{} + "!"` → "[object Object]!").
+        if a.as_handle().is_some() || b.as_handle().is_some() {
+            let mut combined = self.to_display_string(a);
+            combined.push_str(&self.to_display_string(b));
+            let handle = self.heap.alloc(Cell::Str(Rope::from(combined.as_str())));
+            return NanBox::handle(handle.to_raw());
+        }
+        // Primitives only (bool/null/undefined): numeric.
+        NanBox::number(self.to_number(a) + self.to_number(b))
     }
 
     /// ECMAScript `ToNumber` (the cases this model covers): numbers pass

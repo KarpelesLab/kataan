@@ -187,6 +187,8 @@ const ERROR_NAMES: [&str; 5] = [
     "SyntaxError",
     "ReferenceError",
 ];
+const N_TYPE_ERROR: u16 = N_ERROR_BASE + 1;
+const N_REFERENCE_ERROR: u16 = N_ERROR_BASE + 4;
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
@@ -1130,6 +1132,28 @@ impl<'a> Interp<'a> {
         Ok(NanBox::handle(handle.to_raw()))
     }
 
+    /// Builds a match-result object (`[0..n]` groups, plus `index`, `input`,
+    /// `length`) from regex captures over `text`.
+    #[cfg(feature = "regex")]
+    fn regex_match_object(&mut self, text: &str, caps: &crate::regex::Captures) -> NanBox {
+        let obj = self.realm.new_object();
+        for (i, g) in caps.groups.iter().enumerate() {
+            let v = match g {
+                Some((s, e)) => self.new_str(&text[*s..*e]),
+                None => NanBox::undefined(),
+            };
+            self.realm.set_property(obj, &alloc::format!("{i}"), v);
+        }
+        let index = caps.groups.first().and_then(|g| *g).map_or(0, |(s, _)| s);
+        self.realm
+            .set_property(obj, "index", NanBox::number(index as f64));
+        let input = self.new_str(text);
+        self.realm.set_property(obj, "input", input);
+        self.realm
+            .set_property(obj, "length", NanBox::number(caps.groups.len() as f64));
+        NanBox::handle(obj.to_raw())
+    }
+
     /// Builds an error object `{ name, message }` for the constructor `id`.
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
         let name = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
@@ -1454,17 +1478,7 @@ impl<'a> Interp<'a> {
                     ("test", Ok(re)) => return Ok(Some(NanBox::boolean(re.is_match(&text)))),
                     ("exec", Ok(re)) => {
                         return Ok(Some(match re.captures_from(&text, 0) {
-                            Some(caps) => {
-                                let groups: Vec<NanBox> = caps
-                                    .groups
-                                    .iter()
-                                    .map(|g| match g {
-                                        Some((s, e)) => self.new_str(&text[*s..*e]),
-                                        None => NanBox::undefined(),
-                                    })
-                                    .collect();
-                                NanBox::handle(self.realm.new_array(groups).to_raw())
-                            }
+                            Some(caps) => self.regex_match_object(&text, &caps),
                             None => NanBox::null(),
                         }));
                     }
@@ -1505,6 +1519,81 @@ impl<'a> Interp<'a> {
                     return Ok(Some(self.promise_then(handle, arg(0), arg(0))));
                 }
                 _ => {}
+            }
+        }
+
+        // --- regex-backed String methods (when the argument is a RegExp) ---
+        #[cfg(feature = "regex")]
+        if let Some(s) = self.realm.string_value(handle)
+            && matches!(
+                method,
+                "match" | "search" | "replace" | "replaceAll" | "split"
+            )
+            && let Some((src, flags)) = arg(0)
+                .as_handle()
+                .and_then(|raw| self.realm.regexp_at(Handle::from_raw(raw)))
+            && let Ok(re) = crate::regex::Regex::new(&src, &flags)
+        {
+            let global = flags.contains('g');
+            match method {
+                "search" => {
+                    let idx = re.find_from(&s, 0).map_or(-1.0, |(st, _)| st as f64);
+                    return Ok(Some(NanBox::number(idx)));
+                }
+                "match" if !global => {
+                    return Ok(Some(match re.captures_from(&s, 0) {
+                        Some(caps) => self.regex_match_object(&s, &caps),
+                        None => NanBox::null(),
+                    }));
+                }
+                "match" => {
+                    // Global: an array of all whole matches (or null).
+                    let mut out = Vec::new();
+                    let mut at = 0;
+                    while let Some((st, en)) = re.find_from(&s, at) {
+                        out.push(self.new_str(&s[st..en]));
+                        at = if en > st { en } else { en + 1 };
+                    }
+                    return Ok(Some(if out.is_empty() {
+                        NanBox::null()
+                    } else {
+                        NanBox::handle(self.realm.new_array(out).to_raw())
+                    }));
+                }
+                "split" => {
+                    let mut parts = Vec::new();
+                    let mut at = 0;
+                    while let Some((st, en)) = re.find_from(&s, at) {
+                        if en == at && st == at {
+                            at += 1;
+                            if at > s.len() {
+                                break;
+                            }
+                            continue;
+                        }
+                        parts.push(self.new_str(&s[at..st]));
+                        at = en;
+                    }
+                    parts.push(self.new_str(&s[at..]));
+                    return Ok(Some(NanBox::handle(self.realm.new_array(parts).to_raw())));
+                }
+                // replace / replaceAll: substitute `$1`..`$9` / `$&` from groups.
+                _ => {
+                    let templ = self.realm.to_display_string(arg(1));
+                    let mut out = String::new();
+                    let mut at = 0;
+                    while let Some(caps) = re.captures_from(&s, at) {
+                        let (st, en) = caps.groups[0].unwrap_or((at, at));
+                        out.push_str(&s[at..st]);
+                        out.push_str(&expand_replacement(&templ, &s, &caps));
+                        at = if en > st { en } else { en + 1 };
+                        if !global || at > s.len() {
+                            break;
+                        }
+                    }
+                    out.push_str(&s[at.min(s.len())..]);
+                    return Ok(Some(self.new_str(&out)));
+                }
             }
         }
 
@@ -1580,6 +1669,37 @@ impl<'a> Interp<'a> {
                         Some(c) => self.new_str(&String::from(*c)),
                         None => NanBox::undefined(),
                     })
+                }
+                "substring" => {
+                    let chars: Vec<char> = s.chars().collect();
+                    let len = chars.len();
+                    let clamp = |n: f64| (n.max(0.0) as usize).min(len);
+                    let mut a = clamp(self.realm.to_number(arg(0)));
+                    let mut b = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        len
+                    } else {
+                        clamp(self.realm.to_number(arg(1)))
+                    };
+                    if a > b {
+                        core::mem::swap(&mut a, &mut b);
+                    }
+                    Some(self.new_str(&chars[a..b].iter().collect::<String>()))
+                }
+                "substr" => {
+                    let chars: Vec<char> = s.chars().collect();
+                    let len = chars.len() as f64;
+                    let start = self.realm.to_number(arg(0));
+                    let start = if start < 0.0 {
+                        (len + start).max(0.0)
+                    } else {
+                        start.min(len)
+                    } as usize;
+                    let count = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        chars.len() - start
+                    } else {
+                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(chars.len() - start)
+                    };
+                    Some(self.new_str(&chars[start..start + count].iter().collect::<String>()))
                 }
                 "trimStart" => Some(self.new_str(s.trim_start())),
                 "trimEnd" => Some(self.new_str(s.trim_end())),
@@ -1771,6 +1891,25 @@ impl<'a> Interp<'a> {
                         .iter()
                         .rposition(|e| self.realm.strict_equals(*e, target));
                     return Ok(Some(NanBox::number(found.map_or(-1.0, |i| i as f64))));
+                }
+                // Iterators, materialized as arrays (spread / for-of consume them).
+                "keys" => {
+                    let ks = (0..elems.len()).map(|i| NanBox::number(i as f64)).collect();
+                    return Ok(Some(NanBox::handle(self.realm.new_array(ks).to_raw())));
+                }
+                "values" => {
+                    let v = elems.clone();
+                    return Ok(Some(NanBox::handle(self.realm.new_array(v).to_raw())));
+                }
+                "entries" => {
+                    let mut out = Vec::with_capacity(elems.len());
+                    for (i, e) in elems.iter().enumerate() {
+                        let pair = self
+                            .realm
+                            .new_array(alloc::vec![NanBox::number(i as f64), *e]);
+                        out.push(NanBox::handle(pair.to_raw()));
+                    }
+                    return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
                 }
                 "find" => {
                     let f = arg(0);
@@ -2293,6 +2432,70 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Destructures `value` into an assignment pattern of existing targets
+    /// (`[a, b] = …`, `({ x: obj.p } = …)`), recursing into nested patterns.
+    fn assign_destructure(&mut self, target: &'a Expr, value: NanBox) -> Result<(), ExecError> {
+        match target {
+            Expr::Array { elements, .. } => {
+                let items = self.iterate_values(value).unwrap_or_default();
+                let mut i = 0;
+                for el in elements {
+                    match el {
+                        ArrayElement::Hole => i += 1,
+                        ArrayElement::Item(e) => {
+                            let v = items.get(i).copied().unwrap_or(NanBox::undefined());
+                            self.assign_destructure(e, v)?;
+                            i += 1;
+                        }
+                        ArrayElement::Spread(e) => {
+                            let rest = items[i.min(items.len())..].to_vec();
+                            let h = NanBox::handle(self.realm.new_array(rest).to_raw());
+                            self.assign_destructure(e, h)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Expr::Object { members, .. } => {
+                let src = value.as_handle().map(Handle::from_raw);
+                let mut used: Vec<String> = Vec::new();
+                for m in members {
+                    match m {
+                        ObjectMember::Property {
+                            key, value: tgt, ..
+                        } => {
+                            let k = static_key(key)?;
+                            let v = src
+                                .and_then(|h| self.realm.get_property(h, &k))
+                                .unwrap_or(NanBox::undefined());
+                            used.push(k);
+                            self.assign_destructure(tgt, v)?;
+                        }
+                        ObjectMember::Spread { value: tgt, .. } => {
+                            let obj = self.realm.new_object();
+                            if let Some(h) = src {
+                                for k in self.realm.object_keys(h).unwrap_or_default() {
+                                    if !used.contains(&k) {
+                                        let pv = self
+                                            .realm
+                                            .get_property(h, &k)
+                                            .unwrap_or(NanBox::undefined());
+                                        self.realm.set_property(obj, &k, pv);
+                                    }
+                                }
+                            }
+                            self.assign_destructure(tgt, NanBox::handle(obj.to_raw()))?;
+                        }
+                        ObjectMember::Accessor { .. } => {}
+                    }
+                }
+                Ok(())
+            }
+            // A leaf target (identifier or member).
+            _ => self.assign_to(target, value),
+        }
+    }
+
     /// Assigns `value` to an existing target (an identifier or member).
     fn assign_to(&mut self, target: &'a Expr, value: NanBox) -> Result<(), ExecError> {
         match target {
@@ -2452,7 +2655,9 @@ impl<'a> Interp<'a> {
                     // An unresolved reference throws a catchable ReferenceError.
                     None => {
                         let msg = self.new_str(&alloc::format!("{name} is not defined"));
-                        Err(ExecError::Throw(msg))
+                        Err(ExecError::Throw(
+                            self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                        ))
                     }
                 },
             },
@@ -2592,7 +2797,10 @@ impl<'a> Interp<'a> {
                 op, target, value, ..
             } => self.eval_assign(*op, target, value),
             Expr::Call {
-                callee, arguments, ..
+                callee,
+                arguments,
+                optional: call_optional,
+                ..
             } => {
                 // `super(args)` — invoke the base constructor on the current
                 // instance.
@@ -2643,13 +2851,24 @@ impl<'a> Interp<'a> {
                     }
                     // Not a built-in method: read the member and call it.
                     let Some(raw) = recv.as_handle() else {
+                        if *call_optional {
+                            return Ok(NanBox::undefined());
+                        }
                         return Err(ExecError::NotCallable);
                     };
                     let f = self.member(Handle::from_raw(raw), property)?;
+                    // `f?.()` short-circuits when `f` is nullish.
+                    if *call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null)
+                    {
+                        return Ok(NanBox::undefined());
+                    }
                     // Method call: `this` is the receiver.
                     return self.call_with_this(f, recv, &args);
                 }
                 let f = self.eval(callee)?;
+                if *call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    return Ok(NanBox::undefined());
+                }
                 let args = self.eval_args(arguments)?;
                 self.call(f, &args)
             }
@@ -2726,8 +2945,13 @@ impl<'a> Interp<'a> {
                 ..
             } => {
                 let obj = self.eval(object)?;
-                if *optional && matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                    return Ok(NanBox::undefined());
+                if matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    if *optional {
+                        return Ok(NanBox::undefined());
+                    }
+                    // `null.x` / `undefined.x` throws a catchable TypeError.
+                    let msg = self.new_str("cannot read property of null or undefined");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(msg))));
                 }
                 let Some(raw) = obj.as_handle() else {
                     return Ok(NanBox::undefined());
@@ -2795,6 +3019,18 @@ impl<'a> Interp<'a> {
             let this = NanBox::handle(handle.to_raw());
             return self.call_with_this(getter, this, &[]);
         }
+        // RegExp introspection properties.
+        if let Some((source, flags)) = self.realm.regexp_at(handle) {
+            return Ok(match name {
+                "source" => self.new_str(&source),
+                "flags" => self.new_str(&flags),
+                "global" => NanBox::boolean(flags.contains('g')),
+                "ignoreCase" => NanBox::boolean(flags.contains('i')),
+                "multiline" => NanBox::boolean(flags.contains('m')),
+                "sticky" => NanBox::boolean(flags.contains('y')),
+                _ => self.member_value(handle, name),
+            });
+        }
         Ok(self.member_value(handle, name))
     }
 
@@ -2845,6 +3081,11 @@ impl<'a> Interp<'a> {
             return Ok(rhs);
         }
         let rhs = self.eval(value)?;
+        // Destructuring assignment: `[a, b] = …` / `({ x } = …)`.
+        if op == AssignOp::Assign && matches!(target, Expr::Array { .. } | Expr::Object { .. }) {
+            self.assign_destructure(target, rhs)?;
+            return Ok(rhs);
+        }
         match target {
             Expr::Ident(id) => {
                 let name = &*id.name;
@@ -3040,6 +3281,29 @@ impl<'a> Interp<'a> {
         ) else {
             return Ok(false);
         };
+        // Built-in constructors: check the cell kind directly.
+        if let Some(id) = self.realm.native_at(ch) {
+            // The `Error` family: match by the object's `name` against the
+            // constructor (the base `Error` matches any error object).
+            if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
+                let obj_name = self
+                    .realm
+                    .get_property(oh, "name")
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default();
+                if !ERROR_NAMES.contains(&obj_name.as_str()) {
+                    return Ok(false);
+                }
+                let want = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
+                return Ok(want == "Error" || obj_name == want);
+            }
+            return Ok(match id {
+                N_REGEXP => self.realm.regexp_at(oh).is_some(),
+                N_MAP | N_SET => self.realm.collection_is_set(oh).is_some(),
+                N_DATE => self.realm.date_at(oh).is_some(),
+                _ => false,
+            });
+        }
         let (Some(tag), Some((target_id, _))) = (self.realm.class_tag(oh), self.realm.class_at(ch))
         else {
             return Ok(false);
@@ -3179,6 +3443,43 @@ fn parse_float_prefix(s: &str) -> f64 {
         end += 1;
     }
     s[..end].parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// Expands a `replace` template: `$&` (whole match), `$1`..`$9` (groups), `$$`
+/// (literal `$`), against `caps` over `text`.
+#[cfg(feature = "regex")]
+fn expand_replacement(templ: &str, text: &str, caps: &crate::regex::Captures) -> String {
+    let group = |i: usize| {
+        caps.groups
+            .get(i)
+            .and_then(|g| *g)
+            .map(|(s, e)| &text[s..e])
+    };
+    let mut out = String::new();
+    let mut chars = templ.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('$') => {
+                out.push('$');
+                chars.next();
+            }
+            Some('&') => {
+                out.push_str(group(0).unwrap_or(""));
+                chars.next();
+            }
+            Some(d) if d.is_ascii_digit() => {
+                let n = (*d as u8 - b'0') as usize;
+                chars.next();
+                out.push_str(group(n).unwrap_or(""));
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
 }
 
 /// Advances `pos` past JSON whitespace.
@@ -3839,6 +4140,36 @@ mod tests {
         assert_eq!(run("new Date(0).getDay()"), "4"); // Thursday
         // typeof a date is object.
         assert_eq!(run("typeof new Date(0)"), "object");
+    }
+
+    #[test]
+    fn optional_calls_destructuring_assign_and_coercion() {
+        // Optional calls short-circuit on a nullish callee.
+        assert_eq!(run("let o = { f: () => 7 }; o.f?.()"), "7");
+        assert_eq!(run("let o = {}; String(o.missing?.())"), "undefined");
+        // Destructuring assignment (swap, rest, member targets).
+        assert_eq!(run("let a = 1, b = 2; [a, b] = [b, a]; a + ',' + b"), "2,1");
+        assert_eq!(
+            run("let h, t; [h, ...t] = [1, 2, 3, 4]; h + '|' + t.join(',')"),
+            "1|2,3,4"
+        );
+        assert_eq!(
+            run("let p = {}; ({ x: p.px, y: p.py } = { x: 10, y: 20 }); p.px + ',' + p.py"),
+            "10,20"
+        );
+        // `+` ToPrimitive: arrays/objects stringify.
+        assert_eq!(run("'' + [1, 2, 3]"), "1,2,3");
+        assert_eq!(run("String([1, 2] + [3, 4])"), "1,23,4");
+        assert_eq!(run("({}) + '!'"), "[object Object]!");
+        // instanceof on error objects.
+        assert_eq!(
+            run("try { null.x; } catch (e) { '' + (e instanceof TypeError); }"),
+            "true"
+        );
+        assert_eq!(
+            run("try { nope; } catch (e) { '' + (e instanceof ReferenceError); }"),
+            "true"
+        );
     }
 
     #[test]
