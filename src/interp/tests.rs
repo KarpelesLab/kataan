@@ -381,6 +381,64 @@ fn bytecode_vm_classes() {
 }
 
 #[test]
+fn bytecode_vm_class_inheritance() {
+    // super() in the subclass constructor, plus inherited + overridden methods.
+    assert_eq!(
+        eval_bc(
+            "class Animal {
+               constructor(name) { this.name = name; }
+               speak() { return this.name + ' makes a sound'; }
+               describe() { return 'I am ' + this.name; }
+             }
+             class Dog extends Animal {
+               constructor(name) { super(name); this.legs = 4; }
+               speak() { return this.name + ' barks'; }
+             }
+             let d = new Dog('Rex');
+             d.speak() + '|' + d.describe() + '|' + d.legs"
+        ),
+        "Rex barks|I am Rex|4"
+    );
+    // super.method() calls the parent's implementation.
+    assert_eq!(
+        eval_bc(
+            "class Base { greet() { return 'hi'; } }
+             class Sub extends Base { greet() { return super.greet() + '!'; } }
+             new Sub().greet()"
+        ),
+        "hi!"
+    );
+    // instanceof walks the inheritance chain.
+    assert_eq!(
+        eval_bc(
+            "class A {} class B extends A {} class C extends B {}
+             let c = new C();
+             (c instanceof A) + ',' + (c instanceof B) + ',' + (c instanceof C)"
+        ),
+        "true,true,true"
+    );
+    // A three-level chain with super calls and accumulation.
+    assert_eq!(
+        eval_bc(
+            "class L1 { constructor() { this.tag = 'a'; } }
+             class L2 extends L1 { constructor() { super(); this.tag += 'b'; } }
+             class L3 extends L2 { constructor() { super(); this.tag += 'c'; } }
+             new L3().tag"
+        ),
+        "abc"
+    );
+    // Inheritance survives serialize → reload → run.
+    assert_eq!(
+        eval_bc_reloaded(
+            "class Shape { constructor(n) { this.n = n; } kind() { return 'shape'; } }
+             class Circle extends Shape { kind() { return super.kind() + ':circle'; } }
+             let c = new Circle(7); c.n + ',' + c.kind()"
+        ),
+        "7,shape:circle"
+    );
+}
+
+#[test]
 fn bytecode_vm_closures() {
     // A counter closing over a mutable local (shared cell).
     assert_eq!(

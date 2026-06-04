@@ -133,6 +133,10 @@ impl FnState {
 /// The register holding the current function's `this` value.
 const THIS_REG: Reg = 0;
 
+/// The synthetic binding name a subclass's methods capture to reach their
+/// superclass for `super(...)` / `super.m(...)`.
+const SUPER_NAME: &str = "%super%";
+
 /// Unresolved `break`/`continue` jump sites for one loop or switch.
 struct LoopCtx {
     break_jumps: Vec<usize>,
@@ -1093,8 +1097,15 @@ impl Compiler {
     /// blocks, and captured members fall back to the tree-walker.
     fn compile_class(&mut self, class: &crate::ast::Class) -> Result<Reg, CompileError> {
         use crate::ast::{ClassMember, MethodKind};
-        if class.super_class.is_some() {
-            return Err(CompileError::unsupported("class `extends`"));
+        // For `class B extends A`, evaluate the superclass and stash it in a
+        // synthetic captured cell (`%super%`) so the constructor/methods can
+        // reach it as an upvalue for `super(...)` / `super.m(...)`.
+        let super_mark = self.funcs.last().expect("fn").locals.len();
+        let has_super = class.super_class.is_some();
+        if let Some(sc) = &class.super_class {
+            let super_val = self.expr(sc)?;
+            let cell = self.new_cell(super_val);
+            self.declare_local_cell(String::from(SUPER_NAME), cell, true);
         }
         let mut ctor: Option<&Function> = None;
         let mut instance_methods: Vec<(String, &Function)> = Vec::new();
@@ -1136,11 +1147,14 @@ impl Compiler {
         }
 
         // The constructor chunk runs the instance-field initializers, then the
-        // declared constructor body.
-        let ctor_chunk = self.compile_constructor(ctor, &instance_fields)?;
-        let ctor_reg = self.reg();
-        let k = self.add_const(Const::Func(ctor_chunk as u32));
-        self.emit(Op::LoadConst { dst: ctor_reg, k });
+        // declared constructor body. A subclass with no explicit constructor
+        // gets the default `constructor(...args) { super(...args); }`.
+        let (ctor_chunk, ctor_ups) = if has_super && ctor.is_none() {
+            self.compile_default_subclass_ctor(&instance_fields)?
+        } else {
+            self.compile_constructor(ctor, &instance_fields)?
+        };
+        let ctor_reg = self.emit_closure(ctor_chunk, &ctor_ups);
 
         // Build the prototype object with the instance methods.
         let proto = self.reg();
@@ -1160,6 +1174,23 @@ impl Compiler {
             key: proto_key,
             src: proto,
         });
+
+        // Inheritance: chain the prototypes (`B.prototype.__proto__ =
+        // A.prototype`) and the constructors (`B.__proto__ = A`, for static
+        // inheritance), using `Object.setPrototypeOf`.
+        if has_super {
+            let super_val = self.read_ident(SUPER_NAME)?;
+            let super_proto = self.reg();
+            let pk = self.add_const(Const::Str(String::from("prototype")));
+            self.emit(Op::GetProp {
+                dst: super_proto,
+                obj: super_val,
+                key: pk,
+            });
+            self.emit_set_prototype_of(proto, super_proto);
+            let super_val2 = self.read_ident(SUPER_NAME)?;
+            self.emit_set_prototype_of(ctor_reg, super_val2);
+        }
 
         // Static methods and fields live on the constructor object itself.
         for (name, func) in static_methods {
@@ -1187,27 +1218,113 @@ impl Compiler {
                 src: val,
             });
         }
+        // Drop the synthetic `%super%` binding.
+        self.funcs
+            .last_mut()
+            .expect("fn")
+            .locals
+            .truncate(super_mark);
         Ok(ctor_reg)
     }
 
-    /// Compiles one class method to a function value; a method that captures an
-    /// enclosing variable falls back (the class isn't modeled as a closure).
+    /// `Object.setPrototypeOf(target, proto)`.
+    fn emit_set_prototype_of(&mut self, target: Reg, proto: Reg) {
+        let object_global = self.reg();
+        let g = self.add_const(Const::Str(String::from("Object")));
+        self.emit(Op::GetGlobal {
+            dst: object_global,
+            name: g,
+        });
+        let key = self.reg();
+        let k = self.add_const(Const::Str(String::from("setPrototypeOf")));
+        self.emit(Op::LoadConst { dst: key, k });
+        let base = self.funcs.last().expect("fn").next_reg;
+        let s1 = self.reg();
+        self.emit(Op::Move {
+            dst: s1,
+            src: target,
+        });
+        let s2 = self.reg();
+        self.emit(Op::Move {
+            dst: s2,
+            src: proto,
+        });
+        let ret = self.reg();
+        self.emit(Op::CallMethod {
+            dst: ret,
+            recv: object_global,
+            key,
+            args_base: base,
+            argc: 2,
+        });
+    }
+
+    /// Compiles one class method to a function value (may capture `%super%` or
+    /// other enclosing variables as upvalues).
     fn class_method_value(&mut self, func: &Function) -> Result<Reg, CompileError> {
         let (idx, upvalues) =
             self.compile_function(&func.params, FnBody::Block(&func.body), "<method>")?;
-        if !upvalues.is_empty() {
-            return Err(CompileError::unsupported("captured class method"));
-        }
         Ok(self.emit_closure(idx, &upvalues))
     }
 
+    /// Compiles the implicit subclass constructor
+    /// `constructor(...args) { super(...args); <field inits> }`.
+    fn compile_default_subclass_ctor(
+        &mut self,
+        fields: &[(String, Option<&Expr>)],
+    ) -> Result<(usize, Vec<Upvalue>), CompileError> {
+        let chunk_idx = self.module.len();
+        self.module.push(Chunk::new("<constructor>"));
+        self.module[chunk_idx].param_count = 1;
+        self.module[chunk_idx].has_rest = true;
+
+        let mut state = FnState::new(chunk_idx, alloc::collections::BTreeSet::new());
+        // Register 1 receives the collected rest array (the forwarded args).
+        let args_reg = state.next_reg;
+        state.next_reg += 1;
+        self.funcs.push(state);
+
+        let result: Result<(), CompileError> = (|| {
+            // super.apply(this, args)
+            let super_val = self.read_ident(SUPER_NAME)?;
+            self.emit_apply(super_val, THIS_REG, args_reg);
+            // Field initializers run after the super call.
+            for (name, init) in fields {
+                let val = match init {
+                    Some(e) => self.expr(e)?,
+                    None => {
+                        let r = self.reg();
+                        self.emit(Op::LoadUndefined { dst: r });
+                        r
+                    }
+                };
+                let key = self.add_const(Const::Str(name.clone()));
+                self.emit(Op::SetProp {
+                    obj: THIS_REG,
+                    key,
+                    src: val,
+                });
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.funcs.pop();
+            return Err(e);
+        }
+        self.emit(Op::ReturnUndefined);
+        let finished = self.funcs.pop().expect("fn");
+        self.module[chunk_idx].register_count = finished.next_reg;
+        Ok((chunk_idx, finished.upvalues))
+    }
+
     /// Compiles a class constructor chunk: instance-field initializers
-    /// (`this.f = …`) followed by the declared constructor body.
+    /// (`this.f = …`) followed by the declared constructor body. Returns the
+    /// chunk index and any captured upvalues (e.g. `%super%`).
     fn compile_constructor(
         &mut self,
         ctor: Option<&Function>,
         fields: &[(String, Option<&Expr>)],
-    ) -> Result<usize, CompileError> {
+    ) -> Result<(usize, Vec<Upvalue>), CompileError> {
         let params: &[Param] = ctor.map_or(&[], |f| &f.params);
         if params.iter().any(|p| p.rest || p.default.is_some()) {
             return Err(CompileError::unsupported("constructor rest/default param"));
@@ -1262,11 +1379,8 @@ impl Compiler {
         }
         self.emit(Op::ReturnUndefined);
         let finished = self.funcs.pop().expect("fn");
-        if !finished.upvalues.is_empty() {
-            return Err(CompileError::unsupported("captured constructor"));
-        }
         self.module[chunk_idx].register_count = finished.next_reg;
-        Ok(chunk_idx)
+        Ok((chunk_idx, finished.upvalues))
     }
 
     /// Compiles a function body into a new chunk; returns the chunk index and
@@ -1445,6 +1559,9 @@ impl Compiler {
                 self.emit(Op::Move { dst, src: THIS_REG });
                 Ok(dst)
             }
+            // A bare `super` (only valid inside a subclass method) resolves to
+            // the captured superclass constructor.
+            Expr::Super(_) => self.read_ident(SUPER_NAME),
             Expr::Ident(id) => self.read_ident(&id.name),
             Expr::Assign {
                 op, target, value, ..
@@ -2160,6 +2277,26 @@ impl Compiler {
         callee: &Expr,
         arguments: &[crate::ast::Argument],
     ) -> Result<Reg, CompileError> {
+        // `super(args)` runs the superclass constructor on the current `this`,
+        // lowered to `super.call(this, …args)`.
+        if matches!(callee, Expr::Super(_)) {
+            let super_val = self.read_ident(SUPER_NAME)?;
+            return self.emit_call_with_this(super_val, THIS_REG, arguments);
+        }
+        // `super.m(args)` invokes a superclass prototype method on `this`,
+        // lowered to `super.prototype.m.call(this, …args)`.
+        if let Expr::Member {
+            object,
+            property,
+            optional: false,
+            ..
+        } = callee
+            && matches!(&**object, Expr::Super(_))
+        {
+            let name = simple_key(property)?;
+            let method = self.super_proto_member(&name)?;
+            return self.emit_call_with_this(method, THIS_REG, arguments);
+        }
         // A method call `obj.m(args)` / `obj[k](args)` binds `obj` as `this` and
         // dispatches built-in prototype methods (CallMethod).
         if let Expr::Member {
@@ -2186,6 +2323,72 @@ impl Compiler {
             callee: callee_reg,
             args_base,
             argc,
+        });
+        Ok(dst)
+    }
+
+    /// Reads `super.prototype.<name>` (the superclass's prototype method).
+    fn super_proto_member(&mut self, name: &str) -> Result<Reg, CompileError> {
+        let super_val = self.read_ident(SUPER_NAME)?;
+        let proto = self.reg();
+        let pk = self.add_const(Const::Str(String::from("prototype")));
+        self.emit(Op::GetProp {
+            dst: proto,
+            obj: super_val,
+            key: pk,
+        });
+        let method = self.reg();
+        let mk = self.add_const(Const::Str(String::from(name)));
+        self.emit(Op::GetProp {
+            dst: method,
+            obj: proto,
+            key: mk,
+        });
+        Ok(method)
+    }
+
+    /// Emits `callee.call(this_reg, …arguments)` — invokes `callee` with an
+    /// explicit `this`. Used to lower `super(...)` / `super.m(...)`.
+    fn emit_call_with_this(
+        &mut self,
+        callee: Reg,
+        this_reg: Reg,
+        arguments: &[crate::ast::Argument],
+    ) -> Result<Reg, CompileError> {
+        if has_spread(arguments) {
+            // `callee.apply(this, argsArray)`.
+            let args_array = self.build_args_array(arguments)?;
+            return Ok(self.emit_apply(callee, this_reg, args_array));
+        }
+        // Evaluate the key and all argument values first, then lay them out in a
+        // contiguous window: [this, arg0, arg1, …].
+        let key = self.reg();
+        let k = self.add_const(Const::Str(String::from("call")));
+        self.emit(Op::LoadConst { dst: key, k });
+        let mut arg_vals = Vec::with_capacity(arguments.len());
+        for arg in arguments {
+            let crate::ast::Argument::Item(e) = arg else {
+                unreachable!("spread handled above");
+            };
+            arg_vals.push(self.expr(e)?);
+        }
+        let base = self.funcs.last().expect("fn").next_reg;
+        let s_this = self.reg();
+        self.emit(Op::Move {
+            dst: s_this,
+            src: this_reg,
+        });
+        for v in arg_vals {
+            let slot = self.reg();
+            self.emit(Op::Move { dst: slot, src: v });
+        }
+        let dst = self.reg();
+        self.emit(Op::CallMethod {
+            dst,
+            recv: callee,
+            key,
+            args_base: base,
+            argc: (arguments.len() + 1) as u16,
         });
         Ok(dst)
     }
