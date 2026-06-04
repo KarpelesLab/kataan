@@ -666,7 +666,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
     // functions. Each `(id, params, body)` is compiled below.
     let mut next_id = (decls.len() + 1) as u32;
     let mut class_map = alloc::collections::BTreeMap::new();
-    let mut class_jobs: Vec<(u32, &[crate::ast::Param], &[Stmt])> = Vec::new();
+    let mut class_jobs: Vec<ClassJob> = Vec::new();
     for s in &program.body {
         if let Stmt::Class(class) = s {
             let Some(id) = &class.id else { continue };
@@ -696,9 +696,24 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
             Compiler::compile_fn(&fn_ids, &classes, &protos, &f.params, &[], &f.body, false)?;
         protos.borrow_mut()[i + 1] = proto;
     }
-    for (id, params, body) in &class_jobs {
-        let proto = Compiler::compile_fn(&fn_ids, &classes, &protos, params, &[], body, false)?;
-        protos.borrow_mut()[*id as usize] = proto;
+    for job in &class_jobs {
+        // A subclass constructor resolves `super(...)` to the nearest ancestor
+        // constructor.
+        let super_ctor = job
+            .super_of
+            .as_deref()
+            .and_then(|name| nearest_ctor(name, &classes));
+        let proto = Compiler::compile_fn_inner(
+            &fn_ids,
+            &classes,
+            &protos,
+            job.params,
+            &[],
+            job.body,
+            false,
+            super_ctor,
+        )?;
+        protos.borrow_mut()[job.id as usize] = proto;
     }
     Ok(alloc::rc::Rc::try_unwrap(protos)
         .expect("unique proto table")
@@ -1071,13 +1086,19 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
 fn scan_class<'a>(
     class: &'a crate::ast::Class,
     next_id: &mut u32,
-    jobs: &mut Vec<(u32, &'a [crate::ast::Param], &'a [Stmt])>,
+    jobs: &mut Vec<ClassJob<'a>>,
 ) -> Result<ClassInfo, CompileError> {
-    use crate::ast::{ClassMember, MethodKind};
-    if class.super_class.is_some() {
-        return Err(CompileError::Unsupported("class extends"));
-    }
+    use crate::ast::{ClassMember, Expr, MethodKind};
+    // `extends Identifier` is supported; a computed superclass falls back.
+    let super_name = match &class.super_class {
+        None => None,
+        Some(e) => match &**e {
+            Expr::Ident(id) => Some(String::from(&*id.name)),
+            _ => return Err(CompileError::Unsupported("computed extends")),
+        },
+    };
     let mut info = ClassInfo {
+        super_name: super_name.clone(),
         ctor: None,
         methods: Vec::new(),
     };
@@ -1087,14 +1108,24 @@ fn scan_class<'a>(
                 let id = *next_id;
                 *next_id += 1;
                 info.ctor = Some(id);
-                jobs.push((id, &m.value.params, &m.value.body));
+                jobs.push(ClassJob {
+                    id,
+                    params: &m.value.params,
+                    body: &m.value.body,
+                    super_of: super_name.clone(),
+                });
             }
             ClassMember::Method(m) if !m.is_static && m.kind == MethodKind::Method => {
                 let id = *next_id;
                 *next_id += 1;
                 let name = static_key(&m.key)?;
                 info.methods.push((name, id));
-                jobs.push((id, &m.value.params, &m.value.body));
+                jobs.push(ClassJob {
+                    id,
+                    params: &m.value.params,
+                    body: &m.value.body,
+                    super_of: None,
+                });
             }
             // Fields, statics, getters/setters → fall back.
             _ => return Err(CompileError::Unsupported("class member")),
@@ -1103,10 +1134,34 @@ fn scan_class<'a>(
     Ok(info)
 }
 
-/// A compiled (plain) class: its constructor and instance methods as
-/// function-table ids.
+/// A class member queued for compilation: its reserved function id, signature,
+/// and (for a constructor of a subclass) the superclass name for `super(...)`.
+struct ClassJob<'a> {
+    id: u32,
+    params: &'a [crate::ast::Param],
+    body: &'a [Stmt],
+    super_of: Option<String>,
+}
+
+/// The nearest constructor up `name`'s `extends` chain (its own, else an
+/// ancestor's — JS's implicit-super forwarding).
+fn nearest_ctor(
+    name: &str,
+    classes: &alloc::collections::BTreeMap<String, ClassInfo>,
+) -> Option<u32> {
+    let info = classes.get(name)?;
+    if let Some(c) = info.ctor {
+        return Some(c);
+    }
+    nearest_ctor(info.super_name.as_deref()?, classes)
+}
+
+/// A compiled class: its superclass name (for `extends`), its constructor, and
+/// its instance methods as function-table ids.
 #[derive(Clone)]
 struct ClassInfo {
+    /// The `extends` superclass name, if any.
+    super_name: Option<String>,
     /// The constructor's function id, if the class declares one.
     ctor: Option<u32>,
     /// `(method_name, function_id)` for each instance method.
@@ -1141,6 +1196,8 @@ struct Compiler {
     /// The register holding `this` (seeded by the caller at `n_params +
     /// n_captures`).
     this_reg: Reg,
+    /// When compiling a subclass constructor, the function id `super(...)` calls.
+    super_ctor: Option<u32>,
     /// Per enclosing loop/switch: `break` jump indices awaiting the exit target
     /// (loops and `switch` both push here).
     break_sites: Vec<Vec<usize>>,
@@ -1155,6 +1212,7 @@ impl Compiler {
     /// `captures` (a closure's free variables, in sorted order) bind to the next
     /// registers as cells. For `is_main`, the last expression's value is
     /// returned.
+    #[allow(clippy::too_many_arguments)]
     fn compile_fn(
         fn_ids: &alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
         classes: &alloc::rc::Rc<alloc::collections::BTreeMap<String, ClassInfo>>,
@@ -1164,6 +1222,22 @@ impl Compiler {
         body: &[Stmt],
         is_main: bool,
     ) -> Result<FnProto, CompileError> {
+        Self::compile_fn_inner(
+            fn_ids, classes, protos, params, captures, body, is_main, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_fn_inner(
+        fn_ids: &alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
+        classes: &alloc::rc::Rc<alloc::collections::BTreeMap<String, ClassInfo>>,
+        protos: &alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
+        params: &[crate::ast::Param],
+        captures: &[String],
+        body: &[Stmt],
+        is_main: bool,
+        super_ctor: Option<u32>,
+    ) -> Result<FnProto, CompileError> {
         // Which of this function's own names are captured by nested functions →
         // must be cells.
         let cell_names = captured_names(params, body);
@@ -1172,6 +1246,7 @@ impl Compiler {
             classes: alloc::rc::Rc::clone(classes),
             protos: alloc::rc::Rc::clone(protos),
             cell_names,
+            super_ctor,
             ..Compiler::default()
         };
         c.scopes.push(alloc::collections::BTreeMap::new());
@@ -1770,6 +1845,15 @@ impl Compiler {
                     };
                     args.push(self.expr(e)?);
                 }
+                // `super(args)` — run the base constructor on the current `this`.
+                if matches!(&**callee, Expr::Super(_)) {
+                    let ctor = self
+                        .super_ctor
+                        .ok_or(CompileError::Unsupported("super outside a subclass ctor"))?;
+                    let recv = self.this_reg;
+                    self.ops.push(Op::CallCtor { ctor, recv, args });
+                    return Ok(self.this_reg);
+                }
                 // A built-in call (`console.log`, `Math.max`, `String`, …).
                 if let Some(native) = native_call(callee).or_else(|| native_global(callee)) {
                     let dst = self.alloc();
@@ -1911,20 +1995,32 @@ impl Compiler {
                     };
                     args.push(self.expr(e)?);
                 }
+                let _ = info;
                 let instance = self.alloc();
                 self.ops.push(Op::NewObject { dst: instance });
-                // Install each method as a closure property (methods don't
-                // capture — they use `this`/params).
-                for (name, mid) in &info.methods {
-                    let m = self.alloc();
-                    self.ops.push(Op::LoadFunc { dst: m, func: *mid });
-                    self.ops.push(Op::SetProp {
-                        obj: instance,
-                        key: name.clone(),
-                        src: m,
-                    });
+                // Walk the `extends` chain root→derived and install each class's
+                // methods, so a derived method overrides an inherited one.
+                let mut chain: Vec<String> = Vec::new();
+                let mut cur = Some(String::from(&*id.name));
+                while let Some(name) = cur {
+                    cur = self.classes.get(&name).and_then(|c| c.super_name.clone());
+                    chain.push(name);
                 }
-                if let Some(ctor) = info.ctor {
+                for name in chain.iter().rev() {
+                    let methods = self.classes.get(name).expect("class").methods.clone();
+                    for (mname, mid) in &methods {
+                        let m = self.alloc();
+                        self.ops.push(Op::LoadFunc { dst: m, func: *mid });
+                        self.ops.push(Op::SetProp {
+                            obj: instance,
+                            key: mname.clone(),
+                            src: m,
+                        });
+                    }
+                }
+                // Run the most-derived constructor (or the nearest ancestor's,
+                // forwarding args, when the class declares none).
+                if let Some(ctor) = nearest_ctor(&id.name, &self.classes) {
                     self.ops.push(Op::CallCtor {
                         ctor,
                         recv: instance,
@@ -2525,6 +2621,53 @@ mod tests {
                 a.get() + ',' + b.get()"
             ),
             "1,99"
+        );
+    }
+
+    #[test]
+    fn bytecode_class_inheritance() {
+        // A subclass inherits a base method.
+        assert_eq!(
+            bc(
+                "class Animal { constructor(n) { this.n = n; } describe() { return this.n; } }
+                class Dog extends Animal {}
+                new Dog('Rex').describe()"
+            ),
+            "Rex"
+        );
+        // super(...) calls the base constructor; the derived adds state.
+        assert_eq!(
+            bc("class Animal { constructor(n) { this.n = n; } }
+                class Dog extends Animal {
+                  constructor(n, b) { super(n); this.b = b; }
+                  tag() { return this.n + ':' + this.b; }
+                }
+                new Dog('Rex', 'Lab').tag()"),
+            "Rex:Lab"
+        );
+        // A derived method overrides the base.
+        assert_eq!(
+            bc("class A { kind() { return 'A'; } }
+                class B extends A { kind() { return 'B'; } }
+                new B().kind() + new A().kind()"),
+            "BA"
+        );
+        // Implicit super (subclass with no constructor) forwards args.
+        assert_eq!(
+            bc(
+                "class Base { constructor(v) { this.v = v; } get() { return this.v; } }
+                class Sub extends Base {}
+                new Sub(7).get()"
+            ),
+            "7"
+        );
+        // A three-level chain accumulating fields.
+        assert_eq!(
+            bc("class A { constructor() { this.a = 1; } }
+                class B extends A { constructor() { super(); this.b = 2; } }
+                class C extends B { constructor() { super(); this.c = 3; } }
+                let o = new C(); o.a + o.b + o.c"),
+            "6"
         );
     }
 
