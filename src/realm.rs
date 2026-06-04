@@ -804,7 +804,22 @@ impl Realm {
     /// Unary `!a` (logical negation via `ToBoolean`).
     #[must_use]
     pub fn logical_not(&self, a: NanBox) -> NanBox {
-        NanBox::boolean(!a.to_boolean())
+        NanBox::boolean(!self.truthy(a))
+    }
+
+    /// JS truthiness, heap-aware: `false`/`0`/`NaN`/`null`/`undefined` and the
+    /// **empty string** are falsy; every other value (including non-empty
+    /// strings and all objects) is truthy. `NanBox::to_boolean` alone can't see
+    /// that a boxed string is empty, so string handles are checked here.
+    #[must_use]
+    pub fn truthy(&self, v: NanBox) -> bool {
+        if let Some(raw) = v.as_handle() {
+            if let Some(s) = self.string_value(Handle::from_raw(raw)) {
+                return !s.is_empty();
+            }
+            return true;
+        }
+        v.to_boolean()
     }
 
     /// The `typeof` string for any value: primitives via the box

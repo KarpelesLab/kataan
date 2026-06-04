@@ -873,7 +873,7 @@ fn run_frame(
                 regs[*dst as usize] = NanBox::number(-num(regs[*a as usize])?);
             }
             Op::Not { dst, a } => {
-                regs[*dst as usize] = NanBox::boolean(!regs[*a as usize].to_boolean());
+                regs[*dst as usize] = NanBox::boolean(!ctx.realm.truthy(regs[*a as usize]));
             }
             Op::Move { dst, src } => regs[*dst as usize] = regs[*src as usize],
             Op::Lt { dst, a, b } => {
@@ -890,7 +890,7 @@ fn run_frame(
                 );
             }
             Op::JumpIfFalse { cond, target } => {
-                if !regs[*cond as usize].to_boolean() {
+                if !ctx.realm.truthy(regs[*cond as usize]) {
                     pc = *target;
                 }
             }
@@ -1527,7 +1527,7 @@ fn builtin_method(
                         &[*e, NanBox::number(i as f64)],
                         NanBox::undefined(),
                     ) {
-                        Ok(v) if v.to_boolean() => out.push(*e),
+                        Ok(v) if ctx.realm.truthy(v) => out.push(*e),
                         Ok(_) => {}
                         Err(e) => return Some(Err(e)),
                     }
@@ -1580,7 +1580,7 @@ fn builtin_method(
                         &[*e, NanBox::number(i as f64)],
                         NanBox::undefined(),
                     ) {
-                        Ok(v) if v.to_boolean() => {
+                        Ok(v) if ctx.realm.truthy(v) => {
                             found = *e;
                             break;
                         }
@@ -1602,7 +1602,7 @@ fn builtin_method(
                         &[*e, NanBox::number(i as f64)],
                         NanBox::undefined(),
                     ) {
-                        Ok(v) => v.to_boolean(),
+                        Ok(v) => ctx.realm.truthy(v),
                         Err(e) => return Some(Err(e)),
                     };
                     if want_all && !ok {

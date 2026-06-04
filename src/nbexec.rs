@@ -379,7 +379,7 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_string(&s).to_raw())
             }
             N_NUMBER => NanBox::number(self.realm.to_number(arg(0))),
-            N_BOOLEAN => NanBox::boolean(arg(0).to_boolean()),
+            N_BOOLEAN => NanBox::boolean(self.realm.truthy(arg(0))),
             N_PARSE_INT => {
                 let s = self.realm.to_display_string(arg(0));
                 let radix = match args.get(1) {
@@ -1912,6 +1912,17 @@ impl<'a> Interp<'a> {
                     }
                     Some(self.new_str(&out))
                 }
+                // `search(str)` — index of the first match (string needle).
+                "search" => {
+                    let needle = self.realm.to_display_string(arg(0));
+                    let idx = s
+                        .find(&needle)
+                        .map_or(-1.0, |b| s[..b].chars().count() as f64);
+                    Some(NanBox::number(idx))
+                }
+                // `normalize()` — Unicode normalization; a no-op here (the engine
+                // stores strings as-is), sufficient for already-normal input.
+                "normalize" => Some(self.new_str(&s)),
                 _ => None,
             };
             if out.is_some() {
@@ -1944,15 +1955,19 @@ impl<'a> Interp<'a> {
                 }
                 "includes" => {
                     let target = arg(0);
-                    let found = elems.iter().any(|e| self.realm.strict_equals(*e, target));
+                    let from = array_from_index(&self.realm, arg(1), elems.len());
+                    let found = elems[from..]
+                        .iter()
+                        .any(|e| self.realm.strict_equals(*e, target));
                     return Ok(Some(NanBox::boolean(found)));
                 }
                 "indexOf" => {
                     let target = arg(0);
-                    let idx = elems
+                    let from = array_from_index(&self.realm, arg(1), elems.len());
+                    let idx = elems[from..]
                         .iter()
                         .position(|e| self.realm.strict_equals(*e, target))
-                        .map_or(-1.0, |i| i as f64);
+                        .map_or(-1.0, |i| (i + from) as f64);
                     return Ok(Some(NanBox::number(idx)));
                 }
                 "map" => {
@@ -1968,7 +1983,7 @@ impl<'a> Interp<'a> {
                     let f = arg(0);
                     let mut out = Vec::new();
                     for (i, e) in elems.iter().enumerate() {
-                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
                             out.push(*e);
                         }
                     }
@@ -2179,7 +2194,7 @@ impl<'a> Interp<'a> {
                 "find" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
-                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
                             return Ok(Some(*e));
                         }
                     }
@@ -2188,7 +2203,7 @@ impl<'a> Interp<'a> {
                 "findIndex" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
-                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
                             return Ok(Some(NanBox::number(i as f64)));
                         }
                     }
@@ -2198,7 +2213,7 @@ impl<'a> Interp<'a> {
                 "findLast" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate().rev() {
-                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
                             return Ok(Some(*e));
                         }
                     }
@@ -2207,7 +2222,7 @@ impl<'a> Interp<'a> {
                 "findLastIndex" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate().rev() {
-                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
                             return Ok(Some(NanBox::number(i as f64)));
                         }
                     }
@@ -2216,7 +2231,7 @@ impl<'a> Interp<'a> {
                 "some" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
-                        if self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
                             return Ok(Some(NanBox::boolean(true)));
                         }
                     }
@@ -2225,7 +2240,7 @@ impl<'a> Interp<'a> {
                 "every" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
-                        if !self.call(f, &[*e, NanBox::number(i as f64)])?.to_boolean() {
+                        if !self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
                             return Ok(Some(NanBox::boolean(false)));
                         }
                     }
@@ -2403,7 +2418,7 @@ impl<'a> Interp<'a> {
                 alternate,
                 ..
             } => {
-                if self.eval(test)?.to_boolean() {
+                if self.eval_truthy(test)? {
                     self.exec(consequent)
                 } else if let Some(alt) = alternate {
                     self.exec(alt)
@@ -2413,7 +2428,7 @@ impl<'a> Interp<'a> {
             }
             Stmt::While { test, body, .. } => {
                 let label = self.pending_label.take();
-                while self.eval(test)?.to_boolean() {
+                while self.eval_truthy(test)? {
                     match loop_action(self.exec(body)?, &label) {
                         LoopAction::Next => {}
                         LoopAction::Stop => break,
@@ -2430,7 +2445,7 @@ impl<'a> Interp<'a> {
                         LoopAction::Stop => break,
                         LoopAction::Propagate(f) => return Ok(f),
                     }
-                    if !self.eval(test)?.to_boolean() {
+                    if !self.eval_truthy(test)? {
                         break;
                     }
                 }
@@ -2938,7 +2953,7 @@ impl<'a> Interp<'a> {
             }
             loop {
                 let go = match test {
-                    Some(t) => self.eval(t)?.to_boolean(),
+                    Some(t) => self.eval_truthy(t)?,
                     None => true,
                 };
                 if !go {
@@ -2979,6 +2994,19 @@ impl<'a> Interp<'a> {
     }
 
     // --- expressions ---
+
+    /// Evaluates `e` and returns its JS truthiness (heap-aware, so an empty
+    /// string is falsy).
+    fn eval_truthy(&mut self, e: &'a Expr) -> Result<bool, ExecError> {
+        let v = self.eval(e)?;
+        Ok(self.realm.truthy(v))
+    }
+
+    /// Calls `f(args)` and returns the result's truthiness.
+    fn call_truthy(&mut self, f: NanBox, args: &[NanBox]) -> Result<bool, ExecError> {
+        let r = self.call(f, args)?;
+        Ok(self.realm.truthy(r))
+    }
 
     /// Resolves an object/class property key to its string name, evaluating a
     /// `[computed]` key expression (coerced to a string) where present.
@@ -3154,8 +3182,8 @@ impl<'a> Interp<'a> {
             } => {
                 let l = self.eval(left)?;
                 let take_right = match op {
-                    LogicalOp::And => l.to_boolean(),
-                    LogicalOp::Or => !l.to_boolean(),
+                    LogicalOp::And => self.realm.truthy(l),
+                    LogicalOp::Or => !self.realm.truthy(l),
                     LogicalOp::Nullish => {
                         matches!(l.unpack(), Unpacked::Undefined | Unpacked::Null)
                     }
@@ -3168,7 +3196,7 @@ impl<'a> Interp<'a> {
                 alternate,
                 ..
             } => {
-                if self.eval(test)?.to_boolean() {
+                if self.eval_truthy(test)? {
                     self.eval(consequent)
                 } else {
                     self.eval(alternate)
@@ -3474,8 +3502,8 @@ impl<'a> Interp<'a> {
         ) {
             let current = self.read_target(target)?;
             let assign = match op {
-                AssignOp::AndAssign => current.to_boolean(),
-                AssignOp::OrAssign => !current.to_boolean(),
+                AssignOp::AndAssign => self.realm.truthy(current),
+                AssignOp::OrAssign => !self.realm.truthy(current),
                 _ => matches!(current.unpack(), Unpacked::Undefined | Unpacked::Null),
             };
             if !assign {
@@ -4057,6 +4085,20 @@ fn parse_int(s: &str, radix: u32) -> f64 {
         return f64::NAN;
     }
     if neg { -value } else { value }
+}
+
+/// Normalizes an optional `fromIndex` for `indexOf`/`includes`: undefined → 0,
+/// negatives count from the end, clamped to `[0, len]`.
+fn array_from_index(realm: &Realm, arg: NanBox, len: usize) -> usize {
+    if matches!(arg.unpack(), Unpacked::Undefined) {
+        return 0;
+    }
+    let n = realm.to_number(arg);
+    if n < 0.0 {
+        (len as f64 + n).max(0.0) as usize
+    } else {
+        (n as usize).min(len)
+    }
 }
 
 /// A non-negative integer array index, if `n` is one.
@@ -4752,6 +4794,28 @@ mod tests {
             run("class C { #s = 1; constructor(){ this.p = 2; } } Object.keys(new C()).join(',')"),
             "p"
         );
+    }
+
+    #[test]
+    fn empty_string_is_falsy() {
+        assert_eq!(run("!!''"), "false");
+        assert_eq!(run("!!'x'"), "true");
+        assert_eq!(run("'' || 'fallback'"), "fallback");
+        assert_eq!(run("if ('') { 'T' } else { 'F' }"), "F");
+        assert_eq!(run("Boolean('')"), "false");
+        assert_eq!(
+            run("[0, '', null, 1, 'a'].filter(function(x){ return x; }).join(',')"),
+            "1,a"
+        );
+    }
+
+    #[test]
+    fn array_from_index_and_string_search() {
+        assert_eq!(run("[1,2,3,2,1].indexOf(2, 2)"), "3");
+        assert_eq!(run("[1,2,3].includes(2, 2)"), "false");
+        assert_eq!(run("[5,6,7].indexOf(5, 1)"), "-1");
+        assert_eq!(run("'hello world'.search('world')"), "6");
+        assert_eq!(run("'abc'.search('z')"), "-1");
     }
 
     #[test]
