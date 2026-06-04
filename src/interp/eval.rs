@@ -1275,7 +1275,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn eval_binary(
+    pub(super) fn eval_binary(
         &mut self,
         op: BinaryOp,
         l: Value<'a>,
@@ -1391,7 +1391,7 @@ impl<'a> Interp<'a> {
     /// Reads property `key` from `obj`, boxing the few primitive cases we
     /// support (`String.length` / string indexing) and throwing on `null` /
     /// `undefined`.
-    fn get_member(&self, obj: &Value<'a>, key: &str) -> Completion<'a, Value<'a>> {
+    pub(super) fn get_member(&self, obj: &Value<'a>, key: &str) -> Completion<'a, Value<'a>> {
         match obj {
             // `Map`/`Set` expose `size` as an accessor.
             Value::Object(o) if key == "size" && o.as_collection().is_some() => Ok(Value::Number(

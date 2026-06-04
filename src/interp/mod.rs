@@ -17,10 +17,12 @@
 //! ```
 
 mod builtins;
+mod compiler;
 mod env;
 mod eval;
 mod promise;
 mod value;
+mod vm;
 
 #[cfg(test)]
 mod tests;

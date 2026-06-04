@@ -37,6 +37,51 @@ fn eval_global(src: &str, name: &str) -> String {
         .map_or_else(|| String::from("<unbound>"), |v| v.to_js_string())
 }
 
+/// Compiles a single-expression program to bytecode, runs it through the VM,
+/// and returns the result as a string. Panics if the expression is outside the
+/// bytecode compiler's supported subset or throws.
+fn eval_bc(src: &str) -> String {
+    let program = Parser::parse_program(src).expect("parse ok");
+    let mut interp = Interp::new();
+    match interp.eval_via_bytecode(&program.body) {
+        Ok(Ok(v)) => v.to_js_string(),
+        Ok(Err(thrown)) => panic!("uncaught: {}", thrown.to_js_string()),
+        Err(e) => panic!("compile: {}", e.message),
+    }
+}
+
+#[test]
+fn bytecode_vm_matches_tree_walker() {
+    // Arithmetic, precedence, and the compact-int path.
+    assert_eq!(eval_bc("1 + 2 * 3"), "7");
+    assert_eq!(eval_bc("(1 + 2) * 3"), "9");
+    assert_eq!(eval_bc("2 ** 3 ** 2"), "512");
+    assert_eq!(eval_bc("-5 % 3"), "-2");
+    assert_eq!(eval_bc("10 / 4"), "2.5");
+    // String + coercion (reuses the tree-walker's operator semantics).
+    assert_eq!(eval_bc("'a' + 'b' + 'c'"), "abc");
+    assert_eq!(eval_bc("1 + '2'"), "12");
+    // Comparison and logical short-circuit.
+    assert_eq!(eval_bc("3 < 5"), "true");
+    assert_eq!(eval_bc("2 === 2"), "true");
+    assert_eq!(eval_bc("true && 'yes'"), "yes");
+    assert_eq!(eval_bc("false || 'fallback'"), "fallback");
+    assert_eq!(eval_bc("0 && 'no'"), "0"); // short-circuits, leaves left
+    // Unary.
+    assert_eq!(eval_bc("-(3 + 4)"), "-7");
+    assert_eq!(eval_bc("!false"), "true");
+    // Globals, member access, indexing, and calls (into the real stdlib).
+    assert_eq!(eval_bc("Math.max(1, 9, 4)"), "9");
+    assert_eq!(eval_bc("Math.floor(3.9) + Math.ceil(1.1)"), "5");
+    assert_eq!(eval_bc("'hello'.length"), "5");
+    assert_eq!(eval_bc("Number.MAX_SAFE_INTEGER"), "9007199254740991");
+    // A reference error propagates through the VM.
+    let program = Parser::parse_program("missingGlobalXyz").unwrap();
+    let mut interp = Interp::new();
+    let result = interp.eval_via_bytecode(&program.body).unwrap();
+    assert!(result.is_err());
+}
+
 #[test]
 fn arithmetic_and_precedence() {
     assert_eq!(eval("1 + 2 * 3"), "7");
