@@ -375,6 +375,10 @@ impl<'a> Interp<'a> {
     ) -> Completion<'a, Flow<'a>> {
         // The loop header gets its own scope, so `for (let i …)` binds per loop.
         let scope = Scope::child(env);
+        // `let`/`const` loop variables get a *fresh* binding each iteration, so
+        // closures created in the body capture that iteration's value. Collect
+        // their (simple-identifier) names to copy per iteration.
+        let mut per_iter_names: Vec<alloc::string::String> = Vec::new();
         if let Some(init) = init {
             match init {
                 crate::ast::ForInit::Var(decl) => {
@@ -385,28 +389,56 @@ impl<'a> Interp<'a> {
                         };
                         self.bind_target(&d.target, value, &scope, decl.kind)?;
                     }
+                    if matches!(decl.kind, VarDeclKind::Let | VarDeclKind::Const) {
+                        for d in &decl.declarations {
+                            if let BindingTarget::Ident(id) = &d.target {
+                                per_iter_names.push(id.name.to_string());
+                            }
+                        }
+                    }
                 }
                 crate::ast::ForInit::Expr(e) => {
                     self.eval_expr(e, &scope)?;
                 }
             }
         }
+        // `current` holds this iteration's loop-variable bindings; with no
+        // per-iteration names it is just the header scope.
+        let mut current = self.per_iteration_env(&scope, env, &per_iter_names);
         loop {
             if let Some(t) = test
-                && !self.eval_expr(t, &scope)?.to_boolean()
+                && !self.eval_expr(t, &current)?.to_boolean()
             {
                 break;
             }
-            match self.loop_step(body, &scope, label)? {
+            match self.loop_step(body, &current, label)? {
                 LoopCtl::Next => {}
                 LoopCtl::Stop => break,
                 LoopCtl::Propagate(f) => return Ok(f),
             }
+            // Copy the loop variables into a fresh environment, then run the
+            // update there — so the body's closures keep the prior binding.
+            current = self.per_iteration_env(&current, env, &per_iter_names);
             if let Some(u) = update {
-                self.eval_expr(u, &scope)?;
+                self.eval_expr(u, &current)?;
             }
         }
         Ok(Flow::Normal(Value::Undefined))
+    }
+
+    /// Builds the per-iteration environment for a `for` loop: with no
+    /// per-iteration names it reuses `src`; otherwise a fresh child of `outer`
+    /// copying each named binding's current value.
+    fn per_iteration_env(&self, src: &Env<'a>, outer: &Env<'a>, names: &[String]) -> Env<'a> {
+        if names.is_empty() {
+            return Rc::clone(src);
+        }
+        let fresh = Scope::child(outer);
+        for n in names {
+            let value = src.get(n).unwrap_or(Value::Undefined);
+            fresh.declare(n, value, true);
+        }
+        fresh
     }
 
     /// Evaluates one loop-body iteration and classifies the resulting flow,

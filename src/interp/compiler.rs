@@ -532,10 +532,25 @@ impl Compiler {
         update: Option<&Expr>,
         body: &Stmt,
     ) -> Result<Option<Reg>, CompileError> {
-        use crate::ast::ForInit;
+        use crate::ast::{ForInit, VarDeclKind};
         let mark = self.funcs.last().expect("fn").locals.len();
         match init {
             Some(ForInit::Var(decl)) => {
+                // A captured `let`/`const` loop variable needs a *fresh* binding
+                // per iteration (so body closures capture distinct values). The
+                // VM uses one cell for the whole loop, so hand these to the
+                // tree-walker, which implements per-iteration environments.
+                if matches!(decl.kind, VarDeclKind::Let | VarDeclKind::Const) {
+                    for d in &decl.declarations {
+                        if let BindingTarget::Ident(id) = &d.target
+                            && self.is_captured_here(&id.name)
+                        {
+                            return Err(CompileError::unsupported(
+                                "captured for-loop binding (per-iteration scope)",
+                            ));
+                        }
+                    }
+                }
                 self.stmt(&Stmt::Var(decl.clone()))?;
             }
             Some(ForInit::Expr(e)) => {

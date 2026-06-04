@@ -81,6 +81,19 @@ function tagger(tag) {
 const fns = [tagger("a"), tagger("b"), tagger("c")];
 assertEq(fns[0]("x") + "," + fns[1]("y") + "," + fns[2]("z"), "a:x,b:y,c:z");
 
+// --- per-iteration `let` bindings: each closure captures its own `i` ---
+const loopFns = [];
+for (let i = 0; i < 3; i += 1) {
+  loopFns.push(() => i);
+}
+assertEq(loopFns[0]() + "," + loopFns[1]() + "," + loopFns[2](), "0,1,2");
+// `var`, by contrast, shares one binding.
+const varFns = [];
+for (var v = 0; v < 3; v += 1) {
+  varFns.push(() => v);
+}
+assertEq(varFns[0]() + "," + varFns[1]() + "," + varFns[2](), "3,3,3");
+
 // --- accumulator closure ---
 function makeAccumulator() {
   let total = 0;
