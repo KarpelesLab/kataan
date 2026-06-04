@@ -333,7 +333,13 @@ struct Ctx<'a> {
     realm: &'a mut Realm,
     output: String,
     microtasks: alloc::collections::VecDeque<Microtask>,
+    /// Per-function tiering state, keyed by function id.
+    tiers: alloc::collections::BTreeMap<usize, TierState>,
 }
+
+/// Tier state for one function: its activation count and, once hot, its
+/// optimized bytecode body.
+type TierState = (u32, Option<alloc::rc::Rc<Vec<Op>>>);
 
 /// Runs function `id` of `funcs` with `args`, allocating in `realm`. Calls
 /// recurse on the Rust stack — one register window per activation, exactly the
@@ -351,6 +357,7 @@ pub fn run_program(
         realm,
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
+        tiers: alloc::collections::BTreeMap::new(),
     };
     let value = call(&mut ctx, funcs, id, args)?;
     drain_microtasks(&mut ctx, funcs)?;
@@ -371,6 +378,7 @@ pub fn run_program_capturing(
         realm,
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
+        tiers: alloc::collections::BTreeMap::new(),
     };
     let value = call(&mut ctx, funcs, id, args)?;
     // Run the promise event loop before returning (then-callbacks, async tails).
@@ -421,19 +429,33 @@ fn call_with(
     if let Some(slot) = regs.get_mut(proto.n_params + proto.n_captures) {
         *slot = this_val;
     }
+    // Tier-up: count this activation, optimize the body once the function gets
+    // hot, and run the optimized bytecode thereafter.
+    let optimized: Option<alloc::rc::Rc<Vec<Op>>> = {
+        let entry = ctx.tiers.entry(id).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        if entry.0 == TIER_UP_THRESHOLD && entry.1.is_none() {
+            entry.1 = Some(alloc::rc::Rc::new(optimize_ops(&funcs[id].ops)));
+        }
+        entry.1.clone()
+    };
+    let body: &[Op] = match &optimized {
+        Some(o) => o.as_slice(),
+        None => proto.ops.as_slice(),
+    };
     // An `async` function: its synchronous body runs to completion, and its
     // result (or thrown value) settles a returned `Promise`. (No `await` yet —
     // a body that awaits falls back at compile time.)
     if proto.is_async {
         let p = ctx.realm.new_promise();
-        match run_frame(ctx, funcs, &proto.ops, &mut regs) {
+        match run_frame(ctx, funcs, body, &mut regs) {
             Ok(ret) => settle(ctx, p, ret.unwrap_or(NanBox::undefined()), true),
             Err(VmError::Thrown(e)) => settle(ctx, p, e, false),
             Err(other) => return Err(other),
         }
         return Ok(NanBox::handle(p.to_raw()));
     }
-    Ok(run_frame(ctx, funcs, &proto.ops, &mut regs)?.unwrap_or(NanBox::undefined()))
+    Ok(run_frame(ctx, funcs, body, &mut regs)?.unwrap_or(NanBox::undefined()))
 }
 
 /// Why execution stopped abnormally.
@@ -457,6 +479,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         realm,
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
+        tiers: alloc::collections::BTreeMap::new(),
     };
     Ok(run_frame(&mut ctx, &[], program, &mut regs)?.unwrap_or(NanBox::undefined()))
 }
@@ -556,6 +579,116 @@ fn drain_microtasks(ctx: &mut Ctx, funcs: &[FnProto]) -> Result<(), VmError> {
         }
     }
     Ok(())
+}
+
+// --- optimizing tier: a constant-folding bytecode → bytecode pass ---
+
+/// The number of activations after which a function is "tiered up": its baseline
+/// bytecode is run through [`optimize_ops`] once and the result reused.
+const TIER_UP_THRESHOLD: u32 = 8;
+
+/// A bytecode→bytecode optimizer (the second tier): folds compile-time-constant
+/// arithmetic within each basic block, so an expression like `2 ** 10` or
+/// `1 + 2 * 3` collapses to a single `LoadConst`. Op count is preserved (folded
+/// ops are rewritten in place), so jump targets stay valid.
+///
+/// Soundness: a register's constant value is tracked only from a `LoadConst`,
+/// and the tracking is conservatively cleared at every basic-block leader (jump
+/// target) and on any op that isn't itself foldable — so a stale constant can
+/// never feed a fold.
+fn optimize_ops(ops: &[Op]) -> Vec<Op> {
+    use alloc::collections::{BTreeMap, BTreeSet};
+    // Basic-block leaders: the targets of every branch / handler install.
+    let mut leaders: BTreeSet<usize> = BTreeSet::new();
+    for op in ops {
+        match op {
+            Op::Jump { target }
+            | Op::JumpIfFalse { target, .. }
+            | Op::PushHandler { target, .. } => {
+                leaders.insert(*target);
+            }
+            _ => {}
+        }
+    }
+
+    let mut consts: BTreeMap<Reg, NanBox> = BTreeMap::new();
+    let num = |consts: &BTreeMap<Reg, NanBox>, r: &Reg| consts.get(r).and_then(|v| v.as_number());
+
+    let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        if leaders.contains(&i) {
+            consts.clear();
+        }
+        // Try to fold; `folded` is the (possibly rewritten) op to emit.
+        let folded: Op = match op {
+            Op::LoadConst { dst, value } => {
+                consts.insert(*dst, *value);
+                op.clone()
+            }
+            Op::Add { dst, a, b } => fold2(*dst, num(&consts, a), num(&consts, b), |x, y| {
+                NanBox::number(x + y)
+            })
+            .unwrap_or_else(|| op.clone()),
+            Op::Sub { dst, a, b } => fold2(*dst, num(&consts, a), num(&consts, b), |x, y| {
+                NanBox::number(x - y)
+            })
+            .unwrap_or_else(|| op.clone()),
+            Op::Mul { dst, a, b } => fold2(*dst, num(&consts, a), num(&consts, b), |x, y| {
+                NanBox::number(x * y)
+            })
+            .unwrap_or_else(|| op.clone()),
+            Op::Div { dst, a, b } => fold2(*dst, num(&consts, a), num(&consts, b), |x, y| {
+                NanBox::number(x / y)
+            })
+            .unwrap_or_else(|| op.clone()),
+            Op::Mod { dst, a, b } => fold2(*dst, num(&consts, a), num(&consts, b), |x, y| {
+                NanBox::number(x % y)
+            })
+            .unwrap_or_else(|| op.clone()),
+            Op::Lt { dst, a, b } => fold2(*dst, num(&consts, a), num(&consts, b), |x, y| {
+                NanBox::boolean(x < y)
+            })
+            .unwrap_or_else(|| op.clone()),
+            Op::Neg { dst, a } => match num(&consts, a) {
+                Some(x) => Op::LoadConst {
+                    dst: *dst,
+                    value: NanBox::number(-x),
+                },
+                None => op.clone(),
+            },
+            Op::Not { dst, a } => match consts.get(a) {
+                Some(v) => Op::LoadConst {
+                    dst: *dst,
+                    value: NanBox::boolean(!v.to_boolean()),
+                },
+                None => op.clone(),
+            },
+            // Anything else ends the constant run for its destination (and we
+            // conservatively forget all tracked constants, so nothing stale
+            // survives into a fold).
+            _ => {
+                consts.clear();
+                op.clone()
+            }
+        };
+        // A folded arithmetic op now produces a known constant.
+        if let Op::LoadConst { dst, value } = &folded {
+            consts.insert(*dst, *value);
+        }
+        out.push(folded);
+    }
+    out
+}
+
+/// Folds a binary op over two known-number operands, producing a `LoadConst`.
+fn fold2(dst: Reg, a: Option<f64>, b: Option<f64>, f: impl Fn(f64, f64) -> NanBox) -> Option<Op> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(Op::LoadConst {
+            dst,
+            value: f(x, y),
+        }),
+        _ => None,
+    }
 }
 
 /// Executes one function body (`program`) against the register file `regs`.
@@ -5649,6 +5782,100 @@ mod tests {
         assert_eq!(
             bc("let c = {}; c.k = 7; let r = ('k' in c) ? c.k : -1; r"),
             "7"
+        );
+    }
+
+    #[test]
+    fn optimizer_folds_constant_arithmetic() {
+        // 6 * 7 over two constants folds to a single LoadConst 42.
+        let ops = alloc::vec![
+            Op::LoadConst {
+                dst: 0,
+                value: NanBox::number(6.0)
+            },
+            Op::LoadConst {
+                dst: 1,
+                value: NanBox::number(7.0)
+            },
+            Op::Mul { dst: 2, a: 0, b: 1 },
+            Op::Return { src: 2 },
+        ];
+        let opt = optimize_ops(&ops);
+        match &opt[2] {
+            Op::LoadConst { dst, value } => {
+                assert_eq!(*dst, 2);
+                assert_eq!(value.as_number(), Some(42.0));
+            }
+            other => panic!("expected a folded LoadConst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optimizer_propagates_folded_constants() {
+        // (10 - 4) then * 7 — the Sub's folded constant feeds the Mul.
+        let ops = alloc::vec![
+            Op::LoadConst {
+                dst: 0,
+                value: NanBox::number(10.0)
+            },
+            Op::LoadConst {
+                dst: 1,
+                value: NanBox::number(4.0)
+            },
+            Op::Sub { dst: 2, a: 0, b: 1 }, // -> 6
+            Op::LoadConst {
+                dst: 3,
+                value: NanBox::number(7.0)
+            },
+            Op::Mul { dst: 4, a: 2, b: 3 }, // -> 42
+            Op::Return { src: 4 },
+        ];
+        let opt = optimize_ops(&ops);
+        assert!(matches!(&opt[2], Op::LoadConst { value, .. } if value.as_number() == Some(6.0)));
+        assert!(matches!(&opt[4], Op::LoadConst { value, .. } if value.as_number() == Some(42.0)));
+    }
+
+    #[test]
+    fn optimizer_does_not_fold_across_basic_blocks() {
+        // A constant set before a jump target must NOT be assumed at the target
+        // (control could arrive without having run the LoadConst).
+        let ops = alloc::vec![
+            Op::LoadConst {
+                dst: 0,
+                value: NanBox::number(2.0)
+            },
+            Op::Jump { target: 3 },
+            Op::LoadConst {
+                dst: 0,
+                value: NanBox::number(99.0)
+            }, // skipped path
+            // index 3 is a jump target → constants cleared here.
+            Op::Mul { dst: 1, a: 0, b: 0 },
+            Op::Return { src: 1 },
+        ];
+        let opt = optimize_ops(&ops);
+        // The Mul at the leader stays a Mul (not folded on a stale constant).
+        assert!(matches!(&opt[3], Op::Mul { .. }));
+    }
+
+    #[test]
+    fn tier_up_preserves_results_over_many_calls() {
+        // A function called past the tier-up threshold must keep returning the
+        // right values (the optimized body is semantically identical).
+        assert_eq!(
+            bc("function sq(x) { return x * x; }
+                let s = 0;
+                for (let i = 0; i < 12; i++) { s += sq(i); }
+                s"),
+            "506" // sum of squares 0..=11
+        );
+        // A const-folding-heavy body run hot still computes correctly.
+        assert_eq!(
+            bc("function f() { return 6 * 7 - 2; }
+                let t = 0;
+                for (let i = 0; i < 20; i++) { t += f(); }
+                t"),
+            "800" // 40 * 20
         );
     }
 
