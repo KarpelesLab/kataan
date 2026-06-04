@@ -1726,6 +1726,39 @@ impl Compiler {
                 self.write_var(b, next);
                 Ok(if *prefix { next } else { old })
             }
+            // A template literal: interleave cooked quasis with interpolations,
+            // concatenating via the realm's `+` (ToString on each value).
+            Expr::Template(t) => {
+                let cooked = |q: &crate::ast::TemplateElement| -> String {
+                    q.cooked.as_deref().map(String::from).unwrap_or_default()
+                };
+                let mut acc = self.alloc();
+                self.ops.push(Op::NewString {
+                    dst: acc,
+                    value: t.quasis.first().map(cooked).unwrap_or_default(),
+                });
+                for (i, e) in t.expressions.iter().enumerate() {
+                    let v = self.expr(e)?;
+                    let s1 = self.alloc();
+                    self.ops.push(Op::AddValue {
+                        dst: s1,
+                        a: acc,
+                        b: v,
+                    });
+                    let q = self.alloc();
+                    self.ops.push(Op::NewString {
+                        dst: q,
+                        value: t.quasis.get(i + 1).map(cooked).unwrap_or_default(),
+                    });
+                    acc = self.alloc();
+                    self.ops.push(Op::AddValue {
+                        dst: acc,
+                        a: s1,
+                        b: q,
+                    });
+                }
+                Ok(acc)
+            }
             // A function expression / arrow → a closure capturing its free
             // variables (as shared cells).
             Expr::Function(f) => self.make_closure(&f.params, &f.body),
@@ -2230,6 +2263,21 @@ mod tests {
         let (bc, _) = execute(src).expect("ok");
         let (tw, _) = crate::nbexec::eval_source(src).expect("ok");
         assert_eq!(bc, tw);
+    }
+
+    #[test]
+    fn bytecode_template_literals() {
+        assert_eq!(bc("let n = 'world'; `Hello, ${n}!`"), "Hello, world!");
+        assert_eq!(
+            bc("let a = 2, b = 3; `${a} + ${b} = ${a + b}`"),
+            "2 + 3 = 5"
+        );
+        assert_eq!(bc("`no interpolation`"), "no interpolation");
+        // A template in a function, over a captured value.
+        assert_eq!(
+            bc("function greet(who) { return `hi ${who}`; } greet('ada')"),
+            "hi ada"
+        );
     }
 
     #[test]
