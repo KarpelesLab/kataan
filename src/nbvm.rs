@@ -1833,6 +1833,7 @@ fn scan_class<'a>(
         ctor: None,
         methods: Vec::new(),
         accessors: Vec::new(),
+        statics: Vec::new(),
     };
     let mut ctor_member: Option<&crate::ast::ClassMethod> = None;
     let mut fields: Vec<(String, Option<&'a Expr>)> = Vec::new();
@@ -1885,10 +1886,25 @@ fn scan_class<'a>(
                     add_accessor(name, None, Some(id), &mut info.accessors);
                 }
             }
+            ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
+                let id = *next_id;
+                *next_id += 1;
+                let name = static_key(&m.key)?;
+                info.statics.push((name, id));
+                jobs.push(ClassJob {
+                    id,
+                    params: &m.value.params,
+                    body: &m.value.body,
+                    super_of: None,
+                    fields: Vec::new(),
+                });
+            }
             ClassMember::Field(f) if !f.is_static => {
                 fields.push((static_key(&f.key)?, f.value.as_ref()));
             }
-            // Statics → fall back.
+            // Static fields are installed at the declaration site (see
+            // `Stmt::Class`); static getters/setters → fall back.
+            ClassMember::Field(f) if f.is_static => {}
             _ => return Err(CompileError::Unsupported("class member")),
         }
     }
@@ -1957,6 +1973,8 @@ struct ClassInfo {
     methods: Vec<(String, u32)>,
     /// `(name, getter_id, setter_id)` for each accessor property.
     accessors: Vec<(String, Option<u32>, Option<u32>)>,
+    /// `(method_name, function_id)` for each `static` method.
+    statics: Vec<(String, u32)>,
 }
 
 /// A variable binding: the register holding it, and whether that register holds
@@ -2287,7 +2305,50 @@ impl Compiler {
             Stmt::Empty { .. } => Ok(None),
             // Function and (top-level) class declarations are compiled into the
             // table up front; nothing to emit at the declaration site.
-            Stmt::Function(_) | Stmt::Class(_) => Ok(None),
+            Stmt::Function(_) => Ok(None),
+            // Methods/constructors are compiled up front; here we materialize the
+            // class's *static* side as a value object bound to the class name, so
+            // `ClassName.staticMethod()` / `ClassName.staticField` work.
+            Stmt::Class(class) => {
+                let Some(cid) = &class.id else {
+                    return Ok(None);
+                };
+                let info = match self.classes.get(&*cid.name) {
+                    Some(i) => i.clone(),
+                    None => return Ok(None), // a class that fell back at scan time
+                };
+                let cobj = self.alloc();
+                self.ops.push(Op::NewObject { dst: cobj });
+                for (sname, sid) in &info.statics {
+                    let f = self.alloc();
+                    self.ops.push(Op::LoadFunc { dst: f, func: *sid });
+                    self.ops.push(Op::SetProp {
+                        obj: cobj,
+                        key: sname.clone(),
+                        src: f,
+                    });
+                }
+                // Static fields initialize at the declaration site.
+                for member in &class.body {
+                    if let crate::ast::ClassMember::Field(f) = member
+                        && f.is_static
+                    {
+                        let key = static_key(&f.key)?;
+                        let v = match &f.value {
+                            Some(e) => self.expr(e)?,
+                            None => self.constant(NanBox::undefined())?,
+                        };
+                        self.ops.push(Op::SetProp {
+                            obj: cobj,
+                            key,
+                            src: v,
+                        });
+                    }
+                }
+                let b = self.declare(&cid.name);
+                self.write_var(b, cobj);
+                Ok(None)
+            }
             Stmt::Return { argument, .. } => {
                 let src = match argument {
                     Some(e) => self.expr(e)?,
@@ -3805,6 +3866,36 @@ mod tests {
                 a.get() + ',' + b.get()"
             ),
             "1,99"
+        );
+    }
+
+    #[test]
+    fn bytecode_class_statics() {
+        // A static method.
+        assert_eq!(
+            bc("class M { static add(a, b) { return a + b; } } M.add(3, 4)"),
+            "7"
+        );
+        // A static field.
+        assert_eq!(bc("class C { static version = 42; } C.version"), "42");
+        // A static factory returning an instance.
+        assert_eq!(
+            bc(
+                "class P { constructor(x) { this.x = x; } static of(x) { return new P(x); } }
+                P.of(9).x"
+            ),
+            "9"
+        );
+        // Static method + static field together; instance methods unaffected.
+        assert_eq!(
+            bc("class Counter {
+                  static total = 0;
+                  constructor() { this.n = 1; }
+                  static describe() { return 'counter'; }
+                  bump() { return this.n + 1; }
+                }
+                Counter.describe() + ':' + Counter.total + ':' + new Counter().bump()"),
+            "counter:0:2"
         );
     }
 
