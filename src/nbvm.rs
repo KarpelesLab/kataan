@@ -1794,11 +1794,25 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
     let mut class_jobs: Vec<ClassJob> = Vec::new();
     let mut class_id = 0u32;
     for s in &program.body {
-        if let Stmt::Class(class) = s {
-            let Some(id) = &class.id else { continue };
+        // A class declaration, or a top-level `const Name = class {…}` (treated
+        // as a named class so `new Name(...)` resolves).
+        let named = match s {
+            Stmt::Class(class) => class.id.as_ref().map(|id| (String::from(&*id.name), class)),
+            Stmt::Var(decl) => match decl.declarations.as_slice() {
+                [d] => match (&d.target, &d.init) {
+                    (BindingTarget::Ident(id), Some(Expr::Class(class))) => {
+                        Some((String::from(&*id.name), class))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((name, class)) = named {
             let info = scan_class(class, class_id, &mut next_id, &mut class_jobs)?;
             class_id += 1;
-            class_map.insert(String::from(&*id.name), info);
+            class_map.insert(name, info);
         }
     }
     let classes = alloc::rc::Rc::new(class_map);
@@ -2863,43 +2877,9 @@ impl Compiler {
             // class's *static* side as a value object bound to the class name, so
             // `ClassName.staticMethod()` / `ClassName.staticField` work.
             Stmt::Class(class) => {
-                let Some(cid) = &class.id else {
-                    return Ok(None);
-                };
-                let info = match self.classes.get(&*cid.name) {
-                    Some(i) => i.clone(),
-                    None => return Ok(None), // a class that fell back at scan time
-                };
-                let cobj = self.alloc();
-                self.ops.push(Op::NewObject { dst: cobj });
-                for (sname, sid) in &info.statics {
-                    let f = self.alloc();
-                    self.ops.push(Op::LoadFunc { dst: f, func: *sid });
-                    self.ops.push(Op::SetProp {
-                        obj: cobj,
-                        key: sname.clone(),
-                        src: f,
-                    });
+                if let Some(cid) = &class.id {
+                    self.materialize_class(&cid.name, class)?;
                 }
-                // Static fields initialize at the declaration site.
-                for member in &class.body {
-                    if let crate::ast::ClassMember::Field(f) = member
-                        && f.is_static
-                    {
-                        let key = static_key(&f.key)?;
-                        let v = match &f.value {
-                            Some(e) => self.expr(e)?,
-                            None => self.constant(NanBox::undefined())?,
-                        };
-                        self.ops.push(Op::SetProp {
-                            obj: cobj,
-                            key,
-                            src: v,
-                        });
-                    }
-                }
-                let b = self.declare(&cid.name);
-                self.write_var(b, cobj);
                 Ok(None)
             }
             Stmt::Return { argument, .. } => {
@@ -3038,6 +3018,15 @@ impl Compiler {
             Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
             Stmt::Var(decl) => {
                 for d in &decl.declarations {
+                    // `const Name = class {…}` was registered as a named class
+                    // (so `new Name()` resolves); materialize its static side.
+                    if let (BindingTarget::Ident(id), Some(Expr::Class(class))) =
+                        (&d.target, &d.init)
+                        && self.classes.contains_key(&*id.name)
+                    {
+                        self.materialize_class(&id.name, class)?;
+                        continue;
+                    }
                     let value = match &d.init {
                         Some(e) => self.expr(e)?,
                         None => self.constant(NanBox::undefined())?,
@@ -3686,6 +3675,31 @@ impl Compiler {
                         dst,
                         callee: m,
                         recv,
+                        args,
+                    });
+                    return Ok(dst);
+                }
+                // `ClassName.staticMethod(args)` where `ClassName` isn't a local
+                // in scope (e.g. referenced from inside another method) → a
+                // direct static dispatch, since the class object isn't reachable.
+                if let Expr::Member {
+                    object,
+                    property: PropertyKey::Ident(key) | PropertyKey::Str(key),
+                    ..
+                } = &**callee
+                    && let Expr::Ident(cn) = &**object
+                    && self.lookup(&cn.name).is_none()
+                    && let Some(sid) = self.classes.get(&*cn.name).and_then(|info| {
+                        info.statics
+                            .iter()
+                            .find(|(n, _)| n == &**key)
+                            .map(|(_, id)| *id)
+                    })
+                {
+                    let dst = self.alloc();
+                    self.ops.push(Op::Call {
+                        dst,
+                        func: sid,
                         args,
                     });
                     return Ok(dst);
@@ -4358,6 +4372,50 @@ impl Compiler {
         None
     }
 
+    /// Materializes a class's *static* side as a value object bound to `name`
+    /// (static methods + static fields), so `Name.staticMember` works. Used by
+    /// both class declarations and top-level `const Name = class {…}`.
+    fn materialize_class(
+        &mut self,
+        name: &str,
+        class: &crate::ast::Class,
+    ) -> Result<(), CompileError> {
+        let info = match self.classes.get(name) {
+            Some(i) => i.clone(),
+            None => return Ok(()), // a class that fell back at scan time
+        };
+        let cobj = self.alloc();
+        self.ops.push(Op::NewObject { dst: cobj });
+        for (sname, sid) in &info.statics {
+            let f = self.alloc();
+            self.ops.push(Op::LoadFunc { dst: f, func: *sid });
+            self.ops.push(Op::SetProp {
+                obj: cobj,
+                key: sname.clone(),
+                src: f,
+            });
+        }
+        for member in &class.body {
+            if let crate::ast::ClassMember::Field(f) = member
+                && f.is_static
+            {
+                let key = static_key(&f.key)?;
+                let v = match &f.value {
+                    Some(e) => self.expr(e)?,
+                    None => self.constant(NanBox::undefined())?,
+                };
+                self.ops.push(Op::SetProp {
+                    obj: cobj,
+                    key,
+                    src: v,
+                });
+            }
+        }
+        let b = self.declare(name);
+        self.write_var(b, cobj);
+        Ok(())
+    }
+
     /// Writes `src` to `obj.key` / `obj[i]` (the mirror of `member_read`).
     fn member_write(
         &mut self,
@@ -4788,6 +4846,28 @@ mod tests {
                 a.get() + ',' + b.get()"
             ),
             "1,99"
+        );
+    }
+
+    #[test]
+    fn bytecode_class_expressions() {
+        // Class expression assigned to a const, used with `new`.
+        assert_eq!(
+            bc("const Pair = class { constructor(a, b) { this.a = a; this.b = b; } sum() { return this.a + this.b; } };
+                new Pair(10, 20).sum()"),
+            "30"
+        );
+        // Class expression with a getter.
+        assert_eq!(
+            bc("const Box = class { constructor(v) { this._v = v; } get value() { return this._v * 2; } };
+                new Box(21).value"),
+            "42"
+        );
+        // A static method referencing the class by name from another static.
+        assert_eq!(
+            bc("class MathUtil { static square(x) { return x * x; } static sumOfSquares(a, b) { return MathUtil.square(a) + MathUtil.square(b); } }
+                MathUtil.sumOfSquares(3, 4)"),
+            "25"
         );
     }
 
