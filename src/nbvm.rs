@@ -49,6 +49,8 @@ pub enum Op {
     Mul { dst: Reg, a: Reg, b: Reg },
     /// `dst = a / b` (numeric).
     Div { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a % b` (numeric remainder).
+    Mod { dst: Reg, a: Reg, b: Reg },
     /// `dst = -a` (numeric negation).
     Neg { dst: Reg, a: Reg },
     /// `dst = !a` (ECMAScript `ToBoolean` then logical not).
@@ -256,6 +258,10 @@ fn run_frame(
             Op::Div { dst, a, b } => {
                 regs[*dst as usize] =
                     NanBox::number(num(regs[*a as usize])? / num(regs[*b as usize])?);
+            }
+            Op::Mod { dst, a, b } => {
+                regs[*dst as usize] =
+                    NanBox::number(num(regs[*a as usize])? % num(regs[*b as usize])?);
             }
             Op::Neg { dst, a } => {
                 regs[*dst as usize] = NanBox::number(-num(regs[*a as usize])?);
@@ -573,6 +579,13 @@ struct Compiler {
     next_reg: Reg,
     /// Function name → table id, for resolving calls.
     fn_ids: alloc::collections::BTreeMap<String, u32>,
+    /// Per enclosing loop/switch: `break` jump indices awaiting the exit target
+    /// (loops and `switch` both push here).
+    break_sites: Vec<Vec<usize>>,
+    /// Per enclosing loop: `continue` jump indices awaiting the loop's continue
+    /// point (`switch` does *not* push here — `continue` targets the nearest
+    /// loop).
+    continue_sites: Vec<Vec<usize>>,
 }
 
 impl Compiler {
@@ -654,6 +667,57 @@ impl Compiler {
             Stmt::Throw { argument, .. } => {
                 let src = self.expr(argument)?;
                 self.ops.push(Op::Throw { src });
+                Ok(None)
+            }
+            Stmt::Switch {
+                discriminant,
+                cases,
+                ..
+            } => {
+                let d = self.expr(discriminant)?;
+                // Only `break` targets a switch; `continue` skips to the loop.
+                self.break_sites.push(Vec::new());
+                // Dispatch: jump to the first matching `case` body (else default,
+                // else the end). Bodies (compiled next) fall through.
+                let mut case_jumps: Vec<(usize, usize)> = Vec::new();
+                for (i, case) in cases.iter().enumerate() {
+                    if let Some(test) = &case.test {
+                        let t = self.expr(test)?;
+                        let eq = self.alloc();
+                        self.ops.push(Op::StrictEq {
+                            dst: eq,
+                            a: d,
+                            b: t,
+                        });
+                        let skip = self.emit_jump_if_false(eq);
+                        let to_body = self.emit_jump();
+                        case_jumps.push((i, to_body));
+                        self.patch(skip); // not this case → next test
+                    }
+                }
+                let exit_dispatch = self.emit_jump(); // → default body, else end
+                // Bodies, in order, falling through.
+                let mut entries = alloc::vec![0usize; cases.len()];
+                for (i, case) in cases.iter().enumerate() {
+                    entries[i] = self.ops.len();
+                    self.scopes.push(alloc::collections::BTreeMap::new());
+                    for s in &case.body {
+                        self.stmt(s)?;
+                    }
+                    self.scopes.pop();
+                }
+                for (i, j) in case_jumps {
+                    self.patch_to(j, entries[i]);
+                }
+                match cases.iter().position(|c| c.test.is_none()) {
+                    Some(di) => self.patch_to(exit_dispatch, entries[di]),
+                    None => self.patch(exit_dispatch), // no default → end
+                }
+                let breaks = self.break_sites.pop().unwrap_or_default();
+                let end = self.ops.len();
+                for b in breaks {
+                    self.patch_to(b, end);
+                }
                 Ok(None)
             }
             Stmt::Try {
@@ -760,18 +824,41 @@ impl Compiler {
                 }
                 Ok(None)
             }
+            Stmt::Break { label: None, .. } => {
+                let j = self.emit_jump();
+                self.break_sites
+                    .last_mut()
+                    .ok_or(CompileError::Unsupported("break outside loop/switch"))?
+                    .push(j);
+                Ok(None)
+            }
+            Stmt::Continue { label: None, .. } => {
+                let j = self.emit_jump();
+                self.continue_sites
+                    .last_mut()
+                    .ok_or(CompileError::Unsupported("continue outside loop"))?
+                    .push(j);
+                Ok(None)
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } => {
+                Err(CompileError::Unsupported("labeled break/continue"))
+            }
             Stmt::While { test, body, .. } => {
                 let top = self.ops.len();
                 let cond = self.expr(test)?;
                 let jf = self.emit_jump_if_false(cond);
+                self.enter_loop();
                 self.stmt(body)?;
                 self.ops.push(Op::Jump { target: top });
                 self.patch(jf);
+                self.exit_loop(top); // `continue` re-tests
                 Ok(None)
             }
             Stmt::DoWhile { body, test, .. } => {
                 let top = self.ops.len();
+                self.enter_loop();
                 self.stmt(body)?;
+                let cont = self.ops.len(); // `continue` re-tests
                 let cond = self.expr(test)?;
                 // Loop back to the top while the condition holds: jump if the
                 // *negated* condition is false (i.e. while the condition is true).
@@ -779,6 +866,7 @@ impl Compiler {
                 self.ops.push(Op::Not { dst: not, a: cond });
                 let jf = self.emit_jump_if_false(not);
                 self.patch_to(jf, top);
+                self.exit_loop(cont);
                 Ok(None)
             }
             Stmt::For {
@@ -806,7 +894,9 @@ impl Compiler {
                     }
                     None => None,
                 };
+                self.enter_loop();
                 self.stmt(body)?;
+                let cont = self.ops.len(); // `continue` runs the update
                 if let Some(u) = update {
                     self.expr(u)?;
                 }
@@ -814,6 +904,7 @@ impl Compiler {
                 if let Some(jf) = exit {
                     self.patch(jf);
                 }
+                self.exit_loop(cont);
                 self.scopes.pop();
                 Ok(None)
             }
@@ -1093,6 +1184,7 @@ impl Compiler {
             BinaryOp::Sub => self.ops.push(Op::Sub { dst, a, b }),
             BinaryOp::Mul => self.ops.push(Op::Mul { dst, a, b }),
             BinaryOp::Div => self.ops.push(Op::Div { dst, a, b }),
+            BinaryOp::Mod => self.ops.push(Op::Mod { dst, a, b }),
             BinaryOp::Lt => self.ops.push(Op::Lt { dst, a, b }),
             BinaryOp::Gt => self.ops.push(Op::Lt { dst, a: b, b: a }),
             BinaryOp::LtEq => {
@@ -1167,6 +1259,26 @@ impl Compiler {
     fn patch(&mut self, idx: usize) {
         let target = self.ops.len();
         self.patch_to(idx, target);
+    }
+
+    /// Opens a loop scope for `break`/`continue` collection.
+    fn enter_loop(&mut self) {
+        self.break_sites.push(Vec::new());
+        self.continue_sites.push(Vec::new());
+    }
+
+    /// Closes a loop scope: `break`s jump past the loop (here), `continue`s jump
+    /// to `continue_target`.
+    fn exit_loop(&mut self, continue_target: usize) {
+        let breaks = self.break_sites.pop().unwrap_or_default();
+        let continues = self.continue_sites.pop().unwrap_or_default();
+        let end = self.ops.len();
+        for b in breaks {
+            self.patch_to(b, end);
+        }
+        for c in continues {
+            self.patch_to(c, continue_target);
+        }
     }
 
     /// Backpatches the jump (or handler) at `idx` to land at `target`.
@@ -1380,6 +1492,58 @@ mod tests {
             "6"
         );
         assert_eq!(bc("let r = 0; do { r++; } while (false); r"), "1");
+    }
+
+    #[test]
+    fn bytecode_break_continue_switch() {
+        // break exits the loop.
+        assert_eq!(
+            bc("let s = 0; for (let i = 0; i < 100; i++) { if (i === 5) { break; } s += i; } s"),
+            "10"
+        );
+        // continue skips to the next iteration.
+        assert_eq!(
+            bc(
+                "let s = 0; for (let i = 0; i < 6; i++) { if (i % 2 === 0) { continue; } s += i; } s"
+            ),
+            "9"
+        );
+        // break / continue in a while loop.
+        assert_eq!(
+            bc(
+                "let i = 0; let s = 0; while (true) { i++; if (i > 5) { break; } if (i === 3) { continue; } s += i; } s"
+            ),
+            "12"
+        );
+        // continue in a do/while.
+        assert_eq!(
+            bc(
+                "let i = 0; let s = 0; do { i++; if (i === 2) { continue; } s += i; } while (i < 4); s"
+            ),
+            "8"
+        );
+        // switch with fall-through and default; break ends the switch.
+        assert_eq!(
+            bc("function classify(n) {
+                  let r = '';
+                  switch (n) {
+                    case 1: r = 'one'; break;
+                    case 2:
+                    case 3: r = 'few'; break;
+                    default: r = 'many';
+                  }
+                  return r;
+                }
+                classify(1) + ',' + classify(2) + ',' + classify(3) + ',' + classify(9)"),
+            "one,few,few,many"
+        );
+        // A continue inside a switch targets the enclosing loop.
+        assert_eq!(
+            bc(
+                "let s = 0; for (let i = 0; i < 4; i++) { switch (i) { case 1: continue; default: s += i; } } s"
+            ),
+            "5"
+        );
     }
 
     #[test]
