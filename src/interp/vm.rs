@@ -110,6 +110,9 @@ impl<'a> Interp<'a> {
                     Op::Not { dst, src } => {
                         regs[*dst as usize] = Value::Bool(!regs[*src as usize].to_boolean());
                     }
+                    Op::Binary { dst, a, b, op } => {
+                        self.bin(&mut regs, binop_from_code(*op), *dst, *a, *b)?;
+                    }
 
                     Op::GetGlobal { dst, name } => {
                         let key = const_str(chunk, *name);
@@ -161,6 +164,18 @@ impl<'a> Interp<'a> {
                         let args: Vec<Value<'a>> = regs[base..base + *argc as usize].to_vec();
                         regs[*dst as usize] =
                             self.call_with_this(callee_val, Value::Undefined, args)?;
+                    }
+
+                    Op::New {
+                        dst,
+                        callee,
+                        args_base,
+                        argc,
+                    } => {
+                        let callee_val = regs[*callee as usize].clone();
+                        let base = *args_base as usize;
+                        let args: Vec<Value<'a>> = regs[base..base + *argc as usize].to_vec();
+                        regs[*dst as usize] = self.construct(callee_val, args)?;
                     }
 
                     Op::CallMethod {
@@ -250,6 +265,21 @@ fn make_bytecode_fn<'a>(module: &Rc<Module>, chunk: u32) -> Rc<Obj<'a>> {
         captures: Vec::new(),
     }));
     obj
+}
+
+/// Maps a generic [`Op::Binary`] operator code back to its [`BinaryOp`].
+fn binop_from_code(code: u8) -> BinaryOp {
+    use crate::bytecode::binop;
+    match code {
+        binop::BIT_AND => BinaryOp::BitAnd,
+        binop::BIT_OR => BinaryOp::BitOr,
+        binop::BIT_XOR => BinaryOp::BitXor,
+        binop::SHL => BinaryOp::Shl,
+        binop::SHR => BinaryOp::Shr,
+        binop::USHR => BinaryOp::Ushr,
+        binop::IN => BinaryOp::In,
+        _ => BinaryOp::Instanceof,
+    }
 }
 
 /// Reads a string constant from the pool.

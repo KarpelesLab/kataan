@@ -1016,7 +1016,11 @@ impl<'a> Interp<'a> {
     }
 
     /// `new Callee(args)` — constructs from a class or an ordinary function.
-    fn construct(&mut self, callee: Value<'a>, args: Vec<Value<'a>>) -> Completion<'a, Value<'a>> {
+    pub(super) fn construct(
+        &mut self,
+        callee: Value<'a>,
+        args: Vec<Value<'a>>,
+    ) -> Completion<'a, Value<'a>> {
         match callee {
             Value::Class(cv) => {
                 let instance = Obj::with_proto(Rc::clone(&cv.prototype));

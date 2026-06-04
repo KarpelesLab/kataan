@@ -181,6 +181,37 @@ fn bytecode_vm_object_array_literals() {
 }
 
 #[test]
+fn bytecode_vm_bitwise_in_instanceof() {
+    // Bitwise / shift via the generic Binary op.
+    assert_eq!(eval_bc("5 & 3"), "1");
+    assert_eq!(eval_bc("5 | 2"), "7");
+    assert_eq!(eval_bc("5 ^ 1"), "4");
+    assert_eq!(eval_bc("1 << 4"), "16");
+    assert_eq!(eval_bc("256 >> 2"), "64");
+    assert_eq!(eval_bc("-1 >>> 28"), "15");
+    // `in` and `instanceof`.
+    assert_eq!(eval_bc("let o = { a: 1 }; 'a' in o"), "true");
+    assert_eq!(eval_bc("let o = { a: 1 }; 'b' in o"), "false");
+    assert_eq!(eval_bc("new Map() instanceof Map"), "true");
+    assert_eq!(eval_bc("new TypeError('x') instanceof Error"), "true");
+}
+
+#[test]
+fn bytecode_vm_new_operator() {
+    // Built-in constructors via `new`.
+    assert_eq!(eval_bc("let m = new Map(); m.set('k', 1); m.get('k')"), "1");
+    assert_eq!(eval_bc("let s = new Set([1, 1, 2]); s.size"), "2");
+    assert_eq!(eval_bc("new Error('oops').message"), "oops");
+    assert_eq!(eval_bc("new Date(0).getFullYear()"), "1970");
+    assert_eq!(eval_bc("new TypeError('x') instanceof Error"), "true");
+    // `new` then a method call on the result.
+    assert_eq!(
+        eval_bc("let m = new Map([['a', 1], ['b', 2]]); m.has('a') && m.size === 2"),
+        "true"
+    );
+}
+
+#[test]
 fn bytecode_vm_try_catch_throw() {
     // A throw is caught and its value bound.
     assert_eq!(
@@ -218,6 +249,11 @@ fn bytecode_vm_try_catch_throw() {
              r"
         ),
         "y"
+    );
+    // throw new Error(...) and read .message.
+    assert_eq!(
+        eval_bc("let r = ''; try { throw new Error('msg'); } catch (e) { r = e.message; } r"),
+        "msg"
     );
 }
 

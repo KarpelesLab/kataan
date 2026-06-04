@@ -185,6 +185,8 @@ mod tag {
     pub(super) const THROW: u8 = 35;
     pub(super) const PUSH_HANDLER: u8 = 36;
     pub(super) const POP_HANDLER: u8 = 37;
+    pub(super) const NEW: u8 = 38;
+    pub(super) const BINARY: u8 = 39;
 }
 
 fn write_op(w: &mut Writer, op: &Op) {
@@ -227,6 +229,13 @@ fn write_op(w: &mut Writer, op: &Op) {
             w.raw(tag::NEG);
             w.u16(*dst);
             w.u16(*src);
+        }
+        Op::Binary { dst, a, b, op } => {
+            w.raw(tag::BINARY);
+            w.u16(*dst);
+            w.u16(*a);
+            w.u16(*b);
+            w.raw(*op);
         }
         Op::Not { dst, src } => {
             w.raw(tag::NOT);
@@ -293,6 +302,18 @@ fn write_op(w: &mut Writer, op: &Op) {
             argc,
         } => {
             w.raw(tag::CALL);
+            w.u16(*dst);
+            w.u16(*callee);
+            w.u16(*args_base);
+            w.u16(*argc);
+        }
+        Op::New {
+            dst,
+            callee,
+            args_base,
+            argc,
+        } => {
+            w.raw(tag::NEW);
             w.u16(*dst);
             w.u16(*callee);
             w.u16(*args_base);
@@ -412,6 +433,18 @@ fn read_op(r: &mut Reader) -> Result<Op, BytecodeError> {
             offset: r.i32()?,
         },
         tag::CALL => Op::Call {
+            dst: r.u16()?,
+            callee: r.u16()?,
+            args_base: r.u16()?,
+            argc: r.u16()?,
+        },
+        tag::BINARY => Op::Binary {
+            dst: r.u16()?,
+            a: r.u16()?,
+            b: r.u16()?,
+            op: r.raw()?,
+        },
+        tag::NEW => Op::New {
             dst: r.u16()?,
             callee: r.u16()?,
             args_base: r.u16()?,

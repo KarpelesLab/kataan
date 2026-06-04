@@ -615,6 +615,20 @@ impl Compiler {
                 Ok(dst)
             }
             Expr::Arrow(arrow) => self.arrow(arrow),
+            Expr::New {
+                callee, arguments, ..
+            } => {
+                let callee_reg = self.expr(callee)?;
+                let (args_base, argc) = self.lower_args(arguments)?;
+                let dst = self.reg();
+                self.emit(Op::New {
+                    dst,
+                    callee: callee_reg,
+                    args_base,
+                    argc,
+                });
+                Ok(dst)
+            }
             Expr::Array { elements, .. } => self.array_literal(elements),
             Expr::Object { members, .. } => self.object_literal(members),
             Expr::Conditional {
@@ -954,7 +968,12 @@ impl Compiler {
             BinaryOp::LtEq => Op::Le { dst, a, b },
             BinaryOp::Gt => Op::Gt { dst, a, b },
             BinaryOp::GtEq => Op::Ge { dst, a, b },
-            _ => return Err(CompileError::unsupported("binary operator")),
+            // The rest (bitwise/shift, `in`, `instanceof`) go through the
+            // generic `Binary` op, dispatched to the shared evaluator.
+            other => match binop_code(other) {
+                Some(op) => Op::Binary { dst, a, b, op },
+                None => return Err(CompileError::unsupported("binary operator")),
+            },
         };
         self.emit(inst);
         Ok(())
@@ -1121,6 +1140,23 @@ enum PropertySlot {
 enum FnBody<'b> {
     Block(&'b [Stmt]),
     Expr(&'b Expr),
+}
+
+/// Maps the operators without a dedicated instruction to their generic
+/// [`Op::Binary`] code; the others return `None`.
+fn binop_code(op: BinaryOp) -> Option<u8> {
+    use crate::bytecode::binop;
+    Some(match op {
+        BinaryOp::BitAnd => binop::BIT_AND,
+        BinaryOp::BitOr => binop::BIT_OR,
+        BinaryOp::BitXor => binop::BIT_XOR,
+        BinaryOp::Shl => binop::SHL,
+        BinaryOp::Shr => binop::SHR,
+        BinaryOp::Ushr => binop::USHR,
+        BinaryOp::In => binop::IN,
+        BinaryOp::Instanceof => binop::INSTANCEOF,
+        _ => return None,
+    })
 }
 
 /// Maps a compound assignment operator to its binary op; `=` returns `None`.

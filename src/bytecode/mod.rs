@@ -33,6 +33,20 @@ pub const VERSION: u16 = 1;
 /// A virtual register / local slot index.
 pub type Reg = u16;
 
+/// Operator codes for the generic [`Op::Binary`] instruction (stable, part of
+/// the serialized format).
+#[allow(missing_docs)]
+pub mod binop {
+    pub const BIT_AND: u8 = 0;
+    pub const BIT_OR: u8 = 1;
+    pub const BIT_XOR: u8 = 2;
+    pub const SHL: u8 = 3;
+    pub const SHR: u8 = 4;
+    pub const USHR: u8 = 5;
+    pub const IN: u8 = 6;
+    pub const INSTANCEOF: u8 = 7;
+}
+
 /// An index into a chunk's constant pool.
 pub type ConstIdx = u32;
 
@@ -117,6 +131,15 @@ pub enum Op {
     Not {
         dst: Reg,
         src: Reg,
+    },
+    /// A generic binary op (`dst = a OP b`) for operators without a dedicated
+    /// instruction — bitwise/shift, `in`, `instanceof`. `op` is a [`BinOp`]
+    /// code.
+    Binary {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        op: u8,
     },
 
     // --- comparison ---
@@ -206,6 +229,13 @@ pub enum Op {
     // --- calls ---
     /// `dst = callee(args_base .. args_base+argc)`.
     Call {
+        dst: Reg,
+        callee: Reg,
+        args_base: Reg,
+        argc: u16,
+    },
+    /// `dst = new callee(args_base .. args_base+argc)`.
+    New {
         dst: Reg,
         callee: Reg,
         args_base: Reg,

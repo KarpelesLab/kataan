@@ -50,6 +50,7 @@ fn render_op(op: &Op) -> String {
         Op::Pow { dst, a, b } => format!("Pow         r{dst}, r{a}, r{b}"),
         Op::Neg { dst, src } => format!("Neg         r{dst}, r{src}"),
         Op::Not { dst, src } => format!("Not         r{dst}, r{src}"),
+        Op::Binary { dst, a, b, op } => format!("Binary[{op}]  r{dst}, r{a}, r{b}"),
         Op::Eq { dst, a, b } => format!("Eq          r{dst}, r{a}, r{b}"),
         Op::StrictEq { dst, a, b } => format!("StrictEq    r{dst}, r{a}, r{b}"),
         Op::Lt { dst, a, b } => format!("Lt          r{dst}, r{a}, r{b}"),
@@ -73,6 +74,12 @@ fn render_op(op: &Op) -> String {
             args_base,
             argc,
         } => format!("Call        r{dst}, r{callee}, r{args_base}..+{argc}"),
+        Op::New {
+            dst,
+            callee,
+            args_base,
+            argc,
+        } => format!("New         r{dst}, r{callee}, r{args_base}..+{argc}"),
         Op::CallMethod {
             dst,
             recv,
