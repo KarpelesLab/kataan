@@ -535,6 +535,59 @@ impl<'a> Interp<'a> {
             native("keys", |a| Ok(object_entries(&arg(a, 0), EntryKind::Key))),
         );
         object.set(
+            "getOwnPropertyNames",
+            native("getOwnPropertyNames", |a| {
+                Ok(object_entries(&arg(a, 0), EntryKind::Key))
+            }),
+        );
+        object.set(
+            "getPrototypeOf",
+            native("getPrototypeOf", |a| {
+                Ok(match arg(a, 0) {
+                    Value::Object(o) => o.proto().map_or(Value::Null, Value::Object),
+                    _ => Value::Null,
+                })
+            }),
+        );
+        object.set(
+            "setPrototypeOf",
+            native("setPrototypeOf", |a| {
+                if let Value::Object(o) = arg(a, 0) {
+                    o.set_proto(match arg(a, 1) {
+                        Value::Object(p) => Some(p),
+                        _ => None,
+                    });
+                }
+                Ok(arg(a, 0))
+            }),
+        );
+        // `Object.defineProperty(obj, key, descriptor)` — supports data
+        // (`value`) and accessor (`get`/`set`) descriptors.
+        object.set(
+            "defineProperty",
+            native("defineProperty", |a| {
+                if let Value::Object(o) = arg(a, 0) {
+                    let key = arg(a, 1).to_js_string();
+                    if let Value::Object(desc) = arg(a, 2) {
+                        let getter = desc.get("get");
+                        let setter = desc.get("set");
+                        let has_accessor = getter.is_callable() || setter.is_callable();
+                        if getter.is_callable() {
+                            o.define_getter(&key, getter);
+                        }
+                        if setter.is_callable() {
+                            o.define_setter(&key, setter);
+                        }
+                        if !has_accessor {
+                            o.set(&key, desc.get("value"));
+                        }
+                    }
+                }
+                Ok(arg(a, 0))
+            }),
+        );
+        object.set("isFrozen", native("isFrozen", |_| Ok(Value::Bool(false))));
+        object.set(
             "values",
             native("values", |a| {
                 Ok(object_entries(&arg(a, 0), EntryKind::Value))

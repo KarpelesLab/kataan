@@ -647,6 +647,30 @@ fn array_object_statics() {
         eval("let proto = { greet() { return 'hi'; } }; let o = Object.create(proto); o.greet()"),
         "hi"
     );
+    // defineProperty: data and accessor descriptors.
+    assert_eq!(
+        eval("let o = {}; Object.defineProperty(o, 'x', { value: 42 }); o.x"),
+        "42"
+    );
+    assert_eq!(
+        eval(
+            "let o = { n: 5 }; Object.defineProperty(o, 'd', { get() { return this.n * 2; } }); o.d"
+        ),
+        "10"
+    );
+    // getPrototypeOf / setPrototypeOf / getOwnPropertyNames.
+    assert_eq!(
+        eval("let p = { a: 1 }; let o = Object.create(p); Object.getPrototypeOf(o) === p"),
+        "true"
+    );
+    assert_eq!(
+        eval("Object.getOwnPropertyNames({ x: 1, y: 2, z: 3 }).join(',')"),
+        "x,y,z"
+    );
+    assert_eq!(
+        eval("let o = {}; Object.setPrototypeOf(o, { hi() { return 'yo'; } }); o.hi()"),
+        "yo"
+    );
 }
 
 #[test]
