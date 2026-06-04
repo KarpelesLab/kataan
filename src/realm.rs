@@ -295,6 +295,75 @@ impl Realm {
         ))
     }
 
+    /// `a - b` (numeric, both coerced with `ToNumber`).
+    #[must_use]
+    pub fn sub(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(self.to_number(a) - self.to_number(b))
+    }
+
+    /// `a * b` (numeric).
+    #[must_use]
+    pub fn mul(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(self.to_number(a) * self.to_number(b))
+    }
+
+    /// `a / b` (numeric; division by zero yields ±∞ / `NaN` per IEEE-754).
+    #[must_use]
+    pub fn div(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(self.to_number(a) / self.to_number(b))
+    }
+
+    /// `a % b` (the ECMAScript remainder, which follows the sign of the
+    /// dividend — Rust's `%` on `f64` matches).
+    #[must_use]
+    pub fn rem(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(self.to_number(a) % self.to_number(b))
+    }
+
+    /// `a ** b` (exponentiation). Needs `std` for the float `powf` intrinsic
+    /// (the alloc-only core omits it, like the rest of the engine's float math).
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn pow(&self, a: NanBox, b: NanBox) -> NanBox {
+        NanBox::number(self.to_number(a).powf(self.to_number(b)))
+    }
+
+    /// Unary `-a` (numeric negation).
+    #[must_use]
+    pub fn neg(&self, a: NanBox) -> NanBox {
+        NanBox::number(-self.to_number(a))
+    }
+
+    /// ECMAScript abstract equality (`==`) — strict equality plus coercion:
+    /// `null == undefined`; a boolean is compared as its number; a number and a
+    /// string compare numerically; two references use [`strict_equals`] (string
+    /// value / object identity). (Full `ToPrimitive` on objects arrives later.)
+    ///
+    /// [`strict_equals`]: Realm::strict_equals
+    #[must_use]
+    pub fn loose_equals(&self, a: NanBox, b: NanBox) -> bool {
+        use crate::nanbox::Unpacked::{Bool, Handle as H, Null, Undefined};
+        let (ua, ub) = (a.unpack(), b.unpack());
+        let nullish = |u| matches!(u, Undefined | Null);
+        // null/undefined are == to each other and to nothing else.
+        if nullish(ua) || nullish(ub) {
+            return nullish(ua) && nullish(ub);
+        }
+        // Two references: strings by value, objects by identity.
+        if matches!(ua, H(_)) && matches!(ub, H(_)) {
+            return self.strict_equals(a, b);
+        }
+        // Booleans compare as their numeric value.
+        if matches!(ua, Bool(_)) {
+            return self.loose_equals(NanBox::number(self.to_number(a)), b);
+        }
+        if matches!(ub, Bool(_)) {
+            return self.loose_equals(a, NanBox::number(self.to_number(b)));
+        }
+        // Remaining: number vs number, or number vs string — compare numerically.
+        self.to_number(a) == self.to_number(b)
+    }
+
     /// ECMAScript strict equality (`===`) over heap values: primitives compare
     /// by value; two strings compare by *content* (strings are primitives, so
     /// distinct allocations of `"ab"` are equal); other references compare by
@@ -525,6 +594,44 @@ mod tests {
                 .as_boolean(),
             Some(false)
         );
+    }
+
+    #[test]
+    fn arithmetic_operators() {
+        let realm = Realm::new();
+        let n = NanBox::number;
+        assert_eq!(realm.sub(n(5.0), n(3.0)).as_number(), Some(2.0));
+        assert_eq!(realm.mul(n(4.0), n(2.5)).as_number(), Some(10.0));
+        assert_eq!(realm.div(n(9.0), n(2.0)).as_number(), Some(4.5));
+        assert_eq!(realm.rem(n(7.0), n(3.0)).as_number(), Some(1.0));
+        assert_eq!(realm.rem(n(-7.0), n(3.0)).as_number(), Some(-1.0)); // sign of dividend
+        assert_eq!(realm.neg(n(3.0)).as_number(), Some(-3.0));
+        // Division by zero is ±Infinity.
+        assert_eq!(realm.div(n(1.0), n(0.0)).as_number(), Some(f64::INFINITY));
+        #[cfg(feature = "std")]
+        assert_eq!(realm.pow(n(2.0), n(10.0)).as_number(), Some(1024.0));
+    }
+
+    #[test]
+    fn abstract_equality_coerces() {
+        let mut realm = Realm::new();
+        let n = NanBox::number;
+        // null == undefined, but not == 0.
+        assert!(realm.loose_equals(NanBox::null(), NanBox::undefined()));
+        assert!(!realm.loose_equals(NanBox::null(), n(0.0)));
+        // number == string by numeric coercion.
+        let s1 = NanBox::handle(realm.new_string("1").to_raw());
+        assert!(realm.loose_equals(n(1.0), s1));
+        // boolean coerces to number: true == 1, false == 0.
+        assert!(realm.loose_equals(NanBox::boolean(true), n(1.0)));
+        assert!(realm.loose_equals(NanBox::boolean(false), n(0.0)));
+        assert!(!realm.loose_equals(NanBox::boolean(true), n(2.0)));
+        // strings by value; objects by identity.
+        let a = NanBox::handle(realm.new_string("x").to_raw());
+        let b = NanBox::handle(realm.new_string("x").to_raw());
+        assert!(realm.loose_equals(a, b));
+        let o1 = NanBox::handle(realm.new_object().to_raw());
+        assert!(!realm.loose_equals(o1, n(0.0))); // object != 0 (ToNumber→NaN)
     }
 
     #[test]
