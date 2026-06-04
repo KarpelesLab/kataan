@@ -1,14 +1,15 @@
 //! The `kataan` command-line tool.
 //!
-//! The engine front end is being built bottom-up, and the CLI exposes each
-//! stage as it lands: `lex` tokenizes, and `parse` produces an AST. Later
-//! phases add full-program parsing, `run`, and a REPL (see `ROADMAP.md`).
+//! The CLI exposes each stage of the engine: `lex` tokenizes, `parse` produces
+//! an AST, `eval`/`run` execute a program (with a minimal `console`), and
+//! `repl` starts an interactive session. A fuller host runtime (event loop,
+//! modules, `fetch`) arrives in a later phase (see `ROADMAP.md`).
 //!
 //! ```text
-//! kataan lex FILE            # print the tokens of FILE
-//! kataan lex -e 'SOURCE'     # tokenize SOURCE from the command line
-//! kataan parse FILE          # parse a program and dump its AST
-//! kataan parse -e 'SOURCE'   # parse SOURCE (a program) and dump its AST
+//! kataan lex   [-e] SOURCE|FILE   # print the tokens
+//! kataan parse [-e] SOURCE|FILE   # dump the AST
+//! kataan run   [-e] SOURCE|FILE   # evaluate (alias: eval)
+//! kataan repl                     # interactive REPL
 //! kataan --version
 //! ```
 

@@ -597,7 +597,10 @@ impl<'a> Interp<'a> {
             }
             Expr::Ident(id) => match env.get(&id.name) {
                 Some(v) => Ok(v),
-                None => Err(Value::str(alloc::format!("{} is not defined", id.name))),
+                None => Err(make_error(
+                    "ReferenceError",
+                    alloc::format!("{} is not defined", id.name),
+                )),
             },
             Expr::This(_) => Ok(env.get("this").unwrap_or(Value::Undefined)),
             Expr::Unary { op, argument, .. } => self.eval_unary(*op, argument, env),
@@ -696,10 +699,10 @@ impl<'a> Interp<'a> {
                     if *optional && matches!(member, Value::Undefined | Value::Null) {
                         return Ok(Value::Undefined);
                     }
-                    return Err(Value::str(alloc::format!(
-                        "{}.{key} is not a function",
-                        obj.to_js_string()
-                    )));
+                    return Err(make_error(
+                        "TypeError",
+                        alloc::format!("{}.{key} is not a function", obj.to_js_string()),
+                    ));
                 }
                 let callee_val = self.eval_expr(callee, env)?;
                 if *optional && matches!(callee_val, Value::Undefined | Value::Null) {
@@ -874,10 +877,10 @@ impl<'a> Interp<'a> {
             }
             // A native constructor (e.g. `Error`) builds and returns the object.
             Value::Native(_) => self.call_with_this(callee, Value::Undefined, args),
-            _ => Err(Value::str(alloc::format!(
-                "{} is not a constructor",
-                callee.to_js_string()
-            ))),
+            _ => Err(make_error(
+                "TypeError",
+                alloc::format!("{} is not a constructor", callee.to_js_string()),
+            )),
         }
     }
 
@@ -1065,9 +1068,10 @@ impl<'a> Interp<'a> {
                 self.global.declare(name, value, true);
                 Ok(())
             }
-            AssignOutcome::Immutable => Err(Value::str(alloc::format!(
-                "assignment to constant variable {name}"
-            ))),
+            AssignOutcome::Immutable => Err(make_error(
+                "TypeError",
+                alloc::format!("assignment to constant variable {name}"),
+            )),
         }
     }
 
@@ -1202,10 +1206,13 @@ impl<'a> Interp<'a> {
             } else {
                 cv.statics.get(key)
             }),
-            Value::Undefined | Value::Null => Err(Value::str(alloc::format!(
-                "cannot read properties of {} (reading '{key}')",
-                obj.to_js_string()
-            ))),
+            Value::Undefined | Value::Null => Err(make_error(
+                "TypeError",
+                alloc::format!(
+                    "cannot read properties of {} (reading '{key}')",
+                    obj.to_js_string()
+                ),
+            )),
             _ => Ok(Value::Undefined),
         }
     }
@@ -1217,10 +1224,13 @@ impl<'a> Interp<'a> {
                 o.set(key, value);
                 Ok(())
             }
-            Value::Undefined | Value::Null => Err(Value::str(alloc::format!(
-                "cannot set properties of {} (setting '{key}')",
-                obj.to_js_string()
-            ))),
+            Value::Undefined | Value::Null => Err(make_error(
+                "TypeError",
+                alloc::format!(
+                    "cannot set properties of {} (setting '{key}')",
+                    obj.to_js_string()
+                ),
+            )),
             // Writes to primitives are silently ignored (sloppy mode).
             _ => Ok(()),
         }
@@ -1301,10 +1311,10 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            _ => Err(Value::str(alloc::format!(
-                "{} is not a function",
-                callee.to_js_string()
-            ))),
+            _ => Err(make_error(
+                "TypeError",
+                alloc::format!("{} is not a function", callee.to_js_string()),
+            )),
         }
     }
 
@@ -1336,6 +1346,16 @@ impl<'a> Interp<'a> {
 }
 
 /// Maps a compound assignment operator to its underlying binary operator.
+/// Builds a thrown error value (an object with `name` + `message`) so that a
+/// `catch` clause can read `e.message` / `e.name`. (These objects are not yet
+/// linked to the `Error` prototype, so `instanceof Error` is not supported.)
+fn make_error<'a>(name: &'static str, message: impl Into<String>) -> Value<'a> {
+    let obj = Obj::object();
+    obj.set("name", Value::str(name));
+    obj.set("message", Value::str(message.into()));
+    Value::Object(obj)
+}
+
 fn compound_binop(op: AssignOp) -> BinaryOp {
     match op {
         AssignOp::AddAssign => BinaryOp::Add,

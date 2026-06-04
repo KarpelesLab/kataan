@@ -75,7 +75,7 @@ fn variables_and_scoping() {
     assert_eq!(eval("var a = 1, b = 2; a + b"), "3");
     assert_eq!(
         eval_throw("const k = 1; k = 2;"),
-        "assignment to constant variable k"
+        "TypeError: assignment to constant variable k"
     );
 }
 
@@ -190,7 +190,7 @@ fn objects() {
     assert_eq!(eval("let o = { n: 0 }; o.n++; o.n += 10; o.n"), "11");
     assert_eq!(
         eval_throw("let o = null; o.x"),
-        "cannot read properties of null (reading 'x')"
+        "TypeError: cannot read properties of null (reading 'x')"
     );
 }
 
@@ -332,6 +332,16 @@ fn error_objects() {
         "caught"
     );
     assert_eq!(eval("`${new Error('x')}`"), "Error: x");
+    // Runtime errors are catchable objects with a name and message.
+    assert_eq!(eval("try { null.x; } catch (e) { e.name; }"), "TypeError");
+    assert_eq!(
+        eval("try { missingFn(); } catch (e) { e.message; }"),
+        "missingFn is not defined"
+    );
+    assert_eq!(
+        eval("try { let n = 1; n(); } catch (e) { e.name; }"),
+        "TypeError"
+    );
 }
 
 #[test]
