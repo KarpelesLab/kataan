@@ -185,6 +185,40 @@ fn regex_string_op<'a>(s: &str, name: &str, args: &[Value<'a>]) -> Option<Value<
     })
 }
 
+/// A deep structured clone of `value` (arrays, plain objects, `Map`/`Set`).
+/// Primitives are returned as-is; functions/classes are shared rather than
+/// cloned. (No cycle detection yet — deep cyclic graphs would recurse.)
+fn structured_clone<'a>(value: &Value<'a>) -> Value<'a> {
+    match value {
+        Value::Object(o) if o.is_array() => {
+            let elements = o
+                .elements()
+                .expect("array")
+                .borrow()
+                .iter()
+                .map(structured_clone)
+                .collect();
+            Value::Object(Obj::array(elements))
+        }
+        Value::Object(o) if o.as_collection().is_some() => {
+            let src = o.as_collection().unwrap().borrow();
+            let clone = Obj::collection(src.is_set);
+            for (k, v) in &src.entries {
+                collection_set(&clone, structured_clone(k), structured_clone(v));
+            }
+            Value::Object(clone)
+        }
+        Value::Object(o) => {
+            let clone = Obj::object();
+            for key in o.own_keys() {
+                clone.set(&key, structured_clone(&o.get(&key)));
+            }
+            Value::Object(clone)
+        }
+        other => other.clone(),
+    }
+}
+
 /// Milliseconds since the Unix epoch (UTC).
 fn now_ms() -> f64 {
     std::time::SystemTime::now()
@@ -283,6 +317,10 @@ impl<'a> Interp<'a> {
         self.install_date();
         self.install_promise();
         self.install_timers();
+        self.define_global(
+            "structuredClone",
+            native("structuredClone", |a| Ok(structured_clone(&arg(a, 0)))),
+        );
         #[cfg(feature = "regex")]
         self.install_regexp();
     }

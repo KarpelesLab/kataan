@@ -836,6 +836,19 @@ fn array_object_statics() {
         eval("let o = {}; Object.setPrototypeOf(o, { hi() { return 'yo'; } }); o.hi()"),
         "yo"
     );
+    // structuredClone deep-copies (mutating the clone leaves the original).
+    assert_eq!(
+        eval(
+            "let a = { x: 1, nested: { list: [1, 2] } }; let b = structuredClone(a); b.nested.list.push(3); a.nested.list.length + ':' + b.nested.list.length"
+        ),
+        "2:3"
+    );
+    assert_eq!(
+        eval(
+            "let m = new Map([['k', 1]]); let c = structuredClone(m); c.set('k', 9); m.get('k') + ',' + c.get('k')"
+        ),
+        "1,9"
+    );
 }
 
 #[test]
