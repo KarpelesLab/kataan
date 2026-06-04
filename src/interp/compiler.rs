@@ -30,7 +30,7 @@ impl CompileError {
 
 /// Compiles a program (the supported statement subset) into a chunk whose
 /// returned value is that of the final expression statement (REPL-style).
-pub(super) fn compile_program(body: &[Stmt]) -> Result<Chunk, CompileError> {
+pub fn compile_program(body: &[Stmt]) -> Result<Chunk, CompileError> {
     let mut c = Compiler {
         chunk: Chunk::new("<main>"),
         next_reg: 0,

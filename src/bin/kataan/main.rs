@@ -56,6 +56,14 @@ fn main() -> ExitCode {
             }
         },
         ["repl"] => run_repl(),
+        ["disasm", "-e", source] => run_disasm(source, "<argv>"),
+        ["disasm", path] => match std::fs::read_to_string(path) {
+            Ok(source) => run_disasm(&source, path),
+            Err(e) => {
+                eprintln!("kataan: cannot read {path}: {e}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!("kataan: unrecognized arguments: {}", args.join(" "));
             eprintln!("try `kataan --help`");
@@ -129,6 +137,31 @@ fn run_eval(source: &str, origin: &str) -> ExitCode {
         }
         Err(thrown) => {
             eprintln!("kataan: {origin}: Uncaught {}", thrown.to_js_string());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Compiles `source` to bytecode and prints its disassembly. Falls back with a
+/// message for constructs outside the bytecode compiler's current subset.
+fn run_disasm(source: &str, origin: &str) -> ExitCode {
+    use kataan::bytecode::Module;
+    use kataan::interp::compile_program;
+
+    let program = match Parser::parse_program(source) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kataan: {origin}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match compile_program(&program.body) {
+        Ok(chunk) => {
+            print!("{}", Module::new(chunk).disassemble());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kataan: {origin}: {}", e.message);
             ExitCode::FAILURE
         }
     }
@@ -229,6 +262,7 @@ fn print_usage() {
          kataan eval <FILE>        evaluate a program (prints completion value)\n    \
          kataan eval -e <SOURCE>   evaluate a source string\n    \
          kataan repl               start an interactive REPL\n    \
+         kataan disasm <FILE>      compile to bytecode and print the disassembly\n    \
          kataan --version          print the version\n    \
          kataan --help             show this help\n\
          \n\

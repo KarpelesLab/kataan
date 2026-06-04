@@ -27,6 +27,7 @@ mod vm;
 #[cfg(test)]
 mod tests;
 
+pub use compiler::{CompileError, compile_program};
 pub use env::{Env, Scope};
 pub use eval::{Completion, Interp};
 pub use value::{
