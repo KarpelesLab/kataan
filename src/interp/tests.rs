@@ -2198,6 +2198,19 @@ fn array_methods() {
     assert_eq!(eval("Array.isArray('nope')"), "false");
 }
 
+#[cfg(all(feature = "intl", feature = "regex"))]
+#[test]
+fn regex_unicode_case_folding() {
+    // Plain ASCII case-insensitivity still works.
+    assert_eq!(eval("/abc/i.test('ABC')"), "true");
+    assert_eq!(eval("'HELLO'.match(/hello/i)[0]"), "HELLO");
+    // Folds simple lowercasing misses: the Kelvin sign U+212A folds to `k`,
+    // long s U+017F to `s`, and the final sigma ς to σ.
+    assert_eq!(eval("/k/i.test('\\u212a')"), "true");
+    assert_eq!(eval("/S/i.test('\\u017f')"), "true");
+    assert_eq!(eval("/σ/i.test('\\u03c2')"), "true");
+}
+
 #[cfg(feature = "intl")]
 #[test]
 fn string_normalize() {

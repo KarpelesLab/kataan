@@ -136,10 +136,22 @@ fn backtrack(ctx: &Ctx, mut pc: usize, mut sp: usize, saves: &mut Vec<Option<usi
 }
 
 fn char_eq(a: char, b: char, flags: Flags) -> bool {
-    if flags.ignore_case {
+    if a == b {
+        return true;
+    }
+    if !flags.ignore_case {
+        return false;
+    }
+    // Case-insensitive: compare by Unicode case folding (spec `Canonicalize`),
+    // which catches pairs simple lowercasing misses (e.g. the Kelvin sign
+    // U+212A ↔ `k`, long s U+017F ↔ `s`, final sigma ς ↔ σ).
+    #[cfg(feature = "intl")]
+    {
+        intl::unicode::case::case_fold(a).eq(intl::unicode::case::case_fold(b))
+    }
+    #[cfg(not(feature = "intl"))]
+    {
         a.eq_ignore_ascii_case(&b) || a.to_lowercase().eq(b.to_lowercase())
-    } else {
-        a == b
     }
 }
 
