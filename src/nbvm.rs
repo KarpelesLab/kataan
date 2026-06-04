@@ -169,6 +169,14 @@ pub enum Op {
         callee: Reg,
         args: Vec<Reg>,
     },
+    /// `dst = callee(args…)` with `this = recv` — an indirect call through a
+    /// function value, binding an explicit receiver (used by `super.method()`).
+    CallValueThis {
+        dst: Reg,
+        callee: Reg,
+        recv: Reg,
+        args: Vec<Reg>,
+    },
     /// `dst = recv[key](args…)` — a method call: reads the closure at
     /// `recv[key]` and invokes it with `this` bound to `recv`.
     CallMethod {
@@ -249,6 +257,10 @@ pub struct FnProto {
     /// Captured cells, bound to registers `n_params..n_params + n_captures` on
     /// entry (a closure passes its cells here).
     pub n_captures: usize,
+    /// If the last parameter is a rest (`...args`), the number of *fixed*
+    /// parameters before it; the caller gathers any further arguments into an
+    /// array placed in register `fixed`.
+    pub rest_from: Option<usize>,
 }
 
 /// Execution context shared across activations: the heap and the captured
@@ -312,8 +324,24 @@ fn call_with(
 ) -> Result<NanBox, VmError> {
     let proto = &funcs[id];
     let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
-    for (i, a) in args.iter().enumerate().take(proto.n_params) {
-        regs[i] = *a;
+    match proto.rest_from {
+        // A rest parameter: fixed args fill `0..fixed`, the remainder becomes an
+        // array in register `fixed`.
+        Some(fixed) => {
+            for (i, a) in args.iter().enumerate().take(fixed) {
+                regs[i] = *a;
+            }
+            let rest: Vec<NanBox> = args.get(fixed..).unwrap_or(&[]).to_vec();
+            let arr = ctx.realm.new_array(rest);
+            if fixed < regs.len() {
+                regs[fixed] = NanBox::handle(arr.to_raw());
+            }
+        }
+        None => {
+            for (i, a) in args.iter().enumerate().take(proto.n_params) {
+                regs[i] = *a;
+            }
+        }
     }
     for (i, c) in captures.iter().enumerate().take(proto.n_captures) {
         regs[proto.n_params + i] = *c;
@@ -833,6 +861,20 @@ fn run_frame(
                         None => return Err(VmError::Thrown(v)),
                     },
                     Err(other) => return Err(other),
+                }
+            }
+            Op::CallValueThis {
+                dst,
+                callee,
+                recv,
+                args,
+            } => {
+                let closure = regs[*callee as usize];
+                let recv_val = regs[*recv as usize];
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                match call_closure(ctx, funcs, closure, &argv, recv_val) {
+                    Ok(ret) => regs[*dst as usize] = ret,
+                    Err(e) => handle_throw!(e),
                 }
             }
             Op::CallCtor { ctor, recv, args } => {
@@ -1505,6 +1547,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
         n_regs: 0,
         n_params: 0,
         n_captures: 0,
+        rest_from: None,
     };
     // Reserve slots: main (0), top-level functions (1..=N), then class members
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
@@ -1536,6 +1579,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
             false,
             super_ctor,
             &job.fields,
+            job.super_of.clone(),
         )?;
         protos.borrow_mut()[job.id as usize] = proto;
     }
@@ -1968,7 +2012,7 @@ fn scan_class<'a>(
                     id,
                     params: &m.value.params,
                     body: &m.value.body,
-                    super_of: None,
+                    super_of: super_name.clone(),
                     fields: Vec::new(),
                 });
             }
@@ -1982,7 +2026,7 @@ fn scan_class<'a>(
                     id,
                     params: &m.value.params,
                     body: &m.value.body,
-                    super_of: None,
+                    super_of: super_name.clone(),
                     fields: Vec::new(),
                 });
                 if m.kind == MethodKind::Get {
@@ -2112,6 +2156,9 @@ struct Compiler {
     this_reg: Reg,
     /// When compiling a subclass constructor, the function id `super(...)` calls.
     super_ctor: Option<u32>,
+    /// When compiling a subclass method/constructor, the superclass name — for
+    /// resolving `super.method(...)`.
+    super_class: Option<String>,
     /// Per enclosing loop/switch: `break` jump indices awaiting the exit target
     /// (loops and `switch` both push here).
     break_sites: Vec<Vec<usize>>,
@@ -2146,6 +2193,7 @@ impl Compiler {
             is_main,
             None,
             &[],
+            None,
         )
     }
 
@@ -2160,6 +2208,7 @@ impl Compiler {
         is_main: bool,
         super_ctor: Option<u32>,
         fields: &[(String, Option<&crate::ast::Expr>)],
+        super_class: Option<String>,
     ) -> Result<FnProto, CompileError> {
         // Which of this function's own names are captured by nested functions →
         // must be cells.
@@ -2170,6 +2219,7 @@ impl Compiler {
             protos: alloc::rc::Rc::clone(protos),
             cell_names,
             super_ctor,
+            super_class,
             ..Compiler::default()
         };
         c.scopes.push(alloc::collections::BTreeMap::new());
@@ -2179,6 +2229,12 @@ impl Compiler {
         let arg_regs: Vec<Reg> = params.iter().map(|_| c.alloc()).collect();
         let cap_regs: Vec<Reg> = captures.iter().map(|_| c.alloc()).collect();
         c.this_reg = c.alloc(); // = n_params + n_captures
+        // A trailing rest parameter: the caller fills its register with an array.
+        let rest_from = if params.last().is_some_and(|p| p.rest) {
+            Some(params.len() - 1)
+        } else {
+            None
+        };
         // …then bind. A captured parameter is boxed into a fresh cell (preserving
         // the incoming argument value); a captured local that's a parameter must
         // share the cell so mutations are visible.
@@ -2219,6 +2275,17 @@ impl Compiler {
                 },
             );
         }
+        // Apply `= default` to any (non-rest) parameter left `undefined` — after
+        // binding, so a default may reference earlier parameters; written back
+        // through the binding (honoring cells).
+        for p in params {
+            if let (Some(def), BindingTarget::Ident(Ident { name, .. })) = (&p.default, &p.target) {
+                let b = c.lookup(name).expect("a bound param");
+                let cur = c.read_var(b);
+                c.apply_default(cur, Some(def))?;
+                c.write_var(b, cur);
+            }
+        }
         // Field initializers run first (constructors only): `this.field = init`.
         for (name, init) in fields {
             let v = match init {
@@ -2249,6 +2316,7 @@ impl Compiler {
             n_regs: c.next_reg as usize,
             n_params: params.len(),
             n_captures: captures.len(),
+            rest_from,
             ops: c.ops,
         })
     }
@@ -3204,12 +3272,14 @@ impl Compiler {
                     args.push(self.expr(e)?);
                 }
                 // `super(args)` — run the base constructor on the current `this`.
+                // A subclass whose base has no explicit constructor: a no-op.
                 if matches!(&**callee, Expr::Super(_)) {
-                    let ctor = self
-                        .super_ctor
-                        .ok_or(CompileError::Unsupported("super outside a subclass ctor"))?;
-                    let recv = self.this_reg;
-                    self.ops.push(Op::CallCtor { ctor, recv, args });
+                    if let Some(ctor) = self.super_ctor {
+                        let recv = self.this_reg;
+                        self.ops.push(Op::CallCtor { ctor, recv, args });
+                    } else if self.super_class.is_none() {
+                        return Err(CompileError::Unsupported("super outside a subclass ctor"));
+                    }
                     return Ok(self.this_reg);
                 }
                 // A built-in call (`console.log`, `Math.max`, `String`, …).
@@ -3226,6 +3296,34 @@ impl Compiler {
                 {
                     let dst = self.alloc();
                     self.ops.push(Op::Call { dst, func, args });
+                    return Ok(dst);
+                }
+                // `super.method(args)` — call the superclass's method with the
+                // current `this`, resolved at compile time up the `extends` chain.
+                if let Expr::Member {
+                    object,
+                    property: PropertyKey::Ident(key) | PropertyKey::Str(key),
+                    ..
+                } = &**callee
+                    && matches!(&**object, Expr::Super(_))
+                {
+                    let sup = self
+                        .super_class
+                        .clone()
+                        .ok_or(CompileError::Unsupported("super outside a subclass"))?;
+                    let func = self
+                        .resolve_method(&sup, key)
+                        .ok_or(CompileError::Unsupported("super method not found"))?;
+                    let m = self.alloc();
+                    self.ops.push(Op::LoadFunc { dst: m, func });
+                    let recv = self.this_reg;
+                    let dst = self.alloc();
+                    self.ops.push(Op::CallValueThis {
+                        dst,
+                        callee: m,
+                        recv,
+                        args,
+                    });
                     return Ok(dst);
                 }
                 // A method call `recv.method(args)` (named, non-computed
@@ -3584,6 +3682,7 @@ impl Compiler {
                 n_regs: 0,
                 n_params: 0,
                 n_captures: 0,
+                rest_from: None,
             });
             (p.len() - 1) as u32
         };
@@ -3812,6 +3911,20 @@ impl Compiler {
             }
         }
         Ok(dst)
+    }
+
+    /// The function id of method `name` on class `class` or the nearest ancestor
+    /// that declares it (for `super.method()`).
+    fn resolve_method(&self, class: &str, name: &str) -> Option<u32> {
+        let mut cur = Some(String::from(class));
+        while let Some(cname) = cur {
+            let info = self.classes.get(&cname)?;
+            if let Some((_, id)) = info.methods.iter().find(|(n, _)| n == name) {
+                return Some(*id);
+            }
+            cur = info.super_name.clone();
+        }
+        None
     }
 
     /// Writes `src` to `obj.key` / `obj[i]` (the mirror of `member_read`).
@@ -4363,6 +4476,55 @@ mod tests {
             bc("class A {} class B extends A {} class C extends B {}
                 let c = new C(); '' + (c instanceof A) + (c instanceof B) + (c instanceof C)"),
             "truetruetrue"
+        );
+    }
+
+    #[test]
+    fn bytecode_default_and_rest_params() {
+        // Default parameters.
+        assert_eq!(bc("function f(a, b = 10) { return a + b; } f(5)"), "15");
+        assert_eq!(bc("function f(a, b = 10) { return a + b; } f(5, 20)"), "25");
+        assert_eq!(bc("let g = (x, y = x * 2) => x + y; g(3)"), "9");
+        // Rest parameters.
+        assert_eq!(
+            bc("function sum(...nums) { return nums.reduce((a, b) => a + b, 0); } sum(1, 2, 3, 4)"),
+            "10"
+        );
+        assert_eq!(
+            bc(
+                "function tag(first, ...rest) { return first + ':' + rest.join(','); } tag('a', 'b', 'c')"
+            ),
+            "a:b,c"
+        );
+        // Default + rest together.
+        assert_eq!(
+            bc("function f(a, b = 2, ...rest) { return a + b + rest.length; } f(1)"),
+            "3"
+        );
+        assert_eq!(
+            bc("function f(a, b = 2, ...rest) { return a + b + rest.length; } f(1, 5, 9, 9, 9)"),
+            "9"
+        );
+    }
+
+    #[test]
+    fn bytecode_super_method() {
+        // super.method() calls the base implementation.
+        assert_eq!(
+            bc("class A { greet() { return 'hi'; } }
+                class B extends A { greet() { return super.greet() + '!'; } }
+                new B().greet()"),
+            "hi!"
+        );
+        // super reaches through a multi-level chain and combines with this.
+        assert_eq!(
+            bc("class Shape { describe() { return 'shape'; } }
+                class Round extends Shape {
+                  constructor(r) { super(); this.r = r; }
+                  describe() { return super.describe() + ' r=' + this.r; }
+                }
+                new Round(5).describe()"),
+            "shape r=5"
         );
     }
 
