@@ -187,6 +187,8 @@ mod tag {
     pub(super) const POP_HANDLER: u8 = 37;
     pub(super) const NEW: u8 = 38;
     pub(super) const BINARY: u8 = 39;
+    pub(super) const TYPE_OF: u8 = 40;
+    pub(super) const TYPE_OF_GLOBAL: u8 = 41;
 }
 
 fn write_op(w: &mut Writer, op: &Op) {
@@ -236,6 +238,16 @@ fn write_op(w: &mut Writer, op: &Op) {
             w.u16(*a);
             w.u16(*b);
             w.raw(*op);
+        }
+        Op::TypeOf { dst, src } => {
+            w.raw(tag::TYPE_OF);
+            w.u16(*dst);
+            w.u16(*src);
+        }
+        Op::TypeOfGlobal { dst, name } => {
+            w.raw(tag::TYPE_OF_GLOBAL);
+            w.u16(*dst);
+            w.u32(*name);
         }
         Op::Not { dst, src } => {
             w.raw(tag::NOT);
@@ -443,6 +455,14 @@ fn read_op(r: &mut Reader) -> Result<Op, BytecodeError> {
             a: r.u16()?,
             b: r.u16()?,
             op: r.raw()?,
+        },
+        tag::TYPE_OF => Op::TypeOf {
+            dst: r.u16()?,
+            src: r.u16()?,
+        },
+        tag::TYPE_OF_GLOBAL => Op::TypeOfGlobal {
+            dst: r.u16()?,
+            name: r.u32()?,
         },
         tag::NEW => Op::New {
             dst: r.u16()?,

@@ -238,6 +238,28 @@ fn bytecode_vm_bitwise_in_instanceof() {
 }
 
 #[test]
+fn bytecode_vm_typeof_void() {
+    assert_eq!(eval_bc("typeof 42"), "number");
+    assert_eq!(eval_bc("typeof 'x'"), "string");
+    assert_eq!(eval_bc("typeof true"), "boolean");
+    assert_eq!(eval_bc("typeof undefined"), "undefined");
+    assert_eq!(eval_bc("typeof {}"), "object");
+    assert_eq!(eval_bc("typeof Math"), "object");
+    assert_eq!(eval_bc("typeof Math.max"), "function");
+    assert_eq!(eval_bc("let f = x => x; typeof f"), "function");
+    assert_eq!(eval_bc("let n = 5; typeof n"), "number");
+    // typeof an unbound global does not throw.
+    assert_eq!(eval_bc("typeof someUnboundThing"), "undefined");
+    assert_eq!(eval_bc("typeof someUnboundThing === 'undefined'"), "true");
+    // void always yields undefined.
+    assert_eq!(eval_bc("void 0"), "undefined");
+    assert_eq!(eval_bc("let x = 5; void (x = 10); x"), "10"); // side effect runs
+    // Unary plus coerces to number.
+    assert_eq!(eval_bc("+'42'"), "42");
+    assert_eq!(eval_bc("+true"), "1");
+}
+
+#[test]
 fn bytecode_vm_switch() {
     let sw = |n: &str| {
         alloc::format!(

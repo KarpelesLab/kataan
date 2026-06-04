@@ -121,6 +121,15 @@ impl<'a> Interp<'a> {
                     Op::Binary { dst, a, b, op } => {
                         self.bin(&mut regs, binop_from_code(*op), *dst, *a, *b)?;
                     }
+                    Op::TypeOf { dst, src } => {
+                        regs[*dst as usize] = Value::str(regs[*src as usize].type_of());
+                    }
+                    Op::TypeOfGlobal { dst, name } => {
+                        let key = const_str(chunk, *name);
+                        // An unbound global yields "undefined" (no throw).
+                        let ty = self.global().get(&key).map_or("undefined", |v| v.type_of());
+                        regs[*dst as usize] = Value::str(ty);
+                    }
 
                     Op::GetGlobal { dst, name } => {
                         let key = const_str(chunk, *name);

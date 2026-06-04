@@ -51,6 +51,8 @@ fn render_op(op: &Op) -> String {
         Op::Neg { dst, src } => format!("Neg         r{dst}, r{src}"),
         Op::Not { dst, src } => format!("Not         r{dst}, r{src}"),
         Op::Binary { dst, a, b, op } => format!("Binary[{op}]  r{dst}, r{a}, r{b}"),
+        Op::TypeOf { dst, src } => format!("TypeOf      r{dst}, r{src}"),
+        Op::TypeOfGlobal { dst, name } => format!("TypeOfGlbl  r{dst}, k{name}"),
         Op::Eq { dst, a, b } => format!("Eq          r{dst}, r{a}, r{b}"),
         Op::StrictEq { dst, a, b } => format!("StrictEq    r{dst}, r{a}, r{b}"),
         Op::Lt { dst, a, b } => format!("Lt          r{dst}, r{a}, r{b}"),

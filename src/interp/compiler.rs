@@ -1009,6 +1009,29 @@ impl Compiler {
     }
 
     fn unary(&mut self, op: UnaryOp, argument: &Expr) -> Result<Reg, CompileError> {
+        // `typeof` and `void` need to handle the operand specially.
+        match op {
+            UnaryOp::Typeof => return self.type_of(argument),
+            UnaryOp::Void => {
+                self.expr(argument)?; // evaluate for side effects, discard
+                let dst = self.reg();
+                self.emit(Op::LoadUndefined { dst });
+                return Ok(dst);
+            }
+            UnaryOp::Plus => {
+                // Unary `+` coerces to number: `0 + x` reuses Add's coercion.
+                let zero = self.reg();
+                self.emit(Op::LoadInt {
+                    dst: zero,
+                    value: 0,
+                });
+                let x = self.expr(argument)?;
+                let dst = self.reg();
+                self.emit(Op::Sub { dst, a: x, b: zero }); // x - 0 → ToNumber(x)
+                return Ok(dst);
+            }
+            _ => {}
+        }
         let src = self.expr(argument)?;
         let dst = self.reg();
         match op {
@@ -1016,6 +1039,27 @@ impl Compiler {
             UnaryOp::Not => self.emit(Op::Not { dst, src }),
             _ => return Err(CompileError::unsupported("unary operator")),
         };
+        Ok(dst)
+    }
+
+    /// Compiles `typeof argument`. A bare global identifier uses the
+    /// non-throwing form so `typeof unbound === 'undefined'`.
+    fn type_of(&mut self, argument: &Expr) -> Result<Reg, CompileError> {
+        if let Expr::Ident(id) = argument
+            && self.resolve(&id.name).is_none()
+            && id.name.as_ref() != "undefined"
+        {
+            if self.is_capture(&id.name) {
+                return Err(CompileError::unsupported("captured (closure) variable"));
+            }
+            let dst = self.reg();
+            let name = self.add_const(Const::Str(id.name.clone().into_string()));
+            self.emit(Op::TypeOfGlobal { dst, name });
+            return Ok(dst);
+        }
+        let src = self.expr(argument)?;
+        let dst = self.reg();
+        self.emit(Op::TypeOf { dst, src });
         Ok(dst)
     }
 

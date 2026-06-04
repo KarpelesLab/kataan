@@ -132,6 +132,17 @@ pub enum Op {
         dst: Reg,
         src: Reg,
     },
+    /// `dst = typeof src`.
+    TypeOf {
+        dst: Reg,
+        src: Reg,
+    },
+    /// `dst = typeof <global name>` — the non-throwing form (an unbound global
+    /// yields `"undefined"` rather than a ReferenceError).
+    TypeOfGlobal {
+        dst: Reg,
+        name: ConstIdx,
+    },
     /// A generic binary op (`dst = a OP b`) for operators without a dedicated
     /// instruction — bitwise/shift, `in`, `instanceof`. `op` is a [`binop`]
     /// code.
