@@ -197,6 +197,7 @@ const N_OBJECT_DEFINE_PROP: u16 = 110;
 const N_OBJECT_GET_OWN_DESC: u16 = 111;
 const N_WEAKMAP: u16 = 112;
 const N_OBJECT_IS: u16 = 123;
+const N_OBJECT_DEFINE_PROPS: u16 = 124;
 const N_WEAKSET: u16 = 113;
 const N_REFLECT_GET: u16 = 114;
 const N_REFLECT_SET: u16 = 115;
@@ -359,6 +360,7 @@ impl<'a> Interp<'a> {
                 ("getPrototypeOf", N_OBJECT_GET_PROTO),
                 ("setPrototypeOf", N_OBJECT_SET_PROTO),
                 ("defineProperty", N_OBJECT_DEFINE_PROP),
+                ("defineProperties", N_OBJECT_DEFINE_PROPS),
                 ("getOwnPropertyDescriptor", N_OBJECT_GET_OWN_DESC),
                 ("is", N_OBJECT_IS),
             ],
@@ -592,23 +594,26 @@ impl<'a> Interp<'a> {
                     && let Some(draw) = arg(2).as_handle()
                 {
                     let obj = Handle::from_raw(oraw);
-                    let desc = Handle::from_raw(draw);
                     let key = self.realm.to_display_string(arg(1));
-                    let getter = self.realm.get_property(desc, "get");
-                    let setter = self.realm.get_property(desc, "set");
-                    if getter.is_some() || setter.is_some() {
-                        self.realm.define_accessor(
-                            obj,
-                            &key,
-                            getter.unwrap_or(NanBox::undefined()),
-                            setter.unwrap_or(NanBox::undefined()),
-                        );
-                    } else {
-                        let value = self
+                    self.apply_descriptor(obj, &key, Handle::from_raw(draw));
+                }
+                arg(0)
+            }
+            // `Object.defineProperties(obj, { k: descriptor, … })`.
+            N_OBJECT_DEFINE_PROPS => {
+                if let Some(oraw) = arg(0).as_handle()
+                    && let Some(draw) = arg(1).as_handle()
+                {
+                    let obj = Handle::from_raw(oraw);
+                    let descs = Handle::from_raw(draw);
+                    for key in self.realm.object_keys(descs).unwrap_or_default() {
+                        if let Some(d) = self
                             .realm
-                            .get_property(desc, "value")
-                            .unwrap_or(NanBox::undefined());
-                        self.realm.set_property(obj, &key, value);
+                            .get_property(descs, &key)
+                            .and_then(NanBox::as_handle)
+                        {
+                            self.apply_descriptor(obj, &key, Handle::from_raw(d));
+                        }
                     }
                 }
                 arg(0)
@@ -1507,6 +1512,27 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
         Ok(())
+    }
+
+    /// Applies a property descriptor object (`{ value }` or `{ get, set }`) to
+    /// `obj[key]` — shared by `Object.defineProperty`/`defineProperties`.
+    fn apply_descriptor(&mut self, obj: Handle, key: &str, desc: Handle) {
+        let getter = self.realm.get_property(desc, "get");
+        let setter = self.realm.get_property(desc, "set");
+        if getter.is_some() || setter.is_some() {
+            self.realm.define_accessor(
+                obj,
+                key,
+                getter.unwrap_or(NanBox::undefined()),
+                setter.unwrap_or(NanBox::undefined()),
+            );
+        } else {
+            let value = self
+                .realm
+                .get_property(desc, "value")
+                .unwrap_or(NanBox::undefined());
+            self.realm.set_property(obj, key, value);
+        }
     }
 
     fn is_callable(&self, handle: Handle) -> bool {
@@ -6404,6 +6430,20 @@ mod tests {
         // name from a declaration and a named function expression.
         assert_eq!(run("function greet(){} greet.name"), "greet");
         assert_eq!(run("let g = function inner(){}; g.name"), "inner");
+    }
+
+    #[test]
+    fn object_define_properties() {
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperties(o, { x:{value:1}, y:{get:function(){return 2;}} }); o.x + ',' + o.y"
+            ),
+            "1,2"
+        );
+        assert_eq!(
+            run("let o={}; Object.defineProperty(o,'a',{value:42}); o.a"),
+            "42"
+        );
     }
 
     #[test]
