@@ -18,6 +18,7 @@
 //! This is pure, safe `alloc`-only Rust (a `Vec` of slots plus a free list); the
 //! tracing/compaction policy layers on top later.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 /// A stable reference to a heap slot: an index plus the generation it was live
@@ -70,6 +71,11 @@ pub struct Heap<T> {
     free: Vec<u32>,
     /// The number of live (occupied) slots.
     live: usize,
+    /// The **remembered set**: slot indices of old-generation objects that have
+    /// been written with a young pointer since the last minor collection (the
+    /// write barrier records them). A minor collection scans only these as old
+    /// roots instead of the whole old generation.
+    remembered: BTreeSet<u32>,
 }
 
 impl<T> Default for Heap<T> {
@@ -81,11 +87,12 @@ impl<T> Default for Heap<T> {
 impl<T> Heap<T> {
     /// Creates an empty heap.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
             live: 0,
+            remembered: BTreeSet::new(),
         }
     }
 
@@ -220,6 +227,40 @@ impl<T> Heap<T> {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The **write barrier**: records `container` in the remembered set when an
+    /// old-generation `container` is made to point at a young-generation
+    /// `target` (an old→young edge a minor collection must treat as a root).
+    /// A no-op for young containers or old→old edges.
+    pub fn record_edge(&mut self, container: Handle, target: Handle, old_age: u8) {
+        if self.age(container).is_some_and(|a| a >= old_age)
+            && self.age(target).is_some_and(|a| a < old_age)
+        {
+            self.remembered.insert(container.index);
+        }
+    }
+
+    /// Handles to the remembered-set objects that are still live (the old→young
+    /// roots for a minor collection).
+    #[must_use]
+    pub fn remembered_roots(&self) -> Vec<Handle> {
+        self.remembered
+            .iter()
+            .filter_map(|&index| match self.slots.get(index as usize) {
+                Some(Slot::Occupied { generation, .. }) => Some(Handle {
+                    index,
+                    generation: *generation,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Clears the remembered set (after a collection re-establishes the
+    /// generation boundary).
+    pub fn clear_remembered(&mut self) {
+        self.remembered.clear();
     }
 
     /// Frees the slot behind `handle`, returning its value. The slot's

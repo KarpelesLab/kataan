@@ -83,6 +83,8 @@ pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
             swept += 1;
         }
     }
+    // A full collection re-establishes the generation boundary from scratch.
+    heap.clear_remembered();
 
     Stats {
         marked: marked.len(),
@@ -99,9 +101,10 @@ pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
 /// referent survives. (A later refinement adds a remembered set so only mutated
 /// old objects need scanning.) Surviving young objects are promoted.
 pub fn collect_minor<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
-    // Roots = the program roots ∪ the whole old generation.
-    let old = heap.handles_where(|a| a >= OLD_AGE);
-    let marked = mark(heap, roots.iter().copied().chain(old));
+    // Roots = the program roots ∪ the **remembered set** (old objects written
+    // with a young pointer), rather than the entire old generation.
+    let remembered = heap.remembered_roots();
+    let marked = mark(heap, roots.iter().copied().chain(remembered));
 
     // Sweep only the young generation; promote the young survivors.
     let mut swept = 0;
@@ -113,6 +116,8 @@ pub fn collect_minor<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
             swept += 1;
         }
     }
+    // The surviving young are now old; the recorded old→young edges are old→old.
+    heap.clear_remembered();
 
     Stats {
         marked: marked.len(),
@@ -242,12 +247,26 @@ mod tests {
 
         let young = heap.alloc(Node::new(2));
         heap.get_mut(old).unwrap().edges.push(young); // old -> young edge
+        heap.record_edge(old, young, OLD_AGE); // the write barrier remembers `old`
 
-        // `young` is not a direct root, but `old` (a root via the old gen) points
-        // at it, so it survives.
+        // `young` is not a direct root, but `old` is in the remembered set and
+        // points at it, so it survives the minor collection.
         let stats = collect_minor(&mut heap, &[old]);
         assert_eq!(stats.swept, 0);
         assert!(heap.is_live(young));
+    }
+
+    #[test]
+    fn minor_collection_frees_young_when_no_barrier_recorded() {
+        // Without the barrier, an old object's stale view doesn't keep young
+        // garbage alive — the remembered set is the sole old-roots source.
+        let mut heap: Heap<Node> = Heap::new();
+        let old = heap.alloc(Node::new(1));
+        collect(&mut heap, &[old]);
+        let young = heap.alloc(Node::new(2)); // unreferenced, no barrier
+        let stats = collect_minor(&mut heap, &[old]);
+        assert_eq!(stats.swept, 1);
+        assert!(!heap.is_live(young));
     }
 
     #[test]

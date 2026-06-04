@@ -129,6 +129,8 @@ impl Realm {
             Some(i) => entries[i].1 = value,
             None => entries.push((key, value)),
         }
+        self.write_barrier(handle, key);
+        self.write_barrier(handle, value);
         true
     }
 
@@ -313,6 +315,7 @@ impl Realm {
                     a.resize(index + 1, NanBox::undefined());
                 }
                 a[index] = value;
+                self.write_barrier(handle, value);
                 true
             }
             None => false,
@@ -403,9 +406,20 @@ impl Realm {
         match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             Some(obj) => {
                 obj.set(key, value);
+                self.write_barrier(handle, value);
                 true
             }
             None => false,
+        }
+    }
+
+    /// The generational write barrier: records an old→young edge (container is
+    /// in the old generation, `value` is a young heap object) in the heap's
+    /// remembered set, so a minor collection keeps the young object alive.
+    fn write_barrier(&mut self, container: Handle, value: NanBox) {
+        if let Some(raw) = value.as_handle() {
+            self.heap
+                .record_edge(container, Handle::from_raw(raw), gc::OLD_AGE);
         }
     }
 
@@ -1186,5 +1200,26 @@ mod tests {
         assert_eq!(stats.swept, 1); // the unreachable string
         assert!(realm.is_live(obj) && realm.is_live(name) && realm.is_live(items));
         assert_eq!(realm.string_value(name).as_deref(), Some("widget"));
+    }
+
+    #[test]
+    fn minor_collection_with_write_barrier_keeps_old_to_young_edge() {
+        let mut realm = Realm::new();
+        // Create an object and promote it to the old generation via a major GC.
+        let parent = realm.new_object();
+        realm.collect(&[parent]);
+
+        // Now attach a freshly-allocated (young) string — the `set_property`
+        // write barrier records the old→young edge.
+        let child = realm.new_string("attached");
+        realm.set_property(parent, "child", NanBox::handle(child.to_raw()));
+        let _garbage = realm.new_string("garbage"); // young, unreferenced
+
+        // A minor collection frees only the young garbage; `child`, reachable
+        // solely through the old `parent`, survives thanks to the barrier.
+        let stats = realm.collect_minor(&[parent]);
+        assert_eq!(stats.swept, 1);
+        assert!(realm.is_live(parent) && realm.is_live(child));
+        assert_eq!(realm.string_value(child).as_deref(), Some("attached"));
     }
 }
