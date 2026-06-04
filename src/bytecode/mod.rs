@@ -229,6 +229,13 @@ pub enum Op {
         obj: Reg,
         key: Reg,
     },
+    /// `dst = an array of the iterable `src`'s values` (arrays, strings, `Set`s
+    /// — and `Map`s as `[k, v]` pairs); throws a TypeError if not iterable.
+    /// Drives `for-of`.
+    IterValues {
+        dst: Reg,
+        src: Reg,
+    },
 
     // --- control flow ---
     Jump {

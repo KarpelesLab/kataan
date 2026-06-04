@@ -148,6 +148,20 @@ impl<'a> Interp<'a> {
                         };
                         regs[*dst as usize] = Value::Bool(removed);
                     }
+                    Op::IterValues { dst, src } => {
+                        let v = regs[*src as usize].clone();
+                        let iterable = matches!(&v, Value::Str(_))
+                            || matches!(&v, Value::Object(o) if o.is_array() || o.as_collection().is_some());
+                        if !iterable {
+                            return Err(super::eval::make_error(
+                                "TypeError",
+                                alloc::format!("{} is not iterable", v.to_js_string()),
+                            ));
+                        }
+                        let mut items = Vec::new();
+                        super::builtins::iterate_into(&v, &mut items);
+                        regs[*dst as usize] = Value::Object(Obj::array(items));
+                    }
                     Op::TypeOfGlobal { dst, name } => {
                         let key = const_str(chunk, *name);
                         // An unbound global yields "undefined" (no throw).

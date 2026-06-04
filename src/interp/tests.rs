@@ -270,6 +270,53 @@ fn bytecode_vm_typeof_void() {
 }
 
 #[test]
+fn bytecode_vm_for_of() {
+    // Over an array.
+    assert_eq!(
+        eval_bc("let s = 0; for (const x of [1, 2, 3, 4]) s += x; s"),
+        "10"
+    );
+    // Over a string (characters).
+    assert_eq!(
+        eval_bc("let out = ''; for (const c of 'abc') out = c + out; out"),
+        "cba"
+    );
+    // Over a Set (deduplicated values).
+    assert_eq!(
+        eval_bc("let n = 0; for (const v of new Set([1, 1, 2, 3, 3])) n += v; n"),
+        "6"
+    );
+    // Over a Map ([key, value] pairs) with break/continue.
+    assert_eq!(
+        eval_bc(
+            "let out = '';
+             for (const pair of new Map([['a', 1], ['b', 2], ['c', 3]])) {
+               if (pair[0] === 'b') continue;
+               out += pair[0] + pair[1];
+             }
+             out"
+        ),
+        "a1c3"
+    );
+    // break exits the loop.
+    assert_eq!(
+        eval_bc("let r = 0; for (const x of [1, 2, 3, 4, 5]) { if (x === 3) break; r += x; } r"),
+        "3"
+    );
+    // Computed work inside for-of.
+    assert_eq!(
+        eval_bc(
+            "let words = ['hi', 'there']; let total = 0; for (const w of words) total += w.length; total"
+        ),
+        "7"
+    );
+    // A non-iterable throws.
+    let program = Parser::parse_program("for (const x of 42) {}").unwrap();
+    let mut interp = Interp::new();
+    assert!(interp.eval_via_bytecode(&program.body).unwrap().is_err());
+}
+
+#[test]
 fn bytecode_vm_switch() {
     let sw = |n: &str| {
         alloc::format!(

@@ -309,6 +309,9 @@ impl Compiler {
                 cases,
                 ..
             } => self.compile_switch(discriminant, cases),
+            Stmt::ForOf {
+                left, right, body, ..
+            } => self.compile_for_of(left, right, body),
             Stmt::Break { label: None, .. } => {
                 let j = self.emit(Op::Jump { offset: 0 });
                 self.add_break(j)?;
@@ -422,6 +425,95 @@ impl Compiler {
         }
         self.funcs.last_mut().expect("fn").locals.truncate(mark);
         self.patch_to_here(skip_catch);
+        Ok(None)
+    }
+
+    /// Compiles `for (const x of iterable) body`. The iterable is materialized
+    /// into an array (`IterValues`) and walked by index; only a simple
+    /// identifier loop variable is supported.
+    fn compile_for_of(
+        &mut self,
+        left: &crate::ast::ForLeft,
+        right: &Expr,
+        body: &Stmt,
+    ) -> Result<Option<Reg>, CompileError> {
+        use crate::ast::ForLeft;
+        let var_name = match left {
+            ForLeft::Decl {
+                target: BindingTarget::Ident(id),
+                ..
+            } => id.name.clone().into_string(),
+            ForLeft::Target(t) => {
+                if let Expr::Ident(id) = &**t {
+                    id.name.clone().into_string()
+                } else {
+                    return Err(CompileError::unsupported("for-of target"));
+                }
+            }
+            ForLeft::Decl { .. } => return Err(CompileError::unsupported("for-of destructuring")),
+        };
+
+        let iterable = self.expr(right)?;
+        let arr = self.reg();
+        self.emit(Op::IterValues {
+            dst: arr,
+            src: iterable,
+        });
+        let len = self.reg();
+        let klen = self.add_const(Const::Str(String::from("length")));
+        self.emit(Op::GetProp {
+            dst: len,
+            obj: arr,
+            key: klen,
+        });
+        let idx = self.reg();
+        self.emit(Op::LoadInt { dst: idx, value: 0 });
+
+        let mark = self.funcs.last().expect("fn").locals.len();
+        let var_slot = self.reg();
+        self.declare_local(var_name, var_slot);
+
+        let top = self.code_len();
+        let cond = self.reg();
+        self.emit(Op::Lt {
+            dst: cond,
+            a: idx,
+            b: len,
+        });
+        let exit = self.emit(Op::JumpIfFalse { cond, offset: 0 });
+        // x = arr[idx]
+        self.emit(Op::GetElem {
+            dst: var_slot,
+            obj: arr,
+            index: idx,
+        });
+        self.push_loop();
+        self.stmt(body)?;
+        let ctx = self.pop_loop();
+        // `continue` runs the index increment.
+        let inc_pos = self.code_len();
+        for j in &ctx.continue_jumps {
+            self.patch_jump(*j, inc_pos);
+        }
+        let one = self.reg();
+        self.emit(Op::LoadInt { dst: one, value: 1 });
+        let next = self.reg();
+        self.emit(Op::Add {
+            dst: next,
+            a: idx,
+            b: one,
+        });
+        self.emit(Op::Move {
+            dst: idx,
+            src: next,
+        });
+        let back = self.emit(Op::Jump { offset: 0 });
+        self.patch_jump(back, top);
+        self.patch_to_here(exit);
+        for j in &ctx.break_jumps {
+            self.patch_to_here(*j);
+        }
+        self.funcs.last_mut().expect("fn").locals.truncate(mark);
         Ok(None)
     }
 
