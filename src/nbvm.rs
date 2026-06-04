@@ -1407,9 +1407,17 @@ fn regex_method(
             }
         }
         "replace" | "replaceAll" => {
-            let repl = ctx
-                .realm
-                .to_display_string(args.get(1).copied().unwrap_or(NanBox::undefined()));
+            let repl_val = args.get(1).copied().unwrap_or(NanBox::undefined());
+            // A non-string replacement (a function/closure, called per match) is
+            // handled by the tree-walker; defer instead of stringifying it.
+            // (nbvm closures are arrays, so this can't use `function_at`.)
+            if repl_val
+                .as_handle()
+                .is_some_and(|raw| ctx.realm.string_value(Handle::from_raw(raw)).is_none())
+            {
+                return None;
+            }
+            let repl = ctx.realm.to_display_string(repl_val);
             NanBox::handle(ctx.realm.new_string(&re.replace(&text, &repl)).to_raw())
         }
         // "split"

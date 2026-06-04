@@ -1800,15 +1800,40 @@ impl<'a> Interp<'a> {
                     parts.push(self.new_str(&s[at..]));
                     return Ok(Some(NanBox::handle(self.realm.new_array(parts).to_raw())));
                 }
-                // replace / replaceAll: substitute `$1`..`$9` / `$&` from groups.
+                // replace / replaceAll. The replacement is either a function
+                // (called with `match, g1.., offset, whole`) or a template string
+                // (`$1`..`$9` / `$&`).
                 _ => {
-                    let templ = self.realm.to_display_string(arg(1));
+                    let replacer = arg(1);
+                    let is_fn = replacer
+                        .as_handle()
+                        .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)));
+                    let templ = if is_fn {
+                        String::new()
+                    } else {
+                        self.realm.to_display_string(replacer)
+                    };
                     let mut out = String::new();
                     let mut at = 0;
                     while let Some(caps) = re.captures_from(&s, at) {
                         let (st, en) = caps.groups[0].unwrap_or((at, at));
                         out.push_str(&s[at..st]);
-                        out.push_str(&expand_replacement(&templ, &s, &caps));
+                        if is_fn {
+                            let mut call_args = alloc::vec![self.new_str(&s[st..en])];
+                            for g in caps.groups.iter().skip(1) {
+                                call_args.push(match g {
+                                    Some((gs, ge)) => self.new_str(&s[*gs..*ge]),
+                                    None => NanBox::undefined(),
+                                });
+                            }
+                            call_args.push(NanBox::number(st as f64));
+                            call_args.push(self.new_str(&s));
+                            let r = self.call(replacer, &call_args)?;
+                            let rep = self.realm.to_display_string(r);
+                            out.push_str(&rep);
+                        } else {
+                            out.push_str(&expand_replacement(&templ, &s, &caps));
+                        }
                         at = if en > st { en } else { en + 1 };
                         if !global || at > s.len() {
                             break;
@@ -4863,6 +4888,20 @@ mod tests {
             run("class C { #s = 1; constructor(){ this.p = 2; } } Object.keys(new C()).join(',')"),
             "p"
         );
+    }
+
+    #[test]
+    fn regex_replace_with_function() {
+        assert_eq!(
+            run("'a1b2'.replace(/[0-9]/g, function(m){ return '<'+m+'>'; })"),
+            "a<1>b<2>"
+        );
+        assert_eq!(
+            run("'1-2'.replace(/(\\d)-(\\d)/, function(_, a, b){ return b+'-'+a; })"),
+            "2-1"
+        );
+        // A string replacement still works.
+        assert_eq!(run("'foo'.replace(/o/g, '0')"), "f00");
     }
 
     #[test]
