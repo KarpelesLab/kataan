@@ -47,6 +47,12 @@ pub enum Op {
     JumpIfFalse { cond: Reg, target: usize },
     /// Unconditional jump to `target`.
     Jump { target: usize },
+    /// `dst = a + b` via the realm's `+` (numeric add or string concatenation).
+    AddValue { dst: Reg, a: Reg, b: Reg },
+    /// `dst = (a === b)` via the realm's strict equality (strings by value).
+    StrictEq { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a new heap string`.
+    NewString { dst: Reg, value: String },
     /// `dst = a new empty object` (allocated in the realm's heap).
     NewObject { dst: Reg },
     /// `obj[key] = src` (own property set through the object's shape).
@@ -71,10 +77,16 @@ pub enum VmError {
 /// `undefined` if the program falls off the end.
 pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<NanBox, VmError> {
     let mut regs: Vec<NanBox> = vec![NanBox::undefined(); register_count];
-    let mut handles: Vec<Option<Handle>> = vec![None; register_count];
     let mut pc = 0;
 
     let num = |v: NanBox| v.as_number().ok_or(VmError::NotANumber);
+    // A register holding an object: recover its heap handle from the boxed value
+    // (no side table — the handle *is* the value's payload).
+    let object_handle = |v: NanBox| {
+        v.as_handle()
+            .map(Handle::from_raw)
+            .ok_or(VmError::NotAnObject)
+    };
 
     while pc < program.len() {
         let op = &program[pc];
@@ -97,23 +109,33 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
                 regs[*dst as usize] =
                     NanBox::boolean(num(regs[*a as usize])? < num(regs[*b as usize])?);
             }
+            Op::AddValue { dst, a, b } => {
+                regs[*dst as usize] = realm.add(regs[*a as usize], regs[*b as usize]);
+            }
+            Op::StrictEq { dst, a, b } => {
+                regs[*dst as usize] =
+                    NanBox::boolean(realm.strict_equals(regs[*a as usize], regs[*b as usize]));
+            }
             Op::JumpIfFalse { cond, target } => {
                 if !regs[*cond as usize].to_boolean() {
                     pc = *target;
                 }
             }
             Op::Jump { target } => pc = *target,
+            Op::NewString { dst, value } => {
+                let handle = realm.new_string(value);
+                regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            }
             Op::NewObject { dst } => {
                 let handle = realm.new_object();
-                handles[*dst as usize] = Some(handle);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::SetProp { obj, key, src } => {
-                let handle = handles[*obj as usize].ok_or(VmError::NotAnObject)?;
+                let handle = object_handle(regs[*obj as usize])?;
                 realm.set_property(handle, key, regs[*src as usize]);
             }
             Op::GetProp { dst, obj, key } => {
-                let handle = handles[*obj as usize].ok_or(VmError::NotAnObject)?;
+                let handle = object_handle(regs[*obj as usize])?;
                 regs[*dst as usize] = realm
                     .get_property(handle, key)
                     .unwrap_or(NanBox::undefined());
@@ -236,6 +258,70 @@ mod tests {
         assert_eq!(result.as_number(), Some(15.0));
         // The object really lives in the realm's heap.
         assert_eq!(realm.object_count(), 1);
+    }
+
+    #[test]
+    fn builds_and_compares_strings() {
+        // greeting = "Hello, " + "world"; return (greeting === "Hello, world")
+        let prog = [
+            Op::NewString {
+                dst: 0,
+                value: String::from("Hello, "),
+            },
+            Op::NewString {
+                dst: 1,
+                value: String::from("world"),
+            },
+            Op::AddValue { dst: 0, a: 0, b: 1 }, // r0 = "Hello, world"
+            Op::NewString {
+                dst: 2,
+                value: String::from("Hello, world"),
+            },
+            Op::StrictEq { dst: 0, a: 0, b: 2 }, // string === by value
+            Op::Return { src: 0 },
+        ];
+        let mut realm = Realm::new();
+        let result = run(&mut realm, &prog, 3).unwrap();
+        assert_eq!(result.as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn string_concat_loop() {
+        // s = ""; i = 0; while (i < 5) { s = s + "x"; i = i + 1; } return s  → "xxxxx"
+        let prog = vec![
+            Op::NewString {
+                dst: 0,
+                value: String::new(),
+            }, // 0: s = ""
+            Op::LoadConst {
+                dst: 1,
+                value: NanBox::number(0.0),
+            }, // 1: i = 0
+            Op::LoadConst {
+                dst: 2,
+                value: NanBox::number(5.0),
+            }, // 2: limit
+            Op::LoadConst {
+                dst: 3,
+                value: NanBox::number(1.0),
+            }, // 3: step
+            Op::NewString {
+                dst: 4,
+                value: String::from("x"),
+            }, // 4: "x"
+            Op::Lt { dst: 5, a: 1, b: 2 }, // 5: cond = i < 5
+            Op::JumpIfFalse {
+                cond: 5,
+                target: 10,
+            }, // 6: exit
+            Op::AddValue { dst: 0, a: 0, b: 4 }, // 7: s = s + "x"
+            Op::Add { dst: 1, a: 1, b: 3 }, // 8: i += 1
+            Op::Jump { target: 5 },        // 9: loop
+            Op::Return { src: 0 },         // 10
+        ];
+        let mut realm = Realm::new();
+        let result = run(&mut realm, &prog, 6).unwrap();
+        assert_eq!(realm.to_display_string(result), "xxxxx");
     }
 
     #[test]
