@@ -28,6 +28,7 @@ use crate::ast::{
     Function, Ident, LogicalOp, ObjectMember, Param, Program, PropertyKey, Stmt, UnaryOp, VarDecl,
 };
 use crate::env::Scope;
+use crate::heap::Handle;
 use crate::nanbox::{NanBox, Unpacked};
 use crate::realm::Realm;
 use alloc::string::String;
@@ -80,6 +81,8 @@ pub struct Interp<'a> {
     current: Scope,
     /// Function-AST table; a closure cell holds an index into this.
     functions: Vec<FnDef<'a>>,
+    /// Captured `console.log` output (a line per call).
+    output: String,
 }
 
 impl Default for Interp<'_> {
@@ -96,6 +99,15 @@ const N_STRING: u16 = 3;
 const N_NUMBER: u16 = 4;
 const N_BOOLEAN: u16 = 5;
 const N_PARSE_INT: u16 = 6;
+const N_CONSOLE_LOG: u16 = 7;
+const N_JSON_STRINGIFY: u16 = 8;
+const N_OBJECT_KEYS: u16 = 9;
+const N_OBJECT_VALUES: u16 = 10;
+const N_ARRAY_IS_ARRAY: u16 = 11;
+const N_MATH_FLOOR: u16 = 12;
+const N_MATH_CEIL: u16 = 13;
+const N_MATH_ROUND: u16 = 14;
+const N_MATH_SQRT: u16 = 15;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib.
@@ -105,26 +117,54 @@ impl<'a> Interp<'a> {
             realm: Realm::new(),
             current: Scope::root(),
             functions: Vec::new(),
+            output: String::new(),
         };
         interp.install_globals();
         interp
+    }
+
+    /// The accumulated `console.log` output.
+    #[must_use]
+    pub fn output(&self) -> &str {
+        &self.output
     }
 
     /// Installs a small built-in library: the `Math` object and the global
     /// coercion/parse functions. (A token stdlib to prove the native-call path;
     /// the full port is the remaining migration work.)
     fn install_globals(&mut self) {
-        let math = self.realm.new_object();
-        for (name, id) in [
-            ("max", N_MATH_MAX),
-            ("min", N_MATH_MIN),
-            ("abs", N_MATH_ABS),
-        ] {
-            let f = self.realm.new_native(id);
-            self.realm
-                .set_property(math, name, NanBox::handle(f.to_raw()));
-        }
-        self.current.declare("Math", NanBox::handle(math.to_raw()));
+        // An object whose properties are native methods, bound to `global_name`.
+        let install_namespace = |this: &mut Self, global_name: &str, methods: &[(&str, u16)]| {
+            let obj = this.realm.new_object();
+            for (name, id) in methods {
+                let f = this.realm.new_native(*id);
+                this.realm
+                    .set_property(obj, name, NanBox::handle(f.to_raw()));
+            }
+            this.current
+                .declare(global_name, NanBox::handle(obj.to_raw()));
+        };
+        install_namespace(
+            self,
+            "Math",
+            &[
+                ("max", N_MATH_MAX),
+                ("min", N_MATH_MIN),
+                ("abs", N_MATH_ABS),
+                ("floor", N_MATH_FLOOR),
+                ("ceil", N_MATH_CEIL),
+                ("round", N_MATH_ROUND),
+                ("sqrt", N_MATH_SQRT),
+            ],
+        );
+        install_namespace(self, "console", &[("log", N_CONSOLE_LOG)]);
+        install_namespace(self, "JSON", &[("stringify", N_JSON_STRINGIFY)]);
+        install_namespace(
+            self,
+            "Object",
+            &[("keys", N_OBJECT_KEYS), ("values", N_OBJECT_VALUES)],
+        );
+        install_namespace(self, "Array", &[("isArray", N_ARRAY_IS_ARRAY)]);
         for (name, id) in [
             ("String", N_STRING),
             ("Number", N_NUMBER),
@@ -180,8 +220,105 @@ impl<'a> Interp<'a> {
                 let s = self.realm.to_display_string(arg(0));
                 NanBox::number(parse_int(&s))
             }
+            N_CONSOLE_LOG => {
+                let line: Vec<String> = args
+                    .iter()
+                    .map(|a| self.realm.to_display_string(*a))
+                    .collect();
+                self.output.push_str(&line.join(" "));
+                self.output.push('\n');
+                NanBox::undefined()
+            }
+            N_JSON_STRINGIFY => match self.json_stringify(arg(0)) {
+                Some(s) => NanBox::handle(self.realm.new_string(&s).to_raw()),
+                None => NanBox::undefined(),
+            },
+            N_OBJECT_KEYS => {
+                let keys = arg(0)
+                    .as_handle()
+                    .and_then(|raw| self.realm.object_keys(Handle::from_raw(raw)))
+                    .unwrap_or_default();
+                let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_str(k)).collect();
+                NanBox::handle(self.realm.new_array(boxed).to_raw())
+            }
+            N_OBJECT_VALUES => {
+                let mut vals = Vec::new();
+                if let Some(raw) = arg(0).as_handle() {
+                    let h = Handle::from_raw(raw);
+                    for k in self.realm.object_keys(h).unwrap_or_default() {
+                        vals.push(
+                            self.realm
+                                .get_property(h, &k)
+                                .unwrap_or(NanBox::undefined()),
+                        );
+                    }
+                }
+                NanBox::handle(self.realm.new_array(vals).to_raw())
+            }
+            N_ARRAY_IS_ARRAY => NanBox::boolean(
+                arg(0)
+                    .as_handle()
+                    .is_some_and(|raw| self.realm.is_array(Handle::from_raw(raw))),
+            ),
+            #[cfg(feature = "std")]
+            N_MATH_FLOOR => NanBox::number(self.realm.to_number(arg(0)).floor()),
+            #[cfg(feature = "std")]
+            N_MATH_CEIL => NanBox::number(self.realm.to_number(arg(0)).ceil()),
+            #[cfg(feature = "std")]
+            N_MATH_ROUND => NanBox::number(self.realm.to_number(arg(0)).round()),
+            #[cfg(feature = "std")]
+            N_MATH_SQRT => NanBox::number(self.realm.to_number(arg(0)).sqrt()),
+            #[cfg(not(feature = "std"))]
+            N_MATH_FLOOR | N_MATH_CEIL | N_MATH_ROUND | N_MATH_SQRT => {
+                return Err(ExecError::Unsupported("Math float ops need std"));
+            }
             _ => return Err(ExecError::NotCallable),
         })
+    }
+
+    /// Serializes a value to JSON (`None` when the value is `undefined` or a
+    /// function — which `JSON.stringify` omits / drops).
+    fn json_stringify(&self, v: NanBox) -> Option<String> {
+        match v.unpack() {
+            Unpacked::Undefined => None,
+            Unpacked::Null => Some(String::from("null")),
+            Unpacked::Bool(b) => Some(String::from(if b { "true" } else { "false" })),
+            Unpacked::Number(n) => Some(if n.is_finite() {
+                alloc::format!("{n}")
+            } else {
+                String::from("null")
+            }),
+            Unpacked::Handle(raw) => {
+                let h = Handle::from_raw(raw);
+                if let Some(s) = self.realm.string_value(h) {
+                    return Some(json_quote(&s));
+                }
+                if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
+                    let parts: Vec<String> = elems
+                        .iter()
+                        .map(|e| {
+                            self.json_stringify(*e)
+                                .unwrap_or_else(|| String::from("null"))
+                        })
+                        .collect();
+                    return Some(alloc::format!("[{}]", parts.join(",")));
+                }
+                if let Some(keys) = self.realm.object_keys(h) {
+                    let mut parts = Vec::new();
+                    for k in keys {
+                        let val = self
+                            .realm
+                            .get_property(h, &k)
+                            .unwrap_or(NanBox::undefined());
+                        if let Some(s) = self.json_stringify(val) {
+                            parts.push(alloc::format!("{}:{}", json_quote(&k), s));
+                        }
+                    }
+                    return Some(alloc::format!("{{{}}}", parts.join(",")));
+                }
+                None // a function
+            }
+        }
     }
 
     /// The underlying realm (e.g. to render a result with `to_display_string`).
@@ -955,6 +1092,25 @@ fn compound_op(op: AssignOp) -> Result<BinaryOp, ExecError> {
     })
 }
 
+/// Quotes and escapes a string as a JSON string literal.
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&alloc::format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// A minimal `parseInt`: skips leading whitespace, reads an optional sign and
 /// the leading decimal digits, and returns `NaN` if there are none.
 fn parse_int(s: &str) -> f64 {
@@ -1189,6 +1345,53 @@ mod tests {
         assert_eq!(run("[1, 2, 3].includes(2)"), "true");
         assert_eq!(run("[1, 2, 3].indexOf(3)"), "2");
         assert_eq!(run("['a', 'b', 'c'].join(', ')"), "a, b, c");
+    }
+
+    #[test]
+    fn console_log_captures_output() {
+        let program =
+            Parser::parse_program("console.log('hi', 42); let x = [1, 2]; console.log('arr:', x);")
+                .unwrap();
+        let mut interp = Interp::new();
+        interp.run(&program).unwrap();
+        assert_eq!(interp.output(), "hi 42\narr: 1,2\n");
+    }
+
+    #[test]
+    fn json_stringify() {
+        assert_eq!(run("JSON.stringify(42)"), "42");
+        assert_eq!(run("JSON.stringify('hi')"), "\"hi\"");
+        assert_eq!(run("JSON.stringify(true)"), "true");
+        assert_eq!(run("JSON.stringify(null)"), "null");
+        assert_eq!(run("JSON.stringify([1, 2, 3])"), "[1,2,3]");
+        assert_eq!(
+            run("JSON.stringify({ a: 1, b: 'x' })"),
+            "{\"a\":1,\"b\":\"x\"}"
+        );
+        assert_eq!(
+            run("JSON.stringify({ nested: { list: [1, true, null] } })"),
+            "{\"nested\":{\"list\":[1,true,null]}}"
+        );
+        // A quote in a string is escaped.
+        assert_eq!(run("JSON.stringify('a\"b')"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn object_and_array_statics() {
+        assert_eq!(run("Object.keys({ a: 1, b: 2 }).join(',')"), "a,b");
+        assert_eq!(run("Object.values({ a: 1, b: 2 }).join(',')"), "1,2");
+        assert_eq!(run("Array.isArray([1, 2])"), "true");
+        assert_eq!(run("Array.isArray('nope')"), "false");
+        assert_eq!(run("Array.isArray({})"), "false");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn math_float_methods() {
+        assert_eq!(run("Math.floor(3.7)"), "3");
+        assert_eq!(run("Math.ceil(3.2)"), "4");
+        assert_eq!(run("Math.round(3.5)"), "4");
+        assert_eq!(run("Math.sqrt(144)"), "12");
     }
 
     #[test]

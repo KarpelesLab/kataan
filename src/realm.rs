@@ -111,6 +111,25 @@ impl Realm {
         self.heap.get(handle)?.as_array()
     }
 
+    /// Whether `handle` refers to an array.
+    #[must_use]
+    pub fn is_array(&self, handle: Handle) -> bool {
+        self.heap.get(handle).and_then(Cell::as_array).is_some()
+    }
+
+    /// The own property names of the object at `handle`, in insertion order, or
+    /// `None` if it is not an object.
+    #[must_use]
+    pub fn object_keys(&self, handle: Handle) -> Option<Vec<alloc::string::String>> {
+        let obj = self.heap.get(handle)?.as_object()?;
+        Some(
+            obj.keys()
+                .iter()
+                .map(|s| alloc::string::String::from(*s))
+                .collect(),
+        )
+    }
+
     /// The length of the array at `handle`, or `None` if it is not an array.
     #[must_use]
     pub fn array_length(&self, handle: Handle) -> Option<usize> {
