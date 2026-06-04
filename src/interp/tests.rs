@@ -509,6 +509,26 @@ fn math_builtins() {
 }
 
 #[test]
+fn dates() {
+    // Fixed timestamps keep the tests deterministic (no `Date.now`).
+    assert_eq!(
+        eval("new Date(0).toISOString()"),
+        "1970-01-01T00:00:00.000Z"
+    );
+    assert_eq!(
+        eval("new Date(1700000000000).toISOString()"),
+        "2023-11-14T22:13:20.000Z"
+    );
+    assert_eq!(eval("new Date(1700000000000).getFullYear()"), "2023");
+    assert_eq!(eval("new Date(1700000000000).getMonth()"), "10"); // 0-indexed Nov
+    assert_eq!(eval("new Date(1700000000000).getDate()"), "14");
+    assert_eq!(eval("new Date(86400000).getTime()"), "86400000");
+    assert_eq!(eval("new Date(0).getDay()"), "4"); // 1970-01-01 was Thursday
+    assert_eq!(eval("typeof Date.now()"), "number");
+    assert_eq!(eval("new Date(0) instanceof Date"), "true");
+}
+
+#[test]
 fn constructor_statics() {
     // Number statics.
     assert_eq!(eval("Number.isInteger(5)"), "true");

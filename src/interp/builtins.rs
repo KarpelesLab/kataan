@@ -44,6 +44,91 @@ fn constructor_object<'a>(
     obj
 }
 
+/// Milliseconds since the Unix epoch (UTC).
+fn now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_millis() as f64)
+}
+
+/// A UTC civil date/time broken out from an epoch millisecond count.
+struct Civil {
+    year: i64,
+    month: i64, // 1..=12
+    day: i64,   // 1..=31
+    hour: i64,
+    minute: i64,
+    second: i64,
+    millis: i64,
+    weekday: i64, // 0 = Sunday
+}
+
+/// Converts epoch milliseconds to a UTC civil date (Howard Hinnant's
+/// `civil_from_days` — exact, no libc).
+fn civil_from_ms(ms: f64) -> Civil {
+    let total_ms = ms.floor() as i64;
+    let millis = total_ms.rem_euclid(1000);
+    let total_secs = total_ms.div_euclid(1000);
+    let days = total_secs.div_euclid(86400);
+    let sod = total_secs.rem_euclid(86400);
+    let weekday = (days.rem_euclid(7) + 4) % 7; // 1970-01-01 was Thursday
+
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    Civil {
+        year,
+        month,
+        day,
+        hour: sod / 3600,
+        minute: (sod % 3600) / 60,
+        second: sod % 60,
+        millis,
+        weekday,
+    }
+}
+
+/// Builds a `Date` instance from epoch milliseconds. Methods capture the
+/// timestamp (Date is effectively immutable for the supported surface), so they
+/// need no `this`.
+fn make_date<'a>(ms: f64, proto: &Rc<Obj<'a>>) -> Rc<Obj<'a>> {
+    let date = Obj::with_proto(Rc::clone(proto));
+    macro_rules! field {
+        ($name:literal, $f:expr) => {
+            date.set($name, native($name, move |_| Ok(Value::Number($f(ms)))));
+        };
+    }
+    field!("getTime", |ms: f64| ms);
+    field!("valueOf", |ms: f64| ms);
+    field!("getFullYear", |ms: f64| civil_from_ms(ms).year as f64);
+    field!("getMonth", |ms: f64| (civil_from_ms(ms).month - 1) as f64);
+    field!("getDate", |ms: f64| civil_from_ms(ms).day as f64);
+    field!("getDay", |ms: f64| civil_from_ms(ms).weekday as f64);
+    field!("getHours", |ms: f64| civil_from_ms(ms).hour as f64);
+    field!("getMinutes", |ms: f64| civil_from_ms(ms).minute as f64);
+    field!("getSeconds", |ms: f64| civil_from_ms(ms).second as f64);
+    field!("getMilliseconds", |ms: f64| civil_from_ms(ms).millis as f64);
+    date.set(
+        "toISOString",
+        native("toISOString", move |_| {
+            let c = civil_from_ms(ms);
+            Ok(Value::str(format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                c.year, c.month, c.day, c.hour, c.minute, c.second, c.millis
+            )))
+        }),
+    );
+    date
+}
+
 impl<'a> Interp<'a> {
     /// Installs the standard-library globals into the global scope.
     pub(super) fn install_stdlib(&self) {
@@ -54,6 +139,23 @@ impl<'a> Interp<'a> {
         self.install_number_globals();
         self.install_errors();
         self.install_collections();
+        self.install_date();
+    }
+
+    fn install_date(&self) {
+        let date_proto = Obj::object();
+        let proto = Rc::clone(&date_proto);
+        let date = constructor_object("Date", move |a| {
+            let ms = if a.is_empty() {
+                now_ms()
+            } else {
+                arg(a, 0).to_number()
+            };
+            Ok(Value::Object(make_date(ms, &proto)))
+        });
+        date.set("now", native("now", |_| Ok(Value::Number(now_ms()))));
+        date.set("prototype", Value::Object(date_proto));
+        self.define_global("Date", Value::Object(date));
     }
 
     fn install_collections(&self) {
