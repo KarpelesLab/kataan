@@ -13,11 +13,11 @@
 //! backreferences `\1`, lookahead `(?= )`/`(?! )`, lookbehind `(?<= )`/`(?<! )`,
 //! the common Unicode property escapes `\p{…}`/`\P{…}` (general categories `L`,
 //! `Lu`, `Ll`, `N`, plus `White_Space`), and the `i` (case-insensitive), `m`
-//! (multiline), and `s` (dotall) flags. Positions are Unicode scalar (`char`)
-//! indices.
+//! (multiline), `s` (dotall), and `y` (sticky) flags. Positions are Unicode
+//! scalar (`char`) indices.
 //!
-//! Not yet: the full Unicode property set and the `u`/`y` flag semantics — these
-//! land as the engine matures (see `ROADMAP.md`).
+//! Not yet: the full Unicode property set and the `u`-flag semantics — these land
+//! as the engine matures (see `ROADMAP.md`).
 
 mod compile;
 mod parser;
@@ -52,6 +52,8 @@ pub struct Flags {
     pub multiline: bool,
     /// `s` — dotall (`.` matches line terminators).
     pub dotall: bool,
+    /// `y` — sticky: a match must begin exactly at the start position.
+    pub sticky: bool,
 }
 
 impl Flags {
@@ -64,7 +66,8 @@ impl Flags {
                 'g' => f.global = true,
                 'm' => f.multiline = true,
                 's' => f.dotall = true,
-                'u' | 'y' | 'd' => {} // accepted but not yet acted on
+                'y' => f.sticky = true,
+                'u' | 'd' => {} // accepted but not yet acted on
                 other => return Err(RegexError::new(alloc::format!("unknown flag `{other}`"))),
             }
         }
@@ -149,7 +152,14 @@ impl Regex {
     }
 
     fn captures_at(&self, chars: &[char], start: usize) -> Option<Captures> {
-        for s in start..=chars.len() {
+        // A sticky (`y`) match must begin exactly at `start`; otherwise the
+        // engine scans forward for the first match at or after `start`.
+        let last = if self.flags.sticky {
+            start
+        } else {
+            chars.len()
+        };
+        for s in start..=last {
             if let Some(groups) = vm::run(&self.prog, chars, s, self.group_count, self.flags) {
                 return Some(Captures { groups });
             }

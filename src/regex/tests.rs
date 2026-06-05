@@ -150,6 +150,18 @@ fn unicode_property_escapes() {
 }
 
 #[test]
+fn sticky_flag() {
+    // Sticky must match at exactly the start position.
+    assert!(re("\\d", "y").find_from("1a", 0).is_some());
+    assert!(re("\\d", "y").find_from("a1", 0).is_none());
+    // Non-sticky scans forward.
+    assert!(re("\\d", "").find_from("a1", 0).is_some());
+    // Sticky from a later start matches only there.
+    assert_eq!(re("\\d", "y").find_from("a1", 1), Some((1, 2)));
+    assert!(re("abc", "y").find_from("xabc", 0).is_none());
+}
+
+#[test]
 fn errors() {
     assert!(Regex::new("(unterminated", "").is_err());
     assert!(Regex::new("[abc", "").is_err());
