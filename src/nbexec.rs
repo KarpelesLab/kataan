@@ -5090,12 +5090,27 @@ impl<'a> Interp<'a> {
                         ObjectMember::Spread { value, .. } => {
                             let src = self.eval(value)?;
                             if let Some(sh) = src.as_handle().map(Handle::from_raw) {
-                                // Enumerable keys include accessor (getter) props.
-                                let keys = self.realm.object_keys(sh).unwrap_or_default();
-                                for key in keys {
-                                    // `read_member` invokes a getter where present.
-                                    let pv = self.read_member(sh, &key)?;
-                                    self.realm.set_property(handle, &key, pv);
+                                // Spreading an array/string copies its indexed
+                                // elements as `"0"`, `"1"`, … properties.
+                                if let Some(elems) =
+                                    self.realm.array_elements(sh).map(<[_]>::to_vec)
+                                {
+                                    for (i, e) in elems.iter().enumerate() {
+                                        self.realm.set_property(handle, &alloc::format!("{i}"), *e);
+                                    }
+                                } else if let Some(s) = self.realm.string_value(sh) {
+                                    for (i, c) in s.chars().enumerate() {
+                                        let cv = self.new_str(&alloc::string::String::from(c));
+                                        self.realm.set_property(handle, &alloc::format!("{i}"), cv);
+                                    }
+                                } else {
+                                    // Enumerable keys include accessor (getter) props.
+                                    let keys = self.realm.object_keys(sh).unwrap_or_default();
+                                    for key in keys {
+                                        // `read_member` invokes a getter where present.
+                                        let pv = self.read_member(sh, &key)?;
+                                        self.realm.set_property(handle, &key, pv);
+                                    }
                                 }
                             }
                         }
@@ -7310,6 +7325,20 @@ mod tests {
         assert_eq!(
             run("let k='go'; class C { [k](){ return 42; } } new C().go()"),
             "42"
+        );
+    }
+
+    #[test]
+    fn object_spread_of_array_and_string() {
+        assert_eq!(
+            run("let o={...[10,20,30]}; o[0] + ':' + o[2] + ':' + Object.keys(o).join(',')"),
+            "10:30:0,1,2"
+        );
+        assert_eq!(run("let o={...'ab'}; o[0] + o[1]"), "ab");
+        // Mixed with explicit keys.
+        assert_eq!(
+            run("let o={...[1,2], a:9}; o[0] + ':' + o[1] + ':' + o.a"),
+            "1:2:9"
         );
     }
 
