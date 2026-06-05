@@ -101,6 +101,59 @@ pub(crate) enum PropKind {
     White,
     /// `Alphabetic` plus `Number` (`\w`-ish, but Unicode-aware).
     Alnum,
+    /// A general category by its code: a single-letter group (`[b'L', 0]`) or a
+    /// two-letter subcategory (`[b'L', b'u']`). Matched precisely via the `intl`
+    /// Unicode tables when available, else by a `char`-method approximation.
+    Gc([u8; 2]),
+}
+
+/// Maps a `\p{…}` property name (a 1–2 letter category code, or a long alias) to
+/// its general-category code, or `None` if unrecognized.
+pub(crate) fn general_category_code(name: &str) -> Option<[u8; 2]> {
+    // Long-form aliases → their canonical code.
+    let code = match name {
+        "Mark" => "M",
+        "Punctuation" => "P",
+        "Symbol" => "S",
+        "Separator" => "Z",
+        "Titlecase_Letter" => "Lt",
+        "Modifier_Letter" => "Lm",
+        "Other_Letter" => "Lo",
+        "Nonspacing_Mark" => "Mn",
+        "Spacing_Mark" => "Mc",
+        "Enclosing_Mark" => "Me",
+        "Letter_Number" => "Nl",
+        "Other_Number" => "No",
+        "Connector_Punctuation" => "Pc",
+        "Dash_Punctuation" => "Pd",
+        "Open_Punctuation" => "Ps",
+        "Close_Punctuation" => "Pe",
+        "Initial_Punctuation" => "Pi",
+        "Final_Punctuation" => "Pf",
+        "Other_Punctuation" => "Po",
+        "Math_Symbol" => "Sm",
+        "Currency_Symbol" => "Sc",
+        "Modifier_Symbol" => "Sk",
+        "Other_Symbol" => "So",
+        "Space_Separator" => "Zs",
+        "Line_Separator" => "Zl",
+        "Paragraph_Separator" => "Zp",
+        "Control" | "cntrl" => "Cc",
+        "Format" => "Cf",
+        "Private_Use" => "Co",
+        "Unassigned" => "Cn",
+        other => other,
+    };
+    const SUBCATS: [&str; 30] = [
+        "Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me", "Nd", "Nl", "No", "Pc", "Pd", "Ps", "Pe",
+        "Pi", "Pf", "Po", "Sm", "Sc", "Sk", "So", "Zs", "Zl", "Zp", "Cc", "Cf", "Cs", "Co", "Cn",
+    ];
+    let b = code.as_bytes();
+    match code {
+        "L" | "M" | "N" | "P" | "S" | "Z" | "C" => Some([b[0], 0]),
+        _ if SUBCATS.contains(&code) => Some([b[0], b[1]]),
+        _ => None,
+    }
 }
 
 /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -399,11 +452,14 @@ impl Parser {
             "N" | "Nd" | "Number" | "Decimal_Number" => PropKind::Number,
             "White_Space" | "space" => PropKind::White,
             "Alnum" => PropKind::Alnum,
-            other => {
-                return Err(RegexError::new(alloc::format!(
-                    "unsupported \\p property `{other}`"
-                )));
-            }
+            other => match general_category_code(other) {
+                Some(code) => PropKind::Gc(code),
+                None => {
+                    return Err(RegexError::new(alloc::format!(
+                        "unsupported \\p property `{other}`"
+                    )));
+                }
+            },
         })
     }
 

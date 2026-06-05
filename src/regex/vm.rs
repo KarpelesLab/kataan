@@ -283,6 +283,51 @@ fn property_matches(kind: PropKind, c: char) -> bool {
         PropKind::Number => c.is_numeric(),
         PropKind::White => c.is_whitespace(),
         PropKind::Alnum => c.is_alphanumeric(),
+        PropKind::Gc(code) => general_category_matches(code, c),
+    }
+}
+
+/// Whether `c` belongs to the general category `code` (`[group, 0]` or
+/// `[g, sub]`). With the `intl` feature this consults the Unicode tables for an
+/// exact answer; otherwise it falls back to `char`-method approximations that
+/// are correct for the common groups and cased/letter/number subcategories.
+#[cfg(feature = "intl")]
+fn general_category_matches(code: [u8; 2], c: char) -> bool {
+    use intl::unicode::category::Group;
+    let gc = intl::unicode::general_category(c);
+    if code[1] == 0 {
+        let want = match code[0] {
+            b'L' => Group::Letter,
+            b'M' => Group::Mark,
+            b'N' => Group::Number,
+            b'P' => Group::Punctuation,
+            b'S' => Group::Symbol,
+            b'Z' => Group::Separator,
+            b'C' => Group::Other,
+            _ => return false,
+        };
+        gc.group() == want
+    } else {
+        gc.abbr().as_bytes() == code
+    }
+}
+
+#[cfg(not(feature = "intl"))]
+fn general_category_matches(code: [u8; 2], c: char) -> bool {
+    match &code {
+        b"L\0" => c.is_alphabetic(),
+        b"N\0" => c.is_numeric(),
+        b"Z\0" => c == ' ' || (c.is_whitespace() && !c.is_control()),
+        b"C\0" => c.is_control(),
+        b"P\0" => c.is_ascii_punctuation(),
+        b"Lu" => c.is_uppercase(),
+        b"Ll" => c.is_lowercase(),
+        // An uncased letter (e.g. CJK, scripts without case).
+        b"Lo" => c.is_alphabetic() && !c.is_uppercase() && !c.is_lowercase(),
+        b"Nd" => c.is_ascii_digit() || (c.is_numeric() && c.to_digit(10).is_some()),
+        b"Cc" => c.is_control(),
+        // Finer categories need the Unicode tables (the `intl` feature).
+        _ => false,
     }
 }
 

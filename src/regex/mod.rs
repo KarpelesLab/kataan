@@ -11,13 +11,17 @@
 //! capturing `( )`, non-capturing `(?: )` and named `(?<name> )` groups,
 //! alternation `|`, the quantifiers `* + ? {n} {n,} {n,m}` (greedy and lazy),
 //! backreferences `\1`, lookahead `(?= )`/`(?! )`, lookbehind `(?<= )`/`(?<! )`,
-//! the common Unicode property escapes `\p{…}`/`\P{…}` (general categories `L`,
-//! `Lu`, `Ll`, `N`, plus `White_Space`), and the `i` (case-insensitive), `m`
-//! (multiline), `s` (dotall), and `y` (sticky) flags. Positions are Unicode
-//! scalar (`char`) indices.
+//! the Unicode property escapes `\p{…}`/`\P{…}` over the full general-category
+//! set — the seven groups (`L M N P S Z C`) and all thirty two-letter
+//! subcategories (`Lu`, `Ll`, `Lt`, …), plus their long-form aliases — and the
+//! `i` (case-insensitive), `m` (multiline), `s` (dotall), and `y` (sticky) flags.
+//! Positions are Unicode scalar (`char`) indices.
 //!
-//! Not yet: the full Unicode property set and the `u`-flag semantics — these land
-//! as the engine matures (see `ROADMAP.md`).
+//! General-category matching is exact when the `intl` feature is on (it consults
+//! the Unicode tables); without it, the common groups and cased/letter/number
+//! subcategories fall back to `char`-method approximations and the finer
+//! categories match nothing. The `u`-flag's code-point (vs code-unit) semantics
+//! are not yet modeled — that lands with full UTF-16 storage (see `ROADMAP.md`).
 
 mod compile;
 mod parser;

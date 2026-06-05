@@ -9777,6 +9777,31 @@ mod tests {
     }
 
     #[test]
+    fn regex_unicode_property_categories() {
+        // Robust across the intl / no-intl matchers.
+        assert_eq!(run(r#"'Hello World'.match(/\p{Lu}/g).join('')"#), "HW");
+        assert_eq!(run(r#"'Hello'.match(/\p{Ll}/g).join('')"#), "ello");
+        assert_eq!(run(r#"'abc123'.match(/\p{N}/g).join('')"#), "123");
+        assert_eq!(run(r#"'a.b!c'.match(/\p{P}/g).join('')"#), ".!");
+        assert_eq!(run(r#"'中文字'.match(/\p{Lo}/g).length"#), "3");
+        assert_eq!(run(r#"'a1b2'.match(/\P{N}/g).join('')"#), "ab");
+        // The full subcategory set compiles (matching may need Unicode tables).
+        assert_eq!(
+            run(r#"'x'.match(/\p{Sm}|\p{Sc}|\p{Mn}|\p{Pd}/g)===null"#),
+            "true"
+        );
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
+    fn regex_unicode_property_precise_with_intl() {
+        assert_eq!(run(r#"'3+5'.match(/\p{Sm}/)[0]"#), "+");
+        assert_eq!(run(r#"'$5'.match(/\p{Sc}/)[0]"#), "$");
+        assert_eq!(run(r#"'(a)'.match(/\p{Ps}/)[0]"#), "(");
+        assert_eq!(run(r#"'a-b'.match(/\p{Pd}/)[0]"#), "-");
+    }
+
+    #[test]
     fn regex_on_multibyte_strings() {
         // These previously panicked (char-index spans used as byte ranges).
         assert_eq!(run("'café'.match(/é/)[0]"), "é");

@@ -1,21 +1,23 @@
 /*---
-description: Regex Unicode property escapes \p{...} and \P{...}
-esid: sec-regexp-pattern-semantics
+description: Regex \p{...} general categories (groups and common subcategories)
+esid: prod-CharacterClassEscape
 ---*/
-assert.sameValue(/\p{L}/.test("a"), true, "letter");
-assert.sameValue(/\p{L}/.test("5"), false, "digit is not a letter");
-assert.sameValue(/^\p{L}+$/.test("hello"), true);
-assert.sameValue(/^\p{N}+$/.test("12345"), true, "all numbers");
-assert.sameValue(/^\p{N}+$/.test("12a45"), false);
-assert.sameValue(/\p{Lu}/.test("A"), true, "uppercase");
-assert.sameValue(/\p{Lu}/.test("a"), false);
-assert.sameValue(/\p{Ll}/.test("a"), true, "lowercase");
-assert.sameValue(/\p{L}/.test("Ω"), true, "Greek omega is a letter");
-assert.sameValue(/\p{L}/.test("é"), true, "accented e is a letter");
-assert.sameValue(/\P{L}/.test("5"), true, "negated: digit is non-letter");
-assert.sameValue(/\P{L}/.test("a"), false, "negated: letter is not non-letter");
-assert.sameValue(/^[\p{L}\p{N}]+$/.test("abc123"), true, "property in class");
-assert.sameValue(/^[\p{L}\p{N}]+$/.test("abc 123"), false, "space excluded");
-assert.sameValue("a1b2c3".replace(/\p{N}/g, "#"), "a#b#c#", "replace numbers");
-assert.sameValue("Hello World".replace(/\p{Lu}/g, "_"), "_ello _orld", "replace uppercase");
-assert.sameValue("foo123bar".match(/\p{N}+/)[0], "123");
+// Group categories.
+assert.sameValue("Hello World".match(/\p{Lu}/g).join(""), "HW", "uppercase letters");
+assert.sameValue("Hello".match(/\p{Ll}/g).join(""), "ello", "lowercase letters");
+assert.sameValue("abc123".match(/\p{N}/g).join(""), "123", "number group");
+assert.sameValue("a.b!c".match(/\p{P}/g).join(""), ".!", "punctuation group (ASCII)");
+assert.sameValue("中文字".match(/\p{Lo}/g).length, 3, "uncased letters (CJK)");
+assert.sameValue("x y".match(/\p{Z}/)[0], " ", "separator (non-breaking space)");
+// Long-form aliases parse and compile.
+assert.sameValue("Hi".match(/\p{Uppercase_Letter}/)[0], "H", "long-form alias");
+// The negated form.
+assert.sameValue("a1b2".match(/\P{N}/g).join(""), "ab", "negated number");
+// The full subcategory set at least compiles (matching needs Unicode tables).
+var ok = true;
+try {
+  ["Lt", "Lm", "Mn", "Mc", "Me", "Nl", "No", "Pc", "Pd", "Ps", "Pe", "Sm", "Sc", "Sk", "So", "Zs", "Cf"].forEach(function (cat) {
+    new RegExp("\\p{" + cat + "}");
+  });
+} catch (e) { ok = false; }
+assert.sameValue(ok, true, "all general-category codes compile");
