@@ -301,6 +301,10 @@ const GEN_IDX: &str = "\u{0}gidx";
 /// A generator's `return` value, surfaced once after its yields are exhausted.
 const GEN_RET: &str = "\u{0}gret";
 /// Reserved hidden keys for a bound function (`Function.prototype.bind`).
+/// Hidden slot holding a primitive-wrapper object's boxed value, and its
+/// constructor id (for `instanceof`).
+const PRIM_WRAP: &str = "\u{0}prim";
+const PRIM_WRAP_TYPE: &str = "\u{0}primtype";
 const BOUND_TARGET: &str = "\u{0}bnd_t";
 const BOUND_THIS: &str = "\u{0}bnd_this";
 const BOUND_ARGS: &str = "\u{0}bnd_args";
@@ -2668,6 +2672,27 @@ impl<'a> Interp<'a> {
                 .set_hidden_property(obj, FINREG_TAG, NanBox::boolean(true));
             return Ok(NanBox::handle(obj.to_raw()));
         }
+        // `new Number(x)` / `new String(x)` / `new Boolean(x)`: a primitive
+        // wrapper object boxing the coerced primitive (`valueOf` recovers it).
+        if matches!(id, N_NUMBER | N_STRING | N_BOOLEAN) {
+            let prim = match id {
+                N_NUMBER => {
+                    let n = args.first().map_or(0.0, |v| self.realm.to_number(*v));
+                    NanBox::number(n)
+                }
+                N_STRING => {
+                    let s = args
+                        .first()
+                        .map_or_else(String::new, |v| self.realm.to_display_string(*v));
+                    self.new_str(&s)
+                }
+                _ => NanBox::boolean(
+                    self.realm
+                        .truthy(args.first().copied().unwrap_or(NanBox::undefined())),
+                ),
+            };
+            return Ok(self.make_primitive_wrapper(prim, id));
+        }
         // `WeakMap`/`WeakSet` reuse the collection cell (no true weak refs here).
         let is_set = match id {
             N_SET | N_WEAKSET => true,
@@ -2943,6 +2968,17 @@ impl<'a> Interp<'a> {
             }
             _ => grouped,
         }
+    }
+
+    /// Builds a primitive wrapper object (`new Number`/`String`/`Boolean`,
+    /// `Object(primitive)`): an object boxing `prim` behind a `\0prim` slot, with
+    /// `\0wraptype` recording the constructor id (for `instanceof`).
+    fn make_primitive_wrapper(&mut self, prim: NanBox, ctor_id: u16) -> NanBox {
+        let obj = self.realm.new_object();
+        self.realm.set_hidden_property(obj, PRIM_WRAP, prim);
+        self.realm
+            .set_hidden_property(obj, PRIM_WRAP_TYPE, NanBox::number(f64::from(ctor_id)));
+        NanBox::handle(obj.to_raw())
     }
 
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
@@ -3293,6 +3329,17 @@ impl<'a> Interp<'a> {
         args: &[NanBox],
     ) -> Result<Option<NanBox>, ExecError> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+
+        // A primitive wrapper object (`new Number`/`String`/`Boolean`): `valueOf`
+        // recovers the boxed primitive; every other method delegates to it.
+        if let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && let Some(prim) = self.realm.get_property(h, PRIM_WRAP)
+        {
+            return match method {
+                "valueOf" => Ok(Some(prim)),
+                _ => self.call_method(prim, method, args),
+            };
+        }
 
         // --- number methods (the receiver is an immediate, not a handle) ---
         if let Some(n) = recv.as_number() {
@@ -6151,6 +6198,10 @@ impl<'a> Interp<'a> {
             return Ok(v);
         };
         let h = Handle::from_raw(raw);
+        // A primitive wrapper's ToPrimitive is simply its boxed value.
+        if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
+            return Ok(prim);
+        }
         // Strings and arrays are handled by the arithmetic path directly.
         if self.realm.string_value(h).is_some()
             || self.realm.is_array(h)
@@ -7008,6 +7059,27 @@ impl<'a> Interp<'a> {
                 _ => self.member_value(handle, name),
             });
         }
+        // A String wrapper delegates `length` and indexed reads to its boxed
+        // string (`new String("hi").length`, `wrapper[0]`).
+        if let Some(prim) = self.realm.get_property(handle, PRIM_WRAP)
+            && let Some(ph) = prim.as_handle().map(Handle::from_raw)
+            && let Some(s) = self.realm.string_value(ph)
+        {
+            if name == "length" {
+                return Ok(NanBox::number(s.encode_utf16().count() as f64));
+            }
+            if let Ok(i) = name.parse::<usize>() {
+                let ch = s.chars().nth(i);
+                return Ok(match ch {
+                    Some(c) => self.new_str(c.encode_utf8(&mut [0u8; 4])),
+                    None => NanBox::undefined(),
+                });
+            }
+            let v = self.member_value(ph, name);
+            if !matches!(v.unpack(), Unpacked::Undefined) {
+                return Ok(v);
+            }
+        }
         // Own property (or a built-in like `length`) wins.
         let direct = self.member_value(handle, name);
         if !matches!(direct.unpack(), Unpacked::Undefined) || self.realm.has_own(handle, name) {
@@ -7727,6 +7799,12 @@ impl<'a> Interp<'a> {
         };
         // Built-in constructors: check the cell kind directly.
         if let Some(id) = self.realm.native_at(ch) {
+            // A primitive wrapper (`new Number(…)`) matches its constructor.
+            if let Some(wt) = self.realm.get_property(oh, PRIM_WRAP_TYPE)
+                && wt.as_number() == Some(f64::from(id))
+            {
+                return Ok(true);
+            }
             // The `Error` family: match by the object's `name` against the
             // constructor (the base `Error` matches any error object).
             if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
@@ -10773,6 +10851,29 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn primitive_wrapper_objects() {
+        // Number wrapper.
+        assert_eq!(run("typeof new Number(5)"), "object");
+        assert_eq!(run("new Number(5).valueOf()"), "5");
+        assert_eq!(run("new Number(5) + 3"), "8");
+        assert_eq!(run("new Number(255).toString(16)"), "ff");
+        assert_eq!(run("new Number(5) instanceof Number"), "true");
+        // String wrapper.
+        assert_eq!(run("new String('hello').length"), "5");
+        assert_eq!(run("new String('abc')[1]"), "b");
+        assert_eq!(run("new String('HELLO').toLowerCase()"), "hello");
+        assert_eq!(run("new String('a') + 'b'"), "ab");
+        assert_eq!(run("new String('x') instanceof String"), "true");
+        // Boolean wrapper.
+        assert_eq!(run("new Boolean(false).valueOf()"), "false");
+        assert_eq!(run("new Boolean(false) ? 'truthy' : 'falsy'"), "truthy");
+        assert_eq!(run("new Boolean(true) instanceof Boolean"), "true");
+        // Defaults.
+        assert_eq!(run("new Number().valueOf()"), "0");
+        assert_eq!(run("new String().valueOf()"), "");
     }
 
     #[test]
