@@ -483,7 +483,7 @@ impl<'a> Interp<'a> {
                         self.realm.bigint_at(h).unwrap_or_default()
                     }
                 } else {
-                    self.realm.to_number(v) as i128
+                    crate::bignum::BigInt::from_i128(self.realm.to_number(v) as i128)
                 };
                 NanBox::handle(self.realm.new_bigint(n).to_raw())
             }
@@ -2389,7 +2389,7 @@ impl<'a> Interp<'a> {
                     } else {
                         self.realm.to_number(arg(0)) as u32
                     };
-                    return Ok(Some(self.new_str(&bigint_to_radix(big, radix))));
+                    return Ok(Some(self.new_str(&bigint_to_radix(&big, radix))));
                 }
                 "valueOf" => return Ok(Some(NanBox::handle(self.realm.new_bigint(big).to_raw()))),
                 _ => {}
@@ -4379,6 +4379,21 @@ impl<'a> Interp<'a> {
                 ..
             } => {
                 let current = self.read_target(argument)?;
+                // A BigInt operand increments/decrements by one BigInt.
+                if let Some(big) = current
+                    .as_handle()
+                    .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)))
+                {
+                    let one = crate::bignum::BigInt::from_i128(1);
+                    let next = match op {
+                        crate::ast::UpdateOp::Inc => big.add(&one),
+                        crate::ast::UpdateOp::Dec => big.sub(&one),
+                    };
+                    let next_box = NanBox::handle(self.realm.new_bigint(next).to_raw());
+                    self.assign_to(argument, next_box)?;
+                    let old_box = NanBox::handle(self.realm.new_bigint(big).to_raw());
+                    return Ok(if *prefix { next_box } else { old_box });
+                }
                 let old = self.realm.to_number(current);
                 let next = match op {
                     crate::ast::UpdateOp::Inc => old + 1.0,
@@ -4988,14 +5003,15 @@ impl<'a> Interp<'a> {
         {
             match op {
                 UnaryOp::Minus => {
-                    return Ok(NanBox::handle(
-                        self.realm.new_bigint(big.wrapping_neg()).to_raw(),
-                    ));
+                    return Ok(NanBox::handle(self.realm.new_bigint(big.neg()).to_raw()));
                 }
                 UnaryOp::BitNot => {
-                    return Ok(NanBox::handle(self.realm.new_bigint(!big).to_raw()));
+                    // `~x` on a BigInt is `-(x + 1)`.
+                    let one = crate::bignum::BigInt::from_i128(1);
+                    let nx = big.add(&one).neg();
+                    return Ok(NanBox::handle(self.realm.new_bigint(nx).to_raw()));
                 }
-                UnaryOp::Not => return Ok(NanBox::boolean(big == 0)),
+                UnaryOp::Not => return Ok(NanBox::boolean(big.is_zero())),
                 _ => {}
             }
         }
@@ -5023,8 +5039,8 @@ impl<'a> Interp<'a> {
     fn bigint_binary(
         &mut self,
         op: BinaryOp,
-        abig: Option<i128>,
-        bbig: Option<i128>,
+        abig: Option<crate::bignum::BigInt>,
+        bbig: Option<crate::bignum::BigInt>,
         a: NanBox,
         b: NanBox,
     ) -> Result<Option<NanBox>, ExecError> {
@@ -5036,39 +5052,51 @@ impl<'a> Interp<'a> {
             }
             _ => {}
         }
-        if let (Some(x), Some(y)) = (abig, bbig) {
-            let val = |this: &mut Self, n: i128| NanBox::handle(this.realm.new_bigint(n).to_raw());
-            let zero_div = |this: &mut Self| {
-                let m = this.new_str("Division by zero");
+        if let (Some(x), Some(y)) = (abig.clone(), bbig.clone()) {
+            use core::cmp::Ordering;
+            let val = |this: &mut Self, n: crate::bignum::BigInt| {
+                NanBox::handle(this.realm.new_bigint(n).to_raw())
+            };
+            let throw = |this: &mut Self, msg: &str| {
+                let m = this.new_str(msg);
                 ExecError::Throw(this.make_error(N_TYPE_ERROR, Some(m)))
             };
             let r = match op {
-                BinaryOp::Add => val(self, x.wrapping_add(y)),
-                BinaryOp::Sub => val(self, x.wrapping_sub(y)),
-                BinaryOp::Mul => val(self, x.wrapping_mul(y)),
-                BinaryOp::Div => {
-                    if y == 0 {
-                        return Err(zero_div(self));
-                    }
-                    val(self, x / y)
-                }
-                BinaryOp::Mod => {
-                    if y == 0 {
-                        return Err(zero_div(self));
-                    }
-                    val(self, x % y)
-                }
-                BinaryOp::BitAnd => val(self, x & y),
-                BinaryOp::BitOr => val(self, x | y),
-                BinaryOp::BitXor => val(self, x ^ y),
+                BinaryOp::Add => val(self, x.add(&y)),
+                BinaryOp::Sub => val(self, x.sub(&y)),
+                BinaryOp::Mul => val(self, x.mul(&y)),
+                BinaryOp::Div => match x.divmod(&y) {
+                    Some((q, _)) => val(self, q),
+                    None => return Err(throw(self, "Division by zero")),
+                },
+                BinaryOp::Mod => match x.divmod(&y) {
+                    Some((_, rem)) => val(self, rem),
+                    None => return Err(throw(self, "Division by zero")),
+                },
                 BinaryOp::Exp => {
-                    let e = u32::try_from(y).unwrap_or(0);
-                    val(self, x.checked_pow(e).unwrap_or(i128::MAX))
+                    if y.is_negative() {
+                        return Err(throw(self, "Exponent must be non-negative"));
+                    }
+                    let e = y.to_i128().and_then(|v| u64::try_from(v).ok()).unwrap_or(0);
+                    val(self, x.pow(e))
                 }
-                BinaryOp::Lt => NanBox::boolean(x < y),
-                BinaryOp::Gt => NanBox::boolean(x > y),
-                BinaryOp::LtEq => NanBox::boolean(x <= y),
-                BinaryOp::GtEq => NanBox::boolean(x >= y),
+                // Bitwise ops are defined via i128 when both fit (the common
+                // case); arbitrary-width bitwise on bigints is unsupported.
+                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                    let (Some(xi), Some(yi)) = (x.to_i128(), y.to_i128()) else {
+                        return Err(throw(self, "BigInt bitwise op out of range"));
+                    };
+                    let n = match op {
+                        BinaryOp::BitAnd => xi & yi,
+                        BinaryOp::BitOr => xi | yi,
+                        _ => xi ^ yi,
+                    };
+                    val(self, crate::bignum::BigInt::from_i128(n))
+                }
+                BinaryOp::Lt => NanBox::boolean(x.cmp(&y) == Ordering::Less),
+                BinaryOp::Gt => NanBox::boolean(x.cmp(&y) == Ordering::Greater),
+                BinaryOp::LtEq => NanBox::boolean(x.cmp(&y) != Ordering::Greater),
+                BinaryOp::GtEq => NanBox::boolean(x.cmp(&y) != Ordering::Less),
                 BinaryOp::EqEq => NanBox::boolean(x == y),
                 BinaryOp::NotEq => NanBox::boolean(x != y),
                 _ => return Ok(None),
@@ -5095,8 +5123,9 @@ impl<'a> Interp<'a> {
                 | BinaryOp::LtEq
                 | BinaryOp::GtEq
         ) {
-            let xn = abig.map_or_else(|| self.realm.to_number(a), |x| x as f64);
-            let yn = bbig.map_or_else(|| self.realm.to_number(b), |y| y as f64);
+            let to_f = |n: &crate::bignum::BigInt| n.to_i128().map_or(f64::NAN, |v| v as f64);
+            let xn = abig.as_ref().map_or_else(|| self.realm.to_number(a), to_f);
+            let yn = bbig.as_ref().map_or_else(|| self.realm.to_number(b), to_f);
             let r = match op {
                 BinaryOp::EqEq => xn == yn,
                 BinaryOp::NotEq => xn != yn,
@@ -5709,37 +5738,21 @@ fn parse_int(s: &str, radix: u32) -> f64 {
 }
 
 /// Renders a `BigInt` in the given radix (2..=36), base 10 by default.
-fn bigint_to_radix(mut n: i128, radix: u32) -> String {
-    if radix == 10 || !(2..=36).contains(&radix) {
-        return alloc::format!("{n}");
-    }
-    if n == 0 {
-        return String::from("0");
-    }
-    let neg = n < 0;
-    let mut digits = Vec::new();
-    let r = i128::from(radix);
-    while n != 0 {
-        let d = (n % r).unsigned_abs() as u32;
-        digits.push(core::char::from_digit(d, radix).unwrap());
-        n /= r;
-    }
-    if neg {
-        digits.push('-');
-    }
-    digits.iter().rev().collect()
+fn bigint_to_radix(n: &crate::bignum::BigInt, radix: u32) -> String {
+    let radix = if (2..=36).contains(&radix) { radix } else { 10 };
+    n.to_str_radix(radix)
 }
 
 /// Parses a normalized `BigInt` digit string (decimal, or `0x`/`0o`/`0b`
-/// prefixed) into `i128`. Out-of-range values saturate (the bounded model).
-fn parse_bigint(digits: &str) -> i128 {
+/// prefixed) into the arbitrary-precision representation.
+fn parse_bigint(digits: &str) -> crate::bignum::BigInt {
     let (radix, body) = match digits.get(0..2) {
         Some("0x" | "0X") => (16, &digits[2..]),
         Some("0o" | "0O") => (8, &digits[2..]),
         Some("0b" | "0B") => (2, &digits[2..]),
         _ => (10, digits),
     };
-    i128::from_str_radix(body, radix).unwrap_or(0)
+    crate::bignum::BigInt::from_str_radix(body, radix).unwrap_or_else(crate::bignum::BigInt::zero)
 }
 
 /// Normalizes an optional `fromIndex` for `indexOf`/`includes`: undefined → 0,
@@ -6633,6 +6646,20 @@ mod tests {
             run("let r='ok'; try { 1n + 1; } catch (e) { r = 'threw'; } r"),
             "threw"
         );
+        // Arbitrary precision: results far beyond i128 are exact.
+        assert_eq!(
+            run("(2n ** 200n).toString()"),
+            "1606938044258990275541962092341162602522202993782792835301376"
+        );
+        assert_eq!(
+            run("let f=1n; for(let i=1n;i<=25n;i++) f*=i; f.toString()"),
+            "15511210043330985984000000"
+        );
+        assert_eq!(
+            run("((2n ** 128n) - 1n).toString()"),
+            "340282366920938463463374607431768211455"
+        );
+        assert_eq!(run("(~5n).toString()"), "-6");
     }
 
     #[test]

@@ -135,7 +135,7 @@ impl Realm {
     }
 
     /// Allocates a `BigInt` with value `n`.
-    pub fn new_bigint(&mut self, n: i128) -> Handle {
+    pub fn new_bigint(&mut self, n: crate::bignum::BigInt) -> Handle {
         self.heap.alloc(Cell::BigInt(n))
     }
 
@@ -170,10 +170,10 @@ impl Realm {
         }
     }
 
-    /// The `i128` value of the `BigInt` at `handle`, if it is one.
+    /// The value of the `BigInt` at `handle` (cloned), if it is one.
     #[must_use]
-    pub fn bigint_at(&self, handle: Handle) -> Option<i128> {
-        self.heap.get(handle)?.as_bigint()
+    pub fn bigint_at(&self, handle: Handle) -> Option<crate::bignum::BigInt> {
+        self.heap.get(handle)?.as_bigint().cloned()
     }
 
     /// Allocates an array of `elements` in the heap and returns its handle.
@@ -1028,7 +1028,7 @@ impl Realm {
                 return !s.is_empty();
             }
             if let Some(n) = self.bigint_at(h) {
-                return n != 0; // `0n` is falsy
+                return !n.is_zero(); // `0n` is falsy
             }
             return true;
         }

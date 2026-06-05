@@ -122,9 +122,8 @@ pub enum Cell {
         /// A unique id, assigned at creation, giving the symbol its identity.
         id: u64,
     },
-    /// A `BigInt` primitive. Backed by `i128` (a bounded approximation of
-    /// arbitrary precision — sufficient for the common ±2^127 range).
-    BigInt(i128),
+    /// A `BigInt` primitive — true arbitrary precision (a pure-Rust bignum).
+    BigInt(crate::bignum::BigInt),
     /// A `Proxy`: wraps a `target` object, routing property operations through a
     /// `handler` object's traps (`get`/`set`/`has`/`deleteProperty`).
     Proxy {
@@ -294,11 +293,11 @@ impl Cell {
         }
     }
 
-    /// The `i128` value if this cell is a `BigInt`.
+    /// The value if this cell is a `BigInt`.
     #[must_use]
-    pub fn as_bigint(&self) -> Option<i128> {
+    pub fn as_bigint(&self) -> Option<&crate::bignum::BigInt> {
         match self {
-            Cell::BigInt(n) => Some(*n),
+            Cell::BigInt(n) => Some(n),
             _ => None,
         }
     }
