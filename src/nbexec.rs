@@ -246,6 +246,12 @@ const TYPED_ARRAY_KINDS: [(&str, u8); 9] = [
 ];
 const N_ARRAY_BUFFER: u16 = 177;
 const N_DATA_VIEW: u16 = 178;
+// `Object.prototype.*` methods (the receiver arrives as `this`).
+const N_OBJ_PROTO_TOSTRING: u16 = 179;
+const N_OBJ_PROTO_VALUEOF: u16 = 180;
+const N_OBJ_PROTO_HASOWN: u16 = 181;
+const N_OBJ_PROTO_ISPROTOTYPEOF: u16 = 182;
+const N_OBJ_PROTO_PROPISENUM: u16 = 183;
 const N_OBJECT_CREATE: u16 = 107;
 const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
@@ -608,6 +614,30 @@ impl<'a> Interp<'a> {
         for (name, id) in [("ArrayBuffer", N_ARRAY_BUFFER), ("DataView", N_DATA_VIEW)] {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
+        }
+        // A minimal `Object.prototype` carrying the methods commonly invoked via
+        // `Object.prototype.<m>.call(x)`. The receiver arrives as `this`.
+        let obj_proto = self.realm.new_object();
+        for (name, id) in [
+            ("toString", N_OBJ_PROTO_TOSTRING),
+            ("toLocaleString", N_OBJ_PROTO_TOSTRING),
+            ("valueOf", N_OBJ_PROTO_VALUEOF),
+            ("hasOwnProperty", N_OBJ_PROTO_HASOWN),
+            ("isPrototypeOf", N_OBJ_PROTO_ISPROTOTYPEOF),
+            ("propertyIsEnumerable", N_OBJ_PROTO_PROPISENUM),
+        ] {
+            let f = self.realm.new_native(id);
+            self.realm
+                .set_property(obj_proto, name, NanBox::handle(f.to_raw()));
+        }
+        if let Some(obj_ns) = self
+            .current
+            .get("Object")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm
+                .set_property(obj_ns, "prototype", NanBox::handle(obj_proto.to_raw()));
         }
         // `globalThis`: an object mirroring the global bindings, referencing
         // itself. Reads like `globalThis.Math` and `globalThis.globalThis` work.
@@ -1425,6 +1455,60 @@ impl<'a> Interp<'a> {
             // `Intl.NumberFormat(...)` / `Intl.DateTimeFormat(...)` called without
             // `new` build the same formatter object.
             N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => self.make_intl_formatter(id, args),
+            // `Object.prototype.*` methods — the receiver is `self.this_val`.
+            N_OBJ_PROTO_TOSTRING => {
+                let this = self.this_val;
+                let s = match this.unpack() {
+                    Unpacked::Undefined => String::from("[object Undefined]"),
+                    Unpacked::Null => String::from("[object Null]"),
+                    _ => match this.as_handle().map(Handle::from_raw) {
+                        Some(h) => alloc::format!("[object {}]", self.object_string_tag(h)),
+                        // A boxed primitive's tag (number/boolean/string immediates).
+                        None => String::from("[object Object]"),
+                    },
+                };
+                self.new_str(&s)
+            }
+            N_OBJ_PROTO_VALUEOF => self.this_val,
+            N_OBJ_PROTO_HASOWN => {
+                let key = self.member_key(arg(0));
+                match self.this_val.as_handle().map(Handle::from_raw) {
+                    Some(h) => NanBox::boolean(self.realm.has_own(h, &key)),
+                    None => NanBox::boolean(false),
+                }
+            }
+            N_OBJ_PROTO_PROPISENUM => {
+                let key = self.member_key(arg(0));
+                let enumerable = self
+                    .this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| {
+                        self.realm.has_own(h, &key)
+                            && self
+                                .realm
+                                .object_keys(h)
+                                .is_some_and(|ks| ks.contains(&key))
+                    });
+                NanBox::boolean(enumerable)
+            }
+            N_OBJ_PROTO_ISPROTOTYPEOF => {
+                // True if `this` appears in arg(0)'s prototype chain.
+                let target = self.this_val.as_handle().map(Handle::from_raw);
+                let mut cur = arg(0)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.object_proto(h));
+                let mut found = false;
+                while let Some(p) = cur {
+                    if Some(p) == target {
+                        found = true;
+                        break;
+                    }
+                    cur = self.realm.object_proto(p);
+                }
+                NanBox::boolean(found)
+            }
             // `btoa(s)`: each code unit must be a byte (0–255) → base64.
             N_BTOA => {
                 let s = self.realm.to_display_string(arg(0));
@@ -2375,9 +2459,13 @@ impl<'a> Interp<'a> {
             }
             return self.call_with_this(NanBox::handle(target.to_raw()), this_val, args);
         }
-        // A built-in function dispatches directly.
+        // A built-in function dispatches directly, with the receiver available as
+        // `this` (for the `Object.prototype.*` methods called via `.call`).
         if let Some(id) = self.realm.native_at(handle) {
-            return self.call_native(id, args);
+            let saved = core::mem::replace(&mut self.this_val, this_val);
+            let r = self.call_native(id, args);
+            self.this_val = saved;
+            return r;
         }
         // A bound native (promise resolve/reject) carries its target.
         if let Some((id, target)) = self.realm.bound_native_at(handle) {
@@ -9655,6 +9743,46 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn object_prototype_tostring_call() {
+        assert_eq!(run("typeof Object.prototype"), "object");
+        assert_eq!(run("Object.prototype.toString.call({})"), "[object Object]");
+        assert_eq!(run("Object.prototype.toString.call([])"), "[object Array]");
+        assert_eq!(run("Object.prototype.toString.call(null)"), "[object Null]");
+        assert_eq!(
+            run("Object.prototype.toString.call(undefined)"),
+            "[object Undefined]"
+        );
+        assert_eq!(
+            run("Object.prototype.toString.call(function(){})"),
+            "[object Function]"
+        );
+        assert_eq!(
+            run("Object.prototype.toString.call(/x/)"),
+            "[object RegExp]"
+        );
+        assert_eq!(
+            run("Object.prototype.toString.call({[Symbol.toStringTag]:'Widget'})"),
+            "[object Widget]"
+        );
+        assert_eq!(
+            run("Object.prototype.hasOwnProperty.call({a:1},'a')"),
+            "true"
+        );
+        assert_eq!(
+            run("Object.prototype.hasOwnProperty.call({a:1},'b')"),
+            "false"
+        );
+        assert_eq!(
+            run("let p={}; Object.prototype.isPrototypeOf.call(p, Object.create(p))"),
+            "true"
+        );
+        assert_eq!(
+            run("let o={x:1}; Object.prototype.valueOf.call(o)===o"),
+            "true"
+        );
     }
 
     #[test]
