@@ -112,6 +112,11 @@ pub mod nbvm;
 #[cfg(feature = "alloc")]
 pub mod bytecode;
 
+/// A pure, `alloc`-only arbitrary-precision integer — the foundation for a
+/// conformant `BigInt` (`ROADMAP.md`). Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod bignum;
+
 /// Evaluates the real parser AST (the expression subset) over the
 /// `Realm`/`NanBox` model — the front-end → new-representation bridge. Needs
 /// `alloc`.
