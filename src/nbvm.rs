@@ -643,6 +643,7 @@ fn promise_then(ctx: &mut Ctx, p: Handle, on_f: NanBox, on_r: NanBox) -> Handle 
             on_fulfilled: on_f,
             on_rejected: on_r,
             result,
+            finally: false,
         }),
         PromiseStatus::Fulfilled => ctx.microtasks.push_back(Microtask {
             handler: on_f,

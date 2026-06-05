@@ -45,6 +45,9 @@ pub struct Reaction {
     pub on_rejected: NanBox,
     /// The promise produced by `then`, settled with the handler's result.
     pub result: Handle,
+    /// A `finally` reaction: the callback runs for side effects but the result
+    /// mirrors the original promise (its value/rejection passes through).
+    pub finally: bool,
 }
 
 /// A `Promise`'s internal state, shared (`Rc`) between the promise and its

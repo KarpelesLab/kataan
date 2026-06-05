@@ -161,6 +161,9 @@ struct Job {
     value: NanBox,
     result: Handle,
     fulfilled: bool,
+    /// A `finally` job: run the handler for side effects, then pass the original
+    /// value/rejection through to `result`.
+    finally: bool,
 }
 
 impl Default for Interp<'_> {
@@ -1778,6 +1781,7 @@ impl<'a> Interp<'a> {
                 value,
                 result: r.result,
                 fulfilled,
+                finally: r.finally,
             });
         }
     }
@@ -1797,19 +1801,43 @@ impl<'a> Interp<'a> {
                 inner,
                 NanBox::handle(on_f.to_raw()),
                 NanBox::handle(on_r.to_raw()),
+                false,
             );
-        } else {
-            self.settle(handle, value, true);
+            return;
         }
+        // A thenable (a non-promise object with a callable `then`) is adopted by
+        // calling `then(resolve, reject)`.
+        if let Some(vh) = value.as_handle().map(Handle::from_raw)
+            && let Some(then) = self.realm.get_property(vh, "then")
+            && then
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            let on_f = self.realm.new_bound_native(N_RESOLVE, handle);
+            let on_r = self.realm.new_bound_native(N_REJECT, handle);
+            let args = [NanBox::handle(on_f.to_raw()), NanBox::handle(on_r.to_raw())];
+            // A throw from `then` rejects the promise.
+            if let Err(ExecError::Throw(e)) = self.call_with_this(then, value, &args) {
+                self.settle(handle, e, false);
+            }
+            return;
+        }
+        self.settle(handle, value, true);
     }
 
     /// Registers `then` reactions on `handle`, returning a new dependent promise.
     fn promise_then(&mut self, handle: Handle, on_f: NanBox, on_r: NanBox) -> NanBox {
-        let result = self.register_then(handle, on_f, on_r);
+        let result = self.register_then(handle, on_f, on_r, false);
         NanBox::handle(result.to_raw())
     }
 
-    fn register_then(&mut self, handle: Handle, on_f: NanBox, on_r: NanBox) -> Handle {
+    fn register_then(
+        &mut self,
+        handle: Handle,
+        on_f: NanBox,
+        on_r: NanBox,
+        finally: bool,
+    ) -> Handle {
         use crate::cell::PromiseStatus::{Fulfilled, Pending};
         let result = self.realm.new_promise();
         let state = self.realm.promise_state(handle).expect("a promise");
@@ -1825,6 +1853,7 @@ impl<'a> Interp<'a> {
                 on_fulfilled: on_f,
                 on_rejected: on_r,
                 result,
+                finally,
             }),
             Some((fulfilled, value)) => {
                 let handler = if fulfilled { on_f } else { on_r };
@@ -1833,6 +1862,7 @@ impl<'a> Interp<'a> {
                     value,
                     result,
                     fulfilled,
+                    finally,
                 });
             }
         }
@@ -1851,7 +1881,27 @@ impl<'a> Interp<'a> {
     /// Runs the next queued promise reaction.
     fn run_one_microtask(&mut self) -> Result<(), ExecError> {
         let job = self.microtasks.remove(0);
-        if job
+        if job.finally
+            && job
+                .handler
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|h| self.is_callable(h))
+        {
+            // `finally`: run the callback (no args), then pass the original
+            // value/rejection through (a throw from the callback overrides it).
+            match self.call(job.handler, &[]) {
+                Ok(_) => {
+                    if job.fulfilled {
+                        self.resolve_with(job.result, job.value);
+                    } else {
+                        self.settle(job.result, job.value, false);
+                    }
+                }
+                Err(ExecError::Throw(e)) => self.settle(job.result, e, false),
+                Err(other) => return Err(other),
+            }
+        } else if job
             .handler
             .as_handle()
             .map(Handle::from_raw)
@@ -3514,9 +3564,11 @@ impl<'a> Interp<'a> {
                     return Ok(Some(self.promise_then(handle, NanBox::undefined(), arg(0))));
                 }
                 "finally" => {
-                    // Simplified: run the callback on either settlement, passing
-                    // the value through.
-                    return Ok(Some(self.promise_then(handle, arg(0), arg(0))));
+                    // The callback runs on either settlement for side effects; the
+                    // original value/rejection passes through to the new promise.
+                    let cb = arg(0);
+                    let result = self.register_then(handle, cb, cb, true);
+                    return Ok(Some(NanBox::handle(result.to_raw())));
                 }
                 _ => {}
             }
