@@ -1463,6 +1463,15 @@ mod tests {
     }
 
     #[test]
+    fn lowers_comparison_as_value_and_euclid() {
+        // A comparison used as a value (not a condition) widens to f64 0/1, so it
+        // can feed arithmetic; nested ternary; while + modulo (gcd).
+        let src = "function boolSum(a, b, c) { return (a > 0) + (b > 0) + (c > 0); } function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; } function gcd(a, b) { while (b !== 0) { let t = b; b = a % b; a = t; } return a; }";
+        assert_well_formed(&module(src));
+        section_ids(&binary(src));
+    }
+
+    #[test]
     fn lowers_logical_not() {
         // `!` as a value and in a condition.
         let src = "function notZero(x) { return !(x === 0); } function neither(a, b) { if (!(a > 0) && !(b > 0)) { return 1; } return 0; }";
