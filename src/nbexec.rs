@@ -3321,15 +3321,9 @@ impl<'a> Interp<'a> {
                         let Some((st, en)) = caps.groups[0] else {
                             break;
                         };
-                        let groups: Vec<NanBox> = caps
-                            .groups
-                            .iter()
-                            .map(|g| match g {
-                                Some((gs, ge)) => self.new_str(&s[*gs..*ge]),
-                                None => NanBox::undefined(),
-                            })
-                            .collect();
-                        out.push(NanBox::handle(self.realm.new_array(groups).to_raw()));
+                        // A full match-result object (indexed groups + `.groups`
+                        // named captures + `.index`/`.input`).
+                        out.push(self.regex_match_object(&s, &caps, re.group_names()));
                         at = if en > st { en } else { en + 1 };
                         if at > s.len() {
                             break;
@@ -8641,6 +8635,22 @@ mod tests {
         );
         // No named groups → .groups is undefined.
         assert_eq!(run("String('ab'.match(/(a)(b)/).groups)"), "undefined");
+    }
+
+    #[test]
+    fn match_all_named_groups() {
+        assert_eq!(
+            run(
+                "let m=[...'2024-06 2025-12'.matchAll(/(?<y>\\d{4})-(?<mo>\\d{2})/g)]; m[0].groups.y + ':' + m[1].groups.mo"
+            ),
+            "2024:12"
+        );
+        // Positional access + index still work on matchAll results.
+        assert_eq!(run("[...'a1b2'.matchAll(/([a-z])(\\d)/g)][1][2]"), "2");
+        assert_eq!(
+            run("[...'xy'.matchAll(/(?<c>.)/g)].map(m=>m.groups.c).join('')"),
+            "xy"
+        );
     }
 
     #[test]
