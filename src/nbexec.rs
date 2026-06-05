@@ -4410,11 +4410,8 @@ impl<'a> Interp<'a> {
         match target {
             BindingTarget::Ident(Ident { name, .. }) => self.current.declare(name, value),
             BindingTarget::Array(pat) => {
-                let elems = value
-                    .as_handle()
-                    .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
-                    .map(<[_]>::to_vec)
-                    .unwrap_or_default();
+                // Any iterable destructures (strings, Sets, generators, …).
+                let elems = self.iterate_values(value).unwrap_or_default();
                 let mut i = 0;
                 for el in &pat.elements {
                     match el {
@@ -8753,6 +8750,21 @@ mod tests {
             run("'hello'.includes('lo', 3) + ':' + 'hello'.includes('he', 1)"),
             "true:false"
         );
+    }
+
+    #[test]
+    fn destructure_any_iterable() {
+        // Array binding patterns destructure any iterable, not just arrays.
+        assert_eq!(run("let [a,b,c]='xyz'; a+b+c"), "xyz");
+        assert_eq!(
+            run("let [f,...r]=new Set([1,2,3,4]); f + ':' + r.join(',')"),
+            "1:2,3,4"
+        );
+        assert_eq!(
+            run("function* g(){yield 10;yield 20;} let [x,y]=g(); x+y"),
+            "30"
+        );
+        assert_eq!(run("let [[k,v]]=new Map([['a',1]]); k + ':' + v"), "a:1");
     }
 
     #[test]
