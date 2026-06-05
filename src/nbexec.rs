@@ -207,6 +207,8 @@ const N_WEAKMAP: u16 = 112;
 const N_OBJECT_IS: u16 = 123;
 const N_OBJECT_HAS_OWN: u16 = 129;
 const N_OBJECT_GET_OWN_DESCS: u16 = 130;
+const N_WEAKREF: u16 = 131;
+const N_FINALIZATION_REGISTRY: u16 = 132;
 const N_OBJECT_DEFINE_PROPS: u16 = 124;
 const N_WEAKSET: u16 = 113;
 const N_REFLECT_GET: u16 = 114;
@@ -243,6 +245,10 @@ const CTOR_KEY: &str = "\u{0}ctor";
 /// Sentinel description for a `Symbol()` created with no argument (so its
 /// `.description` is `undefined`, distinct from `Symbol("")`).
 const SYMBOL_NO_DESC: &str = "\u{0}nodesc";
+/// Hidden key holding a `WeakRef`'s target (returned by `deref`).
+const WEAKREF_TARGET: &str = "\u{0}wrtarget";
+/// Hidden marker tagging a `FinalizationRegistry` instance.
+const FINREG_TAG: &str = "\u{0}finreg";
 const GEN_BUF: &str = "\u{0}gbuf";
 const GEN_IDX: &str = "\u{0}gidx";
 /// A generator's `return` value, surfaced once after its yields are exhausted.
@@ -441,6 +447,8 @@ impl<'a> Interp<'a> {
             ("Proxy", N_PROXY),
             ("WeakMap", N_WEAKMAP),
             ("WeakSet", N_WEAKSET),
+            ("WeakRef", N_WEAKREF),
+            ("FinalizationRegistry", N_FINALIZATION_REGISTRY),
         ] {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -2029,6 +2037,22 @@ impl<'a> Interp<'a> {
         if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
             return Ok(self.make_error(id, args.first().copied()));
         }
+        // `new WeakRef(target)` — holds the target. `deref()` always returns it
+        // (sound because GC is never driven mid-execution).
+        if id == N_WEAKREF {
+            let target = args.first().copied().unwrap_or(NanBox::undefined());
+            let obj = self.realm.new_object();
+            self.realm.set_hidden_property(obj, WEAKREF_TARGET, target);
+            return Ok(NanBox::handle(obj.to_raw()));
+        }
+        // `new FinalizationRegistry(cb)` — bounded: with no mid-execution GC the
+        // cleanup callback never fires, so `register`/`unregister` are inert.
+        if id == N_FINALIZATION_REGISTRY {
+            let obj = self.realm.new_object();
+            self.realm
+                .set_hidden_property(obj, FINREG_TAG, NanBox::boolean(true));
+            return Ok(NanBox::handle(obj.to_raw()));
+        }
         // `WeakMap`/`WeakSet` reuse the collection cell (no true weak refs here).
         let is_set = match id {
             N_SET | N_WEAKSET => true,
@@ -2438,6 +2462,22 @@ impl<'a> Interp<'a> {
             return Ok(None);
         };
         let handle = Handle::from_raw(raw);
+
+        // --- WeakRef / FinalizationRegistry (bounded: no mid-execution GC) ---
+        if method == "deref"
+            && let Some(target) = self.realm.get_property(handle, WEAKREF_TARGET)
+        {
+            return Ok(Some(target));
+        }
+        if self.realm.get_property(handle, FINREG_TAG).is_some() {
+            match method {
+                // `register(target, heldValue, unregisterToken?)` — inert.
+                "register" => return Ok(Some(NanBox::undefined())),
+                // `unregister(token)` — nothing was ever registered.
+                "unregister" => return Ok(Some(NanBox::boolean(false))),
+                _ => {}
+            }
+        }
 
         // --- universal `Object.prototype` methods (own/inherited reflection) ---
         match method {
@@ -8330,6 +8370,25 @@ mod tests {
             "1,2"
         );
         assert_eq!(run("Object.assign({}, {x:1}, {y:2}, {x:9}).x"), "9");
+    }
+
+    #[test]
+    fn weakref_and_finalization_registry() {
+        assert_eq!(
+            run("let o={x:1}; let r=new WeakRef(o); (r.deref()===o) + ':' + r.deref().x"),
+            "true:1"
+        );
+        assert_eq!(
+            run("typeof WeakRef + ',' + typeof FinalizationRegistry"),
+            "function,function"
+        );
+        assert_eq!(
+            run(
+                "let reg=new FinalizationRegistry(()=>{}); reg.register({}, 'h'); reg.unregister('t')"
+            ),
+            "false"
+        );
+        assert_eq!(run("new WeakRef([1,2,3]).deref().length"), "3");
     }
 
     #[test]
