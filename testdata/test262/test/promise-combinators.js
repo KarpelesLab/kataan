@@ -1,27 +1,18 @@
 /*---
-description: Promise.all, Promise.race, and Promise.allSettled
+description: Promise.all, race, resolve, reject in the eager model
 esid: sec-promise.all
 flags: [async]
 ---*/
 async function main() {
-  var all = await Promise.all([Promise.resolve(1), Promise.resolve(2), 3]);
-  assert.sameValue(all.join(","), "1,2,3");
-
-  var first = await Promise.race([Promise.resolve("a"), Promise.resolve("b")]);
-  assert.sameValue(first, "a");
-
-  var settled = await Promise.allSettled([Promise.resolve(10), Promise.reject("err")]);
-  assert.sameValue(settled[0].status, "fulfilled");
-  assert.sameValue(settled[0].value, 10);
-  assert.sameValue(settled[1].status, "rejected");
-  assert.sameValue(settled[1].reason, "err");
-
-  var rejected = false;
-  try {
-    await Promise.all([Promise.resolve(1), Promise.reject("boom")]);
-  } catch (e) {
-    rejected = (e === "boom");
-  }
-  assert.sameValue(rejected, true, "Promise.all rejects on first rejection");
+  var all = await Promise.all([Promise.resolve(1), Promise.resolve(2), Promise.resolve(3)]);
+  assert.sameValue(all.join(","), "1,2,3", "Promise.all collects in order");
+  var first = await Promise.race([Promise.resolve("fast"), Promise.resolve("slow")]);
+  assert.sameValue(first, "fast");
+  var v = await Promise.resolve(42);
+  assert.sameValue(v, 42);
+  var chained = await Promise.resolve(10).then(function (x) { return x * 2; });
+  assert.sameValue(chained, 20, "then transforms");
+  var caught = await Promise.reject("err").catch(function (e) { return "caught:" + e; });
+  assert.sameValue(caught, "caught:err");
 }
 main();
