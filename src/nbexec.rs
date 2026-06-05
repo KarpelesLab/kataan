@@ -287,6 +287,25 @@ const N_MATH_LOG10: u16 = 105;
 const N_MATH_EXP: u16 = 133;
 const N_MATH_LOG: u16 = 134;
 const N_MATH_RANDOM: u16 = 139;
+// Trig / hyperbolic / extra Math functions (140..=157).
+const N_MATH_SIN: u16 = 140;
+const N_MATH_COS: u16 = 141;
+const N_MATH_TAN: u16 = 142;
+const N_MATH_ASIN: u16 = 143;
+const N_MATH_ACOS: u16 = 144;
+const N_MATH_ATAN: u16 = 145;
+const N_MATH_ATAN2: u16 = 146;
+const N_MATH_SINH: u16 = 147;
+const N_MATH_COSH: u16 = 148;
+const N_MATH_TANH: u16 = 149;
+const N_MATH_ASINH: u16 = 150;
+const N_MATH_ACOSH: u16 = 151;
+const N_MATH_ATANH: u16 = 152;
+const N_MATH_EXPM1: u16 = 153;
+const N_MATH_LOG1P: u16 = 154;
+const N_MATH_FROUND: u16 = 155;
+const N_MATH_CLZ32: u16 = 156;
+const N_MATH_IMUL: u16 = 157;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib.
@@ -369,6 +388,24 @@ impl<'a> Interp<'a> {
                 ("log", N_MATH_LOG),
                 ("random", N_MATH_RANDOM),
                 ("trunc", N_MATH_TRUNC),
+                ("sin", N_MATH_SIN),
+                ("cos", N_MATH_COS),
+                ("tan", N_MATH_TAN),
+                ("asin", N_MATH_ASIN),
+                ("acos", N_MATH_ACOS),
+                ("atan", N_MATH_ATAN),
+                ("atan2", N_MATH_ATAN2),
+                ("sinh", N_MATH_SINH),
+                ("cosh", N_MATH_COSH),
+                ("tanh", N_MATH_TANH),
+                ("asinh", N_MATH_ASINH),
+                ("acosh", N_MATH_ACOSH),
+                ("atanh", N_MATH_ATANH),
+                ("expm1", N_MATH_EXPM1),
+                ("log1p", N_MATH_LOG1P),
+                ("fround", N_MATH_FROUND),
+                ("clz32", N_MATH_CLZ32),
+                ("imul", N_MATH_IMUL),
             ],
         );
         // The `Math` numeric constants.
@@ -1122,6 +1159,46 @@ impl<'a> Interp<'a> {
                 x ^= x << 17;
                 self.rng_state = x;
                 NanBox::number((x >> 11) as f64 / (1u64 << 53) as f64)
+            }
+            // Trig / hyperbolic / inverse — single-argument f64 functions.
+            #[cfg(feature = "std")]
+            N_MATH_SIN..=N_MATH_LOG1P => {
+                let n = self.realm.to_number(arg(0));
+                let r = match id {
+                    N_MATH_SIN => n.sin(),
+                    N_MATH_COS => n.cos(),
+                    N_MATH_TAN => n.tan(),
+                    N_MATH_ASIN => n.asin(),
+                    N_MATH_ACOS => n.acos(),
+                    N_MATH_ATAN => n.atan(),
+                    N_MATH_ATAN2 => n.atan2(self.realm.to_number(arg(1))),
+                    N_MATH_SINH => n.sinh(),
+                    N_MATH_COSH => n.cosh(),
+                    N_MATH_TANH => n.tanh(),
+                    N_MATH_ASINH => n.asinh(),
+                    N_MATH_ACOSH => n.acosh(),
+                    N_MATH_ATANH => n.atanh(),
+                    N_MATH_EXPM1 => n.exp_m1(),
+                    _ => n.ln_1p(), // N_MATH_LOG1P
+                };
+                NanBox::number(r)
+            }
+            #[cfg(not(feature = "std"))]
+            N_MATH_SIN..=N_MATH_LOG1P => {
+                return Err(ExecError::Unsupported("Math fns need std"));
+            }
+            // `Math.fround(x)` — round to the nearest single-precision float.
+            N_MATH_FROUND => NanBox::number(self.realm.to_number(arg(0)) as f32 as f64),
+            // `Math.clz32(x)` — count leading zeros of the ToUint32 value.
+            N_MATH_CLZ32 => {
+                let u = self.realm.to_number(arg(0)) as i64 as u32;
+                NanBox::number(u.leading_zeros() as f64)
+            }
+            // `Math.imul(a, b)` — 32-bit integer multiplication.
+            N_MATH_IMUL => {
+                let a = self.realm.to_number(arg(0)) as i64 as i32;
+                let b = self.realm.to_number(arg(1)) as i64 as i32;
+                NanBox::number(a.wrapping_mul(b) as f64)
             }
             #[cfg(not(feature = "std"))]
             N_MATH_HYPOT | N_MATH_CBRT | N_MATH_LOG2 | N_MATH_LOG10 | N_MATH_EXP | N_MATH_LOG => {
@@ -8733,6 +8810,26 @@ mod tests {
         assert_eq!(run("(1e-7).toString()"), "1e-7");
         assert_eq!(run("(1e20).toString()"), "100000000000000000000"); // not exponential
         assert_eq!(run("(0.000001).toString()"), "0.000001"); // 1e-6 stays decimal
+    }
+
+    #[test]
+    fn math_trig_and_extra() {
+        assert_eq!(
+            run("Math.sin(0) + ':' + Math.cos(0) + ':' + Math.tan(0)"),
+            "0:1:0"
+        );
+        assert_eq!(run("Math.round(Math.sin(Math.PI/2))"), "1");
+        assert_eq!(run("Math.round(Math.atan2(1,1)*4/Math.PI)"), "1");
+        assert_eq!(
+            run("Math.cosh(0) + ':' + Math.tanh(0) + ':' + Math.expm1(0)"),
+            "1:0:0"
+        );
+        assert_eq!(
+            run("Math.fround(1.5) + ':' + (Math.fround(1.1) !== 1.1)"),
+            "1.5:true"
+        );
+        assert_eq!(run("Math.clz32(1) + ':' + Math.clz32(0)"), "31:32");
+        assert_eq!(run("Math.imul(3,4) + ':' + Math.imul(-1,8)"), "12:-8");
     }
 
     #[test]
