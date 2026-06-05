@@ -2146,14 +2146,24 @@ impl<'a> Interp<'a> {
             match (ctor, &parent) {
                 (Some(ctor), _) => {
                     let scope = self.current.child();
-                    for (i, param) in ctor.value.params.iter().enumerate() {
-                        if let BindingTarget::Ident(Ident { name, .. }) = &param.target {
-                            let v = args.get(i).copied().unwrap_or(NanBox::undefined());
-                            scope.declare(name, v);
-                        }
-                    }
                     let saved = core::mem::replace(&mut self.current, scope);
                     let r = (|| {
+                        // Bind parameters (rest/default/destructuring supported).
+                        for (i, param) in ctor.value.params.iter().enumerate() {
+                            let value = if param.rest {
+                                let rest = args[i.min(args.len())..].to_vec();
+                                NanBox::handle(self.realm.new_array(rest).to_raw())
+                            } else {
+                                let mut v = args.get(i).copied().unwrap_or(NanBox::undefined());
+                                if matches!(v.unpack(), Unpacked::Undefined)
+                                    && let Some(d) = &param.default
+                                {
+                                    v = self.eval(d)?;
+                                }
+                                v
+                            };
+                            self.bind_pattern(&param.target, value)?;
+                        }
                         for stmt in &ctor.value.body {
                             if let Flow::Return(_) = self.exec(stmt)? {
                                 break;
@@ -2809,9 +2819,17 @@ impl<'a> Interp<'a> {
                         .unwrap_or_default();
                     Some(self.new_str(&out))
                 }
-                "includes" => Some(NanBox::boolean(
-                    s.contains(&self.realm.to_display_string(arg(0))),
-                )),
+                "includes" => {
+                    let needle = self.realm.to_display_string(arg(0));
+                    let chars: Vec<char> = s.chars().collect();
+                    let pos = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        0
+                    } else {
+                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(chars.len())
+                    };
+                    let sub: String = chars[pos..].iter().collect();
+                    Some(NanBox::boolean(sub.contains(&needle)))
+                }
                 "indexOf" => {
                     let needle = self.realm.to_display_string(arg(0));
                     let idx = s
@@ -2824,12 +2842,25 @@ impl<'a> Interp<'a> {
                     let n = if n >= 0.0 { n as usize } else { 0 };
                     Some(self.new_str(&s.repeat(n)))
                 }
-                "startsWith" => Some(NanBox::boolean(
-                    s.starts_with(&self.realm.to_display_string(arg(0))),
-                )),
-                "endsWith" => Some(NanBox::boolean(
-                    s.ends_with(&self.realm.to_display_string(arg(0))),
-                )),
+                "startsWith" => {
+                    let needle = self.realm.to_display_string(arg(0));
+                    let chars: Vec<char> = s.chars().collect();
+                    let pos = (self.realm.to_number(arg(1)).max(0.0) as usize).min(chars.len());
+                    let sub: String = chars[pos..].iter().collect();
+                    Some(NanBox::boolean(sub.starts_with(&needle)))
+                }
+                "endsWith" => {
+                    let needle = self.realm.to_display_string(arg(0));
+                    let chars: Vec<char> = s.chars().collect();
+                    // `endPosition` defaults to the full length.
+                    let end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        chars.len()
+                    } else {
+                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(chars.len())
+                    };
+                    let sub: String = chars[..end].iter().collect();
+                    Some(NanBox::boolean(sub.ends_with(&needle)))
+                }
                 "slice" => {
                     let chars: Vec<char> = s.chars().collect();
                     let (a, b) = slice_bounds(
@@ -7204,6 +7235,31 @@ mod tests {
         assert_eq!(
             run("let o = { v: 7, m: function(){ return (() => (() => this.v)())(); } }; o.m()"),
             "7"
+        );
+    }
+
+    #[test]
+    fn class_rest_params_and_string_positions() {
+        // Class constructor rest parameter (with spread).
+        assert_eq!(
+            run("class V{constructor(...c){this.c=c;}} new V(...[1,2,3]).c.length"),
+            "3"
+        );
+        assert_eq!(
+            run("class V{constructor(a, ...r){this.r=r;}} new V(1,2,3).r.join(',')"),
+            "2,3"
+        );
+        // Class constructor default parameter.
+        assert_eq!(
+            run("class P{constructor(x=7){this.x=x;}} new P().x + ':' + new P(2).x"),
+            "7:2"
+        );
+        // String prefix/suffix with positions.
+        assert_eq!(run("'hello world'.startsWith('world', 6)"), "true");
+        assert_eq!(run("'hello world'.endsWith('hello', 5)"), "true");
+        assert_eq!(
+            run("'hello'.includes('lo', 3) + ':' + 'hello'.includes('he', 1)"),
+            "true:false"
         );
     }
 
