@@ -46,6 +46,10 @@ pub(crate) enum Node {
         index: Option<usize>,
         inner: Box<Node>,
     },
+    /// A lookahead `(?=…)` / `(?!…)` (`neg` for the negative form).
+    Look { neg: bool, inner: Box<Node> },
+    /// A backreference `\1`…`\9`.
+    Backref(usize),
     /// A sequence of nodes.
     Concat(Vec<Node>),
     /// Alternation `a|b|…`.
@@ -268,6 +272,18 @@ impl Parser {
             if self.chars.get(self.pos + 1) == Some(&':') {
                 self.pos += 2;
                 None
+            } else if matches!(self.chars.get(self.pos + 1), Some('=' | '!')) {
+                // `(?= … )` / `(?! … )` — lookahead.
+                let neg = self.chars.get(self.pos + 1) == Some(&'!');
+                self.pos += 2; // `?=` or `?!`
+                let inner = self.parse_alt()?;
+                if !self.eat(')') {
+                    return Err(RegexError::new("unterminated lookahead `(?=`"));
+                }
+                return Ok(Node::Look {
+                    neg,
+                    inner: Box::new(inner),
+                });
             } else if self.chars.get(self.pos + 1) == Some(&'<')
                 && !matches!(self.chars.get(self.pos + 2), Some('=' | '!'))
             {
@@ -318,6 +334,8 @@ impl Parser {
             'S' => class_shorthand(Shorthand::NotSpace),
             'b' => Node::WordBoundary { neg: false },
             'B' => Node::WordBoundary { neg: true },
+            // `\1`…`\9` — a backreference to a capture group.
+            d if d.is_ascii_digit() && d != '0' => Node::Backref((d as u8 - b'0') as usize),
             'u' => Node::Char(self.parse_unicode_escape()?),
             'x' => Node::Char(self.parse_hex_escape(2)?),
             other => Node::Char(escape_char(other)),

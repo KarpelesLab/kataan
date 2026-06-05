@@ -22,6 +22,11 @@ pub(crate) enum Inst {
     Save(usize),
     /// A zero-width assertion.
     Assert(Assert),
+    /// A lookahead: run `prog` (a self-contained sub-program ending in `Match`)
+    /// at the current position without consuming input. `neg` inverts the sense.
+    Look { neg: bool, prog: Vec<Inst> },
+    /// A backreference: match the text previously captured by group `n`.
+    Backref(usize),
 }
 
 /// A character-class instruction operand.
@@ -123,6 +128,42 @@ fn backtrack(ctx: &Ctx, mut pc: usize, mut sp: usize, saves: &mut Vec<Option<usi
                 }
                 saves[*slot] = old;
                 return false;
+            }
+            Inst::Look { neg, prog } => {
+                // Zero-width: run the sub-program at `sp` (captures discarded).
+                let sub = Ctx {
+                    prog,
+                    input: ctx.input,
+                    flags: ctx.flags,
+                };
+                let mut sub_saves = alloc::vec![None; saves.len()];
+                let matched = backtrack(&sub, 0, sp, &mut sub_saves);
+                if matched != *neg {
+                    pc += 1;
+                } else {
+                    return false;
+                }
+            }
+            Inst::Backref(g) => {
+                match (
+                    saves.get(2 * g).copied().flatten(),
+                    saves.get(2 * g + 1).copied().flatten(),
+                ) {
+                    (Some(s), Some(e)) => {
+                        let len = e - s;
+                        if sp + len <= ctx.input.len()
+                            && (0..len)
+                                .all(|i| char_eq(ctx.input[sp + i], ctx.input[s + i], ctx.flags))
+                        {
+                            sp += len;
+                            pc += 1;
+                        } else {
+                            return false;
+                        }
+                    }
+                    // An unmatched group backreference matches the empty string.
+                    _ => pc += 1,
+                }
             }
             Inst::Assert(assert) => {
                 if assert_ok(assert, ctx.input, sp, ctx.flags) {

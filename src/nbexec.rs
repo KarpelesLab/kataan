@@ -8210,6 +8210,19 @@ mod tests {
     }
 
     #[test]
+    fn regex_lookahead_and_backref() {
+        // Positive / negative lookahead (zero-width).
+        assert_eq!(run("/foo(?=bar)/.test('foobar')"), "true");
+        assert_eq!(run("/foo(?=bar)/.test('foobaz')"), "false");
+        assert_eq!(run("/foo(?!bar)/.test('foobaz')"), "true");
+        assert_eq!(run("'foobar'.replace(/foo(?=bar)/, 'X')"), "Xbar");
+        // Backreferences.
+        assert_eq!(run("/(\\w)\\1/.test('hello')"), "true");
+        assert_eq!(run("/(\\w)\\1/.test('abc')"), "false");
+        assert_eq!(run("'hello'.match(/(.)\\1/)[0]"), "ll");
+    }
+
+    #[test]
     fn regex_named_groups() {
         assert_eq!(
             run(

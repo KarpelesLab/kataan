@@ -85,6 +85,25 @@ impl Compiler {
                 max,
                 greedy,
             } => self.compile_repeat(inner, *min, *max, *greedy),
+            // A lookahead compiles its body into a self-contained sub-program
+            // (ending in `Match`) run zero-width by the VM.
+            Node::Look { neg, inner } => {
+                let mut sub = Compiler {
+                    prog: Vec::new(),
+                    groups: 0,
+                };
+                sub.compile(inner);
+                sub.emit(Inst::Match);
+                self.groups = self.groups.max(sub.groups);
+                self.emit(Inst::Look {
+                    neg: *neg,
+                    prog: sub.prog,
+                });
+            }
+            Node::Backref(n) => {
+                self.groups = self.groups.max(*n);
+                self.emit(Inst::Backref(*n));
+            }
         }
     }
 
