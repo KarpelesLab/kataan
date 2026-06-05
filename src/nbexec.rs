@@ -1547,6 +1547,21 @@ impl<'a> Interp<'a> {
     /// Interpreter-aware `JSON.stringify` (compact): honors a `toJSON` method and
     /// invokes getters, unlike the realm-only `json_stringify`.
     fn json_to_string(&mut self, v: NanBox) -> Result<Option<String>, ExecError> {
+        if let Some(h) = v.as_handle().map(Handle::from_raw) {
+            // A `Date` serializes as its ISO string (its built-in `toJSON`).
+            if let Some(ms) = self.realm.date_at(h) {
+                return Ok(Some(if ms.is_finite() {
+                    json_quote(&crate::realm::date_to_iso(ms))
+                } else {
+                    String::from("null")
+                }));
+            }
+            // A `BigInt` cannot be serialized to JSON.
+            if self.realm.bigint_at(h).is_some() {
+                let m = self.new_str("Do not know how to serialize a BigInt");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+        }
         // A `toJSON` method replaces the value before serialization.
         if let Some(h) = v.as_handle().map(Handle::from_raw)
             && self.realm.string_value(h).is_none()
@@ -9399,6 +9414,27 @@ mod tests {
             ),
             "AC"
         );
+    }
+
+    #[test]
+    fn json_date_and_bigint() {
+        assert_eq!(
+            run("JSON.stringify(new Date(0))"),
+            "\"1970-01-01T00:00:00.000Z\""
+        );
+        assert_eq!(
+            run("JSON.stringify({d:new Date(0)})"),
+            "{\"d\":\"1970-01-01T00:00:00.000Z\"}"
+        );
+        assert_eq!(
+            run("try{ JSON.stringify(10n); 'no' }catch(e){ e instanceof TypeError }"),
+            "true"
+        );
+        assert_eq!(
+            run("try{ JSON.stringify({a:1n}); 'no' }catch(e){ e instanceof TypeError }"),
+            "true"
+        );
+        assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
     }
 
     #[test]
