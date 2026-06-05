@@ -3183,7 +3183,22 @@ impl<'a> Interp<'a> {
                 }
                 "lastIndexOf" => {
                     let target = arg(0);
-                    let found = elems
+                    let len = elems.len();
+                    if len == 0 {
+                        return Ok(Some(NanBox::number(-1.0)));
+                    }
+                    // Optional `fromIndex` (default last; negative counts back).
+                    let from = if args.len() >= 2 {
+                        let n = self.realm.to_number(arg(1));
+                        let n = if n < 0.0 { len as f64 + n } else { n };
+                        if n < 0.0 {
+                            return Ok(Some(NanBox::number(-1.0)));
+                        }
+                        (n as usize).min(len - 1)
+                    } else {
+                        len - 1
+                    };
+                    let found = elems[..=from]
                         .iter()
                         .rposition(|e| self.realm.strict_equals(*e, target));
                     return Ok(Some(NanBox::number(found.map_or(-1.0, |i| i as f64))));
@@ -6664,6 +6679,15 @@ mod tests {
         );
         assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
         assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
+    }
+
+    #[test]
+    fn array_last_index_of_from_index() {
+        assert_eq!(run("[10,20,30,20,10].lastIndexOf(20)"), "3");
+        assert_eq!(run("[10,20,30,20,10].lastIndexOf(10,3)"), "0");
+        assert_eq!(run("[10,20,30,20,10].lastIndexOf(20,-3)"), "1");
+        assert_eq!(run("[1,2,3].lastIndexOf(9)"), "-1");
+        assert_eq!(run("[1,2,3,4].findLastIndex(x => x < 3)"), "1");
     }
 
     #[test]
