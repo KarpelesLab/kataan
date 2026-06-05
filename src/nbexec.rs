@@ -4219,7 +4219,21 @@ impl<'a> Interp<'a> {
                 "getMilliseconds" | "getUTCMilliseconds" => NanBox::number((tod % 1000) as f64),
                 // The engine models all dates in UTC, so the local offset is 0.
                 "getTimezoneOffset" => NanBox::number(0.0),
-                "toISOString" | "toJSON" => self.new_str(&crate::realm::date_to_iso(ms)),
+                // `toISOString` throws on an invalid date; `toJSON` returns null.
+                "toISOString" => {
+                    if !ms.is_finite() {
+                        let m = self.new_str("Invalid time value");
+                        return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                    }
+                    self.new_str(&crate::realm::date_to_iso(ms))
+                }
+                "toJSON" => {
+                    if ms.is_finite() {
+                        self.new_str(&crate::realm::date_to_iso(ms))
+                    } else {
+                        NanBox::null()
+                    }
+                }
                 // Human-readable forms (the engine is UTC, so `GMT+0000`).
                 "toDateString" | "toTimeString" | "toString" | "toUTCString"
                 | "toLocaleDateString" | "toLocaleTimeString" | "toLocaleString" => {
@@ -9748,6 +9762,24 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn date_invalid_toisostring() {
+        assert_eq!(
+            run("try{new Date(NaN).toISOString();'no'}catch(e){e instanceof RangeError}"),
+            "true"
+        );
+        assert_eq!(run("new Date(NaN).toJSON()"), "null");
+        assert_eq!(run("JSON.stringify({d:new Date(NaN)})"), "{\"d\":null}");
+        assert_eq!(
+            run("new Date(Date.UTC(2020,5,15,10,30,45,123)).toISOString()"),
+            "2020-06-15T10:30:45.123Z"
+        );
+        assert_eq!(
+            run("try{new Date('garbage').toISOString();'no'}catch(e){e instanceof RangeError}"),
+            "true"
+        );
     }
 
     #[test]
