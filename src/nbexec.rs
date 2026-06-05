@@ -3800,6 +3800,32 @@ impl<'a> Interp<'a> {
         }
 
         // --- `Date.now()` static ---
+        // `BigInt.asUintN(bits, x)` / `BigInt.asIntN(bits, x)` — wrap a BigInt to
+        // the low `bits` bits, unsigned or signed (two's complement).
+        if self.realm.native_at(handle) == Some(N_BIGINT) && matches!(method, "asUintN" | "asIntN")
+        {
+            use crate::bignum::BigInt;
+            let bits = self.realm.to_number(arg(0)).max(0.0) as u64;
+            let x = arg(1)
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.bigint_at(h))
+                .unwrap_or_else(BigInt::zero);
+            let modulus = BigInt::from_i128(2).pow(bits);
+            // Non-negative remainder modulo 2^bits.
+            let mut u = x.divmod(&modulus).map_or_else(BigInt::zero, |(_, r)| r);
+            if u.is_negative() {
+                u = u.add(&modulus);
+            }
+            if method == "asIntN" && bits >= 1 {
+                // If the top bit is set, the signed value is `u - 2^bits`.
+                let half = BigInt::from_i128(2).pow(bits - 1);
+                if !u.sub(&half).is_negative() {
+                    u = u.sub(&modulus);
+                }
+            }
+            return Ok(Some(NanBox::handle(self.realm.new_bigint(u).to_raw())));
+        }
         if self.realm.native_at(handle) == Some(N_DATE) && method == "now" {
             return Ok(Some(NanBox::number(now_ms())));
         }
@@ -9443,6 +9469,23 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn bigint_as_uintn_intn() {
+        assert_eq!(run("BigInt.asUintN(8, 256n)"), "0");
+        assert_eq!(run("BigInt.asUintN(8, -1n)"), "255");
+        assert_eq!(run("BigInt.asUintN(4, -1n)"), "15");
+        assert_eq!(run("BigInt.asUintN(64, 18446744073709551617n)"), "1");
+        assert_eq!(run("BigInt.asIntN(8, 200n)"), "-56");
+        assert_eq!(run("BigInt.asIntN(8, 128n)"), "-128");
+        assert_eq!(run("BigInt.asIntN(8, 127n)"), "127");
+        assert_eq!(run("BigInt.asIntN(16, 40000n)"), "-25536");
+        assert_eq!(run("BigInt.asIntN(32, 4294967295n)"), "-1");
+        assert_eq!(
+            run("BigInt.asIntN(128, 12345678901234567890n)"),
+            "12345678901234567890"
+        );
     }
 
     #[test]
