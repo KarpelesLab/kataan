@@ -12,6 +12,11 @@ function* delegated() { yield* [1, 2]; yield* "ab"; }
 assert.sameValue([...delegated()].join(","), "1,2,a,b", "yield* over array and string");
 function* nested() { yield 0; yield* g(); yield 4; }
 assert.sameValue([...nested()].join(","), "0,1,2,3,4", "yield* over a generator");
+class Coll { *[Symbol.iterator]() { yield "x"; yield "y"; } }
+assert.sameValue([...new Coll()].join(","), "x,y", "class generator [Symbol.iterator]");
+var collected = [];
+for (var c of new Coll()) collected.push(c);
+assert.sameValue(collected.join(","), "x,y", "for-of over a class iterator");
 var r = g();
 r.next();
 var ret = r.return(99);

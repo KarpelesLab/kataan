@@ -5008,9 +5008,14 @@ impl<'a> Interp<'a> {
             return Ok(elems.into_iter().skip(idx).collect());
         }
         // A custom iterable: call `obj[Symbol.iterator]()` and drain `.next()`.
+        // The method may be an own/inherited property or a class method whose
+        // computed key is `Symbol.iterator` (`class C { *[Symbol.iterator]() {…} }`).
         let iter_sym = self.well_known_symbol("iterator");
         let iter_key = self.member_key(iter_sym);
-        let iter_fn = self.realm.get_property(h, &iter_key);
+        let mut iter_fn = self.realm.get_property(h, &iter_key);
+        if iter_fn.is_none() {
+            iter_fn = self.class_iterator_method(h)?;
+        }
         if let Some(f) = iter_fn
             && f.as_handle()
                 .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
@@ -5019,6 +5024,11 @@ impl<'a> Interp<'a> {
             let Some(ih) = iterator.as_handle().map(Handle::from_raw) else {
                 return Err(ExecError::Throw(self.new_str("iterator is not an object")));
             };
+            // A generator iterator (its `next` is a built-in method, not a
+            // readable property) is drained directly from its buffer.
+            if self.realm.get_property(ih, GEN_BUF).is_some() {
+                return self.iterate_values(iterator);
+            }
             let mut out = Vec::new();
             loop {
                 let next_fn = self.read_member(ih, "next")?;
@@ -5040,6 +5050,49 @@ impl<'a> Interp<'a> {
             return Ok(out);
         }
         Err(ExecError::Throw(self.new_str("value is not iterable")))
+    }
+
+    /// Finds a class instance's `[Symbol.iterator]` method (a method whose
+    /// computed key evaluates to the well-known iterator symbol), walking the
+    /// `extends` chain. Returns the bound method value, or `None`.
+    fn class_iterator_method(
+        &mut self,
+        h: crate::heap::Handle,
+    ) -> Result<Option<NanBox>, ExecError> {
+        let Some(tag) = self.realm.class_tag(h) else {
+            return Ok(None);
+        };
+        let iter_sym = self.well_known_symbol("iterator");
+        let mut cur = Some(tag);
+        while let Some(cid) = cur {
+            let class = self.classes[cid as usize];
+            let env = self.class_envs[cid as usize].clone();
+            for member in &class.body {
+                if let ClassMember::Method(m) = member
+                    && !m.is_static
+                    && m.kind == MethodKind::Method
+                    && let PropertyKey::Computed(ke) = &m.key
+                {
+                    let saved = core::mem::replace(&mut self.current, env.clone());
+                    let key = self.eval(ke);
+                    self.current = saved;
+                    if self.realm.strict_equals(key?, iter_sym) {
+                        let saved = core::mem::replace(&mut self.current, env.clone());
+                        let f = self.make_method(
+                            &m.value.params,
+                            Body::Block(&m.value.body),
+                            false,
+                            m.value.is_generator,
+                            Some(cid),
+                        );
+                        self.current = saved;
+                        return Ok(Some(f));
+                    }
+                }
+            }
+            cur = self.resolve_super(class, &env)?.map(|(p, _)| p);
+        }
+        Ok(None)
     }
 
     /// The keys iterated by `for-in`: object property names or array indices,
@@ -9943,6 +9996,28 @@ mod tests {
             "undefined:undefined"
         );
         assert_eq!(run("[[1,2],[3,4]]['0']['1']"), "2");
+    }
+
+    #[test]
+    fn class_symbol_iterator_method() {
+        assert_eq!(
+            run("class C{ *[Symbol.iterator](){yield 'x';yield 'y';} } [...new C()].join(',')"),
+            "x,y"
+        );
+        // A non-generator iterator method (manual iterator object).
+        assert_eq!(
+            run(
+                "class C{ [Symbol.iterator](){let i=0;return{next:()=>i<3?{value:i++,done:false}:{done:true}};} } [...new C()].join(',')"
+            ),
+            "0,1,2"
+        );
+        // for-of uses it too.
+        assert_eq!(
+            run(
+                "class C{ *[Symbol.iterator](){yield 1;yield 2;} } let s=0; for(let v of new C())s+=v; s"
+            ),
+            "3"
+        );
     }
 
     #[test]
