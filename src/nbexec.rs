@@ -5465,6 +5465,13 @@ impl<'a> Interp<'a> {
                 optional,
                 ..
             } => {
+                // `super.name` reads a super getter/method (not via `this`).
+                if matches!(&**object, Expr::Super(_)) {
+                    let (PropertyKey::Ident(name) | PropertyKey::Str(name)) = property else {
+                        return Err(ExecError::Unsupported("computed super member"));
+                    };
+                    return self.resolve_super_member(name);
+                }
                 let obj = self.eval(object)?;
                 if matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
                     if *optional {
@@ -6353,6 +6360,45 @@ impl<'a> Interp<'a> {
         Err(ExecError::Throw(
             self.new_str(&alloc::format!("super method {name} not found")),
         ))
+    }
+
+    /// `super.name` as a value read: a super getter is invoked (with the current
+    /// `this`); a super method is returned as a bound function.
+    fn resolve_super_member(&mut self, name: &str) -> Result<NanBox, ExecError> {
+        let home = self
+            .current_home
+            .ok_or(ExecError::Unsupported("super outside a method"))?;
+        let mut cur = self.resolve_super(
+            self.classes[home as usize],
+            &self.class_envs[home as usize].clone(),
+        )?;
+        while let Some((pid, penv)) = cur {
+            let class = self.classes[pid as usize];
+            for member in &class.body {
+                if let ClassMember::Method(m) = member
+                    && !m.is_static
+                    && matches!(m.kind, MethodKind::Method | MethodKind::Get)
+                    && static_key(&m.key).ok().as_deref() == Some(name)
+                {
+                    let saved = core::mem::replace(&mut self.current, penv.clone());
+                    let f = self.make_method(
+                        &m.value.params,
+                        Body::Block(&m.value.body),
+                        false,
+                        m.value.is_generator,
+                        Some(pid),
+                    );
+                    self.current = saved;
+                    return if m.kind == MethodKind::Get {
+                        self.call_with_this(f, self.this_val, &[])
+                    } else {
+                        Ok(f)
+                    };
+                }
+            }
+            cur = self.resolve_super(class, &penv)?;
+        }
+        Ok(NanBox::undefined())
     }
 
     /// `obj instanceof Ctor`: true when `obj` was constructed from `Ctor`'s
@@ -8619,6 +8665,24 @@ mod tests {
     // works) is covered by the `recursion-guard` Test262 corpus test, which runs
     // on a large stack; unit tests here run on the default ~2 MB thread stack,
     // too small for the deep recursion the guard permits.
+
+    #[test]
+    fn super_member_read() {
+        // super.getter (invoked) and super.method (returned then called).
+        assert_eq!(
+            run(
+                "class B{ constructor(){this._v=10;} get d(){return this._v*2;} m(){return this._v;} } class D extends B{ get d(){return super.d+1;} m(){return super.m()+5;} } let x=new D(); x.d + ':' + x.m()"
+            ),
+            "21:15"
+        );
+        // super property as a function value.
+        assert_eq!(
+            run(
+                "class A{ greet(){return 'A';} } class C extends A{ greet(){ let f=super.greet; return f.call(this)+'C'; } } new C().greet()"
+            ),
+            "AC"
+        );
+    }
 
     #[test]
     fn class_extends_native_error() {
