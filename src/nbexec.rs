@@ -4247,6 +4247,21 @@ impl<'a> Interp<'a> {
         Ok(None)
     }
 
+    /// ToPrimitive of an object/array for loose equality: an array becomes its
+    /// `join` string; a plain object uses the default-hint ToPrimitive.
+    fn coerce_for_eq(&mut self, v: NanBox) -> Result<NanBox, ExecError> {
+        if let Some(h) = v.as_handle().map(Handle::from_raw) {
+            if self.realm.is_array(h) {
+                let s = self.realm.to_display_string(v);
+                return Ok(self.new_str(&s));
+            }
+            if self.realm.object_keys(h).is_some() {
+                return self.coerce_primitive(v, "default");
+            }
+        }
+        Ok(v)
+    }
+
     /// ToPrimitive for a plain object with the given hint: `[Symbol.toPrimitive]`
     /// first, then `valueOf`/`toString` (order depends on the hint), accepting
     /// the first non-object result. Non-objects (and strings/arrays) pass through.
@@ -5296,6 +5311,32 @@ impl<'a> Interp<'a> {
                 self.coerce_primitive(a, hint)?,
                 self.coerce_primitive(b, hint)?,
             )
+        } else {
+            (a, b)
+        };
+        // `==`/`!=` between an object/array and a number/string primitive coerces
+        // the object side (arrays via their join; plain objects via ToPrimitive).
+        let (a, b) = if matches!(op, BinaryOp::EqEq | BinaryOp::NotEq) {
+            // True for a non-string heap value (object or array).
+            let obj = |this: &Self, v: NanBox| {
+                v.as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| this.realm.string_value(h).is_none())
+            };
+            // True for a number or string primitive.
+            let prim = |this: &Self, v: NanBox| {
+                v.as_number().is_some()
+                    || v.as_handle()
+                        .map(Handle::from_raw)
+                        .is_some_and(|h| this.realm.string_value(h).is_some())
+            };
+            if obj(self, a) && prim(self, b) {
+                (self.coerce_for_eq(a)?, b)
+            } else if obj(self, b) && prim(self, a) {
+                (a, self.coerce_for_eq(b)?)
+            } else {
+                (a, b)
+            }
         } else {
             (a, b)
         };
@@ -6970,6 +7011,17 @@ mod tests {
             run("let o={[Symbol.toPrimitive](){ return 9; }, valueOf(){ return 1; }}; o + 0"),
             "9"
         );
+    }
+
+    #[test]
+    fn loose_equality_object_coercion() {
+        assert_eq!(run("[] == 0"), "true");
+        assert_eq!(run("[1] == 1"), "true");
+        assert_eq!(run("[1,2] == '1,2'"), "true");
+        assert_eq!(run("({}) == ({})"), "false"); // distinct objects
+        assert_eq!(run("let o={valueOf(){return 5;}}; o == 5"), "true");
+        assert_eq!(run("'' == 0"), "true");
+        assert_eq!(run("null == 0"), "false");
     }
 
     #[test]
