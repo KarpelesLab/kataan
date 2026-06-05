@@ -5348,6 +5348,15 @@ impl<'a> Interp<'a> {
                     {
                         return Ok(result);
                     }
+                    // `obj[Symbol.iterator]()` → an iterator over the receiver.
+                    if let PropertyKey::Computed(e) = property {
+                        let key = self.eval(e)?;
+                        let iter_sym = self.well_known_symbol("iterator");
+                        if self.realm.strict_equals(key, iter_sym) {
+                            let vals = self.iterate_values(recv)?;
+                            return Ok(self.make_generator(vals));
+                        }
+                    }
                     // Not a built-in method: read the member and call it.
                     let Some(raw) = recv.as_handle() else {
                         if *call_optional {
@@ -8750,6 +8759,21 @@ mod tests {
             run("'hello'.includes('lo', 3) + ':' + 'hello'.includes('he', 1)"),
             "true:false"
         );
+    }
+
+    #[test]
+    fn explicit_symbol_iterator_call() {
+        assert_eq!(
+            run("let it=[10,20,30][Symbol.iterator](); it.next().value + ',' + it.next().value"),
+            "10,20"
+        );
+        assert_eq!(run("'abc'[Symbol.iterator]().next().value"), "a");
+        assert_eq!(
+            run("let m=new Map([['k','v']])[Symbol.iterator]().next().value; m[0] + '=' + m[1]"),
+            "k=v"
+        );
+        assert_eq!(run("new Set([1,2])[Symbol.iterator]().next().value"), "1");
+        assert_eq!(run("[...[1,2,3][Symbol.iterator]()].join(',')"), "1,2,3");
     }
 
     #[test]
