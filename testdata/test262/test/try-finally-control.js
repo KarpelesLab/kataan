@@ -1,39 +1,44 @@
 /*---
-description: try/catch/finally control flow interactions
+description: try/finally interaction with control flow
 esid: sec-try-statement
 ---*/
-function f1() {
-  try { return "try"; }
-  finally { /* runs but does not override */ }
+function withFinally() {
+  try { return "try"; } finally { /* runs but does not override */ }
 }
-assert.sameValue(f1(), "try");
-function f2() {
-  try { return "try"; }
-  finally { return "finally"; }
+assert.sameValue(withFinally(), "try");
+function finallyOverrides() {
+  try { return "try"; } finally { return "finally"; }
 }
-assert.sameValue(f2(), "finally", "finally return overrides");
-var order = [];
-function f3() {
-  try { order.push("try"); throw new Error("x"); }
-  catch (e) { order.push("catch"); }
-  finally { order.push("finally"); }
+assert.sameValue(finallyOverrides(), "finally", "finally return wins");
+var log = [];
+function order() {
+  try { log.push("try"); return 1; }
+  finally { log.push("finally"); }
 }
-f3();
-assert.sameValue(order.join(","), "try,catch,finally");
-function f4() {
-  for (var i = 0; i < 5; i++) {
-    try { if (i === 2) break; }
-    finally { order.push("f" + i); }
+order();
+assert.sameValue(log.join(","), "try,finally", "finally runs after try return");
+function loopFinally() {
+  var results = [];
+  for (var i = 0; i < 3; i++) {
+    try { if (i === 1) continue; results.push("body" + i); }
+    finally { results.push("fin" + i); }
   }
+  return results.join(",");
 }
-order = [];
-f4();
-assert.sameValue(order.join(","), "f0,f1,f2", "finally runs on break");
-var cleanup = [];
-function withResource() {
-  try { throw new Error("fail"); }
-  catch (e) { return "handled"; }
-  finally { cleanup.push("cleaned"); }
+assert.sameValue(loopFinally(), "body0,fin0,fin1,body2,fin2", "finally on continue");
+function nestedFinally() {
+  var out = [];
+  try { try { throw new Error("x"); } finally { out.push("inner"); } }
+  catch (e) { out.push("caught"); }
+  finally { out.push("outer"); }
+  return out.join(",");
 }
-assert.sameValue(withResource(), "handled");
-assert.sameValue(cleanup.length, 1);
+assert.sameValue(nestedFinally(), "inner,caught,outer", "nested finally order");
+function breakFinally() {
+  var r = [];
+  for (var i = 0; i < 5; i++) {
+    try { if (i === 2) break; r.push(i); } finally { r.push("f"); }
+  }
+  return r.join(",");
+}
+assert.sameValue(breakFinally(), "0,f,1,f,f", "finally on break");

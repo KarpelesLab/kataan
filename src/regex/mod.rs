@@ -8,13 +8,14 @@
 //!
 //! Supported today: literals, `.`, character classes `[...]` (ranges and the
 //! `\d \w \s` shorthands, negation), anchors `^ $`, word boundaries `\b \B`,
-//! capturing `( )` and non-capturing `(?: )` groups, alternation `|`, the
-//! quantifiers `* + ? {n} {n,} {n,m}` (greedy and lazy), and the `i`
-//! (case-insensitive), `m` (multiline), and `s` (dotall) flags. Positions are
-//! Unicode scalar (`char`) indices.
+//! capturing `( )`, non-capturing `(?: )` and named `(?<name> )` groups,
+//! alternation `|`, the quantifiers `* + ? {n} {n,} {n,m}` (greedy and lazy),
+//! backreferences `\1`, lookahead `(?= )`/`(?! )`, lookbehind `(?<= )`/`(?<! )`,
+//! and the `i` (case-insensitive), `m` (multiline), and `s` (dotall) flags.
+//! Positions are Unicode scalar (`char`) indices.
 //!
-//! Not yet: backreferences, lookaround, named groups, and the Unicode property
-//! escapes — these land as the engine matures (see `ROADMAP.md`).
+//! Not yet: the Unicode property escapes `\p{…}` and the `u`/`y` flag semantics —
+//! these land as the engine matures (see `ROADMAP.md`).
 
 mod compile;
 mod parser;

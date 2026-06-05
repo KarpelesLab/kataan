@@ -120,6 +120,23 @@ fn replace() {
 }
 
 #[test]
+fn lookaround_backref_named() {
+    // Lookahead / negative lookahead.
+    assert_eq!(re("foo(?=bar)", "").find_from("foobar", 0), Some((0, 3)));
+    assert!(!re("foo(?=bar)", "").is_match("foobaz"));
+    assert!(re("foo(?!bar)", "").is_match("foobaz"));
+    // Lookbehind / negative lookbehind.
+    assert_eq!(re("(?<=\\$)\\d+", "").find_from("$100", 0), Some((1, 4)));
+    assert!(re("(?<!\\$)\\d+", "").is_match("100"));
+    // Backreference.
+    assert!(re("(ab)\\1", "").is_match("abab"));
+    assert!(!re("(ab)\\1", "").is_match("abcd"));
+    // Named group exposes its index.
+    let r = re("(?<year>\\d{4})", "");
+    assert_eq!(r.group_names(), &[(1, alloc::string::String::from("year"))]);
+}
+
+#[test]
 fn errors() {
     assert!(Regex::new("(unterminated", "").is_err());
     assert!(Regex::new("[abc", "").is_err());
