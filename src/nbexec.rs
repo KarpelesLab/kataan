@@ -1849,12 +1849,13 @@ impl<'a> Interp<'a> {
     /// (accessor or data), or `None` if `key` is not an own property.
     fn build_descriptor(&mut self, obj: Handle, key: &str) -> Option<NanBox> {
         let t = NanBox::boolean(true);
+        let configurable = NanBox::boolean(!self.realm.property_is_non_configurable(obj, key));
         if let Some((g, s)) = self.realm.accessor(obj, key) {
             let d = self.realm.new_object();
             self.realm.set_property(d, "get", g);
             self.realm.set_property(d, "set", s);
             self.realm.set_property(d, "enumerable", t);
-            self.realm.set_property(d, "configurable", t);
+            self.realm.set_property(d, "configurable", configurable);
             Some(NanBox::handle(d.to_raw()))
         } else if self.realm.has_own(obj, key) {
             let v = self
@@ -1869,7 +1870,7 @@ impl<'a> Interp<'a> {
                 .set_property(d, "writable", NanBox::boolean(writable));
             self.realm
                 .set_property(d, "enumerable", NanBox::boolean(enumerable));
-            self.realm.set_property(d, "configurable", t);
+            self.realm.set_property(d, "configurable", configurable);
             Some(NanBox::handle(d.to_raw()))
         } else {
             None
@@ -8382,6 +8383,33 @@ mod tests {
         );
         // An own data property still assigns normally.
         assert_eq!(run("let o={a:1}; o.a=2; o.a"), "2");
+    }
+
+    #[test]
+    fn descriptor_reports_configurable() {
+        // defineProperty defaults to non-configurable.
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'x',{value:1}); Object.getOwnPropertyDescriptor(o,'x').configurable"
+            ),
+            "false"
+        );
+        // Explicit configurable: true is reported.
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'x',{value:1,configurable:true}); Object.getOwnPropertyDescriptor(o,'x').configurable"
+            ),
+            "true"
+        );
+        // A plain literal property is configurable; a frozen one is not.
+        assert_eq!(
+            run("Object.getOwnPropertyDescriptor({a:1},'a').configurable"),
+            "true"
+        );
+        assert_eq!(
+            run("Object.getOwnPropertyDescriptor(Object.freeze({a:1}),'a').configurable"),
+            "false"
+        );
     }
 
     #[test]

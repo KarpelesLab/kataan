@@ -743,6 +743,19 @@ impl Realm {
             .is_some_and(|o| o.is_frozen() || o.is_readonly(key))
     }
 
+    /// Whether own property `key` is non-configurable (frozen/sealed object, or
+    /// marked `configurable: false`).
+    #[must_use]
+    pub fn property_is_non_configurable(&self, handle: Handle, key: &str) -> bool {
+        if self.frozen_arrays.contains(&handle.to_raw()) {
+            return true;
+        }
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_object)
+            .is_some_and(|o| o.is_sealed() || o.is_non_configurable(key))
+    }
+
     /// Whether own property `key` is enumerable (not marked hidden).
     #[must_use]
     pub fn property_is_enumerable(&self, handle: Handle, key: &str) -> bool {
