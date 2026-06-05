@@ -528,6 +528,54 @@ impl<'a> Interp<'a> {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
         }
+        // `globalThis`: an object mirroring the global bindings, referencing
+        // itself. Reads like `globalThis.Math` and `globalThis.globalThis` work.
+        let global = self.realm.new_object();
+        for n in [
+            "Math",
+            "JSON",
+            "Object",
+            "Array",
+            "Reflect",
+            "String",
+            "Number",
+            "Boolean",
+            "parseInt",
+            "parseFloat",
+            "isNaN",
+            "isFinite",
+            "Map",
+            "Set",
+            "Symbol",
+            "BigInt",
+            "Proxy",
+            "WeakMap",
+            "WeakSet",
+            "WeakRef",
+            "FinalizationRegistry",
+            "Promise",
+            "Date",
+            "console",
+            "Error",
+            "TypeError",
+            "RangeError",
+            "SyntaxError",
+            "ReferenceError",
+            "AggregateError",
+        ] {
+            if let Some(v) = self.current.get(n) {
+                self.realm.set_property(global, n, v);
+            }
+        }
+        self.realm
+            .set_property(global, "NaN", NanBox::number(f64::NAN));
+        self.realm
+            .set_property(global, "Infinity", NanBox::number(f64::INFINITY));
+        self.realm
+            .set_property(global, "undefined", NanBox::undefined());
+        let gbox = NanBox::handle(global.to_raw());
+        self.realm.set_property(global, "globalThis", gbox);
+        self.current.declare("globalThis", gbox);
     }
 
     /// Invokes a built-in by id.
@@ -10074,6 +10122,17 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn global_this_object() {
+        assert_eq!(run("typeof globalThis"), "object");
+        assert_eq!(run("globalThis.globalThis === globalThis"), "true");
+        assert_eq!(run("globalThis.Math.max(1,2,3)"), "3");
+        assert_eq!(run("globalThis.parseInt('42px')"), "42");
+        assert_eq!(run("globalThis.Array.isArray([])"), "true");
+        assert_eq!(run("globalThis.Infinity"), "Infinity");
+        assert_eq!(run("globalThis.x = 7; globalThis.x"), "7");
     }
 
     #[test]
