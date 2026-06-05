@@ -3166,7 +3166,10 @@ impl<'a> Interp<'a> {
         self.class_statics.push(statics);
         self.class_static_get.push(static_getters);
         self.class_static_set.push(static_setters);
-        self.class_envs.push(self.current.clone());
+        // The methods' captured scope; a named class binds its own name here (so
+        // `class C { m() { return C; } }` can self-reference), filled in below.
+        let class_env = self.current.child();
+        self.class_envs.push(class_env.clone());
         // Record a native-constructor superclass (`extends Error`), if any, so
         // construction and `instanceof` can reach it (it has no class id).
         let native_super = if let Some(expr) = &class.super_class {
@@ -3182,8 +3185,14 @@ impl<'a> Interp<'a> {
             None
         };
         self.class_native_super.push(native_super);
-        let handle = self.realm.new_class(class_id, self.current.clone());
+        let handle = self.realm.new_class(class_id, class_env.clone());
         let class_val = NanBox::handle(handle.to_raw());
+        // Bind the class's own name in its methods' scope (a named class
+        // expression sees itself; the binding is read-only in spec but not
+        // enforced here).
+        if let Some(id) = &class.id {
+            class_env.declare(&id.name, class_val);
+        }
         // Run `static { … }` initialization blocks with `this` = the class and the
         // class name bound (so the block can reference the class and its statics).
         if class
@@ -7271,6 +7280,16 @@ impl<'a> Interp<'a> {
             };
             return Ok(self.new_str(&alloc::format!("bound {tname}")));
         }
+        // A class's `name` is its declared identifier (`class C {}` → `"C"`).
+        if name == "name"
+            && let Some((cid, _)) = self.realm.class_at(handle)
+        {
+            let cname = self.classes[cid as usize]
+                .id
+                .as_ref()
+                .map_or("", |i| &i.name);
+            return Ok(self.new_str(cname));
+        }
         // A function's `length` (params before a default/rest) and `name`.
         if matches!(name, "length" | "name")
             && let Some((func_id, _)) = self.realm.function_at(handle)
@@ -11297,6 +11316,35 @@ mod tests {
             )),
             "2,3,4"
         );
+    }
+
+    #[test]
+    fn labeled_block_and_class_name() {
+        // break out of a labeled block.
+        assert_eq!(
+            run(
+                "let r=[]; blk:{ r.push(1); if(true)break blk; r.push(2); } r.push(3); r.join(',')"
+            ),
+            "1,3"
+        );
+        assert_eq!(run("let h='no'; a:{ b:{ break a; } h='in'; } h"), "no");
+        // continue to a loop label still works.
+        assert_eq!(
+            run(
+                "let r=[]; outer: for(let i=0;i<3;i++){ for(let j=0;j<3;j++){ if(j===1)continue outer; r.push(i+','+j); } } r.join(';')"
+            ),
+            "0,0;1,0;2,0"
+        );
+        // Named class self-reference and `.name`.
+        assert_eq!(
+            run("let C=class Named{ who(){return Named===C;} }; new C().who()"),
+            "true"
+        );
+        assert_eq!(
+            run("let C=class Named{ n(){return Named.name;} }; new C().n()"),
+            "Named"
+        );
+        assert_eq!(run("class Declared{} Declared.name"), "Declared");
     }
 
     #[test]

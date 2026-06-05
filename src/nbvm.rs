@@ -3857,11 +3857,35 @@ impl Compiler {
             // A labeled loop: record the label against the loop's site index so
             // `break label` / `continue label` can target it.
             Stmt::Labeled { label, body, .. } => {
-                let idx = self.break_sites.len(); // the loop pushes its sites here
+                let is_loop = matches!(
+                    &**body,
+                    Stmt::While { .. }
+                        | Stmt::DoWhile { .. }
+                        | Stmt::For { .. }
+                        | Stmt::ForIn { .. }
+                        | Stmt::ForOf { .. }
+                );
+                let idx = self.break_sites.len();
                 self.labels.push((String::from(&*label.name), idx));
-                let r = self.stmt(body);
-                self.labels.pop();
-                r
+                if is_loop {
+                    // The labeled loop pushes its own break/continue sites at `idx`.
+                    let r = self.stmt(body);
+                    self.labels.pop();
+                    r
+                } else {
+                    // A labeled non-loop (e.g. a block): give the label its own
+                    // break target so `break label` jumps past the body.
+                    self.break_sites.push(Vec::new());
+                    self.continue_sites.push(Vec::new());
+                    let r = self.stmt(body);
+                    self.labels.pop();
+                    let end = self.ops.len();
+                    for b in self.break_sites.pop().unwrap_or_default() {
+                        self.patch_to(b, end);
+                    }
+                    self.continue_sites.pop();
+                    r
+                }
             }
             Stmt::While { test, body, .. } => {
                 let top = self.ops.len();
