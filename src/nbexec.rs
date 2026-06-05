@@ -252,6 +252,13 @@ const N_IS_NAN: u16 = 32;
 const N_IS_FINITE: u16 = 33;
 // Error constructors (id − N_ERROR_BASE indexes ERROR_NAMES).
 const N_ERROR_BASE: u16 = 40;
+/// Abbreviated weekday names (index 0 = Sunday), for `Date` string methods.
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+/// Abbreviated month names (index 0 = January).
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 const ERROR_NAMES: [&str; 6] = [
     "Error",
     "TypeError",
@@ -3529,6 +3536,32 @@ impl<'a> Interp<'a> {
                 // The engine models all dates in UTC, so the local offset is 0.
                 "getTimezoneOffset" => NanBox::number(0.0),
                 "toISOString" | "toJSON" => self.new_str(&crate::realm::date_to_iso(ms)),
+                // Human-readable forms (the engine is UTC, so `GMT+0000`).
+                "toDateString" | "toTimeString" | "toString" | "toUTCString"
+                | "toLocaleDateString" | "toLocaleTimeString" | "toLocaleString" => {
+                    let wd = WEEKDAYS[((day.rem_euclid(7) + 4).rem_euclid(7)) as usize];
+                    let mn = MONTHS[(mo - 1) as usize];
+                    let (hh, mi, ss) = (tod / 3_600_000, tod / 60_000 % 60, tod / 1000 % 60);
+                    let date_str = alloc::format!("{wd} {mn} {d:02} {y}");
+                    let time_str = alloc::format!(
+                        "{hh:02}:{mi:02}:{ss:02} GMT+0000 (Coordinated Universal Time)"
+                    );
+                    let s = match method {
+                        "toDateString" => date_str,
+                        "toTimeString" => time_str,
+                        "toUTCString" => {
+                            alloc::format!("{wd}, {d:02} {mn} {y} {hh:02}:{mi:02}:{ss:02} GMT")
+                        }
+                        "toLocaleDateString" => alloc::format!("{mo}/{d}/{y}"),
+                        "toLocaleTimeString" => alloc::format!("{hh:02}:{mi:02}:{ss:02}"),
+                        "toLocaleString" => {
+                            alloc::format!("{mo}/{d}/{y}, {hh:02}:{mi:02}:{ss:02}")
+                        }
+                        // `toString`
+                        _ => alloc::format!("{date_str} {time_str}"),
+                    };
+                    self.new_str(&s)
+                }
                 // --- `set*` mutators (all UTC; a setter returns the new time) ---
                 "setTime" => {
                     let nms = self.realm.to_number(arg(0));
@@ -10378,6 +10411,27 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn date_string_methods() {
+        assert_eq!(run("new Date(0).toDateString()"), "Thu Jan 01 1970");
+        assert_eq!(
+            run("new Date(0).toUTCString()"),
+            "Thu, 01 Jan 1970 00:00:00 GMT"
+        );
+        assert_eq!(
+            run("new Date(Date.UTC(2020,5,15,10,30,45)).toLocaleString()"),
+            "6/15/2020, 10:30:45"
+        );
+        assert_eq!(
+            run("new Date(Date.UTC(2020,5,15)).toLocaleDateString()"),
+            "6/15/2020"
+        );
+        assert_eq!(
+            run("new Date(Date.UTC(2021,11,25)).toDateString()"),
+            "Sat Dec 25 2021"
+        );
     }
 
     #[test]
