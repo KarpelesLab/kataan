@@ -672,6 +672,14 @@ impl Realm {
         }
     }
 
+    /// Removes any accessor for `key` on `handle` (so a redefined data property
+    /// takes precedence over a former getter/setter).
+    pub fn clear_accessor(&mut self, handle: Handle, key: &str) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.clear_accessor(key);
+        }
+    }
+
     /// The `(getter, setter)` of accessor `key` on `handle`, if defined.
     #[must_use]
     pub fn accessor(&self, handle: Handle, key: &str) -> Option<(NanBox, NanBox)> {

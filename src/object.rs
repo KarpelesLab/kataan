@@ -280,6 +280,12 @@ impl Object {
         self.frozen
     }
 
+    /// Removes any accessor (getter/setter) for `key`, leaving data properties
+    /// intact — used when a `defineProperty` replaces an accessor with data.
+    pub fn clear_accessor(&mut self, key: &str) {
+        self.accessors.retain(|(k, _, _)| k.as_ref() != key);
+    }
+
     /// Deletes own property `key`, rebuilding the shape/slots from `root` without
     /// it (also drops a same-named accessor). Returns whether anything was
     /// removed.

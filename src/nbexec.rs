@@ -1773,6 +1773,8 @@ impl<'a> Interp<'a> {
                 self.realm.mark_hidden(obj, key);
             }
         } else {
+            // Redefining as a data property removes any prior accessor.
+            self.realm.clear_accessor(obj, key);
             let value = self
                 .realm
                 .get_property(desc, "value")
@@ -8007,6 +8009,24 @@ mod tests {
         // Array toString joins with comma.
         assert_eq!(run("['a','b','c'].toString()"), "a,b,c");
         assert_eq!(run("[1,[2,3],4].toString()"), "1,2,3,4");
+    }
+
+    #[test]
+    fn redefine_accessor_as_data() {
+        // Accessor → accessor.
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'x',{get(){return 1;},configurable:true}); Object.defineProperty(o,'x',{get(){return 2;},configurable:true}); o.x"
+            ),
+            "2"
+        );
+        // Accessor → data property (the old getter must no longer apply).
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'x',{get(){return 1;},configurable:true}); Object.defineProperty(o,'x',{value:42,configurable:true}); o.x"
+            ),
+            "42"
+        );
     }
 
     #[test]
