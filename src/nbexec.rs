@@ -6505,9 +6505,12 @@ impl<'a> Interp<'a> {
                     .map(Handle::from_raw)
                     .is_some_and(|h| this.realm.string_value(h).is_none())
             };
-            // True for a number or string primitive.
+            // True for a number, boolean, or string primitive — the operands
+            // against which an object is converted with ToPrimitive (a boolean is
+            // first coerced to a number per the `==` algorithm).
             let prim = |this: &Self, v: NanBox| {
                 v.as_number().is_some()
+                    || matches!(v.unpack(), crate::nanbox::Unpacked::Bool(_))
                     || v.as_handle()
                         .map(Handle::from_raw)
                         .is_some_and(|h| this.realm.string_value(h).is_some())
@@ -9219,6 +9222,16 @@ mod tests {
             run("'hello'.includes('lo', 3) + ':' + 'hello'.includes('he', 1)"),
             "true:false"
         );
+    }
+
+    #[test]
+    fn loose_eq_object_coercion() {
+        assert_eq!(run("String([] == false)"), "true"); // []→""→0, false→0
+        assert_eq!(run("String([] == 0)"), "true");
+        assert_eq!(run("String([0] == false)"), "true"); // [0]→"0"→0
+        assert_eq!(run("String({} == 0)"), "false"); // "[object Object]"→NaN
+        assert_eq!(run("String({} == {})"), "false"); // distinct objects
+        assert_eq!(run("String([1,2] == '1,2')"), "true");
     }
 
     #[test]

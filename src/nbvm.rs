@@ -513,6 +513,34 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
 }
 
 /// Builds an error value `{ name, message }` in the realm (for runtime throws).
+/// For `==`/`!=`: when exactly one operand is a non-string object reference and
+/// the other is a primitive (number/boolean/string), convert the object to its
+/// ToPrimitive (toString) form so e.g. `[] == 0` compares as `"" == 0`. Two
+/// objects (compared by identity) and two primitives are left untouched.
+fn loose_eq_coerce(realm: &mut Realm, x: NanBox, y: NanBox) -> (NanBox, NanBox) {
+    let is_obj = |realm: &Realm, v: NanBox| {
+        v.as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| realm.string_value(h).is_none())
+    };
+    let is_prim = |realm: &Realm, v: NanBox| {
+        v.as_number().is_some()
+            || matches!(v.unpack(), crate::nanbox::Unpacked::Bool(_))
+            || v.as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|h| realm.string_value(h).is_some())
+    };
+    if is_obj(realm, x) && is_prim(realm, y) {
+        let s = realm.to_display_string(x);
+        (NanBox::handle(realm.new_string(&s).to_raw()), y)
+    } else if is_obj(realm, y) && is_prim(realm, x) {
+        let s = realm.to_display_string(y);
+        (x, NanBox::handle(realm.new_string(&s).to_raw()))
+    } else {
+        (x, y)
+    }
+}
+
 fn make_error(realm: &mut Realm, name: &str, message: &str) -> NanBox {
     let obj = realm.new_object();
     let n = NanBox::handle(realm.new_string(name).to_raw());
@@ -877,8 +905,13 @@ fn run_frame(
             Op::ValueBin { dst, op, a, b } => {
                 let (x, y) = (regs[*a as usize], regs[*b as usize]);
                 regs[*dst as usize] = match *op {
-                    VB_LOOSE_EQ => NanBox::boolean(ctx.realm.loose_equals(x, y)),
-                    VB_LOOSE_NEQ => NanBox::boolean(!ctx.realm.loose_equals(x, y)),
+                    VB_LOOSE_EQ | VB_LOOSE_NEQ => {
+                        // `obj == primitive` converts the object with ToPrimitive
+                        // (toString) before comparing, so e.g. `[] == 0` is true.
+                        let (xc, yc) = loose_eq_coerce(ctx.realm, x, y);
+                        let r = ctx.realm.loose_equals(xc, yc);
+                        NanBox::boolean(if *op == VB_LOOSE_EQ { r } else { !r })
+                    }
                     // `**` and bitwise need the realm's `std`-gated math.
                     #[cfg(feature = "std")]
                     VB_POW => ctx.realm.pow(x, y),
@@ -5043,6 +5076,15 @@ mod tests {
         let mut realm = Realm::new();
         let value = compile_and_run(&mut realm, &program).expect("compile+run");
         realm.to_display_string(value)
+    }
+
+    #[test]
+    fn bytecode_loose_eq_object_coercion() {
+        assert_eq!(bc("String([] == false)"), "true");
+        assert_eq!(bc("String([] == 0)"), "true");
+        assert_eq!(bc("String({} == 0)"), "false");
+        assert_eq!(bc("String({} == {})"), "false");
+        assert_eq!(bc("String([1,2] == '1,2')"), "true");
     }
 
     #[test]
