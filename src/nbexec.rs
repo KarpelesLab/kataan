@@ -216,6 +216,8 @@ const N_DECODE_URI_COMPONENT: u16 = 160;
 const N_ENCODE_URI: u16 = 161;
 const N_DECODE_URI: u16 = 162;
 const N_STRUCTURED_CLONE: u16 = 163;
+const N_BTOA: u16 = 164;
+const N_ATOB: u16 = 165;
 const N_OBJECT_CREATE: u16 = 107;
 const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
@@ -534,6 +536,8 @@ impl<'a> Interp<'a> {
             ("encodeURI", N_ENCODE_URI),
             ("decodeURI", N_DECODE_URI),
             ("structuredClone", N_STRUCTURED_CLONE),
+            ("btoa", N_BTOA),
+            ("atob", N_ATOB),
         ] {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -577,6 +581,8 @@ impl<'a> Interp<'a> {
             "encodeURI",
             "decodeURI",
             "structuredClone",
+            "btoa",
+            "atob",
         ] {
             if let Some(v) = self.current.get(n) {
                 self.realm.set_property(global, n, v);
@@ -1339,6 +1345,35 @@ impl<'a> Interp<'a> {
             N_STRUCTURED_CLONE => {
                 let mut seen: Vec<(u64, NanBox)> = Vec::new();
                 self.structured_clone(arg(0), &mut seen)?
+            }
+            // `btoa(s)`: each code unit must be a byte (0–255) → base64.
+            N_BTOA => {
+                let s = self.realm.to_display_string(arg(0));
+                let mut bytes = Vec::with_capacity(s.chars().count());
+                for ch in s.chars() {
+                    if (ch as u32) > 0xff {
+                        let m = self.new_str("string contains a non-Latin1 character");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    bytes.push(ch as u8);
+                }
+                let h = self.realm.new_string(&base64_encode(&bytes));
+                NanBox::handle(h.to_raw())
+            }
+            // `atob(s)`: base64 → a string of bytes (each a code unit 0–255).
+            N_ATOB => {
+                let s = self.realm.to_display_string(arg(0));
+                match base64_decode(&s) {
+                    Some(bytes) => {
+                        let decoded: String = bytes.iter().map(|b| *b as char).collect();
+                        let h = self.realm.new_string(&decoded);
+                        NanBox::handle(h.to_raw())
+                    }
+                    None => {
+                        let m = self.new_str("invalid base64");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                }
             }
             N_IS_NAN => NanBox::boolean(self.realm.to_number(arg(0)).is_nan()),
             N_IS_FINITE => NanBox::boolean(self.realm.to_number(arg(0)).is_finite()),
@@ -7761,6 +7796,71 @@ fn int_to_radix(n: f64, radix: u32) -> String {
 
 /// Parses the longest leading decimal-float prefix of `s` (à la `parseFloat`),
 /// returning `NaN` if none.
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encodes `bytes` to a standard (`+`/`/`, `=`-padded) base64 string.
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_ALPHABET[(n >> 18 & 0x3f) as usize] as char);
+        out.push(B64_ALPHABET[(n >> 12 & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            B64_ALPHABET[(n >> 6 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decodes a base64 string (ASCII whitespace ignored), returning `None` on an
+/// invalid character or length.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let cleaned: Vec<u8> = s
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    let mut out = Vec::with_capacity(cleaned.len() / 4 * 3);
+    for chunk in cleaned.chunks(4) {
+        if chunk.len() < 2 {
+            return None;
+        }
+        let mut n = 0u32;
+        for &c in chunk {
+            n = (n << 6) | val(c)?;
+        }
+        // Left-align the partial group, then take the available bytes.
+        n <<= 6 * (4 - chunk.len());
+        out.push((n >> 16 & 0xff) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8 & 0xff) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push((n & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Percent-encodes `s`. The unreserved set (`A-Za-z0-9-_.!~*'()`) is always kept;
 /// `extra` adds characters preserved by `encodeURI` (the URI reserved set).
 fn uri_encode(s: &str, extra: &str) -> String {
@@ -10278,6 +10378,22 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn base64_btoa_atob() {
+        assert_eq!(run("btoa('hi')"), "aGk=");
+        assert_eq!(run("btoa('Man')"), "TWFu");
+        assert_eq!(run("btoa('M')"), "TQ==");
+        assert_eq!(run("btoa('')"), "");
+        assert_eq!(run("atob('aGVsbG8=')"), "hello");
+        assert_eq!(run("atob(btoa('round trip!'))"), "round trip!");
+        assert_eq!(run("btoa('é')"), "6Q==");
+        assert_eq!(run("atob('aG k=')"), "hi"); // whitespace ignored
+        assert_eq!(
+            run("try{btoa('\\u{1F600}');'no'}catch(e){e instanceof TypeError}"),
+            "true"
+        );
     }
 
     #[test]
