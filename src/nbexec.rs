@@ -2241,6 +2241,33 @@ impl<'a> Interp<'a> {
 
     /// Runs one class's field initializers and constructor on `instance` (with
     /// `this` already bound). `super(args)` reaches the base via `pending_super`.
+    /// Applies a class's own (non-static) instance field initializers to
+    /// `instance`. Run before the constructor body (base class) / after the
+    /// implicit super for a constructor-less derived class.
+    fn init_instance_fields(&mut self, class_id: u32, instance: Handle) -> Result<(), ExecError> {
+        let class = self.classes[class_id as usize];
+        for member in &class.body {
+            if let ClassMember::Field(field) = member
+                && !field.is_static
+            {
+                // A computed field name (`[expr] = v`) is evaluated here.
+                let key = match &field.key {
+                    PropertyKey::Computed(e) => {
+                        let k = self.eval(e)?;
+                        self.member_key(k)
+                    }
+                    other => static_key(other)?,
+                };
+                let v = match &field.value {
+                    Some(e) => self.eval(e)?,
+                    None => NanBox::undefined(),
+                };
+                self.realm.set_property(instance, &key, v);
+            }
+        }
+        Ok(())
+    }
+
     fn run_constructor(
         &mut self,
         class_id: u32,
@@ -2259,6 +2286,9 @@ impl<'a> Interp<'a> {
             });
             match (ctor, &parent) {
                 (Some(ctor), _) => {
+                    // Own fields initialize before the constructor body, so a
+                    // constructor write isn't clobbered by a later field decl.
+                    self.init_instance_fields(class_id, instance)?;
                     let scope = self.current.child();
                     let saved = core::mem::replace(&mut self.current, scope);
                     let r = (|| {
@@ -2288,23 +2318,14 @@ impl<'a> Interp<'a> {
                     self.current = saved;
                     r?;
                 }
-                // No own constructor but a base: implicit `super(args)`.
+                // No own constructor but a base: implicit `super(args)`, then
+                // this class's own field initializers.
                 (None, Some((pid, penv))) => {
                     self.run_constructor(*pid, &penv.clone(), instance, args)?;
+                    self.init_instance_fields(class_id, instance)?;
                 }
-                (None, None) => {}
-            }
-            // Field initializers (after the constructor body / super).
-            for member in &class.body {
-                if let ClassMember::Field(field) = member
-                    && !field.is_static
-                {
-                    let key = static_key(&field.key)?;
-                    let v = match &field.value {
-                        Some(e) => self.eval(e)?,
-                        None => NanBox::undefined(),
-                    };
-                    self.realm.set_property(instance, &key, v);
+                (None, None) => {
+                    self.init_instance_fields(class_id, instance)?;
                 }
             }
             Ok(())
@@ -7905,6 +7926,26 @@ mod tests {
             run("let o = { v: 7, m: function(){ return (() => (() => this.v)())(); } }; o.m()"),
             "7"
         );
+    }
+
+    #[test]
+    fn class_field_init_order_and_computed_fields() {
+        // A field declared without an initializer must not clobber a constructor
+        // write (fields init before the constructor body).
+        assert_eq!(
+            run(
+                "class A{ #b; constructor(v){ this.#b=v; } get b(){ return this.#b; } } new A(100).b"
+            ),
+            "100"
+        );
+        assert_eq!(
+            run(
+                "class A{ #b; constructor(v){ this.#b=v; } add(n){ this.#b+=n; return this.#b; } } let a=new A(100); a.add(50)"
+            ),
+            "150"
+        );
+        // Computed instance field names.
+        assert_eq!(run("let k='x'; class C{ [k+'1']=7; } new C().x1"), "7");
     }
 
     #[test]
