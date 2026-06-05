@@ -9999,6 +9999,27 @@ mod tests {
     }
 
     #[test]
+    fn object_literal_generator_methods() {
+        assert_eq!(
+            run("let o={ *g(){yield 1;yield 2;} }; [...o.g()].join(',')"),
+            "1,2"
+        );
+        assert_eq!(
+            run("let o={ *[Symbol.iterator](){yield 'a';yield 'b';} }; [...o].join(',')"),
+            "a,b"
+        );
+        assert_eq!(
+            run("let k='m'; let o={ *[k](){yield 9;} }; [...o.m()].join(',')"),
+            "9"
+        );
+        // The generator method reads `this`.
+        assert_eq!(
+            run("let o={ v:5, *items(){yield this.v;yield this.v*2;} }; [...o.items()].join(',')"),
+            "5,10"
+        );
+    }
+
+    #[test]
     fn class_symbol_iterator_method() {
         assert_eq!(
             run("class C{ *[Symbol.iterator](){yield 'x';yield 'y';} } [...new C()].join(',')"),

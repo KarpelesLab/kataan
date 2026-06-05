@@ -839,6 +839,19 @@ impl<'src> Parser<'src> {
             });
         }
 
+        // `*key() { … }` / `*[expr]() { … }` — a generator method.
+        if self.at(TokenKind::Star) {
+            self.bump();
+            let key = self.parse_class_key()?;
+            let func = self.parse_method_tail(false, true)?;
+            return Ok(ObjectMember::Property {
+                key,
+                value: Box::new(Expr::Function(func)),
+                shorthand: false,
+                span: start.to(self.prev_span()),
+            });
+        }
+
         // `get key() { … }` / `set key(v) { … }` — accessors. (When `get`/`set`
         // is directly followed by `(`, `:`, or a member terminator it is an
         // ordinary property/method *named* `get`/`set` instead.)
