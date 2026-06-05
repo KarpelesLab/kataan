@@ -45,6 +45,10 @@ pub struct Realm {
     incremental: Option<gc::IncrementalMarker>,
     /// Monotonic counter giving each `Symbol` a unique identity.
     next_symbol_id: u64,
+    /// Maps a symbol's id back to its heap handle, so a symbol used as a property
+    /// key (stored as `\0sym:{id}`) can be recovered (e.g. by
+    /// `Object.getOwnPropertySymbols`).
+    symbols_by_id: alloc::collections::BTreeMap<u64, Handle>,
     /// Lazily-created `.prototype` objects for constructor functions, keyed by
     /// the closure's function id. (Keyed by id, not handle, so it survives a
     /// moving collection; distinct closures sharing an id share a prototype — a
@@ -77,6 +81,7 @@ impl Realm {
             atoms: AtomTable::new(),
             incremental: None,
             next_symbol_id: 1,
+            symbols_by_id: alloc::collections::BTreeMap::new(),
             fn_protos: alloc::collections::BTreeMap::new(),
             aux_props: alloc::collections::BTreeMap::new(),
             frozen_arrays: alloc::collections::BTreeSet::new(),
@@ -124,10 +129,18 @@ impl Realm {
     pub fn new_symbol(&mut self, description: &str) -> Handle {
         let id = self.next_symbol_id;
         self.next_symbol_id += 1;
-        self.heap.alloc(Cell::Symbol {
+        let handle = self.heap.alloc(Cell::Symbol {
             description: alloc::boxed::Box::from(description),
             id,
-        })
+        });
+        self.symbols_by_id.insert(id, handle);
+        handle
+    }
+
+    /// The heap handle of the symbol with the given `id`, if known.
+    #[must_use]
+    pub fn symbol_for_id(&self, id: u64) -> Option<Handle> {
+        self.symbols_by_id.get(&id).copied()
     }
 
     /// The `(description, id)` of the symbol at `handle`, if it is one.

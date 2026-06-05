@@ -207,6 +207,7 @@ const N_OBJECT_IS_SEALED: u16 = 126;
 const N_OBJECT_PREVENT_EXT: u16 = 127;
 const N_OBJECT_IS_EXTENSIBLE: u16 = 128;
 const N_OBJECT_GET_OWN_NAMES: u16 = 37;
+const N_OBJECT_GET_OWN_SYMBOLS: u16 = 158;
 const N_OBJECT_CREATE: u16 = 107;
 const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
@@ -464,6 +465,7 @@ impl<'a> Interp<'a> {
                 ("preventExtensions", N_OBJECT_PREVENT_EXT),
                 ("isExtensible", N_OBJECT_IS_EXTENSIBLE),
                 ("getOwnPropertyNames", N_OBJECT_GET_OWN_NAMES),
+                ("getOwnPropertySymbols", N_OBJECT_GET_OWN_SYMBOLS),
                 ("create", N_OBJECT_CREATE),
                 ("getPrototypeOf", N_OBJECT_GET_PROTO),
                 ("setPrototypeOf", N_OBJECT_SET_PROTO),
@@ -885,11 +887,23 @@ impl<'a> Interp<'a> {
                 NanBox::boolean(true)
             }
             N_REFLECT_OWN_KEYS => {
-                let names = arg(0)
-                    .as_handle()
-                    .and_then(|raw| self.realm.own_property_names(Handle::from_raw(raw)))
-                    .unwrap_or_default();
-                let boxed: Vec<NanBox> = names.iter().map(|k| self.new_str(k)).collect();
+                // String keys (integer-indexed then insertion order), then own
+                // symbol keys — matching `[[OwnPropertyKeys]]`.
+                let mut boxed = Vec::new();
+                if let Some(raw) = arg(0).as_handle() {
+                    let h = Handle::from_raw(raw);
+                    for k in self.realm.own_property_names(h).unwrap_or_default() {
+                        boxed.push(self.new_str(&k));
+                    }
+                    for k in self.realm.object_keys_with_symbols(h) {
+                        if let Some(idstr) = k.strip_prefix("\u{0}sym:")
+                            && let Ok(id) = idstr.parse::<u64>()
+                            && let Some(sh) = self.realm.symbol_for_id(id)
+                        {
+                            boxed.push(NanBox::handle(sh.to_raw()));
+                        }
+                    }
+                }
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
             // `Reflect.defineProperty(obj, key, desc)` → bool.
@@ -976,6 +990,23 @@ impl<'a> Interp<'a> {
                     .unwrap_or_default();
                 let boxed: Vec<NanBox> = names.iter().map(|k| self.new_str(k)).collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
+            }
+            // `Object.getOwnPropertySymbols(obj)` — the own symbol-keyed
+            // properties (recovered from their `\0sym:{id}` internal names).
+            N_OBJECT_GET_OWN_SYMBOLS => {
+                let mut syms = Vec::new();
+                if let Some(raw) = arg(0).as_handle() {
+                    let h = Handle::from_raw(raw);
+                    for k in self.realm.object_keys_with_symbols(h) {
+                        if let Some(idstr) = k.strip_prefix("\u{0}sym:")
+                            && let Ok(id) = idstr.parse::<u64>()
+                            && let Some(sh) = self.realm.symbol_for_id(id)
+                        {
+                            syms.push(NanBox::handle(sh.to_raw()));
+                        }
+                    }
+                }
+                NanBox::handle(self.realm.new_array(syms).to_raw())
             }
             N_OBJECT_VALUES => {
                 let mut vals = Vec::new();
@@ -8371,6 +8402,24 @@ mod tests {
         assert_eq!(
             run("'abc'.isWellFormed() + ':' + '\u{1f600}'.toWellFormed()"),
             "true:\u{1f600}"
+        );
+    }
+
+    #[test]
+    fn get_own_property_symbols_and_reflect_ownkeys() {
+        assert_eq!(
+            run(
+                "let s=Symbol('k'); let o={a:1}; o[s]=2; let g=Object.getOwnPropertySymbols(o); g.length + ':' + (g[0]===s) + ':' + o[g[0]]"
+            ),
+            "1:true:2"
+        );
+        assert_eq!(run("Object.getOwnPropertySymbols({}).length"), "0");
+        // Reflect.ownKeys: string keys then symbol keys.
+        assert_eq!(
+            run(
+                "let s=Symbol('k'); let o={a:1,b:2}; o[s]=3; let k=Reflect.ownKeys(o); k.length + ':' + k[0] + ':' + (k[2]===s)"
+            ),
+            "3:a:true"
         );
     }
 
