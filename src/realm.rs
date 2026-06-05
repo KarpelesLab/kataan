@@ -237,14 +237,22 @@ impl Realm {
         })
     }
 
+    /// `SameValueZero(a, b)` — the key equality `Map`/`Set` use: strict equality,
+    /// except `NaN` equals `NaN` (`+0`/`-0` already compare equal under `===`).
+    #[must_use]
+    pub fn same_value_zero(&self, a: NanBox, b: NanBox) -> bool {
+        self.strict_equals(a, b)
+            || (a.as_number().is_some_and(f64::is_nan) && b.as_number().is_some_and(f64::is_nan))
+    }
+
     /// Sets `key → value` in the collection at `handle` (inserting or updating,
-    /// by strict-equality key match). Returns `false` if not a collection.
+    /// by `SameValueZero` key match). Returns `false` if not a collection.
     pub fn collection_set(&mut self, handle: Handle, key: NanBox, value: NanBox) -> bool {
-        // Find an existing key first (immutable strict_equals borrow), then write.
+        // Find an existing key first (immutable borrow), then write.
         let pos = match self.heap.get(handle).and_then(Cell::as_collection) {
             Some((_, entries)) => entries
                 .iter()
-                .position(|(k, _)| self.strict_equals(*k, key)),
+                .position(|(k, _)| self.same_value_zero(*k, key)),
             None => return false,
         };
         let Some((_, entries)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut) else {
@@ -266,7 +274,7 @@ impl Realm {
         let (_, entries) = self.heap.get(handle)?.as_collection()?;
         entries
             .iter()
-            .find(|(k, _)| self.strict_equals(*k, key))
+            .find(|(k, _)| self.same_value_zero(*k, key))
             .map(|(_, v)| *v)
     }
 
@@ -276,7 +284,7 @@ impl Realm {
         self.heap
             .get(handle)
             .and_then(Cell::as_collection)
-            .is_some_and(|(_, e)| e.iter().any(|(k, _)| self.strict_equals(*k, key)))
+            .is_some_and(|(_, e)| e.iter().any(|(k, _)| self.same_value_zero(*k, key)))
     }
 
     /// Removes `key`; returns whether it was present.
@@ -291,7 +299,7 @@ impl Realm {
     /// whether one was present.
     pub fn collection_delete(&mut self, handle: Handle, key: NanBox) -> bool {
         let pos = match self.heap.get(handle).and_then(Cell::as_collection) {
-            Some((_, e)) => e.iter().position(|(k, _)| self.strict_equals(*k, key)),
+            Some((_, e)) => e.iter().position(|(k, _)| self.same_value_zero(*k, key)),
             None => return false,
         };
         if let Some(i) = pos

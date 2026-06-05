@@ -4677,6 +4677,88 @@ impl<'a> Interp<'a> {
                         .collect();
                     return Ok(Some(NanBox::handle(self.realm.new_array(arr).to_raw())));
                 }
+                // ES2025 Set composition. The argument is treated as a set-like
+                // (any iterable supplies its elements).
+                "union"
+                | "intersection"
+                | "difference"
+                | "symmetricDifference"
+                | "isSubsetOf"
+                | "isSupersetOf"
+                | "isDisjointFrom"
+                    if self.realm.collection_is_set(handle) == Some(true) =>
+                {
+                    let mine: Vec<NanBox> = self
+                        .realm
+                        .collection_entries(handle)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .collect();
+                    let other = self.iterate_values(arg(0))?;
+                    let in_other = |this: &Self, v: NanBox| {
+                        other.iter().any(|o| this.realm.same_value_zero(*o, v))
+                    };
+                    let in_mine = |this: &Self, v: NanBox| {
+                        mine.iter().any(|m| this.realm.same_value_zero(*m, v))
+                    };
+                    // Predicate methods return a boolean.
+                    match method {
+                        "isSubsetOf" => {
+                            return Ok(Some(NanBox::boolean(
+                                mine.iter().all(|m| in_other(self, *m)),
+                            )));
+                        }
+                        "isSupersetOf" => {
+                            return Ok(Some(NanBox::boolean(
+                                other.iter().all(|o| in_mine(self, *o)),
+                            )));
+                        }
+                        "isDisjointFrom" => {
+                            return Ok(Some(NanBox::boolean(
+                                !mine.iter().any(|m| in_other(self, *m)),
+                            )));
+                        }
+                        _ => {}
+                    }
+                    // The rest build a new Set.
+                    let result = self.realm.new_collection(true);
+                    match method {
+                        "union" => {
+                            for e in mine.iter().chain(other.iter()) {
+                                self.realm.collection_set(result, *e, *e);
+                            }
+                        }
+                        "intersection" => {
+                            for e in &mine {
+                                if in_other(self, *e) {
+                                    self.realm.collection_set(result, *e, *e);
+                                }
+                            }
+                        }
+                        "difference" => {
+                            for e in &mine {
+                                if !in_other(self, *e) {
+                                    self.realm.collection_set(result, *e, *e);
+                                }
+                            }
+                        }
+                        // symmetricDifference: in exactly one of the two.
+                        _ => {
+                            for e in &mine {
+                                if !in_other(self, *e) {
+                                    self.realm.collection_set(result, *e, *e);
+                                }
+                            }
+                            for e in &other {
+                                if !in_mine(self, *e) {
+                                    self.realm.collection_set(result, *e, *e);
+                                }
+                            }
+                        }
+                    }
+                    return Ok(Some(NanBox::handle(result.to_raw())));
+                }
                 _ => {
                     let _ = size;
                 }
@@ -9992,6 +10074,39 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn map_set_samevaluezero_and_set_ops() {
+        // SameValueZero key matching.
+        assert_eq!(run("let m=new Map(); m.set(NaN,'y'); m.get(NaN)"), "y");
+        assert_eq!(run("new Set([NaN,NaN,1]).size"), "2");
+        assert_eq!(run("let m=new Map(); m.set(-0,'n'); m.get(0)"), "n");
+        // ES2025 Set composition.
+        assert_eq!(
+            run("[...new Set([1,2,3]).union(new Set([3,4]))].join(',')"),
+            "1,2,3,4"
+        );
+        assert_eq!(
+            run("[...new Set([1,2,3]).intersection(new Set([2,3,4]))].join(',')"),
+            "2,3"
+        );
+        assert_eq!(
+            run("[...new Set([1,2,3]).difference(new Set([2]))].join(',')"),
+            "1,3"
+        );
+        assert_eq!(
+            run("[...new Set([1,2]).symmetricDifference(new Set([2,3]))].join(',')"),
+            "1,3"
+        );
+        assert_eq!(run("new Set([1,2]).isSubsetOf(new Set([1,2,3]))"), "true");
+        assert_eq!(run("new Set([1,2,3]).isSupersetOf(new Set([1,2]))"), "true");
+        assert_eq!(run("new Set([1,2]).isDisjointFrom(new Set([3,4]))"), "true");
+        // The argument may be any iterable.
+        assert_eq!(
+            run("[...new Set([1,2,3]).intersection([2,3,9])].join(',')"),
+            "2,3"
+        );
     }
 
     #[test]
