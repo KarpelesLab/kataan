@@ -3249,7 +3249,34 @@ impl<'a> Interp<'a> {
                 }
                 // `normalize()` — Unicode normalization; a no-op here (the engine
                 // stores strings as-is), sufficient for already-normal input.
-                "normalize" => Some(self.new_str(&s)),
+                "normalize" => {
+                    let form = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                        String::from("NFC")
+                    } else {
+                        self.realm.to_display_string(arg(0))
+                    };
+                    #[cfg(feature = "intl")]
+                    {
+                        use intl::unicode::normalize;
+                        let out: String = match form.as_str() {
+                            "NFC" => normalize::nfc(s.chars()).collect(),
+                            "NFD" => normalize::nfd(s.chars()).collect(),
+                            "NFKC" => normalize::nfkc(s.chars()).collect(),
+                            "NFKD" => normalize::nfkd(s.chars()).collect(),
+                            _ => {
+                                return Err(ExecError::Throw(
+                                    self.new_str("RangeError: invalid normalization form"),
+                                ));
+                            }
+                        };
+                        Some(self.new_str(&out))
+                    }
+                    #[cfg(not(feature = "intl"))]
+                    {
+                        let _ = &form;
+                        Some(self.new_str(&s))
+                    }
+                }
                 // `localeCompare(other)` — ordering sign (code-point order; no
                 // locale tailoring).
                 "localeCompare" => {
@@ -7688,6 +7715,21 @@ mod tests {
             "true:1,2,3"
         );
         assert_eq!(run("[3,1,2].sort((x,y)=>y-x).join(',')"), "3,2,1");
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
+    fn string_normalize_forms() {
+        // "é" composed (1 cp) vs decomposed (e + U+0301).
+        assert_eq!(run("'\u{e9}'.normalize('NFD').length"), "2");
+        assert_eq!(run("'e\u{301}'.normalize('NFC').length"), "1");
+        assert_eq!(
+            run("'\u{e9}'.normalize() === 'e\u{301}'.normalize()"),
+            "true"
+        );
+        // NFKC expands the ﬁ ligature.
+        assert_eq!(run("'\u{fb01}'.normalize('NFKC')"), "fi");
+        assert_eq!(run("'abc'.normalize()"), "abc");
     }
 
     #[test]

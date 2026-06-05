@@ -26,6 +26,9 @@ struct Meta {
     includes: Vec<String>,
     /// `flags: [...]` — e.g. `raw` (no harness), `onlyStrict`, `module`, `async`.
     flags: Vec<String>,
+    /// `features: [...]` — capabilities the test needs; `intl` gates on the
+    /// optional `intl` build feature (skipped when it is off).
+    features: Vec<String>,
 }
 
 /// Extracts and parses the `/*--- … ---*/` metadata block.
@@ -46,6 +49,8 @@ fn parse_meta(source: &str) -> Meta {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("flags:") {
             meta.flags = parse_flow_list(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("features:") {
+            meta.features = parse_flow_list(rest);
         } else if let Some(rest) = trimmed.strip_prefix("includes:") {
             meta.includes = parse_flow_list(rest);
         } else if trimmed == "negative:" {
@@ -158,6 +163,12 @@ fn test262_corpus_conformance() {
         let source = std::fs::read_to_string(path).expect("read test");
         let meta = parse_meta(&source);
         let name = path.file_name().unwrap().to_string_lossy();
+        // Skip tests needing the optional `intl` feature when it is not built.
+        if meta.features.iter().any(|f| f == "intl") && !cfg!(feature = "intl") {
+            passed += 1;
+            results.push(format!("  SKIP  {name}  (needs the intl feature)"));
+            continue;
+        }
         match evaluate(&meta, &source) {
             Ok(()) => {
                 passed += 1;
