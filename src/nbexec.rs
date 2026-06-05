@@ -149,6 +149,9 @@ pub struct Interp<'a> {
     pending_label: Option<String>,
     /// The promise-reaction microtask queue, drained after the script.
     microtasks: Vec<Job>,
+    /// Whether the currently-executing code is in strict mode (`"use strict"`),
+    /// which propagates into nested functions.
+    strict: bool,
     /// Captured `console.log` output (a line per call).
     output: String,
 }
@@ -354,6 +357,7 @@ impl<'a> Interp<'a> {
             current_home: None,
             pending_label: None,
             microtasks: Vec::new(),
+            strict: false,
             output: String::new(),
         };
         interp.install_globals();
@@ -1786,6 +1790,7 @@ impl<'a> Interp<'a> {
     /// Runs a whole program, returning the value of its last expression
     /// statement (or `undefined`).
     pub fn run(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
+        self.strict = self.strict || has_use_strict(&program.body);
         self.hoist_with(&program.body, true)?;
         let mut last = NanBox::undefined();
         for stmt in &program.body {
@@ -5218,14 +5223,28 @@ impl<'a> Interp<'a> {
         match body {
             Body::Expr(e) => self.eval(e),
             Body::Block(stmts) => {
+                // Strict mode is inherited from the caller and additionally enabled
+                // by a `"use strict"` directive prologue; it propagates to nested
+                // bodies and is restored on exit.
+                let saved_strict = self.strict;
+                self.strict = self.strict || has_use_strict(stmts);
                 self.hoist_with(stmts, true)?;
+                let mut result = Ok(NanBox::undefined());
                 for stmt in stmts {
-                    match self.exec(stmt)? {
-                        Flow::Return(v) => return Ok(v),
-                        Flow::Normal(_) | Flow::Break(_) | Flow::Continue(_) => {}
+                    match self.exec(stmt) {
+                        Ok(Flow::Return(v)) => {
+                            result = Ok(v);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
                     }
                 }
-                Ok(NanBox::undefined())
+                self.strict = saved_strict;
+                result
             }
         }
     }
@@ -5843,6 +5862,13 @@ impl<'a> Interp<'a> {
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
                 if !self.current.set(&id.name, value) {
+                    // Strict mode forbids creating an implicit global.
+                    if self.strict {
+                        let m = self.new_str(&alloc::format!("{} is not defined", id.name));
+                        return Err(ExecError::Throw(
+                            self.make_error(N_REFERENCE_ERROR, Some(m)),
+                        ));
+                    }
                     self.current.declare(&id.name, value);
                 }
                 Ok(())
@@ -7083,6 +7109,12 @@ impl<'a> Interp<'a> {
                     self.binary(compound_op(op)?, current, rhs)?
                 };
                 if !self.current.set(name, new) {
+                    if self.strict {
+                        let m = self.new_str(&alloc::format!("{name} is not defined"));
+                        return Err(ExecError::Throw(
+                            self.make_error(N_REFERENCE_ERROR, Some(m)),
+                        ));
+                    }
                     self.current.declare(name, new); // sloppy global
                 }
                 Ok(new)
@@ -7803,6 +7835,25 @@ fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
             _ => {}
         }
     }
+}
+
+/// Whether a body's directive prologue contains `"use strict"` — a leading run
+/// of string-literal expression statements, one of which is exactly `use strict`.
+fn has_use_strict(stmts: &[Stmt]) -> bool {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Expr { expression, .. } => match &**expression {
+                Expr::Str { value, .. } => {
+                    if &**value == "use strict" {
+                        return true;
+                    }
+                }
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Collects the names of function declarations that appear **inside a block** (at
@@ -10676,6 +10727,36 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn strict_mode_undeclared_assignment() {
+        // Strict mode: an implicit-global assignment throws ReferenceError.
+        assert_eq!(
+            run(
+                "(function(){'use strict'; try{ undeclaredX=1; return 'no'; }catch(e){ return e instanceof ReferenceError ? 'ref' : 'other'; }})()"
+            ),
+            "ref"
+        );
+        // Sloppy mode still creates the global.
+        assert_eq!(
+            run("(function(){ sloppyG=5; return typeof sloppyG; })()"),
+            "number"
+        );
+        // Strict propagates to a nested function.
+        assert_eq!(
+            run(
+                "(function(){'use strict'; return (function(){ try{nx=1;return 'no';}catch(e){return 'ref';} })(); })()"
+            ),
+            "ref"
+        );
+        // A declared binding is assignable under strict mode.
+        assert_eq!(
+            run("(function(){'use strict'; let x=1; x=2; return x; })()"),
+            "2"
+        );
+        // Program-level `use strict`.
+        assert_eq!(run("'use strict'; var ok='y'; ok"), "y");
     }
 
     #[test]
