@@ -589,6 +589,8 @@ impl Realm {
     pub fn delete_property(&mut self, handle: Handle, key: &str) -> bool {
         let root = Rc::clone(&self.root_shape);
         match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            // A frozen object's properties are non-configurable: delete is a no-op.
+            Some(o) if o.is_frozen() => false,
             Some(o) => o.delete(root, key),
             None => false,
         }

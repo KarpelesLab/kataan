@@ -6667,6 +6667,19 @@ mod tests {
     }
 
     #[test]
+    fn frozen_object_blocks_delete() {
+        assert_eq!(
+            run("let o={a:1,b:2}; Object.freeze(o); delete o.b; o.b"),
+            "2"
+        );
+        assert_eq!(
+            run("let o={a:1}; Object.freeze(o); o.a=9; o.c=3; o.a + ':' + String(o.c)"),
+            "1:undefined"
+        );
+        assert_eq!(run("let o={a:1,b:2}; delete o.b; String(o.b)"), "undefined");
+    }
+
+    #[test]
     fn array_and_function_named_properties() {
         assert_eq!(
             run("let a=[1,2,3]; a.tag='x'; a.tag + ':' + a.length + ':' + a[0]"),
