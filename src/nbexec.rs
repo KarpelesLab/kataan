@@ -211,6 +211,10 @@ const N_OBJECT_PREVENT_EXT: u16 = 127;
 const N_OBJECT_IS_EXTENSIBLE: u16 = 128;
 const N_OBJECT_GET_OWN_NAMES: u16 = 37;
 const N_OBJECT_GET_OWN_SYMBOLS: u16 = 158;
+const N_ENCODE_URI_COMPONENT: u16 = 159;
+const N_DECODE_URI_COMPONENT: u16 = 160;
+const N_ENCODE_URI: u16 = 161;
+const N_DECODE_URI: u16 = 162;
 const N_OBJECT_CREATE: u16 = 107;
 const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
@@ -524,6 +528,10 @@ impl<'a> Interp<'a> {
             ("WeakSet", N_WEAKSET),
             ("WeakRef", N_WEAKREF),
             ("FinalizationRegistry", N_FINALIZATION_REGISTRY),
+            ("encodeURIComponent", N_ENCODE_URI_COMPONENT),
+            ("decodeURIComponent", N_DECODE_URI_COMPONENT),
+            ("encodeURI", N_ENCODE_URI),
+            ("decodeURI", N_DECODE_URI),
         ] {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -562,6 +570,10 @@ impl<'a> Interp<'a> {
             "SyntaxError",
             "ReferenceError",
             "AggregateError",
+            "encodeURIComponent",
+            "decodeURIComponent",
+            "encodeURI",
+            "decodeURI",
         ] {
             if let Some(v) = self.current.get(n) {
                 self.realm.set_property(global, n, v);
@@ -1294,6 +1306,32 @@ impl<'a> Interp<'a> {
             N_PARSE_FLOAT => {
                 let s = self.realm.to_display_string(arg(0));
                 NanBox::number(parse_float_prefix(s.trim()))
+            }
+            // URI encoding/decoding. `encodeURI` preserves the URI reserved set
+            // on top of the unreserved set that `encodeURIComponent` keeps.
+            N_ENCODE_URI_COMPONENT | N_ENCODE_URI => {
+                let s = self.realm.to_display_string(arg(0));
+                let extra = if id == N_ENCODE_URI {
+                    ";,/?:@&=+$#"
+                } else {
+                    ""
+                };
+                let out = uri_encode(&s, extra);
+                let h = self.realm.new_string(&out);
+                NanBox::handle(h.to_raw())
+            }
+            N_DECODE_URI_COMPONENT | N_DECODE_URI => {
+                let s = self.realm.to_display_string(arg(0));
+                match uri_decode(&s) {
+                    Some(out) => {
+                        let h = self.realm.new_string(&out);
+                        NanBox::handle(h.to_raw())
+                    }
+                    None => {
+                        let m = self.new_str("URI malformed");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                }
             }
             N_IS_NAN => NanBox::boolean(self.realm.to_number(arg(0)).is_nan()),
             N_IS_FINITE => NanBox::boolean(self.realm.to_number(arg(0)).is_finite()),
@@ -7653,6 +7691,54 @@ fn int_to_radix(n: f64, radix: u32) -> String {
 
 /// Parses the longest leading decimal-float prefix of `s` (à la `parseFloat`),
 /// returning `NaN` if none.
+/// Percent-encodes `s`. The unreserved set (`A-Za-z0-9-_.!~*'()`) is always kept;
+/// `extra` adds characters preserved by `encodeURI` (the URI reserved set).
+fn uri_encode(s: &str, extra: &str) -> String {
+    let mut out = String::new();
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        let keep = ch.is_ascii_alphanumeric() || "-_.!~*'()".contains(ch) || extra.contains(ch);
+        if keep {
+            out.push(ch);
+        } else {
+            for b in ch.encode_utf8(&mut buf).bytes() {
+                out.push('%');
+                out.push(
+                    char::from_digit((b >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((b & 0xf) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Decodes percent-escapes in `s` (`%XX` → byte), returning `None` on a malformed
+/// escape or invalid UTF-8.
+fn uri_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = (*bytes.get(i + 1)? as char).to_digit(16)?;
+            let lo = (*bytes.get(i + 2)? as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 fn parse_float_prefix(s: &str) -> f64 {
     // A leading (optionally signed) `Infinity`.
     let (sign, rest) = match s.strip_prefix('-') {
@@ -10122,6 +10208,21 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn uri_encoding_functions() {
+        assert_eq!(run("encodeURIComponent('a b&c=d')"), "a%20b%26c%3Dd");
+        assert_eq!(run("decodeURIComponent('a%20b%26c')"), "a b&c");
+        assert_eq!(run("encodeURI('http://a.com/x y')"), "http://a.com/x%20y");
+        assert_eq!(run("encodeURIComponent('café')"), "caf%C3%A9");
+        assert_eq!(run("decodeURIComponent('caf%C3%A9')"), "café");
+        assert_eq!(run("encodeURIComponent(\"-_.!~*'()\")"), "-_.!~*'()");
+        assert_eq!(run("decodeURIComponent('%2f')"), "/");
+        assert_eq!(
+            run("try{decodeURIComponent('%zz');'no'}catch(e){e instanceof TypeError}"),
+            "true"
+        );
     }
 
     #[test]
