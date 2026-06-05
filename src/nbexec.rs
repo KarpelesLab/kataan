@@ -878,23 +878,19 @@ impl<'a> Interp<'a> {
             N_ARRAY_OF => NanBox::handle(self.realm.new_array(args.to_vec()).to_raw()),
             N_OBJECT_FROM_ENTRIES => {
                 let obj = self.realm.new_object();
-                if let Some(pairs) = arg(0)
-                    .as_handle()
-                    .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
-                    .map(<[_]>::to_vec)
-                {
-                    for pair in pairs {
-                        if let Some(kv) = pair
-                            .as_handle()
-                            .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
-                            .map(<[_]>::to_vec)
-                        {
-                            let k = self.realm.to_display_string(
-                                kv.first().copied().unwrap_or(NanBox::undefined()),
-                            );
-                            let v = kv.get(1).copied().unwrap_or(NanBox::undefined());
-                            self.realm.set_property(obj, &k, v);
-                        }
+                // Accepts any iterable of `[key, value]` pairs (arrays, a Map, …).
+                let pairs = self.iterate_values(arg(0)).unwrap_or_default();
+                for pair in pairs {
+                    if let Some(kv) = pair
+                        .as_handle()
+                        .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
+                        .map(<[_]>::to_vec)
+                    {
+                        let k = self
+                            .realm
+                            .to_display_string(kv.first().copied().unwrap_or(NanBox::undefined()));
+                        let v = kv.get(1).copied().unwrap_or(NanBox::undefined());
+                        self.realm.set_property(obj, &k, v);
                     }
                 }
                 NanBox::handle(obj.to_raw())
@@ -5546,6 +5542,17 @@ impl<'a> Interp<'a> {
                 _ => false,
             });
         }
+        // `Array`/`Object` are namespace objects (not natives), matched by the
+        // identity of the global binding.
+        if self.current.get("Array").and_then(|v| v.as_handle()) == ctor.as_handle() {
+            return Ok(self.realm.is_array(oh));
+        }
+        if self.current.get("Object").and_then(|v| v.as_handle()) == ctor.as_handle() {
+            // Any non-primitive heap value is an instance of `Object`.
+            return Ok(self.realm.string_value(oh).is_none()
+                && self.realm.symbol_at(oh).is_none()
+                && self.realm.bigint_at(oh).is_none());
+        }
         // Plain function constructors: match the instance's recorded constructor.
         if self.realm.function_at(ch).is_some() {
             return Ok(self
@@ -7371,6 +7378,20 @@ mod tests {
         assert_eq!(
             run("let p=new Proxy({x:1},{}); let r = 'x' in p; delete p.x; '' + r + ('x' in p)"),
             "truefalse"
+        );
+    }
+
+    #[test]
+    fn instanceof_array_object_and_fromentries_map() {
+        assert_eq!(run("[] instanceof Array"), "true");
+        assert_eq!(run("({}) instanceof Array"), "false");
+        assert_eq!(run("[] instanceof Object"), "true");
+        assert_eq!(run("({}) instanceof Object"), "true");
+        assert_eq!(run("'str' instanceof Object"), "false"); // primitive
+        // Object.fromEntries from a Map.
+        assert_eq!(
+            run("let m=new Map([['x',10],['y',20]]); let o=Object.fromEntries(m); o.x + ':' + o.y"),
+            "10:20"
         );
     }
 
