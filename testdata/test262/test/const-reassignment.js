@@ -3,9 +3,6 @@ description: Reassigning a const binding throws a TypeError; mutation is allowed
 esid: sec-let-and-const-declarations
 flags: [onlyStrict]
 ---*/
-// Force the tree-walker (which enforces const) via the documented prefix.
-function Foo() {}
-var force = (new Foo()) instanceof Foo;
 var threw = false;
 (function () {
   const x = 1;

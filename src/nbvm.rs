@@ -3114,6 +3114,8 @@ struct ClassInfo {
 struct Binding {
     reg: Reg,
     cell: bool,
+    /// Declared `const` (reassignment is a TypeError — routed to the tree-walker).
+    konst: bool,
 }
 
 /// A single-pass register-allocating compiler from the AST to [`Op`]s.
@@ -3233,6 +3235,7 @@ impl Compiler {
                         let bind = Binding {
                             reg: cell,
                             cell: true,
+                            konst: false,
                         };
                         c.write_var(bind, arg_regs[i]);
                         bind
@@ -3240,6 +3243,7 @@ impl Compiler {
                         Binding {
                             reg: arg_regs[i],
                             cell: false,
+                            konst: false,
                         }
                     };
                     c.scopes
@@ -3258,6 +3262,7 @@ impl Compiler {
                 Binding {
                     reg: cap_regs[j],
                     cell: true,
+                    konst: false,
                 },
             );
         }
@@ -3325,12 +3330,23 @@ impl Compiler {
             // A fresh one-element cell to hold the value.
             self.ops.push(Op::NewArray { dst: reg, len: 1 });
         }
-        let b = Binding { reg, cell };
+        let b = Binding {
+            reg,
+            cell,
+            konst: false,
+        };
         self.scopes
             .last_mut()
             .expect("a scope")
             .insert(String::from(name), b);
         b
+    }
+
+    /// Marks the just-declared local `name` as `const`.
+    fn mark_const(&mut self, name: &str) {
+        if let Some(b) = self.scopes.last_mut().and_then(|s| s.get_mut(name)) {
+            b.konst = true;
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<Binding> {
@@ -3683,6 +3699,7 @@ impl Compiler {
                             let bind = Binding {
                                 reg: cell,
                                 cell: true,
+                                konst: false,
                             };
                             self.write_var(bind, catch_reg);
                             bind
@@ -3690,6 +3707,7 @@ impl Compiler {
                             Binding {
                                 reg: catch_reg,
                                 cell: false,
+                                konst: false,
                             }
                         };
                         self.scopes
@@ -3731,6 +3749,11 @@ impl Compiler {
                         None => self.constant(NanBox::undefined())?,
                     };
                     self.bind_pattern(&d.target, value)?;
+                    if matches!(decl.kind, crate::ast::VarDeclKind::Const)
+                        && let BindingTarget::Ident(id) = &d.target
+                    {
+                        self.mark_const(&id.name);
+                    }
                 }
                 Ok(None)
             }
@@ -4446,6 +4469,13 @@ impl Compiler {
                 op, target, value, ..
             } => {
                 use crate::ast::AssignOp;
+                // Reassigning a `const` binding is a TypeError; route the program
+                // to the tree-walker, which enforces it at the right point.
+                if let Expr::Ident(id) = &**target
+                    && self.lookup(&id.name).is_some_and(|b| b.konst)
+                {
+                    return Err(CompileError::Unsupported("assignment to const"));
+                }
                 // Logical assignment (`&&=`/`||=`/`??=`) short-circuits.
                 if matches!(
                     op,
