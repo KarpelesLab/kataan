@@ -2711,7 +2711,14 @@ impl<'a> Interp<'a> {
                 "trim" => Some(self.new_str(s.trim())),
                 "charAt" => {
                     let i = self.realm.to_number(arg(0)) as usize;
-                    Some(self.new_str(&s.chars().nth(i).map(String::from).unwrap_or_default()))
+                    // UTF-16-indexed: the unit at `i` as a one-unit string (a
+                    // lone surrogate renders as U+FFFD via lossy decoding).
+                    let units: Vec<u16> = s.encode_utf16().collect();
+                    let out = units
+                        .get(i)
+                        .map(|&u| String::from_utf16_lossy(&[u]))
+                        .unwrap_or_default();
+                    Some(self.new_str(&out))
                 }
                 "includes" => Some(NanBox::boolean(
                     s.contains(&self.realm.to_display_string(arg(0))),
@@ -2776,10 +2783,11 @@ impl<'a> Interp<'a> {
                 }
                 "at" => {
                     let i = self.realm.to_number(arg(0));
-                    let chars: Vec<char> = s.chars().collect();
-                    let idx = if i < 0.0 { chars.len() as f64 + i } else { i };
-                    Some(match as_index(idx).and_then(|u| chars.get(u)) {
-                        Some(c) => self.new_str(&String::from(*c)),
+                    // UTF-16-indexed with negative-from-end support.
+                    let units: Vec<u16> = s.encode_utf16().collect();
+                    let idx = if i < 0.0 { units.len() as f64 + i } else { i };
+                    Some(match as_index(idx).and_then(|u| units.get(u)) {
+                        Some(&u) => self.new_str(&String::from_utf16_lossy(&[u])),
                         None => NanBox::undefined(),
                     })
                 }
@@ -2816,10 +2824,33 @@ impl<'a> Interp<'a> {
                 }
                 "trimStart" => Some(self.new_str(s.trim_start())),
                 "trimEnd" => Some(self.new_str(s.trim_end())),
-                "charCodeAt" | "codePointAt" => {
+                // `charCodeAt(i)` is the UTF-16 code unit at index `i` (NaN if
+                // out of range); a surrogate half reads as that 16-bit value.
+                "charCodeAt" => {
                     let i = self.realm.to_number(arg(0)) as usize;
-                    Some(match s.chars().nth(i) {
-                        Some(c) => NanBox::number(u32::from(c) as f64),
+                    Some(
+                        s.encode_utf16()
+                            .nth(i)
+                            .map_or(NanBox::number(f64::NAN), |u| NanBox::number(f64::from(u))),
+                    )
+                }
+                // `codePointAt(i)` combines a surrogate pair at UTF-16 index `i`.
+                "codePointAt" => {
+                    let i = self.realm.to_number(arg(0)) as usize;
+                    let units: Vec<u16> = s.encode_utf16().collect();
+                    Some(match units.get(i).copied() {
+                        Some(u) if (0xD800..0xDC00).contains(&u) => {
+                            match units.get(i + 1).copied() {
+                                Some(low) if (0xDC00..0xE000).contains(&low) => {
+                                    let cp = 0x1_0000
+                                        + ((u32::from(u) - 0xD800) << 10)
+                                        + (u32::from(low) - 0xDC00);
+                                    NanBox::number(f64::from(cp))
+                                }
+                                _ => NanBox::number(f64::from(u)),
+                            }
+                        }
+                        Some(u) => NanBox::number(f64::from(u)),
                         None => NanBox::undefined(),
                     })
                 }
@@ -4834,7 +4865,8 @@ impl<'a> Interp<'a> {
                 return NanBox::number(len as f64);
             }
             if let Some(s) = self.realm.string_value(handle) {
-                return NanBox::number(s.chars().count() as f64);
+                // `String.length` counts UTF-16 code units (astral chars = 2).
+                return NanBox::number(s.encode_utf16().count() as f64);
             }
         }
         // `Map`/`Set` expose `size`.
@@ -6704,6 +6736,18 @@ mod tests {
         );
         assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
         assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
+    }
+
+    #[test]
+    fn utf16_string_indexing() {
+        assert_eq!(run("'café'.length"), "4");
+        assert_eq!(run("'\\u{1F600}'.length"), "2");
+        assert_eq!(run("'a\\u{1F600}b'.length"), "4");
+        assert_eq!(run("'\\u{1F600}'.charCodeAt(0)"), "55357");
+        assert_eq!(run("'\\u{1F600}'.charCodeAt(1)"), "56832");
+        assert_eq!(run("'\\u{1F600}'.codePointAt(0)"), "128512");
+        assert_eq!(run("'a\\u{1F600}b'.codePointAt(1)"), "128512");
+        assert_eq!(run("'hello'.charCodeAt(0)"), "104");
     }
 
     #[test]
