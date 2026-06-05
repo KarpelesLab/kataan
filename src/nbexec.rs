@@ -213,6 +213,7 @@ const N_OBJECT_GET_OWN_DESC: u16 = 111;
 const N_WEAKMAP: u16 = 112;
 const N_OBJECT_IS: u16 = 123;
 const N_OBJECT_HAS_OWN: u16 = 129;
+const N_OBJECT_GROUP_BY: u16 = 138;
 const N_OBJECT_GET_OWN_DESCS: u16 = 130;
 const N_WEAKREF: u16 = 131;
 const N_FINALIZATION_REGISTRY: u16 = 132;
@@ -429,6 +430,7 @@ impl<'a> Interp<'a> {
                 ("getOwnPropertyDescriptors", N_OBJECT_GET_OWN_DESCS),
                 ("is", N_OBJECT_IS),
                 ("hasOwn", N_OBJECT_HAS_OWN),
+                ("groupBy", N_OBJECT_GROUP_BY),
             ],
         );
         install_namespace(
@@ -766,6 +768,33 @@ impl<'a> Interp<'a> {
                             .is_some_and(|len| key.parse::<usize>().is_ok_and(|i| i < len))
                 });
                 NanBox::boolean(owned)
+            }
+            // `Object.groupBy(items, cb)` — groups each item by `cb(item, i)` into
+            // an object of arrays keyed by the (stringified) group.
+            N_OBJECT_GROUP_BY => {
+                let items = self.iterate_values(arg(0))?;
+                let cb = arg(1);
+                let out = self.realm.new_object();
+                for (i, item) in items.iter().enumerate() {
+                    let key = self.call(cb, &[*item, NanBox::number(i as f64)])?;
+                    let k = self.realm.to_display_string(key);
+                    let bucket = match self
+                        .realm
+                        .get_property(out, &k)
+                        .and_then(NanBox::as_handle)
+                        .map(Handle::from_raw)
+                    {
+                        Some(h) => h,
+                        None => {
+                            let arr = self.realm.new_array(Vec::new());
+                            self.realm
+                                .set_property(out, &k, NanBox::handle(arr.to_raw()));
+                            arr
+                        }
+                    };
+                    self.realm.array_push(bucket, *item);
+                }
+                NanBox::handle(out.to_raw())
             }
             // --- Reflect.* ---
             N_REFLECT_GET => {
@@ -8007,6 +8036,20 @@ mod tests {
         );
         // Array.join renders null/undefined as empty.
         assert_eq!(run("[1,null,2,undefined,3].join('-')"), "1--2--3");
+    }
+
+    #[test]
+    fn object_group_by() {
+        assert_eq!(
+            run(
+                "let g=Object.groupBy([1,2,3,4,5], x=>x%2?'odd':'even'); g.odd.join(',') + '|' + g.even.join(',')"
+            ),
+            "1,3,5|2,4"
+        );
+        assert_eq!(run("Object.groupBy(['a','ab','b'], s=>s[0]).a.length"), "2");
+        assert_eq!(run("Object.keys(Object.groupBy([], x=>x)).length"), "0");
+        // Works over any iterable + uses the index.
+        assert_eq!(run("Object.groupBy('aab', c=>c).a.length"), "2");
     }
 
     #[test]
