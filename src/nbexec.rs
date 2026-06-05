@@ -726,12 +726,16 @@ impl<'a> Interp<'a> {
                             .realm
                             .get_property(obj, &key)
                             .unwrap_or(NanBox::undefined());
+                        let writable = !self.realm.property_is_readonly(obj, &key);
+                        let enumerable = self.realm.property_is_enumerable(obj, &key);
                         let d = self.realm.new_object();
                         self.realm.set_property(d, "value", v);
-                        let t = NanBox::boolean(true);
-                        self.realm.set_property(d, "writable", t);
-                        self.realm.set_property(d, "enumerable", t);
-                        self.realm.set_property(d, "configurable", t);
+                        self.realm
+                            .set_property(d, "writable", NanBox::boolean(writable));
+                        self.realm
+                            .set_property(d, "enumerable", NanBox::boolean(enumerable));
+                        self.realm
+                            .set_property(d, "configurable", NanBox::boolean(true));
                         result = NanBox::handle(d.to_raw());
                     }
                 }
@@ -1547,7 +1551,24 @@ impl<'a> Interp<'a> {
                 .realm
                 .get_property(desc, "value")
                 .unwrap_or(NanBox::undefined());
+            // Set the value first, then apply the attribute flags.
             self.realm.set_property(obj, key, value);
+            if matches!(
+                self.realm
+                    .get_property(desc, "writable")
+                    .map(|v| self.realm.truthy(v)),
+                Some(false)
+            ) {
+                self.realm.set_readonly_property(obj, key);
+            }
+            // A descriptor defaults to non-enumerable unless `enumerable: true`.
+            let enumerable = self
+                .realm
+                .get_property(desc, "enumerable")
+                .is_some_and(|v| self.realm.truthy(v));
+            if !enumerable {
+                self.realm.mark_hidden(obj, key);
+            }
         }
     }
 
@@ -2972,9 +2993,13 @@ impl<'a> Interp<'a> {
                     } else {
                         self.realm.to_display_string(arg(0))
                     };
+                    // `null`/`undefined` elements render as the empty string.
                     let parts: Vec<String> = elems
                         .iter()
-                        .map(|e| self.realm.to_display_string(*e))
+                        .map(|e| match e.unpack() {
+                            Unpacked::Null | Unpacked::Undefined => String::new(),
+                            _ => self.realm.to_display_string(*e),
+                        })
                         .collect();
                     return Ok(Some(self.new_str(&parts.join(&sep))));
                 }
@@ -6741,6 +6766,32 @@ mod tests {
         // name from a declaration and a named function expression.
         assert_eq!(run("function greet(){} greet.name"), "greet");
         assert_eq!(run("let g = function inner(){}; g.name"), "inner");
+    }
+
+    #[test]
+    fn non_writable_and_join_nullish() {
+        // defineProperty writable:false ignores writes; descriptor reports it.
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'x',{value:1,writable:false,enumerable:true}); o.x=9; o.x"
+            ),
+            "1"
+        );
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'x',{value:1,writable:false}); Object.getOwnPropertyDescriptor(o,'x').writable"
+            ),
+            "false"
+        );
+        // Non-enumerable stays out of Object.keys but readable.
+        assert_eq!(
+            run(
+                "let o={a:1}; Object.defineProperty(o,'h',{value:2,enumerable:false}); Object.keys(o).join(',') + ':' + o.h"
+            ),
+            "a:2"
+        );
+        // Array.join renders null/undefined as empty.
+        assert_eq!(run("[1,null,2,undefined,3].join('-')"), "1--2--3");
     }
 
     #[test]

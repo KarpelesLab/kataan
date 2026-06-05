@@ -649,6 +649,39 @@ impl Realm {
         false
     }
 
+    /// Marks own property `key` of the object at `handle` non-writable
+    /// (`defineProperty` with `writable: false`).
+    pub fn set_readonly_property(&mut self, handle: Handle, key: &str) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.set_readonly(key);
+        }
+    }
+
+    /// Whether own property `key` is non-writable (frozen or read-only).
+    #[must_use]
+    pub fn property_is_readonly(&self, handle: Handle, key: &str) -> bool {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_object)
+            .is_some_and(|o| o.is_frozen() || o.is_readonly(key))
+    }
+
+    /// Whether own property `key` is enumerable (not marked hidden).
+    #[must_use]
+    pub fn property_is_enumerable(&self, handle: Handle, key: &str) -> bool {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_object)
+            .is_some_and(|o| !o.is_hidden(key))
+    }
+
+    /// Marks own property `key` non-enumerable (without changing its value).
+    pub fn mark_hidden(&mut self, handle: Handle, key: &str) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.set_hidden(key);
+        }
+    }
+
     /// Sets own property `key` to `value` but marks it **non-enumerable** — used
     /// for class methods, which are callable but must stay out of `Object.keys`,
     /// spread, `for-in`, and JSON.

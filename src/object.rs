@@ -33,6 +33,9 @@ pub struct Object {
     /// Own keys that are **non-enumerable** (e.g. class methods): present in the
     /// slots and readable, but hidden from `Object.keys`/spread/`for-in`/JSON.
     hidden: Vec<alloc::boxed::Box<str>>,
+    /// Own keys that are **non-writable** (`defineProperty` with
+    /// `writable: false`): writes are silently ignored.
+    readonly: Vec<alloc::boxed::Box<str>>,
     /// Whether the object is frozen (`Object.freeze`): no new properties and no
     /// writes to existing ones.
     frozen: bool,
@@ -54,6 +57,7 @@ impl Object {
             slots: Vec::new(),
             accessors: Vec::new(),
             hidden: Vec::new(),
+            readonly: Vec::new(),
             frozen: false,
             class_tag: None,
             proto: None,
@@ -153,7 +157,7 @@ impl Object {
     /// no-op on a frozen object (matching `Object.freeze` semantics in
     /// non-strict code).
     pub fn set(&mut self, key: &str, value: NanBox) {
-        if self.frozen {
+        if self.frozen || self.is_readonly(key) {
             return;
         }
         if let Some(slot) = self.shape.lookup(key) {
@@ -191,6 +195,19 @@ impl Object {
     #[must_use]
     pub fn is_hidden(&self, key: &str) -> bool {
         self.hidden.iter().any(|k| k.as_ref() == key)
+    }
+
+    /// Marks own property `key` non-writable (idempotent).
+    pub fn set_readonly(&mut self, key: &str) {
+        if !self.is_readonly(key) {
+            self.readonly.push(alloc::boxed::Box::from(key));
+        }
+    }
+
+    /// Whether own property `key` is non-writable.
+    #[must_use]
+    pub fn is_readonly(&self, key: &str) -> bool {
+        self.readonly.iter().any(|k| k.as_ref() == key)
     }
 
     /// Marks the object frozen (`Object.freeze`).
