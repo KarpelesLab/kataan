@@ -3125,12 +3125,14 @@ impl<'a> Interp<'a> {
                     self.realm.array_set_all(handle, next);
                     return Ok(Some(NanBox::handle(self.realm.new_array(removed).to_raw())));
                 }
-                "join" => {
-                    let sep = if matches!(arg(0).unpack(), Unpacked::Undefined) {
-                        String::from(",")
-                    } else {
-                        self.realm.to_display_string(arg(0))
-                    };
+                // `arr.toString()` joins with a comma (like `join()`).
+                "join" | "toString" => {
+                    let sep =
+                        if method == "toString" || matches!(arg(0).unpack(), Unpacked::Undefined) {
+                            String::from(",")
+                        } else {
+                            self.realm.to_display_string(arg(0))
+                        };
                     // `null`/`undefined` elements render as the empty string.
                     let parts: Vec<String> = elems
                         .iter()
@@ -7128,6 +7130,30 @@ mod tests {
         );
         // Array.join renders null/undefined as empty.
         assert_eq!(run("[1,null,2,undefined,3].join('-')"), "1--2--3");
+    }
+
+    #[test]
+    fn integer_key_ordering_and_array_tostring() {
+        // Integer keys come first (ascending), then string keys in insertion order.
+        assert_eq!(
+            run("let o={2:'a',1:'b',3:'c'}; Object.keys(o).join(',')"),
+            "1,2,3"
+        );
+        assert_eq!(
+            run("let o={z:1, 2:2, a:3, 1:4}; Object.keys(o).join(',')"),
+            "1,2,z,a"
+        );
+        assert_eq!(
+            run("let o={}; o.b=1; o.a=2; Object.keys(o).join(',')"),
+            "b,a"
+        );
+        assert_eq!(
+            run("Object.values({10:'x',2:'y',1:'z'}).join(',')"),
+            "z,y,x"
+        );
+        // Array toString joins with comma.
+        assert_eq!(run("['a','b','c'].toString()"), "a,b,c");
+        assert_eq!(run("[1,[2,3],4].toString()"), "1,2,3,4");
     }
 
     #[test]

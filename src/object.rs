@@ -20,7 +20,16 @@
 use crate::nanbox::NanBox;
 use crate::shape::Shape;
 use alloc::rc::Rc;
+use alloc::string::ToString;
 use alloc::vec::Vec;
+
+/// The numeric value of `k` if it is a canonical array-index key (a non-negative
+/// integer `< 2^32 - 1` whose decimal form is exactly `k`), else `None`.
+fn array_index(k: &str) -> Option<u32> {
+    k.parse::<u32>()
+        .ok()
+        .filter(|n| *n < u32::MAX && n.to_string() == k)
+}
 
 /// A property-bearing object: a hidden-class shape plus its value slots, with an
 /// optional side list of accessor (getter/setter) properties.
@@ -182,14 +191,24 @@ impl Object {
         self.shape.keys()
     }
 
-    /// The own **enumerable** property names (excludes keys marked hidden).
+    /// The own **enumerable** property names (excludes keys marked hidden), in
+    /// spec order: integer-index keys ascending, then the rest in insertion order.
     #[must_use]
     pub fn enumerable_keys(&self) -> Vec<&str> {
-        self.shape
+        let keys: Vec<&str> = self
+            .shape
             .keys()
             .into_iter()
             .filter(|k| !self.is_hidden(k))
-            .collect()
+            .collect();
+        let mut ints: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| array_index(k).is_some())
+            .collect();
+        ints.sort_by_key(|k| array_index(k).unwrap());
+        let strs = keys.into_iter().filter(|k| array_index(k).is_none());
+        ints.into_iter().chain(strs).collect()
     }
 
     /// Marks own property `key` non-enumerable (idempotent).
