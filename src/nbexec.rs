@@ -7793,6 +7793,12 @@ impl<'a> Interp<'a> {
                     if !matches!(setter.unpack(), Unpacked::Undefined) {
                         let this = NanBox::handle(handle.to_raw());
                         self.call_with_this(setter, this, &[new])?;
+                    } else if self.strict {
+                        // Strict mode: writing a getter-only accessor is a TypeError.
+                        let m = self.new_str(&alloc::format!(
+                            "Cannot set property {s} which has only a getter"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     }
                     // A getter-only accessor still shadows a data assignment.
                     return Ok(());
@@ -9578,6 +9584,33 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn strict_getter_only_write() {
+        // Sloppy: silently ignored.
+        assert_eq!(run("let o={get x(){return 1;}}; o.x=2; o.x"), "1");
+        // Strict: throws TypeError.
+        assert_eq!(
+            run(
+                "(function(){'use strict'; let o={get x(){return 1;}}; try{o.x=2;return 'no';}catch(e){return e instanceof TypeError?'te':'other';}})()"
+            ),
+            "te"
+        );
+        // A setter still works under strict mode.
+        assert_eq!(
+            run(
+                "(function(){'use strict'; let o={_v:0,get x(){return this._v;},set x(v){this._v=v*2;}}; o.x=5; return o.x;})()"
+            ),
+            "10"
+        );
+        // Inherited getter-only accessor.
+        assert_eq!(
+            run(
+                "(function(){'use strict'; let o=Object.create({get y(){return 9;}}); try{o.y=1;return 'no';}catch(e){return e instanceof TypeError?'te':'other';}})()"
+            ),
+            "te"
+        );
     }
 
     #[test]
