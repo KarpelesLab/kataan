@@ -462,10 +462,7 @@ impl<'a> Interp<'a> {
                 }
                 NanBox::number(m)
             }
-            N_MATH_ABS => {
-                let n = self.realm.to_number(arg(0));
-                NanBox::number(if n < 0.0 { -n } else { n })
-            }
+            N_MATH_ABS => NanBox::number(self.realm.to_number(arg(0)).abs()),
             N_STRING => {
                 let s = self.realm.to_display_string(arg(0));
                 NanBox::handle(self.realm.new_string(&s).to_raw())
@@ -620,7 +617,20 @@ impl<'a> Interp<'a> {
             // (`null` → no prototype).
             N_OBJECT_CREATE => {
                 let proto = arg(0).as_handle().map(Handle::from_raw);
-                NanBox::handle(self.realm.new_object_with_proto(proto).to_raw())
+                let obj = self.realm.new_object_with_proto(proto);
+                // Optional second argument: a property-descriptors map.
+                if let Some(descs) = arg(1).as_handle().map(Handle::from_raw) {
+                    for key in self.realm.object_keys(descs).unwrap_or_default() {
+                        if let Some(d) = self
+                            .realm
+                            .get_property(descs, &key)
+                            .and_then(NanBox::as_handle)
+                        {
+                            self.apply_descriptor(obj, &key, Handle::from_raw(d));
+                        }
+                    }
+                }
+                NanBox::handle(obj.to_raw())
             }
             N_OBJECT_GET_PROTO => arg(0)
                 .as_handle()
@@ -901,7 +911,12 @@ impl<'a> Interp<'a> {
             #[cfg(feature = "std")]
             N_MATH_CEIL => NanBox::number(self.realm.to_number(arg(0)).ceil()),
             #[cfg(feature = "std")]
-            N_MATH_ROUND => NanBox::number(self.realm.to_number(arg(0)).round()),
+            // JS `Math.round` rounds half toward +Infinity (`floor(x + 0.5)`),
+            // unlike Rust's round-half-away-from-zero.
+            N_MATH_ROUND => {
+                let n = self.realm.to_number(arg(0));
+                NanBox::number(if n.is_finite() { (n + 0.5).floor() } else { n })
+            }
             #[cfg(feature = "std")]
             N_MATH_SQRT => NanBox::number(self.realm.to_number(arg(0)).sqrt()),
             #[cfg(not(feature = "std"))]
@@ -7162,6 +7177,23 @@ mod tests {
         assert_eq!(run("`${ {a:1} }`"), "[object Object]");
         // Arrays/numbers/booleans coerce as usual.
         assert_eq!(run("`${[1,2,3]}-${true}-${null}`"), "1,2,3-true-null");
+    }
+
+    #[test]
+    fn math_abs_round_and_create_descriptors() {
+        // Math.round rounds half toward +Infinity (not away from zero).
+        assert_eq!(run("Math.round(-2.5)"), "-2");
+        assert_eq!(run("Math.round(2.5)"), "3");
+        assert_eq!(run("Math.round(-0.5) === 0"), "true");
+        // Math.abs(-0) is +0.
+        assert_eq!(run("Object.is(Math.abs(-0), 0)"), "true");
+        // Object.create with a descriptors map.
+        assert_eq!(
+            run(
+                "let p={g(){return 'hi';}}; let o=Object.create(p, {n:{value:5,enumerable:true}}); o.n + ':' + o.g() + ':' + Object.keys(o).join(',')"
+            ),
+            "5:hi:n"
+        );
     }
 
     #[test]
