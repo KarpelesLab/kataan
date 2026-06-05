@@ -120,6 +120,8 @@ pub struct Interp<'a> {
     class_statics: Vec<alloc::collections::BTreeMap<String, NanBox>>,
     /// Per-class static getter functions (`static get x() {}`), called on read.
     class_static_get: Vec<alloc::collections::BTreeMap<String, NanBox>>,
+    /// Per-class static setter functions (`static set x(v) {}`), called on write.
+    class_static_set: Vec<alloc::collections::BTreeMap<String, NanBox>>,
     /// Per-class captured definition scope, parallel to `classes`.
     class_envs: Vec<Scope>,
     /// The current `this` binding (method/constructor receiver).
@@ -237,6 +239,9 @@ const N_REFERENCE_ERROR: u16 = N_ERROR_BASE + 4;
 const CTOR_KEY: &str = "\u{0}ctor";
 /// Reserved hidden keys for an eager generator's result object: the buffer of
 /// yielded values and the current `next()` cursor.
+/// Sentinel description for a `Symbol()` created with no argument (so its
+/// `.description` is `undefined`, distinct from `Symbol("")`).
+const SYMBOL_NO_DESC: &str = "\u{0}nodesc";
 const GEN_BUF: &str = "\u{0}gbuf";
 const GEN_IDX: &str = "\u{0}gidx";
 /// Reserved hidden keys for a bound function (`Function.prototype.bind`).
@@ -265,6 +270,7 @@ impl<'a> Interp<'a> {
             classes: Vec::new(),
             class_statics: Vec::new(),
             class_static_get: Vec::new(),
+            class_static_set: Vec::new(),
             class_envs: Vec::new(),
             this_val: NanBox::undefined(),
             gen_sink: None,
@@ -475,8 +481,10 @@ impl<'a> Interp<'a> {
             N_NUMBER => NanBox::number(self.realm.to_number(arg(0))),
             N_BOOLEAN => NanBox::boolean(self.realm.truthy(arg(0))),
             N_SYMBOL => {
+                // A no-argument `Symbol()` has an `undefined` description, marked
+                // with a reserved sentinel (distinct from `Symbol("")`).
                 let desc = if matches!(arg(0).unpack(), Unpacked::Undefined) {
-                    String::new()
+                    String::from(SYMBOL_NO_DESC)
                 } else {
                     self.realm.to_display_string(arg(0))
                 };
@@ -2052,6 +2060,7 @@ impl<'a> Interp<'a> {
         // Build the static members (`static foo() {}` / `static x = …`).
         let mut statics = alloc::collections::BTreeMap::new();
         let mut static_getters = alloc::collections::BTreeMap::new();
+        let mut static_setters = alloc::collections::BTreeMap::new();
         for member in &class.body {
             match member {
                 ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
@@ -2074,8 +2083,10 @@ impl<'a> Interp<'a> {
                         statics.insert(key, v);
                     }
                 }
-                // `static get x() {}` — stored as a getter, called on read.
-                ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Get => {
+                // `static get x() {}` / `static set x(v) {}` — accessors.
+                ClassMember::Method(m)
+                    if m.is_static && matches!(m.kind, MethodKind::Get | MethodKind::Set) =>
+                {
                     if let Ok(key) = static_key(&m.key) {
                         let f = self.make_function(
                             &m.value.params,
@@ -2083,7 +2094,11 @@ impl<'a> Interp<'a> {
                             false,
                             false,
                         );
-                        static_getters.insert(key, f);
+                        if m.kind == MethodKind::Get {
+                            static_getters.insert(key, f);
+                        } else {
+                            static_setters.insert(key, f);
+                        }
                     }
                 }
                 _ => {}
@@ -2091,6 +2106,7 @@ impl<'a> Interp<'a> {
         }
         self.class_statics.push(statics);
         self.class_static_get.push(static_getters);
+        self.class_static_set.push(static_setters);
         self.class_envs.push(self.current.clone());
         let handle = self.realm.new_class(class_id, self.current.clone());
         NanBox::handle(handle.to_raw())
@@ -5127,11 +5143,15 @@ impl<'a> Interp<'a> {
             };
             return Ok(self.well_known_symbol(key));
         }
-        // A symbol's `description`.
+        // A symbol's `description` (`undefined` for a no-argument `Symbol()`).
         if let Some((desc, _)) = self.realm.symbol_at(handle)
             && name == "description"
         {
-            return Ok(self.new_str(&desc));
+            return Ok(if &*desc == SYMBOL_NO_DESC {
+                NanBox::undefined()
+            } else {
+                self.new_str(&desc)
+            });
         }
         // A constructor function's `.prototype` (lazily created), so
         // `Fn.prototype.method = …` and prototype-chain inheritance work.
@@ -5331,11 +5351,16 @@ impl<'a> Interp<'a> {
         property: &'a PropertyKey,
         new: NanBox,
     ) -> Result<(), ExecError> {
-        // Writing a static on a class (`C.field = v`, `++C.field`) updates the
-        // class's static table.
+        // Writing a static on a class (`C.field = v`, `++C.field`): call a static
+        // setter if one is defined, else update the class's static table.
         if let Some((cid, _)) = self.realm.class_at(handle) {
             let key = self.eval_prop_key(property)?;
-            self.class_statics[cid as usize].insert(key, new);
+            if let Some(setter) = self.class_static_set[cid as usize].get(&key).copied() {
+                let this = NanBox::handle(handle.to_raw());
+                self.call_with_this(setter, this, &[new])?;
+            } else {
+                self.class_statics[cid as usize].insert(key, new);
+            }
             return Ok(());
         }
         // Proxy `set` trap (or forward the write to the target).
@@ -7516,6 +7541,21 @@ mod tests {
         assert_eq!(run("Math.E > 2.71 && Math.E < 2.72"), "true");
         assert_eq!(run("Math.SQRT2 * Math.SQRT2 > 1.999"), "true");
         assert_eq!(run("Math.floor(Math.LN2 * 1000)"), "693");
+    }
+
+    #[test]
+    fn static_setters_and_symbol_description() {
+        // Static setter then getter.
+        assert_eq!(
+            run(
+                "class T{ static _c=0; static get c(){return T._c;} static set c(v){T._c=v;} } T.c=25; T.c"
+            ),
+            "25"
+        );
+        // Symbol description: undefined for no-arg, the string otherwise.
+        assert_eq!(run("String(Symbol().description)"), "undefined");
+        assert_eq!(run("Symbol('d').description"), "d");
+        assert_eq!(run("Symbol('').description"), ""); // explicit empty
     }
 
     #[test]
