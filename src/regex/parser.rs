@@ -48,6 +48,8 @@ pub(crate) enum Node {
     },
     /// A lookahead `(?=…)` / `(?!…)` (`neg` for the negative form).
     Look { neg: bool, inner: Box<Node> },
+    /// A lookbehind `(?<=…)` / `(?<!…)` (`neg` for the negative form).
+    LookBehind { neg: bool, inner: Box<Node> },
     /// A backreference `\1`…`\9`.
     Backref(usize),
     /// A sequence of nodes.
@@ -285,8 +287,20 @@ impl Parser {
                     inner: Box::new(inner),
                 });
             } else if self.chars.get(self.pos + 1) == Some(&'<')
-                && !matches!(self.chars.get(self.pos + 2), Some('=' | '!'))
+                && matches!(self.chars.get(self.pos + 2), Some('=' | '!'))
             {
+                // `(?<= … )` / `(?<! … )` — lookbehind.
+                let neg = self.chars.get(self.pos + 2) == Some(&'!');
+                self.pos += 3; // `?<=` or `?<!`
+                let inner = self.parse_alt()?;
+                if !self.eat(')') {
+                    return Err(RegexError::new("unterminated lookbehind `(?<=`"));
+                }
+                return Ok(Node::LookBehind {
+                    neg,
+                    inner: Box::new(inner),
+                });
+            } else if self.chars.get(self.pos + 1) == Some(&'<') {
                 // `(?<name> … )` — a capturing group with a name.
                 self.pos += 2; // `?<`
                 let mut name = alloc::string::String::new();

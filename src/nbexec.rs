@@ -8210,6 +8210,19 @@ mod tests {
     }
 
     #[test]
+    fn regex_lookbehind() {
+        assert_eq!(run("/(?<=\\$)\\d+/.test('$100')"), "true");
+        assert_eq!(run("/(?<=\\$)\\d+/.test('100')"), "false");
+        assert_eq!(run("'$100'.match(/(?<=\\$)\\d+/)[0]"), "100");
+        assert_eq!(
+            run("'price: $50'.replace(/(?<=\\$)\\d+/, 'X')"),
+            "price: $X"
+        );
+        assert_eq!(run("/(?<!a)b/.test('ab')"), "false");
+        assert_eq!(run("/(?<!a)b/.test('xb')"), "true");
+    }
+
+    #[test]
     fn regex_lookahead_and_backref() {
         // Positive / negative lookahead (zero-width).
         assert_eq!(run("/foo(?=bar)/.test('foobar')"), "true");

@@ -100,6 +100,19 @@ impl Compiler {
                     prog: sub.prog,
                 });
             }
+            Node::LookBehind { neg, inner } => {
+                let mut sub = Compiler {
+                    prog: Vec::new(),
+                    groups: 0,
+                };
+                sub.compile(inner);
+                sub.emit(Inst::Match);
+                self.groups = self.groups.max(sub.groups);
+                self.emit(Inst::LookBehind {
+                    neg: *neg,
+                    prog: sub.prog,
+                });
+            }
             Node::Backref(n) => {
                 self.groups = self.groups.max(*n);
                 self.emit(Inst::Backref(*n));

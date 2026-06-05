@@ -25,6 +25,9 @@ pub(crate) enum Inst {
     /// A lookahead: run `prog` (a self-contained sub-program ending in `Match`)
     /// at the current position without consuming input. `neg` inverts the sense.
     Look { neg: bool, prog: Vec<Inst> },
+    /// A lookbehind: `prog` must match some substring ending exactly at the
+    /// current position. `neg` inverts the sense.
+    LookBehind { neg: bool, prog: Vec<Inst> },
     /// A backreference: match the text previously captured by group `n`.
     Backref(usize),
 }
@@ -60,7 +63,12 @@ pub(crate) fn run(
     flags: Flags,
 ) -> Option<Vec<Option<(usize, usize)>>> {
     let mut saves = alloc::vec![None; 2 * (group_count + 1)];
-    let ctx = Ctx { prog, input, flags };
+    let ctx = Ctx {
+        prog,
+        input,
+        flags,
+        match_end: None,
+    };
     if backtrack(&ctx, 0, start, &mut saves) {
         // Pair the raw save slots into (start, end) spans per group.
         let mut groups = Vec::with_capacity(group_count + 1);
@@ -80,6 +88,9 @@ struct Ctx<'a> {
     prog: &'a [Inst],
     input: &'a [char],
     flags: Flags,
+    /// When `Some(p)`, `Match` succeeds only at position `p` (for lookbehind,
+    /// which requires the sub-pattern to end exactly at the assertion point).
+    match_end: Option<usize>,
 }
 
 /// The recursive backtracking executor. `pc` is the program counter, `sp` the
@@ -87,7 +98,7 @@ struct Ctx<'a> {
 fn backtrack(ctx: &Ctx, mut pc: usize, mut sp: usize, saves: &mut Vec<Option<usize>>) -> bool {
     loop {
         match &ctx.prog[pc] {
-            Inst::Match => return true,
+            Inst::Match => return ctx.match_end.is_none_or(|p| sp == p),
             Inst::Char(c) => {
                 if sp < ctx.input.len() && char_eq(ctx.input[sp], *c, ctx.flags) {
                     sp += 1;
@@ -135,9 +146,33 @@ fn backtrack(ctx: &Ctx, mut pc: usize, mut sp: usize, saves: &mut Vec<Option<usi
                     prog,
                     input: ctx.input,
                     flags: ctx.flags,
+                    match_end: None,
                 };
                 let mut sub_saves = alloc::vec![None; saves.len()];
                 let matched = backtrack(&sub, 0, sp, &mut sub_saves);
+                if matched != *neg {
+                    pc += 1;
+                } else {
+                    return false;
+                }
+            }
+            Inst::LookBehind { neg, prog } => {
+                // The sub-pattern must match some substring ending exactly at
+                // `sp`; try every start position `j <= sp`.
+                let sub = Ctx {
+                    prog,
+                    input: ctx.input,
+                    flags: ctx.flags,
+                    match_end: Some(sp),
+                };
+                let mut matched = false;
+                for j in (0..=sp).rev() {
+                    let mut sub_saves = alloc::vec![None; saves.len()];
+                    if backtrack(&sub, 0, j, &mut sub_saves) {
+                        matched = true;
+                        break;
+                    }
+                }
                 if matched != *neg {
                     pc += 1;
                 } else {
