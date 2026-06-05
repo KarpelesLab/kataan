@@ -458,7 +458,8 @@ impl<'a> Interp<'a> {
                     if n.is_nan() {
                         return Ok(NanBox::number(f64::NAN));
                     }
-                    if n > m {
+                    // `+0` is treated as greater than `-0`.
+                    if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive()) {
                         m = n;
                     }
                 }
@@ -471,7 +472,8 @@ impl<'a> Interp<'a> {
                     if n.is_nan() {
                         return Ok(NanBox::number(f64::NAN));
                     }
-                    if n < m {
+                    // `-0` is treated as less than `+0`.
+                    if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative()) {
                         m = n;
                     }
                 }
@@ -3013,9 +3015,17 @@ impl<'a> Interp<'a> {
                 }
                 "indexOf" => {
                     let needle = self.realm.to_display_string(arg(0));
-                    let idx = s
+                    // An optional `fromIndex` (char offset) starts the search.
+                    let chars: Vec<char> = s.chars().collect();
+                    let from = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        0
+                    } else {
+                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(chars.len())
+                    };
+                    let byte_off: usize = chars[..from].iter().map(|c| c.len_utf8()).sum();
+                    let idx = s[byte_off..]
                         .find(&needle)
-                        .map_or(-1.0, |b| s[..b].chars().count() as f64);
+                        .map_or(-1.0, |b| s[..byte_off + b].chars().count() as f64);
                     Some(NanBox::number(idx))
                 }
                 "repeat" => {
@@ -7855,6 +7865,21 @@ mod tests {
             ),
             "5:hi:n"
         );
+    }
+
+    #[test]
+    fn math_minus_zero_indexof_fromindex_number_exponential() {
+        // Math.max/min treat +0 > -0.
+        assert_eq!(run("Object.is(Math.max(-0, 0), 0)"), "true");
+        assert_eq!(run("Object.is(Math.min(0, -0), -0)"), "true");
+        // String.indexOf honors fromIndex.
+        assert_eq!(run("'hello world'.indexOf('o', 5)"), "7");
+        assert_eq!(run("'hello world'.indexOf('o')"), "4");
+        // Number.toString exponential thresholds.
+        assert_eq!(run("(1e21).toString()"), "1e+21");
+        assert_eq!(run("(1e-7).toString()"), "1e-7");
+        assert_eq!(run("(1e20).toString()"), "100000000000000000000"); // not exponential
+        assert_eq!(run("(0.000001).toString()"), "0.000001"); // 1e-6 stays decimal
     }
 
     #[test]

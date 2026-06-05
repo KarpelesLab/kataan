@@ -1272,12 +1272,23 @@ impl Realm {
 /// `Display` (which omits a trailing `.0` for integers).
 #[must_use]
 pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
+    if n.is_nan() {
+        return "NaN".into();
+    }
     if n.is_infinite() {
-        if n > 0.0 {
-            "Infinity".into()
-        } else {
-            "-Infinity".into()
+        return if n > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    let abs = n.abs();
+    // JS uses exponential notation for magnitudes ≥ 1e21 or (nonzero) < 1e-6.
+    if abs != 0.0 && !(1e-6..1e21).contains(&abs) {
+        let s = alloc::format!("{n:e}"); // e.g. "1e21", "1.5e-7"
+        if let Some(epos) = s.find('e') {
+            let mant = &s[..epos];
+            let exp: i64 = s[epos + 1..].parse().unwrap_or(0);
+            let sign = if exp >= 0 { "+" } else { "-" };
+            return alloc::format!("{mant}e{sign}{}", exp.abs());
         }
+        s
     } else {
         alloc::format!("{n}")
     }
