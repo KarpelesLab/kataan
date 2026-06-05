@@ -3639,6 +3639,17 @@ impl<'a> Interp<'a> {
                     let bound: Vec<NanBox> = args.iter().skip(1).copied().collect();
                     return Ok(Some(self.make_bound_function(recv, this, bound)));
                 }
+                // A textual representation (the engine does not retain source).
+                "toString" | "toLocaleString" => {
+                    let nm = self.read_member(handle, "name")?;
+                    let nm = self.realm.to_display_string(nm);
+                    let s = if self.realm.class_at(handle).is_some() {
+                        alloc::format!("class {nm} {{ }}")
+                    } else {
+                        alloc::format!("function {nm}() {{ [native code] }}")
+                    };
+                    return Ok(Some(self.new_str(&s)));
+                }
                 _ => {}
             }
         }
@@ -5852,6 +5863,13 @@ impl<'a> Interp<'a> {
                 Some(e) => self.eval(e)?,
                 None => NanBox::undefined(),
             };
+            // An anonymous function/class assigned to a name takes that name
+            // (`const f = function(){}` → `f.name === "f"`).
+            if let (Some(init), BindingTarget::Ident(Ident { name, .. })) = (&d.init, &d.target)
+                && matches!(init, Expr::Function(_) | Expr::Class(_) | Expr::Arrow(_))
+            {
+                self.set_fn_name(value, name);
+            }
             // `var` assigns to its hoisted binding (in the function/program
             // scope), so a declaration inside a block updates the same variable.
             if is_var && let BindingTarget::Ident(Ident { name, .. }) = &d.target {
@@ -7018,6 +7036,13 @@ impl<'a> Interp<'a> {
                             }
                             let k = self.eval_prop_key(key)?;
                             let v = self.eval(value)?;
+                            // A method / function-valued property is named after its
+                            // (static) key when otherwise anonymous.
+                            if matches!(&**value, Expr::Function(_) | Expr::Arrow(_))
+                                && let PropertyKey::Ident(s) | PropertyKey::Str(s) = key
+                            {
+                                self.set_fn_name(v, s);
+                            }
                             self.realm.set_property(handle, &k, v);
                         }
                         // `{ ...src }` — copy own enumerable properties.
@@ -7152,6 +7177,9 @@ impl<'a> Interp<'a> {
     fn set_fn_name(&mut self, value: NanBox, name: &'a str) {
         if let Some(raw) = value.as_handle()
             && let Some((func_id, _)) = self.realm.function_at(Handle::from_raw(raw))
+            // Don't clobber a name the function already has (a named function
+            // expression keeps its own name over the binding/key name).
+            && self.functions[func_id as usize].name.is_empty()
         {
             self.functions[func_id as usize].name = name;
         }
@@ -7334,18 +7362,37 @@ impl<'a> Interp<'a> {
             return Ok(NanBox::handle(proto.to_raw()));
         }
         // A bound function's `name` is `"bound " + target.name` (recursing so a
-        // re-bound function reads `"bound bound …"`).
-        if name == "name"
+        // re-bound function reads `"bound bound …"`); its `length` is the target's
+        // length minus the bound arguments (floored at 0).
+        if matches!(name, "name" | "length")
             && let Some(target) = self.realm.get_property(handle, BOUND_TARGET)
         {
-            let tname = match target.as_handle().map(Handle::from_raw) {
-                Some(th) => {
-                    let v = self.read_member(th, "name")?;
-                    self.realm.to_display_string(v)
+            let th = target.as_handle().map(Handle::from_raw);
+            if name == "name" {
+                let tname = match th {
+                    Some(t) => {
+                        let v = self.read_member(t, "name")?;
+                        self.realm.to_display_string(v)
+                    }
+                    None => String::new(),
+                };
+                return Ok(self.new_str(&alloc::format!("bound {tname}")));
+            }
+            // `length`: target.length − number of pre-bound arguments.
+            let tlen = match th {
+                Some(t) => {
+                    let v = self.read_member(t, "length")?;
+                    self.realm.to_number(v)
                 }
-                None => String::new(),
+                None => 0.0,
             };
-            return Ok(self.new_str(&alloc::format!("bound {tname}")));
+            let bound = self
+                .realm
+                .get_property(handle, BOUND_ARGS)
+                .and_then(|a| a.as_handle().map(Handle::from_raw))
+                .and_then(|bh| self.realm.array_length(bh))
+                .unwrap_or(0);
+            return Ok(NanBox::number((tlen - bound as f64).max(0.0)));
         }
         // `obj.__proto__` reads the prototype link (unless shadowed by an own
         // data property of that name).
@@ -9533,6 +9580,25 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn function_names_tostring_bound() {
+        assert_eq!(run("let myFn=function(){}; myFn.name"), "myFn");
+        assert_eq!(run("let arrow=()=>1; arrow.name"), "arrow");
+        assert_eq!(run("let x=function inner(){}; x.name"), "inner");
+        assert_eq!(
+            run("let o={method(){},fn:()=>1}; o.method.name + ':' + o.fn.name"),
+            "method:fn"
+        );
+        assert_eq!(run("typeof (function f(){}).toString()"), "string");
+        assert_eq!(
+            run("(function f(){}).toString().indexOf('function')>=0"),
+            "true"
+        );
+        assert_eq!(run("function t(a,b,c){} t.bind(null,1).length"), "2");
+        assert_eq!(run("function t(a,b,c){} t.bind(null,1,2,3,4).length"), "0");
+        assert_eq!(run("function t(){} t.bind(null).name"), "bound t");
     }
 
     #[test]
