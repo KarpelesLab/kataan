@@ -225,6 +225,9 @@ const N_REFLECT_OWN_KEYS: u16 = 117;
 const N_REFLECT_DELETE: u16 = 118;
 const N_REFLECT_APPLY: u16 = 119;
 const N_REFLECT_CONSTRUCT: u16 = 120;
+const N_REFLECT_DEFINE_PROP: u16 = 135;
+const N_REFLECT_GET_OWN_DESC: u16 = 136;
+const N_REFLECT_GET_PROTO: u16 = 137;
 /// Bound native: the `revoke` function from `Proxy.revocable` (carries the proxy).
 const N_PROXY_REVOKE: u16 = 122;
 const N_SYMBOL: u16 = 38;
@@ -278,6 +281,8 @@ const N_MATH_HYPOT: u16 = 102;
 const N_MATH_CBRT: u16 = 103;
 const N_MATH_LOG2: u16 = 104;
 const N_MATH_LOG10: u16 = 105;
+const N_MATH_EXP: u16 = 133;
+const N_MATH_LOG: u16 = 134;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib.
@@ -354,6 +359,8 @@ impl<'a> Interp<'a> {
                 ("cbrt", N_MATH_CBRT),
                 ("log2", N_MATH_LOG2),
                 ("log10", N_MATH_LOG10),
+                ("exp", N_MATH_EXP),
+                ("log", N_MATH_LOG),
                 ("trunc", N_MATH_TRUNC),
             ],
         );
@@ -441,6 +448,9 @@ impl<'a> Interp<'a> {
                 ("set", N_REFLECT_SET),
                 ("has", N_REFLECT_HAS),
                 ("ownKeys", N_REFLECT_OWN_KEYS),
+                ("defineProperty", N_REFLECT_DEFINE_PROP),
+                ("getOwnPropertyDescriptor", N_REFLECT_GET_OWN_DESC),
+                ("getPrototypeOf", N_REFLECT_GET_PROTO),
                 ("deleteProperty", N_REFLECT_DELETE),
                 ("apply", N_REFLECT_APPLY),
                 ("construct", N_REFLECT_CONSTRUCT),
@@ -767,19 +777,33 @@ impl<'a> Interp<'a> {
             }
             N_REFLECT_SET => {
                 if let Some(raw) = arg(0).as_handle() {
-                    let key = self.member_key(arg(1));
-                    self.realm.set_property(Handle::from_raw(raw), &key, arg(2));
+                    // Via `assign_member_value` so array indices, setters, and
+                    // `length` resize behave like an ordinary assignment.
+                    self.assign_member_value(Handle::from_raw(raw), arg(1), arg(2))?;
                 }
                 NanBox::boolean(true)
             }
             N_REFLECT_HAS => {
+                // Like the `in` operator: own property or anywhere on the
+                // prototype chain (array indices bounds-checked).
                 let key = self.member_key(arg(1));
-                NanBox::boolean(
-                    arg(0)
-                        .as_handle()
-                        .map(Handle::from_raw)
-                        .is_some_and(|h| self.realm.has_own(h, &key) || self.realm.is_array(h)),
-                )
+                let mut present = false;
+                let mut cur = arg(0).as_handle().map(Handle::from_raw);
+                while let Some(c) = cur {
+                    let here = if let Some(len) = self.realm.array_length(c) {
+                        key == "length"
+                            || key.parse::<usize>().is_ok_and(|i| i < len)
+                            || self.realm.has_own(c, &key)
+                    } else {
+                        self.realm.has_own(c, &key)
+                    };
+                    if here {
+                        present = true;
+                        break;
+                    }
+                    cur = self.realm.object_proto(c);
+                }
+                NanBox::boolean(present)
             }
             N_REFLECT_DELETE => {
                 if let Some(raw) = arg(0).as_handle() {
@@ -796,6 +820,34 @@ impl<'a> Interp<'a> {
                 let boxed: Vec<NanBox> = names.iter().map(|k| self.new_str(k)).collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
+            // `Reflect.defineProperty(obj, key, desc)` → bool.
+            N_REFLECT_DEFINE_PROP => {
+                let done = if let (Some(obj), Some(desc)) = (
+                    arg(0).as_handle().map(Handle::from_raw),
+                    arg(2).as_handle().map(Handle::from_raw),
+                ) {
+                    let key = self.realm.to_display_string(arg(1));
+                    self.apply_descriptor(obj, &key, desc);
+                    true
+                } else {
+                    false
+                };
+                NanBox::boolean(done)
+            }
+            // `Reflect.getOwnPropertyDescriptor(obj, key)`.
+            N_REFLECT_GET_OWN_DESC => match arg(0).as_handle().map(Handle::from_raw) {
+                Some(obj) => {
+                    let key = self.realm.to_display_string(arg(1));
+                    self.build_descriptor(obj, &key)
+                        .unwrap_or(NanBox::undefined())
+                }
+                None => NanBox::undefined(),
+            },
+            // `Reflect.getPrototypeOf(obj)`.
+            N_REFLECT_GET_PROTO => arg(0)
+                .as_handle()
+                .and_then(|raw| self.realm.object_proto(Handle::from_raw(raw)))
+                .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())),
             N_REFLECT_APPLY => {
                 let list = match arg(2).as_handle().map(Handle::from_raw) {
                     Some(h) => self
@@ -877,6 +929,13 @@ impl<'a> Interp<'a> {
                 if let Some(t) = target.as_handle().map(Handle::from_raw) {
                     for src in &args[1.min(args.len())..] {
                         if let Some(sh) = src.as_handle().map(Handle::from_raw) {
+                            // An array source contributes its indexed elements.
+                            if let Some(elems) = self.realm.array_elements(sh).map(<[_]>::to_vec) {
+                                for (i, e) in elems.iter().enumerate() {
+                                    self.realm.set_property(t, &alloc::format!("{i}"), *e);
+                                }
+                                continue;
+                            }
                             // Data keys plus accessor (getter) keys, read via
                             // `read_member` so getters are invoked.
                             let keys = self.realm.object_keys(sh).unwrap_or_default();
@@ -1015,8 +1074,12 @@ impl<'a> Interp<'a> {
             N_MATH_LOG2 => NanBox::number(self.realm.to_number(arg(0)).log2()),
             #[cfg(feature = "std")]
             N_MATH_LOG10 => NanBox::number(self.realm.to_number(arg(0)).log10()),
+            #[cfg(feature = "std")]
+            N_MATH_EXP => NanBox::number(self.realm.to_number(arg(0)).exp()),
+            #[cfg(feature = "std")]
+            N_MATH_LOG => NanBox::number(self.realm.to_number(arg(0)).ln()),
             #[cfg(not(feature = "std"))]
-            N_MATH_HYPOT | N_MATH_CBRT | N_MATH_LOG2 | N_MATH_LOG10 => {
+            N_MATH_HYPOT | N_MATH_CBRT | N_MATH_LOG2 | N_MATH_LOG10 | N_MATH_EXP | N_MATH_LOG => {
                 return Err(ExecError::Unsupported("Math fns need std"));
             }
             N_PARSE_FLOAT => {
@@ -8717,6 +8780,36 @@ mod tests {
             "false"
         );
         assert_eq!(run("new WeakRef([1,2,3]).deref().length"), "3");
+    }
+
+    #[test]
+    fn math_exp_log_reflect_assign_array() {
+        // Math.exp / Math.log.
+        assert_eq!(run("Math.round(Math.exp(0))"), "1");
+        assert_eq!(run("Math.round(Math.log(Math.E))"), "1");
+        // Object.assign spreads an array source's indices.
+        assert_eq!(
+            run(
+                "let o=Object.assign({}, ['a','b','c']); o[0] + o[2] + ':' + Object.keys(o).join(',')"
+            ),
+            "ac:0,1,2"
+        );
+        // Reflect.has walks the chain; Reflect.set updates array storage.
+        assert_eq!(run("Reflect.has(Object.create({k:1}), 'k')"), "true");
+        assert_eq!(
+            run("let a=[1,2,3]; Reflect.set(a, 3, 4); a[3] + ':' + a.length"),
+            "4:4"
+        );
+        assert_eq!(
+            run("Reflect.defineProperty({}, 'x', {value:5}) === true"),
+            "true"
+        );
+        assert_eq!(
+            run(
+                "let o={}; Reflect.defineProperty(o,'x',{value:9,enumerable:true}); Reflect.getOwnPropertyDescriptor(o,'x').value"
+            ),
+            "9"
+        );
     }
 
     #[test]
