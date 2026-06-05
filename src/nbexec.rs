@@ -6311,7 +6311,11 @@ impl<'a> Interp<'a> {
             }
             UnaryOp::Void => NanBox::undefined(),
             #[cfg(feature = "std")]
-            UnaryOp::BitNot => self.realm.bit_not(v),
+            UnaryOp::BitNot => {
+                // ToPrimitive(Number) first, so `~obj` honors a user `valueOf`.
+                let p = self.coerce_object(v, "number")?;
+                self.realm.bit_not(p)
+            }
             #[cfg(not(feature = "std"))]
             UnaryOp::BitNot => return Err(ExecError::Unsupported("~ needs std")),
             UnaryOp::Delete => return Err(ExecError::Unsupported("delete")),

@@ -541,6 +541,47 @@ fn loose_eq_coerce(realm: &mut Realm, x: NanBox, y: NanBox) -> (NanBox, NanBox) 
     }
 }
 
+/// ECMAScript ToPrimitive for the bytecode VM's operators: for a plain object
+/// carrying a user-defined `valueOf`/`toString`, calls it (in the hint's order)
+/// and returns the primitive result. Non-objects, strings, Dates, and objects
+/// without a usable own method are returned unchanged (the realm then applies its
+/// default coercion). Keeps numeric fast paths cheap: a non-handle returns at once.
+fn to_primitive(ctx: &mut Ctx, funcs: &[FnProto], v: NanBox, number_hint: bool) -> NanBox {
+    let Some(raw) = v.as_handle() else {
+        return v;
+    };
+    let h = Handle::from_raw(raw);
+    if ctx.realm.string_value(h).is_some() || ctx.realm.date_at(h).is_some() {
+        return v;
+    }
+    let order: [&str; 2] = if number_hint {
+        ["valueOf", "toString"]
+    } else {
+        ["toString", "valueOf"]
+    };
+    for name in order {
+        if let Some(method) = ctx.realm.get_property(h, name)
+            && method.as_handle().is_some()
+            && let Ok(res) = call_closure(ctx, funcs, method, &[], v)
+        {
+            use crate::nanbox::Unpacked;
+            let is_prim = res.as_number().is_some()
+                || matches!(
+                    res.unpack(),
+                    Unpacked::Bool(_) | Unpacked::Null | Unpacked::Undefined
+                )
+                || res
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|rh| ctx.realm.string_value(rh).is_some());
+            if is_prim {
+                return res;
+            }
+        }
+    }
+    v
+}
+
 fn make_error(realm: &mut Realm, name: &str, message: &str) -> NanBox {
     let obj = realm.new_object();
     let n = NanBox::handle(realm.new_string(name).to_raw());
@@ -813,18 +854,27 @@ fn run_frame(
             }
             // Use the realm's arithmetic (ToNumber on each operand, which applies
             // ToPrimitive to objects) so `[5] - 2` is `3` natively, without an
-            // error-driven fall back to the tree-walker.
+            // error-driven fall back to the tree-walker. A user `valueOf`/
+            // `toString` is honored first via `to_primitive`.
             Op::Sub { dst, a, b } => {
-                regs[*dst as usize] = ctx.realm.sub(regs[*a as usize], regs[*b as usize]);
+                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
+                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                regs[*dst as usize] = ctx.realm.sub(x, y);
             }
             Op::Mul { dst, a, b } => {
-                regs[*dst as usize] = ctx.realm.mul(regs[*a as usize], regs[*b as usize]);
+                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
+                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                regs[*dst as usize] = ctx.realm.mul(x, y);
             }
             Op::Div { dst, a, b } => {
-                regs[*dst as usize] = ctx.realm.div(regs[*a as usize], regs[*b as usize]);
+                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
+                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                regs[*dst as usize] = ctx.realm.div(x, y);
             }
             Op::Mod { dst, a, b } => {
-                regs[*dst as usize] = ctx.realm.rem(regs[*a as usize], regs[*b as usize]);
+                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
+                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                regs[*dst as usize] = ctx.realm.rem(x, y);
             }
             Op::HasProp { dst, key, obj } => {
                 let present = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
@@ -897,7 +947,8 @@ fn run_frame(
             }
             #[cfg(feature = "std")]
             Op::BitNot { dst, a } => {
-                regs[*dst as usize] = ctx.realm.bit_not(regs[*a as usize]);
+                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
+                regs[*dst as usize] = ctx.realm.bit_not(x);
             }
             #[cfg(not(feature = "std"))]
             Op::BitNot { dst, .. } => regs[*dst as usize] = NanBox::number(f64::NAN),
@@ -911,26 +962,30 @@ fn run_frame(
                         let r = ctx.realm.loose_equals(xc, yc);
                         NanBox::boolean(if *op == VB_LOOSE_EQ { r } else { !r })
                     }
-                    // `**` and bitwise need the realm's `std`-gated math.
+                    // `**`/bitwise/shifts are numeric: ToPrimitive each operand
+                    // (honoring a user `valueOf`) before the realm's `std`-gated math.
                     #[cfg(feature = "std")]
-                    VB_POW => ctx.realm.pow(x, y),
-                    #[cfg(feature = "std")]
-                    VB_BIT_AND => ctx.realm.bit_and(x, y),
-                    #[cfg(feature = "std")]
-                    VB_BIT_OR => ctx.realm.bit_or(x, y),
-                    #[cfg(feature = "std")]
-                    VB_BIT_XOR => ctx.realm.bit_xor(x, y),
-                    #[cfg(feature = "std")]
-                    VB_SHL => ctx.realm.shl(x, y),
-                    #[cfg(feature = "std")]
-                    VB_SHR => ctx.realm.shr(x, y),
-                    #[cfg(feature = "std")]
-                    VB_USHR => ctx.realm.ushr(x, y),
+                    _ => {
+                        let xn = to_primitive(ctx, funcs, x, true);
+                        let yn = to_primitive(ctx, funcs, y, true);
+                        match *op {
+                            VB_POW => ctx.realm.pow(xn, yn),
+                            VB_BIT_AND => ctx.realm.bit_and(xn, yn),
+                            VB_BIT_OR => ctx.realm.bit_or(xn, yn),
+                            VB_BIT_XOR => ctx.realm.bit_xor(xn, yn),
+                            VB_SHL => ctx.realm.shl(xn, yn),
+                            VB_SHR => ctx.realm.shr(xn, yn),
+                            VB_USHR => ctx.realm.ushr(xn, yn),
+                            _ => NanBox::number(f64::NAN),
+                        }
+                    }
+                    #[cfg(not(feature = "std"))]
                     _ => NanBox::number(f64::NAN),
                 };
             }
             Op::Neg { dst, a } => {
-                regs[*dst as usize] = NanBox::number(-num(regs[*a as usize])?);
+                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
+                regs[*dst as usize] = ctx.realm.neg(x);
             }
             Op::Not { dst, a } => {
                 regs[*dst as usize] = NanBox::boolean(!ctx.realm.truthy(regs[*a as usize]));
@@ -939,10 +994,17 @@ fn run_frame(
             Op::Lt { dst, a, b } => {
                 // Use the realm's relational comparison so strings and objects
                 // (ToPrimitive) work natively instead of erroring into a fallback.
-                regs[*dst as usize] = ctx.realm.less_than(regs[*a as usize], regs[*b as usize]);
+                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
+                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                regs[*dst as usize] = ctx.realm.less_than(x, y);
             }
             Op::AddValue { dst, a, b } => {
-                regs[*dst as usize] = ctx.realm.add(regs[*a as usize], regs[*b as usize]);
+                // `+` uses ToPrimitive (default hint) on each operand — honoring a
+                // user `valueOf`/`toString` — then `realm.add` picks string
+                // concatenation vs numeric addition from the resulting primitives.
+                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
+                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                regs[*dst as usize] = ctx.realm.add(x, y);
             }
             Op::StrictEq { dst, a, b } => {
                 regs[*dst as usize] = NanBox::boolean(
@@ -4396,8 +4458,16 @@ impl Compiler {
                     crate::ast::UpdateOp::Inc => BinaryOp::Add,
                     crate::ast::UpdateOp::Dec => BinaryOp::Sub,
                 };
-                // Keep the pre-update value for a postfix result.
-                let cur = self.read_var(b);
+                // `++`/`--` operate on `ToNumber(x)`, so coerce first: this makes
+                // `"5"++` yield 5 then 6 (numeric) rather than the string concat
+                // `"51"`, and the postfix result is the coerced number.
+                let raw = self.read_var(b);
+                let cur = self.alloc();
+                self.ops.push(Op::CallNative {
+                    dst: cur,
+                    native: NB_NUMBER,
+                    args: alloc::vec![raw],
+                });
                 let old = self.alloc();
                 self.ops.push(Op::Move { dst: old, src: cur });
                 let next = self.emit_binop(bop, cur, one)?;
@@ -5076,6 +5146,20 @@ mod tests {
         let mut realm = Realm::new();
         let value = compile_and_run(&mut realm, &program).expect("compile+run");
         realm.to_display_string(value)
+    }
+
+    #[test]
+    fn bytecode_valueof_in_operators() {
+        // User valueOf/toString honored in the bytecode VM's operators.
+        assert_eq!(bc("let m={valueOf(){return 5;}}; m - 2"), "3");
+        assert_eq!(bc("let m={valueOf(){return 5;}}; m + 1"), "6");
+        assert_eq!(bc("let m={valueOf(){return 5;}}; ~m"), "-6");
+        assert_eq!(bc("let m={valueOf(){return 5;}}; -m"), "-5");
+        assert_eq!(bc("let m={valueOf(){return 5;}}; m & 3"), "1");
+        assert_eq!(bc("let s={toString(){return 'x';}}; s + '!'"), "x!");
+        // Increment/decrement are numeric.
+        assert_eq!(bc("let x='5'; ++x"), "6");
+        assert_eq!(bc("let x='3'; let y=x++; y + ',' + x"), "3,4");
     }
 
     #[test]
