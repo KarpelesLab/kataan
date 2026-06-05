@@ -5168,6 +5168,76 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Reads a member by an already-evaluated key value (an array index when the
+    /// key is a numeric index and the receiver is an array, else a named read).
+    fn read_member_value(
+        &mut self,
+        handle: crate::heap::Handle,
+        key: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        if let Some(i) = key.as_number().and_then(as_index)
+            && self.realm.is_array(handle)
+        {
+            return Ok(self.realm.get_element(handle, i));
+        }
+        let name = self.member_key(key);
+        self.read_member(handle, &name)
+    }
+
+    /// Assigns a member by an already-evaluated key value (used when the target's
+    /// computed key must be resolved before the RHS, per spec evaluation order).
+    /// Mirrors `assign_member`'s proxy / array-index / setter / length handling.
+    fn assign_member_value(
+        &mut self,
+        handle: crate::heap::Handle,
+        key: NanBox,
+        new: NanBox,
+    ) -> Result<(), ExecError> {
+        // Proxy `set` trap (or forward to the target).
+        if let Some((target, handler)) = self.realm.proxy_at(handle) {
+            self.guard_revoked(handle)?;
+            let trap = self
+                .realm
+                .get_property(handler, "set")
+                .unwrap_or(NanBox::undefined());
+            if trap
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let name = self.member_key(key);
+                let key_box = self.new_str(&name);
+                let recv = NanBox::handle(handle.to_raw());
+                self.call(trap, &[NanBox::handle(target.to_raw()), key_box, new, recv])?;
+                return Ok(());
+            }
+            return self.assign_member_value(target, key, new);
+        }
+        // A numeric index addresses array storage directly.
+        if let Some(i) = key.as_number().and_then(as_index)
+            && self.realm.is_array(handle)
+        {
+            self.realm.set_element(handle, i, new);
+            return Ok(());
+        }
+        let name = self.member_key(key);
+        // An accessor setter takes precedence.
+        if let Some((_, setter)) = self.realm.accessor(handle, &name) {
+            if !matches!(setter.unpack(), Unpacked::Undefined) {
+                let this = NanBox::handle(handle.to_raw());
+                self.call_with_this(setter, this, &[new])?;
+            }
+            return Ok(());
+        }
+        // `arr.length = n` resizes the array.
+        if name == "length" && self.realm.is_array(handle) {
+            let n = self.realm.to_number(new).max(0.0) as usize;
+            self.realm.set_array_length(handle, n);
+        } else {
+            self.realm.set_property(handle, &name, new);
+        }
+        Ok(())
+    }
+
     /// Reads a named member, honoring class statics and accessor getters before
     /// ordinary property/length access.
     fn read_member(
@@ -5373,6 +5443,30 @@ impl<'a> Interp<'a> {
             let rhs = self.eval(value)?;
             self.assign_to(target, rhs)?;
             return Ok(rhs);
+        }
+        // A computed-member target evaluates the object and key *before* the RHS
+        // (spec order): `arr[i] = i = 1` writes the original `arr[i]`.
+        if let Expr::Member {
+            object,
+            property: PropertyKey::Computed(key_expr),
+            ..
+        } = target
+        {
+            let obj = self.eval(object)?;
+            let Some(raw) = obj.as_handle() else {
+                return Err(ExecError::Unsupported("member assign to non-object"));
+            };
+            let handle = crate::heap::Handle::from_raw(raw);
+            let key = self.eval(key_expr)?;
+            let new = if op == AssignOp::Assign {
+                self.eval(value)?
+            } else {
+                let current = self.read_member_value(handle, key)?;
+                let rhs = self.eval(value)?;
+                self.binary(compound_op(op)?, current, rhs)?
+            };
+            self.assign_member_value(handle, key, new)?;
+            return Ok(new);
         }
         let rhs = self.eval(value)?;
         // Destructuring assignment: `[a, b] = …` / `({ x } = …)`.
@@ -7836,6 +7930,20 @@ mod tests {
             run("'hello'.includes('lo', 3) + ':' + 'hello'.includes('he', 1)"),
             "true:false"
         );
+    }
+
+    #[test]
+    fn computed_member_assignment_eval_order() {
+        // The index is resolved before the RHS (which mutates it).
+        assert_eq!(
+            run("let a=[0,0]; let i=0; a[i] = i = 1; a[0] + ',' + a[1]"),
+            "1,0"
+        );
+        // Compound assignment on a computed element still works.
+        assert_eq!(run("let a=[1,2,3]; a[1] *= 10; a.join(',')"), "1,20,3");
+        assert_eq!(run("let o={x:5}; let k='x'; o[k] += 3; o.x"), "8");
+        // Computed key honoring a setter.
+        assert_eq!(run("let o={set v(n){this._v=n*2;}}; o['v']=10; o._v"), "20");
     }
 
     #[test]
