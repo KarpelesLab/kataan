@@ -769,7 +769,7 @@ impl<'a> Interp<'a> {
                     && let Some(draw) = arg(2).as_handle()
                 {
                     let obj = Handle::from_raw(oraw);
-                    let key = self.realm.to_display_string(arg(1));
+                    let key = self.member_key(arg(1));
                     self.apply_descriptor(obj, &key, Handle::from_raw(draw))?;
                 }
                 arg(0)
@@ -916,7 +916,7 @@ impl<'a> Interp<'a> {
                     arg(0).as_handle().map(Handle::from_raw),
                     arg(2).as_handle().map(Handle::from_raw),
                 ) {
-                    let key = self.realm.to_display_string(arg(1));
+                    let key = self.member_key(arg(1));
                     self.apply_descriptor(obj, &key, desc)?;
                     true
                 } else {
@@ -927,7 +927,7 @@ impl<'a> Interp<'a> {
             // `Reflect.getOwnPropertyDescriptor(obj, key)`.
             N_REFLECT_GET_OWN_DESC => match arg(0).as_handle().map(Handle::from_raw) {
                 Some(obj) => {
-                    let key = self.realm.to_display_string(arg(1));
+                    let key = self.member_key(arg(1));
                     self.build_descriptor(obj, &key)
                         .unwrap_or(NanBox::undefined())
                 }
@@ -962,7 +962,7 @@ impl<'a> Interp<'a> {
             }
             N_OBJECT_GET_OWN_DESC => match arg(0).as_handle().map(Handle::from_raw) {
                 Some(obj) => {
-                    let key = self.realm.to_display_string(arg(1));
+                    let key = self.member_key(arg(1));
                     self.build_descriptor(obj, &key)
                         .unwrap_or(NanBox::undefined())
                 }
@@ -1001,7 +1001,9 @@ impl<'a> Interp<'a> {
                 let mut syms = Vec::new();
                 if let Some(raw) = arg(0).as_handle() {
                     let h = Handle::from_raw(raw);
-                    for k in self.realm.object_keys_with_symbols(h) {
+                    // All own symbol keys, including non-enumerable ones (e.g. a
+                    // symbol defined via `Object.defineProperty`).
+                    for k in self.realm.object_all_keys(h) {
                         if let Some(idstr) = k.strip_prefix("\u{0}sym:")
                             && let Ok(id) = idstr.parse::<u64>()
                             && let Some(sh) = self.realm.symbol_for_id(id)
@@ -9982,6 +9984,40 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn define_property_with_symbol_key() {
+        assert_eq!(
+            run("let s=Symbol('k'); let o={}; Object.defineProperty(o,s,{value:42}); o[s]"),
+            "42"
+        );
+        assert_eq!(
+            run(
+                "let s=Symbol('k'); let o={}; Object.defineProperty(o,s,{value:42}); Object.getOwnPropertyDescriptor(o,s).value"
+            ),
+            "42"
+        );
+        // A non-enumerable symbol (defineProperty's default) still appears here.
+        assert_eq!(
+            run(
+                "let s=Symbol('k'); let o={}; Object.defineProperty(o,s,{value:42}); Object.getOwnPropertySymbols(o).length"
+            ),
+            "1"
+        );
+        // A symbol-keyed accessor.
+        assert_eq!(
+            run(
+                "let s=Symbol('a'); let o={}; let v=0; Object.defineProperty(o,s,{get(){return v;},set(n){v=n;}}); o[s]=7; o[s]"
+            ),
+            "7"
+        );
+        assert_eq!(
+            run(
+                "let s=Symbol('r'); let o={}; Reflect.defineProperty(o,s,{value:9}); Reflect.getOwnPropertyDescriptor(o,s).value"
+            ),
+            "9"
+        );
     }
 
     #[test]

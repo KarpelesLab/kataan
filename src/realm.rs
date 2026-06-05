@@ -474,6 +474,22 @@ impl Realm {
             .unwrap_or_default()
     }
 
+    /// All own property keys (data and accessor, including non-enumerable) —
+    /// for reflection that ignores enumerability (`getOwnPropertySymbols`).
+    #[must_use]
+    pub fn object_all_keys(&self, handle: Handle) -> Vec<alloc::string::String> {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_object)
+            .map(|obj| {
+                obj.all_keys()
+                    .iter()
+                    .map(|s| alloc::string::String::from(*s))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The names of the object's accessor (getter/setter) properties.
     #[must_use]
     pub fn object_accessor_keys(&self, handle: Handle) -> Vec<alloc::string::String> {

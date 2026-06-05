@@ -195,6 +195,16 @@ impl Object {
         self.shape.keys()
     }
 
+    /// All own property names — data and accessor, including non-enumerable — in
+    /// insertion order. For reflection that ignores enumerability (e.g.
+    /// `Object.getOwnPropertySymbols`).
+    #[must_use]
+    pub fn all_keys(&self) -> Vec<&str> {
+        let mut keys = self.shape.keys();
+        keys.extend(self.accessors.iter().map(|(k, _, _)| k.as_ref()));
+        keys
+    }
+
     /// The own **enumerable** property names (excludes keys marked hidden), in
     /// spec order: integer-index keys ascending, then the rest in insertion order.
     #[must_use]
