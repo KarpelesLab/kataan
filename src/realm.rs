@@ -50,6 +50,11 @@ pub struct Realm {
     /// moving collection; distinct closures sharing an id share a prototype — a
     /// bounded approximation, see `[[latent-engine-conformance-bugs]]`.)
     fn_protos: alloc::collections::BTreeMap<u32, Handle>,
+    /// Auxiliary named-property objects for non-object cells (arrays, functions),
+    /// which have no inline object part. Keyed by the cell's handle. Not a GC root
+    /// and not relocated on a moving collection — sound only because collection is
+    /// never driven mid-execution (see `[[latent-engine-conformance-bugs]]`).
+    aux_props: alloc::collections::BTreeMap<u64, Handle>,
 }
 
 impl Default for Realm {
@@ -69,7 +74,18 @@ impl Realm {
             incremental: None,
             next_symbol_id: 1,
             fn_protos: alloc::collections::BTreeMap::new(),
+            aux_props: alloc::collections::BTreeMap::new(),
         }
+    }
+
+    /// The auxiliary property object for a non-object cell, created on first use.
+    fn aux_object(&mut self, handle: Handle) -> Handle {
+        if let Some(h) = self.aux_props.get(&handle.to_raw()) {
+            return *h;
+        }
+        let obj = self.new_object();
+        self.aux_props.insert(handle.to_raw(), obj);
+        obj
     }
 
     /// The `.prototype` object for the constructor function with id `func_id`,
@@ -547,7 +563,12 @@ impl Realm {
     /// the property is absent, the cell is not an object, or the handle is stale.
     #[must_use]
     pub fn get_property(&self, handle: Handle, key: &str) -> Option<NanBox> {
-        self.heap.get(handle)?.as_object()?.get(key)
+        if let Some(o) = self.heap.get(handle)?.as_object() {
+            return o.get(key);
+        }
+        // A non-object cell (array/function): look in its auxiliary props.
+        let aux = self.aux_props.get(&handle.to_raw())?;
+        self.heap.get(*aux)?.as_object()?.get(key)
     }
 
     /// Tags the object at `handle` with the class it was constructed from.
@@ -577,10 +598,15 @@ impl Realm {
     /// accessors) — the `in` operator.
     #[must_use]
     pub fn has_own(&self, handle: Handle, key: &str) -> bool {
-        self.heap
-            .get(handle)
+        if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
+            return o.contains(key) || o.accessor(key).is_some();
+        }
+        // A non-object cell: check its auxiliary props.
+        self.aux_props
+            .get(&handle.to_raw())
+            .and_then(|aux| self.heap.get(*aux))
             .and_then(Cell::as_object)
-            .is_some_and(|o| o.contains(key) || o.accessor(key).is_some())
+            .is_some_and(|o| o.contains(key))
     }
 
     /// Defines an accessor (getter/setter) property on the object at `handle`.
@@ -599,14 +625,26 @@ impl Realm {
     /// Sets own property `key` to `value` on the object at `handle`. Returns
     /// `false` if the handle is stale or the cell is not an object.
     pub fn set_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
-        match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
-            Some(obj) => {
-                obj.set(key, value);
-                self.write_barrier(handle, value);
-                true
-            }
-            None => false,
+        if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            obj.set(key, value);
+            self.write_barrier(handle, value);
+            return true;
         }
+        // Only arrays and functions carry auxiliary named properties; other
+        // primitives (strings, numbers, …) reject property writes.
+        let aux_eligible = self
+            .heap
+            .get(handle)
+            .is_some_and(|c| c.as_array().is_some() || c.as_function().is_some());
+        if aux_eligible {
+            let aux = self.aux_object(handle);
+            if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                o.set(key, value);
+            }
+            self.write_barrier(aux, value);
+            return true;
+        }
+        false
     }
 
     /// Sets own property `key` to `value` but marks it **non-enumerable** — used

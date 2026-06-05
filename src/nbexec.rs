@@ -4246,10 +4246,13 @@ impl<'a> Interp<'a> {
                     .iter()
                     .map(|q| self.new_str(q.cooked.as_deref().unwrap_or("")))
                     .collect();
-                // NOTE: the strings object should also carry a `.raw` array, but
-                // arrays can't hold named properties yet (`Cell::Array` has no
-                // object part) — see `[[latent-engine-conformance-bugs]]`.
-                let strings_arr = NanBox::handle(self.realm.new_array(strings).to_raw());
+                let raw: Vec<NanBox> = quasi.quasis.iter().map(|q| self.new_str(&q.raw)).collect();
+                let strings_h = self.realm.new_array(strings);
+                // The strings object carries a `.raw` array (for `String.raw` and
+                // tags reading `strings.raw`).
+                let raw_arr = NanBox::handle(self.realm.new_array(raw).to_raw());
+                self.realm.set_property(strings_h, "raw", raw_arr);
+                let strings_arr = NanBox::handle(strings_h.to_raw());
                 let mut args = alloc::vec![strings_arr];
                 for e in &quasi.expressions {
                     args.push(self.eval(e)?);
@@ -6661,6 +6664,18 @@ mod tests {
         );
         assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
         assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
+    }
+
+    #[test]
+    fn array_and_function_named_properties() {
+        assert_eq!(
+            run("let a=[1,2,3]; a.tag='x'; a.tag + ':' + a.length + ':' + a[0]"),
+            "x:3:1"
+        );
+        assert_eq!(run("let a=[1]; a.tag='y'; a.hasOwnProperty('tag')"), "true");
+        assert_eq!(run("function f(){} f.meta=42; f.meta"), "42");
+        // Tagged template strings carry `.raw`.
+        assert_eq!(run("function t(s){ return s.raw[0]; } t`a\\tb`"), "a\\tb");
     }
 
     #[test]
