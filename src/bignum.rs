@@ -280,6 +280,71 @@ impl BigInt {
         Some((quot, rem))
     }
 
+    /// The two's-complement limb representation over `width` limbs (negative
+    /// values are sign-extended with infinite leading 1s, truncated to `width`).
+    fn to_twos(&self, width: usize) -> Vec<u32> {
+        let mut v = self.mag.clone();
+        v.resize(width, 0);
+        if self.negative {
+            for limb in &mut v {
+                *limb = !*limb;
+            }
+            let mut carry = 1u64;
+            for limb in &mut v {
+                let s = u64::from(*limb) + carry;
+                *limb = s as u32;
+                carry = s >> 32;
+            }
+        }
+        v
+    }
+
+    /// Reconstructs a signed value from a two's-complement limb vector.
+    fn from_twos(mut v: Vec<u32>, negative: bool) -> Self {
+        if negative {
+            for limb in &mut v {
+                *limb = !*limb;
+            }
+            let mut carry = 1u64;
+            for limb in &mut v {
+                let s = u64::from(*limb) + carry;
+                *limb = s as u32;
+                carry = s >> 32;
+            }
+        }
+        Self { negative, mag: v }.normalized()
+    }
+
+    /// Applies a limb-wise bitwise op under arbitrary-precision two's-complement
+    /// semantics (so negative operands behave as infinite-width).
+    fn bit_op(&self, other: &Self, f: impl Fn(u32, u32) -> u32) -> Self {
+        let width = self.mag.len().max(other.mag.len()) + 1;
+        let a = self.to_twos(width);
+        let b = other.to_twos(width);
+        let out: Vec<u32> = a.iter().zip(&b).map(|(&x, &y)| f(x, y)).collect();
+        // The sign of the result is the op applied to each operand's sign bit.
+        let negative = f(u32::from(self.negative), u32::from(other.negative)) & 1 == 1;
+        Self::from_twos(out, negative)
+    }
+
+    /// Bitwise AND (two's-complement).
+    #[must_use]
+    pub fn bitand(&self, other: &Self) -> Self {
+        self.bit_op(other, |a, b| a & b)
+    }
+
+    /// Bitwise OR (two's-complement).
+    #[must_use]
+    pub fn bitor(&self, other: &Self) -> Self {
+        self.bit_op(other, |a, b| a | b)
+    }
+
+    /// Bitwise XOR (two's-complement).
+    #[must_use]
+    pub fn bitxor(&self, other: &Self) -> Self {
+        self.bit_op(other, |a, b| a ^ b)
+    }
+
     /// Returns `self ** exp` (non-negative exponent) by binary exponentiation.
     #[must_use]
     pub fn pow(&self, mut exp: u64) -> Self {
@@ -453,6 +518,20 @@ mod tests {
             BigInt::from_str_radix("-1010", 2).unwrap().to_string(),
             "-10"
         );
+    }
+
+    #[test]
+    fn bitwise_twos_complement() {
+        assert_eq!(b("12").bitand(&b("10")).to_string(), "8");
+        assert_eq!(b("12").bitor(&b("10")).to_string(), "14");
+        assert_eq!(b("12").bitxor(&b("10")).to_string(), "6");
+        // Negative operands follow two's-complement semantics.
+        assert_eq!(b("-1").bitand(&b("12")).to_string(), "12"); // -1 is all ones
+        assert_eq!(b("-12").bitor(&b("10")).to_string(), "-2");
+        assert_eq!(b("-5").bitxor(&b("3")).to_string(), "-8");
+        // Beyond i128 width.
+        let big = b("2").pow(200);
+        assert_eq!(big.bitor(&BigInt::from_i128(1)).sub(&big).to_string(), "1");
     }
 
     #[test]

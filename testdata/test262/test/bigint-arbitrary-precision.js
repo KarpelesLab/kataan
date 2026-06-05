@@ -13,3 +13,9 @@ assert.sameValue((2n ** 128n) - 1n, 340282366920938463463374607431768211455n);
 assert.sameValue((-(2n ** 100n)).toString(), "-1267650600228229401496703205376");
 assert.sameValue((10n ** 30n) % 7n, 1n);
 assert.sameValue((2n ** 256n) > (2n ** 255n), true);
+// Two's-complement bitwise at arbitrary precision.
+assert.sameValue(12n & 10n, 8n);
+assert.sameValue(12n | 10n, 14n);
+assert.sameValue(12n ^ 10n, 6n);
+assert.sameValue(-1n & 255n, 255n, "-1n is all ones");
+assert.sameValue(((2n ** 100n) | 1n) - (2n ** 100n), 1n, "bitor beyond i128");

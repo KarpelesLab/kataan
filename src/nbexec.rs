@@ -5080,19 +5080,10 @@ impl<'a> Interp<'a> {
                     let e = y.to_i128().and_then(|v| u64::try_from(v).ok()).unwrap_or(0);
                     val(self, x.pow(e))
                 }
-                // Bitwise ops are defined via i128 when both fit (the common
-                // case); arbitrary-width bitwise on bigints is unsupported.
-                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
-                    let (Some(xi), Some(yi)) = (x.to_i128(), y.to_i128()) else {
-                        return Err(throw(self, "BigInt bitwise op out of range"));
-                    };
-                    let n = match op {
-                        BinaryOp::BitAnd => xi & yi,
-                        BinaryOp::BitOr => xi | yi,
-                        _ => xi ^ yi,
-                    };
-                    val(self, crate::bignum::BigInt::from_i128(n))
-                }
+                // Two's-complement bitwise ops at arbitrary precision.
+                BinaryOp::BitAnd => val(self, x.bitand(&y)),
+                BinaryOp::BitOr => val(self, x.bitor(&y)),
+                BinaryOp::BitXor => val(self, x.bitxor(&y)),
                 BinaryOp::Lt => NanBox::boolean(x.cmp(&y) == Ordering::Less),
                 BinaryOp::Gt => NanBox::boolean(x.cmp(&y) == Ordering::Greater),
                 BinaryOp::LtEq => NanBox::boolean(x.cmp(&y) != Ordering::Greater),
@@ -6660,6 +6651,13 @@ mod tests {
             "340282366920938463463374607431768211455"
         );
         assert_eq!(run("(~5n).toString()"), "-6");
+        // Two's-complement bitwise, including beyond i128.
+        assert_eq!(
+            run("(12n & 10n).toString() + ',' + (12n | 10n) + ',' + (12n ^ 10n)"),
+            "8,14,6"
+        );
+        assert_eq!(run("(-1n & 255n).toString()"), "255");
+        assert_eq!(run("(((2n ** 100n) | 1n) - (2n ** 100n)).toString()"), "1");
     }
 
     #[test]
