@@ -208,7 +208,14 @@ impl Object {
             .collect();
         ints.sort_by_key(|k| array_index(k).unwrap());
         let strs = keys.into_iter().filter(|k| array_index(k).is_none());
-        ints.into_iter().chain(strs).collect()
+        // Enumerable accessor (getter/setter) properties live outside the shape;
+        // include those not marked hidden, after the data keys.
+        let acc = self
+            .accessors
+            .iter()
+            .map(|(k, _, _)| k.as_ref())
+            .filter(|k| !self.is_hidden(k));
+        ints.into_iter().chain(strs).chain(acc).collect()
     }
 
     /// Marks own property `key` non-enumerable (idempotent).

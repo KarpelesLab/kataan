@@ -847,8 +847,7 @@ impl<'a> Interp<'a> {
                         if let Some(sh) = src.as_handle().map(Handle::from_raw) {
                             // Data keys plus accessor (getter) keys, read via
                             // `read_member` so getters are invoked.
-                            let mut keys = self.realm.object_keys(sh).unwrap_or_default();
-                            keys.extend(self.realm.object_accessor_keys(sh));
+                            let keys = self.realm.object_keys(sh).unwrap_or_default();
                             for k in keys {
                                 let v = self.read_member(sh, &k)?;
                                 self.realm.set_property(t, &k, v);
@@ -1327,9 +1326,9 @@ impl<'a> Interp<'a> {
                     return Ok(Some(alloc::format!("[{}]", parts.join(","))));
                 }
                 if self.realm.object_keys(h).is_some() {
-                    // Data keys plus accessor (getter) keys, read via read_member.
-                    let mut keys = self.realm.object_keys(h).unwrap_or_default();
-                    keys.extend(self.realm.object_accessor_keys(h));
+                    // Enumerable keys (incl. accessors), read via read_member so
+                    // getters are invoked.
+                    let keys = self.realm.object_keys(h).unwrap_or_default();
                     let mut parts = Vec::new();
                     for k in keys {
                         let val = self.read_member(h, &k)?;
@@ -1670,6 +1669,14 @@ impl<'a> Interp<'a> {
                 getter.unwrap_or(NanBox::undefined()),
                 setter.unwrap_or(NanBox::undefined()),
             );
+            // An accessor descriptor is non-enumerable unless `enumerable: true`.
+            let enumerable = self
+                .realm
+                .get_property(desc, "enumerable")
+                .is_some_and(|v| self.realm.truthy(v));
+            if !enumerable {
+                self.realm.mark_hidden(obj, key);
+            }
         } else {
             let value = self
                 .realm
@@ -2221,10 +2228,12 @@ impl<'a> Interp<'a> {
                     MethodKind::Get => {
                         self.realm
                             .define_accessor(instance, &key, f, NanBox::undefined());
+                        self.realm.mark_hidden(instance, &key); // class accessors are non-enumerable
                     }
                     MethodKind::Set => {
                         self.realm
                             .define_accessor(instance, &key, NanBox::undefined(), f);
+                        self.realm.mark_hidden(instance, &key);
                     }
                     MethodKind::Constructor => {}
                 }
@@ -5071,9 +5080,8 @@ impl<'a> Interp<'a> {
                         ObjectMember::Spread { value, .. } => {
                             let src = self.eval(value)?;
                             if let Some(sh) = src.as_handle().map(Handle::from_raw) {
-                                let mut keys = self.realm.object_keys(sh).unwrap_or_default();
-                                // Accessor (getter) properties are enumerable too.
-                                keys.extend(self.realm.object_accessor_keys(sh));
+                                // Enumerable keys include accessor (getter) props.
+                                let keys = self.realm.object_keys(sh).unwrap_or_default();
                                 for key in keys {
                                     // `read_member` invokes a getter where present.
                                     let pv = self.read_member(sh, &key)?;
@@ -7470,6 +7478,39 @@ mod tests {
         // Array toString joins with comma.
         assert_eq!(run("['a','b','c'].toString()"), "a,b,c");
         assert_eq!(run("[1,[2,3],4].toString()"), "1,2,3,4");
+    }
+
+    #[test]
+    fn enumerable_accessor_keys() {
+        // Object-literal getters are enumerable (appear in Object.keys/JSON).
+        assert_eq!(
+            run("Object.keys({x:1, get y(){return 2;}}).join(',')"),
+            "x,y"
+        );
+        assert_eq!(
+            run("JSON.stringify({a:1, get b(){return 2;}})"),
+            "{\"a\":1,\"b\":2}"
+        );
+        // defineProperty accessor: enumerable per the descriptor.
+        assert_eq!(
+            run(
+                "let o={a:1}; Object.defineProperty(o,'c',{get(){return 9;},enumerable:true}); Object.keys(o).join(',')"
+            ),
+            "a,c"
+        );
+        assert_eq!(
+            run(
+                "let o={a:1}; Object.defineProperty(o,'c',{get(){return 9;}}); Object.keys(o).join(',')"
+            ),
+            "a"
+        );
+        // Class accessors are non-enumerable.
+        assert_eq!(
+            run(
+                "class C{ constructor(){this.a=1;} get b(){return 2;} } Object.keys(new C()).join(',')"
+            ),
+            "a"
+        );
     }
 
     #[test]
