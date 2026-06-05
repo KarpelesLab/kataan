@@ -1,11 +1,22 @@
 /*---
-description: Generator delegation (yield*) over arrays and other generators
+description: Generator delegation with yield*
 esid: sec-generator-function-definitions
 ---*/
-function* inner() { yield 2; yield 3; }
-function* outer() { yield 1; yield* inner(); yield 4; }
-assert.sameValue([...outer()].join(","), "1,2,3,4", "yield* delegates");
-function* fromArray() { yield* [10, 20, 30]; }
-assert.sameValue([...fromArray()].join(","), "10,20,30", "yield* over an array");
-function* combined() { yield* [1, 2]; yield* [3, 4]; }
-assert.sameValue([...combined()].join(","), "1,2,3,4");
+function* inner() { yield 1; yield 2; yield 3; }
+function* outer() { yield 0; yield* inner(); yield 4; }
+assert.sameValue([...outer()].join(","), "0,1,2,3,4", "yield* delegation");
+function* letters() { yield* ["a", "b", "c"]; }
+assert.sameValue([...letters()].join(""), "abc", "yield* an array");
+function* nested() {
+  yield* inner();
+  yield* inner();
+}
+assert.sameValue([...nested()].length, 6, "double delegation");
+function* withString() { yield* "xy"; yield "z"; }
+assert.sameValue([...withString()].join(""), "xyz", "yield* a string");
+function* combined() {
+  yield 1;
+  yield* [2, 3];
+  yield* (function* () { yield 4; yield 5; })();
+}
+assert.sameValue([...combined()].join(","), "1,2,3,4,5");
