@@ -3033,7 +3033,7 @@ impl<'a> Interp<'a> {
         if let Some(s) = self.realm.string_value(handle)
             && matches!(
                 method,
-                "match" | "search" | "replace" | "replaceAll" | "split"
+                "match" | "matchAll" | "search" | "replace" | "replaceAll" | "split"
             )
             && let Some((src, flags)) = arg(0)
                 .as_handle()
@@ -3065,6 +3065,30 @@ impl<'a> Interp<'a> {
                     } else {
                         NanBox::handle(self.realm.new_array(out).to_raw())
                     }));
+                }
+                // `matchAll` — an iterator of match-result arrays `[full, g1, …]`.
+                "matchAll" => {
+                    let mut out = Vec::new();
+                    let mut at = 0;
+                    while let Some(caps) = re.captures_from(&s, at) {
+                        let Some((st, en)) = caps.groups[0] else {
+                            break;
+                        };
+                        let groups: Vec<NanBox> = caps
+                            .groups
+                            .iter()
+                            .map(|g| match g {
+                                Some((gs, ge)) => self.new_str(&s[*gs..*ge]),
+                                None => NanBox::undefined(),
+                            })
+                            .collect();
+                        out.push(NanBox::handle(self.realm.new_array(groups).to_raw()));
+                        at = if en > st { en } else { en + 1 };
+                        if at > s.len() {
+                            break;
+                        }
+                    }
+                    return Ok(Some(self.make_generator(out)));
                 }
                 "split" => {
                     let mut parts = Vec::new();
@@ -8047,6 +8071,22 @@ mod tests {
         );
         assert_eq!(run("'x'.replace(/x/, '$1')"), "$1"); // no group 1 → literal
         assert_eq!(run("'abc'.replace(/b/, '$`')"), "aac");
+    }
+
+    #[test]
+    fn string_match_all() {
+        assert_eq!(run("[...'a1b2c3'.matchAll(/([a-z])(\\d)/g)].length"), "3");
+        assert_eq!(
+            run(
+                "let m=[...'a1b2'.matchAll(/([a-z])(\\d)/g)]; m[0][0] + ':' + m[0][1] + ':' + m[0][2]"
+            ),
+            "a1:a:1"
+        );
+        assert_eq!(
+            run("[...'hello world'.matchAll(/\\w+/g)].map(m=>m[0]).join(',')"),
+            "hello,world"
+        );
+        assert_eq!(run("[...'abc'.matchAll(/\\d/g)].length"), "0");
     }
 
     #[test]
