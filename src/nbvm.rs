@@ -1553,6 +1553,14 @@ fn regex_method(
         return Some(Ok(NanBox::null()));
     };
     let global = flags.contains('g');
+    // `replaceAll` requires a global RegExp.
+    if !global && key == "replaceAll" {
+        return Some(Err(VmError::Thrown(make_error(
+            ctx.realm,
+            "TypeError",
+            "replaceAll must be called with a global RegExp",
+        ))));
+    }
     let result = match key {
         "search" => {
             let i = re

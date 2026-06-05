@@ -3474,6 +3474,13 @@ impl<'a> Interp<'a> {
             && let Ok(re) = crate::regex::Regex::new(&src, &flags)
         {
             let global = flags.contains('g');
+            // `matchAll`/`replaceAll` require a global RegExp.
+            if !global && matches!(method, "matchAll" | "replaceAll") {
+                let m = self.new_str(&alloc::format!(
+                    "{method} must be called with a global RegExp"
+                ));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
             match method {
                 "search" => {
                     let idx = re.find_from(&s, 0).map_or(-1.0, |(st, _)| st as f64);
@@ -9013,6 +9020,24 @@ mod tests {
         assert_eq!(
             run("let it=['p','q'].values(); it.next().value + it.next().value"),
             "pq"
+        );
+    }
+
+    #[test]
+    fn matchall_replaceall_require_global() {
+        assert_eq!(
+            run("try{ 'aaa'.replaceAll(/a/,'b'); 'no' }catch(e){ e instanceof TypeError }"),
+            "true"
+        );
+        assert_eq!(
+            run("try{ [...'aaa'.matchAll(/a/)]; 'no' }catch(e){ e instanceof TypeError }"),
+            "true"
+        );
+        assert_eq!(run("'aaa'.replaceAll(/a/g,'b')"), "bbb");
+        assert_eq!(run("[...'a1b2'.matchAll(/[a-z]\\d/g)].length"), "2");
+        assert_eq!(
+            run("'2024-06'.replace(/(?<y>\\d+)-(?<m>\\d+)/, '$<m>/$<y>')"),
+            "06/2024"
         );
     }
 
