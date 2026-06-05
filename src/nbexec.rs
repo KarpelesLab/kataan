@@ -3753,7 +3753,8 @@ impl<'a> Interp<'a> {
                 let src = value.as_handle().map(Handle::from_raw);
                 let mut used: Vec<String> = Vec::new();
                 for prop in &pat.properties {
-                    let key = static_key(&prop.key)?;
+                    // A computed key (`{ [expr]: t }`) is evaluated here.
+                    let key = self.eval_prop_key(&prop.key)?;
                     let mut v = src
                         .and_then(|h| self.realm.get_property(h, &key))
                         .unwrap_or(NanBox::undefined());
@@ -3985,7 +3986,7 @@ impl<'a> Interp<'a> {
                         ObjectMember::Property {
                             key, value: tgt, ..
                         } => {
-                            let k = static_key(key)?;
+                            let k = self.eval_prop_key(key)?;
                             let v = src
                                 .and_then(|h| self.realm.get_property(h, &k))
                                 .unwrap_or(NanBox::undefined());
@@ -6857,6 +6858,24 @@ mod tests {
         );
         assert_eq!(
             run("let o={}; Object.defineProperty(o,'a',{value:42}); o.a"),
+            "42"
+        );
+    }
+
+    #[test]
+    fn computed_key_destructuring() {
+        // Declaration form.
+        assert_eq!(
+            run("let k='name'; let {[k]: v} = {name:'Alice'}; v"),
+            "Alice"
+        );
+        assert_eq!(
+            run("let p='x'; let {[p]: a, ...rest} = {x:1, y:2}; a + ':' + rest.y"),
+            "1:2"
+        );
+        // Assignment form.
+        assert_eq!(
+            run("let k='m'; let v; ({[k]: v} = {m:42}); String(v)"),
             "42"
         );
     }
