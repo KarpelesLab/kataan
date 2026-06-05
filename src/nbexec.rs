@@ -6168,15 +6168,25 @@ impl<'a> Interp<'a> {
             }
             return self.assign_member(target, property, new);
         }
-        // An accessor setter takes precedence for a named property.
-        if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property
-            && let Some((_, setter)) = self.realm.accessor(handle, s)
-        {
-            if !matches!(setter.unpack(), Unpacked::Undefined) {
-                let this = NanBox::handle(handle.to_raw());
-                self.call_with_this(setter, this, &[new])?;
+        // An accessor setter — own or inherited via the prototype chain — takes
+        // precedence over creating a data property.
+        if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property {
+            let mut cur = Some(handle);
+            while let Some(c) = cur {
+                if let Some((_, setter)) = self.realm.accessor(c, s) {
+                    if !matches!(setter.unpack(), Unpacked::Undefined) {
+                        let this = NanBox::handle(handle.to_raw());
+                        self.call_with_this(setter, this, &[new])?;
+                    }
+                    // A getter-only accessor still shadows a data assignment.
+                    return Ok(());
+                }
+                // An own data property below shadows an inherited accessor.
+                if self.realm.has_own(c, s) {
+                    break;
+                }
+                cur = self.realm.object_proto(c);
             }
-            return Ok(());
         }
         match property {
             PropertyKey::Number(n) if as_index(*n).is_some() && self.realm.is_array(handle) => {
@@ -8255,6 +8265,25 @@ mod tests {
         // Array toString joins with comma.
         assert_eq!(run("['a','b','c'].toString()"), "a,b,c");
         assert_eq!(run("[1,[2,3],4].toString()"), "1,2,3,4");
+    }
+
+    #[test]
+    fn inherited_setter_is_called() {
+        // Assigning to a property with an *inherited* setter calls it (rather
+        // than shadowing it with an own data property).
+        assert_eq!(
+            run(
+                "let base={_d:0, get c(){return this._d;}, set c(v){this._d=v;}}; let d=Object.create(base); d.c=10; d._d + ':' + base._d"
+            ),
+            "10:0"
+        );
+        // A getter-only inherited accessor shadows the data assignment.
+        assert_eq!(
+            run("let base={get x(){return 1;}}; let d=Object.create(base); d.x=99; d.x"),
+            "1"
+        );
+        // An own data property still assigns normally.
+        assert_eq!(run("let o={a:1}; o.a=2; o.a"), "2");
     }
 
     #[test]
