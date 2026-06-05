@@ -362,6 +362,15 @@ fn emit_expr(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmErro
                 "{pad}i32.trunc_sat_f64_s\n{pad}i32.const -1\n{pad}i32.xor\n{pad}f64.convert_i32_s\n"
             ));
         }
+        // `!a` → the boolean negation, widened to an f64 `0`/`1`.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            argument,
+            ..
+        } => {
+            emit_cond(argument, out, depth)?; // i32 truthiness of the argument
+            out.push_str(&format!("{pad}i32.eqz\n{pad}f64.convert_i32_u\n"));
+        }
         // `a ** n` for a constant non-negative integer `n` (≤ 16): unrolled to
         // repeated multiplication (WASM has no f64 pow). `n == 0` → `1`.
         Expr::Binary {
@@ -542,6 +551,16 @@ fn emit_cond(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmErro
                 _ => "i32.or",
             };
             out.push_str(&format!("{pad}{mnemonic}\n"));
+            Ok(())
+        }
+        // `!a` in a condition → the negated truthiness (still i32).
+        Expr::Unary {
+            op: UnaryOp::Not,
+            argument,
+            ..
+        } => {
+            emit_cond(argument, out, depth)?;
+            out.push_str(&format!("{pad}i32.eqz\n"));
             Ok(())
         }
         // Any other numeric expression: nonzero is true.
@@ -1026,6 +1045,16 @@ fn emit_expr_bin(
             out.push(0x73); // i32.xor
             out.push(0xb7); // f64.convert_i32_s
         }
+        // `!a` → boolean negation widened to f64.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            argument,
+            ..
+        } => {
+            emit_cond_bin(argument, locals, fns, out)?;
+            out.push(0x45); // i32.eqz
+            out.push(0xb8); // f64.convert_i32_u
+        }
         // `a ** n` for a constant non-negative integer exponent → unrolled mul.
         Expr::Binary {
             op: BinaryOp::Exp,
@@ -1199,6 +1228,16 @@ fn emit_cond_bin(
                 crate::ast::LogicalOp::And => 0x71, // i32.and
                 _ => 0x72,                          // i32.or
             });
+            Ok(())
+        }
+        // `!a` → negated truthiness (still i32).
+        Expr::Unary {
+            op: UnaryOp::Not,
+            argument,
+            ..
+        } => {
+            emit_cond_bin(argument, locals, fns, out)?;
+            out.push(0x45); // i32.eqz
             Ok(())
         }
         _ => {
@@ -1421,6 +1460,18 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_logical_not() {
+        // `!` as a value and in a condition.
+        let src = "function notZero(x) { return !(x === 0); } function neither(a, b) { if (!(a > 0) && !(b > 0)) { return 1; } return 0; }";
+        let wat = module(src);
+        assert!(wat.contains("i32.eqz"));
+        assert_well_formed(&wat);
+        let wasm = binary(src);
+        assert!(wasm.contains(&0x45)); // i32.eqz
+        section_ids(&wasm);
     }
 
     #[test]
