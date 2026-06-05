@@ -244,6 +244,8 @@ const TYPED_ARRAY_KINDS: [(&str, u8); 9] = [
     ("Float32Array", 4),
     ("Float64Array", 8),
 ];
+const N_ARRAY_BUFFER: u16 = 177;
+const N_DATA_VIEW: u16 = 178;
 const N_OBJECT_CREATE: u16 = 107;
 const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
@@ -322,6 +324,10 @@ const PRIM_WRAP: &str = "\u{0}prim";
 const PRIM_WRAP_TYPE: &str = "\u{0}primtype";
 /// Hidden slot on a typed array recording its element-kind index.
 const TYPED_ARRAY_KIND: &str = "\u{0}takind";
+/// `ArrayBuffer` byte store (an array of 0–255 numbers) and `DataView` linkage.
+const ARRAY_BUFFER_BYTES: &str = "\u{0}abytes";
+const DATA_VIEW_BUF: &str = "\u{0}dvbuf";
+const DATA_VIEW_OFF: &str = "\u{0}dvoff";
 const BOUND_TARGET: &str = "\u{0}bnd_t";
 const BOUND_THIS: &str = "\u{0}bnd_this";
 const BOUND_ARGS: &str = "\u{0}bnd_args";
@@ -597,6 +603,10 @@ impl<'a> Interp<'a> {
         // The typed-array constructors.
         for (i, (name, _)) in TYPED_ARRAY_KINDS.iter().enumerate() {
             let f = self.realm.new_native(N_TYPED_ARRAY_BASE + i as u16);
+            self.current.declare(name, NanBox::handle(f.to_raw()));
+        }
+        for (name, id) in [("ArrayBuffer", N_ARRAY_BUFFER), ("DataView", N_DATA_VIEW)] {
+            let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
         }
         // `globalThis`: an object mirroring the global bindings, referencing
@@ -2699,6 +2709,28 @@ impl<'a> Interp<'a> {
                 .set_hidden_property(obj, FINREG_TAG, NanBox::boolean(true));
             return Ok(NanBox::handle(obj.to_raw()));
         }
+        // `new ArrayBuffer(n)` — a zeroed byte store of length `n`.
+        if id == N_ARRAY_BUFFER {
+            let n = args
+                .first()
+                .map_or(0.0, |v| self.realm.to_number(*v))
+                .max(0.0) as usize;
+            let obj = self.realm.new_object();
+            let bytes = self.realm.new_array(alloc::vec![NanBox::number(0.0); n]);
+            self.realm
+                .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(bytes.to_raw()));
+            return Ok(NanBox::handle(obj.to_raw()));
+        }
+        // `new DataView(buffer, byteOffset?)` — a view onto an ArrayBuffer.
+        if id == N_DATA_VIEW {
+            let obj = self.realm.new_object();
+            let buf = args.first().copied().unwrap_or(NanBox::undefined());
+            let off = args.get(1).map_or(0.0, |v| self.realm.to_number(*v));
+            self.realm.set_hidden_property(obj, DATA_VIEW_BUF, buf);
+            self.realm
+                .set_hidden_property(obj, DATA_VIEW_OFF, NanBox::number(off));
+            return Ok(NanBox::handle(obj.to_raw()));
+        }
         // `new Int8Array(n)` / `new Uint8Array([…])` / … — a typed array backed by
         // a plain array whose element writes coerce to the element kind.
         if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id) {
@@ -3921,6 +3953,73 @@ impl<'a> Interp<'a> {
             }
             _ => {}
         }
+        // --- DataView get*/set* ---
+        if let Some(bufv) = self.realm.get_property(handle, DATA_VIEW_BUF)
+            && let Some((is_set, size, signed, is_float)) = dataview_method(method)
+        {
+            let bytes_h = bufv
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.get_property(h, ARRAY_BUFFER_BYTES))
+                .and_then(|b| b.as_handle())
+                .map(Handle::from_raw);
+            let Some(bh) = bytes_h else {
+                let m = self.new_str("DataView has no buffer");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            };
+            let base = self
+                .realm
+                .get_property(handle, DATA_VIEW_OFF)
+                .and_then(|n| n.as_number())
+                .unwrap_or(0.0) as usize;
+            let abs = base + self.realm.to_number(arg(0)).max(0.0) as usize;
+            if is_set {
+                let value = self.realm.to_number(arg(1));
+                let le = self.realm.truthy(arg(2));
+                let bits = if is_float {
+                    if size == 4 {
+                        u64::from((value as f32).to_bits())
+                    } else {
+                        value.to_bits()
+                    }
+                } else {
+                    value as i64 as u64
+                };
+                for i in 0..size {
+                    let shift = if le { i } else { size - 1 - i };
+                    let byte = (bits >> (8 * shift)) & 0xff;
+                    self.realm
+                        .set_element(bh, abs + i, NanBox::number(byte as f64));
+                }
+                return Ok(Some(NanBox::undefined()));
+            }
+            let le = self.realm.truthy(arg(1));
+            let mut bits: u64 = 0;
+            for i in 0..size {
+                let b = self
+                    .realm
+                    .array_elements(bh)
+                    .and_then(|e| e.get(abs + i).copied())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as u64
+                    & 0xff;
+                let shift = if le { i } else { size - 1 - i };
+                bits |= b << (8 * shift);
+            }
+            let value = if is_float {
+                if size == 4 {
+                    f64::from(f32::from_bits(bits as u32))
+                } else {
+                    f64::from_bits(bits)
+                }
+            } else if signed && size < 8 && bits & (1 << (8 * size - 1)) != 0 {
+                (bits as i64 - (1i64 << (8 * size))) as f64
+            } else {
+                bits as f64
+            };
+            return Ok(Some(NanBox::number(value)));
+        }
+
         // --- Intl.NumberFormat / Intl.DateTimeFormat instance methods ---
         if let Some(kind) = self.realm.get_property(handle, "\u{0}intl") {
             let kind = self.realm.to_display_string(kind);
@@ -7239,6 +7338,42 @@ impl<'a> Interp<'a> {
                 _ => self.member_value(handle, name),
             });
         }
+        // `ArrayBuffer.byteLength` (the byte store's length).
+        if name == "byteLength"
+            && let Some(b) = self.realm.get_property(handle, ARRAY_BUFFER_BYTES)
+            && let Some(bh) = b.as_handle().map(Handle::from_raw)
+        {
+            return Ok(NanBox::number(
+                self.realm.array_length(bh).unwrap_or(0) as f64
+            ));
+        }
+        // `DataView.byteLength` / `.buffer` / `.byteOffset`.
+        if matches!(name, "byteLength" | "buffer" | "byteOffset")
+            && let Some(buf) = self.realm.get_property(handle, DATA_VIEW_BUF)
+        {
+            return Ok(match name {
+                "buffer" => buf,
+                "byteOffset" => self
+                    .realm
+                    .get_property(handle, DATA_VIEW_OFF)
+                    .unwrap_or(NanBox::number(0.0)),
+                _ => {
+                    let total = buf
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.get_property(h, ARRAY_BUFFER_BYTES))
+                        .and_then(|b| b.as_handle().map(Handle::from_raw))
+                        .and_then(|bh| self.realm.array_length(bh))
+                        .unwrap_or(0);
+                    let off = self
+                        .realm
+                        .get_property(handle, DATA_VIEW_OFF)
+                        .and_then(|n| n.as_number())
+                        .unwrap_or(0.0) as usize;
+                    NanBox::number(total.saturating_sub(off) as f64)
+                }
+            });
+        }
         // Typed-array introspection (`byteLength`, `BYTES_PER_ELEMENT`).
         if matches!(name, "byteLength" | "BYTES_PER_ELEMENT" | "byteOffset")
             && let Some(k) = self.realm.get_property(handle, TYPED_ARRAY_KIND)
@@ -8360,6 +8495,30 @@ fn json_quote(s: &str) -> String {
 /// Coerces `n` to a typed-array element of the given kind index (see
 /// [`TYPED_ARRAY_KINDS`]): integer kinds truncate then wrap (or clamp, for
 /// `Uint8Clamped`); float kinds narrow precision.
+/// Parses a `DataView` accessor name (`getInt32`, `setFloat64`, …) into
+/// `(is_set, byte_size, signed, is_float)`, or `None` if it isn't one.
+fn dataview_method(method: &str) -> Option<(bool, usize, bool, bool)> {
+    let (is_set, t) = if let Some(t) = method.strip_prefix("get") {
+        (false, t)
+    } else if let Some(t) = method.strip_prefix("set") {
+        (true, t)
+    } else {
+        return None;
+    };
+    let (size, signed, is_float) = match t {
+        "Int8" => (1, true, false),
+        "Uint8" => (1, false, false),
+        "Int16" => (2, true, false),
+        "Uint16" => (2, false, false),
+        "Int32" => (4, true, false),
+        "Uint32" => (4, false, false),
+        "Float32" => (4, false, true),
+        "Float64" => (8, false, true),
+        _ => return None,
+    };
+    Some((is_set, size, signed, is_float))
+}
+
 fn coerce_typed(kind: u16, n: f64) -> f64 {
     match kind {
         7 => f64::from(n as f32), // Float32
@@ -11137,6 +11296,54 @@ mod tests {
                 "{g}let it=g(); it.next(); it.map(x=>x).toArray().join(',')"
             )),
             "2,3,4"
+        );
+    }
+
+    #[test]
+    fn arraybuffer_and_dataview() {
+        assert_eq!(run("new ArrayBuffer(8).byteLength"), "8");
+        assert_eq!(
+            run("let v=new DataView(new ArrayBuffer(8)); v.setInt32(0,42); v.getInt32(0)"),
+            "42"
+        );
+        assert_eq!(
+            run("let v=new DataView(new ArrayBuffer(8)); v.setInt32(0,-1); v.getUint32(0)"),
+            "4294967295"
+        );
+        assert_eq!(
+            run("let v=new DataView(new ArrayBuffer(8)); v.setUint8(0,255); v.getInt8(0)"),
+            "-1"
+        );
+        assert_eq!(
+            run(
+                "let v=new DataView(new ArrayBuffer(8)); v.setInt16(0,1000,true); v.getInt16(0,true)"
+            ),
+            "1000"
+        );
+        assert_eq!(
+            run(
+                "let v=new DataView(new ArrayBuffer(8)); v.setInt16(0,1000,true); v.getInt16(0,false)"
+            ),
+            "-6141"
+        );
+        assert_eq!(
+            run("let v=new DataView(new ArrayBuffer(8)); v.setFloat64(0,3.14159); v.getFloat64(0)"),
+            "3.14159"
+        );
+        assert_eq!(
+            run("let v=new DataView(new ArrayBuffer(8)); v.setFloat32(0,1.5); v.getFloat32(0)"),
+            "1.5"
+        );
+        assert_eq!(
+            run("let v=new DataView(new ArrayBuffer(8)); v.setInt8(0,300); v.getInt8(0)"),
+            "44"
+        );
+        // Offset view shares the buffer.
+        assert_eq!(
+            run(
+                "let b=new ArrayBuffer(8); let v=new DataView(b); new DataView(b,2).setInt32(0,7); v.getInt32(2)"
+            ),
+            "7"
         );
     }
 
