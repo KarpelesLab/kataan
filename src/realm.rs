@@ -262,6 +262,15 @@ impl Realm {
     }
 
     /// Removes `key`; returns whether it was present.
+    /// `Map.clear()` / `Set.clear()` — removes all entries.
+    pub fn collection_clear(&mut self, handle: Handle) {
+        if let Some((_, e)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut) {
+            e.clear();
+        }
+    }
+
+    /// `Map.delete(key)` / `Set.delete(value)` — removes the entry, returning
+    /// whether one was present.
     pub fn collection_delete(&mut self, handle: Handle, key: NanBox) -> bool {
         let pos = match self.heap.get(handle).and_then(Cell::as_collection) {
             Some((_, e)) => e.iter().position(|(k, _)| self.strict_equals(*k, key)),

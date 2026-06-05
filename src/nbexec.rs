@@ -809,11 +809,12 @@ impl<'a> Interp<'a> {
                 if let Some(t) = target.as_handle().map(Handle::from_raw) {
                     for src in &args[1.min(args.len())..] {
                         if let Some(sh) = src.as_handle().map(Handle::from_raw) {
-                            for k in self.realm.object_keys(sh).unwrap_or_default() {
-                                let v = self
-                                    .realm
-                                    .get_property(sh, &k)
-                                    .unwrap_or(NanBox::undefined());
+                            // Data keys plus accessor (getter) keys, read via
+                            // `read_member` so getters are invoked.
+                            let mut keys = self.realm.object_keys(sh).unwrap_or_default();
+                            keys.extend(self.realm.object_accessor_keys(sh));
+                            for k in keys {
+                                let v = self.read_member(sh, &k)?;
                                 self.realm.set_property(t, &k, v);
                             }
                         }
@@ -3464,6 +3465,10 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::boolean(
                         self.realm.collection_delete(handle, arg(0)),
                     )));
+                }
+                "clear" => {
+                    self.realm.collection_clear(handle);
+                    return Ok(Some(NanBox::undefined()));
                 }
                 "forEach" => {
                     let f = arg(0);
@@ -7393,6 +7398,26 @@ mod tests {
             run("let m=new Map([['x',10],['y',20]]); let o=Object.fromEntries(m); o.x + ':' + o.y"),
             "10:20"
         );
+    }
+
+    #[test]
+    fn map_set_clear_and_assign_getters() {
+        assert_eq!(
+            run("let m=new Map(); m.set('a',1).set('b',2); m.clear(); m.size + ':' + m.has('a')"),
+            "0:false"
+        );
+        assert_eq!(
+            run("let s=new Set([1,2,3]); s.clear(); s.add(5).add(5); s.size"),
+            "1"
+        );
+        // Object.assign invokes getters.
+        assert_eq!(
+            run(
+                "let src={a:1, get b(){ return this.a + 1; }}; let t=Object.assign({}, src); t.a + ',' + t.b"
+            ),
+            "1,2"
+        );
+        assert_eq!(run("Object.assign({}, {x:1}, {y:2}, {x:9}).x"), "9");
     }
 
     #[test]
