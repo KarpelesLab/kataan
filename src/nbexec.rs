@@ -3645,6 +3645,113 @@ impl<'a> Interp<'a> {
                     self.realm.set_property(res, "done", NanBox::boolean(true));
                     return Ok(Some(NanBox::handle(res.to_raw())));
                 }
+                // ES2025 iterator helpers — they consume the remaining yields.
+                "map" | "filter" | "take" | "drop" | "toArray" | "forEach" | "reduce" | "some"
+                | "every" | "find" | "flatMap" => {
+                    let idx = self
+                        .realm
+                        .get_property(handle, GEN_IDX)
+                        .and_then(|n| n.as_number())
+                        .unwrap_or(0.0) as usize;
+                    let rest: Vec<NanBox> = self
+                        .realm
+                        .array_elements(buf)
+                        .map(|e| e.get(idx..).unwrap_or(&[]).to_vec())
+                        .unwrap_or_default();
+                    // The source iterator is now exhausted.
+                    let len = self.realm.array_elements(buf).map_or(0, <[_]>::len);
+                    self.realm
+                        .set_hidden_property(handle, GEN_IDX, NanBox::number(len as f64));
+                    let f = arg(0);
+                    return Ok(Some(match method {
+                        "toArray" => NanBox::handle(self.realm.new_array(rest).to_raw()),
+                        "map" => {
+                            let mut out = Vec::with_capacity(rest.len());
+                            for v in rest {
+                                out.push(self.call(f, &[v])?);
+                            }
+                            self.make_generator(out)
+                        }
+                        "flatMap" => {
+                            let mut out = Vec::new();
+                            for v in rest {
+                                let r = self.call(f, &[v])?;
+                                out.extend(
+                                    self.iterate_values(r).unwrap_or_else(|_| alloc::vec![r]),
+                                );
+                            }
+                            self.make_generator(out)
+                        }
+                        "filter" => {
+                            let mut out = Vec::new();
+                            for v in rest {
+                                let r = self.call(f, &[v])?;
+                                if self.realm.truthy(r) {
+                                    out.push(v);
+                                }
+                            }
+                            self.make_generator(out)
+                        }
+                        "take" => {
+                            let n = self.realm.to_number(f).max(0.0) as usize;
+                            self.make_generator(rest.into_iter().take(n).collect())
+                        }
+                        "drop" => {
+                            let n = self.realm.to_number(f).max(0.0) as usize;
+                            self.make_generator(rest.into_iter().skip(n).collect())
+                        }
+                        "forEach" => {
+                            for v in rest {
+                                self.call(f, &[v])?;
+                            }
+                            NanBox::undefined()
+                        }
+                        "some" | "every" | "find" => {
+                            let mut found = NanBox::undefined();
+                            let mut hit = false;
+                            for v in rest {
+                                let r = self.call(f, &[v])?;
+                                let t = self.realm.truthy(r);
+                                if method == "every" && !t {
+                                    return Ok(Some(NanBox::boolean(false)));
+                                }
+                                if method != "every" && t {
+                                    found = v;
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            match method {
+                                "some" => NanBox::boolean(hit),
+                                "every" => NanBox::boolean(true),
+                                _ => found, // find
+                            }
+                        }
+                        // reduce
+                        _ => {
+                            let mut it = rest.into_iter();
+                            let mut acc = if args.len() >= 2 {
+                                arg(1)
+                            } else {
+                                match it.next() {
+                                    Some(v) => v,
+                                    None => {
+                                        let m = self.new_str(
+                                            "Reduce of empty iterator with no initial value",
+                                        );
+                                        return Err(ExecError::Throw(
+                                            self.make_error(N_TYPE_ERROR, Some(m)),
+                                        ));
+                                    }
+                                }
+                            };
+                            for v in it {
+                                acc = self.call(f, &[acc, v])?;
+                            }
+                            acc
+                        }
+                    }));
+                }
                 _ => {}
             }
         }
@@ -10994,6 +11101,43 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn iterator_helpers() {
+        let g = "function* g(){yield 1;yield 2;yield 3;yield 4;} ";
+        assert_eq!(
+            run(&alloc::format!("{g}[...g().map(x=>x*10)].join(',')")),
+            "10,20,30,40"
+        );
+        assert_eq!(
+            run(&alloc::format!("{g}[...g().filter(x=>x%2===0)].join(',')")),
+            "2,4"
+        );
+        assert_eq!(run(&alloc::format!("{g}[...g().take(2)].join(',')")), "1,2");
+        assert_eq!(run(&alloc::format!("{g}[...g().drop(2)].join(',')")), "3,4");
+        assert_eq!(
+            run(&alloc::format!("{g}g().toArray().join(',')")),
+            "1,2,3,4"
+        );
+        assert_eq!(run(&alloc::format!("{g}g().reduce((a,b)=>a+b,0)")), "10");
+        assert_eq!(run(&alloc::format!("{g}g().reduce((a,b)=>a+b)")), "10");
+        assert_eq!(run(&alloc::format!("{g}g().some(x=>x>3)")), "true");
+        assert_eq!(run(&alloc::format!("{g}g().every(x=>x>2)")), "false");
+        assert_eq!(run(&alloc::format!("{g}g().find(x=>x>2)")), "3");
+        assert_eq!(
+            run(&alloc::format!(
+                "{g}[...g().map(x=>x*2).filter(x=>x>4)].join(',')"
+            )),
+            "6,8"
+        );
+        // A helper over the remaining values after one `next()`.
+        assert_eq!(
+            run(&alloc::format!(
+                "{g}let it=g(); it.next(); it.map(x=>x).toArray().join(',')"
+            )),
+            "2,3,4"
+        );
     }
 
     #[test]
