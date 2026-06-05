@@ -727,6 +727,14 @@ impl Realm {
         }
     }
 
+    /// Clears the non-writable mark for `key` (used when `defineProperty`
+    /// redefines a configurable property's attributes).
+    pub fn clear_readonly_property(&mut self, handle: Handle, key: &str) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.clear_readonly(key);
+        }
+    }
+
     /// Marks own property `key` non-configurable (it cannot be deleted).
     pub fn set_non_configurable_property(&mut self, handle: Handle, key: &str) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {

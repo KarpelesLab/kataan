@@ -248,6 +248,12 @@ impl Object {
         self.readonly.iter().any(|k| k.as_ref() == key)
     }
 
+    /// Clears the non-writable mark for `key` (a `defineProperty` redefines
+    /// attributes from scratch, so the prior `writable: false` is dropped first).
+    pub fn clear_readonly(&mut self, key: &str) {
+        self.readonly.retain(|k| k.as_ref() != key);
+    }
+
     /// Marks own property `key` non-configurable (idempotent).
     pub fn set_non_configurable(&mut self, key: &str) {
         if !self.is_non_configurable(key) {

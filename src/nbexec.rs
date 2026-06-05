@@ -738,7 +738,7 @@ impl<'a> Interp<'a> {
                             .get_property(descs, &key)
                             .and_then(NanBox::as_handle)
                         {
-                            self.apply_descriptor(obj, &key, Handle::from_raw(d));
+                            self.apply_descriptor(obj, &key, Handle::from_raw(d))?;
                         }
                     }
                 }
@@ -764,7 +764,7 @@ impl<'a> Interp<'a> {
                 {
                     let obj = Handle::from_raw(oraw);
                     let key = self.realm.to_display_string(arg(1));
-                    self.apply_descriptor(obj, &key, Handle::from_raw(draw));
+                    self.apply_descriptor(obj, &key, Handle::from_raw(draw))?;
                 }
                 arg(0)
             }
@@ -781,7 +781,7 @@ impl<'a> Interp<'a> {
                             .get_property(descs, &key)
                             .and_then(NanBox::as_handle)
                         {
-                            self.apply_descriptor(obj, &key, Handle::from_raw(d));
+                            self.apply_descriptor(obj, &key, Handle::from_raw(d))?;
                         }
                     }
                 }
@@ -899,7 +899,7 @@ impl<'a> Interp<'a> {
                     arg(2).as_handle().map(Handle::from_raw),
                 ) {
                     let key = self.realm.to_display_string(arg(1));
-                    self.apply_descriptor(obj, &key, desc);
+                    self.apply_descriptor(obj, &key, desc)?;
                     true
                 } else {
                     false
@@ -1877,7 +1877,23 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn apply_descriptor(&mut self, obj: Handle, key: &str, desc: Handle) {
+    fn apply_descriptor(&mut self, obj: Handle, key: &str, desc: Handle) -> Result<(), ExecError> {
+        let is_own = self.realm.has_own(obj, key) || self.realm.accessor(obj, key).is_some();
+        // Adding a *new* property to a non-extensible object is a TypeError.
+        if !is_own && !self.realm.is_extensible(obj) {
+            let m = self.new_str("Cannot define property: object is not extensible");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        // Redefining a non-configurable property is a TypeError — except a
+        // non-configurable *writable data* property, whose value may still change.
+        if is_own && self.realm.property_is_non_configurable(obj, key) {
+            let is_accessor = self.realm.accessor(obj, key).is_some();
+            let writable = !self.realm.property_is_readonly(obj, key);
+            if is_accessor || !writable {
+                let m = self.new_str("Cannot redefine non-configurable property");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+        }
         let getter = self.realm.get_property(desc, "get");
         let setter = self.realm.get_property(desc, "set");
         if getter.is_some() || setter.is_some() {
@@ -1902,14 +1918,16 @@ impl<'a> Interp<'a> {
                 .realm
                 .get_property(desc, "value")
                 .unwrap_or(NanBox::undefined());
-            // Set the value first, then apply the attribute flags.
+            // A `defineProperty` redefines attributes from scratch: drop any prior
+            // non-writable mark so the new value takes effect, then set it.
+            self.realm.clear_readonly_property(obj, key);
             self.realm.set_property(obj, key, value);
-            if matches!(
-                self.realm
-                    .get_property(desc, "writable")
-                    .map(|v| self.realm.truthy(v)),
-                Some(false)
-            ) {
+            // A data descriptor defaults to non-writable unless `writable: true`.
+            let writable = self
+                .realm
+                .get_property(desc, "writable")
+                .is_some_and(|v| self.realm.truthy(v));
+            if !writable {
                 self.realm.set_readonly_property(obj, key);
             }
             // A descriptor defaults to non-enumerable unless `enumerable: true`.
@@ -1930,6 +1948,7 @@ impl<'a> Interp<'a> {
         if !configurable {
             self.realm.set_non_configurable_property(obj, key);
         }
+        Ok(())
     }
 
     fn is_callable(&self, handle: Handle) -> bool {
@@ -8383,6 +8402,38 @@ mod tests {
         );
         // An own data property still assigns normally.
         assert_eq!(run("let o={a:1}; o.a=2; o.a"), "2");
+    }
+
+    #[test]
+    fn defineproperty_invariants() {
+        // Redefining a non-configurable property throws; value is retained.
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'x',{value:1,configurable:false}); try{ Object.defineProperty(o,'x',{value:2}); 'no' }catch(e){ (e instanceof TypeError)+':'+o.x }"
+            ),
+            "true:1"
+        );
+        // A configurable property can be redefined (attributes reset).
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'x',{value:1,configurable:true}); Object.defineProperty(o,'x',{value:2,configurable:true}); o.x"
+            ),
+            "2"
+        );
+        // Defining a new property on a non-extensible object throws.
+        assert_eq!(
+            run(
+                "let o={}; Object.preventExtensions(o); try{ Object.defineProperty(o,'z',{value:1}); 'no' }catch(e){ e instanceof TypeError }"
+            ),
+            "true"
+        );
+        // Non-configurable but writable: value may still change.
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'w',{value:1,writable:true,configurable:false}); Object.defineProperty(o,'w',{value:2,writable:true,configurable:false}); o.w"
+            ),
+            "2"
+        );
     }
 
     #[test]
