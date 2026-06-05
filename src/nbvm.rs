@@ -950,9 +950,25 @@ fn run_frame(
                     }
                     _ => {
                         let ks = ctx.realm.to_display_string(k);
-                        ctx.realm
-                            .get_property(handle, &ks)
-                            .unwrap_or(NanBox::undefined())
+                        // A canonical numeric string key on an array (`arr["0"]`)
+                        // reads the element, like `arr[0]`.
+                        if ctx.realm.is_array(handle)
+                            && let Ok(i) = ks.parse::<usize>()
+                            && alloc::format!("{i}") == ks
+                        {
+                            ctx.realm.get_element(handle, i)
+                        } else if ks == "length"
+                            && let Some(len) = ctx.realm.array_length(handle).or_else(|| {
+                                ctx.realm.string_value(handle).map(|s| s.chars().count())
+                            })
+                        {
+                            // Computed `arr["length"]` / `str["length"]`.
+                            NanBox::number(len as f64)
+                        } else {
+                            ctx.realm
+                                .get_property(handle, &ks)
+                                .unwrap_or(NanBox::undefined())
+                        }
                     }
                 };
             }
@@ -5027,6 +5043,16 @@ mod tests {
         let mut realm = Realm::new();
         let value = compile_and_run(&mut realm, &program).expect("compile+run");
         realm.to_display_string(value)
+    }
+
+    #[test]
+    fn bytecode_array_string_index() {
+        // `arr["0"]` reads the element (canonical numeric string key).
+        assert_eq!(bc("let a=[10,20,30]; a['1']"), "20");
+        assert_eq!(bc("let a=[10,20,30]; let k='2'; a[k]"), "30");
+        // Non-canonical keys are not indices.
+        assert_eq!(bc("let a=[10,20,30]; String(a['00'])"), "undefined");
+        assert_eq!(bc("let a=[1,2,3]; a['length']"), "3");
     }
 
     #[test]

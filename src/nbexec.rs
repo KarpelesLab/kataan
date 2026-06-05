@@ -5907,6 +5907,14 @@ impl<'a> Interp<'a> {
                 None => NanBox::undefined(),
             });
         }
+        // A canonical numeric string key on an array (`arr["0"]`) reads the
+        // element, exactly like `arr[0]`.
+        if self.realm.is_array(handle)
+            && let Ok(i) = name.parse::<usize>()
+            && alloc::format!("{i}") == name
+        {
+            return Ok(self.realm.get_element(handle, i));
+        }
         // Proxy `get` trap (or forward the read to the target).
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
@@ -9211,6 +9219,17 @@ mod tests {
             run("'hello'.includes('lo', 3) + ':' + 'hello'.includes('he', 1)"),
             "true:false"
         );
+    }
+
+    #[test]
+    fn array_string_index_access() {
+        assert_eq!(run("let a=[10,20,30]; a['0'] + ':' + a['2']"), "10:30");
+        assert_eq!(run("let a=[10,20,30]; let k='1'; a[k]"), "20");
+        assert_eq!(
+            run("let a=[10,20,30]; String(a['00']) + ':' + String(a['01'])"),
+            "undefined:undefined"
+        );
+        assert_eq!(run("[[1,2],[3,4]]['0']['1']"), "2");
     }
 
     #[test]
