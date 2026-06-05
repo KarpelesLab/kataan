@@ -3215,8 +3215,9 @@ impl<'a> Interp<'a> {
                         acc = elems[0];
                         start = 1;
                     }
+                    let arr = NanBox::handle(handle.to_raw());
                     for (i, e) in elems.iter().enumerate().skip(start) {
-                        acc = self.call(f, &[acc, *e, NanBox::number(i as f64)])?;
+                        acc = self.call(f, &[acc, *e, NanBox::number(i as f64), arr])?;
                     }
                     return Ok(Some(acc));
                 }
@@ -3235,9 +3236,10 @@ impl<'a> Interp<'a> {
                         idx -= 1;
                         acc = elems[idx];
                     }
+                    let arr = NanBox::handle(handle.to_raw());
                     while idx > 0 {
                         idx -= 1;
-                        acc = self.call(f, &[acc, elems[idx], NanBox::number(idx as f64)])?;
+                        acc = self.call(f, &[acc, elems[idx], NanBox::number(idx as f64), arr])?;
                     }
                     return Ok(Some(acc));
                 }
@@ -3514,9 +3516,10 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::boolean(true)));
                 }
                 "sort" => {
+                    // Sorts in place and returns the same array.
                     let sorted = self.sort_array(elems, arg(0))?;
-                    let h = self.realm.new_array(sorted);
-                    return Ok(Some(NanBox::handle(h.to_raw())));
+                    self.realm.array_set_all(handle, sorted);
+                    return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 _ => {}
             }
@@ -7156,6 +7159,27 @@ mod tests {
         assert_eq!(run("'\\u{1F600}'.codePointAt(0)"), "128512");
         assert_eq!(run("'a\\u{1F600}b'.codePointAt(1)"), "128512");
         assert_eq!(run("'hello'.charCodeAt(0)"), "104");
+    }
+
+    #[test]
+    fn reduce_args_and_sort_in_place() {
+        // reduce callback gets (acc, cur, index, array).
+        assert_eq!(
+            run(
+                "let ix=[]; [10,20,30].reduce(function(a,c,i,arr){ ix.push(i + ':' + arr.length); return a+c; }, 0); ix.join(',')"
+            ),
+            "0:3,1:3,2:3"
+        );
+        assert_eq!(
+            run("['a','b','c'].reduceRight(function(a,c){return a+c;})"),
+            "cba"
+        );
+        // sort is in place and returns the same array.
+        assert_eq!(
+            run("let a=[3,1,2]; let b=a.sort(); (a===b) + ':' + a.join(',')"),
+            "true:1,2,3"
+        );
+        assert_eq!(run("[3,1,2].sort((x,y)=>y-x).join(',')"), "3,2,1");
     }
 
     #[test]
