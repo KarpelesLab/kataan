@@ -1920,6 +1920,15 @@ impl<'a> Interp<'a> {
                 self.realm.mark_hidden(obj, key);
             }
         }
+        // A descriptor defaults to non-configurable unless `configurable: true`
+        // (so the property cannot be deleted).
+        let configurable = self
+            .realm
+            .get_property(desc, "configurable")
+            .is_some_and(|v| self.realm.truthy(v));
+        if !configurable {
+            self.realm.set_non_configurable_property(obj, key);
+        }
     }
 
     fn is_callable(&self, handle: Handle) -> bool {
@@ -5420,6 +5429,9 @@ impl<'a> Interp<'a> {
                 // not throw — both inspect the operand rather than its value.
                 match op {
                     UnaryOp::Delete => {
+                        // `delete` returns `false` when the property is
+                        // non-configurable (sealed/frozen); `true` otherwise.
+                        let mut result = true;
                         if let Expr::Member {
                             object, property, ..
                         } = &**argument
@@ -5464,12 +5476,12 @@ impl<'a> Interp<'a> {
                                         // true holes; the slot becomes undefined).
                                         self.realm.set_element(h, i, NanBox::undefined());
                                     } else {
-                                        self.realm.delete_property(h, &name);
+                                        result = self.realm.delete_property(h, &name);
                                     }
                                 }
                             }
                         }
-                        return Ok(NanBox::boolean(true));
+                        return Ok(NanBox::boolean(result));
                     }
                     UnaryOp::Typeof => {
                         if let Expr::Ident(id) = &**argument
@@ -8370,6 +8382,27 @@ mod tests {
         );
         // An own data property still assigns normally.
         assert_eq!(run("let o={a:1}; o.a=2; o.a"), "2");
+    }
+
+    #[test]
+    fn delete_respects_configurable() {
+        assert_eq!(run("let o={a:1}; delete o.a"), "true");
+        assert_eq!(run("let o={}; delete o.missing"), "true");
+        assert_eq!(
+            run("let o={}; Object.defineProperty(o,'x',{value:1,configurable:false}); delete o.x"),
+            "false"
+        );
+        assert_eq!(
+            run(
+                "let o={}; Object.defineProperty(o,'x',{value:1,configurable:false}); delete o.x; o.x"
+            ),
+            "1"
+        );
+        assert_eq!(
+            run("let o={}; Object.defineProperty(o,'y',{value:2,configurable:true}); delete o.y"),
+            "true"
+        );
+        assert_eq!(run("let o=Object.freeze({a:1}); delete o.a"), "false");
     }
 
     #[test]

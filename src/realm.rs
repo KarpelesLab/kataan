@@ -611,10 +611,18 @@ impl Realm {
     pub fn delete_property(&mut self, handle: Handle, key: &str) -> bool {
         let root = Rc::clone(&self.root_shape);
         match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
-            // A sealed/frozen object's properties are non-configurable: no delete.
-            Some(o) if o.is_sealed() => false,
-            Some(o) => o.delete(root, key),
-            None => false,
+            Some(o) => {
+                // Deleting a non-configurable property (a sealed/frozen object, or
+                // one marked `configurable: false`) fails — but only if it exists;
+                // deleting a missing property is a no-op that still "succeeds".
+                if (o.is_sealed() || o.is_non_configurable(key)) && o.has_own_key(key) {
+                    return false;
+                }
+                o.delete(root, key);
+                true
+            }
+            // A non-object receiver: nothing to delete, which counts as success.
+            None => true,
         }
     }
 
@@ -716,6 +724,13 @@ impl Realm {
     pub fn set_readonly_property(&mut self, handle: Handle, key: &str) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.set_readonly(key);
+        }
+    }
+
+    /// Marks own property `key` non-configurable (it cannot be deleted).
+    pub fn set_non_configurable_property(&mut self, handle: Handle, key: &str) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.set_non_configurable(key);
         }
     }
 

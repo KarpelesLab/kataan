@@ -45,6 +45,9 @@ pub struct Object {
     /// Own keys that are **non-writable** (`defineProperty` with
     /// `writable: false`): writes are silently ignored.
     readonly: Vec<alloc::boxed::Box<str>>,
+    /// Own keys that are **non-configurable** (`defineProperty` with
+    /// `configurable: false`): they cannot be deleted.
+    non_configurable: Vec<alloc::boxed::Box<str>>,
     /// Whether the object is frozen (`Object.freeze`): no new properties and no
     /// writes to existing ones.
     frozen: bool,
@@ -72,6 +75,7 @@ impl Object {
             accessors: Vec::new(),
             hidden: Vec::new(),
             readonly: Vec::new(),
+            non_configurable: Vec::new(),
             frozen: false,
             extensible: true,
             sealed: false,
@@ -242,6 +246,25 @@ impl Object {
     #[must_use]
     pub fn is_readonly(&self, key: &str) -> bool {
         self.readonly.iter().any(|k| k.as_ref() == key)
+    }
+
+    /// Marks own property `key` non-configurable (idempotent).
+    pub fn set_non_configurable(&mut self, key: &str) {
+        if !self.is_non_configurable(key) {
+            self.non_configurable.push(alloc::boxed::Box::from(key));
+        }
+    }
+
+    /// Whether own property `key` is non-configurable (cannot be deleted).
+    #[must_use]
+    pub fn is_non_configurable(&self, key: &str) -> bool {
+        self.non_configurable.iter().any(|k| k.as_ref() == key)
+    }
+
+    /// Whether `key` is an own property (data slot or accessor).
+    #[must_use]
+    pub fn has_own_key(&self, key: &str) -> bool {
+        self.shape.contains(key) || self.accessors.iter().any(|(k, _, _)| k.as_ref() == key)
     }
 
     /// Marks the object frozen (`Object.freeze`) — implies sealed + non-extensible.
