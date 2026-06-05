@@ -63,6 +63,10 @@ pub struct Realm {
     /// object part to carry the flag; same handle-keyed, non-GC-root caveat as
     /// `aux_props`.
     frozen_arrays: alloc::collections::BTreeSet<u64>,
+    /// The default prototype (`Object.prototype`) installed on objects created by
+    /// [`new_object`](Realm::new_object) once the global environment is set up. A
+    /// `None`-proto object (`Object.create(null)`) opts out explicitly.
+    default_object_proto: Option<Handle>,
 }
 
 impl Default for Realm {
@@ -85,7 +89,14 @@ impl Realm {
             fn_protos: alloc::collections::BTreeMap::new(),
             aux_props: alloc::collections::BTreeMap::new(),
             frozen_arrays: alloc::collections::BTreeSet::new(),
+            default_object_proto: None,
         }
+    }
+
+    /// Records the realm's `Object.prototype`, applied to subsequently-created
+    /// plain objects (so they inherit `toString`, `hasOwnProperty`, …).
+    pub fn set_default_object_proto(&mut self, proto: Handle) {
+        self.default_object_proto = Some(proto);
     }
 
     /// The auxiliary property object for a non-object cell, created on first use.
@@ -117,7 +128,11 @@ impl Realm {
     /// Allocates a fresh empty object in the heap and returns its handle.
     pub fn new_object(&mut self) -> Handle {
         let obj = Object::new(Rc::clone(&self.root_shape));
-        self.heap.alloc(Cell::Object(obj))
+        let h = self.heap.alloc(Cell::Object(obj));
+        if let Some(proto) = self.default_object_proto {
+            self.set_object_proto(h, Some(proto));
+        }
+        h
     }
 
     /// Allocates a string value in the heap and returns its handle.

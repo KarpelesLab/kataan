@@ -629,6 +629,9 @@ impl<'a> Interp<'a> {
             let f = self.realm.new_native(id);
             self.realm
                 .set_property(obj_proto, name, NanBox::handle(f.to_raw()));
+            // Non-enumerable, so inheriting objects don't surface them in for-in /
+            // Object.keys.
+            self.realm.mark_hidden(obj_proto, name);
         }
         if let Some(obj_ns) = self
             .current
@@ -639,6 +642,8 @@ impl<'a> Interp<'a> {
             self.realm
                 .set_property(obj_ns, "prototype", NanBox::handle(obj_proto.to_raw()));
         }
+        // Newly-created plain objects now inherit from `Object.prototype`.
+        self.realm.set_default_object_proto(obj_proto);
         // `globalThis`: an object mirroring the global bindings, referencing
         // itself. Reads like `globalThis.Math` and `globalThis.globalThis` work.
         let global = self.realm.new_object();
@@ -9743,6 +9748,35 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn objects_inherit_object_prototype() {
+        assert_eq!(run("'toString' in {}"), "true");
+        assert_eq!(run("'hasOwnProperty' in {}"), "true");
+        assert_eq!(
+            run("Object.getPrototypeOf({}) === Object.prototype"),
+            "true"
+        );
+        assert_eq!(run("'toString' in Object.create(null)"), "false");
+        assert_eq!(
+            run("Object.getPrototypeOf(Object.create(null)) === null"),
+            "true"
+        );
+        // Inherited methods are non-enumerable.
+        assert_eq!(run("Object.keys({a:1,b:2}).join(',')"), "a,b");
+        assert_eq!(
+            run("let s=[]; for(let k in {a:1,b:2}) s.push(k); s.join(',')"),
+            "a,b"
+        );
+        assert_eq!(run("JSON.stringify({a:1})"), "{\"a\":1}");
+        // hasOwnProperty distinguishes own vs inherited.
+        assert_eq!(
+            run(
+                "let c=Object.create({i:1}); c.o=2; c.hasOwnProperty('o') + ',' + c.hasOwnProperty('i')"
+            ),
+            "true,false"
+        );
     }
 
     #[test]
