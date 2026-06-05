@@ -1847,6 +1847,15 @@ fn builtin_method(
             "reduce" => {
                 let f = arg0();
                 let mut acc = args.get(1).copied();
+                // Empty array with no seed is a TypeError.
+                if acc.is_none() && elems(ctx).is_empty() {
+                    let e = make_error(
+                        ctx.realm,
+                        "TypeError",
+                        "Reduce of empty array with no initial value",
+                    );
+                    return Some(Err(VmError::Thrown(e)));
+                }
                 for (i, e) in elems(ctx).iter().enumerate() {
                     match acc {
                         None => acc = Some(*e), // first element seeds the accumulator

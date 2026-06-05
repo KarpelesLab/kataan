@@ -5081,9 +5081,8 @@ impl<'a> Interp<'a> {
                     if args.len() >= 2 {
                         acc = arg(1);
                     } else if elems.is_empty() {
-                        return Err(ExecError::Throw(
-                            self.new_str("Reduce of empty array with no initial value"),
-                        ));
+                        let m = self.new_str("Reduce of empty array with no initial value");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     } else {
                         acc = elems[0];
                         start = 1;
@@ -5102,9 +5101,8 @@ impl<'a> Interp<'a> {
                     if args.len() >= 2 {
                         acc = arg(1);
                     } else if elems.is_empty() {
-                        return Err(ExecError::Throw(
-                            self.new_str("Reduce of empty array with no initial value"),
-                        ));
+                        let m = self.new_str("Reduce of empty array with no initial value");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     } else {
                         idx -= 1;
                         acc = elems[idx];
@@ -9580,6 +9578,21 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn reduce_empty_throws_typeerror() {
+        assert_eq!(
+            run("try{[].reduce((a,b)=>a+b);'no'}catch(e){e instanceof TypeError}"),
+            "true"
+        );
+        assert_eq!(
+            run("try{[].reduceRight((a,b)=>a+b);'no'}catch(e){e instanceof TypeError}"),
+            "true"
+        );
+        assert_eq!(run("[].reduce((a,b)=>a+b, 99)"), "99");
+        assert_eq!(run("[42].reduce((a,b)=>a+b)"), "42");
+        assert_eq!(run("[1,2,3,4].reduce((a,b)=>a+b)"), "10");
     }
 
     #[test]
