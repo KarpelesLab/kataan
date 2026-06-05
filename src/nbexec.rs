@@ -1210,9 +1210,20 @@ impl<'a> Interp<'a> {
             }
             N_IS_NAN => NanBox::boolean(self.realm.to_number(arg(0)).is_nan()),
             N_IS_FINITE => NanBox::boolean(self.realm.to_number(arg(0)).is_finite()),
-            // `Error(msg)` called without `new` builds the same object.
+            // `Error(msg)` / `new Error(msg, { cause })` (the ES2022 cause option).
             id if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) => {
-                self.make_error(id, args.first().copied())
+                let err = self.make_error(id, args.first().copied());
+                if let Some(opts) = args
+                    .get(1)
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+                    && let Some(cause) = self.realm.get_property(opts, "cause")
+                    && let Some(eh) = err.as_handle()
+                {
+                    self.realm
+                        .set_property(Handle::from_raw(eh), "cause", cause);
+                }
+                err
             }
             _ => return Err(ExecError::NotCallable),
         })
@@ -2294,9 +2305,21 @@ impl<'a> Interp<'a> {
             let r = self.realm.new_regexp(&pat, &flags);
             return Ok(NanBox::handle(r.to_raw()));
         }
-        // `new Error(message)` and friends → `{ name, message }`.
+        // `new Error(message, { cause })` and friends → `{ name, message }` plus
+        // the ES2022 `cause` option when supplied.
         if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
-            return Ok(self.make_error(id, args.first().copied()));
+            let err = self.make_error(id, args.first().copied());
+            if let Some(opts) = args
+                .get(1)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                && let Some(cause) = self.realm.get_property(opts, "cause")
+                && let Some(eh) = err.as_handle()
+            {
+                self.realm
+                    .set_property(Handle::from_raw(eh), "cause", cause);
+            }
+            return Ok(err);
         }
         // `new WeakRef(target)` — holds the target. `deref()` always returns it
         // (sound because GC is never driven mid-execution).
@@ -9303,6 +9326,18 @@ mod tests {
                 "class A{ greet(){return 'A';} } class C extends A{ greet(){ let f=super.greet; return f.call(this)+'C'; } } new C().greet()"
             ),
             "AC"
+        );
+    }
+
+    #[test]
+    fn error_cause_option() {
+        assert_eq!(run("new Error('m',{cause:'r'}).cause"), "r");
+        assert_eq!(run("new TypeError('t',{cause:42}).cause"), "42");
+        assert_eq!(run("String(new Error('m').cause)"), "undefined");
+        assert_eq!(run("String(new Error('m',{}).cause)"), "undefined");
+        assert_eq!(
+            run("new Error('o',{cause:new Error('i')}).cause.message"),
+            "i"
         );
     }
 
