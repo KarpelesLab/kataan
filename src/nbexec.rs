@@ -3200,7 +3200,15 @@ impl<'a> Interp<'a> {
                         }
                     } else {
                         let to = self.realm.to_display_string(repl);
-                        Some(self.new_str(&s.replacen(&from, &to, 1)))
+                        match s.find(&from) {
+                            Some(pos) => {
+                                let before = &s[..pos];
+                                let after = &s[pos + from.len()..];
+                                let mid = expand_dollar(&to, &from, before, after);
+                                Some(self.new_str(&alloc::format!("{before}{mid}{after}")))
+                            }
+                            None => Some(self.new_str(&s)),
+                        }
                     }
                 }
                 "replaceAll" => {
@@ -3224,9 +3232,22 @@ impl<'a> Interp<'a> {
                         }
                         out.push_str(&s[last..]);
                         Some(self.new_str(&out))
-                    } else {
+                    } else if from.is_empty() {
                         let to = self.realm.to_display_string(repl);
                         Some(self.new_str(&s.replace(&from, &to)))
+                    } else {
+                        let to = self.realm.to_display_string(repl);
+                        let mut out = String::new();
+                        let mut last = 0;
+                        while let Some(rel) = s[last..].find(&from) {
+                            let abs = last + rel;
+                            out.push_str(&s[last..abs]);
+                            let after = &s[abs + from.len()..];
+                            out.push_str(&expand_dollar(&to, &from, &s[..abs], after));
+                            last = abs + from.len();
+                        }
+                        out.push_str(&s[last..]);
+                        Some(self.new_str(&out))
                     }
                 }
                 "at" => {
@@ -6482,6 +6503,7 @@ fn expand_replacement(templ: &str, text: &str, caps: &crate::regex::Captures) ->
             .and_then(|g| *g)
             .map(|(s, e)| &text[s..e])
     };
+    let (m_start, m_end) = caps.groups.first().and_then(|g| *g).unwrap_or((0, 0));
     let mut out = String::new();
     let mut chars = templ.chars().peekable();
     while let Some(c) = chars.next() {
@@ -6498,7 +6520,23 @@ fn expand_replacement(templ: &str, text: &str, caps: &crate::regex::Captures) ->
                 out.push_str(group(0).unwrap_or(""));
                 chars.next();
             }
-            Some(d) if d.is_ascii_digit() => {
+            // `` $` `` is the portion before the match; `$'` the portion after.
+            Some('`') => {
+                out.push_str(&text[..m_start]);
+                chars.next();
+            }
+            Some('\'') => {
+                out.push_str(&text[m_end..]);
+                chars.next();
+            }
+            // `$n` for an in-range group → the capture (empty if unmatched);
+            // out-of-range `$n` is left literal.
+            Some(d)
+                if d.is_ascii_digit() && {
+                    let n = (*d as u8 - b'0') as usize;
+                    n >= 1 && n < caps.groups.len()
+                } =>
+            {
                 let n = (*d as u8 - b'0') as usize;
                 chars.next();
                 out.push_str(group(n).unwrap_or(""));
@@ -6666,6 +6704,34 @@ fn as_index(n: f64) -> Option<usize> {
 }
 
 /// A static (non-computed) property key as a string.
+/// Expands `$`-patterns in a string-`replace` template (no capture groups, so
+/// `$1`…`$9` stay literal): `$&` → match, `` $` `` → prefix, `$'` → suffix,
+/// `$$` → `$`.
+fn expand_dollar(template: &str, m: &str, before: &str, after: &str) -> String {
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$'
+            && i + 1 < chars.len()
+            && let Some(rep) = match chars[i + 1] {
+                '$' => Some("$"),
+                '&' => Some(m),
+                '`' => Some(before),
+                '\'' => Some(after),
+                _ => None,
+            }
+        {
+            out.push_str(rep);
+            i += 2;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 fn static_key(key: &PropertyKey) -> Result<String, ExecError> {
     match key {
         PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(String::from(&**s)),
@@ -7907,6 +7973,22 @@ mod tests {
             run("let it=['p','q'].values(); it.next().value + it.next().value"),
             "pq"
         );
+    }
+
+    #[test]
+    fn replace_dollar_patterns() {
+        // String-pattern replace.
+        assert_eq!(run("'hello'.replace('l', '[$&]')"), "he[l]lo");
+        assert_eq!(run("'abc'.replace('b', '$`')"), "aac"); // prefix
+        assert_eq!(run("'abc'.replace('b', \"$'\")"), "acc"); // suffix
+        assert_eq!(run("'test'.replaceAll('t', '$$')"), "$es$"); // literal $
+        // Regex-pattern replace.
+        assert_eq!(
+            run("'2024-06'.replace(/(\\d+)-(\\d+)/, '$2/$1')"),
+            "06/2024"
+        );
+        assert_eq!(run("'x'.replace(/x/, '$1')"), "$1"); // no group 1 → literal
+        assert_eq!(run("'abc'.replace(/b/, '$`')"), "aac");
     }
 
     #[test]
