@@ -503,10 +503,18 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_string(&s).to_raw())
             }
             N_NUMBER => {
-                // `Number(obj)` runs the object through ToNumber (number hint),
-                // honoring a custom `valueOf`.
-                let p = self.coerce_object(arg(0), "number")?;
-                NanBox::number(self.realm.to_number(p))
+                // `Number(bigint)` converts to the nearest double.
+                if let Some(big) = arg(0)
+                    .as_handle()
+                    .and_then(|r| self.realm.bigint_at(Handle::from_raw(r)))
+                {
+                    NanBox::number(big.to_f64())
+                } else {
+                    // `Number(obj)` runs the object through ToNumber (number
+                    // hint), honoring a custom `valueOf`.
+                    let p = self.coerce_object(arg(0), "number")?;
+                    NanBox::number(self.realm.to_number(p))
+                }
             }
             N_BOOLEAN => NanBox::boolean(self.realm.truthy(arg(0))),
             N_SYMBOL => {
@@ -2069,14 +2077,11 @@ impl<'a> Interp<'a> {
         let handle = self.realm.new_collection(is_set);
         // Seed from an iterable: a `Set` from array elements, a `Map` from
         // `[key, value]` pairs.
-        if let Some(seed) = args
-            .first()
-            .copied()
-            .and_then(NanBox::as_handle)
-            .and_then(|r| self.realm.array_elements(Handle::from_raw(r)))
-            .map(<[_]>::to_vec)
-        {
-            for item in seed {
+        // Seed from any iterable (array, string, Set, Map, …): a `Set` from each
+        // value, a `Map` from each `[key, value]` pair.
+        let first = args.first().copied().unwrap_or(NanBox::undefined());
+        if !matches!(first.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            for item in self.iterate_values(first).unwrap_or_default() {
                 if is_set {
                     self.realm.collection_set(handle, item, item);
                 } else if let Some(pr) = item
@@ -8489,6 +8494,21 @@ mod tests {
             "1,2"
         );
         assert_eq!(run("Object.assign({}, {x:1}, {y:2}, {x:9}).x"), "9");
+    }
+
+    #[test]
+    fn number_of_bigint_and_collection_from_iterable() {
+        // Number(bigint) → the double value.
+        assert_eq!(run("Number(100n)"), "100");
+        assert_eq!(run("Number(-7n)"), "-7");
+        assert_eq!(run("Number(2n ** 10n)"), "1024");
+        // Set/Map seed from any iterable, incl. a string.
+        assert_eq!(run("[...new Set('hello')].join('')"), "helo");
+        assert_eq!(run("new Set([1,1,2,3]).size"), "3");
+        assert_eq!(
+            run("let m=new Map([['a',1],['b',2]]); m.get('a') + m.get('b')"),
+            "3"
+        );
     }
 
     #[test]

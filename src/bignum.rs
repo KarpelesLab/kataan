@@ -60,6 +60,17 @@ impl BigInt {
         Self { negative, mag }.normalized()
     }
 
+    /// Converts to the nearest `f64` (overflowing to ±∞ for huge magnitudes).
+    #[must_use]
+    pub fn to_f64(&self) -> f64 {
+        let mut result = 0.0_f64;
+        // Horner over little-endian base-2^32 limbs, high limb first.
+        for &limb in self.mag.iter().rev() {
+            result = result * 4_294_967_296.0 + f64::from(limb);
+        }
+        if self.negative { -result } else { result }
+    }
+
     /// Converts to an `i128` if it fits, else `None`.
     #[must_use]
     pub fn to_i128(&self) -> Option<i128> {
