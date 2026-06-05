@@ -2194,7 +2194,12 @@ impl<'a> Interp<'a> {
     /// Builds a match-result object (`[0..n]` groups, plus `index`, `input`,
     /// `length`) from regex captures over `text`.
     #[cfg(feature = "regex")]
-    fn regex_match_object(&mut self, text: &str, caps: &crate::regex::Captures) -> NanBox {
+    fn regex_match_object(
+        &mut self,
+        text: &str,
+        caps: &crate::regex::Captures,
+        group_names: &[(usize, String)],
+    ) -> NanBox {
         let obj = self.realm.new_object();
         for (i, g) in caps.groups.iter().enumerate() {
             let v = match g {
@@ -2210,6 +2215,21 @@ impl<'a> Interp<'a> {
         self.realm.set_property(obj, "input", input);
         self.realm
             .set_property(obj, "length", NanBox::number(caps.groups.len() as f64));
+        // `.groups`: an object of named captures (or `undefined` if none).
+        let groups = if group_names.is_empty() {
+            NanBox::undefined()
+        } else {
+            let g = self.realm.new_object();
+            for (idx, name) in group_names {
+                let v = match caps.groups.get(*idx).and_then(|x| *x) {
+                    Some((s, e)) => self.new_str(&text[s..e]),
+                    None => NanBox::undefined(),
+                };
+                self.realm.set_property(g, name, v);
+            }
+            NanBox::handle(g.to_raw())
+        };
+        self.realm.set_property(obj, "groups", groups);
         NanBox::handle(obj.to_raw())
     }
 
@@ -2958,7 +2978,7 @@ impl<'a> Interp<'a> {
                     ("test", Ok(re)) => return Ok(Some(NanBox::boolean(re.is_match(&text)))),
                     ("exec", Ok(re)) => {
                         return Ok(Some(match re.captures_from(&text, 0) {
-                            Some(caps) => self.regex_match_object(&text, &caps),
+                            Some(caps) => self.regex_match_object(&text, &caps, re.group_names()),
                             None => NanBox::null(),
                         }));
                     }
@@ -3111,7 +3131,7 @@ impl<'a> Interp<'a> {
                 }
                 "match" if !global => {
                     return Ok(Some(match re.captures_from(&s, 0) {
-                        Some(caps) => self.regex_match_object(&s, &caps),
+                        Some(caps) => self.regex_match_object(&s, &caps, re.group_names()),
                         None => NanBox::null(),
                     }));
                 }
@@ -3213,7 +3233,7 @@ impl<'a> Interp<'a> {
                             let rep = self.realm.to_display_string(r);
                             out.push_str(&rep);
                         } else {
-                            out.push_str(&expand_replacement(&templ, &s, &caps));
+                            out.push_str(&expand_replacement(&templ, &s, &caps, re.group_names()));
                         }
                         at = if en > st { en } else { en + 1 };
                         if !global || at > s.len() {
@@ -6673,7 +6693,12 @@ fn parse_float_prefix(s: &str) -> f64 {
 /// Expands a `replace` template: `$&` (whole match), `$1`..`$9` (groups), `$$`
 /// (literal `$`), against `caps` over `text`.
 #[cfg(feature = "regex")]
-fn expand_replacement(templ: &str, text: &str, caps: &crate::regex::Captures) -> String {
+fn expand_replacement(
+    templ: &str,
+    text: &str,
+    caps: &crate::regex::Captures,
+    group_names: &[(usize, String)],
+) -> String {
     let group = |i: usize| {
         caps.groups
             .get(i)
@@ -6684,6 +6709,22 @@ fn expand_replacement(templ: &str, text: &str, caps: &crate::regex::Captures) ->
     let mut out = String::new();
     let mut chars = templ.chars().peekable();
     while let Some(c) = chars.next() {
+        // `$<name>` — a named-group backreference.
+        if c == '$' && chars.peek() == Some(&'<') {
+            chars.next(); // `<`
+            let mut name = String::new();
+            while let Some(&ch) = chars.peek() {
+                chars.next();
+                if ch == '>' {
+                    break;
+                }
+                name.push(ch);
+            }
+            if let Some((idx, _)) = group_names.iter().find(|(_, n)| *n == name) {
+                out.push_str(group(*idx).unwrap_or(""));
+            }
+            continue;
+        }
         if c != '$' {
             out.push(c);
             continue;
@@ -8166,6 +8207,28 @@ mod tests {
         );
         assert_eq!(run("'x'.replace(/x/, '$1')"), "$1"); // no group 1 → literal
         assert_eq!(run("'abc'.replace(/b/, '$`')"), "aac");
+    }
+
+    #[test]
+    fn regex_named_groups() {
+        assert_eq!(
+            run(
+                "let m='2024-06'.match(/(?<y>\\d{4})-(?<mo>\\d{2})/); m.groups.y + ':' + m.groups.mo"
+            ),
+            "2024:06"
+        );
+        // Still positionally indexable.
+        assert_eq!(
+            run("'2024-06'.match(/(?<y>\\d{4})-(?<mo>\\d{2})/)[1]"),
+            "2024"
+        );
+        // Named backreference in replacement.
+        assert_eq!(
+            run("'John Smith'.replace(/(?<first>\\w+) (?<last>\\w+)/, '$<last>, $<first>')"),
+            "Smith, John"
+        );
+        // No named groups → .groups is undefined.
+        assert_eq!(run("String('ab'.match(/(a)(b)/).groups)"), "undefined");
     }
 
     #[test]

@@ -77,12 +77,17 @@ pub(crate) enum Shorthand {
     NotSpace,
 }
 
-/// Parses `pattern` into an AST plus the number of capturing groups.
-pub(crate) fn parse(pattern: &str) -> Result<(Node, usize), RegexError> {
+/// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
+pub(crate) type GroupNames = Vec<(usize, alloc::string::String)>;
+
+/// Parses `pattern` into an AST plus the number of capturing groups and the
+/// `(group index, name)` pairs of any named groups (`(?<name>…)`).
+pub(crate) fn parse(pattern: &str) -> Result<(Node, usize, GroupNames), RegexError> {
     let mut p = Parser {
         chars: pattern.chars().collect(),
         pos: 0,
         group_count: 0,
+        group_names: Vec::new(),
     };
     let node = p.parse_alt()?;
     if p.pos != p.chars.len() {
@@ -91,13 +96,14 @@ pub(crate) fn parse(pattern: &str) -> Result<(Node, usize), RegexError> {
             p.chars[p.pos]
         )));
     }
-    Ok((node, p.group_count))
+    Ok((node, p.group_count, p.group_names))
 }
 
 struct Parser {
     chars: Vec<char>,
     pos: usize,
     group_count: usize,
+    group_names: Vec<(usize, alloc::string::String)>,
 }
 
 impl Parser {
@@ -258,10 +264,29 @@ impl Parser {
     fn parse_group(&mut self) -> Result<Node, RegexError> {
         self.pos += 1; // `(`
         let index = if self.peek() == Some('?') {
-            // `(?: … )` non-capturing; other `(?…)` forms are unsupported.
+            // `(?: … )` non-capturing; `(?<name> … )` named capturing.
             if self.chars.get(self.pos + 1) == Some(&':') {
                 self.pos += 2;
                 None
+            } else if self.chars.get(self.pos + 1) == Some(&'<')
+                && !matches!(self.chars.get(self.pos + 2), Some('=' | '!'))
+            {
+                // `(?<name> … )` — a capturing group with a name.
+                self.pos += 2; // `?<`
+                let mut name = alloc::string::String::new();
+                while let Some(&c) = self.chars.get(self.pos) {
+                    if c == '>' {
+                        break;
+                    }
+                    name.push(c);
+                    self.pos += 1;
+                }
+                if !self.eat('>') {
+                    return Err(RegexError::new("unterminated group name `(?<`"));
+                }
+                self.group_count += 1;
+                self.group_names.push((self.group_count, name));
+                Some(self.group_count)
             } else {
                 return Err(RegexError::new("unsupported group extension `(?…)`"));
             }

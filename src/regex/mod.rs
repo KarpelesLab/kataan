@@ -33,6 +33,8 @@ pub struct Regex {
     prog: Vec<vm::Inst>,
     /// Number of capturing groups (excluding the whole-match group 0).
     group_count: usize,
+    /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
+    group_names: alloc::vec::Vec<(usize, alloc::string::String)>,
     flags: Flags,
 }
 
@@ -95,11 +97,12 @@ impl Regex {
     /// Compiles `pattern` with the given `flags` string.
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, RegexError> {
         let flags = Flags::parse(flags)?;
-        let (ast, _) = parser::parse(pattern)?;
+        let (ast, _, group_names) = parser::parse(pattern)?;
         let (prog, group_count) = compile::compile(&ast);
         Ok(Regex {
             prog,
             group_count,
+            group_names,
             flags,
         })
     }
@@ -108,6 +111,12 @@ impl Regex {
     #[must_use]
     pub fn group_count(&self) -> usize {
         self.group_count
+    }
+
+    /// The `(group index, name)` pairs of named capture groups (`(?<name>…)`).
+    #[must_use]
+    pub fn group_names(&self) -> &[(usize, alloc::string::String)] {
+        &self.group_names
     }
 
     /// The flags this regex was compiled with.
