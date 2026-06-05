@@ -1595,10 +1595,19 @@ fn regex_method(
         // "split" — splices capture groups and handles zero-width matches (kept
         // in sync with the tree-walker's `split`).
         _ => {
+            // An optional limit caps the segment count (args[1]).
+            let limit = match args.get(1) {
+                Some(a) if !matches!(a.unpack(), crate::nanbox::Unpacked::Undefined) => {
+                    let n = ctx.realm.to_number(*a);
+                    if n >= 0.0 { Some(n as usize) } else { None }
+                }
+                _ => None,
+            };
             let mut out = Vec::new();
             let mut seg_start = 0;
             let mut search = 0;
-            while search <= text.len() {
+            // Match positions are `< len` (spec `q < size`); the tail is appended once.
+            while search < text.len() && limit.is_none_or(|l| out.len() < l) {
                 let Some(caps) = re.captures_from(&text, search) else {
                     break;
                 };
@@ -1628,9 +1637,14 @@ fn regex_method(
                 seg_start = en;
                 search = if en > st { en } else { en + 1 };
             }
-            out.push(NanBox::handle(
-                ctx.realm.new_string(&text[seg_start..]).to_raw(),
-            ));
+            if limit.is_none_or(|l| out.len() < l) {
+                out.push(NanBox::handle(
+                    ctx.realm.new_string(&text[seg_start..]).to_raw(),
+                ));
+            }
+            if let Some(l) = limit {
+                out.truncate(l);
+            }
             NanBox::handle(ctx.realm.new_array(out).to_raw())
         }
     };

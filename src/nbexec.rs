@@ -3518,13 +3518,23 @@ impl<'a> Interp<'a> {
                     return Ok(Some(self.make_generator(out)));
                 }
                 "split" => {
+                    // An optional limit caps the number of result segments.
+                    let limit = match args.get(1) {
+                        Some(a) if !matches!(a.unpack(), Unpacked::Undefined) => {
+                            let n = self.realm.to_number(*a);
+                            if n >= 0.0 { Some(n as usize) } else { None }
+                        }
+                        _ => None,
+                    };
                     let mut parts = Vec::new();
                     // `seg_start` begins the current segment; `search` is where the
                     // next match is sought (advanced past zero-width matches so a
                     // lookahead split doesn't drop a character).
                     let mut seg_start = 0;
                     let mut search = 0;
-                    while search <= s.len() {
+                    // Match positions are `< len` (the spec's `q < size`); the tail
+                    // after the last split is appended once, below.
+                    while search < s.len() && limit.is_none_or(|l| parts.len() < l) {
                         let Some(caps) = re.captures_from(&s, search) else {
                             break;
                         };
@@ -3554,7 +3564,12 @@ impl<'a> Interp<'a> {
                         seg_start = en;
                         search = if en > st { en } else { en + 1 };
                     }
-                    parts.push(self.new_str(&s[seg_start..]));
+                    if limit.is_none_or(|l| parts.len() < l) {
+                        parts.push(self.new_str(&s[seg_start..]));
+                    }
+                    if let Some(l) = limit {
+                        parts.truncate(l);
+                    }
                     return Ok(Some(NanBox::handle(self.realm.new_array(parts).to_raw())));
                 }
                 // replace / replaceAll. The replacement is either a function
@@ -3585,6 +3600,20 @@ impl<'a> Interp<'a> {
                             }
                             call_args.push(NanBox::number(st as f64));
                             call_args.push(self.new_str(&s));
+                            // With named groups, the final argument is a `groups`
+                            // object mapping each name to its captured substring.
+                            let group_names = re.group_names();
+                            if !group_names.is_empty() {
+                                let go = self.realm.new_object();
+                                for (idx, name) in group_names {
+                                    let v = match caps.groups.get(*idx).copied().flatten() {
+                                        Some((gs, ge)) => self.new_str(&s[gs..ge]),
+                                        None => NanBox::undefined(),
+                                    };
+                                    self.realm.set_property(go, name, v);
+                                }
+                                call_args.push(NanBox::handle(go.to_raw()));
+                            }
                             let r = self.call(replacer, &call_args)?;
                             let rep = self.realm.to_display_string(r);
                             out.push_str(&rep);
@@ -8985,6 +9014,20 @@ mod tests {
             run("let it=['p','q'].values(); it.next().value + it.next().value"),
             "pq"
         );
+    }
+
+    #[test]
+    fn replace_groups_and_split_limit() {
+        // The replace function receives a `groups` object for named captures.
+        assert_eq!(
+            run("'2024-06'.replace(/(?<y>\\d+)-(?<m>\\d+)/, (m,y,mo,o,s,g)=>g.y+'/'+g.m)"),
+            "2024/06"
+        );
+        // Regex split honors the limit.
+        assert_eq!(run("'a1b2c3'.split(/(\\d)/,3).join('|')"), "a|1|b");
+        // Empty-regex split has no trailing empty; capture split keeps its trailing.
+        assert_eq!(run("'abc'.split(/(?:)/).join(',')"), "a,b,c");
+        assert_eq!(run("'a1'.split(/(\\d)/).length"), "3");
     }
 
     #[test]
