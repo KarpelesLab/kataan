@@ -4209,9 +4209,11 @@ impl<'a> Interp<'a> {
                 }
                 "forEach" => {
                     let f = arg(0);
+                    let this_arg = arg(1);
+                    let coll = NanBox::handle(handle.to_raw());
                     for (k, v) in self.realm.collection_entries(handle).unwrap_or_default() {
-                        // (value, key) per the JS signature.
-                        self.call(f, &[v, k])?;
+                        // The callback gets `(value, key, collection)` with `thisArg`.
+                        self.call_with_this(f, this_arg, &[v, k, coll])?;
                     }
                     return Ok(Some(NanBox::undefined()));
                 }
@@ -9177,6 +9179,25 @@ mod tests {
         assert_eq!(
             run("let m=new Map([['x',10],['y',20]]); let o=Object.fromEntries(m); o.x + ':' + o.y"),
             "10:20"
+        );
+    }
+
+    #[test]
+    fn collection_foreach_thisarg() {
+        assert_eq!(
+            run(
+                "let r=[]; new Map([['a',1],['b',2]]).forEach(function(v,k){ r.push(k+':'+v*this.m); }, {m:10}); r.join(',')"
+            ),
+            "a:10,b:20"
+        );
+        assert_eq!(
+            run("let s=0; new Set([1,2,3]).forEach(function(v){ s+=v*this.m; }, {m:2}); s"),
+            "12"
+        );
+        // The callback also gets the collection as the third argument.
+        assert_eq!(
+            run("let n; new Set([1]).forEach((v,k,coll)=>{ n=coll.size; }); n"),
+            "1"
         );
     }
 
