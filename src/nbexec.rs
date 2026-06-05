@@ -101,6 +101,9 @@ struct FnDef<'a> {
     is_generator: bool,
     /// Whether this is an arrow function (no own `arguments` binding).
     is_arrow: bool,
+    /// Whether the function is strict (its own `"use strict"`, or defined inside
+    /// strict code) — strict functions keep an `undefined`/`null` `this`.
+    is_strict: bool,
     /// The function's name (`fn.name`); empty for anonymous functions.
     name: &'a str,
     /// The class this is a method of (for `super.method()`), if any.
@@ -152,6 +155,9 @@ pub struct Interp<'a> {
     /// Whether the currently-executing code is in strict mode (`"use strict"`),
     /// which propagates into nested functions.
     strict: bool,
+    /// The global object (`globalThis`) — substituted for an `undefined`/`null`
+    /// `this` when calling a non-strict function.
+    global_this: NanBox,
     /// Captured `console.log` output (a line per call).
     output: String,
 }
@@ -358,6 +364,7 @@ impl<'a> Interp<'a> {
             pending_label: None,
             microtasks: Vec::new(),
             strict: false,
+            global_this: NanBox::undefined(),
             output: String::new(),
         };
         interp.install_globals();
@@ -622,6 +629,7 @@ impl<'a> Interp<'a> {
         let gbox = NanBox::handle(global.to_raw());
         self.realm.set_property(global, "globalThis", gbox);
         self.current.declare("globalThis", gbox);
+        self.global_this = gbox;
     }
 
     /// Invokes a built-in by id.
@@ -1884,6 +1892,9 @@ impl<'a> Interp<'a> {
         is_generator: bool,
         home_class: Option<u32>,
     ) -> NanBox {
+        // Strict mode is lexical: inherited from the defining context, or set by
+        // the function body's own `"use strict"` directive prologue.
+        let is_strict = self.strict || matches!(body, Body::Block(stmts) if has_use_strict(stmts));
         let func_id = self.functions.len() as u32;
         self.functions.push(FnDef {
             params,
@@ -1891,6 +1902,7 @@ impl<'a> Interp<'a> {
             is_async,
             is_generator,
             is_arrow: false,
+            is_strict,
             name: "",
             home_class,
         });
@@ -2380,7 +2392,16 @@ impl<'a> Interp<'a> {
         let saved_this = if def.is_arrow {
             self.this_val
         } else {
-            core::mem::replace(&mut self.this_val, this_val)
+            // Sloppy-mode `this` coercion: an `undefined`/`null` receiver becomes
+            // the global object. Strict functions keep it as-is.
+            let bound = if !def.is_strict
+                && matches!(this_val.unpack(), Unpacked::Undefined | Unpacked::Null)
+            {
+                self.global_this
+            } else {
+                this_val
+            };
+            core::mem::replace(&mut self.this_val, bound)
         };
         let saved_home = core::mem::replace(&mut self.current_home, def.home_class);
         // A generator body runs eagerly into a fresh yield buffer.
@@ -10752,6 +10773,50 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn sloppy_this_is_global_object() {
+        // Sloppy plain call: `this` is the global object.
+        assert_eq!(
+            run("(function(){ function f(){return this===globalThis;} return f(); })()"),
+            "true"
+        );
+        assert_eq!(
+            run("(function(){ function f(){return typeof this;} return f(); })()"),
+            "object"
+        );
+        assert_eq!(
+            run("(function(){ function f(){return this===globalThis;} return f.call(null); })()"),
+            "true"
+        );
+        // Nested plain function.
+        assert_eq!(
+            run(
+                "(function(){ var o={m(){ function inner(){return this===globalThis;} return inner(); }}; return o.m(); })()"
+            ),
+            "true"
+        );
+        // Strict (lexical) keeps `this` undefined.
+        assert_eq!(
+            run(
+                "(function(){'use strict'; function f(){return this===undefined;} return f(); })()"
+            ),
+            "true"
+        );
+        assert_eq!(
+            run("(function(){'use strict'; function f(){return this;} return f.call(null); })()"),
+            "null"
+        );
+        // A method receiver and a lexical arrow `this` are unaffected.
+        assert_eq!(
+            run("(function(){ var o={x:5,m(){return this.x;}}; return o.m(); })()"),
+            "5"
+        );
+        assert_eq!(
+            run("(function(){ var o={x:9,m(){var a=()=>this.x;return a();}}; return o.m(); })()"),
+            "9"
+        );
     }
 
     #[test]
