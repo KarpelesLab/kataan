@@ -215,6 +215,7 @@ const N_ENCODE_URI_COMPONENT: u16 = 159;
 const N_DECODE_URI_COMPONENT: u16 = 160;
 const N_ENCODE_URI: u16 = 161;
 const N_DECODE_URI: u16 = 162;
+const N_STRUCTURED_CLONE: u16 = 163;
 const N_OBJECT_CREATE: u16 = 107;
 const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
@@ -532,6 +533,7 @@ impl<'a> Interp<'a> {
             ("decodeURIComponent", N_DECODE_URI_COMPONENT),
             ("encodeURI", N_ENCODE_URI),
             ("decodeURI", N_DECODE_URI),
+            ("structuredClone", N_STRUCTURED_CLONE),
         ] {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -574,6 +576,7 @@ impl<'a> Interp<'a> {
             "decodeURIComponent",
             "encodeURI",
             "decodeURI",
+            "structuredClone",
         ] {
             if let Some(v) = self.current.get(n) {
                 self.realm.set_property(global, n, v);
@@ -1332,6 +1335,10 @@ impl<'a> Interp<'a> {
                         return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     }
                 }
+            }
+            N_STRUCTURED_CLONE => {
+                let mut seen: Vec<(u64, NanBox)> = Vec::new();
+                self.structured_clone(arg(0), &mut seen)?
             }
             N_IS_NAN => NanBox::boolean(self.realm.to_number(arg(0)).is_nan()),
             N_IS_FINITE => NanBox::boolean(self.realm.to_number(arg(0)).is_finite()),
@@ -2651,6 +2658,69 @@ impl<'a> Interp<'a> {
             };
             self.realm.set_property(instance, "message", msg);
         }
+    }
+
+    /// `structuredClone(v)`: a deep copy. Primitives and immutable heap values
+    /// (strings, BigInts) are shared; Dates, Maps, Sets, arrays, and plain
+    /// objects are recursively cloned. `seen` maps each visited source handle to
+    /// its clone so cyclic and shared references are preserved. Functions and
+    /// symbols are not cloneable (a TypeError, like `DataCloneError`).
+    fn structured_clone(
+        &mut self,
+        v: NanBox,
+        seen: &mut Vec<(u64, NanBox)>,
+    ) -> Result<NanBox, ExecError> {
+        let Some(raw) = v.as_handle() else {
+            return Ok(v); // a primitive
+        };
+        let h = Handle::from_raw(raw);
+        // Immutable heap values are shared, not copied.
+        if self.realm.string_value(h).is_some() || self.realm.bigint_at(h).is_some() {
+            return Ok(v);
+        }
+        if self.is_callable(h) || self.realm.symbol_at(h).is_some() {
+            let m = self.new_str("value could not be cloned");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        // A previously-cloned handle (cycle or shared reference).
+        if let Some((_, c)) = seen.iter().find(|(r, _)| *r == raw) {
+            return Ok(*c);
+        }
+        if let Some(ms) = self.realm.date_at(h) {
+            return Ok(NanBox::handle(self.realm.new_date(ms).to_raw()));
+        }
+        if let Some(is_set) = self.realm.collection_is_set(h) {
+            let coll = self.realm.new_collection(is_set);
+            let cbox = NanBox::handle(coll.to_raw());
+            seen.push((raw, cbox));
+            for (k, val) in self.realm.collection_entries(h).unwrap_or_default() {
+                let ck = self.structured_clone(k, seen)?;
+                let cv = self.structured_clone(val, seen)?;
+                self.realm.collection_set(coll, ck, cv);
+            }
+            return Ok(cbox);
+        }
+        if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
+            let arr = self.realm.new_array(Vec::new());
+            let abox = NanBox::handle(arr.to_raw());
+            seen.push((raw, abox));
+            for e in elems {
+                let c = self.structured_clone(e, seen)?;
+                self.realm.array_push(arr, c);
+            }
+            return Ok(abox);
+        }
+        // A plain object: clone own enumerable string-keyed properties.
+        let obj = self.realm.new_object();
+        let obox = NanBox::handle(obj.to_raw());
+        seen.push((raw, obox));
+        for k in self.realm.object_keys(h).unwrap_or_default() {
+            if let Some(pv) = self.realm.get_property(h, &k) {
+                let c = self.structured_clone(pv, seen)?;
+                self.realm.set_property(obj, &k, c);
+            }
+        }
+        Ok(obox)
     }
 
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
@@ -10208,6 +10278,39 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn structured_clone_deep_copy() {
+        assert_eq!(
+            run("let o={b:{c:2}}; let c=structuredClone(o); c.b.c=9; o.b.c"),
+            "2"
+        );
+        assert_eq!(
+            run("let c=structuredClone([1,[2,3]]); c[1][0]=9; c[1][0]"),
+            "9"
+        );
+        assert_eq!(run("structuredClone(new Map([['k',1]])).get('k')"), "1");
+        assert_eq!(
+            run("[...structuredClone(new Set([1,2,3]))].join(',')"),
+            "1,2,3"
+        );
+        assert_eq!(run("structuredClone(new Date(1000)).getTime()"), "1000");
+        // Cycles and shared references.
+        assert_eq!(
+            run("let o={}; o.self=o; let c=structuredClone(o); c.self===c"),
+            "true"
+        );
+        assert_eq!(
+            run("let s={v:1}; let c=structuredClone({x:s,y:s}); c.x===c.y"),
+            "true"
+        );
+        // Primitives pass through; functions throw.
+        assert_eq!(run("structuredClone(42)"), "42");
+        assert_eq!(
+            run("try{structuredClone({f:function(){}});'no'}catch(e){e instanceof TypeError}"),
+            "true"
+        );
     }
 
     #[test]
