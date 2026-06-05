@@ -841,7 +841,8 @@ impl<'a> Interp<'a> {
             N_OBJECT_KEYS => {
                 let keys = arg(0)
                     .as_handle()
-                    .and_then(|raw| self.realm.object_keys(Handle::from_raw(raw)))
+                    .map(|raw| self.proxy_key_target(Handle::from_raw(raw)))
+                    .and_then(|h| self.realm.object_keys(h))
                     .unwrap_or_default();
                 let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_str(k)).collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
@@ -1160,7 +1161,7 @@ impl<'a> Interp<'a> {
             N_OBJECT_VALUES => {
                 let mut vals = Vec::new();
                 if let Some(raw) = arg(0).as_handle() {
-                    let h = Handle::from_raw(raw);
+                    let h = self.proxy_key_target(Handle::from_raw(raw));
                     for k in self.realm.object_keys(h).unwrap_or_default() {
                         vals.push(
                             self.realm
@@ -1205,6 +1206,7 @@ impl<'a> Interp<'a> {
             N_OBJECT_ENTRIES => {
                 let mut pairs = Vec::new();
                 if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
+                    let h = self.proxy_key_target(h);
                     for k in self.realm.object_keys(h).unwrap_or_default() {
                         let v = self
                             .realm
@@ -3086,6 +3088,17 @@ impl<'a> Interp<'a> {
         self.realm
             .set_hidden_property(obj, PRIM_WRAP_TYPE, NanBox::number(f64::from(ctor_id)));
         NanBox::handle(obj.to_raw())
+    }
+
+    /// Resolves a (trap-less) proxy to its target for key enumeration, so
+    /// `Object.keys`/`values`/`entries` on a pass-through proxy see the target's
+    /// own keys. A non-proxy is returned unchanged. (The `ownKeys` trap is not
+    /// invoked here.)
+    fn proxy_key_target(&self, mut h: crate::heap::Handle) -> crate::heap::Handle {
+        while let Some((target, _)) = self.realm.proxy_at(h) {
+            h = target;
+        }
+        h
     }
 
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
@@ -9469,6 +9482,24 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn proxy_passthrough_keys() {
+        assert_eq!(run("Object.keys(new Proxy({a:1,b:2},{})).join(',')"), "a,b");
+        assert_eq!(
+            run("Object.values(new Proxy({a:1,b:2},{})).join(',')"),
+            "1,2"
+        );
+        assert_eq!(
+            run("Object.entries(new Proxy({a:1,b:2},{})).map(e=>e.join(':')).join(',')"),
+            "a:1,b:2"
+        );
+        // Nested trap-less proxies forward through.
+        assert_eq!(
+            run("Object.keys(new Proxy(new Proxy({x:1},{}),{})).join(',')"),
+            "x"
+        );
     }
 
     #[test]
