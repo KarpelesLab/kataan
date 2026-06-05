@@ -37,7 +37,9 @@ jobs:
 
       - name: Format
         if: runner.os == 'Linux' # formatting is platform-independent
-        run: cargo fmt --all --check
+        # Scope to our own package: the `intl` path dependency (`../unicoders`) is
+        # an upstream checkout whose formatting we do not gate on.
+        run: cargo fmt --check -p kataan
 
       - name: Clippy (all features, warnings denied)
         run: cargo clippy --all-targets --all-features -- -D warnings
