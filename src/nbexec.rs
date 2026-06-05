@@ -129,6 +129,8 @@ pub struct Interp<'a> {
     class_native_super: Vec<Option<u16>>,
     /// Current function-call nesting depth (recursion guard).
     call_depth: usize,
+    /// xorshift PRNG state backing `Math.random` (pure Rust, no foreign code).
+    rng_state: u64,
     /// The current `this` binding (method/constructor receiver).
     this_val: NanBox,
     /// When running a generator body eagerly, the buffer `yield` appends to.
@@ -284,6 +286,7 @@ const N_MATH_LOG2: u16 = 104;
 const N_MATH_LOG10: u16 = 105;
 const N_MATH_EXP: u16 = 133;
 const N_MATH_LOG: u16 = 134;
+const N_MATH_RANDOM: u16 = 139;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib.
@@ -300,6 +303,8 @@ impl<'a> Interp<'a> {
             class_envs: Vec::new(),
             class_native_super: Vec::new(),
             call_depth: 0,
+            // A fixed non-zero seed (deterministic, but advances per call).
+            rng_state: 0x9E37_79B9_7F4A_7C15,
             this_val: NanBox::undefined(),
             gen_sink: None,
             symbol_registry: alloc::collections::BTreeMap::new(),
@@ -362,6 +367,7 @@ impl<'a> Interp<'a> {
                 ("log10", N_MATH_LOG10),
                 ("exp", N_MATH_EXP),
                 ("log", N_MATH_LOG),
+                ("random", N_MATH_RANDOM),
                 ("trunc", N_MATH_TRUNC),
             ],
         );
@@ -1107,6 +1113,16 @@ impl<'a> Interp<'a> {
             N_MATH_EXP => NanBox::number(self.realm.to_number(arg(0)).exp()),
             #[cfg(feature = "std")]
             N_MATH_LOG => NanBox::number(self.realm.to_number(arg(0)).ln()),
+            // `Math.random()` ∈ [0, 1) — a pure-Rust xorshift64 generator; the
+            // top 53 bits form the mantissa.
+            N_MATH_RANDOM => {
+                let mut x = self.rng_state;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.rng_state = x;
+                NanBox::number((x >> 11) as f64 / (1u64 << 53) as f64)
+            }
             #[cfg(not(feature = "std"))]
             N_MATH_HYPOT | N_MATH_CBRT | N_MATH_LOG2 | N_MATH_LOG10 | N_MATH_EXP | N_MATH_LOG => {
                 return Err(ExecError::Unsupported("Math fns need std"));
@@ -8717,6 +8733,19 @@ mod tests {
         assert_eq!(run("(1e-7).toString()"), "1e-7");
         assert_eq!(run("(1e20).toString()"), "100000000000000000000"); // not exponential
         assert_eq!(run("(0.000001).toString()"), "0.000001"); // 1e-6 stays decimal
+    }
+
+    #[test]
+    fn math_random_in_range() {
+        // In [0, 1), and consecutive calls differ (the PRNG advances).
+        assert_eq!(run("let a=Math.random(); a >= 0 && a < 1"), "true");
+        assert_eq!(run("Math.random() !== Math.random()"), "true");
+        assert_eq!(
+            run(
+                "let xs=[]; for (let i=0;i<100;i++) xs.push(Math.random()); xs.every(x=>x>=0&&x<1)"
+            ),
+            "true"
+        );
     }
 
     #[test]
