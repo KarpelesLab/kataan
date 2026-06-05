@@ -549,7 +549,8 @@ impl<'a> Interp<'a> {
                     String::new()
                 };
                 let result = if indent.is_empty() {
-                    self.json_stringify(value)
+                    // Interpreter-aware: honors `toJSON` and invokes getters.
+                    self.json_to_string(value)?
                 } else {
                     crate::json::stringify_pretty(&self.realm, value, &indent)
                 };
@@ -1245,45 +1246,62 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn json_stringify(&self, v: NanBox) -> Option<String> {
+    /// Interpreter-aware `JSON.stringify` (compact): honors a `toJSON` method and
+    /// invokes getters, unlike the realm-only `json_stringify`.
+    fn json_to_string(&mut self, v: NanBox) -> Result<Option<String>, ExecError> {
+        // A `toJSON` method replaces the value before serialization.
+        if let Some(h) = v.as_handle().map(Handle::from_raw)
+            && self.realm.string_value(h).is_none()
+            && !self.realm.is_array(h)
+            && self.realm.object_keys(h).is_some()
+        {
+            let tj = self.read_member(h, "toJSON")?;
+            if tj
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let r = self.call_with_this(tj, v, &[])?;
+                return self.json_to_string(r);
+            }
+        }
         match v.unpack() {
-            Unpacked::Undefined => None,
-            Unpacked::Null => Some(String::from("null")),
-            Unpacked::Bool(b) => Some(String::from(if b { "true" } else { "false" })),
-            Unpacked::Number(n) => Some(if n.is_finite() {
+            Unpacked::Undefined => Ok(None),
+            Unpacked::Null => Ok(Some(String::from("null"))),
+            Unpacked::Bool(b) => Ok(Some(String::from(if b { "true" } else { "false" }))),
+            Unpacked::Number(n) => Ok(Some(if n.is_finite() {
                 alloc::format!("{n}")
             } else {
                 String::from("null")
-            }),
+            })),
             Unpacked::Handle(raw) => {
                 let h = Handle::from_raw(raw);
                 if let Some(s) = self.realm.string_value(h) {
-                    return Some(json_quote(&s));
+                    return Ok(Some(json_quote(&s)));
                 }
                 if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
-                    let parts: Vec<String> = elems
-                        .iter()
-                        .map(|e| {
-                            self.json_stringify(*e)
-                                .unwrap_or_else(|| String::from("null"))
-                        })
-                        .collect();
-                    return Some(alloc::format!("[{}]", parts.join(",")));
+                    let mut parts = Vec::with_capacity(elems.len());
+                    for e in elems {
+                        parts.push(
+                            self.json_to_string(e)?
+                                .unwrap_or_else(|| String::from("null")),
+                        );
+                    }
+                    return Ok(Some(alloc::format!("[{}]", parts.join(","))));
                 }
-                if let Some(keys) = self.realm.object_keys(h) {
+                if self.realm.object_keys(h).is_some() {
+                    // Data keys plus accessor (getter) keys, read via read_member.
+                    let mut keys = self.realm.object_keys(h).unwrap_or_default();
+                    keys.extend(self.realm.object_accessor_keys(h));
                     let mut parts = Vec::new();
                     for k in keys {
-                        let val = self
-                            .realm
-                            .get_property(h, &k)
-                            .unwrap_or(NanBox::undefined());
-                        if let Some(s) = self.json_stringify(val) {
+                        let val = self.read_member(h, &k)?;
+                        if let Some(s) = self.json_to_string(val)? {
                             parts.push(alloc::format!("{}:{}", json_quote(&k), s));
                         }
                     }
-                    return Some(alloc::format!("{{{}}}", parts.join(",")));
+                    return Ok(Some(alloc::format!("{{{}}}", parts.join(","))));
                 }
-                None // a function
+                Ok(None) // a function
             }
         }
     }
@@ -2381,6 +2399,23 @@ impl<'a> Interp<'a> {
         if self.realm.native_at(handle) == Some(N_DATE) && method == "now" {
             return Ok(Some(NanBox::number(now_ms())));
         }
+        // --- `Date.UTC(year, month, day?, h?, m?, s?, ms?)` → epoch ms ---
+        if self.realm.native_at(handle) == Some(N_DATE) && method == "UTC" {
+            let num = |i: usize, dflt: f64| args.get(i).map_or(dflt, |a| self.realm.to_number(*a));
+            let year = num(0, 1970.0) as i64;
+            let month = num(1, 0.0) as i64;
+            let day = num(2, 1.0) as i64;
+            let total_months = year * 12 + month;
+            let y = total_months.div_euclid(12);
+            let mo = total_months.rem_euclid(12) as u32 + 1;
+            let days = crate::realm::days_from_civil(y, mo, day as u32);
+            let ms = (days * 86_400_000
+                + (num(3, 0.0) as i64) * 3_600_000
+                + (num(4, 0.0) as i64) * 60_000
+                + (num(5, 0.0) as i64) * 1_000
+                + num(6, 0.0) as i64) as f64;
+            return Ok(Some(NanBox::number(ms)));
+        }
         // --- `Proxy.revocable(target, handler)` → `{ proxy, revoke }` ---
         if self.realm.native_at(handle) == Some(N_PROXY) && method == "revocable" {
             let (Some(tr), Some(hr)) = (arg(0).as_handle(), arg(1).as_handle()) else {
@@ -2525,15 +2560,18 @@ impl<'a> Interp<'a> {
             let tod = t.rem_euclid(86_400_000);
             let (y, mo, d) = crate::realm::civil_from_days(day);
             return Ok(Some(match method {
+                // The engine models all dates in UTC, so `getUTC*` aliases `get*`.
                 "getTime" | "valueOf" => NanBox::number(ms),
-                "getFullYear" => NanBox::number(y as f64),
-                "getMonth" => NanBox::number((mo - 1) as f64), // 0-based
-                "getDate" => NanBox::number(d as f64),
-                "getDay" => NanBox::number((day.rem_euclid(7) + 4).rem_euclid(7) as f64),
-                "getHours" => NanBox::number((tod / 3_600_000) as f64),
-                "getMinutes" => NanBox::number((tod / 60_000 % 60) as f64),
-                "getSeconds" => NanBox::number((tod / 1000 % 60) as f64),
-                "getMilliseconds" => NanBox::number((tod % 1000) as f64),
+                "getFullYear" | "getUTCFullYear" => NanBox::number(y as f64),
+                "getMonth" | "getUTCMonth" => NanBox::number((mo - 1) as f64), // 0-based
+                "getDate" | "getUTCDate" => NanBox::number(d as f64),
+                "getDay" | "getUTCDay" => {
+                    NanBox::number((day.rem_euclid(7) + 4).rem_euclid(7) as f64)
+                }
+                "getHours" | "getUTCHours" => NanBox::number((tod / 3_600_000) as f64),
+                "getMinutes" | "getUTCMinutes" => NanBox::number((tod / 60_000 % 60) as f64),
+                "getSeconds" | "getUTCSeconds" => NanBox::number((tod / 1000 % 60) as f64),
+                "getMilliseconds" | "getUTCMilliseconds" => NanBox::number((tod % 1000) as f64),
                 "toISOString" | "toJSON" => self.new_str(&crate::realm::date_to_iso(ms)),
                 _ => return Ok(None),
             }));
@@ -6280,6 +6318,24 @@ mod tests {
         let mut interp = Interp::new();
         interp.run(&program).unwrap();
         assert_eq!(interp.output(), "hi 42\narr: 1,2\n");
+    }
+
+    #[test]
+    fn json_getters_tojson_and_date_utc() {
+        // JSON.stringify invokes getters and honors toJSON.
+        assert_eq!(
+            run("JSON.stringify({a:1, get b(){ return 2; }})"),
+            "{\"a\":1,\"b\":2}"
+        );
+        assert_eq!(
+            run("JSON.stringify({v:42, toJSON(){ return {w:this.v}; }})"),
+            "{\"w\":42}"
+        );
+        assert_eq!(run("JSON.stringify([undefined,1])"), "[null,1]");
+        // Date.UTC and getUTC* methods.
+        assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
+        assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
+        assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
     }
 
     #[test]
