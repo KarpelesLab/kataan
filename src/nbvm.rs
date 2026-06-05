@@ -1044,7 +1044,9 @@ fn run_frame(
                         ctx.realm.get_element(handle, n as usize)
                     }
                     _ => {
-                        let ks = ctx.realm.to_display_string(k);
+                        // ToPropertyKey: an object key uses its `toString`.
+                        let pk = to_primitive(ctx, funcs, k, false);
+                        let ks = ctx.realm.to_display_string(pk);
                         // A canonical numeric string key on an array (`arr["0"]`)
                         // reads the element, like `arr[0]`.
                         if ctx.realm.is_array(handle)
@@ -1076,7 +1078,9 @@ fn run_frame(
                             .set_element(handle, n as usize, regs[*src as usize]);
                     }
                     _ => {
-                        let ks = ctx.realm.to_display_string(k);
+                        // ToPropertyKey: an object key uses its `toString`.
+                        let pk = to_primitive(ctx, funcs, k, false);
+                        let ks = ctx.realm.to_display_string(pk);
                         ctx.realm.set_property(handle, &ks, regs[*src as usize]);
                     }
                 }

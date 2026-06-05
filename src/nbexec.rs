@@ -3730,7 +3730,9 @@ impl<'a> Interp<'a> {
                 "concat" => {
                     let mut out = s.clone();
                     for a in args {
-                        out.push_str(&self.realm.to_display_string(*a));
+                        // ToString each argument, honoring a user `toString`.
+                        let p = self.coerce_object(*a, "string")?;
+                        out.push_str(&self.realm.to_display_string(p));
                     }
                     Some(self.new_str(&out))
                 }
@@ -5159,6 +5161,21 @@ impl<'a> Interp<'a> {
         self.realm.to_display_string(k)
     }
 
+    /// `ToPropertyKey(k)`: like `member_key`, but a non-string, non-symbol object
+    /// key is coerced with ToPrimitive(String) so a user `toString` is honored
+    /// (`obj[{toString(){return "x"}}]` keys on `"x"`).
+    fn coerce_property_key(&mut self, k: NanBox) -> Result<String, ExecError> {
+        let is_object_key = k.as_handle().is_some_and(|raw| {
+            let h = Handle::from_raw(raw);
+            self.realm.symbol_at(h).is_none() && self.realm.string_value(h).is_none()
+        });
+        if is_object_key {
+            let p = self.coerce_object(k, "string")?;
+            return Ok(self.realm.to_display_string(p));
+        }
+        Ok(self.member_key(k))
+    }
+
     /// Invokes a plain object's `[Symbol.toPrimitive](hint)` method, if it has a
     /// callable one. Returns `None` to fall back to `valueOf`/`toString`.
     fn symbol_to_primitive(&mut self, v: NanBox, hint: &str) -> Result<Option<NanBox>, ExecError> {
@@ -5811,7 +5828,7 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(self.realm.get_element(handle, i));
                 }
-                let name = self.member_key(k);
+                let name = self.coerce_property_key(k)?;
                 self.read_member(handle, &name)
             }
             PropertyKey::Ident(s) | PropertyKey::Str(s) => self.read_member(handle, s),
@@ -5872,7 +5889,7 @@ impl<'a> Interp<'a> {
             self.realm.set_element(handle, i, new);
             return Ok(());
         }
-        let name = self.member_key(key);
+        let name = self.coerce_property_key(key)?;
         // An accessor setter takes precedence.
         if let Some((_, setter)) = self.realm.accessor(handle, &name) {
             if !matches!(setter.unpack(), Unpacked::Undefined) {
@@ -6243,7 +6260,7 @@ impl<'a> Interp<'a> {
                 {
                     self.realm.set_element(handle, i, new);
                 } else {
-                    let name = self.member_key(k);
+                    let name = self.coerce_property_key(k)?;
                     self.realm.set_property(handle, &name, new);
                 }
             }
@@ -9237,6 +9254,17 @@ mod tests {
         assert_eq!(run("String({} - 1)"), "NaN");
         assert_eq!(run("-[5]"), "-5");
         assert_eq!(run("new Date(5000) - new Date(2000)"), "3000");
+    }
+
+    #[test]
+    fn tostring_in_concat_and_property_key() {
+        // String.concat honors a user toString.
+        assert_eq!(run("'x'.concat({toString(){return 'TS';}})"), "xTS");
+        // An object property key is coerced via ToString (toString).
+        assert_eq!(
+            run("let k={toString(){return 'key';}}; let m={}; m[k]=42; m.key + ':' + m[k]"),
+            "42:42"
+        );
     }
 
     #[test]
