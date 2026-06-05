@@ -189,6 +189,10 @@ const N_MATH_TRUNC: u16 = 30;
 const N_OBJECT_FROM_ENTRIES: u16 = 34;
 const N_OBJECT_FREEZE: u16 = 35;
 const N_OBJECT_IS_FROZEN: u16 = 36;
+const N_OBJECT_SEAL: u16 = 125;
+const N_OBJECT_IS_SEALED: u16 = 126;
+const N_OBJECT_PREVENT_EXT: u16 = 127;
+const N_OBJECT_IS_EXTENSIBLE: u16 = 128;
 const N_OBJECT_GET_OWN_NAMES: u16 = 37;
 const N_OBJECT_CREATE: u16 = 107;
 const N_OBJECT_GET_PROTO: u16 = 108;
@@ -371,6 +375,10 @@ impl<'a> Interp<'a> {
                 ("fromEntries", N_OBJECT_FROM_ENTRIES),
                 ("freeze", N_OBJECT_FREEZE),
                 ("isFrozen", N_OBJECT_IS_FROZEN),
+                ("seal", N_OBJECT_SEAL),
+                ("isSealed", N_OBJECT_IS_SEALED),
+                ("preventExtensions", N_OBJECT_PREVENT_EXT),
+                ("isExtensible", N_OBJECT_IS_EXTENSIBLE),
                 ("getOwnPropertyNames", N_OBJECT_GET_OWN_NAMES),
                 ("create", N_OBJECT_CREATE),
                 ("getPrototypeOf", N_OBJECT_GET_PROTO),
@@ -585,6 +593,28 @@ impl<'a> Interp<'a> {
                 }
                 arg(0) // returns the (now frozen) object
             }
+            N_OBJECT_SEAL => {
+                if let Some(raw) = arg(0).as_handle() {
+                    self.realm.seal_object(Handle::from_raw(raw));
+                }
+                arg(0)
+            }
+            N_OBJECT_PREVENT_EXT => {
+                if let Some(raw) = arg(0).as_handle() {
+                    self.realm.prevent_extensions(Handle::from_raw(raw));
+                }
+                arg(0)
+            }
+            N_OBJECT_IS_SEALED => NanBox::boolean(
+                arg(0)
+                    .as_handle()
+                    .is_some_and(|raw| self.realm.is_sealed(Handle::from_raw(raw))),
+            ),
+            N_OBJECT_IS_EXTENSIBLE => NanBox::boolean(
+                arg(0)
+                    .as_handle()
+                    .is_some_and(|raw| self.realm.is_extensible(Handle::from_raw(raw))),
+            ),
             // `Object.create(proto)` — a new object with the given prototype
             // (`null` → no prototype).
             N_OBJECT_CREATE => {
@@ -6766,6 +6796,29 @@ mod tests {
         // name from a declaration and a named function expression.
         assert_eq!(run("function greet(){} greet.name"), "greet");
         assert_eq!(run("let g = function inner(){}; g.name"), "inner");
+    }
+
+    #[test]
+    fn object_seal_and_extensibility() {
+        // preventExtensions: no new props, existing still writable.
+        assert_eq!(
+            run(
+                "let o={a:1}; Object.preventExtensions(o); o.b=2; o.a=9; String(o.b) + ':' + o.a + ':' + Object.isExtensible(o)"
+            ),
+            "undefined:9:false"
+        );
+        // seal: no new props, no delete, existing writable.
+        assert_eq!(
+            run(
+                "let o={x:1}; Object.seal(o); o.y=2; o.x=5; delete o.x; o.x + ':' + String(o.y) + ':' + Object.isSealed(o)"
+            ),
+            "5:undefined:true"
+        );
+        // freeze implies sealed + non-extensible.
+        assert_eq!(
+            run("let o={a:1}; Object.freeze(o); Object.isSealed(o) + ':' + Object.isExtensible(o)"),
+            "true:false"
+        );
     }
 
     #[test]

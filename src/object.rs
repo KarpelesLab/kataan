@@ -39,6 +39,11 @@ pub struct Object {
     /// Whether the object is frozen (`Object.freeze`): no new properties and no
     /// writes to existing ones.
     frozen: bool,
+    /// Whether new properties may be added (`Object.preventExtensions` clears it).
+    extensible: bool,
+    /// Whether the object is sealed (`Object.seal`): no new properties and no
+    /// deletions, but existing writable properties may still change.
+    sealed: bool,
     /// The class this object was instantiated from (for `instanceof`), if any.
     class_tag: Option<u32>,
     /// The `[[Prototype]]` link (`Object.create`/`getPrototypeOf`), if any. A
@@ -59,6 +64,8 @@ impl Object {
             hidden: Vec::new(),
             readonly: Vec::new(),
             frozen: false,
+            extensible: true,
+            sealed: false,
             class_tag: None,
             proto: None,
         }
@@ -162,10 +169,11 @@ impl Object {
         }
         if let Some(slot) = self.shape.lookup(key) {
             self.slots[slot as usize] = value;
-        } else {
+        } else if self.extensible {
             self.shape = self.shape.transition(key);
             self.slots.push(value);
         }
+        // A non-extensible object silently ignores new keys.
     }
 
     /// The own property names, in insertion (slot) order.
@@ -210,9 +218,34 @@ impl Object {
         self.readonly.iter().any(|k| k.as_ref() == key)
     }
 
-    /// Marks the object frozen (`Object.freeze`).
+    /// Marks the object frozen (`Object.freeze`) — implies sealed + non-extensible.
     pub fn freeze(&mut self) {
         self.frozen = true;
+        self.sealed = true;
+        self.extensible = false;
+    }
+
+    /// Prevents new properties (`Object.preventExtensions`).
+    pub fn prevent_extensions(&mut self) {
+        self.extensible = false;
+    }
+
+    /// Seals the object (`Object.seal`): no new props, no deletions.
+    pub fn seal(&mut self) {
+        self.sealed = true;
+        self.extensible = false;
+    }
+
+    /// Whether new properties may be added.
+    #[must_use]
+    pub fn is_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    /// Whether the object is sealed (or frozen).
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        self.sealed || self.frozen
     }
 
     /// Whether the object is frozen.

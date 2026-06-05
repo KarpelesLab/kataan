@@ -589,11 +589,43 @@ impl Realm {
     pub fn delete_property(&mut self, handle: Handle, key: &str) -> bool {
         let root = Rc::clone(&self.root_shape);
         match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
-            // A frozen object's properties are non-configurable: delete is a no-op.
-            Some(o) if o.is_frozen() => false,
+            // A sealed/frozen object's properties are non-configurable: no delete.
+            Some(o) if o.is_sealed() => false,
             Some(o) => o.delete(root, key),
             None => false,
         }
+    }
+
+    /// `Object.preventExtensions(obj)` — disallow new properties.
+    pub fn prevent_extensions(&mut self, handle: Handle) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.prevent_extensions();
+        }
+    }
+
+    /// `Object.seal(obj)` — no new properties and no deletions.
+    pub fn seal_object(&mut self, handle: Handle) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.seal();
+        }
+    }
+
+    /// Whether the object at `handle` is extensible.
+    #[must_use]
+    pub fn is_extensible(&self, handle: Handle) -> bool {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_object)
+            .is_some_and(Object::is_extensible)
+    }
+
+    /// Whether the object at `handle` is sealed (or frozen).
+    #[must_use]
+    pub fn is_sealed(&self, handle: Handle) -> bool {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_object)
+            .is_some_and(Object::is_sealed)
     }
 
     /// Whether the object at `handle` has an own property `key` (including
