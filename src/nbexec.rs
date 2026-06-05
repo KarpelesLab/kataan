@@ -3284,15 +3284,27 @@ impl<'a> Interp<'a> {
             {
                 let text = self.realm.to_display_string(arg(0));
                 let re = crate::regex::Regex::new(&source, &flags);
-                match (method, re) {
-                    ("test", Ok(re)) => return Ok(Some(NanBox::boolean(re.is_match(&text)))),
-                    ("exec", Ok(re)) => {
-                        return Ok(Some(match re.captures_from(&text, 0) {
-                            Some(caps) => self.regex_match_object(&text, &caps, re.group_names()),
-                            None => NanBox::null(),
-                        }));
+                if matches!(method, "test" | "exec")
+                    && let Ok(re) = re
+                {
+                    // `g`/`y` regexes are stateful: search resumes at `lastIndex`
+                    // and is updated to the match end (or reset to 0 on no match).
+                    let stateful = flags.contains('g') || flags.contains('y');
+                    let start = if stateful {
+                        self.realm.regex_last_index(handle)
+                    } else {
+                        0
+                    };
+                    let caps = re.captures_from(&text, start);
+                    if stateful {
+                        let next = caps.as_ref().map_or(0, |c| c.whole().1);
+                        self.realm.set_regex_last_index(handle, next);
                     }
-                    _ => {}
+                    return Ok(Some(match (method, caps) {
+                        ("test", c) => NanBox::boolean(c.is_some()),
+                        (_, Some(c)) => self.regex_match_object(&text, &c, re.group_names()),
+                        (_, None) => NanBox::null(),
+                    }));
                 }
             }
             #[cfg(not(feature = "regex"))]
@@ -6097,6 +6109,12 @@ impl<'a> Interp<'a> {
             return Ok(());
         }
         let name = self.coerce_property_key(key)?;
+        // `regex.lastIndex = n` updates the RegExp's stateful search position.
+        if name == "lastIndex" && self.realm.regexp_at(handle).is_some() {
+            let n = self.realm.to_number(new).max(0.0) as usize;
+            self.realm.set_regex_last_index(handle, n);
+            return Ok(());
+        }
         // An accessor setter takes precedence.
         if let Some((_, setter)) = self.realm.accessor(handle, &name) {
             if !matches!(setter.unpack(), Unpacked::Undefined) {
@@ -6252,6 +6270,7 @@ impl<'a> Interp<'a> {
                 "ignoreCase" => NanBox::boolean(flags.contains('i')),
                 "multiline" => NanBox::boolean(flags.contains('m')),
                 "sticky" => NanBox::boolean(flags.contains('y')),
+                "lastIndex" => NanBox::number(self.realm.regex_last_index(handle) as f64),
                 _ => self.member_value(handle, name),
             });
         }
@@ -6403,6 +6422,15 @@ impl<'a> Interp<'a> {
         property: &'a PropertyKey,
         new: NanBox,
     ) -> Result<(), ExecError> {
+        // `regex.lastIndex = n` updates the RegExp's stateful search position.
+        if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property
+            && &**s == "lastIndex"
+            && self.realm.regexp_at(handle).is_some()
+        {
+            let n = self.realm.to_number(new).max(0.0) as usize;
+            self.realm.set_regex_last_index(handle, n);
+            return Ok(());
+        }
         // Writing a static on a class (`C.field = v`, `++C.field`): call a static
         // setter if one is defined, else update the class's static table.
         if let Some((cid, _)) = self.realm.class_at(handle) {
@@ -9087,6 +9115,28 @@ mod tests {
         );
         assert_eq!(run("'x'.replace(/x/, '$1')"), "$1"); // no group 1 → literal
         assert_eq!(run("'abc'.replace(/b/, '$`')"), "aac");
+    }
+
+    #[test]
+    fn regex_stateful_last_index() {
+        // Global exec advances lastIndex and resets on a miss.
+        assert_eq!(
+            run(
+                "let r=/\\d/g; r.exec('a1b2')[0] + ':' + r.lastIndex + ':' + r.exec('a1b2')[0] + ':' + r.lastIndex"
+            ),
+            "1:2:2:4"
+        );
+        assert_eq!(
+            run(
+                "let r=/\\d/g; r.exec('a1'); String(r.exec('a1')) + ':' + r.lastIndex"
+            ),
+            "null:0"
+        );
+        // Writing lastIndex resumes from there.
+        assert_eq!(run("let r=/\\d/g; r.lastIndex=3; r.exec('12345')[0]"), "4");
+        // test() advances; non-global never does.
+        assert_eq!(run("let r=/x/g; r.test('axbx'); r.lastIndex"), "2");
+        assert_eq!(run("let r=/\\d/; r.exec('a1'); r.lastIndex"), "0");
     }
 
     #[test]

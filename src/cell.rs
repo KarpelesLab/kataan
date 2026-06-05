@@ -96,6 +96,8 @@ pub enum Cell {
         source: alloc::boxed::Box<str>,
         /// The flags (e.g. `"gi"`).
         flags: alloc::boxed::Box<str>,
+        /// The mutable `lastIndex` (where the next `g`/`y` search resumes).
+        last_index: usize,
     },
     /// A class constructor: an index into the interpreter's class table plus the
     /// scope it was defined in.
@@ -230,7 +232,7 @@ impl Cell {
     #[must_use]
     pub fn as_regexp(&self) -> Option<(&str, &str)> {
         match self {
-            Cell::RegExp { source, flags } => Some((source, flags)),
+            Cell::RegExp { source, flags, .. } => Some((source, flags)),
             _ => None,
         }
     }

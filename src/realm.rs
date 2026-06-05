@@ -365,7 +365,24 @@ impl Realm {
         self.heap.alloc(Cell::RegExp {
             source: alloc::boxed::Box::from(source),
             flags: alloc::boxed::Box::from(flags),
+            last_index: 0,
         })
+    }
+
+    /// The `RegExp`'s `lastIndex` (0 if not a RegExp).
+    #[must_use]
+    pub fn regex_last_index(&self, handle: Handle) -> usize {
+        match self.heap.get(handle) {
+            Some(Cell::RegExp { last_index, .. }) => *last_index,
+            _ => 0,
+        }
+    }
+
+    /// Sets the `RegExp`'s `lastIndex`.
+    pub fn set_regex_last_index(&mut self, handle: Handle, n: usize) {
+        if let Some(Cell::RegExp { last_index, .. }) = self.heap.get_mut(handle) {
+            *last_index = n;
+        }
     }
 
     /// The `(source, flags)` of the `RegExp` at `handle` (owned), if it is one.
@@ -1013,7 +1030,7 @@ impl Realm {
                 Some(Cell::BoundNative { .. }) => "function () { … }".into(),
                 Some(Cell::Promise(_)) => "[object Promise]".into(),
                 Some(Cell::Date(ms)) => date_to_iso(*ms),
-                Some(Cell::RegExp { source, flags }) => alloc::format!("/{source}/{flags}"),
+                Some(Cell::RegExp { source, flags, .. }) => alloc::format!("/{source}/{flags}"),
                 Some(Cell::Symbol { description, .. }) => alloc::format!("Symbol({description})"),
                 Some(Cell::BigInt(n)) => alloc::format!("{n}"),
                 // A proxy renders as its target would.

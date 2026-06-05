@@ -1249,6 +1249,12 @@ fn run_frame(
             Op::SetProp { obj, key, src } => {
                 let handle = object_handle(regs[*obj as usize])?;
                 let recv = regs[*obj as usize];
+                // `regex.lastIndex = n` updates the stateful search position.
+                if key.as_str() == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
+                    let n = num(regs[*src as usize]).unwrap_or(0.0).max(0.0) as usize;
+                    ctx.realm.set_regex_last_index(handle, n);
+                    continue;
+                }
                 // A setter accessor takes precedence over a data slot.
                 match ctx.realm.accessor(handle, key) {
                     Some((_, setter)) if setter.as_handle().is_some() => {
@@ -1290,19 +1296,54 @@ fn run_frame(
                         }
                     }
                     Some(handle) => {
-                        // A getter accessor takes precedence over a data slot.
-                        match ctx.realm.accessor(handle, key) {
-                            Some((getter, _)) if getter.as_handle().is_some() => {
-                                match call_closure(ctx, funcs, getter, &[], recv) {
-                                    Ok(v) => regs[*dst as usize] = v,
-                                    Err(e) => handle_throw!(e),
+                        // RegExp introspection properties.
+                        let mut done = true;
+                        if let Some((src, flags)) = ctx.realm.regexp_at(handle) {
+                            match key.as_str() {
+                                "source" => {
+                                    let s = ctx.realm.new_string(&src);
+                                    regs[*dst as usize] = NanBox::handle(s.to_raw());
                                 }
+                                "flags" => {
+                                    let s = ctx.realm.new_string(&flags);
+                                    regs[*dst as usize] = NanBox::handle(s.to_raw());
+                                }
+                                "global" => {
+                                    regs[*dst as usize] = NanBox::boolean(flags.contains('g'))
+                                }
+                                "ignoreCase" => {
+                                    regs[*dst as usize] = NanBox::boolean(flags.contains('i'));
+                                }
+                                "multiline" => {
+                                    regs[*dst as usize] = NanBox::boolean(flags.contains('m'));
+                                }
+                                "sticky" => {
+                                    regs[*dst as usize] = NanBox::boolean(flags.contains('y'))
+                                }
+                                "lastIndex" => {
+                                    regs[*dst as usize] =
+                                        NanBox::number(ctx.realm.regex_last_index(handle) as f64);
+                                }
+                                _ => done = false,
                             }
-                            _ => {
-                                regs[*dst as usize] = ctx
-                                    .realm
-                                    .get_property(handle, key)
-                                    .unwrap_or(NanBox::undefined());
+                        } else {
+                            done = false;
+                        }
+                        if !done {
+                            // A getter accessor takes precedence over a data slot.
+                            match ctx.realm.accessor(handle, key) {
+                                Some((getter, _)) if getter.as_handle().is_some() => {
+                                    match call_closure(ctx, funcs, getter, &[], recv) {
+                                        Ok(v) => regs[*dst as usize] = v,
+                                        Err(e) => handle_throw!(e),
+                                    }
+                                }
+                                _ => {
+                                    regs[*dst as usize] = ctx
+                                        .realm
+                                        .get_property(handle, key)
+                                        .unwrap_or(NanBox::undefined());
+                                }
                             }
                         }
                     }
@@ -1530,12 +1571,22 @@ fn regex_method(
         let Ok(re) = Regex::new(&source, &flags) else {
             return Some(Ok(NanBox::null()));
         };
-        return Some(Ok(match key {
-            "test" => NanBox::boolean(re.is_match(&text)),
-            _ => match re.captures_from(&text, 0) {
-                Some(caps) => regex_match_object(ctx.realm, &text, &caps),
-                None => NanBox::null(),
-            },
+        // `g`/`y` regexes resume at `lastIndex` and update it (reset to 0 on miss).
+        let stateful = flags.contains('g') || flags.contains('y');
+        let start = if stateful {
+            ctx.realm.regex_last_index(h)
+        } else {
+            0
+        };
+        let caps = re.captures_from(&text, start);
+        if stateful {
+            let next = caps.as_ref().map_or(0, |c| c.whole().1);
+            ctx.realm.set_regex_last_index(h, next);
+        }
+        return Some(Ok(match (key, caps) {
+            ("test", c) => NanBox::boolean(c.is_some()),
+            (_, Some(caps)) => regex_match_object(ctx.realm, &text, &caps),
+            (_, None) => NanBox::null(),
         }));
     }
 
