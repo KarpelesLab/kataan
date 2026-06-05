@@ -7524,6 +7524,14 @@ fn int_to_radix(n: f64, radix: u32) -> String {
 /// Parses the longest leading decimal-float prefix of `s` (à la `parseFloat`),
 /// returning `NaN` if none.
 fn parse_float_prefix(s: &str) -> f64 {
+    // A leading (optionally signed) `Infinity`.
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => (-1.0, r),
+        None => (1.0, s.strip_prefix('+').unwrap_or(s)),
+    };
+    if rest.starts_with("Infinity") {
+        return sign * f64::INFINITY;
+    }
     let bytes = s.as_bytes();
     let mut end = 0;
     let mut seen_dot = false;
@@ -9984,6 +9992,16 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn parse_float_infinity() {
+        assert_eq!(run("parseFloat('Infinity')"), "Infinity");
+        assert_eq!(run("parseFloat('-Infinity')"), "-Infinity");
+        assert_eq!(run("parseFloat('  +Infinity x')"), "Infinity");
+        assert_eq!(run("parseFloat('InfinityX')"), "Infinity");
+        assert_eq!(run("Number.isNaN(parseFloat('Inf'))"), "true");
+        assert_eq!(run("parseFloat('3.14abc')"), "3.14");
     }
 
     #[test]

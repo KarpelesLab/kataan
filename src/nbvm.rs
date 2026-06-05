@@ -2326,6 +2326,14 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
 
 /// Parses the longest leading decimal-float prefix of `s` (à la `parseFloat`).
 fn parse_float_prefix(s: &str) -> f64 {
+    // A leading (optionally signed) `Infinity`.
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => (-1.0, r),
+        None => (1.0, s.strip_prefix('+').unwrap_or(s)),
+    };
+    if rest.starts_with("Infinity") {
+        return sign * f64::INFINITY;
+    }
     let bytes = s.as_bytes();
     let mut end = 0;
     let (mut dot, mut e) = (false, false);
