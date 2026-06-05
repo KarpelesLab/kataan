@@ -7471,11 +7471,13 @@ fn group_thousands(n: f64) -> String {
 /// Slices `s` by *character* (Unicode scalar) indices `[st, en)` — the index
 /// space the regex engine works in — so multi-byte characters never split a byte
 /// boundary (which would panic on `&s[st..en]`).
+#[cfg(feature = "regex")]
 fn char_substr(s: &str, st: usize, en: usize) -> String {
     s.chars().skip(st).take(en.saturating_sub(st)).collect()
 }
 
 /// Slices `s` from character index `st` to the end.
+#[cfg(feature = "regex")]
 fn char_substr_from(s: &str, st: usize) -> String {
     s.chars().skip(st).collect()
 }

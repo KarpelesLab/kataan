@@ -1529,20 +1529,22 @@ fn call_closure(
 /// Dispatches a built-in `Array`/`String` instance method on the fast path.
 /// Returns `None` when `key` isn't a recognized method (the caller then routes
 /// the program to the tree-walker).
-/// Builds a regex match result object `{ 0: whole, 1: g1, …, index, input,
-/// length }` (the shape `RegExp.exec` / `String.match` return).
-#[cfg(feature = "regex")]
 /// Slices `s` by *character* (scalar) indices `[st, en)` — the regex engine's
 /// index space — so a multi-byte character never splits a byte boundary.
+#[cfg(feature = "regex")]
 fn char_substr(s: &str, st: usize, en: usize) -> String {
     s.chars().skip(st).take(en.saturating_sub(st)).collect()
 }
 
 /// Slices `s` from character index `st` to the end.
+#[cfg(feature = "regex")]
 fn char_substr_from(s: &str, st: usize) -> String {
     s.chars().skip(st).collect()
 }
 
+/// Builds a regex match result object `{ 0: whole, 1: g1, …, index, input,
+/// length }` (the shape `RegExp.exec` / `String.match` return).
+#[cfg(feature = "regex")]
 fn regex_match_object(realm: &mut Realm, text: &str, caps: &crate::regex::Captures) -> NanBox {
     let obj = realm.new_object();
     for (i, g) in caps.groups.iter().enumerate() {
