@@ -811,21 +811,20 @@ fn run_frame(
                 regs[*dst as usize] =
                     NanBox::number(num(regs[*a as usize])? + num(regs[*b as usize])?);
             }
+            // Use the realm's arithmetic (ToNumber on each operand, which applies
+            // ToPrimitive to objects) so `[5] - 2` is `3` natively, without an
+            // error-driven fall back to the tree-walker.
             Op::Sub { dst, a, b } => {
-                regs[*dst as usize] =
-                    NanBox::number(num(regs[*a as usize])? - num(regs[*b as usize])?);
+                regs[*dst as usize] = ctx.realm.sub(regs[*a as usize], regs[*b as usize]);
             }
             Op::Mul { dst, a, b } => {
-                regs[*dst as usize] =
-                    NanBox::number(num(regs[*a as usize])? * num(regs[*b as usize])?);
+                regs[*dst as usize] = ctx.realm.mul(regs[*a as usize], regs[*b as usize]);
             }
             Op::Div { dst, a, b } => {
-                regs[*dst as usize] =
-                    NanBox::number(num(regs[*a as usize])? / num(regs[*b as usize])?);
+                regs[*dst as usize] = ctx.realm.div(regs[*a as usize], regs[*b as usize]);
             }
             Op::Mod { dst, a, b } => {
-                regs[*dst as usize] =
-                    NanBox::number(num(regs[*a as usize])? % num(regs[*b as usize])?);
+                regs[*dst as usize] = ctx.realm.rem(regs[*a as usize], regs[*b as usize]);
             }
             Op::HasProp { dst, key, obj } => {
                 let present = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
@@ -5077,6 +5076,17 @@ mod tests {
         let mut realm = Realm::new();
         let value = compile_and_run(&mut realm, &program).expect("compile+run");
         realm.to_display_string(value)
+    }
+
+    #[test]
+    fn bytecode_arithmetic_object_coercion() {
+        assert_eq!(bc("[5] - 2"), "3");
+        assert_eq!(bc("[10] / 2"), "5");
+        assert_eq!(bc("[10] % 3"), "1");
+        assert_eq!(bc("[6] & 3"), "2");
+        assert_eq!(bc("[2] ** 3"), "8");
+        assert_eq!(bc("'5' - 2"), "3");
+        assert_eq!(bc("({a:1}) - 1"), "NaN");
     }
 
     #[test]

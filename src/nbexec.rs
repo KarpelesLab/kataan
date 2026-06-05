@@ -9225,6 +9225,17 @@ mod tests {
     }
 
     #[test]
+    fn arithmetic_object_coercion() {
+        assert_eq!(run("[5] - 2"), "3");
+        assert_eq!(run("[10] / 2"), "5");
+        assert_eq!(run("[6] & 3"), "2");
+        assert_eq!(run("[2] ** 3"), "8");
+        assert_eq!(run("String({} - 1)"), "NaN");
+        assert_eq!(run("-[5]"), "-5");
+        assert_eq!(run("new Date(5000) - new Date(2000)"), "3000");
+    }
+
+    #[test]
     fn relational_object_coercion() {
         assert_eq!(run("String([5] < 10)"), "true");
         assert_eq!(run("String([20] > 10)"), "true");

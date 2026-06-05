@@ -1014,8 +1014,13 @@ impl Realm {
                         t.parse::<f64>().unwrap_or(f64::NAN)
                     }
                     // A `Date` coerces to its millisecond timestamp (so `b - a`
-                    // yields an elapsed-ms difference); other objects → NaN.
-                    None => self.date_at(Handle::from_raw(raw)).unwrap_or(f64::NAN),
+                    // yields an elapsed-ms difference); any other object coerces
+                    // via ToPrimitive (its `toString`/`valueOf`) then ToNumber —
+                    // so `[5] - 2` is `3` and `{} * 1` is `NaN`.
+                    None => match self.date_at(Handle::from_raw(raw)) {
+                        Some(ms) => ms,
+                        None => self.number_from_str(&self.to_display_string(v)),
+                    },
                 }
             }
         }
