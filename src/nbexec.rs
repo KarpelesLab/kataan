@@ -118,6 +118,8 @@ pub struct Interp<'a> {
     classes: Vec<&'a Class>,
     /// Per-class static members (`Class.foo`), parallel to `classes`.
     class_statics: Vec<alloc::collections::BTreeMap<String, NanBox>>,
+    /// Per-class static getter functions (`static get x() {}`), called on read.
+    class_static_get: Vec<alloc::collections::BTreeMap<String, NanBox>>,
     /// Per-class captured definition scope, parallel to `classes`.
     class_envs: Vec<Scope>,
     /// The current `this` binding (method/constructor receiver).
@@ -201,6 +203,7 @@ const N_OBJECT_DEFINE_PROP: u16 = 110;
 const N_OBJECT_GET_OWN_DESC: u16 = 111;
 const N_WEAKMAP: u16 = 112;
 const N_OBJECT_IS: u16 = 123;
+const N_OBJECT_HAS_OWN: u16 = 129;
 const N_OBJECT_DEFINE_PROPS: u16 = 124;
 const N_WEAKSET: u16 = 113;
 const N_REFLECT_GET: u16 = 114;
@@ -261,6 +264,7 @@ impl<'a> Interp<'a> {
             functions: Vec::new(),
             classes: Vec::new(),
             class_statics: Vec::new(),
+            class_static_get: Vec::new(),
             class_envs: Vec::new(),
             this_val: NanBox::undefined(),
             gen_sink: None,
@@ -387,6 +391,7 @@ impl<'a> Interp<'a> {
                 ("defineProperties", N_OBJECT_DEFINE_PROPS),
                 ("getOwnPropertyDescriptor", N_OBJECT_GET_OWN_DESC),
                 ("is", N_OBJECT_IS),
+                ("hasOwn", N_OBJECT_HAS_OWN),
             ],
         );
         install_namespace(
@@ -687,6 +692,18 @@ impl<'a> Interp<'a> {
                     _ => self.realm.strict_equals(a, b),
                 };
                 NanBox::boolean(same)
+            }
+            // `Object.hasOwn(obj, key)` — own-property check (incl. array index).
+            N_OBJECT_HAS_OWN => {
+                let key = self.realm.to_display_string(arg(1));
+                let owned = arg(0).as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    self.realm.has_own(h, &key)
+                        || self
+                            .realm
+                            .array_length(h)
+                            .is_some_and(|len| key.parse::<usize>().is_ok_and(|i| i < len))
+                });
+                NanBox::boolean(owned)
             }
             // --- Reflect.* ---
             N_REFLECT_GET => {
@@ -2034,6 +2051,7 @@ impl<'a> Interp<'a> {
         self.classes.push(class);
         // Build the static members (`static foo() {}` / `static x = …`).
         let mut statics = alloc::collections::BTreeMap::new();
+        let mut static_getters = alloc::collections::BTreeMap::new();
         for member in &class.body {
             match member {
                 ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
@@ -2056,10 +2074,23 @@ impl<'a> Interp<'a> {
                         statics.insert(key, v);
                     }
                 }
+                // `static get x() {}` — stored as a getter, called on read.
+                ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Get => {
+                    if let Ok(key) = static_key(&m.key) {
+                        let f = self.make_function(
+                            &m.value.params,
+                            Body::Block(&m.value.body),
+                            false,
+                            false,
+                        );
+                        static_getters.insert(key, f);
+                    }
+                }
                 _ => {}
             }
         }
         self.class_statics.push(statics);
+        self.class_static_get.push(static_getters);
         self.class_envs.push(self.current.clone());
         let handle = self.realm.new_class(class_id, self.current.clone());
         NanBox::handle(handle.to_raw())
@@ -2932,13 +2963,54 @@ impl<'a> Interp<'a> {
                 }
                 "replace" => {
                     let from = self.realm.to_display_string(arg(0));
-                    let to = self.realm.to_display_string(arg(1));
-                    Some(self.new_str(&s.replacen(&from, &to, 1)))
+                    let repl = arg(1);
+                    let is_fn = repl
+                        .as_handle()
+                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
+                    if is_fn {
+                        match s.find(&from) {
+                            Some(pos) => {
+                                let m = self.new_str(&from);
+                                let off = NanBox::number(s[..pos].chars().count() as f64);
+                                let whole = self.new_str(&s);
+                                let r = self.call(repl, &[m, off, whole])?;
+                                let rs = self.realm.to_display_string(r);
+                                let out =
+                                    alloc::format!("{}{}{}", &s[..pos], rs, &s[pos + from.len()..]);
+                                Some(self.new_str(&out))
+                            }
+                            None => Some(self.new_str(&s)),
+                        }
+                    } else {
+                        let to = self.realm.to_display_string(repl);
+                        Some(self.new_str(&s.replacen(&from, &to, 1)))
+                    }
                 }
                 "replaceAll" => {
                     let from = self.realm.to_display_string(arg(0));
-                    let to = self.realm.to_display_string(arg(1));
-                    Some(self.new_str(&s.replace(&from, &to)))
+                    let repl = arg(1);
+                    let is_fn = repl
+                        .as_handle()
+                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
+                    if is_fn && !from.is_empty() {
+                        let mut out = String::new();
+                        let mut last = 0;
+                        while let Some(rel) = s[last..].find(&from) {
+                            let abs = last + rel;
+                            out.push_str(&s[last..abs]);
+                            let m = self.new_str(&from);
+                            let off = NanBox::number(s[..abs].chars().count() as f64);
+                            let whole = self.new_str(&s);
+                            let r = self.call(repl, &[m, off, whole])?;
+                            out.push_str(&self.realm.to_display_string(r));
+                            last = abs + from.len();
+                        }
+                        out.push_str(&s[last..]);
+                        Some(self.new_str(&out))
+                    } else {
+                        let to = self.realm.to_display_string(repl);
+                        Some(self.new_str(&s.replace(&from, &to)))
+                    }
                 }
                 "at" => {
                     let i = self.realm.to_number(arg(0));
@@ -5106,6 +5178,11 @@ impl<'a> Interp<'a> {
                 if let Some(v) = self.class_statics[c as usize].get(name) {
                     return Ok(*v);
                 }
+                // A static getter is called with `this` = the class.
+                if let Some(getter) = self.class_static_get[c as usize].get(name).copied() {
+                    let this = NanBox::handle(handle.to_raw());
+                    return self.call_with_this(getter, this, &[]);
+                }
                 let class = self.classes[c as usize];
                 let env = self.class_envs[c as usize].clone();
                 cur = self.resolve_super(class, &env)?.map(|(pid, _)| pid);
@@ -5254,6 +5331,13 @@ impl<'a> Interp<'a> {
         property: &'a PropertyKey,
         new: NanBox,
     ) -> Result<(), ExecError> {
+        // Writing a static on a class (`C.field = v`, `++C.field`) updates the
+        // class's static table.
+        if let Some((cid, _)) = self.realm.class_at(handle) {
+            let key = self.eval_prop_key(property)?;
+            self.class_statics[cid as usize].insert(key, new);
+            return Ok(());
+        }
         // Proxy `set` trap (or forward the write to the target).
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
@@ -7432,6 +7516,32 @@ mod tests {
         assert_eq!(run("Math.E > 2.71 && Math.E < 2.72"), "true");
         assert_eq!(run("Math.SQRT2 * Math.SQRT2 > 1.999"), "true");
         assert_eq!(run("Math.floor(Math.LN2 * 1000)"), "693");
+    }
+
+    #[test]
+    fn object_hasown_static_accessors_replaceall_fn() {
+        // Object.hasOwn.
+        assert_eq!(
+            run("Object.hasOwn({a:1},'a') + ':' + Object.hasOwn({a:1},'b')"),
+            "true:false"
+        );
+        assert_eq!(run("Object.hasOwn(Object.create({x:1}),'x')"), "false");
+        // Static field write-back and static getter.
+        assert_eq!(
+            run(
+                "class C{ static n=0; static inc(){ return ++C.n; } static get cur(){ return C.n; } } C.inc(); C.inc(); C.cur"
+            ),
+            "2"
+        );
+        // replaceAll with a function replacer.
+        assert_eq!(
+            run("'AAA'.replaceAll('A', function(){ return 'B'; })"),
+            "BBB"
+        );
+        assert_eq!(
+            run("'a1b2'.replace('1', function(m){ return '['+m+']'; })"),
+            "a[1]b2"
+        );
     }
 
     #[test]
