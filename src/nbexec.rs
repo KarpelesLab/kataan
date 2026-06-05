@@ -2755,7 +2755,10 @@ impl<'a> Interp<'a> {
                 "split" => {
                     let mut parts = Vec::new();
                     let mut at = 0;
-                    while let Some((st, en)) = re.find_from(&s, at) {
+                    while let Some(caps) = re.captures_from(&s, at) {
+                        let Some((st, en)) = caps.groups[0] else {
+                            break;
+                        };
                         if en == at && st == at {
                             at += 1;
                             if at > s.len() {
@@ -2764,6 +2767,14 @@ impl<'a> Interp<'a> {
                             continue;
                         }
                         parts.push(self.new_str(&s[at..st]));
+                        // The separator's capture groups are spliced into the
+                        // result (`"a1b".split(/(\d)/)` → `["a","1","b"]`).
+                        for g in &caps.groups[1..] {
+                            match g {
+                                Some((gs, ge)) => parts.push(self.new_str(&s[*gs..*ge])),
+                                None => parts.push(NanBox::undefined()),
+                            }
+                        }
                         at = en;
                     }
                     parts.push(self.new_str(&s[at..]));
@@ -3155,18 +3166,25 @@ impl<'a> Interp<'a> {
                 }
                 "map" => {
                     let f = arg(0);
+                    let this_arg = arg(1);
+                    let arr = NanBox::handle(handle.to_raw());
                     let mut out = Vec::with_capacity(elems.len());
                     for (i, e) in elems.iter().enumerate() {
-                        out.push(self.call(f, &[*e, NanBox::number(i as f64)])?);
+                        let cb_args = [*e, NanBox::number(i as f64), arr];
+                        out.push(self.call_with_this(f, this_arg, &cb_args)?);
                     }
                     let h = self.realm.new_array(out);
                     return Ok(Some(NanBox::handle(h.to_raw())));
                 }
                 "filter" => {
                     let f = arg(0);
+                    let this_arg = arg(1);
+                    let arr = NanBox::handle(handle.to_raw());
                     let mut out = Vec::new();
                     for (i, e) in elems.iter().enumerate() {
-                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
+                        let cb_args = [*e, NanBox::number(i as f64), arr];
+                        let r = self.call_with_this(f, this_arg, &cb_args)?;
+                        if self.realm.truthy(r) {
                             out.push(*e);
                         }
                     }
@@ -3175,8 +3193,11 @@ impl<'a> Interp<'a> {
                 }
                 "forEach" => {
                     let f = arg(0);
+                    let this_arg = arg(1);
+                    let arr = NanBox::handle(handle.to_raw());
                     for (i, e) in elems.iter().enumerate() {
-                        self.call(f, &[*e, NanBox::number(i as f64)])?;
+                        let cb_args = [*e, NanBox::number(i as f64), arr];
+                        self.call_with_this(f, this_arg, &cb_args)?;
                     }
                     return Ok(Some(NanBox::undefined()));
                 }
@@ -3392,7 +3413,15 @@ impl<'a> Interp<'a> {
                 "find" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
-                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
+                        if self.call_truthy_this(
+                            f,
+                            arg(1),
+                            &[
+                                *e,
+                                NanBox::number(i as f64),
+                                NanBox::handle(handle.to_raw()),
+                            ],
+                        )? {
                             return Ok(Some(*e));
                         }
                     }
@@ -3401,7 +3430,15 @@ impl<'a> Interp<'a> {
                 "findIndex" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
-                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
+                        if self.call_truthy_this(
+                            f,
+                            arg(1),
+                            &[
+                                *e,
+                                NanBox::number(i as f64),
+                                NanBox::handle(handle.to_raw()),
+                            ],
+                        )? {
                             return Ok(Some(NanBox::number(i as f64)));
                         }
                     }
@@ -3411,7 +3448,15 @@ impl<'a> Interp<'a> {
                 "findLast" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate().rev() {
-                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
+                        if self.call_truthy_this(
+                            f,
+                            arg(1),
+                            &[
+                                *e,
+                                NanBox::number(i as f64),
+                                NanBox::handle(handle.to_raw()),
+                            ],
+                        )? {
                             return Ok(Some(*e));
                         }
                     }
@@ -3420,7 +3465,15 @@ impl<'a> Interp<'a> {
                 "findLastIndex" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate().rev() {
-                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
+                        if self.call_truthy_this(
+                            f,
+                            arg(1),
+                            &[
+                                *e,
+                                NanBox::number(i as f64),
+                                NanBox::handle(handle.to_raw()),
+                            ],
+                        )? {
                             return Ok(Some(NanBox::number(i as f64)));
                         }
                     }
@@ -3429,7 +3482,15 @@ impl<'a> Interp<'a> {
                 "some" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
-                        if self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
+                        if self.call_truthy_this(
+                            f,
+                            arg(1),
+                            &[
+                                *e,
+                                NanBox::number(i as f64),
+                                NanBox::handle(handle.to_raw()),
+                            ],
+                        )? {
                             return Ok(Some(NanBox::boolean(true)));
                         }
                     }
@@ -3438,7 +3499,15 @@ impl<'a> Interp<'a> {
                 "every" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
-                        if !self.call_truthy(f, &[*e, NanBox::number(i as f64)])? {
+                        if !self.call_truthy_this(
+                            f,
+                            arg(1),
+                            &[
+                                *e,
+                                NanBox::number(i as f64),
+                                NanBox::handle(handle.to_raw()),
+                            ],
+                        )? {
                             return Ok(Some(NanBox::boolean(false)));
                         }
                     }
@@ -4282,8 +4351,15 @@ impl<'a> Interp<'a> {
     }
 
     /// Calls `f(args)` and returns the result's truthiness.
-    fn call_truthy(&mut self, f: NanBox, args: &[NanBox]) -> Result<bool, ExecError> {
-        let r = self.call(f, args)?;
+    /// Calls `f` with an explicit `this` and returns whether the result is truthy
+    /// (for array predicates with a `thisArg`).
+    fn call_truthy_this(
+        &mut self,
+        f: NanBox,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<bool, ExecError> {
+        let r = self.call_with_this(f, this, args)?;
         Ok(self.realm.truthy(r))
     }
 
@@ -7080,6 +7156,28 @@ mod tests {
         assert_eq!(run("'\\u{1F600}'.codePointAt(0)"), "128512");
         assert_eq!(run("'a\\u{1F600}b'.codePointAt(1)"), "128512");
         assert_eq!(run("'hello'.charCodeAt(0)"), "104");
+    }
+
+    #[test]
+    fn array_thisarg_and_split_captures() {
+        assert_eq!(
+            run("[1,2,3].map(function(x){return x*this.m;},{m:3}).join(',')"),
+            "3,6,9"
+        );
+        assert_eq!(
+            run("[1,2,3,4].filter(function(x){return x>this.t;},{t:2}).join(',')"),
+            "3,4"
+        );
+        assert_eq!(
+            run("[1,2,3].some(function(x){return x===this.g;},{g:2})"),
+            "true"
+        );
+        assert_eq!(
+            run("[1,2,3].every(function(x){return x<=this.mx;},{mx:3})"),
+            "true"
+        );
+        // split with a capturing separator splices the captures in.
+        assert_eq!(run("'a1b2c3'.split(/(\\d)/).join('|')"), "a|1|b|2|c|3|");
     }
 
     #[test]
