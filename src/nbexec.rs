@@ -3021,6 +3021,32 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Unsupported("RegExp needs the regex feature"));
             }
         }
+        // `Map.groupBy(items, cb)` — like `Object.groupBy` but a Map (keys are
+        // the callback's return value as-is, so objects work as group keys).
+        if self.realm.native_at(handle) == Some(N_MAP) && method == "groupBy" {
+            let items = self.iterate_values(arg(0))?;
+            let cb = arg(1);
+            let map = self.realm.new_collection(false);
+            for (i, item) in items.iter().enumerate() {
+                let key = self.call(cb, &[*item, NanBox::number(i as f64)])?;
+                let bucket = match self
+                    .realm
+                    .collection_get(map, key)
+                    .and_then(NanBox::as_handle)
+                    .map(Handle::from_raw)
+                {
+                    Some(h) => h,
+                    None => {
+                        let arr = self.realm.new_array(Vec::new());
+                        self.realm
+                            .collection_set(map, key, NanBox::handle(arr.to_raw()));
+                        arr
+                    }
+                };
+                self.realm.array_push(bucket, *item);
+            }
+            return Ok(Some(NanBox::handle(map.to_raw())));
+        }
         // --- `Promise.resolve` / `Promise.reject` statics (on the constructor) ---
         if self.realm.native_at(handle) == Some(N_PROMISE) {
             match method {
@@ -3503,6 +3529,10 @@ impl<'a> Interp<'a> {
                 }
                 "trimStart" => Some(self.new_str(s.trim_start())),
                 "trimEnd" => Some(self.new_str(s.trim_end())),
+                // Strings are stored as well-formed UTF-8 (lone surrogates cannot
+                // be represented), so these are always well-formed already.
+                "isWellFormed" => Some(NanBox::boolean(true)),
+                "toWellFormed" => Some(self.new_str(&s)),
                 // `charCodeAt(i)` is the UTF-16 code unit at index `i` (NaN if
                 // out of range); a surrogate half reads as that 16-bit value.
                 "charCodeAt" => {
@@ -8050,6 +8080,25 @@ mod tests {
         );
         // Array.join renders null/undefined as empty.
         assert_eq!(run("[1,null,2,undefined,3].join('-')"), "1--2--3");
+    }
+
+    #[test]
+    fn map_group_by_and_well_formed() {
+        assert_eq!(
+            run(
+                "let g=Map.groupBy([1,2,3,4,5], x=>x%2?'odd':'even'); (g instanceof Map) + ':' + g.get('odd').join(',') + ':' + g.size"
+            ),
+            "true:1,3,5:2"
+        );
+        // Object keys are preserved (not stringified, unlike Object.groupBy).
+        assert_eq!(
+            run("let k={}; let g=Map.groupBy([1,2], x=>k); g.get(k).join(',')"),
+            "1,2"
+        );
+        assert_eq!(
+            run("'abc'.isWellFormed() + ':' + '\u{1f600}'.toWellFormed()"),
+            "true:\u{1f600}"
+        );
     }
 
     #[test]
