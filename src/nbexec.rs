@@ -6989,7 +6989,33 @@ impl<'a> Interp<'a> {
                 let handle = self.realm.new_object();
                 for m in members {
                     match m {
-                        ObjectMember::Property { key, value, .. } => {
+                        ObjectMember::Property {
+                            key,
+                            value,
+                            shorthand,
+                            ..
+                        } => {
+                            // `{ __proto__: obj }` — a non-computed, non-shorthand,
+                            // non-method data property named `__proto__` sets the
+                            // prototype rather than creating a property.
+                            if !shorthand
+                                && !matches!(&**value, Expr::Function(_))
+                                && let PropertyKey::Ident(s) | PropertyKey::Str(s) = key
+                                && &**s == "__proto__"
+                            {
+                                let v = self.eval(value)?;
+                                match v.unpack() {
+                                    Unpacked::Null => {
+                                        self.realm.set_object_proto(handle, None);
+                                    }
+                                    _ => {
+                                        if let Some(p) = v.as_handle().map(Handle::from_raw) {
+                                            self.realm.set_object_proto(handle, Some(p));
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
                             let k = self.eval_prop_key(key)?;
                             let v = self.eval(value)?;
                             self.realm.set_property(handle, &k, v);
@@ -7320,6 +7346,14 @@ impl<'a> Interp<'a> {
                 None => String::new(),
             };
             return Ok(self.new_str(&alloc::format!("bound {tname}")));
+        }
+        // `obj.__proto__` reads the prototype link (unless shadowed by an own
+        // data property of that name).
+        if name == "__proto__" && !self.realm.has_own(handle, "__proto__") {
+            return Ok(match self.realm.object_proto(handle) {
+                Some(p) => NanBox::handle(p.to_raw()),
+                None => NanBox::null(),
+            });
         }
         // A class's `name` is its declared identifier (`class C {}` → `"C"`).
         if name == "name"
@@ -7655,6 +7689,23 @@ impl<'a> Interp<'a> {
         {
             let n = self.realm.to_number(new).max(0.0) as usize;
             self.realm.set_regex_last_index(handle, n);
+            return Ok(());
+        }
+        // `obj.__proto__ = proto` updates the prototype link (like
+        // `Object.setPrototypeOf`); a non-object, non-null value is ignored.
+        if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property
+            && &**s == "__proto__"
+        {
+            match new.unpack() {
+                Unpacked::Null => {
+                    self.realm.set_object_proto(handle, None);
+                }
+                _ => {
+                    if let Some(p) = new.as_handle().map(Handle::from_raw) {
+                        self.realm.set_object_proto(handle, Some(p));
+                    }
+                }
+            }
             return Ok(());
         }
         // Writing a static on a class (`C.field = v`, `++C.field`): call a static
@@ -9482,6 +9533,47 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn proto_accessor() {
+        // Object.create + __proto__ read.
+        assert_eq!(
+            run("let p={greet(){return 'hi';}}; let o=Object.create(p); o.__proto__===p"),
+            "true"
+        );
+        assert_eq!(
+            run("let p={greet(){return 'hi';}}; Object.create(p).greet()"),
+            "hi"
+        );
+        // __proto__ assignment relinks.
+        assert_eq!(
+            run("let o={}; o.__proto__={hello(){return 'yo';}}; o.hello()"),
+            "yo"
+        );
+        assert_eq!(
+            run("let b={getX(){return this.x;}}; let o={}; o.__proto__=b; o.x=42; o.getX()"),
+            "42"
+        );
+        // Object-literal __proto__ sets the prototype.
+        assert_eq!(
+            run("let b={getX(){return this.x;}}; let n={__proto__:b, x:5}; n.getX()"),
+            "5"
+        );
+        // The method form is a regular property, not a prototype set.
+        assert_eq!(
+            run("typeof ({__proto__(){return 1;}}).__proto__"),
+            "function"
+        );
+        // __proto__ = null clears the chain; a primitive is ignored.
+        assert_eq!(
+            run("let o={__proto__:{}}; o.__proto__=null; Object.getPrototypeOf(o)===null"),
+            "true"
+        );
+        assert_eq!(
+            run("let p={g(){return 1;}}; let o=Object.create(p); o.__proto__=5; o.g()"),
+            "1"
+        );
     }
 
     #[test]
