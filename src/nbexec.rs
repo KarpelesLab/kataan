@@ -1858,6 +1858,18 @@ impl<'a> Interp<'a> {
             }
             return Ok(this);
         }
+        // `new Array(...)` — Array is a namespace object, matched by identity.
+        // A single number argument is the length; otherwise the elements.
+        if self.current.get("Array").and_then(|v| v.as_handle()) == callee.as_handle() {
+            let elems = if args.len() == 1
+                && let Some(n) = args[0].as_number()
+            {
+                alloc::vec![NanBox::undefined(); n.max(0.0) as usize]
+            } else {
+                args.to_vec()
+            };
+            return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
+        }
         let id = self
             .realm
             .native_at(handle)
@@ -3270,10 +3282,11 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::handle(h.to_raw())));
                 }
                 "reverse" => {
+                    // Reverses in place and returns the same array.
                     let mut out = elems.clone();
                     out.reverse();
-                    let h = self.realm.new_array(out);
-                    return Ok(Some(NanBox::handle(h.to_raw())));
+                    self.realm.array_set_all(handle, out);
+                    return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 // `fill(value, start?, end?)` — mutate in place, return the array.
                 // `start`/`end` default to `0`/`len`; negatives count from the end.
@@ -4987,6 +5000,15 @@ impl<'a> Interp<'a> {
         handle: crate::heap::Handle,
         name: &str,
     ) -> Result<NanBox, ExecError> {
+        // String index access (`"abc"[1]`) → the UTF-16 code unit at the index.
+        if let Ok(i) = name.parse::<usize>()
+            && let Some(s) = self.realm.string_value(handle)
+        {
+            return Ok(match s.encode_utf16().nth(i) {
+                Some(u) => self.new_str(&String::from_utf16_lossy(&[u])),
+                None => NanBox::undefined(),
+            });
+        }
         // Proxy `get` trap (or forward the read to the target).
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
@@ -7159,6 +7181,22 @@ mod tests {
         assert_eq!(run("'\\u{1F600}'.codePointAt(0)"), "128512");
         assert_eq!(run("'a\\u{1F600}b'.codePointAt(1)"), "128512");
         assert_eq!(run("'hello'.charCodeAt(0)"), "104");
+    }
+
+    #[test]
+    fn reverse_inplace_new_array_string_index() {
+        // reverse mutates in place and returns the same array.
+        assert_eq!(
+            run("let a=[1,2,3]; let b=a.reverse(); (a===b) + ':' + a.join(',')"),
+            "true:3,2,1"
+        );
+        // new Array(n) and new Array(...elements).
+        assert_eq!(run("new Array(3).fill(7).join(',')"), "7,7,7");
+        assert_eq!(run("new Array(1,2,3).join(',')"), "1,2,3");
+        assert_eq!(run("new Array(3).length"), "3");
+        // String index access.
+        assert_eq!(run("'hello'[0] + 'hello'[4]"), "ho");
+        assert_eq!(run("String('abc'[5])"), "undefined");
     }
 
     #[test]
