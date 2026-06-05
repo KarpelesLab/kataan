@@ -55,6 +55,10 @@ pub struct Realm {
     /// and not relocated on a moving collection — sound only because collection is
     /// never driven mid-execution (see `[[latent-engine-conformance-bugs]]`).
     aux_props: alloc::collections::BTreeMap<u64, Handle>,
+    /// Handles of frozen arrays (`Object.freeze([...])`). Arrays have no inline
+    /// object part to carry the flag; same handle-keyed, non-GC-root caveat as
+    /// `aux_props`.
+    frozen_arrays: alloc::collections::BTreeSet<u64>,
 }
 
 impl Default for Realm {
@@ -75,6 +79,7 @@ impl Realm {
             next_symbol_id: 1,
             fn_protos: alloc::collections::BTreeMap::new(),
             aux_props: alloc::collections::BTreeMap::new(),
+            frozen_arrays: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -468,6 +473,11 @@ impl Realm {
     /// Freezes the object at `handle` (`Object.freeze`); returns whether it was
     /// an object.
     pub fn freeze_object(&mut self, handle: Handle) -> bool {
+        // An array carries no inline object part — track frozen-ness aside.
+        if self.heap.get(handle).and_then(Cell::as_array).is_some() {
+            self.frozen_arrays.insert(handle.to_raw());
+            return true;
+        }
         match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             Some(obj) => {
                 obj.freeze();
@@ -477,9 +487,12 @@ impl Realm {
         }
     }
 
-    /// Whether the value at `handle` is a frozen object.
+    /// Whether the value at `handle` is a frozen object or array.
     #[must_use]
     pub fn is_frozen(&self, handle: Handle) -> bool {
+        if self.frozen_arrays.contains(&handle.to_raw()) {
+            return true;
+        }
         self.heap
             .get(handle)
             .and_then(Cell::as_object)

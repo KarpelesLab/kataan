@@ -479,10 +479,18 @@ impl<'a> Interp<'a> {
             }
             N_MATH_ABS => NanBox::number(self.realm.to_number(arg(0)).abs()),
             N_STRING => {
-                let s = self.realm.to_display_string(arg(0));
+                // `String(obj)` runs the object through ToString (string hint),
+                // honoring a custom `toString`.
+                let p = self.coerce_object(arg(0), "string")?;
+                let s = self.realm.to_display_string(p);
                 NanBox::handle(self.realm.new_string(&s).to_raw())
             }
-            N_NUMBER => NanBox::number(self.realm.to_number(arg(0))),
+            N_NUMBER => {
+                // `Number(obj)` runs the object through ToNumber (number hint),
+                // honoring a custom `valueOf`.
+                let p = self.coerce_object(arg(0), "number")?;
+                NanBox::number(self.realm.to_number(p))
+            }
             N_BOOLEAN => NanBox::boolean(self.realm.truthy(arg(0))),
             N_SYMBOL => {
                 // A no-argument `Symbol()` has an `undefined` description, marked
@@ -2350,8 +2358,17 @@ impl<'a> Interp<'a> {
                 "valueOf" => Some(recv),
                 #[cfg(feature = "std")]
                 "toFixed" => {
-                    let digits = self.realm.to_number(arg(0)) as usize;
-                    Some(self.new_str(&alloc::format!("{n:.digits$}")))
+                    let digits = (self.realm.to_number(arg(0)) as usize).min(100);
+                    // JS rounds half away from zero (Rust's formatter rounds half
+                    // to even), so pre-round at the target scale.
+                    let s = if n.is_finite() {
+                        let factor = 10f64.powi(digits as i32);
+                        let rounded = (n * factor).round() / factor;
+                        alloc::format!("{rounded:.digits$}")
+                    } else {
+                        alloc::format!("{n}")
+                    };
+                    Some(self.new_str(&s))
                 }
                 // `toExponential(d)` — exponential notation with `d` fractional
                 // digits and a signed exponent (`1.23e+3`).
@@ -3216,8 +3233,11 @@ impl<'a> Interp<'a> {
             match method {
                 "push" => {
                     let mut len = elems.len();
-                    for a in args {
-                        len = self.realm.array_push(handle, *a).unwrap_or(len);
+                    // A frozen array rejects new elements (non-strict: silent).
+                    if !self.realm.is_frozen(handle) {
+                        for a in args {
+                            len = self.realm.array_push(handle, *a).unwrap_or(len);
+                        }
                     }
                     return Ok(Some(NanBox::number(len as f64)));
                 }
@@ -3269,14 +3289,19 @@ impl<'a> Interp<'a> {
                         } else {
                             self.realm.to_display_string(arg(0))
                         };
-                    // `null`/`undefined` elements render as the empty string.
-                    let parts: Vec<String> = elems
-                        .iter()
-                        .map(|e| match e.unpack() {
+                    // `null`/`undefined` render empty; an object element is run
+                    // through ToString (so a custom `toString` is honored).
+                    let mut parts: Vec<String> = Vec::with_capacity(elems.len());
+                    for e in &elems {
+                        let s = match e.unpack() {
                             Unpacked::Null | Unpacked::Undefined => String::new(),
-                            _ => self.realm.to_display_string(*e),
-                        })
-                        .collect();
+                            _ => {
+                                let p = self.coerce_object(*e, "string")?;
+                                self.realm.to_display_string(p)
+                            }
+                        };
+                        parts.push(s);
+                    }
                     return Ok(Some(self.new_str(&parts.join(&sep))));
                 }
                 "includes" => {
@@ -7607,6 +7632,26 @@ mod tests {
         assert_eq!(run("`${ {a:1} }`"), "[object Object]");
         // Arrays/numbers/booleans coerce as usual.
         assert_eq!(run("`${[1,2,3]}-${true}-${null}`"), "1,2,3-true-null");
+    }
+
+    #[test]
+    fn coercion_string_number_join_freeze_tofixed() {
+        // String()/Number() honor toString/valueOf; join too.
+        assert_eq!(run("String({toString(){return 'x';}})"), "x");
+        assert_eq!(run("Number({valueOf(){return 42;}})"), "42");
+        assert_eq!(
+            run("[{toString(){return 'a';}},{toString(){return 'b';}}].join(',')"),
+            "a,b"
+        );
+        // Frozen array rejects push.
+        assert_eq!(
+            run("let a=[1,2,3]; Object.freeze(a); a.push(4); a.length + ':' + Object.isFrozen(a)"),
+            "3:true"
+        );
+        // toFixed rounds half away from zero.
+        assert_eq!(run("(0.5).toFixed(0)"), "1");
+        assert_eq!(run("(2.5).toFixed(0)"), "3");
+        assert_eq!(run("(123.456).toFixed(2)"), "123.46");
     }
 
     #[test]
