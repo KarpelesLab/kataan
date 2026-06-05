@@ -2842,6 +2842,9 @@ impl<'a> Interp<'a> {
                     }
                 }
                 "valueOf" => Some(recv),
+                // `toLocaleString()` — a minimal grouping format (thousands
+                // separators with `,`), since no locale data is available.
+                "toLocaleString" => Some(self.new_str(&group_thousands(n))),
                 #[cfg(feature = "std")]
                 "toFixed" => {
                     let digits = (self.realm.to_number(arg(0)) as usize).min(100);
@@ -7121,8 +7124,15 @@ fn format_precision(n: f64, p: usize) -> String {
         .and_then(|i| sci[i + 1..].parse().ok())
         .unwrap_or(0);
     if e < -6 || e >= p as i32 {
-        // Exponential notation with p-1 fractional digits.
-        return alloc::format!("{:.*e}", p - 1, n);
+        // Exponential notation with p-1 fractional digits. Rust omits the `+` on
+        // a non-negative exponent; JavaScript includes it (`1e+4`, not `1e4`).
+        let s = alloc::format!("{:.*e}", p - 1, n);
+        return match s.find('e') {
+            Some(epos) if s.as_bytes().get(epos + 1) != Some(&b'-') => {
+                alloc::format!("{}e+{}", &s[..epos], &s[epos + 1..])
+            }
+            _ => s,
+        };
     }
     let decimals = (p as i32 - 1 - e).max(0) as usize;
     alloc::format!("{:.*}", decimals, n)
@@ -7164,23 +7174,76 @@ fn json_quote(s: &str) -> String {
 
 /// Renders the integer part of `n` in `radix` (2–36), with a leading `-` for
 /// negatives (matching `Number.prototype.toString(radix)` for integers).
-fn int_to_radix(n: f64, radix: u32) -> String {
-    let neg = n < 0.0;
-    let mut v = n.abs() as u64;
-    if v == 0 {
-        return String::from("0");
+/// A minimal `Number.prototype.toLocaleString` — groups the integer part with
+/// `,` thousands separators (no locale data, so this is the en-US-ish default).
+fn group_thousands(n: f64) -> String {
+    if n.is_nan() {
+        return String::from("NaN");
     }
+    if n.is_infinite() {
+        return String::from(if n > 0.0 { "∞" } else { "-∞" });
+    }
+    let neg = n.is_sign_negative() && n != 0.0;
+    let abs = if n < 0.0 { -n } else { n };
+    let base = alloc::format!("{abs}");
+    let (int_part, frac_part) = match base.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (base.as_str(), None),
+    };
+    let bytes = int_part.as_bytes();
+    let len = bytes.len();
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    if let Some(f) = frac_part {
+        out.push('.');
+        out.push_str(f);
+    }
+    out
+}
+
+fn int_to_radix(n: f64, radix: u32) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut buf = Vec::new();
+    let neg = n < 0.0;
+    let abs = if neg { -n } else { n };
+    // Integer part (the `as u64` cast truncates toward zero — no `std` float math).
+    let mut v = abs as u64;
+    let mut ibuf = Vec::new();
+    if v == 0 {
+        ibuf.push(b'0');
+    }
     while v > 0 {
-        buf.push(DIGITS[(v % radix as u64) as usize]);
+        ibuf.push(DIGITS[(v % radix as u64) as usize]);
         v /= radix as u64;
     }
+    ibuf.reverse();
+    let mut out = String::new();
     if neg {
-        buf.push(b'-');
+        out.push('-');
     }
-    buf.reverse();
-    String::from_utf8(buf).unwrap_or_default()
+    out.push_str(&String::from_utf8(ibuf).unwrap_or_default());
+    // Fractional part (bounded digit count to terminate on repeating fractions).
+    let mut frac = abs - (abs as u64) as f64;
+    if frac > 0.0 {
+        out.push('.');
+        for _ in 0..20 {
+            if frac <= 0.0 {
+                break;
+            }
+            frac *= radix as f64;
+            let digit = (frac as usize).min(radix as usize - 1);
+            out.push(DIGITS[digit] as char);
+            frac -= digit as f64;
+        }
+    }
+    out
 }
 
 /// Parses the longest leading decimal-float prefix of `s` (à la `parseFloat`),
@@ -9238,6 +9301,17 @@ mod tests {
         );
         assert_eq!(run("Math.clz32(1) + ':' + Math.clz32(0)"), "31:32");
         assert_eq!(run("Math.imul(3,4) + ':' + Math.imul(-1,8)"), "12:-8");
+    }
+
+    #[test]
+    fn number_formatting() {
+        assert_eq!(run("(3.5).toString(2)"), "11.1");
+        assert_eq!(run("(255.5).toString(16)"), "ff.8");
+        assert_eq!(run("(-255.5).toString(16)"), "-ff.8");
+        assert_eq!(run("(12345).toPrecision(1)"), "1e+4");
+        assert_eq!(run("(0.0000001234).toPrecision(2)"), "1.2e-7");
+        assert_eq!(run("(1234567).toLocaleString()"), "1,234,567");
+        assert_eq!(run("(-1234.5).toLocaleString()"), "-1,234.5");
     }
 
     #[test]
