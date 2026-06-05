@@ -43,6 +43,9 @@ pub enum Expr {
 
     /// An identifier reference.
     Ident(Ident),
+    /// A bare private name `#x`, valid only as the left of `#x in obj` (the
+    /// ergonomic brand check).
+    PrivateName(Box<str>, Span),
     /// The `this` keyword.
     This(Span),
     /// The `super` keyword (only valid inside methods; validated later).
@@ -153,6 +156,7 @@ impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::Null(span)
+            | Expr::PrivateName(_, span)
             | Expr::This(span)
             | Expr::Super(span)
             | Expr::Bool { span, .. }

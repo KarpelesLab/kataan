@@ -91,6 +91,7 @@ fn sexpr(e: &Expr) -> String {
         Expr::Str { value, .. } => format!("{value:?}"),
         Expr::Regex { pattern, flags, .. } => format!("/{pattern}/{flags}"),
         Expr::Ident(id) => id.name.clone().into_string(),
+        Expr::PrivateName(name, _) => format!("#{name}"),
         Expr::This(_) => "this".into(),
         Expr::Super(_) => "super".into(),
         Expr::Template(t) => sexpr_template(t),

@@ -765,6 +765,12 @@ impl<'src> Parser<'src> {
             TokenKind::LBrace => self.parse_object(),
             TokenKind::Keyword(Kw::Function) => self.parse_function_expr(false, tok.span),
             TokenKind::Keyword(Kw::Class) => self.parse_class_expr(),
+            // A bare `#x` — only valid as the left of `#x in obj` (brand check).
+            TokenKind::PrivateName => {
+                self.bump();
+                let name = &tok.text(self.source)[1..];
+                Ok(Expr::PrivateName(name.into(), tok.span))
+            }
             _ => Err(self.err(format!("unexpected token {:?}", tok.kind))),
         }
     }

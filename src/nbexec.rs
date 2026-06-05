@@ -5493,6 +5493,18 @@ impl<'a> Interp<'a> {
             Expr::Binary {
                 op, left, right, ..
             } => {
+                // `#x in obj` — the ergonomic brand check (private fields are
+                // stored under a `#`-prefixed key).
+                if matches!(op, BinaryOp::In)
+                    && let Expr::PrivateName(name, _) = &**left
+                {
+                    let obj = self.eval(right)?;
+                    let present = obj
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .is_some_and(|h| self.realm.has_own(h, &alloc::format!("#{name}")));
+                    return Ok(NanBox::boolean(present));
+                }
                 let a = self.eval(left)?;
                 let b = self.eval(right)?;
                 self.binary(*op, a, b)
@@ -8918,6 +8930,23 @@ mod tests {
         assert_eq!(run("Math.E > 2.71 && Math.E < 2.72"), "true");
         assert_eq!(run("Math.SQRT2 * Math.SQRT2 > 1.999"), "true");
         assert_eq!(run("Math.floor(Math.LN2 * 1000)"), "693");
+    }
+
+    #[test]
+    fn private_in_brand_check() {
+        assert_eq!(
+            run(
+                "class H{ #s=1; static check(o){ return #s in o; } } H.check(new H()) + ':' + H.check({})"
+            ),
+            "true:false"
+        );
+        // Works for an inherited brand too (subclass instances have the field).
+        assert_eq!(
+            run(
+                "class H{ #s=1; static check(o){ return #s in o; } } class D extends H{} H.check(new D())"
+            ),
+            "true"
+        );
     }
 
     #[test]

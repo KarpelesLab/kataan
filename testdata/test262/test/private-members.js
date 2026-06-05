@@ -39,5 +39,9 @@ assert.sameValue(t.describe(), "0C = 32F", "private getter");
 class Hidden {
   #secret = 42;
   reveal() { return this.#secret; }
+  static check(obj) { return #secret in obj; }
 }
-assert.sameValue(new Hidden().reveal(), 42, "private field access");
+var h = new Hidden();
+assert.sameValue(h.reveal(), 42);
+assert.sameValue(Hidden.check(h), true, "private brand check");
+assert.sameValue(Hidden.check({}), false, "not a Hidden instance");
