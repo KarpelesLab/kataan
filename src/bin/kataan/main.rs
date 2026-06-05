@@ -18,6 +18,17 @@ use kataan::parser::Parser;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Run on a large stack so deep JS recursion is bounded by the engine's
+    // call-depth guard (a thrown RangeError), not a host stack overflow.
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(run_main)
+        .expect("spawn main thread")
+        .join()
+        .expect("main thread")
+}
+
+fn run_main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 

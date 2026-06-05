@@ -148,6 +148,17 @@ fn evaluate(meta: &Meta, source: &str) -> Result<(), String> {
 
 #[test]
 fn test262_corpus_conformance() {
+    // Run on a large stack so legitimately deep JS recursion is bounded by the
+    // engine's call-depth guard (a thrown RangeError), not a host stack overflow.
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(corpus_conformance)
+        .expect("spawn corpus thread")
+        .join()
+        .expect("corpus thread");
+}
+
+fn corpus_conformance() {
     let test_dir = format!("{DIR}test/");
     let mut entries: Vec<_> = std::fs::read_dir(&test_dir)
         .expect("read test262 test dir")

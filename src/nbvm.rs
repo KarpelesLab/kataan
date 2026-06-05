@@ -335,7 +335,13 @@ struct Ctx<'a> {
     microtasks: alloc::collections::VecDeque<Microtask>,
     /// Per-function tiering state, keyed by function id.
     tiers: alloc::collections::BTreeMap<usize, TierState>,
+    /// Function-call nesting depth (recursion guard).
+    call_depth: usize,
 }
+
+/// Maximum function-call nesting before a `RangeError` (recursion guard), sized
+/// to fire before the large stack the engine entry points run on overflows.
+const MAX_VM_CALL_DEPTH: usize = 3500;
 
 /// Tier state for one function: its activation count and, once hot, its
 /// optimized bytecode body.
@@ -358,6 +364,7 @@ pub fn run_program(
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         tiers: alloc::collections::BTreeMap::new(),
+        call_depth: 0,
     };
     let value = call(&mut ctx, funcs, id, args)?;
     drain_microtasks(&mut ctx, funcs)?;
@@ -379,6 +386,7 @@ pub fn run_program_capturing(
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         tiers: alloc::collections::BTreeMap::new(),
+        call_depth: 0,
     };
     let value = call(&mut ctx, funcs, id, args)?;
     // Run the promise event loop before returning (then-callbacks, async tails).
@@ -394,6 +402,25 @@ fn call(ctx: &mut Ctx, funcs: &[FnProto], id: usize, args: &[NanBox]) -> Result<
 /// (registers `n_params..n_params + n_captures`), and `this_val` (the register
 /// right after).
 fn call_with(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    args: &[NanBox],
+    captures: &[NanBox],
+    this_val: NanBox,
+) -> Result<NanBox, VmError> {
+    // Recursion guard: throw a catchable `RangeError` rather than overflowing.
+    if ctx.call_depth >= MAX_VM_CALL_DEPTH {
+        let e = make_error(ctx.realm, "RangeError", "Maximum call stack size exceeded");
+        return Err(VmError::Thrown(e));
+    }
+    ctx.call_depth += 1;
+    let result = call_with_inner(ctx, funcs, id, args, captures, this_val);
+    ctx.call_depth -= 1;
+    result
+}
+
+fn call_with_inner(
     ctx: &mut Ctx,
     funcs: &[FnProto],
     id: usize,
@@ -480,6 +507,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         tiers: alloc::collections::BTreeMap::new(),
+        call_depth: 0,
     };
     Ok(run_frame(&mut ctx, &[], program, &mut regs)?.unwrap_or(NanBox::undefined()))
 }

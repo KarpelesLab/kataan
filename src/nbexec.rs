@@ -127,6 +127,8 @@ pub struct Interp<'a> {
     /// Per-class native-constructor superclass id (`class X extends Error`),
     /// parallel to `classes`; `None` when the parent is a class or absent.
     class_native_super: Vec<Option<u16>>,
+    /// Current function-call nesting depth (recursion guard).
+    call_depth: usize,
     /// The current `this` binding (method/constructor receiver).
     this_val: NanBox,
     /// When running a generator body eagerly, the buffer `yield` appends to.
@@ -249,6 +251,10 @@ const CTOR_KEY: &str = "\u{0}ctor";
 /// yielded values and the current `next()` cursor.
 /// Sentinel description for a `Symbol()` created with no argument (so its
 /// `.description` is `undefined`, distinct from `Symbol("")`).
+/// Maximum function-call nesting before a `RangeError` (recursion guard). Sized
+/// to fire before the large stack the engine entry points run on overflows (the
+/// tree-walker uses several tens of KB of host stack per JS call).
+const MAX_CALL_DEPTH: usize = 3500;
 const SYMBOL_NO_DESC: &str = "\u{0}nodesc";
 /// Hidden key holding a `WeakRef`'s target (returned by `deref`).
 const WEAKREF_TARGET: &str = "\u{0}wrtarget";
@@ -287,6 +293,7 @@ impl<'a> Interp<'a> {
             class_static_set: Vec::new(),
             class_envs: Vec::new(),
             class_native_super: Vec::new(),
+            call_depth: 0,
             this_val: NanBox::undefined(),
             gen_sink: None,
             symbol_registry: alloc::collections::BTreeMap::new(),
@@ -1839,7 +1846,30 @@ impl<'a> Interp<'a> {
 
     /// Runs a function body with `this` and the parameters bound in a fresh
     /// child of `captured`.
+    /// Invokes a function, guarding against unbounded recursion: beyond
+    /// `MAX_CALL_DEPTH` nested calls it throws a `RangeError` instead of letting
+    /// the host stack overflow.
     fn invoke(
+        &mut self,
+        def: FnDef<'a>,
+        captured: Scope,
+        this_val: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        if self.call_depth >= MAX_CALL_DEPTH {
+            let msg = self.new_str("Maximum call stack size exceeded");
+            // A proper `RangeError` object (id 2 in `ERROR_NAMES`) so `instanceof
+            // RangeError`/`Error` and `.name` work on the caught value.
+            let err = self.make_error(N_ERROR_BASE + 2, Some(msg));
+            return Err(ExecError::Throw(err));
+        }
+        self.call_depth += 1;
+        let r = self.invoke_inner(def, captured, this_val, args);
+        self.call_depth -= 1;
+        r
+    }
+
+    fn invoke_inner(
         &mut self,
         def: FnDef<'a>,
         captured: Scope,
@@ -8332,6 +8362,11 @@ mod tests {
             "a:4:b"
         );
     }
+
+    // The recursion guard (infinite recursion → RangeError, deep finite recursion
+    // works) is covered by the `recursion-guard` Test262 corpus test, which runs
+    // on a large stack; unit tests here run on the default ~2 MB thread stack,
+    // too small for the deep recursion the guard permits.
 
     #[test]
     fn class_extends_native_error() {
