@@ -526,6 +526,24 @@ fn emit_cond(expr: &Expr, out: &mut String, depth: usize) -> Result<(), WasmErro
             out.push_str(&format!("{pad}{}\n", cmp_op(*op)));
             Ok(())
         }
+        // `a && b` / `a || b` in a condition → both sides as i32 booleans, then
+        // a bitwise combine. Sound in the numeric subset (operands are side-
+        // effect-free, so the lack of short-circuit doesn't matter).
+        Expr::Logical {
+            op: op @ (crate::ast::LogicalOp::And | crate::ast::LogicalOp::Or),
+            left,
+            right,
+            ..
+        } => {
+            emit_cond(left, out, depth)?;
+            emit_cond(right, out, depth)?;
+            let mnemonic = match op {
+                crate::ast::LogicalOp::And => "i32.and",
+                _ => "i32.or",
+            };
+            out.push_str(&format!("{pad}{mnemonic}\n"));
+            Ok(())
+        }
         // Any other numeric expression: nonzero is true.
         _ => {
             emit_expr(expr, out, depth)?;
@@ -1168,6 +1186,21 @@ fn emit_cond_bin(
             out.push(cmp_opcode(*op)); // i32 result, no widening
             Ok(())
         }
+        // `a && b` / `a || b` → i32 booleans combined bitwise.
+        Expr::Logical {
+            op: op @ (crate::ast::LogicalOp::And | crate::ast::LogicalOp::Or),
+            left,
+            right,
+            ..
+        } => {
+            emit_cond_bin(left, locals, fns, out)?;
+            emit_cond_bin(right, locals, fns, out)?;
+            out.push(match op {
+                crate::ast::LogicalOp::And => 0x71, // i32.and
+                _ => 0x72,                          // i32.or
+            });
+            Ok(())
+        }
         _ => {
             emit_expr_bin(expr, locals, fns, out)?;
             out.push(0x44); // f64.const 0
@@ -1388,6 +1421,19 @@ mod tests {
             "f64.const 1.5 little-endian payload present"
         );
         section_ids(&wasm); // still well-framed
+    }
+
+    #[test]
+    fn lowers_logical_conditions() {
+        // `&&`/`||` in an `if` condition lower to i32.and / i32.or.
+        let src = "function inRange(x, lo, hi) { if (x >= lo && x <= hi) { return 1; } return 0; } function either(a, b) { if (a > 0 || b > 0) { return 1; } return 0; }";
+        let wat = module(src);
+        assert!(wat.contains("i32.and"));
+        assert!(wat.contains("i32.or"));
+        assert_well_formed(&wat);
+        let wasm = binary(src);
+        assert!(wasm.contains(&0x71) && wasm.contains(&0x72));
+        section_ids(&wasm);
     }
 
     #[test]

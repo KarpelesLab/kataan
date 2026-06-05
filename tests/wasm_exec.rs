@@ -53,6 +53,8 @@ fn emitted_wasm_runs_on_a_real_engine() {
         function quad(x) { return x ** 4 + x ** 0; }
         function maxOf3(a, b, c) { return Math.max(a, b, c); }
         function minOf4(a, b, c, d) { return Math.min(a, b, c, d); }
+        function inRange(x, lo, hi) { if (x >= lo && x <= hi) { return 1; } return 0; }
+        function either(a, b) { if (a > 0 || b > 0) { return 1; } return 0; }
     ";
     let program = Parser::parse_program(src).expect("parse");
     let wasm = kataan::wasm::compile_module_binary(&program).expect("compile to wasm");
@@ -94,6 +96,8 @@ fn emitted_wasm_runs_on_a_real_engine() {
             e.quad(2),
             e.maxOf3(4, 9, 2),
             e.minOf4(8, 3, 5, 1),
+            e.inRange(5, 1, 10),
+            e.either(0, -1),
           ];
           console.log(out.join(','));
         }}).catch(err => {{ console.error('INVALID:' + err.message); process.exit(1); }});
@@ -117,7 +121,7 @@ fn emitted_wasm_runs_on_a_real_engine() {
     // absdiff(2,9)=7 — including the native Math.sqrt/max/abs ops.
     assert_eq!(
         stdout.trim(),
-        "5,9,9,55,6765,25,5,7,2,1,0,55,120,26,10,18,13,8,8014006,40002,-6,27,17,9,1", // …, maxOf3=9, minOf4=1 (variadic Math.max/min)
+        "5,9,9,55,6765,25,5,7,2,1,0,55,120,26,10,18,13,8,8014006,40002,-6,27,17,9,1,1,0", // …, inRange(5,1,10)=1, either(0,-1)=0 (&&/||)
         "wasm produced wrong results"
     );
 
