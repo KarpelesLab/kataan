@@ -9127,9 +9127,7 @@ mod tests {
             "1:2:2:4"
         );
         assert_eq!(
-            run(
-                "let r=/\\d/g; r.exec('a1'); String(r.exec('a1')) + ':' + r.lastIndex"
-            ),
+            run("let r=/\\d/g; r.exec('a1'); String(r.exec('a1')) + ':' + r.lastIndex"),
             "null:0"
         );
         // Writing lastIndex resumes from there.
