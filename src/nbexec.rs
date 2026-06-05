@@ -1008,9 +1008,11 @@ impl<'a> Interp<'a> {
                                 }
                                 continue;
                             }
-                            // Data keys plus accessor (getter) keys, read via
-                            // `read_member` so getters are invoked.
-                            let keys = self.realm.object_keys(sh).unwrap_or_default();
+                            // Own enumerable string *and* symbol keys (plus
+                            // accessor getters), read via `read_member` so getters
+                            // are invoked; the raw key string preserves symbol
+                            // identity.
+                            let keys = self.realm.object_keys_with_symbols(sh);
                             for k in keys {
                                 let v = self.read_member(sh, &k)?;
                                 self.realm.set_property(t, &k, v);
@@ -5758,8 +5760,10 @@ impl<'a> Interp<'a> {
                                         self.realm.set_property(handle, &alloc::format!("{i}"), cv);
                                     }
                                 } else {
-                                    // Enumerable keys include accessor (getter) props.
-                                    let keys = self.realm.object_keys(sh).unwrap_or_default();
+                                    // Own enumerable string + symbol keys (and
+                                    // accessor getters); the raw key preserves
+                                    // symbol identity.
+                                    let keys = self.realm.object_keys_with_symbols(sh);
                                     for key in keys {
                                         // `read_member` invokes a getter where present.
                                         let pv = self.read_member(sh, &key)?;
@@ -8367,6 +8371,25 @@ mod tests {
         assert_eq!(
             run("'abc'.isWellFormed() + ':' + '\u{1f600}'.toWellFormed()"),
             "true:\u{1f600}"
+        );
+    }
+
+    #[test]
+    fn assign_and_spread_copy_symbol_keys() {
+        assert_eq!(
+            run(
+                "let s=Symbol('k'); let src={a:1}; src[s]=9; let t=Object.assign({},src); t.a + ':' + t[s]"
+            ),
+            "1:9"
+        );
+        assert_eq!(
+            run("let s=Symbol('k'); let src={a:1}; src[s]=9; let t={...src}; t[s]"),
+            "9"
+        );
+        // Object.keys still excludes the symbol.
+        assert_eq!(
+            run("let s=Symbol('k'); let src={a:1}; src[s]=9; Object.keys({...src}).join(',')"),
+            "a"
         );
     }
 

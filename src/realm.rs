@@ -415,6 +415,24 @@ impl Realm {
         )
     }
 
+    /// Own enumerable keys **including** symbol keys (the `\0sym:` internal
+    /// names), excluding only private (`#`) fields — for `Object.assign` and
+    /// spread, which copy own enumerable string *and* symbol properties.
+    #[must_use]
+    pub fn object_keys_with_symbols(&self, handle: Handle) -> Vec<alloc::string::String> {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_object)
+            .map(|obj| {
+                obj.enumerable_keys()
+                    .iter()
+                    .filter(|s| !s.starts_with('#'))
+                    .map(|s| alloc::string::String::from(*s))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The names of the object's accessor (getter/setter) properties.
     #[must_use]
     pub fn object_accessor_keys(&self, handle: Handle) -> Vec<alloc::string::String> {
