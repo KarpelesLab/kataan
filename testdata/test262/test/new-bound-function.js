@@ -20,3 +20,8 @@ var ReBound = Point.bind(null, 5).bind(null, 6);
 var rp = new ReBound();
 assert.sameValue(rp.x, 5, "re-bound first arg");
 assert.sameValue(rp.y, 6, "re-bound second arg");
+class Cls { constructor(v) { this.v = v; } }
+var BoundCls = Cls.bind(null);
+assert.sameValue(new BoundCls(42).v, 42, "new on a bound class");
+var PartialCls = Cls.bind(null, 7);
+assert.sameValue(new PartialCls().v, 7, "bound class with a bound arg");

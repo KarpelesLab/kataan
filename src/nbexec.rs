@@ -2973,7 +2973,8 @@ impl<'a> Interp<'a> {
         }
 
         // --- `Function.prototype.call`/`apply`/`bind` on a callable receiver ---
-        if self.is_callable(handle) {
+        // `call`/`apply`/`bind` work on any constructor, including a class.
+        if self.is_callable(handle) || self.realm.class_at(handle).is_some() {
             match method {
                 "call" => {
                     let this = arg(0);
@@ -8581,6 +8582,15 @@ mod tests {
                 "function P(x,y){this.x=x;this.y=y;} let B=P.bind(null,5).bind(null,6); let p=new B(); p.x + ':' + p.y"
             ),
             "5:6"
+        );
+        // A class can be bound and constructed.
+        assert_eq!(
+            run("class C{constructor(v){this.v=v;}} new (C.bind(null))(42).v"),
+            "42"
+        );
+        assert_eq!(
+            run("class C{constructor(v){this.v=v;}} new (C.bind(null,7))().v"),
+            "7"
         );
     }
 
