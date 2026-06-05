@@ -4868,6 +4868,13 @@ impl<'a> Interp<'a> {
                 }
                 continue;
             }
+            // A simple `const x = …` binding is tracked so reassignment throws.
+            if matches!(decl.kind, crate::ast::VarDeclKind::Const)
+                && let BindingTarget::Ident(Ident { name, .. }) = &d.target
+            {
+                self.current.declare_const(name, value);
+                continue;
+            }
             self.bind_pattern(&d.target, value)?;
         }
         Ok(())
@@ -5254,6 +5261,11 @@ impl<'a> Interp<'a> {
     fn assign_to(&mut self, target: &'a Expr, value: NanBox) -> Result<(), ExecError> {
         match target {
             Expr::Ident(id) => {
+                // Reassigning a `const` binding is a TypeError.
+                if self.current.is_const(&id.name) {
+                    let m = self.new_str("Assignment to constant variable.");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 if !self.current.set(&id.name, value) {
                     self.current.declare(&id.name, value);
                 }
@@ -6480,6 +6492,11 @@ impl<'a> Interp<'a> {
         match target {
             Expr::Ident(id) => {
                 let name = &*id.name;
+                // Reassigning a `const` binding is a TypeError.
+                if self.current.is_const(name) {
+                    let m = self.new_str("Assignment to constant variable.");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 let new = if op == AssignOp::Assign {
                     rhs
                 } else {
@@ -10124,6 +10141,24 @@ mod tests {
             run("let o=Object.create({v:1}); o.v=2; let k=[]; for(let x in o)k.push(x); k.length"),
             "1"
         );
+    }
+
+    #[test]
+    fn const_reassignment_throws() {
+        assert_eq!(
+            run("const x=1; try{ x=2; 'no' }catch(e){ e instanceof TypeError }"),
+            "true"
+        );
+        assert_eq!(run("const x=1; try{ x=2; }catch(e){} x"), "1");
+        assert_eq!(
+            run("const n=10; try{ n+=5; 'no' }catch(e){ e instanceof TypeError }"),
+            "true"
+        );
+        // Mutation through a const reference is allowed; let is reassignable.
+        assert_eq!(run("const a=[1]; a.push(2); a.length"), "2");
+        assert_eq!(run("let y=1; y=2; y"), "2");
+        // An inner const shadows without affecting the outer.
+        assert_eq!(run("const a=1; { const a=2; } a"), "1");
     }
 
     #[test]

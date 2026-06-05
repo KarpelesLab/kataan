@@ -29,6 +29,8 @@ pub struct Scope(Rc<RefCell<ScopeData>>);
 
 struct ScopeData {
     vars: BTreeMap<String, NanBox>,
+    /// Names declared `const` in this frame (reassignment is a TypeError).
+    consts: alloc::collections::BTreeSet<String>,
     parent: Option<Scope>,
 }
 
@@ -38,6 +40,7 @@ impl Scope {
     pub fn root() -> Self {
         Scope(Rc::new(RefCell::new(ScopeData {
             vars: BTreeMap::new(),
+            consts: alloc::collections::BTreeSet::new(),
             parent: None,
         })))
     }
@@ -47,6 +50,7 @@ impl Scope {
     pub fn child(&self) -> Self {
         Scope(Rc::new(RefCell::new(ScopeData {
             vars: BTreeMap::new(),
+            consts: alloc::collections::BTreeSet::new(),
             parent: Some(self.clone()),
         })))
     }
@@ -54,6 +58,23 @@ impl Scope {
     /// Declares (or redeclares) `name` in *this* scope.
     pub fn declare(&self, name: &str, value: NanBox) {
         self.0.borrow_mut().vars.insert(String::from(name), value);
+    }
+
+    /// Declares `name` as a `const` binding in *this* scope (reassignment fails).
+    pub fn declare_const(&self, name: &str, value: NanBox) {
+        let mut data = self.0.borrow_mut();
+        data.vars.insert(String::from(name), value);
+        data.consts.insert(String::from(name));
+    }
+
+    /// Whether the nearest binding of `name` was declared `const`.
+    #[must_use]
+    pub fn is_const(&self, name: &str) -> bool {
+        let data = self.0.borrow();
+        if data.vars.contains_key(name) {
+            return data.consts.contains(name);
+        }
+        data.parent.as_ref().is_some_and(|p| p.is_const(name))
     }
 
     /// Whether `name` is bound in *this* scope (not the enclosing chain).
