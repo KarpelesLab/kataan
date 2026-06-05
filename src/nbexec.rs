@@ -229,6 +229,21 @@ const N_BTOA: u16 = 164;
 const N_ATOB: u16 = 165;
 const N_INTL_NUMBER_FORMAT: u16 = 166;
 const N_INTL_DATETIME_FORMAT: u16 = 167;
+/// The typed-array constructors occupy `[BASE, BASE + KINDS.len())`; the id minus
+/// the base indexes [`TYPED_ARRAY_KINDS`].
+const N_TYPED_ARRAY_BASE: u16 = 168;
+/// `(name, bytes-per-element)` for each typed-array kind, in id order.
+const TYPED_ARRAY_KINDS: [(&str, u8); 9] = [
+    ("Int8Array", 1),
+    ("Uint8Array", 1),
+    ("Uint8ClampedArray", 1),
+    ("Int16Array", 2),
+    ("Uint16Array", 2),
+    ("Int32Array", 4),
+    ("Uint32Array", 4),
+    ("Float32Array", 4),
+    ("Float64Array", 8),
+];
 const N_OBJECT_CREATE: u16 = 107;
 const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
@@ -305,6 +320,8 @@ const GEN_RET: &str = "\u{0}gret";
 /// constructor id (for `instanceof`).
 const PRIM_WRAP: &str = "\u{0}prim";
 const PRIM_WRAP_TYPE: &str = "\u{0}primtype";
+/// Hidden slot on a typed array recording its element-kind index.
+const TYPED_ARRAY_KIND: &str = "\u{0}takind";
 const BOUND_TARGET: &str = "\u{0}bnd_t";
 const BOUND_THIS: &str = "\u{0}bnd_this";
 const BOUND_ARGS: &str = "\u{0}bnd_args";
@@ -577,6 +594,11 @@ impl<'a> Interp<'a> {
                 .set_property(intl, name, NanBox::handle(f.to_raw()));
         }
         self.current.declare("Intl", NanBox::handle(intl.to_raw()));
+        // The typed-array constructors.
+        for (i, (name, _)) in TYPED_ARRAY_KINDS.iter().enumerate() {
+            let f = self.realm.new_native(N_TYPED_ARRAY_BASE + i as u16);
+            self.current.declare(name, NanBox::handle(f.to_raw()));
+        }
         // `globalThis`: an object mirroring the global bindings, referencing
         // itself. Reads like `globalThis.Math` and `globalThis.globalThis` work.
         let global = self.realm.new_object();
@@ -622,6 +644,11 @@ impl<'a> Interp<'a> {
         ] {
             if let Some(v) = self.current.get(n) {
                 self.realm.set_property(global, n, v);
+            }
+        }
+        for (name, _) in TYPED_ARRAY_KINDS {
+            if let Some(v) = self.current.get(name) {
+                self.realm.set_property(global, name, v);
             }
         }
         self.realm
@@ -2672,6 +2699,39 @@ impl<'a> Interp<'a> {
                 .set_hidden_property(obj, FINREG_TAG, NanBox::boolean(true));
             return Ok(NanBox::handle(obj.to_raw()));
         }
+        // `new Int8Array(n)` / `new Uint8Array([…])` / … — a typed array backed by
+        // a plain array whose element writes coerce to the element kind.
+        if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id) {
+            let kind = id - N_TYPED_ARRAY_BASE;
+            let elems: Vec<NanBox> = match args.first().copied() {
+                // `new T(arrayLike)` copies and coerces the source's elements.
+                Some(v)
+                    if v.as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
+                        .is_some() =>
+                {
+                    let src = v
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
+                        .unwrap();
+                    src.iter()
+                        .map(|e| NanBox::number(coerce_typed(kind, self.realm.to_number(*e))))
+                        .collect()
+                }
+                // `new T(length)` allocates a zeroed array.
+                Some(v) => {
+                    let n = self.realm.to_number(v).max(0.0) as usize;
+                    alloc::vec![NanBox::number(0.0); n]
+                }
+                None => Vec::new(),
+            };
+            let arr = self.realm.new_array(elems);
+            self.realm
+                .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
+            return Ok(NanBox::handle(arr.to_raw()));
+        }
         // `new Number(x)` / `new String(x)` / `new Boolean(x)`: a primitive
         // wrapper object boxing the coerced primitive (`valueOf` recovers it).
         if matches!(id, N_NUMBER | N_STRING | N_BOOLEAN) {
@@ -2968,6 +3028,19 @@ impl<'a> Interp<'a> {
             }
             _ => grouped,
         }
+    }
+
+    /// Writes `value` to array index `i`, coercing it to the element kind first
+    /// if `handle` is a typed array (`Uint8Array`, …).
+    fn set_element_coerced(&mut self, handle: crate::heap::Handle, i: usize, value: NanBox) {
+        let v = match self.realm.get_property(handle, TYPED_ARRAY_KIND) {
+            Some(k) => {
+                let n = self.realm.to_number(value);
+                NanBox::number(coerce_typed(k.as_number().unwrap_or(0.0) as u16, n))
+            }
+            None => value,
+        };
+        self.realm.set_element(handle, i, v);
     }
 
     /// Builds a primitive wrapper object (`new Number`/`String`/`Boolean`,
@@ -6876,7 +6949,7 @@ impl<'a> Interp<'a> {
         if let Some(i) = key.as_number().and_then(as_index)
             && self.realm.is_array(handle)
         {
-            self.realm.set_element(handle, i, new);
+            self.set_element_coerced(handle, i, new);
             return Ok(());
         }
         let name = self.coerce_property_key(key)?;
@@ -7058,6 +7131,17 @@ impl<'a> Interp<'a> {
                 "lastIndex" => NanBox::number(self.realm.regex_last_index(handle) as f64),
                 _ => self.member_value(handle, name),
             });
+        }
+        // Typed-array introspection (`byteLength`, `BYTES_PER_ELEMENT`).
+        if matches!(name, "byteLength" | "BYTES_PER_ELEMENT" | "byteOffset")
+            && let Some(k) = self.realm.get_property(handle, TYPED_ARRAY_KIND)
+        {
+            let bpe = f64::from(TYPED_ARRAY_KINDS[k.as_number().unwrap_or(0.0) as usize].1);
+            return Ok(NanBox::number(match name {
+                "BYTES_PER_ELEMENT" => bpe,
+                "byteOffset" => 0.0,
+                _ => self.realm.array_length(handle).unwrap_or(0) as f64 * bpe,
+            }));
         }
         // A String wrapper delegates `length` and indexed reads to its boxed
         // string (`new String("hi").length`, `wrapper[0]`).
@@ -7324,7 +7408,7 @@ impl<'a> Interp<'a> {
         }
         match property {
             PropertyKey::Number(n) if as_index(*n).is_some() && self.realm.is_array(handle) => {
-                self.realm.set_element(handle, as_index(*n).unwrap(), new);
+                self.set_element_coerced(handle, as_index(*n).unwrap(), new);
             }
             PropertyKey::Computed(e) => {
                 let k = self.eval(e)?;
@@ -7333,7 +7417,7 @@ impl<'a> Interp<'a> {
                 if let Some(i) = k.as_number().and_then(as_index)
                     && self.realm.is_array(handle)
                 {
-                    self.realm.set_element(handle, i, new);
+                    self.set_element_coerced(handle, i, new);
                 } else {
                     let name = self.coerce_property_key(k)?;
                     if self.allow_property_write(handle, &name)? {
@@ -7805,6 +7889,14 @@ impl<'a> Interp<'a> {
             {
                 return Ok(true);
             }
+            // A typed array matches its constructor.
+            if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
+                .contains(&id)
+                && let Some(k) = self.realm.get_property(oh, TYPED_ARRAY_KIND)
+                && k.as_number() == Some(f64::from(id - N_TYPED_ARRAY_BASE))
+            {
+                return Ok(true);
+            }
             // The `Error` family: match by the object's `name` against the
             // constructor (the base `Error` matches any error object).
             if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
@@ -8158,6 +8250,57 @@ fn json_quote(s: &str) -> String {
 /// negatives (matching `Number.prototype.toString(radix)` for integers).
 /// A minimal `Number.prototype.toLocaleString` — groups the integer part with
 /// `,` thousands separators (no locale data, so this is the en-US-ish default).
+/// Coerces `n` to a typed-array element of the given kind index (see
+/// [`TYPED_ARRAY_KINDS`]): integer kinds truncate then wrap (or clamp, for
+/// `Uint8Clamped`); float kinds narrow precision.
+fn coerce_typed(kind: u16, n: f64) -> f64 {
+    match kind {
+        7 => f64::from(n as f32), // Float32
+        8 => n,                   // Float64
+        2 => {
+            // Uint8Clamped: clamp to 0..=255 with round-half-to-even (core only).
+            if n.is_nan() || n <= 0.0 {
+                0.0
+            } else if n >= 255.0 {
+                255.0
+            } else {
+                let fl = n as i64;
+                let frac = n - fl as f64;
+                let r = if frac < 0.5 {
+                    fl
+                } else if frac > 0.5 || fl % 2 != 0 {
+                    fl + 1
+                } else {
+                    fl
+                };
+                r as f64
+            }
+        }
+        _ => {
+            if !n.is_finite() {
+                return 0.0;
+            }
+            // Truncate toward zero, then reduce into range with integer math (no
+            // std float methods, for the `alloc`-only build).
+            let i = n as i64;
+            let (bits, signed) = match kind {
+                0 => (8u32, true), // Int8
+                1 => (8, false),   // Uint8
+                3 => (16, true),   // Int16
+                4 => (16, false),  // Uint16
+                5 => (32, true),   // Int32
+                _ => (32, false),  // Uint32
+            };
+            let modulus = 1i64 << bits;
+            let mut u = i.rem_euclid(modulus);
+            if signed && u >= modulus / 2 {
+                u -= modulus;
+            }
+            u as f64
+        }
+    }
+}
+
 fn group_thousands(n: f64) -> String {
     if n.is_nan() {
         return String::from("NaN");
@@ -10851,6 +10994,29 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn typed_arrays() {
+        assert_eq!(run("new Uint8Array(3).length"), "3");
+        assert_eq!(run("let a=new Uint8Array(1); a[0]=256; a[0]"), "0");
+        assert_eq!(run("let a=new Uint8Array(1); a[0]=-1; a[0]"), "255");
+        assert_eq!(run("let a=new Int8Array(1); a[0]=200; a[0]"), "-56");
+        assert_eq!(
+            run("new Uint8ClampedArray([300,-5,100]).join(',')"),
+            "255,0,100"
+        );
+        assert_eq!(run("new Int16Array([70000])[0]"), "4464");
+        assert_eq!(run("let f=new Float64Array(1); f[0]=3.14; f[0]"), "3.14");
+        assert_eq!(run("new Uint8Array([1,2,3])[1]"), "2");
+        assert_eq!(run("new Uint16Array(4).byteLength"), "8");
+        assert_eq!(run("new Uint8Array(1).BYTES_PER_ELEMENT"), "1");
+        assert_eq!(run("new Uint8Array([1,2,3]) instanceof Uint8Array"), "true");
+        assert_eq!(
+            run("new Uint8Array([1,2,3]).map(x=>x*2).join(',')"),
+            "2,4,6"
+        );
+        assert_eq!(run("[...new Uint8Array([8,9])].join(',')"), "8,9");
     }
 
     #[test]
