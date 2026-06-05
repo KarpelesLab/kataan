@@ -880,7 +880,18 @@ fn run_frame(
                 let present = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
                     Some(h) => {
                         let k = ctx.realm.to_display_string(regs[*key as usize]);
-                        ctx.realm.has_own(h, &k)
+                        // Own or inherited (walk the prototype chain); arrays also
+                        // report in-bounds indices.
+                        let mut found = false;
+                        let mut cur = Some(h);
+                        while let Some(c) = cur {
+                            if ctx.realm.has_own(c, &k) {
+                                found = true;
+                                break;
+                            }
+                            cur = ctx.realm.object_proto(c);
+                        }
+                        found
                             || ctx
                                 .realm
                                 .array_length(h)

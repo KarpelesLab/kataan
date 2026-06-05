@@ -6613,13 +6613,25 @@ impl<'a> Interp<'a> {
                         }
                     }
                     Some(h) => {
+                        // `key in obj` is true for an own *or inherited* property
+                        // (walk the prototype chain); arrays also report in-bounds
+                        // indices and `length`.
+                        let in_chain = || {
+                            let mut cur = Some(h);
+                            while let Some(c) = cur {
+                                if self.realm.has_own(c, &key) {
+                                    return true;
+                                }
+                                cur = self.realm.object_proto(c);
+                            }
+                            false
+                        };
                         if let Some(len) = self.realm.array_length(h) {
-                            // An array index is present iff it is in bounds.
                             key == "length"
                                 || key.parse::<usize>().is_ok_and(|i| i < len)
-                                || self.realm.has_own(h, &key)
+                                || in_chain()
                         } else {
-                            self.realm.has_own(h, &key)
+                            in_chain()
                         }
                     }
                     None => false,
@@ -9319,6 +9331,19 @@ mod tests {
         );
         assert_eq!(run("new Set([1,2])[Symbol.iterator]().next().value"), "1");
         assert_eq!(run("[...[1,2,3][Symbol.iterator]()].join(',')"), "1,2,3");
+    }
+
+    #[test]
+    fn in_operator_walks_prototype_chain() {
+        assert_eq!(run("'a' in {a:1}"), "true");
+        assert_eq!(run("'z' in {a:1}"), "false");
+        assert_eq!(run("let o=Object.create({x:1}); 'x' in o"), "true");
+        assert_eq!(
+            run("let o=Object.create(Object.create({deep:1})); 'deep' in o"),
+            "true"
+        );
+        assert_eq!(run("0 in [10,20]"), "true");
+        assert_eq!(run("5 in [10,20]"), "false");
     }
 
     #[test]
