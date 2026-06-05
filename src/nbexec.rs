@@ -1792,8 +1792,10 @@ impl<'a> Interp<'a> {
             Unpacked::Undefined => Ok(None),
             Unpacked::Null => Ok(Some(String::from("null"))),
             Unpacked::Bool(b) => Ok(Some(String::from(if b { "true" } else { "false" }))),
+            // Use the spec ToString (`0` for `-0`, exponential for ≥ 1e21, …);
+            // non-finite numbers serialize as `null`.
             Unpacked::Number(n) => Ok(Some(if n.is_finite() {
-                alloc::format!("{n}")
+                self.realm.to_display_string(v)
             } else {
                 String::from("null")
             })),
@@ -9441,6 +9443,22 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn json_number_serialization() {
+        assert_eq!(run("JSON.stringify(-0)"), "0");
+        assert_eq!(run("JSON.stringify([-0])"), "[0]");
+        assert_eq!(run("JSON.stringify({x:-0})"), "{\"x\":0}");
+        assert_eq!(run("JSON.stringify(1e21)"), "1e+21");
+        assert_eq!(run("JSON.stringify(1e-7)"), "1e-7");
+        assert_eq!(run("JSON.stringify(1e20)"), "100000000000000000000");
+        assert_eq!(run("JSON.stringify(0.001)"), "0.001");
+        assert_eq!(run("JSON.stringify([NaN,Infinity])"), "[null,null]");
+        assert_eq!(
+            run("JSON.stringify([-0,1e21,0.001,-42])"),
+            "[0,1e+21,0.001,-42]"
+        );
     }
 
     #[test]

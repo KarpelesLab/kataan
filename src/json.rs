@@ -20,8 +20,9 @@ pub fn stringify(realm: &Realm, v: NanBox) -> Option<String> {
         Unpacked::Undefined => None,
         Unpacked::Null => Some(String::from("null")),
         Unpacked::Bool(b) => Some(String::from(if b { "true" } else { "false" })),
+        // Spec `ToString` (`0` for `-0`, exponential for ≥ 1e21).
         Unpacked::Number(n) => Some(if n.is_finite() {
-            alloc::format!("{n}")
+            realm.to_display_string(v)
         } else {
             String::from("null")
         }),
