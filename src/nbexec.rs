@@ -4312,11 +4312,14 @@ impl<'a> Interp<'a> {
         if let (Err(ExecError::Throw(value)), Some(catch)) = (&outcome, handler) {
             let thrown = *value;
             let child = self.current.child();
-            if let Some(BindingTarget::Ident(Ident { name, .. })) = &catch.param {
-                child.declare(name, thrown);
-            }
             let saved = core::mem::replace(&mut self.current, child);
-            outcome = self.exec_seq(&catch.body);
+            // The catch binding may be a name, a destructuring pattern, or absent
+            // (optional catch binding).
+            let bound = match &catch.param {
+                Some(target) => self.bind_pattern(target, thrown),
+                None => Ok(()),
+            };
+            outcome = bound.and_then(|()| self.exec_seq(&catch.body));
             self.current = saved;
         }
         // `finally` runs regardless; an abrupt finally overrides the outcome.
@@ -8626,6 +8629,31 @@ mod tests {
             "undefined:3"
         );
         assert_eq!(run("let o={a:1}; delete o.a; 'a' in o"), "false");
+    }
+
+    #[test]
+    fn catch_binding_forms() {
+        // Destructured catch binding (object and array patterns).
+        assert_eq!(
+            run(
+                "let r; try { throw {code:42, text:'x'}; } catch({code,text}){ r=code+':'+text; } r"
+            ),
+            "42:x"
+        );
+        assert_eq!(
+            run("let r; try { throw [1,2,3]; } catch([a,b]){ r=a+b; } r"),
+            "3"
+        );
+        // Optional catch binding (no parameter).
+        assert_eq!(
+            run("let r=false; try { throw 1; } catch { r=true; } r"),
+            "true"
+        );
+        // Named binding still works.
+        assert_eq!(
+            run("let r; try { throw new Error('m'); } catch(e){ r=e.message; } r"),
+            "m"
+        );
     }
 
     #[test]
