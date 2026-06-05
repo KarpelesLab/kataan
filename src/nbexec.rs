@@ -242,12 +242,13 @@ const N_IS_NAN: u16 = 32;
 const N_IS_FINITE: u16 = 33;
 // Error constructors (id − N_ERROR_BASE indexes ERROR_NAMES).
 const N_ERROR_BASE: u16 = 40;
-const ERROR_NAMES: [&str; 5] = [
+const ERROR_NAMES: [&str; 6] = [
     "Error",
     "TypeError",
     "RangeError",
     "SyntaxError",
     "ReferenceError",
+    "AggregateError",
 ];
 const N_TYPE_ERROR: u16 = N_ERROR_BASE + 1;
 const N_REFERENCE_ERROR: u16 = N_ERROR_BASE + 4;
@@ -2376,13 +2377,27 @@ impl<'a> Interp<'a> {
             return Ok(NanBox::handle(r.to_raw()));
         }
         // `new Error(message, { cause })` and friends → `{ name, message }` plus
-        // the ES2022 `cause` option when supplied.
+        // the ES2022 `cause` option. `AggregateError(errors, message, { cause })`
+        // takes its message second and exposes `.errors`.
         if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
-            let err = self.make_error(id, args.first().copied());
-            if let Some(opts) = args
-                .get(1)
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw)
+            let is_aggregate = id == N_ERROR_BASE + 5;
+            let (msg_arg, opts_arg) = if is_aggregate {
+                (args.get(1).copied(), args.get(2))
+            } else {
+                (args.first().copied(), args.get(1))
+            };
+            let err = self.make_error(id, msg_arg);
+            if is_aggregate && let Some(eh) = err.as_handle() {
+                let errors = args.first().copied().unwrap_or(NanBox::undefined());
+                let list = self.iterate_values(errors).unwrap_or_default();
+                let arr = self.realm.new_array(list);
+                self.realm.set_property(
+                    Handle::from_raw(eh),
+                    "errors",
+                    NanBox::handle(arr.to_raw()),
+                );
+            }
+            if let Some(opts) = opts_arg.and_then(|v| v.as_handle()).map(Handle::from_raw)
                 && let Some(cause) = self.realm.get_property(opts, "cause")
                 && let Some(eh) = err.as_handle()
             {
@@ -2505,14 +2520,24 @@ impl<'a> Interp<'a> {
         let obj = self.realm.new_object();
         let name_v = self.new_str(name);
         self.realm.set_property(obj, "name", name_v);
-        let msg = match message {
+        let msg_str = match message {
             Some(m) if !matches!(m.unpack(), Unpacked::Undefined) => {
-                let s = self.realm.to_display_string(m);
-                self.new_str(&s)
+                self.realm.to_display_string(m)
             }
-            _ => self.new_str(""),
+            _ => String::new(),
         };
+        let msg = self.new_str(&msg_str);
         self.realm.set_property(obj, "message", msg);
+        // A minimal `stack` (the `name: message` header; no real frame capture),
+        // non-enumerable like the real property.
+        let head = if msg_str.is_empty() {
+            String::from(name)
+        } else {
+            alloc::format!("{name}: {msg_str}")
+        };
+        let stack = self.new_str(&alloc::format!("{head}\n    at <anonymous>"));
+        self.realm.set_property(obj, "stack", stack);
+        self.realm.mark_hidden(obj, "stack");
         NanBox::handle(obj.to_raw())
     }
 
@@ -9877,6 +9902,25 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn error_stack_and_aggregate() {
+        assert_eq!(run("typeof new Error('x').stack"), "string");
+        assert_eq!(run("new Error('boom').stack.indexOf('boom') >= 0"), "true");
+        assert_eq!(run("Object.keys(new Error('x')).indexOf('stack')"), "-1");
+        // AggregateError: message is the 2nd arg, `.errors` collects the 1st.
+        assert_eq!(
+            run(
+                "let a=new AggregateError([new Error('a'),new TypeError('b')],'m'); a.message + ':' + a.errors.length + ':' + a.name"
+            ),
+            "m:2:AggregateError"
+        );
+        assert_eq!(run("new AggregateError([],'x') instanceof Error"), "true");
+        assert_eq!(
+            run("new AggregateError(new Set([new Error('x')]),'s').errors.length"),
+            "1"
+        );
     }
 
     #[test]
