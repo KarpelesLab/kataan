@@ -4754,7 +4754,6 @@ impl<'a> Interp<'a> {
             }
             // A tagged template: `tag(stringsArray, ...interpolatedValues)`.
             Expr::TaggedTemplate { tag, quasi, .. } => {
-                let tagf = self.eval(tag)?;
                 let strings: Vec<NanBox> = quasi
                     .quasis
                     .iter()
@@ -4771,6 +4770,25 @@ impl<'a> Interp<'a> {
                 for e in &quasi.expressions {
                     args.push(self.eval(e)?);
                 }
+                // A `recv.tag` tag (e.g. `String.raw`) is dispatched as a method
+                // call, so a built-in tag works even if it isn't a readable value.
+                if let Expr::Member {
+                    object, property, ..
+                } = &**tag
+                    && let PropertyKey::Ident(name) | PropertyKey::Str(name) = property
+                {
+                    let recv = self.eval(object)?;
+                    if let Some(result) = self.call_method(recv, name, &args)? {
+                        return Ok(result);
+                    }
+                    // Fall back to a property-valued tag function.
+                    let Some(raw) = recv.as_handle() else {
+                        return Err(ExecError::NotCallable);
+                    };
+                    let f = self.member(Handle::from_raw(raw), property)?;
+                    return self.call_with_this(f, recv, &args);
+                }
+                let tagf = self.eval(tag)?;
                 self.call(tagf, &args)
             }
             Expr::This(_) => Ok(self.this_val),
@@ -7590,6 +7608,18 @@ mod tests {
             "true:1,2,3"
         );
         assert_eq!(run("[3,1,2].sort((x,y)=>y-x).join(',')"), "3,2,1");
+    }
+
+    #[test]
+    fn string_raw_and_member_tag() {
+        assert_eq!(run("String.raw`a\\nb`"), "a\\nb");
+        assert_eq!(run("String.raw`${1}+${2}=${3}`"), "1+2=3");
+        assert_eq!(run("String.raw`line\\tend`.length"), "9"); // backslash + t kept raw
+        // A tag read as a member of a plain object also dispatches.
+        assert_eq!(
+            run("let o={ t(s){ return s.raw[0]; } }; o.t`x\\ny`"),
+            "x\\ny"
+        );
     }
 
     #[test]
