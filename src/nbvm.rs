@@ -1094,12 +1094,20 @@ fn run_frame(
                         })
                         .collect()
                 } else {
-                    ctx.realm
-                        .object_keys(h)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|k| NanBox::handle(ctx.realm.new_string(&k).to_raw()))
-                        .collect()
+                    // Own enumerable keys, then enumerable keys inherited through
+                    // the prototype chain (each name once, own first).
+                    let mut seen = alloc::collections::BTreeSet::new();
+                    let mut out = Vec::new();
+                    let mut cur = Some(h);
+                    while let Some(c) = cur {
+                        for k in ctx.realm.object_keys(c).unwrap_or_default() {
+                            if seen.insert(k.clone()) {
+                                out.push(NanBox::handle(ctx.realm.new_string(&k).to_raw()));
+                            }
+                        }
+                        cur = ctx.realm.object_proto(c);
+                    }
+                    out
                 };
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(keys).to_raw());
             }

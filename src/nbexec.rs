@@ -4823,12 +4823,20 @@ impl<'a> Interp<'a> {
                 .map(|i| self.new_str(&alloc::format!("{i}")))
                 .collect();
         }
-        self.realm
-            .object_keys(h)
-            .unwrap_or_default()
-            .iter()
-            .map(|k| self.new_str(k))
-            .collect()
+        // `for-in` enumerates own enumerable keys, then enumerable keys inherited
+        // through the prototype chain — each name only once, own keys first.
+        let mut seen = alloc::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        let mut cur = Some(h);
+        while let Some(c) = cur {
+            for k in self.realm.object_keys(c).unwrap_or_default() {
+                if seen.insert(k.clone()) {
+                    out.push(self.new_str(&k));
+                }
+            }
+            cur = self.realm.object_proto(c);
+        }
+        out
     }
 
     /// Runs `body` once per `item`, binding the loop variable (a fresh scope per
@@ -9311,6 +9319,23 @@ mod tests {
         );
         assert_eq!(run("new Set([1,2])[Symbol.iterator]().next().value"), "1");
         assert_eq!(run("[...[1,2,3][Symbol.iterator]()].join(',')"), "1,2,3");
+    }
+
+    #[test]
+    fn for_in_inherited_enumeration() {
+        assert_eq!(
+            run(
+                "let p={a:1}; let o=Object.create(p); o.b=2; let k=[]; for(let x in o)k.push(x); k.sort().join(',')"
+            ),
+            "a,b"
+        );
+        // Non-enumerable prototype methods are not enumerated.
+        assert_eq!(run("let k=[]; for(let x in {})k.push(x); k.length"), "0");
+        // A shadowed inherited key appears once.
+        assert_eq!(
+            run("let o=Object.create({v:1}); o.v=2; let k=[]; for(let x in o)k.push(x); k.length"),
+            "1"
+        );
     }
 
     #[test]
