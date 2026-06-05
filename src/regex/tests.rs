@@ -137,6 +137,19 @@ fn lookaround_backref_named() {
 }
 
 #[test]
+fn unicode_property_escapes() {
+    assert!(re("\\p{L}", "").is_match("a"));
+    assert!(!re("\\p{L}", "").is_match("5"));
+    assert!(re("\\p{L}", "").is_match("Ω")); // Unicode-aware, not just ASCII
+    assert!(re("^\\p{N}+$", "").is_match("123"));
+    assert!(re("\\p{Lu}", "").is_match("A"));
+    assert!(!re("\\p{Lu}", "").is_match("a"));
+    assert!(re("\\P{L}", "").is_match("5")); // negated
+    assert!(re("^[\\p{L}\\p{N}]+$", "").is_match("abc123")); // in a class
+    assert!(Regex::new("\\p{Nonsense}", "").is_err()); // unknown property
+}
+
+#[test]
 fn errors() {
     assert!(Regex::new("(unterminated", "").is_err());
     assert!(Regex::new("[abc", "").is_err());

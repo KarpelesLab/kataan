@@ -81,6 +81,26 @@ pub(crate) enum Shorthand {
     NotWord,
     Space,
     NotSpace,
+    /// A Unicode property escape `\p{…}` (or negated `\P{…}`).
+    Property(PropKind, bool),
+}
+
+/// The Unicode general categories / binary properties supported by `\p{…}`,
+/// matched via pure-Rust `char` methods (no Unicode tables of our own).
+#[derive(Clone, Copy)]
+pub(crate) enum PropKind {
+    /// `L` / `Letter` / `Alphabetic`.
+    Letter,
+    /// `Lu` / `Uppercase`.
+    Upper,
+    /// `Ll` / `Lowercase`.
+    Lower,
+    /// `N` / `Nd` / `Number`.
+    Number,
+    /// `White_Space` / `space`.
+    White,
+    /// `Alphabetic` plus `Number` (`\w`-ish, but Unicode-aware).
+    Alnum,
 }
 
 /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -352,7 +372,38 @@ impl Parser {
             d if d.is_ascii_digit() && d != '0' => Node::Backref((d as u8 - b'0') as usize),
             'u' => Node::Char(self.parse_unicode_escape()?),
             'x' => Node::Char(self.parse_hex_escape(2)?),
+            'p' => class_shorthand(Shorthand::Property(self.parse_property()?, false)),
+            'P' => class_shorthand(Shorthand::Property(self.parse_property()?, true)),
             other => Node::Char(escape_char(other)),
+        })
+    }
+
+    /// Parses a `\p{Name}` body (the `\p`/`\P` already consumed) into a
+    /// `PropKind`. Unknown property names are rejected.
+    fn parse_property(&mut self) -> Result<PropKind, RegexError> {
+        if !self.eat('{') {
+            return Err(RegexError::new("expected `{` after `\\p`"));
+        }
+        let mut name = alloc::string::String::new();
+        loop {
+            match self.bump() {
+                Some('}') => break,
+                Some(c) => name.push(c),
+                None => return Err(RegexError::new("unterminated `\\p{…}`")),
+            }
+        }
+        Ok(match name.as_str() {
+            "L" | "Letter" | "Alphabetic" => PropKind::Letter,
+            "Lu" | "Uppercase" | "Uppercase_Letter" => PropKind::Upper,
+            "Ll" | "Lowercase" | "Lowercase_Letter" => PropKind::Lower,
+            "N" | "Nd" | "Number" | "Decimal_Number" => PropKind::Number,
+            "White_Space" | "space" => PropKind::White,
+            "Alnum" => PropKind::Alnum,
+            other => {
+                return Err(RegexError::new(alloc::format!(
+                    "unsupported \\p property `{other}`"
+                )));
+            }
         })
     }
 
@@ -427,6 +478,14 @@ impl Parser {
                         'W' => items.push(ClassItem::Shorthand(Shorthand::NotWord)),
                         's' => items.push(ClassItem::Shorthand(Shorthand::Space)),
                         'S' => items.push(ClassItem::Shorthand(Shorthand::NotSpace)),
+                        'p' => items.push(ClassItem::Shorthand(Shorthand::Property(
+                            self.parse_property()?,
+                            false,
+                        ))),
+                        'P' => items.push(ClassItem::Shorthand(Shorthand::Property(
+                            self.parse_property()?,
+                            true,
+                        ))),
                         'u' => {
                             let ch = self.parse_unicode_escape()?;
                             self.push_class_member(&mut items, ch);

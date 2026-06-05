@@ -11,11 +11,13 @@
 //! capturing `( )`, non-capturing `(?: )` and named `(?<name> )` groups,
 //! alternation `|`, the quantifiers `* + ? {n} {n,} {n,m}` (greedy and lazy),
 //! backreferences `\1`, lookahead `(?= )`/`(?! )`, lookbehind `(?<= )`/`(?<! )`,
-//! and the `i` (case-insensitive), `m` (multiline), and `s` (dotall) flags.
-//! Positions are Unicode scalar (`char`) indices.
+//! the common Unicode property escapes `\p{…}`/`\P{…}` (general categories `L`,
+//! `Lu`, `Ll`, `N`, plus `White_Space`), and the `i` (case-insensitive), `m`
+//! (multiline), and `s` (dotall) flags. Positions are Unicode scalar (`char`)
+//! indices.
 //!
-//! Not yet: the Unicode property escapes `\p{…}` and the `u`/`y` flag semantics —
-//! these land as the engine matures (see `ROADMAP.md`).
+//! Not yet: the full Unicode property set and the `u`/`y` flag semantics — these
+//! land as the engine matures (see `ROADMAP.md`).
 
 mod compile;
 mod parser;

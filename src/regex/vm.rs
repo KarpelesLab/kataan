@@ -1,7 +1,7 @@
 //! The backtracking regex virtual machine.
 
 use super::Flags;
-use super::parser::Shorthand;
+use super::parser::{PropKind, Shorthand};
 use alloc::vec::Vec;
 
 /// A compiled instruction.
@@ -270,6 +270,19 @@ fn shorthand_matches(s: Shorthand, c: char) -> bool {
         Shorthand::NotWord => !is_word(c),
         Shorthand::Space => c.is_whitespace(),
         Shorthand::NotSpace => !c.is_whitespace(),
+        Shorthand::Property(kind, neg) => property_matches(kind, c) ^ neg,
+    }
+}
+
+/// Matches a `\p{…}` property using pure-Rust `char` predicates.
+fn property_matches(kind: PropKind, c: char) -> bool {
+    match kind {
+        PropKind::Letter => c.is_alphabetic(),
+        PropKind::Upper => c.is_uppercase(),
+        PropKind::Lower => c.is_lowercase(),
+        PropKind::Number => c.is_numeric(),
+        PropKind::White => c.is_whitespace(),
+        PropKind::Alnum => c.is_alphanumeric(),
     }
 }
 
