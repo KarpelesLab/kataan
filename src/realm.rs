@@ -1026,14 +1026,59 @@ impl Realm {
     /// are coerced with `ToNumber`. Returns `None` when the result is undefined
     /// (a `NaN` operand) — the caller turns that into `false`.
     #[must_use]
-    fn compare(&self, a: NanBox, b: NanBox) -> Option<core::cmp::Ordering> {
-        if self.is_string(a) && self.is_string(b) {
-            let sa = self.to_display_string(a);
-            let sb = self.to_display_string(b);
-            return Some(sa.cmp(&sb));
+    /// Parses a string to a number with the same rules as `ToNumber` over a
+    /// string (radix prefixes, trimming, empty → 0).
+    fn number_from_str(&self, s: &str) -> f64 {
+        let t = s.trim();
+        if t.is_empty() {
+            return 0.0;
         }
-        let (x, y) = (self.to_number(a), self.to_number(b));
-        x.partial_cmp(&y) // None on NaN
+        let radixed = match t.get(0..2) {
+            Some("0x" | "0X") => Some((16, &t[2..])),
+            Some("0o" | "0O") => Some((8, &t[2..])),
+            Some("0b" | "0B") => Some((2, &t[2..])),
+            _ => None,
+        };
+        if let Some((radix, body)) = radixed {
+            return i64::from_str_radix(body, radix).map_or(f64::NAN, |n| n as f64);
+        }
+        t.parse::<f64>().unwrap_or(f64::NAN)
+    }
+
+    fn compare(&self, a: NanBox, b: NanBox) -> Option<core::cmp::Ordering> {
+        // The abstract relational comparison applies ToPrimitive(Number) to each
+        // operand: a string (or an object that stringifies, e.g. an array or plain
+        // object) yields a string; everything else (numbers, booleans, and Dates —
+        // whose `valueOf` is the timestamp) yields a number. If *both* sides are
+        // strings they compare lexicographically; otherwise both compare as numbers.
+        enum P {
+            S(alloc::string::String),
+            N(f64),
+        }
+        let prim = |this: &Self, v: NanBox| -> P {
+            if this.is_string(v) {
+                return P::S(this.to_display_string(v));
+            }
+            if let Some(raw) = v.as_handle() {
+                let h = Handle::from_raw(raw);
+                let is_str_cell = this.heap.get(h).and_then(Cell::as_str).is_some();
+                if !is_str_cell && this.date_at(h).is_none() {
+                    // array / plain object / function → ToPrimitive → toString.
+                    return P::S(this.to_display_string(v));
+                }
+            }
+            P::N(this.to_number(v))
+        };
+        match (prim(self, a), prim(self, b)) {
+            (P::S(sa), P::S(sb)) => Some(sa.cmp(&sb)),
+            (pa, pb) => {
+                let n = |p: P, this: &Self| match p {
+                    P::N(n) => n,
+                    P::S(s) => this.number_from_str(&s),
+                };
+                n(pa, self).partial_cmp(&n(pb, self)) // None on NaN
+            }
+        }
     }
 
     /// `a < b` (boolean).

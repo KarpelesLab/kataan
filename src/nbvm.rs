@@ -938,8 +938,9 @@ fn run_frame(
             }
             Op::Move { dst, src } => regs[*dst as usize] = regs[*src as usize],
             Op::Lt { dst, a, b } => {
-                regs[*dst as usize] =
-                    NanBox::boolean(num(regs[*a as usize])? < num(regs[*b as usize])?);
+                // Use the realm's relational comparison so strings and objects
+                // (ToPrimitive) work natively instead of erroring into a fallback.
+                regs[*dst as usize] = ctx.realm.less_than(regs[*a as usize], regs[*b as usize]);
             }
             Op::AddValue { dst, a, b } => {
                 regs[*dst as usize] = ctx.realm.add(regs[*a as usize], regs[*b as usize]);
@@ -5076,6 +5077,14 @@ mod tests {
         let mut realm = Realm::new();
         let value = compile_and_run(&mut realm, &program).expect("compile+run");
         realm.to_display_string(value)
+    }
+
+    #[test]
+    fn bytecode_relational_object_coercion() {
+        assert_eq!(bc("[5] < 10"), "true");
+        assert_eq!(bc("[1] < [2]"), "true");
+        assert_eq!(bc("[10] < [9]"), "true");
+        assert_eq!(bc("({}) < 1"), "false");
     }
 
     #[test]

@@ -9225,6 +9225,16 @@ mod tests {
     }
 
     #[test]
+    fn relational_object_coercion() {
+        assert_eq!(run("String([5] < 10)"), "true");
+        assert_eq!(run("String([20] > 10)"), "true");
+        assert_eq!(run("String([1] < [2])"), "true"); // "1" < "2"
+        assert_eq!(run("String([10] < [9])"), "true"); // lexicographic
+        assert_eq!(run("String({} < 1)"), "false"); // NaN
+        assert_eq!(run("String(new Date(1) < new Date(2))"), "true"); // by timestamp
+    }
+
+    #[test]
     fn loose_eq_object_coercion() {
         assert_eq!(run("String([] == false)"), "true"); // []→""→0, false→0
         assert_eq!(run("String([] == 0)"), "true");
