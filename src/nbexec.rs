@@ -206,6 +206,7 @@ const N_OBJECT_GET_OWN_DESC: u16 = 111;
 const N_WEAKMAP: u16 = 112;
 const N_OBJECT_IS: u16 = 123;
 const N_OBJECT_HAS_OWN: u16 = 129;
+const N_OBJECT_GET_OWN_DESCS: u16 = 130;
 const N_OBJECT_DEFINE_PROPS: u16 = 124;
 const N_WEAKSET: u16 = 113;
 const N_REFLECT_GET: u16 = 114;
@@ -396,6 +397,7 @@ impl<'a> Interp<'a> {
                 ("defineProperty", N_OBJECT_DEFINE_PROP),
                 ("defineProperties", N_OBJECT_DEFINE_PROPS),
                 ("getOwnPropertyDescriptor", N_OBJECT_GET_OWN_DESC),
+                ("getOwnPropertyDescriptors", N_OBJECT_GET_OWN_DESCS),
                 ("is", N_OBJECT_IS),
                 ("hasOwn", N_OBJECT_HAS_OWN),
             ],
@@ -774,38 +776,27 @@ impl<'a> Interp<'a> {
                 };
                 return self.construct(arg(0), &list);
             }
-            N_OBJECT_GET_OWN_DESC => {
-                let mut result = NanBox::undefined();
-                if let Some(oraw) = arg(0).as_handle() {
-                    let obj = Handle::from_raw(oraw);
+            N_OBJECT_GET_OWN_DESC => match arg(0).as_handle().map(Handle::from_raw) {
+                Some(obj) => {
                     let key = self.realm.to_display_string(arg(1));
-                    if let Some((g, s)) = self.realm.accessor(obj, &key) {
-                        let d = self.realm.new_object();
-                        self.realm.set_property(d, "get", g);
-                        self.realm.set_property(d, "set", s);
-                        let t = NanBox::boolean(true);
-                        self.realm.set_property(d, "enumerable", t);
-                        self.realm.set_property(d, "configurable", t);
-                        result = NanBox::handle(d.to_raw());
-                    } else if self.realm.has_own(obj, &key) {
-                        let v = self
-                            .realm
-                            .get_property(obj, &key)
-                            .unwrap_or(NanBox::undefined());
-                        let writable = !self.realm.property_is_readonly(obj, &key);
-                        let enumerable = self.realm.property_is_enumerable(obj, &key);
-                        let d = self.realm.new_object();
-                        self.realm.set_property(d, "value", v);
-                        self.realm
-                            .set_property(d, "writable", NanBox::boolean(writable));
-                        self.realm
-                            .set_property(d, "enumerable", NanBox::boolean(enumerable));
-                        self.realm
-                            .set_property(d, "configurable", NanBox::boolean(true));
-                        result = NanBox::handle(d.to_raw());
+                    self.build_descriptor(obj, &key)
+                        .unwrap_or(NanBox::undefined())
+                }
+                None => NanBox::undefined(),
+            },
+            // `Object.getOwnPropertyDescriptors(obj)` → a map of all descriptors.
+            N_OBJECT_GET_OWN_DESCS => {
+                let out = self.realm.new_object();
+                if let Some(obj) = arg(0).as_handle().map(Handle::from_raw) {
+                    let mut keys = self.realm.own_property_names(obj).unwrap_or_default();
+                    keys.extend(self.realm.object_accessor_keys(obj));
+                    for k in keys {
+                        if let Some(d) = self.build_descriptor(obj, &k) {
+                            self.realm.set_property(out, &k, d);
+                        }
                     }
                 }
-                result
+                NanBox::handle(out.to_raw())
             }
             N_OBJECT_IS_FROZEN => NanBox::boolean(
                 arg(0)
@@ -1621,6 +1612,37 @@ impl<'a> Interp<'a> {
 
     /// Applies a property descriptor object (`{ value }` or `{ get, set }`) to
     /// `obj[key]` — shared by `Object.defineProperty`/`defineProperties`.
+    /// Builds the property descriptor object for own property `key` of `obj`
+    /// (accessor or data), or `None` if `key` is not an own property.
+    fn build_descriptor(&mut self, obj: Handle, key: &str) -> Option<NanBox> {
+        let t = NanBox::boolean(true);
+        if let Some((g, s)) = self.realm.accessor(obj, key) {
+            let d = self.realm.new_object();
+            self.realm.set_property(d, "get", g);
+            self.realm.set_property(d, "set", s);
+            self.realm.set_property(d, "enumerable", t);
+            self.realm.set_property(d, "configurable", t);
+            Some(NanBox::handle(d.to_raw()))
+        } else if self.realm.has_own(obj, key) {
+            let v = self
+                .realm
+                .get_property(obj, key)
+                .unwrap_or(NanBox::undefined());
+            let writable = !self.realm.property_is_readonly(obj, key);
+            let enumerable = self.realm.property_is_enumerable(obj, key);
+            let d = self.realm.new_object();
+            self.realm.set_property(d, "value", v);
+            self.realm
+                .set_property(d, "writable", NanBox::boolean(writable));
+            self.realm
+                .set_property(d, "enumerable", NanBox::boolean(enumerable));
+            self.realm.set_property(d, "configurable", t);
+            Some(NanBox::handle(d.to_raw()))
+        } else {
+            None
+        }
+    }
+
     fn apply_descriptor(&mut self, obj: Handle, key: &str, desc: Handle) {
         let getter = self.realm.get_property(desc, "get");
         let setter = self.realm.get_property(desc, "set");
@@ -7264,6 +7286,26 @@ mod tests {
         // Array toString joins with comma.
         assert_eq!(run("['a','b','c'].toString()"), "a,b,c");
         assert_eq!(run("[1,[2,3],4].toString()"), "1,2,3,4");
+    }
+
+    #[test]
+    fn get_own_property_descriptors() {
+        assert_eq!(
+            run(
+                "let o={a:1}; Object.defineProperty(o,'b',{value:2,writable:false,enumerable:true}); let d=Object.getOwnPropertyDescriptors(o); d.a.value + ',' + d.a.writable + ',' + d.b.value + ',' + d.b.writable"
+            ),
+            "1,true,2,false"
+        );
+        assert_eq!(
+            run("Object.keys(Object.getOwnPropertyDescriptors({a:1,b:2})).join(',')"),
+            "a,b"
+        );
+        assert_eq!(
+            run(
+                "let o={get x(){return 5;}}; let d=Object.getOwnPropertyDescriptors(o); typeof d.x.get"
+            ),
+            "function"
+        );
     }
 
     #[test]
