@@ -7140,6 +7140,29 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Decides whether a data-property write may proceed. A write to a
+    /// non-writable property (its own `writable: false`, or any property of a
+    /// frozen object) is a `TypeError` in strict mode and silently ignored
+    /// otherwise. Returns `true` when the caller should perform the write.
+    fn allow_property_write(
+        &mut self,
+        handle: crate::heap::Handle,
+        key: &str,
+    ) -> Result<bool, ExecError> {
+        let readonly = self.realm.property_is_readonly(handle, key)
+            || (self.realm.is_frozen(handle) && self.realm.get_property(handle, key).is_some());
+        if readonly {
+            if self.strict {
+                let m = self.new_str(&alloc::format!(
+                    "Cannot assign to read only property '{key}'"
+                ));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            return Ok(false); // sloppy mode: the write is silently dropped
+        }
+        Ok(true)
+    }
+
     fn assign_member(
         &mut self,
         handle: crate::heap::Handle,
@@ -7220,7 +7243,9 @@ impl<'a> Interp<'a> {
                     self.realm.set_element(handle, i, new);
                 } else {
                     let name = self.coerce_property_key(k)?;
-                    self.realm.set_property(handle, &name, new);
+                    if self.allow_property_write(handle, &name)? {
+                        self.realm.set_property(handle, &name, new);
+                    }
                 }
             }
             PropertyKey::Ident(s) | PropertyKey::Str(s) => {
@@ -7236,7 +7261,7 @@ impl<'a> Interp<'a> {
                     // `Fn.prototype = obj` reassigns the constructor's prototype.
                     self.realm
                         .set_function_prototype(func_id, Handle::from_raw(praw));
-                } else {
+                } else if self.allow_property_write(handle, s)? {
                     self.realm.set_property(handle, s, new);
                 }
             }
@@ -10757,6 +10782,24 @@ mod tests {
         );
         // Program-level `use strict`.
         assert_eq!(run("'use strict'; var ok='y'; ok"), "y");
+        // Strict: writing a read-only property throws; sloppy silently ignores it.
+        assert_eq!(
+            run(
+                "(function(){'use strict'; let o={}; Object.defineProperty(o,'x',{value:1,writable:false}); try{o.x=2;return 'no';}catch(e){return e instanceof TypeError?'te':'other';}})()"
+            ),
+            "te"
+        );
+        assert_eq!(
+            run("let o={}; Object.defineProperty(o,'x',{value:1,writable:false}); o.x=2; o.x"),
+            "1"
+        );
+        // Strict: a frozen object rejects writes.
+        assert_eq!(
+            run(
+                "(function(){'use strict'; let o=Object.freeze({a:1}); try{o.a=9;return 'no';}catch(e){return e instanceof TypeError?'te':'other';}})()"
+            ),
+            "te"
+        );
     }
 
     #[test]

@@ -15,6 +15,22 @@ var force = (new Probe()) instanceof Probe;
   var declared = 0;
   declared = 5;
   assert.sameValue(declared, 5, "declared variable assignment works");
+  // A write to a non-writable property throws (silently ignored in sloppy mode).
+  var ro = {};
+  Object.defineProperty(ro, "x", { value: 1, writable: false });
+  var roThrew = false;
+  try { ro.x = 2; } catch (e) { roThrew = e instanceof TypeError; }
+  assert.sameValue(roThrew, true, "write to read-only property throws in strict mode");
+  assert.sameValue(ro.x, 1, "value unchanged");
+  // A frozen object rejects writes.
+  var frozen = Object.freeze({ a: 1 });
+  var fThrew = false;
+  try { frozen.a = 9; } catch (e) { fThrew = e instanceof TypeError; }
+  assert.sameValue(fThrew, true, "write to a frozen object throws in strict mode");
+  // A writable property is fine.
+  var ok = {};
+  ok.y = 5;
+  assert.sameValue(ok.y, 5, "writable property assignment works");
   // Strict propagates into a nested function.
   (function () {
     var nestedThrew = false;
@@ -26,4 +42,8 @@ var force = (new Probe()) instanceof Probe;
 (function () {
   sloppyImplicit = 7;
   assert.sameValue(typeof sloppyImplicit, "number", "sloppy mode still allows implicit globals");
+  var so = {};
+  Object.defineProperty(so, "x", { value: 1, writable: false });
+  so.x = 2;
+  assert.sameValue(so.x, 1, "sloppy read-only write is silently ignored");
 })();
