@@ -1458,26 +1458,45 @@ fn regex_method(
             let repl = ctx.realm.to_display_string(repl_val);
             NanBox::handle(ctx.realm.new_string(&re.replace(&text, &repl)).to_raw())
         }
-        // "split"
+        // "split" — splices capture groups and handles zero-width matches (kept
+        // in sync with the tree-walker's `split`).
         _ => {
             let mut out = Vec::new();
-            let mut last = 0;
-            let mut pos = 0;
-            while let Some((s, e)) = re.find_from(&text, pos) {
-                if e == s {
-                    pos = e + 1;
-                    if pos > text.len() {
-                        break;
+            let mut seg_start = 0;
+            let mut search = 0;
+            while search <= text.len() {
+                let Some(caps) = re.captures_from(&text, search) else {
+                    break;
+                };
+                let Some((st, en)) = caps.groups[0] else {
+                    break;
+                };
+                if en == seg_start {
+                    match text[search..].chars().next() {
+                        Some(c) => {
+                            search = search.max(st) + c.len_utf8();
+                            continue;
+                        }
+                        None => break,
                     }
-                    continue;
                 }
                 out.push(NanBox::handle(
-                    ctx.realm.new_string(&text[last..s]).to_raw(),
+                    ctx.realm.new_string(&text[seg_start..st]).to_raw(),
                 ));
-                last = e;
-                pos = e;
+                for g in &caps.groups[1..] {
+                    out.push(match g {
+                        Some((gs, ge)) => {
+                            NanBox::handle(ctx.realm.new_string(&text[*gs..*ge]).to_raw())
+                        }
+                        None => NanBox::undefined(),
+                    });
+                }
+                seg_start = en;
+                search = if en > st { en } else { en + 1 };
             }
-            out.push(NanBox::handle(ctx.realm.new_string(&text[last..]).to_raw()));
+            out.push(NanBox::handle(
+                ctx.realm.new_string(&text[seg_start..]).to_raw(),
+            ));
             NanBox::handle(ctx.realm.new_array(out).to_raw())
         }
     };
@@ -5008,6 +5027,18 @@ mod tests {
         let mut realm = Realm::new();
         let value = compile_and_run(&mut realm, &program).expect("compile+run");
         realm.to_display_string(value)
+    }
+
+    #[test]
+    fn bytecode_regex_split_matches_tree_walker() {
+        // The bytecode VM's regex split splices capture groups and keeps the
+        // boundary char on zero-width (lookahead) matches, like the tree-walker.
+        assert_eq!(bc("'a1b2c3'.split(/(\\d)/).join(',')"), "a,1,b,2,c,3,");
+        assert_eq!(
+            bc("'camelCaseWord'.split(/(?=[A-Z])/).join('|')"),
+            "camel|Case|Word"
+        );
+        assert_eq!(bc("'aXbYc'.split(/[XY]/).join(',')"), "a,b,c");
     }
 
     #[test]
