@@ -8061,6 +8061,17 @@ mod tests {
     }
 
     #[test]
+    fn negative_zero_stringifies_to_zero() {
+        assert_eq!(run("String(-0)"), "0");
+        assert_eq!(run("(-0).toString()"), "0");
+        assert_eq!(run("'' + -0"), "0");
+        assert_eq!(run("`${-0}`"), "0");
+        assert_eq!(run("[-0, 0].join(',')"), "0,0");
+        // But Object.is still distinguishes the bit pattern.
+        assert_eq!(run("Object.is(-0, 0)"), "false");
+    }
+
+    #[test]
     fn math_minus_zero_indexof_fromindex_number_exponential() {
         // Math.max/min treat +0 > -0.
         assert_eq!(run("Object.is(Math.max(-0, 0), 0)"), "true");

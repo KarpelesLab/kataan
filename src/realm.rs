@@ -1278,6 +1278,10 @@ pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
     if n.is_infinite() {
         return if n > 0.0 { "Infinity" } else { "-Infinity" }.into();
     }
+    // Both `+0` and `-0` stringify to "0".
+    if n == 0.0 {
+        return "0".into();
+    }
     let abs = n.abs();
     // JS uses exponential notation for magnitudes ≥ 1e21 or (nonzero) < 1e-6.
     if abs != 0.0 && !(1e-6..1e21).contains(&abs) {
