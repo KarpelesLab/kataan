@@ -1818,6 +1818,9 @@ impl<'a> Interp<'a> {
         if hoist_vars {
             let mut var_names: Vec<&str> = Vec::new();
             collect_var_names(stmts, &mut var_names);
+            // Annex B: a function declared inside a block also var-hoists its name
+            // to the enclosing function scope (initially `undefined`).
+            collect_block_function_names(stmts, &mut var_names);
             for name in var_names {
                 if !self.current.has_local(name) {
                     self.current.declare(name, NanBox::undefined());
@@ -1835,7 +1838,16 @@ impl<'a> Interp<'a> {
                     func.is_generator,
                 );
                 self.set_fn_name(value, &id.name);
-                self.current.declare(&id.name, value);
+                if hoist_vars {
+                    // A function/program top-level declaration binds here.
+                    self.current.declare(&id.name, value);
+                } else {
+                    // A block-level declaration (Annex B) assigns the function-scope
+                    // `var` binding hoisted above; if none exists, bind locally.
+                    if !self.current.set(&id.name, value) {
+                        self.current.declare(&id.name, value);
+                    }
+                }
             }
         }
         Ok(())
@@ -7793,6 +7805,57 @@ fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
     }
 }
 
+/// Collects the names of function declarations that appear **inside a block** (at
+/// any nesting depth below the immediate statement list). Per Annex B, such a
+/// name is var-hoisted to the enclosing function scope. The immediate top-level
+/// functions are excluded — they are bound directly by the hoisting loop.
+fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
+    use core::slice::from_ref;
+    fn walk<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>, in_block: bool) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Function(f) if in_block => {
+                    if let Some(id) = &f.id {
+                        out.push(&id.name);
+                    }
+                }
+                Stmt::Block { body, .. } => walk(body, out, true),
+                Stmt::If {
+                    consequent,
+                    alternate,
+                    ..
+                } => {
+                    walk(from_ref(consequent), out, true);
+                    if let Some(a) = alternate {
+                        walk(from_ref(a), out, true);
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::Labeled { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::ForIn { body, .. }
+                | Stmt::ForOf { body, .. } => walk(from_ref(body), out, true),
+                Stmt::Try {
+                    block, finalizer, ..
+                } => {
+                    walk(block, out, true);
+                    if let Some(f) = finalizer {
+                        walk(f, out, true);
+                    }
+                }
+                Stmt::Switch { cases, .. } => {
+                    for case in cases {
+                        walk(&case.body, out, true);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(stmts, out, false);
+}
+
 /// The binary operator underlying a compound assignment (`+=` → `+`).
 fn compound_op(op: AssignOp) -> Result<BinaryOp, ExecError> {
     Ok(match op {
@@ -10613,6 +10676,38 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn block_level_function_hoisting() {
+        assert_eq!(
+            run("(function(){ {function g(){return 1;}} return typeof g; })()"),
+            "function"
+        );
+        assert_eq!(
+            run("(function(){ {function g(){return 42;}} return g(); })()"),
+            "42"
+        );
+        assert_eq!(
+            run("(function(){ if(true){function h(){return 5;}} return h(); })()"),
+            "5"
+        );
+        assert_eq!(
+            run("(function(){ {{function d(){return 9;}}} return d(); })()"),
+            "9"
+        );
+        // A later block declaration overrides the outer one (function-scoped).
+        assert_eq!(
+            run(
+                "(function(){ function f(){return 'o';} {function f(){return 'i';}} return f(); })()"
+            ),
+            "i"
+        );
+        // Top-level hoisting is unaffected.
+        assert_eq!(
+            run("(function(){ return e(); function e(){return 'h';} })()"),
+            "h"
+        );
     }
 
     #[test]

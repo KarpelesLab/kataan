@@ -324,7 +324,7 @@ fn general_category_matches(code: [u8; 2], c: char) -> bool {
         b"Ll" => c.is_lowercase(),
         // An uncased letter (e.g. CJK, scripts without case).
         b"Lo" => c.is_alphabetic() && !c.is_uppercase() && !c.is_lowercase(),
-        b"Nd" => c.is_ascii_digit() || (c.is_numeric() && c.to_digit(10).is_some()),
+        b"Nd" => c.is_ascii_digit(),
         b"Cc" => c.is_control(),
         // Finer categories need the Unicode tables (the `intl` feature).
         _ => false,
