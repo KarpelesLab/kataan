@@ -1,29 +1,34 @@
 /*---
-description: Symbol.toPrimitive custom coercion
+description: Symbol.toPrimitive controls object coercion by hint
 esid: sec-symbol.toprimitive
 ---*/
-var temperature = {
-  celsius: 25,
+var obj = {
   [Symbol.toPrimitive](hint) {
-    if (hint === "number") return this.celsius;
-    if (hint === "string") return this.celsius + "°C";
-    return "default:" + this.celsius;
+    if (hint === "number") return 42;
+    if (hint === "string") return "str";
+    return "default";
   }
 };
-assert.sameValue(+temperature, 25, "number hint");
-assert.sameValue(`${temperature}`, "25°C", "string hint");
-assert.sameValue(temperature + "", "default:25", "default hint in concatenation");
-assert.sameValue(temperature * 2, 50, "number hint in arithmetic");
+assert.sameValue(+obj, 42, "number hint via unary plus");
+assert.sameValue(obj - 0, 42, "number hint via subtraction");
+assert.sameValue(obj * 1, 42, "number hint via multiplication");
+assert.sameValue(`${obj}`, "str", "string hint via template");
+assert.sameValue(String(obj), "str", "string hint via String()");
+assert.sameValue(obj + "", "default", "default hint via +");
+assert.sameValue(obj + 1, "default1", "default hint with number");
+assert.sameValue("" + obj, "default");
 var money = {
   amount: 100,
   [Symbol.toPrimitive](hint) { return hint === "string" ? "$" + this.amount : this.amount; }
 };
-assert.sameValue(money - 50, 50);
-assert.sameValue(String(money), "$100");
-assert.sameValue(Number(money), 100);
-var obj = {
-  valueOf() { return 10; },
-  toString() { return "twenty"; }
-};
-assert.sameValue(obj + 5, 15, "valueOf for default hint");
-assert.sameValue(`${obj}`, "twenty", "toString for string hint");
+assert.sameValue(money * 2, 200, "number hint reads this");
+assert.sameValue(`${money}`, "$100", "string hint reads this");
+assert.sameValue(money > 50, true, "number hint in comparison");
+var sym = Symbol("key");
+var holder = {};
+holder[sym] = "value";
+assert.sameValue(holder[sym], "value", "symbol-keyed property");
+assert.sameValue(holder[Symbol("key")], undefined, "distinct symbols");
+assert.sameValue(Symbol("d").description, "d", "symbol description");
+assert.sameValue(Symbol("x").toString(), "Symbol(x)");
+assert.sameValue(typeof Symbol.iterator, "symbol", "well-known symbol");
