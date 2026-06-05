@@ -6067,6 +6067,35 @@ impl<'a> Interp<'a> {
                 BinaryOp::BitAnd => val(self, x.bitand(&y)),
                 BinaryOp::BitOr => val(self, x.bitor(&y)),
                 BinaryOp::BitXor => val(self, x.bitxor(&y)),
+                // `<<`/`>>` as multiply/floor-divide by `2^n` (a negative shift
+                // count reverses direction). BigInts have no unsigned `>>>`.
+                BinaryOp::Shl | BinaryOp::Shr => {
+                    let two = crate::bignum::BigInt::from_i128(2);
+                    let count = y.to_i128().unwrap_or(0);
+                    // `>>` is `<<` by the negated count, and vice versa.
+                    let left = (op == BinaryOp::Shl) == (count >= 0);
+                    let mag = u64::try_from(count.unsigned_abs()).unwrap_or(0);
+                    let pow2 = two.pow(mag);
+                    if left {
+                        val(self, x.mul(&pow2))
+                    } else {
+                        match x.divmod(&pow2) {
+                            // Arithmetic shift floors; truncating divmod needs a
+                            // `-1` correction for a negative value with a remainder.
+                            Some((q, rem)) => {
+                                if x.is_negative() && !rem.is_zero() {
+                                    val(self, q.sub(&crate::bignum::BigInt::from_i128(1)))
+                                } else {
+                                    val(self, q)
+                                }
+                            }
+                            None => val(self, crate::bignum::BigInt::zero()),
+                        }
+                    }
+                }
+                BinaryOp::Ushr => {
+                    return Err(throw(self, "BigInts have no unsigned right shift"));
+                }
                 BinaryOp::Lt => NanBox::boolean(x.cmp(&y) == Ordering::Less),
                 BinaryOp::Gt => NanBox::boolean(x.cmp(&y) == Ordering::Greater),
                 BinaryOp::LtEq => NanBox::boolean(x.cmp(&y) != Ordering::Greater),
@@ -8742,6 +8771,16 @@ mod tests {
             "1,2"
         );
         assert_eq!(run("Object.assign({}, {x:1}, {y:2}, {x:9}).x"), "9");
+    }
+
+    #[test]
+    fn bigint_shifts() {
+        assert_eq!(run("(1n << 8n).toString()"), "256");
+        assert_eq!(run("(256n >> 2n).toString()"), "64");
+        assert_eq!(run("(2n ** 32n).toString()"), "4294967296");
+        assert_eq!(run("(-8n >> 1n).toString()"), "-4");
+        assert_eq!(run("(-7n >> 1n).toString()"), "-4"); // arithmetic floor
+        assert_eq!(run("(5n << -1n).toString()"), "2"); // negative count reverses
     }
 
     #[test]
