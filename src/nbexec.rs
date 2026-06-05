@@ -2969,13 +2969,23 @@ impl<'a> Interp<'a> {
                 }
                 "apply" => {
                     let this = arg(0);
-                    let list = match arg(1).as_handle().map(Handle::from_raw) {
-                        Some(h) => self
-                            .realm
-                            .array_elements(h)
-                            .map(<[_]>::to_vec)
-                            .unwrap_or_default(),
-                        None => Vec::new(),
+                    let list = if let Some(h) = arg(1).as_handle().map(Handle::from_raw) {
+                        if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
+                            elems
+                        } else {
+                            // An array-like: its `length` and indexed properties.
+                            let len = self
+                                .realm
+                                .get_property(h, "length")
+                                .map_or(0, |v| self.realm.to_number(v).max(0.0) as usize);
+                            let mut v = Vec::with_capacity(len);
+                            for i in 0..len {
+                                v.push(self.read_member(h, &alloc::format!("{i}"))?);
+                            }
+                            v
+                        }
+                    } else {
+                        Vec::new()
                     };
                     return self.call_with_this(recv, this, &list).map(Some);
                 }
@@ -6207,6 +6217,20 @@ impl<'a> Interp<'a> {
             let proto = self.realm.function_prototype(func_id);
             return Ok(NanBox::handle(proto.to_raw()));
         }
+        // A bound function's `name` is `"bound " + target.name` (recursing so a
+        // re-bound function reads `"bound bound …"`).
+        if name == "name"
+            && let Some(target) = self.realm.get_property(handle, BOUND_TARGET)
+        {
+            let tname = match target.as_handle().map(Handle::from_raw) {
+                Some(th) => {
+                    let v = self.read_member(th, "name")?;
+                    self.realm.to_display_string(v)
+                }
+                None => String::new(),
+            };
+            return Ok(self.new_str(&alloc::format!("bound {tname}")));
+        }
         // A function's `length` (params before a default/rest) and `name`.
         if matches!(name, "length" | "name")
             && let Some((func_id, _)) = self.realm.function_at(handle)
@@ -8520,6 +8544,27 @@ mod tests {
         );
         assert_eq!(run("(-1n & 255n).toString()"), "255");
         assert_eq!(run("(((2n ** 100n) | 1n) - (2n ** 100n)).toString()"), "1");
+    }
+
+    #[test]
+    fn apply_arraylike_and_bound_name() {
+        // apply accepts an array-like (length + indexed properties).
+        assert_eq!(
+            run("function f(){return arguments.length;} f.apply(null,{length:3,0:1,1:2,2:3})"),
+            "3"
+        );
+        assert_eq!(
+            run(
+                "function s(){let t=0;for(let i=0;i<arguments.length;i++)t+=arguments[i];return t;} s.apply(null,{length:2,0:10,1:20})"
+            ),
+            "30"
+        );
+        // A bound function's name.
+        assert_eq!(run("function foo(){} foo.bind(null).name"), "bound foo");
+        assert_eq!(
+            run("function foo(){} foo.bind(null).bind(null).name"),
+            "bound bound foo"
+        );
     }
 
     #[test]
