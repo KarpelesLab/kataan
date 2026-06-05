@@ -2981,6 +2981,34 @@ impl<'a> Interp<'a> {
                     self.resolve_with(p, NanBox::handle(arr.to_raw()));
                     return Ok(Some(NanBox::handle(p.to_raw())));
                 }
+                // `Promise.any(iterable)`: fulfills with the first input to
+                // fulfill; rejects with an `AggregateError` if all reject.
+                "any" => {
+                    let items = self.iterate_values(arg(0))?;
+                    let p = self.realm.new_promise();
+                    let mut errors = Vec::new();
+                    for item in items {
+                        match self.await_value(item) {
+                            Ok(v) => {
+                                self.resolve_with(p, v);
+                                return Ok(Some(NanBox::handle(p.to_raw())));
+                            }
+                            Err(ExecError::Throw(e)) => errors.push(e),
+                            Err(other) => return Err(other),
+                        }
+                    }
+                    // None fulfilled: reject with an AggregateError holding them.
+                    let agg = self.realm.new_object();
+                    let name = self.new_str("AggregateError");
+                    self.realm.set_property(agg, "name", name);
+                    let msg = self.new_str("All promises were rejected");
+                    self.realm.set_property(agg, "message", msg);
+                    let errs = self.realm.new_array(errors);
+                    self.realm
+                        .set_property(agg, "errors", NanBox::handle(errs.to_raw()));
+                    self.settle(p, NanBox::handle(agg.to_raw()), false);
+                    return Ok(Some(NanBox::handle(p.to_raw())));
+                }
                 _ => {}
             }
         }
@@ -8627,6 +8655,10 @@ mod tests {
             "3"
         );
     }
+
+    // `Promise.any` (first-fulfilled / AggregateError-when-all-reject) is covered
+    // by the `promise-allsettled-any` Test262 corpus test, which awaits the
+    // settled value (microtask timing isn't observable synchronously here).
 
     #[test]
     fn weakref_and_finalization_registry() {
