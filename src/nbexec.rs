@@ -3673,12 +3673,16 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
                 }
                 "with" => {
-                    let mut out = elems.clone();
-                    let i = self.realm.to_number(arg(0));
-                    let idx = if i < 0.0 { out.len() as f64 + i } else { i } as usize;
-                    if idx < out.len() {
-                        out[idx] = arg(1);
+                    let len = elems.len() as i64;
+                    let i = self.realm.to_number(arg(0)) as i64;
+                    let idx = if i < 0 { len + i } else { i };
+                    // An out-of-range index is a RangeError.
+                    if idx < 0 || idx >= len {
+                        let m = self.new_str("Invalid index");
+                        return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
                     }
+                    let mut out = elems.clone();
+                    out[idx as usize] = arg(1);
                     return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
                 }
                 "toSorted" => {
@@ -4052,6 +4056,24 @@ impl<'a> Interp<'a> {
                     let sorted = self.sort_array(elems, arg(0))?;
                     self.realm.array_set_all(handle, sorted);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
+                }
+                // `toSpliced(start, deleteCount, ...items)` — a spliced copy
+                // (the ES2023 immutable counterpart of `splice`).
+                "toSpliced" => {
+                    let len = elems.len() as i64;
+                    let start = {
+                        let s = self.realm.to_number(arg(0)) as i64;
+                        if s < 0 { (len + s).max(0) } else { s.min(len) }
+                    } as usize;
+                    let del = if args.len() < 2 {
+                        elems.len() - start
+                    } else {
+                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(elems.len() - start)
+                    };
+                    let mut out: Vec<NanBox> = elems[..start].to_vec();
+                    out.extend_from_slice(&args[2.min(args.len())..]);
+                    out.extend_from_slice(&elems[start + del..]);
+                    return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
                 }
                 _ => {}
             }
@@ -8177,6 +8199,27 @@ mod tests {
         // String index access.
         assert_eq!(run("'hello'[0] + 'hello'[4]"), "ho");
         assert_eq!(run("String('abc'[5])"), "undefined");
+    }
+
+    #[test]
+    fn array_immutable_methods() {
+        assert_eq!(
+            run("let a=[3,1,2]; a.toSorted().join(',') + '|' + a.join(',')"),
+            "1,2,3|3,1,2"
+        );
+        assert_eq!(run("[1,2,3].toReversed().join(',')"), "3,2,1");
+        assert_eq!(run("[1,2,3].with(1,9).join(',')"), "1,9,3");
+        assert_eq!(run("[1,2,3].with(-1,9).join(',')"), "1,2,9");
+        assert_eq!(
+            run("[1,2,3,4,5].toSpliced(1,2,'a','b').join(',')"),
+            "1,a,b,4,5"
+        );
+        assert_eq!(run("[1,2,3,4].toSpliced(2).join(',')"), "1,2");
+        // with out-of-range → RangeError.
+        assert_eq!(
+            run("try { [1,2,3].with(10,0); 'no' } catch(e){ e instanceof RangeError }"),
+            "true"
+        );
     }
 
     #[test]
