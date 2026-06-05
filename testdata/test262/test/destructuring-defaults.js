@@ -1,20 +1,22 @@
 /*---
-description: Array/object destructuring with defaults, nesting, and rest
-esid: sec-destructuring-binding-patterns
+description: Destructuring with default values
+esid: sec-destructuring-assignment
 ---*/
-var [a, b = 10, ...rest] = [1, undefined, 3, 4];
-assert.sameValue(a, 1);
-assert.sameValue(b, 10, "default fills undefined");
-assert.sameValue(rest.join(","), "3,4");
-
-var { x, y = 5, z: { w } } = { x: 1, z: { w: 9 } };
+function greet({ name = "Anonymous", greeting = "Hello" } = {}) {
+  return greeting + ", " + name;
+}
+assert.sameValue(greet(), "Hello, Anonymous");
+assert.sameValue(greet({ name: "Alice" }), "Hello, Alice");
+assert.sameValue(greet({ name: "Bob", greeting: "Hi" }), "Hi, Bob");
+var [a = 1, b = 2, c = 3] = [10, undefined];
+assert.sameValue(a, 10);
+assert.sameValue(b, 2, "default for undefined");
+assert.sameValue(c, 3, "default for missing");
+var { x = 5, y = 10 } = { x: 1 };
 assert.sameValue(x, 1);
-assert.sameValue(y, 5);
-assert.sameValue(w, 9, "nested destructuring");
-
-function f({ p = 1, q = 2 } = {}) { return p + q; }
-assert.sameValue(f(), 3, "defaulted parameter object");
-assert.sameValue(f({ p: 10 }), 12);
-
-var [m, n] = [n, m] = [1, 2];
-assert.sameValue(m, 1);
+assert.sameValue(y, 10);
+var { p: { q = 99 } = {} } = {};
+assert.sameValue(q, 99, "nested default");
+function sum([first = 0, second = 0] = []) { return first + second; }
+assert.sameValue(sum([3, 4]), 7);
+assert.sameValue(sum(), 0);

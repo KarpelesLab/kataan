@@ -245,6 +245,8 @@ const CTOR_KEY: &str = "\u{0}ctor";
 const SYMBOL_NO_DESC: &str = "\u{0}nodesc";
 const GEN_BUF: &str = "\u{0}gbuf";
 const GEN_IDX: &str = "\u{0}gidx";
+/// A generator's `return` value, surfaced once after its yields are exhausted.
+const GEN_RET: &str = "\u{0}gret";
 /// Reserved hidden keys for a bound function (`Function.prototype.bind`).
 const BOUND_TARGET: &str = "\u{0}bnd_t";
 const BOUND_THIS: &str = "\u{0}bnd_this";
@@ -1447,12 +1449,19 @@ impl<'a> Interp<'a> {
     /// a hidden buffer array plus a `next()` cursor, recognized by `for-of`,
     /// spread, and a `next()` method.
     fn make_generator(&mut self, values: Vec<NanBox>) -> NanBox {
+        self.make_generator_with_return(values, NanBox::undefined())
+    }
+
+    /// Like [`make_generator`], but with the generator's `return` value (surfaced
+    /// once, with `done: true`, after the yields are exhausted).
+    fn make_generator_with_return(&mut self, values: Vec<NanBox>, ret: NanBox) -> NanBox {
         let obj = self.realm.new_object();
         let buf = self.realm.new_array(values);
         self.realm
             .set_hidden_property(obj, GEN_BUF, NanBox::handle(buf.to_raw()));
         self.realm
             .set_hidden_property(obj, GEN_IDX, NanBox::number(0.0));
+        self.realm.set_hidden_property(obj, GEN_RET, ret);
         NanBox::handle(obj.to_raw())
     }
 
@@ -1845,8 +1854,8 @@ impl<'a> Interp<'a> {
         if def.is_generator {
             let collected = self.gen_sink.take().unwrap_or_default();
             self.gen_sink = saved_sink.flatten();
-            result?; // a throw during collection propagates at call time
-            return Ok(self.make_generator(collected));
+            let ret = result?; // a throw during collection propagates at call time
+            return Ok(self.make_generator_with_return(collected, ret));
         }
         // An `async` function returns a promise of its result (rejected on throw).
         if def.is_async {
@@ -2472,6 +2481,7 @@ impl<'a> Interp<'a> {
                         .and_then(|n| n.as_number())
                         .unwrap_or(0.0) as usize;
                     let elems = self.realm.array_elements(buf).map(<[_]>::to_vec);
+                    let len = elems.as_ref().map_or(0, Vec::len);
                     let (value, done) = match elems.as_ref().and_then(|e| e.get(idx)) {
                         Some(v) => {
                             self.realm.set_hidden_property(
@@ -2481,7 +2491,23 @@ impl<'a> Interp<'a> {
                             );
                             (*v, false)
                         }
-                        None => (NanBox::undefined(), true),
+                        // The first call past the yields surfaces the `return`
+                        // value (with `done: true`); later calls yield undefined.
+                        None => {
+                            let v = if idx == len {
+                                self.realm.set_hidden_property(
+                                    handle,
+                                    GEN_IDX,
+                                    NanBox::number((idx + 1) as f64),
+                                );
+                                self.realm
+                                    .get_property(handle, GEN_RET)
+                                    .unwrap_or(NanBox::undefined())
+                            } else {
+                                NanBox::undefined()
+                            };
+                            (v, true)
+                        }
                     };
                     let res = self.realm.new_object();
                     self.realm.set_property(res, "value", value);
@@ -7424,6 +7450,29 @@ mod tests {
             "true:1,2,3"
         );
         assert_eq!(run("[3,1,2].sort((x,y)=>y-x).join(',')"), "3,2,1");
+    }
+
+    #[test]
+    fn generator_return_value() {
+        // The return value is surfaced once, with done:true, after the yields.
+        assert_eq!(
+            run(
+                "function* g(){ yield 1; yield 2; return 99; } let it=g(); it.next(); it.next(); let r=it.next(); r.value + ':' + r.done"
+            ),
+            "99:true"
+        );
+        // Subsequent next() calls yield undefined/done.
+        assert_eq!(
+            run(
+                "function* g(){ yield 1; return 7; } let it=g(); it.next(); it.next(); String(it.next().value) + ':' + it.next().done"
+            ),
+            "undefined:true"
+        );
+        // Spread excludes the return value.
+        assert_eq!(
+            run("function* g(){ yield 1; yield 2; return 9; } [...g()].join(',')"),
+            "1,2"
+        );
     }
 
     #[test]
