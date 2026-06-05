@@ -3271,6 +3271,26 @@ impl<'a> Interp<'a> {
                     let h = self.realm.new_array(elems[a..b].to_vec());
                     return Ok(Some(NanBox::handle(h.to_raw())));
                 }
+                // Iterators: `keys()` over indices, `values()` over elements,
+                // `entries()` over `[index, element]` pairs (eager generators).
+                "keys" => {
+                    let ks: Vec<NanBox> =
+                        (0..elems.len()).map(|i| NanBox::number(i as f64)).collect();
+                    return Ok(Some(self.make_generator(ks)));
+                }
+                "values" => {
+                    return Ok(Some(self.make_generator(elems.clone())));
+                }
+                "entries" => {
+                    let mut pairs = Vec::with_capacity(elems.len());
+                    for (i, e) in elems.iter().enumerate() {
+                        let pair = self
+                            .realm
+                            .new_array(alloc::vec![NanBox::number(i as f64), *e]);
+                        pairs.push(NanBox::handle(pair.to_raw()));
+                    }
+                    return Ok(Some(self.make_generator(pairs)));
+                }
                 "concat" => {
                     let mut out = elems.clone();
                     for a in args {
@@ -3411,25 +3431,6 @@ impl<'a> Interp<'a> {
                         .iter()
                         .rposition(|e| self.realm.strict_equals(*e, target));
                     return Ok(Some(NanBox::number(found.map_or(-1.0, |i| i as f64))));
-                }
-                // Iterators, materialized as arrays (spread / for-of consume them).
-                "keys" => {
-                    let ks = (0..elems.len()).map(|i| NanBox::number(i as f64)).collect();
-                    return Ok(Some(NanBox::handle(self.realm.new_array(ks).to_raw())));
-                }
-                "values" => {
-                    let v = elems.clone();
-                    return Ok(Some(NanBox::handle(self.realm.new_array(v).to_raw())));
-                }
-                "entries" => {
-                    let mut out = Vec::with_capacity(elems.len());
-                    for (i, e) in elems.iter().enumerate() {
-                        let pair = self
-                            .realm
-                            .new_array(alloc::vec![NanBox::number(i as f64), *e]);
-                        out.push(NanBox::handle(pair.to_raw()));
-                    }
-                    return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
                 }
                 "find" => {
                     let f = arg(0);
@@ -7272,6 +7273,21 @@ mod tests {
             "true:1,2,3"
         );
         assert_eq!(run("[3,1,2].sort((x,y)=>y-x).join(',')"), "3,2,1");
+    }
+
+    #[test]
+    fn array_iterators() {
+        assert_eq!(run("[...['a','b','c'].keys()].join(',')"), "0,1,2");
+        assert_eq!(run("[...['a','b','c'].values()].join(',')"), "a,b,c");
+        assert_eq!(
+            run("let o=[]; for (let [i,v] of ['x','y'].entries()) o.push(i+':'+v); o.join(',')"),
+            "0:x,1:y"
+        );
+        // The iterator supports next().
+        assert_eq!(
+            run("let it=['p','q'].values(); it.next().value + it.next().value"),
+            "pq"
+        );
     }
 
     #[test]
