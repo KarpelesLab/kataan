@@ -1675,6 +1675,10 @@ impl<'a> Interp<'a> {
             return Err(ExecError::NotCallable);
         };
         let handle = Handle::from_raw(raw);
+        // `Array(...)` without `new` behaves like `new Array(...)`.
+        if self.current.get("Array").and_then(|v| v.as_handle()) == callee.as_handle() {
+            return self.construct(callee, args);
+        }
         // A bound function: prepend the bound `this`/args and forward.
         if let Some(target) = self.realm.get_property(handle, BOUND_TARGET) {
             let bthis = self
@@ -4427,13 +4431,20 @@ impl<'a> Interp<'a> {
     /// ToPrimitive of an object/array for loose equality: an array becomes its
     /// `join` string; a plain object uses the default-hint ToPrimitive.
     fn coerce_for_eq(&mut self, v: NanBox) -> Result<NanBox, ExecError> {
+        self.coerce_object(v, "default")
+    }
+
+    /// ToPrimitive of an object/array with `hint`: an array becomes its `join`
+    /// string (arrays have no readable `valueOf`/`toString`); a plain object goes
+    /// through `coerce_primitive`. Non-objects pass through.
+    fn coerce_object(&mut self, v: NanBox, hint: &str) -> Result<NanBox, ExecError> {
         if let Some(h) = v.as_handle().map(Handle::from_raw) {
             if self.realm.is_array(h) {
                 let s = self.realm.to_display_string(v);
                 return Ok(self.new_str(&s));
             }
             if self.realm.object_keys(h).is_some() {
-                return self.coerce_primitive(v, "default");
+                return self.coerce_primitive(v, hint);
             }
         }
         Ok(v)
@@ -5336,11 +5347,11 @@ impl<'a> Interp<'a> {
         }
         Ok(match op {
             UnaryOp::Plus => {
-                let p = self.coerce_primitive(v, "number")?;
+                let p = self.coerce_object(v, "number")?;
                 NanBox::number(self.realm.to_number(p))
             }
             UnaryOp::Minus => {
-                let p = self.coerce_primitive(v, "number")?;
+                let p = self.coerce_object(v, "number")?;
                 self.realm.neg(p)
             }
             UnaryOp::Not => self.realm.logical_not(v),
@@ -7181,6 +7192,23 @@ mod tests {
         assert_eq!(run("'\\u{1F600}'.codePointAt(0)"), "128512");
         assert_eq!(run("'a\\u{1F600}b'.codePointAt(1)"), "128512");
         assert_eq!(run("'hello'.charCodeAt(0)"), "104");
+    }
+
+    #[test]
+    fn array_call_and_unary_plus_array() {
+        // Array(...) without new.
+        assert_eq!(run("Array(3).length"), "3");
+        assert_eq!(run("Array(1,2,3).join(',')"), "1,2,3");
+        assert_eq!(run("Array().length"), "0");
+        // Unary + coerces arrays via their string form.
+        assert_eq!(run("+[]"), "0");
+        assert_eq!(run("+[5]"), "5");
+        assert_eq!(run("Number.isNaN(+[1,2])"), "true");
+        // Symbol.toPrimitive still gets the number hint for unary +.
+        assert_eq!(
+            run("+{[Symbol.toPrimitive](h){ return h==='number'?9:0; }}"),
+            "9"
+        );
     }
 
     #[test]
