@@ -5844,7 +5844,7 @@ impl<'a> Interp<'a> {
             }
             return Ok(match id {
                 N_REGEXP => self.realm.regexp_at(oh).is_some(),
-                N_MAP | N_SET => self.realm.collection_is_set(oh).is_some(),
+                N_MAP | N_SET | N_WEAKMAP | N_WEAKSET => self.realm.collection_is_set(oh).is_some(),
                 N_DATE => self.realm.date_at(oh).is_some(),
                 _ => false,
             });
@@ -7976,6 +7976,9 @@ mod tests {
             run("let k={}; let m=new WeakMap(); m.set(k,'v'); m.get(k) + ':' + m.has(k)"),
             "v:true"
         );
+        // Weak collections are recognized by instanceof and chain from set/add.
+        assert_eq!(run("(new WeakMap()).set({}, 1) instanceof WeakMap"), "true");
+        assert_eq!(run("(new WeakSet()).add({}) instanceof WeakSet"), "true");
         assert_eq!(
             run("let s=new WeakSet(); let o={}; s.add(o); s.has(o) + ':' + s.has({})"),
             "true:false"
