@@ -2103,7 +2103,7 @@ impl<'a> Interp<'a> {
         for member in &class.body {
             match member {
                 ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
-                    if let Ok(key) = static_key(&m.key) {
+                    if let Ok(key) = self.eval_prop_key(&m.key) {
                         let f = self.make_function(
                             &m.value.params,
                             Body::Block(&m.value.body),
@@ -2114,7 +2114,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 ClassMember::Field(field) if field.is_static => {
-                    if let Ok(key) = static_key(&field.key) {
+                    if let Ok(key) = self.eval_prop_key(&field.key) {
                         let v = match &field.value {
                             Some(e) => self.eval(e).unwrap_or(NanBox::undefined()),
                             None => NanBox::undefined(),
@@ -2126,7 +2126,7 @@ impl<'a> Interp<'a> {
                 ClassMember::Method(m)
                     if m.is_static && matches!(m.kind, MethodKind::Get | MethodKind::Set) =>
                 {
-                    if let Ok(key) = static_key(&m.key) {
+                    if let Ok(key) = self.eval_prop_key(&m.key) {
                         let f = self.make_function(
                             &m.value.params,
                             Body::Block(&m.value.body),
@@ -7955,6 +7955,24 @@ mod tests {
         assert_eq!(
             run("let o = { v: 7, m: function(){ return (() => (() => this.v)())(); } }; o.m()"),
             "7"
+        );
+    }
+
+    #[test]
+    fn computed_class_members() {
+        // Computed instance method, field, and getter names.
+        assert_eq!(
+            run(
+                "let m='go'; class C{ [m](){return 1;} [m+'V']=2; get [m+'G'](){return 3;} } let c=new C(); c.go() + ':' + c.goV + ':' + c.goG"
+            ),
+            "1:2:3"
+        );
+        // Computed static method, field, and getter names.
+        assert_eq!(
+            run(
+                "let s='mk'; class C{ static [s](){return 'a';} static [s+'N']=4; static get [s+'G'](){return 'b';} } C.mk() + ':' + C.mkN + ':' + C.mkG"
+            ),
+            "a:4:b"
         );
     }
 
