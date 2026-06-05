@@ -2395,7 +2395,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Registers a class and allocates a class value capturing the current scope.
-    fn make_class(&mut self, class: &'a Class) -> NanBox {
+    fn make_class(&mut self, class: &'a Class) -> Result<NanBox, ExecError> {
         let class_id = self.classes.len() as u32;
         self.classes.push(class);
         // Build the static members (`static foo() {}` / `static x = …`).
@@ -2465,7 +2465,35 @@ impl<'a> Interp<'a> {
         };
         self.class_native_super.push(native_super);
         let handle = self.realm.new_class(class_id, self.current.clone());
-        NanBox::handle(handle.to_raw())
+        let class_val = NanBox::handle(handle.to_raw());
+        // Run `static { … }` initialization blocks with `this` = the class and the
+        // class name bound (so the block can reference the class and its statics).
+        if class
+            .body
+            .iter()
+            .any(|m| matches!(m, ClassMember::StaticBlock { .. }))
+        {
+            let scope = self.current.child();
+            if let Some(id) = &class.id {
+                scope.declare(&id.name, class_val);
+            }
+            let saved = core::mem::replace(&mut self.current, scope);
+            let saved_this = core::mem::replace(&mut self.this_val, class_val);
+            let r = (|| {
+                for member in &class.body {
+                    if let ClassMember::StaticBlock { body, .. } = member {
+                        for stmt in body {
+                            self.exec(stmt)?;
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            self.current = saved;
+            self.this_val = saved_this;
+            r?;
+        }
+        Ok(class_val)
     }
 
     /// Resolves a class's `extends` superclass to `(class_id, env)`, if any.
@@ -4418,7 +4446,7 @@ impl<'a> Interp<'a> {
             // Function declarations are handled by hoisting; nothing to do here.
             Stmt::Function(_) => Ok(Flow::Normal(NanBox::undefined())),
             Stmt::Class(class) => {
-                let value = self.make_class(class);
+                let value = self.make_class(class)?;
                 if let Some(id) = &class.id {
                     self.current.declare(&id.name, value);
                 }
@@ -5361,7 +5389,7 @@ impl<'a> Interp<'a> {
             }
             Expr::Function(func) => Ok(self.eval_fn_expr(func)),
             Expr::Arrow(arrow) => Ok(self.eval_arrow(arrow)),
-            Expr::Class(class) => Ok(self.make_class(class)),
+            Expr::Class(class) => self.make_class(class),
             Expr::Unary { op, argument, .. } => {
                 // `delete obj.x` removes a property; `typeof undefinedVar` must
                 // not throw — both inspect the operand rather than its value.
@@ -8890,6 +8918,24 @@ mod tests {
         assert_eq!(run("Math.E > 2.71 && Math.E < 2.72"), "true");
         assert_eq!(run("Math.SQRT2 * Math.SQRT2 > 1.999"), "true");
         assert_eq!(run("Math.floor(Math.LN2 * 1000)"), "693");
+    }
+
+    #[test]
+    fn class_static_blocks() {
+        assert_eq!(
+            run("class C{ static x=1; static { C.y = C.x + 1; } } C.y"),
+            "2"
+        );
+        // Multiple blocks run in order.
+        assert_eq!(
+            run("class C{ static n=0; static { C.n=10; } static { C.n+=5; } } C.n"),
+            "15"
+        );
+        // `this` is the class inside a static block.
+        assert_eq!(
+            run("class C{ static x=1; static { this.y = this.x + 100; } } C.y"),
+            "101"
+        );
     }
 
     #[test]
