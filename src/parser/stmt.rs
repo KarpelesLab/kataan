@@ -437,13 +437,15 @@ impl<'src> Parser<'src> {
 
     fn parse_for(&mut self) -> Result<Stmt> {
         let start = self.bump().span; // `for`
+        // `for await (… of …)` — async iteration.
+        let is_await = self.eat(TokenKind::Keyword(Kw::Await));
         self.expect(TokenKind::LParen)?;
         // The header is parsed with the `in`-as-operator restriction in force.
         let head = self.with_no_in(Self::parse_for_head)?;
         match head {
             ForHead::Empty => self.finish_for_classic(start, None),
             ForHead::Classic(init) => self.finish_for_classic(start, init),
-            ForHead::InOf { left, is_of } => self.finish_for_in_of(start, left, is_of),
+            ForHead::InOf { left, is_of } => self.finish_for_in_of(start, left, is_of, is_await),
         }
     }
 
@@ -546,7 +548,13 @@ impl<'src> Parser<'src> {
     }
 
     /// Parses the remainder of a `for-in`/`for-of`: `right ) body`.
-    fn finish_for_in_of(&mut self, start: Span, left: ForLeft, is_of: bool) -> Result<Stmt> {
+    fn finish_for_in_of(
+        &mut self,
+        start: Span,
+        left: ForLeft,
+        is_of: bool,
+        is_await: bool,
+    ) -> Result<Stmt> {
         // `for-of` iterates an AssignmentExpression; `for-in` an Expression.
         let right = if is_of {
             self.parse_assignment()?
@@ -563,6 +571,7 @@ impl<'src> Parser<'src> {
                 left,
                 right,
                 body,
+                is_await,
                 span,
             }
         } else {

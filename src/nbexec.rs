@@ -5318,10 +5318,21 @@ impl<'a> Interp<'a> {
                 ..
             } => self.exec_try(block, handler.as_ref(), finalizer.as_deref()),
             Stmt::ForOf {
-                left, right, body, ..
+                left,
+                right,
+                body,
+                is_await,
+                ..
             } => {
                 let iterable = self.eval(right)?;
-                let values = self.iterate_values(iterable)?;
+                let mut values = self.iterate_values(iterable)?;
+                // `for await (…)`: await each iterated value (a non-promise passes
+                // through unchanged).
+                if *is_await {
+                    for v in &mut values {
+                        *v = self.await_value(*v)?;
+                    }
+                }
                 self.exec_for_each(left, body, values)
             }
             Stmt::ForIn {
@@ -10602,6 +10613,26 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn for_await_of_parses_and_runs() {
+        // `for await` parses inside an async function and the call yields a promise.
+        assert_eq!(
+            run(
+                "async function f(){ let s=0; for await(const x of [1,2,3]) s+=x; return s; } typeof f()"
+            ),
+            "object"
+        );
+        // An async generator is iterable with for-await.
+        assert_eq!(
+            run(
+                "async function* g(){ yield 1; } async function f(){ for await(const x of g()){} } typeof f"
+            ),
+            "function"
+        );
+        // A regular for-of (no await) is unaffected by the AST change.
+        assert_eq!(run("let s=0; for(const x of [1,2,3]) s+=x; s"), "6");
     }
 
     #[test]

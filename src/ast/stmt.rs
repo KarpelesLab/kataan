@@ -62,11 +62,13 @@ pub enum Stmt {
         body: Box<Stmt>,
         span: Span,
     },
-    /// A `for (left of right) body` loop.
+    /// A `for (left of right) body` loop. `is_await` marks `for await (…)`, which
+    /// awaits each iterated value.
     ForOf {
         left: ForLeft,
         right: Box<Expr>,
         body: Box<Stmt>,
+        is_await: bool,
         span: Span,
     },
     /// `while (test) body`.
