@@ -5860,6 +5860,14 @@ impl<'a> Interp<'a> {
                         let key = self.eval(e)?;
                         let iter_sym = self.well_known_symbol("iterator");
                         if self.realm.strict_equals(key, iter_sym) {
+                            // A generator/iterator is its own iterator (identity).
+                            if recv
+                                .as_handle()
+                                .map(Handle::from_raw)
+                                .is_some_and(|h| self.realm.get_property(h, GEN_BUF).is_some())
+                            {
+                                return Ok(recv);
+                            }
                             let vals = self.iterate_values(recv)?;
                             return Ok(self.make_generator(vals));
                         }
@@ -9935,6 +9943,24 @@ mod tests {
             "undefined:undefined"
         );
         assert_eq!(run("[[1,2],[3,4]]['0']['1']"), "2");
+    }
+
+    #[test]
+    fn generator_is_its_own_iterator() {
+        assert_eq!(
+            run("function* g(){yield 1;} let it=g(); it[Symbol.iterator]() === it"),
+            "true"
+        );
+        assert_eq!(
+            run(
+                "function* g(){yield 1;yield 2;} let it=g(); it[Symbol.iterator]().next().value + ':' + it.next().value"
+            ),
+            "1:2"
+        );
+        assert_eq!(
+            run("function* g(){yield* [1,2]; yield* 'ab';} [...g()].join(',')"),
+            "1,2,a,b"
+        );
     }
 
     #[test]
