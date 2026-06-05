@@ -3246,19 +3246,30 @@ impl<'a> Interp<'a> {
                 }
                 "split" => {
                     let mut parts = Vec::new();
-                    let mut at = 0;
-                    while let Some(caps) = re.captures_from(&s, at) {
+                    // `seg_start` begins the current segment; `search` is where the
+                    // next match is sought (advanced past zero-width matches so a
+                    // lookahead split doesn't drop a character).
+                    let mut seg_start = 0;
+                    let mut search = 0;
+                    while search <= s.len() {
+                        let Some(caps) = re.captures_from(&s, search) else {
+                            break;
+                        };
                         let Some((st, en)) = caps.groups[0] else {
                             break;
                         };
-                        if en == at && st == at {
-                            at += 1;
-                            if at > s.len() {
-                                break;
+                        // A zero-width match at the segment start: not a split;
+                        // step the search past one character and retry.
+                        if en == seg_start {
+                            match s[search..].chars().next() {
+                                Some(c) => {
+                                    search = search.max(st) + c.len_utf8();
+                                    continue;
+                                }
+                                None => break,
                             }
-                            continue;
                         }
-                        parts.push(self.new_str(&s[at..st]));
+                        parts.push(self.new_str(&s[seg_start..st]));
                         // The separator's capture groups are spliced into the
                         // result (`"a1b".split(/(\d)/)` → `["a","1","b"]`).
                         for g in &caps.groups[1..] {
@@ -3267,9 +3278,10 @@ impl<'a> Interp<'a> {
                                 None => parts.push(NanBox::undefined()),
                             }
                         }
-                        at = en;
+                        seg_start = en;
+                        search = if en > st { en } else { en + 1 };
                     }
-                    parts.push(self.new_str(&s[at..]));
+                    parts.push(self.new_str(&s[seg_start..]));
                     return Ok(Some(NanBox::handle(self.realm.new_array(parts).to_raw())));
                 }
                 // replace / replaceAll. The replacement is either a function
@@ -3306,8 +3318,19 @@ impl<'a> Interp<'a> {
                         } else {
                             out.push_str(&expand_replacement(&templ, &s, &caps, re.group_names()));
                         }
-                        at = if en > st { en } else { en + 1 };
-                        if !global || at > s.len() {
+                        if en > st {
+                            at = en;
+                        } else {
+                            // Empty match: keep the char at `st` and step past it.
+                            match s[en..].chars().next() {
+                                Some(c) => {
+                                    out.push(c);
+                                    at = en + c.len_utf8();
+                                }
+                                None => break,
+                            }
+                        }
+                        if !global {
                             break;
                         }
                     }
@@ -8411,6 +8434,24 @@ mod tests {
         assert_eq!(
             run("let it=['p','q'].values(); it.next().value + it.next().value"),
             "pq"
+        );
+    }
+
+    #[test]
+    fn regex_empty_and_zerowidth_matches() {
+        // Empty-match global replace keeps the characters.
+        assert_eq!(run("'abc'.replace(/x*/g, '-')"), "-a-b-c-");
+        // Zero-width (lookahead) split keeps the boundary character.
+        assert_eq!(
+            run("'camelCaseWord'.split(/(?=[A-Z])/).join('|')"),
+            "camel|Case|Word"
+        );
+        // Capture-group split still splices the captures.
+        assert_eq!(run("'a1b2'.split(/(\\d)/).join(',')"), "a,1,b,2,");
+        // Lookahead-based number grouping replace.
+        assert_eq!(
+            run("'1234567'.replace(/(?<=\\d)(?=(?:\\d{3})+$)/g, ',')"),
+            "1,234,567"
         );
     }
 
