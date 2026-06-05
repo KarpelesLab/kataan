@@ -124,6 +124,9 @@ pub struct Interp<'a> {
     class_static_set: Vec<alloc::collections::BTreeMap<String, NanBox>>,
     /// Per-class captured definition scope, parallel to `classes`.
     class_envs: Vec<Scope>,
+    /// Per-class native-constructor superclass id (`class X extends Error`),
+    /// parallel to `classes`; `None` when the parent is a class or absent.
+    class_native_super: Vec<Option<u16>>,
     /// The current `this` binding (method/constructor receiver).
     this_val: NanBox,
     /// When running a generator body eagerly, the buffer `yield` appends to.
@@ -134,6 +137,8 @@ pub struct Interp<'a> {
     well_known_symbols: alloc::collections::BTreeMap<&'static str, NanBox>,
     /// The superclass to invoke for `super(...)` inside the running constructor.
     pending_super: Option<(u32, Scope)>,
+    /// The native-constructor superclass for `super(...)` (e.g. extending Error).
+    pending_super_native: Option<u16>,
     /// The class of the currently-running method (for `super.method()`).
     current_home: Option<u32>,
     /// A label attached to the next loop (for `break`/`continue label`).
@@ -281,11 +286,13 @@ impl<'a> Interp<'a> {
             class_static_get: Vec::new(),
             class_static_set: Vec::new(),
             class_envs: Vec::new(),
+            class_native_super: Vec::new(),
             this_val: NanBox::undefined(),
             gen_sink: None,
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
             pending_super: None,
+            pending_super_native: None,
             current_home: None,
             pending_label: None,
             microtasks: Vec::new(),
@@ -2109,6 +2116,26 @@ impl<'a> Interp<'a> {
     }
 
     /// Builds an error object `{ name, message }` for the constructor `id`.
+    /// Applies a native superclass constructor's effect to `instance` for
+    /// `super(...)` in a class that `extends` a native (e.g. `extends Error`).
+    fn apply_native_super(&mut self, native_id: u16, instance: Handle, args: &[NanBox]) {
+        // Error family: set `message` and the default `name` (a `this.name = …`
+        // after `super()` may override it).
+        if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&native_id) {
+            let name = ERROR_NAMES[(native_id - N_ERROR_BASE) as usize];
+            let name_v = self.new_str(name);
+            self.realm.set_property(instance, "name", name_v);
+            let msg = match args.first() {
+                Some(m) if !matches!(m.unpack(), Unpacked::Undefined) => {
+                    let s = self.realm.to_display_string(*m);
+                    self.new_str(&s)
+                }
+                _ => self.new_str(""),
+            };
+            self.realm.set_property(instance, "message", msg);
+        }
+    }
+
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
         let name = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
         let obj = self.realm.new_object();
@@ -2180,6 +2207,21 @@ impl<'a> Interp<'a> {
         self.class_static_get.push(static_getters);
         self.class_static_set.push(static_setters);
         self.class_envs.push(self.current.clone());
+        // Record a native-constructor superclass (`extends Error`), if any, so
+        // construction and `instanceof` can reach it (it has no class id).
+        let native_super = if let Some(expr) = &class.super_class {
+            self.eval(expr).ok().and_then(|v| {
+                let h = Handle::from_raw(v.as_handle()?);
+                if self.realm.class_at(h).is_some() {
+                    None
+                } else {
+                    self.realm.native_at(h)
+                }
+            })
+        } else {
+            None
+        };
+        self.class_native_super.push(native_super);
         let handle = self.realm.new_class(class_id, self.current.clone());
         NanBox::handle(handle.to_raw())
     }
@@ -2199,10 +2241,16 @@ impl<'a> Interp<'a> {
         let raw = value?
             .as_handle()
             .ok_or(ExecError::Unsupported("extends a non-class"))?;
-        self.realm
-            .class_at(Handle::from_raw(raw))
-            .map(Some)
-            .ok_or(ExecError::Unsupported("extends a non-class"))
+        let h = Handle::from_raw(raw);
+        if let Some(parent) = self.realm.class_at(h) {
+            Ok(Some(parent))
+        } else if self.realm.native_at(h).is_some() {
+            // A native superclass (e.g. `extends Error`) has no class chain;
+            // it is tracked separately in `class_native_super`.
+            Ok(None)
+        } else {
+            Err(ExecError::Unsupported("extends a non-class"))
+        }
     }
 
     /// Instantiates `new Class(args)`: creates the object, installs the methods
@@ -2313,6 +2361,8 @@ impl<'a> Interp<'a> {
         let class = self.classes[class_id as usize];
         let parent = self.resolve_super(class, env)?;
         let saved_super = core::mem::replace(&mut self.pending_super, parent.clone());
+        let native_parent = self.class_native_super[class_id as usize];
+        let saved_super_native = core::mem::replace(&mut self.pending_super_native, native_parent);
         let saved_scope = core::mem::replace(&mut self.current, env.child());
         let result = (|| {
             let ctor = class.body.iter().find_map(|m| match m {
@@ -2367,6 +2417,7 @@ impl<'a> Interp<'a> {
         })();
         self.current = saved_scope;
         self.pending_super = saved_super;
+        self.pending_super_native = saved_super_native;
         result
     }
 
@@ -5056,15 +5107,22 @@ impl<'a> Interp<'a> {
                 // instance.
                 if matches!(&**callee, Expr::Super(_)) {
                     let args = self.eval_args(arguments)?;
-                    let Some((pid, penv)) = self.pending_super.clone() else {
-                        return Err(ExecError::Unsupported(
-                            "super outside a derived constructor",
-                        ));
-                    };
-                    if let Some(raw) = self.this_val.as_handle() {
-                        self.run_constructor(pid, &penv, Handle::from_raw(raw), &args)?;
+                    if let Some((pid, penv)) = self.pending_super.clone() {
+                        if let Some(raw) = self.this_val.as_handle() {
+                            self.run_constructor(pid, &penv, Handle::from_raw(raw), &args)?;
+                        }
+                        return Ok(NanBox::undefined());
                     }
-                    return Ok(NanBox::undefined());
+                    // `super(...)` reaching a native constructor (`extends Error`).
+                    if let Some(nid) = self.pending_super_native
+                        && let Some(raw) = self.this_val.as_handle()
+                    {
+                        self.apply_native_super(nid, Handle::from_raw(raw), &args);
+                        return Ok(NanBox::undefined());
+                    }
+                    return Err(ExecError::Unsupported(
+                        "super outside a derived constructor",
+                    ));
                 }
                 // `super.method(args)` — invoke the base-class method with the
                 // current `this`.
@@ -6089,6 +6147,31 @@ impl<'a> Interp<'a> {
             // The `Error` family: match by the object's `name` against the
             // constructor (the base `Error` matches any error object).
             if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
+                let want = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
+                // A user class extending a native error: walk its class chain for
+                // a native error super (so `customErr instanceof Error` holds even
+                // when the subclass overrides `this.name`).
+                if let Some(tag) = self.realm.class_tag(oh) {
+                    let mut cur = Some(tag);
+                    while let Some(cid) = cur {
+                        if let Some(nsup) = self.class_native_super[cid as usize]
+                            && (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16)
+                                .contains(&nsup)
+                        {
+                            let have = ERROR_NAMES[(nsup - N_ERROR_BASE) as usize];
+                            if want == "Error" || want == have {
+                                return Ok(true);
+                            }
+                        }
+                        cur = self
+                            .resolve_super(
+                                self.classes[cid as usize],
+                                &self.class_envs[cid as usize].clone(),
+                            )?
+                            .map(|(p, _)| p);
+                    }
+                }
+                // Plain error objects: match by the `name` property.
                 let obj_name = self
                     .realm
                     .get_property(oh, "name")
@@ -6097,7 +6180,6 @@ impl<'a> Interp<'a> {
                 if !ERROR_NAMES.contains(&obj_name.as_str()) {
                     return Ok(false);
                 }
-                let want = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
                 return Ok(want == "Error" || obj_name == want);
             }
             return Ok(match id {
@@ -8150,6 +8232,32 @@ mod tests {
                 "let s='mk'; class C{ static [s](){return 'a';} static [s+'N']=4; static get [s+'G'](){return 'b';} } C.mk() + ':' + C.mkN + ':' + C.mkG"
             ),
             "a:4:b"
+        );
+    }
+
+    #[test]
+    fn class_extends_native_error() {
+        assert_eq!(
+            run(
+                "class E extends Error{ constructor(m,c){ super(m); this.name='E'; this.c=c; } } let e=new E('x',5); e.message + ':' + e.c + ':' + e.name"
+            ),
+            "x:5:E"
+        );
+        assert_eq!(
+            run("class E extends Error{} (new E('m')) instanceof Error"),
+            "true"
+        );
+        assert_eq!(
+            run(
+                "class E extends Error{ constructor(m){super(m);} } let e=new E('m'); (e instanceof Error) + ',' + (e instanceof E) + ',' + (e instanceof TypeError)"
+            ),
+            "true,true,false"
+        );
+        assert_eq!(
+            run(
+                "class V extends RangeError{} let v=new V(); (v instanceof RangeError) + ',' + (v instanceof Error)"
+            ),
+            "true,true"
         );
     }
 
