@@ -4546,6 +4546,12 @@ impl<'a> Interp<'a> {
                                         } else {
                                             self.realm.delete_property(target, &name);
                                         }
+                                    } else if let (true, Ok(i)) =
+                                        (self.realm.is_array(h), name.parse::<usize>())
+                                    {
+                                        // `delete arr[i]` clears the element (no
+                                        // true holes; the slot becomes undefined).
+                                        self.realm.set_element(h, i, NanBox::undefined());
                                     } else {
                                         self.realm.delete_property(h, &name);
                                     }
@@ -5468,7 +5474,16 @@ impl<'a> Interp<'a> {
                             self.realm.has_own(target, &key) || self.realm.is_array(target)
                         }
                     }
-                    Some(h) => self.realm.has_own(h, &key) || self.realm.is_array(h),
+                    Some(h) => {
+                        if let Some(len) = self.realm.array_length(h) {
+                            // An array index is present iff it is in bounds.
+                            key == "length"
+                                || key.parse::<usize>().is_ok_and(|i| i < len)
+                                || self.realm.has_own(h, &key)
+                        } else {
+                            self.realm.has_own(h, &key)
+                        }
+                    }
                     None => false,
                 };
                 NanBox::boolean(present)
@@ -7273,6 +7288,21 @@ mod tests {
             run("'hello'.includes('lo', 3) + ':' + 'hello'.includes('he', 1)"),
             "true:false"
         );
+    }
+
+    #[test]
+    fn in_operator_array_bounds_and_delete() {
+        assert_eq!(run("0 in [1,2,3]"), "true");
+        assert_eq!(run("5 in [1,2,3]"), "false"); // out of bounds
+        assert_eq!(run("'length' in [1,2,3]"), "true");
+        assert_eq!(run("'a' in {a:1}"), "true");
+        assert_eq!(run("'b' in {a:1}"), "false");
+        // delete clears an array element.
+        assert_eq!(
+            run("let a=[1,2,3]; delete a[1]; String(a[1]) + ':' + a.length"),
+            "undefined:3"
+        );
+        assert_eq!(run("let o={a:1}; delete o.a; 'a' in o"), "false");
     }
 
     #[test]
