@@ -218,6 +218,8 @@ const N_DECODE_URI: u16 = 162;
 const N_STRUCTURED_CLONE: u16 = 163;
 const N_BTOA: u16 = 164;
 const N_ATOB: u16 = 165;
+const N_INTL_NUMBER_FORMAT: u16 = 166;
+const N_INTL_DATETIME_FORMAT: u16 = 167;
 const N_OBJECT_CREATE: u16 = 107;
 const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
@@ -549,6 +551,17 @@ impl<'a> Interp<'a> {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
         }
+        // The `Intl` namespace with its format constructors.
+        let intl = self.realm.new_object();
+        for (name, id) in [
+            ("NumberFormat", N_INTL_NUMBER_FORMAT),
+            ("DateTimeFormat", N_INTL_DATETIME_FORMAT),
+        ] {
+            let f = self.realm.new_native(id);
+            self.realm
+                .set_property(intl, name, NanBox::handle(f.to_raw()));
+        }
+        self.current.declare("Intl", NanBox::handle(intl.to_raw()));
         // `globalThis`: an object mirroring the global bindings, referencing
         // itself. Reads like `globalThis.Math` and `globalThis.globalThis` work.
         let global = self.realm.new_object();
@@ -590,6 +603,7 @@ impl<'a> Interp<'a> {
             "structuredClone",
             "btoa",
             "atob",
+            "Intl",
         ] {
             if let Some(v) = self.current.get(n) {
                 self.realm.set_property(global, n, v);
@@ -1353,6 +1367,9 @@ impl<'a> Interp<'a> {
                 let mut seen: Vec<(u64, NanBox)> = Vec::new();
                 self.structured_clone(arg(0), &mut seen)?
             }
+            // `Intl.NumberFormat(...)` / `Intl.DateTimeFormat(...)` called without
+            // `new` build the same formatter object.
+            N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => self.make_intl_formatter(id, args),
             // `btoa(s)`: each code unit must be a byte (0–255) → base64.
             N_BTOA => {
                 let s = self.realm.to_display_string(arg(0));
@@ -2493,6 +2510,10 @@ impl<'a> Interp<'a> {
                 .new_proxy(Handle::from_raw(tr), Handle::from_raw(hr));
             return Ok(NanBox::handle(p.to_raw()));
         }
+        // `new Intl.NumberFormat(locales, options)` / `Intl.DateTimeFormat(...)`.
+        if id == N_INTL_NUMBER_FORMAT || id == N_INTL_DATETIME_FORMAT {
+            return Ok(self.make_intl_formatter(id, args));
+        }
         // `new Promise(executor)`: run executor(resolve, reject).
         if id == N_PROMISE {
             let promise = self.realm.new_promise();
@@ -2763,6 +2784,127 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(obox)
+    }
+
+    /// Builds an `Intl.NumberFormat`/`DateTimeFormat` instance — an object that
+    /// captures the relevant options behind a `\0intl` kind marker. Used for both
+    /// `new Intl.X(...)` and the callable-without-`new` form.
+    fn make_intl_formatter(&mut self, id: u16, args: &[NanBox]) -> NanBox {
+        let obj = self.realm.new_object();
+        let kind = if id == N_INTL_NUMBER_FORMAT {
+            "number"
+        } else {
+            "datetime"
+        };
+        let marker = self.new_str(kind);
+        self.realm.set_hidden_property(obj, "\u{0}intl", marker);
+        if let Some(opts) = args
+            .get(1)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            for key in [
+                "style",
+                "currency",
+                "minimumFractionDigits",
+                "maximumFractionDigits",
+                "useGrouping",
+            ] {
+                if let Some(v) = self.realm.get_property(opts, key) {
+                    self.realm.set_hidden_property(obj, key, v);
+                }
+            }
+        }
+        NanBox::handle(obj.to_raw())
+    }
+
+    /// Formats `n` per an `Intl.NumberFormat` instance's captured options
+    /// (`style`, `currency`, min/max `FractionDigits`, `useGrouping`).
+    fn intl_format_number(&mut self, handle: Handle, n: f64) -> String {
+        let opt_str = |this: &mut Self, k: &str| -> Option<String> {
+            this.realm
+                .get_property(handle, k)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_display_string(v))
+        };
+        let opt_num = |this: &mut Self, k: &str| -> Option<i32> {
+            this.realm
+                .get_property(handle, k)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_number(v) as i32)
+        };
+        let style = opt_str(self, "style").unwrap_or_else(|| String::from("decimal"));
+        let currency = opt_str(self, "currency");
+        let use_grouping = !matches!(
+            self.realm.get_property(handle, "useGrouping"),
+            Some(v) if matches!(v.unpack(), Unpacked::Bool(false))
+        );
+        // Default fraction digits: currency = 2 (0 for JPY), else 0..=3.
+        let is_jpy = currency.as_deref() == Some("JPY");
+        let (def_min, def_max) = match style.as_str() {
+            "currency" if is_jpy => (0, 0),
+            "currency" => (2, 2),
+            "percent" => (0, 0),
+            _ => (0, 3),
+        };
+        let min = opt_num(self, "minimumFractionDigits")
+            .unwrap_or(def_min)
+            .clamp(0, 20);
+        let max = opt_num(self, "maximumFractionDigits")
+            .unwrap_or(def_max.max(min))
+            .clamp(min, 20);
+        let value = if style == "percent" { n * 100.0 } else { n };
+        // Round to `max` digits, then trim trailing zeros down to `min`.
+        let mut s = alloc::format!("{:.*}", max as usize, value);
+        if max > min && s.contains('.') {
+            while s.ends_with('0') && {
+                let frac = s.split_once('.').map_or(0, |(_, f)| f.len());
+                frac > min as usize
+            } {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
+        }
+        // Group the integer part.
+        let grouped = if use_grouping {
+            let neg = s.starts_with('-');
+            let body = s.trim_start_matches('-');
+            let (ip, fp) = body
+                .split_once('.')
+                .map_or((body, None), |(i, f)| (i, Some(f)));
+            let mut g = String::new();
+            let len = ip.len();
+            for (i, b) in ip.bytes().enumerate() {
+                if i > 0 && (len - i) % 3 == 0 {
+                    g.push(',');
+                }
+                g.push(b as char);
+            }
+            if let Some(f) = fp {
+                g.push('.');
+                g.push_str(f);
+            }
+            if neg { alloc::format!("-{g}") } else { g }
+        } else {
+            s
+        };
+        match style.as_str() {
+            "percent" => alloc::format!("{grouped}%"),
+            "currency" => {
+                let sym = match currency.as_deref() {
+                    Some("USD") => "$",
+                    Some("EUR") => "€",
+                    Some("GBP") => "£",
+                    Some("JPY" | "CNY") => "¥",
+                    Some(other) => return alloc::format!("{other}\u{a0}{grouped}"),
+                    None => "$",
+                };
+                alloc::format!("{sym}{grouped}")
+            }
+            _ => grouped,
+        }
     }
 
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
@@ -3513,6 +3655,30 @@ impl<'a> Interp<'a> {
                 return Ok(Some(self.new_str(&out)));
             }
             _ => {}
+        }
+        // --- Intl.NumberFormat / Intl.DateTimeFormat instance methods ---
+        if let Some(kind) = self.realm.get_property(handle, "\u{0}intl") {
+            let kind = self.realm.to_display_string(kind);
+            match method {
+                "format" if kind == "number" => {
+                    let n = self.realm.to_number(arg(0));
+                    let s = self.intl_format_number(handle, n);
+                    return Ok(Some(self.new_str(&s)));
+                }
+                "format" if kind == "datetime" => {
+                    // Format a Date (or epoch ms) as a locale date string.
+                    let ms = match arg(0).as_handle().map(Handle::from_raw) {
+                        Some(h) if self.realm.date_at(h).is_some() => {
+                            self.realm.date_at(h).unwrap()
+                        }
+                        _ => self.realm.to_number(arg(0)),
+                    };
+                    let day = (ms as i64).div_euclid(86_400_000);
+                    let (y, mo, d) = crate::realm::civil_from_days(day);
+                    return Ok(Some(self.new_str(&alloc::format!("{mo}/{d}/{y}"))));
+                }
+                _ => {}
+            }
         }
         // --- Date instance methods ---
         if let Some(ms) = self.realm.date_at(handle) {
@@ -10436,6 +10602,48 @@ mod tests {
             "true"
         );
         assert_eq!(run("JSON.stringify({a:1,b:'x'})"), "{\"a\":1,\"b\":\"x\"}");
+    }
+
+    #[test]
+    fn intl_number_and_datetime_format() {
+        assert_eq!(
+            run("new Intl.NumberFormat('en-US').format(1234.5)"),
+            "1,234.5"
+        );
+        assert_eq!(
+            run("new Intl.NumberFormat('en-US').format(1000000)"),
+            "1,000,000"
+        );
+        assert_eq!(
+            run("new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(1234.5)"),
+            "$1,234.50"
+        );
+        assert_eq!(
+            run("new Intl.NumberFormat('en-US',{style:'currency',currency:'JPY'}).format(1234)"),
+            "¥1,234"
+        );
+        assert_eq!(
+            run("new Intl.NumberFormat('en-US',{style:'percent'}).format(0.25)"),
+            "25%"
+        );
+        assert_eq!(
+            run("new Intl.NumberFormat('en-US',{minimumFractionDigits:2}).format(5)"),
+            "5.00"
+        );
+        assert_eq!(
+            run("new Intl.NumberFormat('en-US',{useGrouping:false}).format(1234567)"),
+            "1234567"
+        );
+        assert_eq!(
+            run("new Intl.NumberFormat('en-US').format(-1234.5)"),
+            "-1,234.5"
+        );
+        // Callable without `new`.
+        assert_eq!(run("Intl.NumberFormat('en-US').format(42)"), "42");
+        assert_eq!(
+            run("new Intl.DateTimeFormat('en-US').format(new Date(Date.UTC(2020,5,15)))"),
+            "6/15/2020"
+        );
     }
 
     #[test]
