@@ -2514,7 +2514,7 @@ impl<'a> Interp<'a> {
         let obj = self.realm.new_object();
         for (i, g) in caps.groups.iter().enumerate() {
             let v = match g {
-                Some((s, e)) => self.new_str(&text[*s..*e]),
+                Some((s, e)) => self.new_str(&char_substr(text, *s, *e)),
                 None => NanBox::undefined(),
             };
             self.realm.set_property(obj, &alloc::format!("{i}"), v);
@@ -2533,7 +2533,7 @@ impl<'a> Interp<'a> {
             let g = self.realm.new_object();
             for (idx, name) in group_names {
                 let v = match caps.groups.get(*idx).and_then(|x| *x) {
-                    Some((s, e)) => self.new_str(&text[s..e]),
+                    Some((s, e)) => self.new_str(&char_substr(text, s, e)),
                     None => NanBox::undefined(),
                 };
                 self.realm.set_property(g, name, v);
@@ -3610,7 +3610,7 @@ impl<'a> Interp<'a> {
                     let mut out = Vec::new();
                     let mut at = 0;
                     while let Some((st, en)) = re.find_from(&s, at) {
-                        out.push(self.new_str(&s[st..en]));
+                        out.push(self.new_str(&char_substr(&s, st, en)));
                         at = if en > st { en } else { en + 1 };
                     }
                     return Ok(Some(if out.is_empty() {
@@ -3672,12 +3672,14 @@ impl<'a> Interp<'a> {
                                 None => break,
                             }
                         }
-                        parts.push(self.new_str(&s[seg_start..st]));
+                        parts.push(self.new_str(&char_substr(&s, seg_start, st)));
                         // The separator's capture groups are spliced into the
                         // result (`"a1b".split(/(\d)/)` → `["a","1","b"]`).
                         for g in &caps.groups[1..] {
                             match g {
-                                Some((gs, ge)) => parts.push(self.new_str(&s[*gs..*ge])),
+                                Some((gs, ge)) => {
+                                    parts.push(self.new_str(&char_substr(&s, *gs, *ge)))
+                                }
                                 None => parts.push(NanBox::undefined()),
                             }
                         }
@@ -3685,7 +3687,7 @@ impl<'a> Interp<'a> {
                         search = if en > st { en } else { en + 1 };
                     }
                     if limit.is_none_or(|l| parts.len() < l) {
-                        parts.push(self.new_str(&s[seg_start..]));
+                        parts.push(self.new_str(&char_substr_from(&s, seg_start)));
                     }
                     if let Some(l) = limit {
                         parts.truncate(l);
@@ -3709,12 +3711,12 @@ impl<'a> Interp<'a> {
                     let mut at = 0;
                     while let Some(caps) = re.captures_from(&s, at) {
                         let (st, en) = caps.groups[0].unwrap_or((at, at));
-                        out.push_str(&s[at..st]);
+                        out.push_str(&char_substr(&s, at, st));
                         if is_fn {
-                            let mut call_args = alloc::vec![self.new_str(&s[st..en])];
+                            let mut call_args = alloc::vec![self.new_str(&char_substr(&s, st, en))];
                             for g in caps.groups.iter().skip(1) {
                                 call_args.push(match g {
-                                    Some((gs, ge)) => self.new_str(&s[*gs..*ge]),
+                                    Some((gs, ge)) => self.new_str(&char_substr(&s, *gs, *ge)),
                                     None => NanBox::undefined(),
                                 });
                             }
@@ -3727,7 +3729,7 @@ impl<'a> Interp<'a> {
                                 let go = self.realm.new_object();
                                 for (idx, name) in group_names {
                                     let v = match caps.groups.get(*idx).copied().flatten() {
-                                        Some((gs, ge)) => self.new_str(&s[gs..ge]),
+                                        Some((gs, ge)) => self.new_str(&char_substr(&s, gs, ge)),
                                         None => NanBox::undefined(),
                                     };
                                     self.realm.set_property(go, name, v);
@@ -3756,7 +3758,7 @@ impl<'a> Interp<'a> {
                             break;
                         }
                     }
-                    out.push_str(&s[at.min(s.len())..]);
+                    out.push_str(&char_substr_from(&s, at));
                     return Ok(Some(self.new_str(&out)));
                 }
             }
@@ -7466,6 +7468,18 @@ fn group_thousands(n: f64) -> String {
     out
 }
 
+/// Slices `s` by *character* (Unicode scalar) indices `[st, en)` — the index
+/// space the regex engine works in — so multi-byte characters never split a byte
+/// boundary (which would panic on `&s[st..en]`).
+fn char_substr(s: &str, st: usize, en: usize) -> String {
+    s.chars().skip(st).take(en.saturating_sub(st)).collect()
+}
+
+/// Slices `s` from character index `st` to the end.
+fn char_substr_from(s: &str, st: usize) -> String {
+    s.chars().skip(st).collect()
+}
+
 fn int_to_radix(n: f64, radix: u32) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let neg = n < 0.0;
@@ -9329,6 +9343,18 @@ mod tests {
         // Empty-regex split has no trailing empty; capture split keeps its trailing.
         assert_eq!(run("'abc'.split(/(?:)/).join(',')"), "a,b,c");
         assert_eq!(run("'a1'.split(/(\\d)/).length"), "3");
+    }
+
+    #[test]
+    fn regex_on_multibyte_strings() {
+        // These previously panicked (char-index spans used as byte ranges).
+        assert_eq!(run("'café'.match(/é/)[0]"), "é");
+        assert_eq!(run("'café'.match(/(.+)/)[1]"), "café");
+        assert_eq!(run("'café'.replace(/é/, 'e')"), "cafe");
+        assert_eq!(run("'a→b→c'.split(/→/).join('|')"), "a|b|c");
+        assert_eq!(run("'über 123'.match(/\\d+/)[0]"), "123");
+        assert_eq!(run("'café'.match(/(?<r>.+)/).groups.r"), "café");
+        assert_eq!(run("[...'café déjà'.matchAll(/é/g)].length"), "2");
     }
 
     #[test]

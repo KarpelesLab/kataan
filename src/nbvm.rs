@@ -1532,11 +1532,22 @@ fn call_closure(
 /// Builds a regex match result object `{ 0: whole, 1: g1, …, index, input,
 /// length }` (the shape `RegExp.exec` / `String.match` return).
 #[cfg(feature = "regex")]
+/// Slices `s` by *character* (scalar) indices `[st, en)` — the regex engine's
+/// index space — so a multi-byte character never splits a byte boundary.
+fn char_substr(s: &str, st: usize, en: usize) -> String {
+    s.chars().skip(st).take(en.saturating_sub(st)).collect()
+}
+
+/// Slices `s` from character index `st` to the end.
+fn char_substr_from(s: &str, st: usize) -> String {
+    s.chars().skip(st).collect()
+}
+
 fn regex_match_object(realm: &mut Realm, text: &str, caps: &crate::regex::Captures) -> NanBox {
     let obj = realm.new_object();
     for (i, g) in caps.groups.iter().enumerate() {
         let v = match g {
-            Some((s, e)) => NanBox::handle(realm.new_string(&text[*s..*e]).to_raw()),
+            Some((s, e)) => NanBox::handle(realm.new_string(&char_substr(text, *s, *e)).to_raw()),
             None => NanBox::undefined(),
         };
         realm.set_property(obj, &alloc::format!("{i}"), v);
@@ -1629,7 +1640,9 @@ fn regex_method(
             let mut out = Vec::new();
             let mut pos = 0;
             while let Some((s, e)) = re.find_from(&text, pos) {
-                out.push(NanBox::handle(ctx.realm.new_string(&text[s..e]).to_raw()));
+                out.push(NanBox::handle(
+                    ctx.realm.new_string(&char_substr(&text, s, e)).to_raw(),
+                ));
                 pos = if e > s { e } else { e + 1 };
             }
             if out.is_empty() {
@@ -1675,22 +1688,22 @@ fn regex_method(
                     break;
                 };
                 if en == seg_start {
-                    match text[search..].chars().next() {
-                        Some(c) => {
-                            search = search.max(st) + c.len_utf8();
-                            continue;
-                        }
-                        None => break,
+                    if text.chars().nth(search).is_some() {
+                        search = search.max(st) + 1;
+                        continue;
                     }
+                    break;
                 }
                 out.push(NanBox::handle(
-                    ctx.realm.new_string(&text[seg_start..st]).to_raw(),
+                    ctx.realm
+                        .new_string(&char_substr(&text, seg_start, st))
+                        .to_raw(),
                 ));
                 for g in &caps.groups[1..] {
                     out.push(match g {
-                        Some((gs, ge)) => {
-                            NanBox::handle(ctx.realm.new_string(&text[*gs..*ge]).to_raw())
-                        }
+                        Some((gs, ge)) => NanBox::handle(
+                            ctx.realm.new_string(&char_substr(&text, *gs, *ge)).to_raw(),
+                        ),
                         None => NanBox::undefined(),
                     });
                 }
@@ -1699,7 +1712,9 @@ fn regex_method(
             }
             if limit.is_none_or(|l| out.len() < l) {
                 out.push(NanBox::handle(
-                    ctx.realm.new_string(&text[seg_start..]).to_raw(),
+                    ctx.realm
+                        .new_string(&char_substr_from(&text, seg_start))
+                        .to_raw(),
                 ));
             }
             if let Some(l) = limit {
