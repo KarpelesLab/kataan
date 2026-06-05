@@ -5577,7 +5577,56 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+
+        // Default `Object.prototype` methods for an object receiver that did not
+        // match a more specific built-in and has no own/inherited method of its
+        // own (e.g. a plain object's `toString`/`valueOf`).
+        if let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && matches!(method, "toString" | "valueOf" | "toLocaleString")
+        {
+            // A user-defined (own or inherited) method takes precedence.
+            let own = self.read_member(h, method)?;
+            if own
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                return Ok(None);
+            }
+            // String values/objects: `toString`/`valueOf` yield the string.
+            if let Some(s) = self.realm.string_value(h) {
+                return Ok(Some(self.new_str(&s)));
+            }
+            if method == "valueOf" {
+                return Ok(Some(recv));
+            }
+            let tag = self.object_string_tag(h);
+            return Ok(Some(self.new_str(&alloc::format!("[object {tag}]"))));
+        }
         Ok(None)
+    }
+
+    /// The tag used by `Object.prototype.toString` (`"[object <tag>]"`): a
+    /// `Symbol.toStringTag` string property if present, else the built-in tag.
+    fn object_string_tag(&mut self, h: crate::heap::Handle) -> String {
+        let tag_sym = self.well_known_symbol("toStringTag");
+        let tag_key = self.member_key(tag_sym);
+        if let Some(v) = self.realm.get_property(h, &tag_key)
+            && let Some(sh) = v.as_handle().map(Handle::from_raw)
+            && let Some(s) = self.realm.string_value(sh)
+        {
+            return s;
+        }
+        if self.realm.is_array(h) {
+            String::from("Array")
+        } else if self.is_callable(h) || self.realm.class_at(h).is_some() {
+            String::from("Function")
+        } else if self.realm.date_at(h).is_some() {
+            String::from("Date")
+        } else if self.realm.regexp_at(h).is_some() {
+            String::from("RegExp")
+        } else {
+            String::from("Object")
+        }
     }
 
     /// Allocates a heap string and returns its boxed handle.
@@ -7330,14 +7379,36 @@ impl<'a> Interp<'a> {
         if self.realm.native_at(handle) == Some(N_SYMBOL)
             && matches!(
                 name,
-                "iterator" | "asyncIterator" | "hasInstance" | "toPrimitive"
+                "iterator"
+                    | "asyncIterator"
+                    | "hasInstance"
+                    | "toPrimitive"
+                    | "toStringTag"
+                    | "species"
+                    | "isConcatSpreadable"
+                    | "match"
+                    | "matchAll"
+                    | "replace"
+                    | "search"
+                    | "split"
+                    | "unscopables"
             )
         {
+            // The name is the well-known symbol's key.
             let key: &'static str = match name {
                 "iterator" => "iterator",
                 "asyncIterator" => "asyncIterator",
                 "hasInstance" => "hasInstance",
-                _ => "toPrimitive",
+                "toPrimitive" => "toPrimitive",
+                "toStringTag" => "toStringTag",
+                "species" => "species",
+                "isConcatSpreadable" => "isConcatSpreadable",
+                "match" => "match",
+                "matchAll" => "matchAll",
+                "replace" => "replace",
+                "search" => "search",
+                "split" => "split",
+                _ => "unscopables",
             };
             return Ok(self.well_known_symbol(key));
         }
@@ -9584,6 +9655,31 @@ mod tests {
         assert_eq!(run("new Date(Date.UTC(2024,0,15)).getUTCDate()"), "15");
         assert_eq!(run("new Date(Date.UTC(2024,0,1)).getUTCDay()"), "1"); // Monday
         assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn object_default_tostring_and_tag() {
+        assert_eq!(run("({}).toString()"), "[object Object]");
+        assert_eq!(run("'abc'.toString()"), "abc");
+        assert_eq!(run("({a:1}).valueOf().a"), "1");
+        assert_eq!(run("({toString(){return 'custom';}}).toString()"), "custom");
+        assert_eq!(
+            run("Object.create({toString(){return 'base';}}).toString()"),
+            "base"
+        );
+        assert_eq!(
+            run("({[Symbol.toStringTag]:'Widget'}).toString()"),
+            "[object Widget]"
+        );
+        assert_eq!(run("typeof Symbol.toStringTag"), "symbol");
+        assert_eq!(run("typeof Symbol.species"), "symbol");
+        assert_eq!(
+            run("let o={[Symbol.toStringTag]:'X'}; Object.getOwnPropertySymbols(o).length"),
+            "1"
+        );
+        // Existing toStrings unaffected.
+        assert_eq!(run("[1,2,3].toString()"), "1,2,3");
+        assert_eq!(run("new Error('x').toString()"), "Error: x");
     }
 
     #[test]
