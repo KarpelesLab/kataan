@@ -349,6 +349,17 @@ impl Realm {
         self.heap.get(handle)?.as_date()
     }
 
+    /// Sets a `Date`'s timestamp (for the `set*` mutators). Returns whether the
+    /// handle was a Date.
+    pub fn set_date_ms(&mut self, handle: Handle, ms: f64) -> bool {
+        if let Some(cell @ Cell::Date(_)) = self.heap.get_mut(handle) {
+            *cell = Cell::Date(ms);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Allocates a `RegExp` from its source and flags.
     pub fn new_regexp(&mut self, source: &str, flags: &str) -> Handle {
         self.heap.alloc(Cell::RegExp {
@@ -1453,8 +1464,46 @@ pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Renders a millisecond timestamp as an ISO-8601 UTC string.
+/// Parses an ISO-8601 date/time string (`YYYY-MM-DD`, optionally
+/// `THH:MM[:SS[.sss]]` and a trailing `Z`) into milliseconds since the epoch.
+/// Returns `None` for anything it cannot parse (the caller yields `NaN`).
 #[must_use]
+pub fn parse_iso_date(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (date, time) = match s.split_once('T') {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let mo: u32 = dp.next()?.parse().ok()?;
+    let d: u32 = dp.next()?.parse().ok()?;
+    if !(1..=12).contains(&mo) || dp.next().is_some() {
+        return None;
+    }
+    let mut ms: i64 = days_from_civil(y, mo, d) * 86_400_000;
+    if let Some(t) = time {
+        let t = t.trim_end_matches('Z');
+        let (hms, frac) = match t.split_once('.') {
+            Some((a, b)) => (a, Some(b)),
+            None => (t, None),
+        };
+        let mut tp = hms.split(':');
+        let h: i64 = tp.next()?.parse().ok()?;
+        let mi: i64 = tp.next().unwrap_or("0").parse().ok()?;
+        let sec: i64 = tp.next().unwrap_or("0").parse().ok()?;
+        ms += h * 3_600_000 + mi * 60_000 + sec * 1000;
+        if let Some(f) = frac {
+            let digits: alloc::string::String = f.chars().take(3).collect();
+            // Pad to exactly three digits (milliseconds).
+            let padded = alloc::format!("{digits:0<3}");
+            ms += padded.parse::<i64>().ok()?;
+        }
+    }
+    Some(ms as f64)
+}
+
+/// Renders a millisecond timestamp as an ISO-8601 UTC string.
 pub(crate) fn date_to_iso(ms: f64) -> alloc::string::String {
     let total_ms = ms as i64;
     let day = total_ms.div_euclid(86_400_000);

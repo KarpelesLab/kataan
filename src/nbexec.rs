@@ -2334,7 +2334,16 @@ impl<'a> Interp<'a> {
                     as f64
             } else {
                 match args.first() {
-                    Some(a) => self.realm.to_number(*a),
+                    // A string argument is parsed as an ISO date; otherwise ToNumber.
+                    Some(a) => {
+                        if let Some(h) = a.as_handle().map(Handle::from_raw)
+                            && let Some(s) = self.realm.string_value(h)
+                        {
+                            crate::realm::parse_iso_date(&s).unwrap_or(f64::NAN)
+                        } else {
+                            self.realm.to_number(*a)
+                        }
+                    }
                     None => now_ms(),
                 }
             };
@@ -3042,6 +3051,13 @@ impl<'a> Interp<'a> {
         if self.realm.native_at(handle) == Some(N_DATE) && method == "now" {
             return Ok(Some(NanBox::number(now_ms())));
         }
+        // `Date.parse(str)` → epoch ms (or NaN) by ISO parsing.
+        if self.realm.native_at(handle) == Some(N_DATE) && method == "parse" {
+            let s = self.realm.to_display_string(arg(0));
+            return Ok(Some(NanBox::number(
+                crate::realm::parse_iso_date(&s).unwrap_or(f64::NAN),
+            )));
+        }
         // --- `Date.UTC(year, month, day?, h?, m?, s?, ms?)` → epoch ms ---
         if self.realm.native_at(handle) == Some(N_DATE) && method == "UTC" {
             let num = |i: usize, dflt: f64| args.get(i).map_or(dflt, |a| self.realm.to_number(*a));
@@ -3215,7 +3231,46 @@ impl<'a> Interp<'a> {
                 "getMinutes" | "getUTCMinutes" => NanBox::number((tod / 60_000 % 60) as f64),
                 "getSeconds" | "getUTCSeconds" => NanBox::number((tod / 1000 % 60) as f64),
                 "getMilliseconds" | "getUTCMilliseconds" => NanBox::number((tod % 1000) as f64),
+                // The engine models all dates in UTC, so the local offset is 0.
+                "getTimezoneOffset" => NanBox::number(0.0),
                 "toISOString" | "toJSON" => self.new_str(&crate::realm::date_to_iso(ms)),
+                // --- `set*` mutators (all UTC; a setter returns the new time) ---
+                "setTime" => {
+                    let nms = self.realm.to_number(arg(0));
+                    self.realm.set_date_ms(handle, nms);
+                    NanBox::number(nms)
+                }
+                "setFullYear" | "setUTCFullYear" | "setMonth" | "setUTCMonth" | "setDate"
+                | "setUTCDate" | "setHours" | "setUTCHours" | "setMinutes" | "setUTCMinutes"
+                | "setSeconds" | "setUTCSeconds" | "setMilliseconds" | "setUTCMilliseconds" => {
+                    // Decompose the current time, replace one field, recompose.
+                    let (mut yy, mut mo0, mut dd) = (y, (mo as i64) - 1, d as i64);
+                    let mut hh = tod / 3_600_000;
+                    let mut mi = tod / 60_000 % 60;
+                    let mut ss = tod / 1000 % 60;
+                    let mut mss = tod % 1000;
+                    let n = self.realm.to_number(arg(0)) as i64;
+                    match method {
+                        "setFullYear" | "setUTCFullYear" => yy = n,
+                        "setMonth" | "setUTCMonth" => mo0 = n,
+                        "setDate" | "setUTCDate" => dd = n,
+                        "setHours" | "setUTCHours" => hh = n,
+                        "setMinutes" | "setUTCMinutes" => mi = n,
+                        "setSeconds" | "setUTCSeconds" => ss = n,
+                        _ => mss = n, // setMilliseconds
+                    }
+                    // Normalize a possibly out-of-range month into the year, then
+                    // measure the day as an offset from the 1st (so out-of-range
+                    // day/hour/… values roll over via plain integer arithmetic).
+                    let yy2 = yy + mo0.div_euclid(12);
+                    let mo1 = (mo0.rem_euclid(12) + 1) as u32;
+                    let base_days = crate::realm::days_from_civil(yy2, mo1, 1) + (dd - 1);
+                    let nms =
+                        (base_days * 86_400_000 + hh * 3_600_000 + mi * 60_000 + ss * 1000 + mss)
+                            as f64;
+                    self.realm.set_date_ms(handle, nms);
+                    NanBox::number(nms)
+                }
                 _ => return Ok(None),
             }));
         }
@@ -9414,6 +9469,32 @@ mod tests {
             ),
             "AC"
         );
+    }
+
+    #[test]
+    fn date_setters_and_parse() {
+        assert_eq!(
+            run("let d=new Date(0); d.setUTCFullYear(2000); d.getUTCFullYear()"),
+            "2000"
+        );
+        assert_eq!(
+            run("let d=new Date(0); d.setUTCMonth(5); d.getUTCMonth()"),
+            "5"
+        );
+        assert_eq!(
+            run("let d=new Date(0); d.setTime(86400000); d.getUTCDate()"),
+            "2"
+        );
+        assert_eq!(run("Date.parse('1970-01-01T00:00:00.000Z')"), "0");
+        assert_eq!(
+            run("Date.parse('2000-01-01T00:00:00.000Z') === Date.UTC(2000,0,1)"),
+            "true"
+        );
+        assert_eq!(
+            run("new Date('2000-01-01T12:00:00.000Z').getUTCHours()"),
+            "12"
+        );
+        assert_eq!(run("Number.isNaN(Date.parse('garbage'))"), "true");
     }
 
     #[test]
