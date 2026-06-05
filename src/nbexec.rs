@@ -2240,6 +2240,19 @@ impl<'a> Interp<'a> {
             }
             return self.construct(NanBox::handle(target.to_raw()), args);
         }
+        // `new boundFn(...)`: construct the bound target with the bound arguments
+        // prepended (the bound `this` is ignored when constructing).
+        if let Some(target) = self.realm.get_property(handle, BOUND_TARGET) {
+            let mut all = Vec::new();
+            if let Some(ba) = self.realm.get_property(handle, BOUND_ARGS)
+                && let Some(bh) = ba.as_handle().map(Handle::from_raw)
+                && let Some(elems) = self.realm.array_elements(bh)
+            {
+                all.extend_from_slice(elems);
+            }
+            all.extend_from_slice(args);
+            return self.construct(target, &all);
+        }
         // `new UserClass(...)`.
         if let Some((class_id, env)) = self.realm.class_at(handle) {
             return self.instantiate(class_id, &env, args);
@@ -8544,6 +8557,31 @@ mod tests {
         );
         assert_eq!(run("(-1n & 255n).toString()"), "255");
         assert_eq!(run("(((2n ** 100n) | 1n) - (2n ** 100n)).toString()"), "1");
+    }
+
+    #[test]
+    fn new_on_bound_function() {
+        assert_eq!(
+            run(
+                "function P(x,y){this.x=x;this.y=y;} let B=P.bind(null); let p=new B(3,4); p.x + ':' + p.y"
+            ),
+            "3:4"
+        );
+        assert_eq!(
+            run("function P(x,y){this.x=x;this.y=y;} let B=P.bind(null,10); new B(20).x"),
+            "10"
+        );
+        assert_eq!(
+            run("function P(x){this.x=x;} let B=P.bind(null); (new B(1)) instanceof P"),
+            "true"
+        );
+        // Re-bound: bound args accumulate.
+        assert_eq!(
+            run(
+                "function P(x,y){this.x=x;this.y=y;} let B=P.bind(null,5).bind(null,6); let p=new B(); p.x + ':' + p.y"
+            ),
+            "5:6"
+        );
     }
 
     #[test]
