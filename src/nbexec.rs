@@ -4172,10 +4172,29 @@ impl<'a> Interp<'a> {
         self.realm.to_display_string(k)
     }
 
-    /// ToPrimitive for a plain object (default hint): try a callable `valueOf`,
-    /// then `toString`, accepting the first that returns a non-object. Non-object
-    /// values (and strings/arrays) pass through unchanged.
-    fn coerce_primitive(&mut self, v: NanBox) -> Result<NanBox, ExecError> {
+    /// Invokes a plain object's `[Symbol.toPrimitive](hint)` method, if it has a
+    /// callable one. Returns `None` to fall back to `valueOf`/`toString`.
+    fn symbol_to_primitive(&mut self, v: NanBox, hint: &str) -> Result<Option<NanBox>, ExecError> {
+        let Some(raw) = v.as_handle() else {
+            return Ok(None);
+        };
+        let h = Handle::from_raw(raw);
+        let sym = self.well_known_symbol("toPrimitive");
+        let key = self.member_key(sym);
+        if let Some(f) = self.realm.get_property(h, &key)
+            && f.as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            let hint_box = self.new_str(hint);
+            return Ok(Some(self.call_with_this(f, v, &[hint_box])?));
+        }
+        Ok(None)
+    }
+
+    /// ToPrimitive for a plain object with the given hint: `[Symbol.toPrimitive]`
+    /// first, then `valueOf`/`toString` (order depends on the hint), accepting
+    /// the first non-object result. Non-objects (and strings/arrays) pass through.
+    fn coerce_primitive(&mut self, v: NanBox, hint: &str) -> Result<NanBox, ExecError> {
         let Some(raw) = v.as_handle() else {
             return Ok(v);
         };
@@ -4187,6 +4206,9 @@ impl<'a> Interp<'a> {
         {
             return Ok(v);
         }
+        if let Some(r) = self.symbol_to_primitive(v, hint)? {
+            return Ok(r);
+        }
         let is_object = |this: &Self, r: NanBox| {
             r.as_handle().is_some_and(|rr| {
                 let rh = Handle::from_raw(rr);
@@ -4194,7 +4216,13 @@ impl<'a> Interp<'a> {
                     && (this.realm.object_keys(rh).is_some() || this.realm.is_array(rh))
             })
         };
-        for method in ["valueOf", "toString"] {
+        // String hint tries `toString` first; number/default try `valueOf` first.
+        let order = if hint == "string" {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for method in order {
             let m = self.read_member(h, method)?;
             if m.as_handle()
                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
@@ -4208,8 +4236,8 @@ impl<'a> Interp<'a> {
         Ok(v)
     }
 
-    /// Coerces `v` to a string, invoking a plain object's own/inherited
-    /// `toString` method when it has a callable one (else the default form).
+    /// Coerces `v` to a string, invoking `[Symbol.toPrimitive]("string")` or a
+    /// callable `toString` when present (else the default form).
     fn coerce_to_string(&mut self, v: NanBox) -> Result<String, ExecError> {
         if let Some(raw) = v.as_handle() {
             let h = Handle::from_raw(raw);
@@ -4217,13 +4245,9 @@ impl<'a> Interp<'a> {
                 && !self.realm.is_array(h)
                 && self.realm.object_keys(h).is_some()
             {
-                let ts = self.read_member(h, "toString")?;
-                if ts
-                    .as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                {
-                    let r = self.call_with_this(ts, v, &[])?;
-                    return Ok(self.realm.to_display_string(r));
+                let p = self.coerce_primitive(v, "string")?;
+                if p.as_handle() != v.as_handle() {
+                    return Ok(self.realm.to_display_string(p));
                 }
             }
         }
@@ -5048,8 +5072,14 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(match op {
-            UnaryOp::Plus => NanBox::number(self.realm.to_number(v)),
-            UnaryOp::Minus => self.realm.neg(v),
+            UnaryOp::Plus => {
+                let p = self.coerce_primitive(v, "number")?;
+                NanBox::number(self.realm.to_number(p))
+            }
+            UnaryOp::Minus => {
+                let p = self.coerce_primitive(v, "number")?;
+                self.realm.neg(p)
+            }
             UnaryOp::Not => self.realm.logical_not(v),
             UnaryOp::Typeof => {
                 let t = self.realm.type_of_value(v);
@@ -5199,8 +5229,17 @@ impl<'a> Interp<'a> {
                 | BinaryOp::BitOr
                 | BinaryOp::BitXor
         );
+        // `+` uses the "default" hint; the other numeric operators use "number".
+        let hint = if matches!(op, BinaryOp::Add) {
+            "default"
+        } else {
+            "number"
+        };
         let (a, b) = if coerces && (a.as_handle().is_some() || b.as_handle().is_some()) {
-            (self.coerce_primitive(a)?, self.coerce_primitive(b)?)
+            (
+                self.coerce_primitive(a, hint)?,
+                self.coerce_primitive(b, hint)?,
+            )
         } else {
             (a, b)
         };
@@ -6793,6 +6832,20 @@ mod tests {
         assert_eq!(
             run("({ name:'X', message:'y', toString(){ return 'custom'; } }).toString()"),
             "custom"
+        );
+    }
+
+    #[test]
+    fn symbol_to_primitive_hints() {
+        let o =
+            "let o={[Symbol.toPrimitive](h){ return h==='number'?42:h==='string'?'str':'def'; }};";
+        assert_eq!(run(&alloc::format!("{o} +o")), "42");
+        assert_eq!(run(&alloc::format!("{o} `${{o}}`")), "str");
+        assert_eq!(run(&alloc::format!("{o} o + ''")), "def");
+        // Symbol.toPrimitive takes precedence over valueOf/toString.
+        assert_eq!(
+            run("let o={[Symbol.toPrimitive](){ return 9; }, valueOf(){ return 1; }}; o + 0"),
+            "9"
         );
     }
 
