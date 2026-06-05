@@ -9999,6 +9999,28 @@ mod tests {
     }
 
     #[test]
+    fn object_literal_async_methods_parse() {
+        // `async`/`get`/`set` remain usable as property names.
+        assert_eq!(
+            run("let async=5; let o={async, get:6, set:7}; o.async + ':' + o.get + ':' + o.set"),
+            "5:6:7"
+        );
+        // An async method is a function whose call yields a promise (object).
+        assert_eq!(
+            run("let o={ async f(){return 1;} }; typeof o.f"),
+            "function"
+        );
+        assert_eq!(
+            run("let o={ async f(){return 1;} }; typeof o.f()"),
+            "object"
+        );
+        assert_eq!(
+            run("let k='m'; let o={ async [k](){return 1;} }; typeof o.m"),
+            "function"
+        );
+    }
+
+    #[test]
     fn object_literal_generator_methods() {
         assert_eq!(
             run("let o={ *g(){yield 1;yield 2;} }; [...o.g()].join(',')"),

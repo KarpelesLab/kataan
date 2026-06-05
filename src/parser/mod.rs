@@ -839,6 +839,26 @@ impl<'src> Parser<'src> {
             });
         }
 
+        // `async method() { … }` / `async *gen() { … }` / `async [expr]() { … }`
+        // (when `async` is not itself the property name).
+        if self.at(TokenKind::Keyword(Kw::Async))
+            && !self.nth_newline(1)
+            && !self.modifier_is_name(1)
+            // In an object literal, `,`/`:` after `async` mean it is the key.
+            && !matches!(self.nth_kind(1), TokenKind::Comma | TokenKind::Colon)
+        {
+            self.bump(); // `async`
+            let is_gen = self.eat(TokenKind::Star);
+            let key = self.parse_class_key()?;
+            let func = self.parse_method_tail(true, is_gen)?;
+            return Ok(ObjectMember::Property {
+                key,
+                value: Box::new(Expr::Function(func)),
+                shorthand: false,
+                span: start.to(self.prev_span()),
+            });
+        }
+
         // `*key() { … }` / `*[expr]() { … }` — a generator method.
         if self.at(TokenKind::Star) {
             self.bump();

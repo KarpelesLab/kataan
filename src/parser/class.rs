@@ -208,7 +208,7 @@ impl<'src> Parser<'src> {
     /// Whether the token `n` ahead means the preceding contextual keyword is a
     /// member *name* rather than a modifier (i.e. it is directly followed by a
     /// method `(`, a field `=`, or a member terminator).
-    fn modifier_is_name(&self, n: usize) -> bool {
+    pub(super) fn modifier_is_name(&self, n: usize) -> bool {
         matches!(
             self.nth_kind(n),
             TokenKind::LParen | TokenKind::Eq | TokenKind::Semicolon | TokenKind::RBrace
