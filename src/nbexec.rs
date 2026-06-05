@@ -3034,6 +3034,20 @@ impl<'a> Interp<'a> {
                     self.settle(p, arg(0), false);
                     return Ok(Some(NanBox::handle(p.to_raw())));
                 }
+                // `Promise.withResolvers()` → `{ promise, resolve, reject }`.
+                "withResolvers" => {
+                    let p = self.realm.new_promise();
+                    let resolve = self.realm.new_bound_native(N_RESOLVE, p);
+                    let reject = self.realm.new_bound_native(N_REJECT, p);
+                    let obj = self.realm.new_object();
+                    self.realm
+                        .set_property(obj, "promise", NanBox::handle(p.to_raw()));
+                    self.realm
+                        .set_property(obj, "resolve", NanBox::handle(resolve.to_raw()));
+                    self.realm
+                        .set_property(obj, "reject", NanBox::handle(reject.to_raw()));
+                    return Ok(Some(NanBox::handle(obj.to_raw())));
+                }
                 // `Promise.all(iterable)`: resolve with the array of awaited
                 // values, or reject with the first rejection (eager model).
                 "all" => {
