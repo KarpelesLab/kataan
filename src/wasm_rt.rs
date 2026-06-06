@@ -597,10 +597,18 @@ impl Module {
                 0xaa | 0xab => (&[F64], Some(I32)),      // i32.trunc_f64
                 0xac | 0xad => (&[I32], Some(I64)),      // i64.extend_i32
                 0xb0 | 0xb1 => (&[F64], Some(I64)),      // i64.trunc_f64
+                0xa8 | 0xa9 => (&[F32], Some(I32)),      // i32.trunc_f32
+                0xae | 0xaf => (&[F32], Some(I64)),      // i64.trunc_f32
+                0xb2 | 0xb3 => (&[I32], Some(F32)),      // f32.convert_i32
+                0xb4 | 0xb5 => (&[I64], Some(F32)),      // f32.convert_i64
                 0xb6 => (&[F64], Some(F32)),             // f32.demote_f64
                 0xb7 | 0xb8 => (&[I32], Some(F64)),      // f64.convert_i32
                 0xb9 => (&[I64], Some(F64)),             // f64.convert_i64
                 0xbb => (&[F32], Some(F64)),             // f64.promote_f32
+                0xbc => (&[F32], Some(I32)),             // i32.reinterpret_f32
+                0xbd => (&[F64], Some(I64)),             // i64.reinterpret_f64
+                0xbe => (&[I32], Some(F32)),             // f32.reinterpret_i32
+                0xbf => (&[I64], Some(F64)),             // f64.reinterpret_i64
                 _ => return None,
             })
         };
@@ -1761,6 +1769,55 @@ impl Module {
                 0xb6 => {
                     let a = pop!().as_f64()?;
                     stack.push(Val::F32(a as f32)); // f32.demote_f64
+                }
+                // f32 conversions from integers.
+                0xb2 => {
+                    let a = pop!().as_i32()?;
+                    stack.push(Val::F32(a as f32)); // f32.convert_i32_s
+                }
+                0xb3 => {
+                    let a = pop!().as_i32()? as u32;
+                    stack.push(Val::F32(a as f32)); // f32.convert_i32_u
+                }
+                0xb4 => {
+                    let a = pop!().as_i64()?;
+                    stack.push(Val::F32(a as f32)); // f32.convert_i64_s
+                }
+                0xb5 => {
+                    let a = pop!().as_i64()? as u64;
+                    stack.push(Val::F32(a as f32)); // f32.convert_i64_u
+                }
+                // Integer truncations from f32 (trap on NaN/∞).
+                0xa8 | 0xa9 => {
+                    let a = pop!().as_f32()?;
+                    if a.is_nan() || a.is_infinite() {
+                        return Err(WasmRtError("invalid conversion to integer"));
+                    }
+                    stack.push(Val::I32(a as i32)); // i32.trunc_f32_s / _u
+                }
+                0xae | 0xaf => {
+                    let a = pop!().as_f32()?;
+                    if a.is_nan() || a.is_infinite() {
+                        return Err(WasmRtError("invalid conversion to integer"));
+                    }
+                    stack.push(Val::I64(a as i64)); // i64.trunc_f32_s / _u
+                }
+                // Bit-level reinterpretations (no value change, only the type).
+                0xbc => {
+                    let a = pop!().as_f32()?;
+                    stack.push(Val::I32(a.to_bits() as i32)); // i32.reinterpret_f32
+                }
+                0xbd => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::I64(a.to_bits() as i64)); // i64.reinterpret_f64
+                }
+                0xbe => {
+                    let a = pop!().as_i32()?;
+                    stack.push(Val::F32(f32::from_bits(a as u32))); // f32.reinterpret_i32
+                }
+                0xbf => {
+                    let a = pop!().as_i64()?;
+                    stack.push(Val::F64(f64::from_bits(a as u64))); // f64.reinterpret_i64
                 }
                 // select: pop cond, then b, then a; push `cond ? a : b`.
                 0x1b => {
@@ -3329,6 +3386,42 @@ mod tests {
         assert_eq!(
             module.call(0, &[Val::I64(12345)]).unwrap(),
             vec![Val::I64(12345)]
+        );
+    }
+
+    #[test]
+    fn reinterpret_and_f32_conversions() {
+        // (func (export "bits") (param f64) (result i64) local.get 0 i64.reinterpret_f64)
+        let body: Vec<u8> = vec![0x00, 0x20, 0x00, 0xbd, 0x0b];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7c, 0x01, 0x7e]); // (f64)->i64
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x07, 0x08, 0x01, 0x04, b'b', b'i', b't', b's', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).expect("decode reinterpret module");
+        // The bit pattern of 1.0_f64 is 0x3FF0000000000000.
+        let r = module.call(0, &[Val::F64(1.0)]).unwrap();
+        assert_eq!(r, vec![Val::I64(0x3FF0_0000_0000_0000)]);
+
+        // (func (export "cf") (param i32) (result f32) local.get 0 f32.convert_i32_s)
+        let body2: Vec<u8> = vec![0x00, 0x20, 0x00, 0xb2, 0x0b];
+        let mut m2 = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m2.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7d]); // (i32)->f32
+        m2.extend([0x03, 0x02, 0x01, 0x00]);
+        m2.extend([0x07, 0x06, 0x01, 0x02, b'c', b'f', 0x00, 0x00]);
+        m2.push(0x0a);
+        m2.push((body2.len() + 2) as u8);
+        m2.push(0x01);
+        m2.push(body2.len() as u8);
+        m2.extend(body2);
+        let module2 = Module::decode(&m2).expect("decode convert module");
+        assert_eq!(
+            module2.call(0, &[Val::I32(-42)]).unwrap(),
+            vec![Val::F32(-42.0)]
         );
     }
 
