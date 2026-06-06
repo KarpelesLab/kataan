@@ -31,6 +31,15 @@ pub enum Val {
 }
 
 impl Val {
+    /// The value type of this runtime value.
+    fn val_type(self) -> ValType {
+        match self {
+            Val::I32(_) => ValType::I32,
+            Val::I64(_) => ValType::I64,
+            Val::F32(_) => ValType::F32,
+            Val::F64(_) => ValType::F64,
+        }
+    }
     fn as_i32(self) -> Result<i32, WasmRtError> {
         match self {
             Val::I32(v) => Ok(v),
@@ -419,6 +428,195 @@ impl Module {
                 .ok_or(WasmRtError("function has no type"))?;
             let n_locals = ty.params.len() + body.locals.len();
             self.validate_body(&body.code, n_locals, n_globals, n_funcs)?;
+            self.validate_types(ty, body)?;
+        }
+        Ok(())
+    }
+
+    /// The value type of global `idx` (imported globals first, then defined).
+    fn global_type(&self, idx: u32) -> Option<ValType> {
+        let i = idx as usize;
+        if i < self.global_imports.len() {
+            Some(self.global_imports[i].2)
+        } else {
+            self.globals
+                .get(i - self.global_imports.len())
+                .map(|(v, _)| v.val_type())
+        }
+    }
+
+    /// Operand-stack **type** validation for a *straight-line* function body: it
+    /// simulates the operand stack's value types through the numeric, local,
+    /// global, memory, const, drop/select, and call instructions, rejecting a type
+    /// mismatch, a stack underflow, or a wrong final result type. Bodies that use
+    /// structured control flow (block/loop/if/br/…) or any instruction not modeled
+    /// here are validated conservatively (accepted) — so this never rejects a valid
+    /// module, only ill-typed straight-line ones.
+    fn validate_types(&self, ty: &FuncType, body: &FuncBody) -> Result<(), WasmRtError> {
+        use ValType::{F32, F64, I32, I64};
+        let mut locals: Vec<ValType> = ty.params.clone();
+        locals.extend_from_slice(&body.locals);
+        let mut stack: Vec<ValType> = Vec::new();
+        // Pop the top operand, requiring it to be `t`.
+        fn need(stack: &mut Vec<ValType>, t: ValType) -> Result<(), WasmRtError> {
+            match stack.pop() {
+                Some(g) if g == t => Ok(()),
+                Some(_) => Err(WasmRtError("operand type mismatch")),
+                None => Err(WasmRtError("operand stack underflow")),
+            }
+        }
+        // (pops top-to-bottom, push) for a fixed-signature instruction.
+        type Effect = (&'static [ValType], Option<ValType>);
+        let simple: fn(u8) -> Option<Effect> = |op| {
+            Some(match op {
+                0x45 => (&[I32], Some(I32)),             // i32.eqz
+                0x46..=0x4f => (&[I32, I32], Some(I32)), // i32 compares
+                0x67..=0x69 => (&[I32], Some(I32)),      // clz/ctz/popcnt
+                0x6a..=0x78 => (&[I32, I32], Some(I32)), // i32 binary
+                0x50 => (&[I64], Some(I32)),             // i64.eqz
+                0x51..=0x5a => (&[I64, I64], Some(I32)), // i64 compares
+                0x79..=0x7b => (&[I64], Some(I64)),      // i64 clz/ctz/popcnt
+                0x7c..=0x8a => (&[I64, I64], Some(I64)), // i64 binary
+                0x61..=0x66 => (&[F64, F64], Some(I32)), // f64 compares
+                0x99..=0x9f => (&[F64], Some(F64)),      // f64 unary
+                0xa0..=0xa5 => (&[F64, F64], Some(F64)), // f64 binary
+                0xa7 => (&[I64], Some(I32)),             // i32.wrap_i64
+                0xaa | 0xab => (&[F64], Some(I32)),      // i32.trunc_f64
+                0xac | 0xad => (&[I32], Some(I64)),      // i64.extend_i32
+                0xb0 | 0xb1 => (&[F64], Some(I64)),      // i64.trunc_f64
+                0xb6 => (&[F64], Some(F32)),             // f32.demote_f64
+                0xb7 | 0xb8 => (&[I32], Some(F64)),      // f64.convert_i32
+                0xb9 => (&[I64], Some(F64)),             // f64.convert_i64
+                0xbb => (&[F32], Some(F64)),             // f64.promote_f32
+                _ => return None,
+            })
+        };
+        let mut r = Reader::new(&body.code);
+        while !r.done() {
+            let op = r.byte()?;
+            match op {
+                // Control flow / unmodeled-here: validate conservatively.
+                0x00 | 0x02..=0x05 | 0x0c..=0x0f | 0x11 => return Ok(()),
+                0x0b => {
+                    // Final `end`: the stack must be exactly the result types.
+                    if stack != ty.results {
+                        return Err(WasmRtError("function result type mismatch"));
+                    }
+                    return Ok(());
+                }
+                0x01 => {} // nop
+                0x1a => {
+                    stack.pop().ok_or(WasmRtError("drop on empty stack"))?;
+                }
+                0x1b => {
+                    need(&mut stack, I32)?; // select condition
+                    let a = stack.pop().ok_or(WasmRtError("select underflow"))?;
+                    let b = stack.pop().ok_or(WasmRtError("select underflow"))?;
+                    if a != b {
+                        return Err(WasmRtError("select arms differ in type"));
+                    }
+                    stack.push(a);
+                }
+                0x20 => {
+                    let i = r.u32()? as usize;
+                    stack.push(*locals.get(i).ok_or(WasmRtError("bad local"))?);
+                }
+                0x21 => {
+                    let i = r.u32()? as usize;
+                    need(&mut stack, *locals.get(i).ok_or(WasmRtError("bad local"))?)?;
+                }
+                0x22 => {
+                    let i = r.u32()? as usize;
+                    let t = *locals.get(i).ok_or(WasmRtError("bad local"))?;
+                    need(&mut stack, t)?;
+                    stack.push(t);
+                }
+                0x23 => {
+                    let t = self
+                        .global_type(r.u32()?)
+                        .ok_or(WasmRtError("bad global"))?;
+                    stack.push(t);
+                }
+                0x24 => {
+                    let t = self
+                        .global_type(r.u32()?)
+                        .ok_or(WasmRtError("bad global"))?;
+                    need(&mut stack, t)?;
+                }
+                0x41 => {
+                    r.i32()?;
+                    stack.push(I32);
+                }
+                0x42 => {
+                    r.i64()?;
+                    stack.push(I64);
+                }
+                0x43 => {
+                    r.bytes(4)?;
+                    stack.push(F32);
+                }
+                0x44 => {
+                    r.bytes(8)?;
+                    stack.push(F64);
+                }
+                0x10 => {
+                    let cty = self
+                        .func_type(r.u32()?)
+                        .ok_or(WasmRtError("bad call target"))?
+                        .clone();
+                    for p in cty.params.iter().rev() {
+                        need(&mut stack, *p)?;
+                    }
+                    stack.extend(cty.results.iter().copied());
+                }
+                // Memory loads: pop the i32 address, push the loaded type.
+                0x28..=0x35 => {
+                    r.u32()?;
+                    r.u32()?;
+                    need(&mut stack, I32)?;
+                    let t = match op {
+                        0x29 | 0x30..=0x35 => I64,
+                        0x2a => F32,
+                        0x2b => F64,
+                        _ => I32,
+                    };
+                    stack.push(t);
+                }
+                // Memory stores: pop the value then the i32 address.
+                0x36..=0x3e => {
+                    r.u32()?;
+                    r.u32()?;
+                    let vt = match op {
+                        0x37 | 0x3c..=0x3e => I64,
+                        0x38 => F32,
+                        0x39 => F64,
+                        _ => I32,
+                    };
+                    need(&mut stack, vt)?;
+                    need(&mut stack, I32)?;
+                }
+                0x3f => {
+                    r.byte()?;
+                    stack.push(I32); // memory.size
+                }
+                0x40 => {
+                    r.byte()?;
+                    need(&mut stack, I32)?;
+                    stack.push(I32); // memory.grow
+                }
+                _ => {
+                    if let Some((pops, push)) = simple(op) {
+                        for t in pops {
+                            need(&mut stack, *t)?;
+                        }
+                        if let Some(t) = push {
+                            stack.push(t);
+                        }
+                    } else {
+                        return Ok(()); // unmodeled opcode: accept conservatively
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2712,6 +2910,44 @@ mod tests {
         let module2 = Module::decode(&m2).expect("decode if-no-else module");
         assert_eq!(module2.call(0, &[Val::I32(0)]).unwrap(), vec![Val::I32(0)]); // cond false
         assert_eq!(module2.call(0, &[Val::I32(9)]).unwrap(), vec![Val::I32(1)]); // cond true
+    }
+
+    #[test]
+    fn type_validation_rejects_ill_typed_bodies() {
+        // Helper: a (i32)->i32 function with the given body bytes (no trailing end).
+        let module = |tail: &[u8]| -> Vec<u8> {
+            let mut body = vec![0x00]; // 0 locals
+            body.extend_from_slice(tail);
+            body.push(0x0b);
+            let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+            m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]); // (i32)->i32
+            m.extend([0x03, 0x02, 0x01, 0x00]);
+            m.extend([0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00]);
+            m.push(0x0a);
+            m.push((body.len() + 2) as u8);
+            m.push(0x01);
+            m.push(body.len() as u8);
+            m.extend(body);
+            m
+        };
+        // Well-typed: local.get 0; i32.const 1; i32.add  → i32.
+        assert!(Module::decode(&module(&[0x20, 0x00, 0x41, 0x01, 0x6a])).is_ok());
+        // Type mismatch: i64.const 1; i32.add (i32.add wants i32 operands).
+        assert!(
+            Module::decode(&module(&[0x20, 0x00, 0x42, 0x01, 0x6a])).is_err(),
+            "i32.add on an i64 operand must be rejected"
+        );
+        // Wrong result type: the body leaves an f64 but the function returns i32.
+        // (local.get 0; f64.convert_i32_s)
+        assert!(
+            Module::decode(&module(&[0x20, 0x00, 0xb7])).is_err(),
+            "returning f64 from an i32 function must be rejected"
+        );
+        // Stack underflow: i32.add with only one operand.
+        assert!(
+            Module::decode(&module(&[0x20, 0x00, 0x6a])).is_err(),
+            "i32.add with one operand must be rejected"
+        );
     }
 
     #[test]
