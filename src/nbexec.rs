@@ -264,6 +264,9 @@ const N_WASM_INSTANTIATE: u16 = 185;
 // A WASM export wrapper (a bound native whose target carries the module bytes +
 // the export name).
 const N_WASM_CALL: u16 = 186;
+/// The `Function` global — supports `typeof`/`instanceof` (any callable); the
+/// dynamic `Function(...)` constructor (runtime code compilation) is unsupported.
+const N_FUNCTION: u16 = 187;
 // Hidden slots on a WASM export wrapper's data object.
 const WASM_BYTES: &str = "\u{0}wbytes";
 const WASM_EXPORT: &str = "\u{0}wexport";
@@ -603,6 +606,7 @@ impl<'a> Interp<'a> {
             ("Set", N_SET),
             ("Symbol", N_SYMBOL),
             ("BigInt", N_BIGINT),
+            ("Function", N_FUNCTION),
             ("Proxy", N_PROXY),
             ("WeakMap", N_WEAKMAP),
             ("WeakSet", N_WEAKSET),
@@ -838,6 +842,12 @@ impl<'a> Interp<'a> {
                     crate::bignum::BigInt::from_i128(num as i128)
                 };
                 NanBox::handle(self.realm.new_bigint(n).to_raw())
+            }
+            N_FUNCTION => {
+                // The dynamic `Function(...)` / `new Function(...)` constructor
+                // compiles a string of source at runtime — unsupported here.
+                let m = self.new_str("Function constructor (dynamic code) is not supported");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
             N_PARSE_INT => {
                 let s = self.realm.to_display_string(arg(0));
@@ -9015,6 +9025,9 @@ impl<'a> Interp<'a> {
                 N_MAP | N_SET | N_WEAKMAP | N_WEAKSET => self.realm.collection_is_set(oh).is_some(),
                 N_DATE => self.realm.date_at(oh).is_some(),
                 N_PROMISE => self.realm.promise_state(oh).is_some(),
+                // Every callable (function, native, bound) and every class is a
+                // `Function`.
+                N_FUNCTION => self.is_callable(oh) || self.realm.class_at(oh).is_some(),
                 _ => false,
             });
         }
