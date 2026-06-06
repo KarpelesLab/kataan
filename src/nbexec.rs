@@ -4463,6 +4463,10 @@ impl<'a> Interp<'a> {
                 // Human-readable forms (the engine is UTC, so `GMT+0000`).
                 "toDateString" | "toTimeString" | "toString" | "toUTCString"
                 | "toLocaleDateString" | "toLocaleTimeString" | "toLocaleString" => {
+                    // An invalid date (NaN timestamp) stringifies as "Invalid Date".
+                    if !ms.is_finite() {
+                        return Ok(Some(self.new_str("Invalid Date")));
+                    }
                     let wd = WEEKDAYS[((day.rem_euclid(7) + 4).rem_euclid(7)) as usize];
                     let mn = MONTHS[(mo - 1) as usize];
                     let (hh, mi, ss) = (tod / 3_600_000, tod / 60_000 % 60, tod / 1000 % 60);
