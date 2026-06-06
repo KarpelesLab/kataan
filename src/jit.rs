@@ -258,6 +258,21 @@ pub enum RegOp {
     Jump { target: usize },
     /// return `reg[src]`
     Ret { src: u8 },
+    /// `reg[dst] = call(code_ptr)(reg[args[0]], …, reg[args[n_args-1]])` — a
+    /// native call to another compiled function at absolute `code_ptr`, System V
+    /// ABI (integer args in rdi/rsi/rdx/rcx/r8/r9, result in rax). Programs with a
+    /// `Call` skip the constant/allocation passes (which assume pure register ops)
+    /// and are compiled directly.
+    Call {
+        /// destination register for the result
+        dst: u8,
+        /// absolute address of the callee's native code
+        code_ptr: u64,
+        /// number of arguments (≤ 6)
+        n_args: u8,
+        /// the argument registers (first `n_args` used)
+        args: [u8; 6],
+    },
 }
 
 /// Interprets a [`RegOp`] program (the oracle for [`JitFunction::compile_reg`]),
@@ -306,6 +321,9 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
             }
             RegOp::Jump { target } => pc = target,
             RegOp::Ret { src } => return regs[src as usize],
+            // `Call` invokes native code; the interpreter oracle is only used for
+            // pure register programs (which never contain a Call).
+            RegOp::Call { .. } => unreachable!("eval_reg does not evaluate Call ops"),
         }
     }
     0
@@ -392,6 +410,7 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
             RegOp::Const { dst, .. }
             | RegOp::Bin { dst, .. }
             | RegOp::Lt { dst, .. }
+            | RegOp::Call { dst, .. }
             | RegOp::Arg { dst, .. } => invalidate(&mut copy_of, dst),
             RegOp::JumpIfFalse { .. } | RegOp::Jump { .. } => {
                 copy_of.iter_mut().for_each(|c| *c = None);
@@ -428,11 +447,19 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
             RegOp::Ret { src } => {
                 used.insert(src);
             }
+            RegOp::Call { n_args, args, .. } => {
+                for a in &args[..n_args as usize] {
+                    used.insert(*a);
+                }
+            }
             RegOp::Const { .. } | RegOp::Arg { .. } | RegOp::Jump { .. } => {}
         }
     }
     let keep = |op: &RegOp| match *op {
-        RegOp::Ret { .. } | RegOp::Jump { .. } | RegOp::JumpIfFalse { .. } => true,
+        // A `Call` has side effects (it invokes a function), so always keep it.
+        RegOp::Ret { .. } | RegOp::Jump { .. } | RegOp::JumpIfFalse { .. } | RegOp::Call { .. } => {
+            true
+        }
         RegOp::Const { dst, .. }
         | RegOp::Bin { dst, .. }
         | RegOp::Move { dst, .. }
@@ -474,6 +501,8 @@ fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
         RegOp::JumpIfFalse { cond, .. } => (None, [Some(cond), None]),
         RegOp::Ret { src } => (None, [Some(src), None]),
         RegOp::Jump { .. } => (None, [None, None]),
+        // Call programs skip allocation, so this is only for exhaustiveness.
+        RegOp::Call { dst, .. } => (Some(dst), [None, None]),
     }
 }
 
@@ -577,6 +606,17 @@ pub fn allocate_reg(ops: &[RegOp], n_regs: usize) -> (Vec<RegOp>, usize) {
             },
             RegOp::Jump { target } => RegOp::Jump { target },
             RegOp::Ret { src } => RegOp::Ret { src: m(src) },
+            RegOp::Call {
+                dst,
+                code_ptr,
+                n_args,
+                args,
+            } => RegOp::Call {
+                dst: m(dst),
+                code_ptr,
+                n_args,
+                args: args.map(m),
+            },
         })
         .collect();
     (out, new_n)
@@ -667,6 +707,10 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 *op
             }
             RegOp::Ret { .. } => *op,
+            RegOp::Call { dst, .. } => {
+                known[dst as usize] = None;
+                *op
+            }
         };
         out.push(lowered);
     }
@@ -761,6 +805,18 @@ fn nanbox_int(v: crate::nanbox::NanBox) -> Option<i64> {
 #[cfg(feature = "alloc")]
 #[must_use]
 pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
+    lower_nbvm_with(proto, &alloc::collections::BTreeMap::new())
+}
+
+/// Like [`lower_nbvm`], but `registry` maps a callee function-table index to the
+/// absolute address of its already-compiled native code, so an `Op::Call` to a
+/// registered (JIT-compiled) function lowers to a native [`RegOp::Call`]. A call
+/// to an unregistered function still bails (returns `None`).
+#[must_use]
+pub fn lower_nbvm_with(
+    proto: &crate::nbvm::FnProto,
+    registry: &alloc::collections::BTreeMap<u32, u64>,
+) -> Option<Vec<RegOp>> {
     use crate::nbvm::Op;
     if proto.n_regs > 64 || proto.n_params > 6 || proto.n_captures != 0 {
         return None;
@@ -861,6 +917,26 @@ pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
             Op::Return { src } => RegOp::Ret {
                 src: read(&written, *src)?,
             },
+            // A static call to an already-compiled function lowers to a native
+            // call; an unregistered callee bails the whole compilation.
+            Op::Call { dst, func, args } => {
+                if args.len() > 6 {
+                    return None;
+                }
+                let code_ptr = registry.get(func).copied()?;
+                let mut argregs = [0u8; 6];
+                for (i, r) in args.iter().enumerate() {
+                    argregs[i] = read(&written, *r)?;
+                }
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Call {
+                    dst: d,
+                    code_ptr,
+                    n_args: args.len() as u8,
+                    args: argregs,
+                }
+            }
             _ => return None,
         };
         out.push(lowered);
@@ -1015,12 +1091,30 @@ impl JitProto {
     /// handles `/` and non-integer values). `None` if neither applies.
     #[must_use]
     pub fn compile(proto: &crate::nbvm::FnProto) -> Option<Self> {
-        if let Some(ops) = lower_nbvm(proto) {
-            // Optimizing tier: fold/simplify/copy-prop/DCE, then register-allocate
-            // (shrinking the frame) before native codegen.
-            let ops = optimize_reg(&ops, proto.n_regs);
-            let (ops, n_regs) = allocate_reg(&ops, proto.n_regs);
-            let func = JitFunction::compile_reg(n_regs, proto.n_params, &ops)?;
+        Self::compile_with_registry(proto, &alloc::collections::BTreeMap::new())
+    }
+
+    /// Like [`compile`](Self::compile) but with a `registry` of already-compiled
+    /// callee code addresses, so a function that statically calls another JIT'd
+    /// function lowers to native calls (see [`lower_nbvm_with`]).
+    #[must_use]
+    pub fn compile_with_registry(
+        proto: &crate::nbvm::FnProto,
+        registry: &alloc::collections::BTreeMap<u32, u64>,
+    ) -> Option<Self> {
+        if let Some(ops) = lower_nbvm_with(proto, registry) {
+            let has_call = ops.iter().any(|o| matches!(o, RegOp::Call { .. }));
+            let func = if has_call {
+                // Call programs skip the constant/allocation passes (which assume
+                // pure register ops) and compile directly.
+                JitFunction::compile_reg(proto.n_regs, proto.n_params, &ops)?
+            } else {
+                // Optimizing tier: fold/simplify/copy-prop/DCE, then register-
+                // allocate (shrinking the frame) before native codegen.
+                let ops = optimize_reg(&ops, proto.n_regs);
+                let (ops, n_regs) = allocate_reg(&ops, proto.n_regs);
+                JitFunction::compile_reg(n_regs, proto.n_params, &ops)?
+            };
             return Some(Self {
                 func,
                 n_params: proto.n_params,
@@ -1034,6 +1128,13 @@ impl JitProto {
             n_params: proto.n_params,
             kind: JitKind::Float,
         })
+    }
+
+    /// The native entry address of this compiled function — register it so other
+    /// JIT'd functions can call it (see [`compile_with_registry`](Self::compile_with_registry)).
+    #[must_use]
+    pub fn code_ptr(&self) -> usize {
+        self.func.code_ptr()
     }
 
     /// Calls the native code with `NanBox` arguments, or `None` to **deopt** to
@@ -1490,6 +1591,23 @@ impl X64Assembler {
     pub fn call_rax(&mut self) {
         self.code.extend_from_slice(&[0xff, 0xd0]);
     }
+
+    /// `mov <argreg[i]>, [rbp+disp]` — load a frame slot into System V integer
+    /// argument register `i` (rdi, rsi, rdx, rcx, r8, r9), for a native call.
+    pub fn load_argreg(&mut self, i: usize, disp: i32) {
+        // REX prefix + ModRM reg field per argument register.
+        let (rex, modrm): (u8, u8) = match i {
+            0 => (0x48, 0xbd), // rdi
+            1 => (0x48, 0xb5), // rsi
+            2 => (0x48, 0x95), // rdx
+            3 => (0x48, 0x8d), // rcx
+            4 => (0x4c, 0x85), // r8
+            5 => (0x4c, 0x8d), // r9
+            _ => return,
+        };
+        self.code.extend_from_slice(&[rex, 0x8b, modrm]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
     /// `sub rsp, imm8`.
     pub fn sub_rsp_imm8(&mut self, imm: u8) {
         self.code.extend_from_slice(&[0x48, 0x83, 0xec, imm]);
@@ -1756,6 +1874,32 @@ impl JitFunction {
                     a.epilogue();
                     has_ret = true;
                     // Do NOT break: later ops may be branch targets.
+                }
+                RegOp::Call {
+                    dst,
+                    code_ptr,
+                    n_args,
+                    args,
+                } => {
+                    if !ok_reg(dst) || n_args as usize > 6 {
+                        return None;
+                    }
+                    // Load each argument register from its slot into the System V
+                    // integer arg register (rdi, rsi, rdx, rcx, r8, r9). The frame
+                    // is already 16-byte aligned (frame size is a multiple of 16
+                    // and rbp is aligned), so the `call` needs no rsp adjustment.
+                    for (i, &arg) in args[..n_args as usize].iter().enumerate() {
+                        if !ok_reg(arg) {
+                            return None;
+                        }
+                        a.load_argreg(i, disp(arg));
+                    }
+                    a.movabs_rax(code_ptr as i64);
+                    a.call_rax();
+                    a.store_rax(disp(dst));
+                    // The callee clobbered the caller-saved bounds regs; reload.
+                    a.movabs_r11(SAFE_INT_MAX);
+                    a.movabs_r10(-SAFE_INT_MAX);
                 }
             }
         }
@@ -2561,6 +2705,71 @@ mod tests {
             is_async: false,
         };
         assert!(lower_nbvm(&ok).is_some(), "written-then-read should lower");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn lower_nbvm_wires_a_static_call() {
+        use crate::nbvm::{FnProto, Op};
+        // Callee B(x) = x * 3, compiled to native code.
+        let b = FnProto {
+            ops: alloc::vec![
+                Op::LoadConst {
+                    dst: 1,
+                    value: crate::nanbox::NanBox::number(3.0)
+                },
+                Op::Mul { dst: 2, a: 0, b: 1 },
+                Op::Return { src: 2 },
+            ],
+            n_regs: 3,
+            n_params: 1,
+            n_captures: 0,
+            rest_from: None,
+            is_async: false,
+        };
+        let bjit = JitProto::compile(&b).expect("compile B");
+        let b_ptr = bjit.code_ptr();
+        assert_ne!(b_ptr, 0);
+        let mut registry = alloc::collections::BTreeMap::new();
+        registry.insert(7u32, b_ptr as u64); // B is function-table index 7
+
+        // Caller A(x) = B(x) + x, with an Op::Call to func 7.
+        let a = FnProto {
+            ops: alloc::vec![
+                Op::Call {
+                    dst: 1,
+                    func: 7,
+                    args: alloc::vec![0]
+                }, // r1 = B(r0)
+                Op::Add { dst: 2, a: 1, b: 0 }, // r2 = r1 + r0
+                Op::Return { src: 2 },
+            ],
+            n_regs: 3,
+            n_params: 1,
+            n_captures: 0,
+            rest_from: None,
+            is_async: false,
+        };
+        // Without the registry the call can't lower; with it, it does.
+        assert!(lower_nbvm(&a).is_none(), "unregistered call must bail");
+        let lowered = lower_nbvm_with(&a, &registry).expect("registered call lowers");
+        assert!(
+            lowered.iter().any(|o| matches!(o, RegOp::Call { .. })),
+            "emits a Call op"
+        );
+
+        // Compile A with the registry and run it natively: A(x) = 3x + x = 4x.
+        let ajit = JitProto::compile_with_registry(&a, &registry).expect("compile A");
+        for x in [0i64, 1, 5, 12] {
+            let r = ajit
+                .call_guarded(&[crate::nanbox::NanBox::number(x as f64)])
+                .expect("no deopt");
+            assert_eq!(
+                r.unpack(),
+                crate::nanbox::Unpacked::Number((4 * x) as f64),
+                "A({x})"
+            );
+        }
     }
 
     #[test]
