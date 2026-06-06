@@ -251,6 +251,19 @@ pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
         }
     };
     let mut out = Vec::new();
+    // Def-use safety: a register may be read only after it has been written
+    // (params count as written). This rejects any function that reads an
+    // uninitialized slot — `this`, a capture, a hoisted/TDZ binding — which the
+    // native frame does not hold, so the JIT can't silently diverge from the
+    // interpreter's `undefined`.
+    let mut written = alloc::vec![false; proto.n_regs];
+    for w in written.iter_mut().take(proto.n_params) {
+        *w = true;
+    }
+    let read = |w: &[bool], r: crate::nbvm::Reg| -> Option<u8> {
+        let r8 = reg8(r)?;
+        if *w.get(r as usize)? { Some(r8) } else { None }
+    };
     // Parameters arrive in registers `0..n_params`; seed them from the args.
     for i in 0..proto.n_params {
         out.push(RegOp::Arg {
@@ -260,50 +273,72 @@ pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
     }
     for op in &proto.ops {
         let lowered = match op {
-            Op::LoadConst { dst, value } => RegOp::Const {
-                dst: reg8(*dst)?,
-                imm: nanbox_int(*value)?,
-            },
+            Op::LoadConst { dst, value } => {
+                let imm = nanbox_int(*value)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Const { dst: d, imm }
+            }
             // `Add` is the numeric-typed add; `AddValue` is the general `+`
             // (string-or-number). The integer fast path treats both as integer
-            // addition — a real deopt guard would verify the operands are ints.
-            Op::Add { dst, a, b } | Op::AddValue { dst, a, b } => RegOp::Bin {
-                dst: reg8(*dst)?,
-                a: reg8(*a)?,
-                b: reg8(*b)?,
-                op: BinOp2::Add,
-            },
-            Op::Sub { dst, a, b } => RegOp::Bin {
-                dst: reg8(*dst)?,
-                a: reg8(*a)?,
-                b: reg8(*b)?,
-                op: BinOp2::Sub,
-            },
-            Op::Mul { dst, a, b } => RegOp::Bin {
-                dst: reg8(*dst)?,
-                a: reg8(*a)?,
-                b: reg8(*b)?,
-                op: BinOp2::Mul,
-            },
-            Op::Move { dst, src } => RegOp::Move {
-                dst: reg8(*dst)?,
-                src: reg8(*src)?,
-            },
-            Op::Lt { dst, a, b } => RegOp::Lt {
-                dst: reg8(*dst)?,
-                a: reg8(*a)?,
-                b: reg8(*b)?,
-            },
+            // addition — the range/overflow guards keep it sound.
+            Op::Add { dst, a, b } | Op::AddValue { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Bin {
+                    dst: d,
+                    a,
+                    b,
+                    op: BinOp2::Add,
+                }
+            }
+            Op::Sub { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Bin {
+                    dst: d,
+                    a,
+                    b,
+                    op: BinOp2::Sub,
+                }
+            }
+            Op::Mul { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Bin {
+                    dst: d,
+                    a,
+                    b,
+                    op: BinOp2::Mul,
+                }
+            }
+            Op::Move { dst, src } => {
+                let s = read(&written, *src)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Move { dst: d, src: s }
+            }
+            Op::Lt { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Lt { dst: d, a, b }
+            }
             // Branch targets are nbvm op indices; the lowered stream prepends one
             // `Arg` per parameter, so every target shifts by `n_params`.
             Op::JumpIfFalse { cond, target } => RegOp::JumpIfFalse {
-                cond: reg8(*cond)?,
+                cond: read(&written, *cond)?,
                 target: target.checked_add(proto.n_params)?,
             },
             Op::Jump { target } => RegOp::Jump {
                 target: target.checked_add(proto.n_params)?,
             },
-            Op::Return { src } => RegOp::Ret { src: reg8(*src)? },
+            Op::Return { src } => RegOp::Ret {
+                src: read(&written, *src)?,
+            },
             _ => return None,
         };
         out.push(lowered);
@@ -882,6 +917,13 @@ impl JitFunction {
         let labels: Vec<Label> = (0..ops.len()).map(|_| a.new_label()).collect();
         let deopt = a.new_label();
         a.prologue(frame);
+        // Zero every register slot, so an (unexpected) read of an unwritten slot
+        // yields 0 rather than stack garbage — defense in depth behind
+        // `lower_nbvm`'s def-use check.
+        a.zero_rax();
+        for r in 0..n_regs {
+            a.store_rax(-((r as i32 + 1) * 8));
+        }
         // Hoist the safe-integer bounds (±2^53) into scratch regs r10/r11, so the
         // per-op range guard is two register compares. Loaded after the prologue;
         // r10/r11 are caller-saved and not argument registers, so no arg clobber.
@@ -1517,6 +1559,44 @@ mod tests {
             jit.call_guarded(&[NanBox::number(1.0)]).is_none(),
             "arity mismatch deopts"
         );
+    }
+
+    #[test]
+    fn lower_rejects_read_before_write() {
+        use crate::nbvm::{FnProto, Op};
+        // reg 2 is read by Mul but never written and is not a parameter — this
+        // would read an uninitialized slot (e.g. `this`/a capture), so it must
+        // not JIT-lower.
+        let proto = FnProto {
+            ops: alloc::vec![Op::Mul { dst: 1, a: 0, b: 2 }, Op::Return { src: 1 },],
+            n_regs: 3,
+            n_params: 1,
+            n_captures: 0,
+            rest_from: None,
+            is_async: false,
+        };
+        assert!(
+            lower_nbvm(&proto).is_none(),
+            "read-before-write must not lower"
+        );
+
+        // The same shape but with reg 2 written first *does* lower.
+        let ok = FnProto {
+            ops: alloc::vec![
+                Op::LoadConst {
+                    dst: 2,
+                    value: crate::nanbox::NanBox::number(3.0)
+                },
+                Op::Mul { dst: 1, a: 0, b: 2 },
+                Op::Return { src: 1 },
+            ],
+            n_regs: 3,
+            n_params: 1,
+            n_captures: 0,
+            rest_from: None,
+            is_async: false,
+        };
+        assert!(lower_nbvm(&ok).is_some(), "written-then-read should lower");
     }
 
     #[test]
