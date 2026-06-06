@@ -473,6 +473,24 @@ fn memory_op(name: &str) -> Option<(u8, u8)> {
     })
 }
 
+/// Resolves a `(type $t)` / `(type N)` annotation to a type index.
+fn resolve_type(ann: Option<&Sexpr>, types: &[String]) -> Result<u64, String> {
+    if let Some(Sexpr::List(p)) = ann
+        && p.first() == Some(&Sexpr::Atom(String::from("type")))
+    {
+        return match p.get(1) {
+            Some(Sexpr::Atom(s)) if s.starts_with('$') => types
+                .iter()
+                .position(|n| n == &s[1..])
+                .map(|x| x as u64)
+                .ok_or_else(|| format!("unknown type {s}")),
+            Some(Sexpr::Atom(n)) => n.parse::<u64>().map_err(|_| String::from("bad type index")),
+            _ => Err(String::from("malformed (type …)")),
+        };
+    }
+    Err(String::from("call_indirect needs a (type …) annotation"))
+}
+
 /// Emits a flat sequence of instructions (each an atom — possibly consuming the
 /// next atom as an immediate — or a folded `(op …)` list).
 fn emit_instrs(
@@ -480,6 +498,7 @@ fn emit_instrs(
     locals: &[String],
     funcs: &[String],
     globals: &[String],
+    types: &[String],
     labels: &mut Vec<String>,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
@@ -487,8 +506,16 @@ fn emit_instrs(
     while i < items.len() {
         match &items[i] {
             Sexpr::List(inner) => {
-                emit_folded(inner, locals, funcs, globals, labels, out)?;
+                emit_folded(inner, locals, funcs, globals, types, labels, out)?;
                 i += 1;
+            }
+            // `call_indirect (type $t)` — the type annotation is a following list.
+            Sexpr::Atom(name) if name == "call_indirect" => {
+                let t = resolve_type(items.get(i + 1), types)?;
+                out.push(0x11);
+                leb_u(t, out);
+                leb_u(0, out); // table index 0
+                i += 2;
             }
             Sexpr::Atom(name) => {
                 if has_immediate(name) {
@@ -538,6 +565,7 @@ fn emit_folded(
     locals: &[String],
     funcs: &[String],
     globals: &[String],
+    types: &[String],
     labels: &mut Vec<String>,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
@@ -545,12 +573,29 @@ fn emit_folded(
         return Err(String::from("folded instruction needs a head opcode"));
     };
     match name.as_str() {
+        "call_indirect" => {
+            // (call_indirect (type $t) operand… table_index_operand)
+            let t = resolve_type(inner.get(1), types)?;
+            emit_instrs(&inner[2..], locals, funcs, globals, types, labels, out)?;
+            out.push(0x11);
+            leb_u(t, out);
+            leb_u(0, out); // table index 0
+            return Ok(());
+        }
         "block" | "loop" => {
             let (label, bt, skip) = block_type_of(&inner[1..]);
             out.push(if name == "block" { 0x02 } else { 0x03 });
             out.push(bt);
             labels.push(label);
-            emit_instrs(&inner[1 + skip..], locals, funcs, globals, labels, out)?;
+            emit_instrs(
+                &inner[1 + skip..],
+                locals,
+                funcs,
+                globals,
+                types,
+                labels,
+                out,
+            )?;
             labels.pop();
             out.push(0x0b); // end
             return Ok(());
@@ -566,19 +611,19 @@ fn emit_folded(
                 .ok_or("if without a (then …) clause")?;
             // The condition precedes `(then …)`, emitted before the `if` (so it
             // doesn't see the if's own label).
-            emit_instrs(&rest[..then_at], locals, funcs, globals, labels, out)?;
+            emit_instrs(&rest[..then_at], locals, funcs, globals, types, labels, out)?;
             out.push(0x04); // if
             out.push(bt);
             labels.push(label);
             if let Sexpr::List(then_p) = &rest[then_at] {
-                emit_instrs(&then_p[1..], locals, funcs, globals, labels, out)?;
+                emit_instrs(&then_p[1..], locals, funcs, globals, types, labels, out)?;
             }
             if let Some(else_s) = rest.get(then_at + 1)
                 && is_clause(else_s, "else")
                 && let Sexpr::List(else_p) = else_s
             {
                 out.push(0x05); // else
-                emit_instrs(&else_p[1..], locals, funcs, globals, labels, out)?;
+                emit_instrs(&else_p[1..], locals, funcs, globals, types, labels, out)?;
             }
             labels.pop();
             out.push(0x0b); // end
@@ -591,10 +636,10 @@ fn emit_folded(
             Some(Sexpr::Atom(s)) => s.clone(),
             _ => return Err(format!("{name} needs an immediate")),
         };
-        emit_instrs(&inner[2..], locals, funcs, globals, labels, out)?;
+        emit_instrs(&inner[2..], locals, funcs, globals, types, labels, out)?;
         emit_op(name, Some(&imm), locals, funcs, globals, labels, out)?;
     } else {
-        emit_instrs(&inner[1..], locals, funcs, globals, labels, out)?;
+        emit_instrs(&inner[1..], locals, funcs, globals, types, labels, out)?;
         emit_op(name, None, locals, funcs, globals, labels, out)?;
     }
     Ok(())
@@ -616,6 +661,56 @@ struct WatFunc {
 
 /// Compiles an inline `(module (func …)…)` text module to a binary module.
 fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
+    // Collect `(type $name? (func (param …)(result …)))` declarations: their names
+    // (for `call_indirect (type $t)`) and the encoded function-type entries. These
+    // occupy the *front* of the type section, before the per-function types.
+    let mut type_names: Vec<String> = Vec::new();
+    let mut declared_types: Vec<u8> = Vec::new(); // concatenated `0x60 …` entries
+    for field in &items[1..] {
+        let Sexpr::List(t) = field else { continue };
+        if t.first() != Some(&Sexpr::Atom(String::from("type"))) {
+            continue;
+        }
+        let mut k = 1;
+        let mut name = String::new();
+        if let Some(Sexpr::Atom(s)) = t.get(k)
+            && let Some(nm) = s.strip_prefix('$')
+        {
+            name = nm.into();
+            k += 1;
+        }
+        // The `(func (param …) (result …))` signature.
+        let mut params = Vec::new();
+        let mut results = Vec::new();
+        if let Some(Sexpr::List(f)) = t.get(k) {
+            for part in &f[1..] {
+                if let Sexpr::List(p) = part {
+                    let kw = p.first();
+                    if kw == Some(&Sexpr::Atom(String::from("param"))) {
+                        for ty in &p[1..] {
+                            if let Sexpr::Atom(ty) = ty {
+                                params.push(valtype_byte(ty).ok_or("bad param type")?);
+                            }
+                        }
+                    } else if kw == Some(&Sexpr::Atom(String::from("result"))) {
+                        for ty in &p[1..] {
+                            if let Sexpr::Atom(ty) = ty {
+                                results.push(valtype_byte(ty).ok_or("bad result type")?);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        declared_types.push(0x60);
+        leb_u(params.len() as u64, &mut declared_types);
+        declared_types.extend_from_slice(&params);
+        leb_u(results.len() as u64, &mut declared_types);
+        declared_types.extend_from_slice(&results);
+        type_names.push(name);
+    }
+    let n_decl_types = type_names.len();
+
     // First, collect `(global $name? (mut? T) (init))` declarations: their names
     // (for `global.get/set $g`) and the encoded global-section entries.
     let mut global_names: Vec<String> = Vec::new();
@@ -659,6 +754,25 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
         global_names.push(name);
     }
     let n_globals = global_names.len();
+
+    // Collect `(table N funcref)` (at most one in the MVP).
+    let mut table: Option<(u32, Option<u32>)> = None;
+    for field in &items[1..] {
+        if let Sexpr::List(t) = field
+            && t.first() == Some(&Sexpr::Atom(String::from("table")))
+        {
+            let nums: Vec<u32> = t[1..]
+                .iter()
+                .filter_map(|s| match s {
+                    Sexpr::Atom(n) => n.parse::<u32>().ok(),
+                    _ => None,
+                })
+                .collect();
+            if let Some(&min) = nums.first() {
+                table = Some((min, nums.get(1).copied()));
+            }
+        }
+    }
 
     // Collect `(memory N M?)` (at most one in the MVP) and `(data (offset) "…")`.
     let mut memory: Option<(u32, Option<u32>)> = None;
@@ -785,6 +899,42 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
     // Second pass: now that every function's index is known, build the function
     // symbol table and emit each body (so `call $name` resolves).
     let func_names: Vec<String> = funcs.iter().map(|f| f.name.clone()).collect();
+    let resolve_func = |r: &str| -> Result<u32, String> {
+        if let Some(nm) = r.strip_prefix('$') {
+            func_names
+                .iter()
+                .position(|n| n == nm)
+                .map(|p| p as u32)
+                .ok_or_else(|| format!("unknown function ${nm}"))
+        } else {
+            r.parse::<u32>()
+                .map_err(|_| String::from("bad function index"))
+        }
+    };
+    // Collect `(elem (i32.const off) $f1 $f2 …)` segments (table 0).
+    let mut elements: Vec<(Vec<u8>, Vec<u32>)> = Vec::new();
+    for field in &items[1..] {
+        let Sexpr::List(e) = field else { continue };
+        if e.first() != Some(&Sexpr::Atom(String::from("elem"))) {
+            continue;
+        }
+        let mut offset = Vec::new();
+        let mut rest = 1;
+        if let Some(Sexpr::List(off)) = e.get(1)
+            && let (Some(Sexpr::Atom(op)), Some(Sexpr::Atom(n))) = (off.first(), off.get(1))
+        {
+            emit_op(op, Some(n), &[], &[], &[], &[], &mut offset)?;
+            rest = 2;
+        }
+        offset.push(0x0b);
+        let mut indices = Vec::new();
+        for it in &e[rest..] {
+            if let Sexpr::Atom(r) = it {
+                indices.push(resolve_func(r)?);
+            }
+        }
+        elements.push((offset, indices));
+    }
     // A `(start $f)` declaration: the function run at instantiation.
     let mut start_func: Option<u32> = None;
     for field in &items[1..] {
@@ -812,6 +962,7 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
             &f.local_names,
             &func_names,
             &global_names,
+            &type_names,
             &mut labels,
             &mut body,
         )?;
@@ -820,9 +971,11 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
 
     // Assemble the binary sections.
     let mut out = alloc::vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
-    // type section (one signature per function; no dedup, which is valid).
+    // type section: the declared `(type …)` entries first, then one signature per
+    // function (no dedup, which is valid). `call_indirect` references the former.
     let mut types = Vec::new();
-    leb_u(funcs.len() as u64, &mut types);
+    leb_u((n_decl_types + funcs.len()) as u64, &mut types);
+    types.extend_from_slice(&declared_types);
     for f in &funcs {
         types.push(0x60);
         leb_u(f.params.len() as u64, &mut types);
@@ -831,13 +984,31 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
         types.extend_from_slice(&f.results);
     }
     section(1, &types, &mut out);
-    // function section.
+    // function section: function `i`'s type is the `(n_decl_types + i)`-th entry.
     let mut fns = Vec::new();
     leb_u(funcs.len() as u64, &mut fns);
     for i in 0..funcs.len() {
-        leb_u(i as u64, &mut fns);
+        leb_u((n_decl_types + i) as u64, &mut fns);
     }
     section(3, &fns, &mut out);
+    // table section (id 4): a single funcref table's limits.
+    if let Some((min, max)) = table {
+        let mut tbl = Vec::new();
+        leb_u(1, &mut tbl); // one table
+        tbl.push(0x70); // funcref
+        match max {
+            Some(m) => {
+                tbl.push(0x01);
+                leb_u(u64::from(min), &mut tbl);
+                leb_u(u64::from(m), &mut tbl);
+            }
+            None => {
+                tbl.push(0x00);
+                leb_u(u64::from(min), &mut tbl);
+            }
+        }
+        section(4, &tbl, &mut out);
+    }
     // memory section (id 5): a single memory's limits.
     if let Some((min, max)) = memory {
         let mut mem = Vec::new();
@@ -882,6 +1053,20 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
         let mut s = Vec::new();
         leb_u(u64::from(idx), &mut s);
         section(8, &s, &mut out);
+    }
+    // element section (id 9): each segment populates table 0 from an offset.
+    if !elements.is_empty() {
+        let mut elem = Vec::new();
+        leb_u(elements.len() as u64, &mut elem);
+        for (offset, indices) in &elements {
+            leb_u(0, &mut elem); // table index 0
+            elem.extend_from_slice(offset);
+            leb_u(indices.len() as u64, &mut elem);
+            for idx in indices {
+                leb_u(u64::from(*idx), &mut elem);
+            }
+        }
+        section(9, &elem, &mut out);
     }
     // code section.
     let mut code = Vec::new();
@@ -1269,6 +1454,33 @@ mod tests {
         assert_eq!(
             inst.call_export("rt", &[Val::I32(-12345)]).unwrap(),
             vec![Val::I32(-12345)]
+        );
+    }
+
+    #[test]
+    fn wat_call_indirect_through_table() {
+        // A type, a table of 2 functions, and `dispatch(i, x)` calling table[i](x).
+        let src = "(module \
+            (type $unop (func (param i32) (result i32))) \
+            (table 2 funcref) \
+            (func $double (param $x i32) (result i32) (i32.mul (local.get $x) (i32.const 2))) \
+            (func $inc (param $x i32) (result i32) (i32.add (local.get $x) (i32.const 1))) \
+            (elem (i32.const 0) $double $inc) \
+            (func (export \"dispatch\") (param $i i32) (param $x i32) (result i32) \
+              (call_indirect (type $unop) (local.get $x) (local.get $i))))";
+        let bin = wat_to_binary(src).expect("compile WAT with call_indirect");
+        let module = crate::wasm_rt::Module::decode(&bin).expect("decode");
+        let mut inst = crate::wasm_rt::Instance::new(&module).expect("instantiate");
+        // table[0] = $double, table[1] = $inc.
+        assert_eq!(
+            inst.call_export("dispatch", &[Val::I32(0), Val::I32(21)])
+                .unwrap(),
+            vec![Val::I32(42)]
+        );
+        assert_eq!(
+            inst.call_export("dispatch", &[Val::I32(1), Val::I32(41)])
+                .unwrap(),
+            vec![Val::I32(42)]
         );
     }
 
