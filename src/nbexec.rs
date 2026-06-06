@@ -2912,6 +2912,15 @@ impl<'a> Interp<'a> {
                 Some(f) => self.realm.to_display_string(*f),
                 None => String::new(),
             };
+            // Validate the pattern/flags up front: an invalid regular expression is
+            // a `SyntaxError` at construction, not a silent broken object.
+            #[cfg(feature = "regex")]
+            if crate::regex::Regex::new(&pat, &flags).is_err() {
+                let m = self.new_str(&alloc::format!(
+                    "Invalid regular expression: /{pat}/{flags}"
+                ));
+                return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 3, Some(m))));
+            }
             let r = self.realm.new_regexp(&pat, &flags);
             return Ok(NanBox::handle(r.to_raw()));
         }
