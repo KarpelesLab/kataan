@@ -147,6 +147,8 @@ pub struct Module {
     /// `true` if the module imports its linear memory from the host (rather than
     /// defining its own); the host supplies the backing bytes at instantiation.
     mem_imported: bool,
+    /// The `start` function index, run automatically at instantiation, if any.
+    start: Option<u32>,
 }
 
 /// A host function backing an `import` — receives the WASM call's arguments and
@@ -363,6 +365,7 @@ impl Module {
                 5 => Self::decode_memory(&mut s, &mut m)?,
                 6 => Self::decode_globals(&mut s, &mut m)?,
                 7 => Self::decode_exports(&mut s, &mut m)?,
+                8 => m.start = Some(s.u32()?),
                 9 => Self::decode_elements(&mut s, &mut m)?,
                 10 => Self::decode_code(&mut s, &mut m)?,
                 11 => Self::decode_data(&mut s, &mut m)?,
@@ -1246,7 +1249,13 @@ impl<'m> Instance<'m> {
             }
             store.mem = mem;
         }
-        Ok(Self { module, store })
+        let mut inst = Self { module, store };
+        // The `start` function runs automatically at instantiation (after memory
+        // and globals are set up), initializing the instance.
+        if let Some(start) = module.start {
+            inst.call(start, &[])?;
+        }
+        Ok(inst)
     }
 
     /// Calls function `index` with `args` over this instance's **persistent**
@@ -1977,6 +1986,36 @@ mod tests {
 
         // A missing import binding is rejected at instantiation.
         assert!(Instance::with_imports(&module, vec![]).is_err());
+    }
+
+    #[test]
+    fn start_function_runs_at_instantiation() {
+        // (global (mut i32) (i32.const 0))
+        // (func $init  i32.const 111 global.set 0)     ;; func 0, the start fn
+        // (func (export "get") (result i32) global.get 0)  ;; func 1
+        // (start 0)
+        // i32.const 111 needs 2 LEB bytes (0x6f alone is -17: sign bit set).
+        let init_body: Vec<u8> = vec![0x00, 0x41, 0xef, 0x00, 0x24, 0x00, 0x0b]; // global0 = 111
+        let get_body: Vec<u8> = vec![0x00, 0x23, 0x00, 0x0b];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // types: 0 = ()->(), 1 = ()->i32
+        m.extend([0x01, 0x08, 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f]);
+        m.extend([0x03, 0x03, 0x02, 0x00, 0x01]); // func0:type0, func1:type1
+        m.extend([0x06, 0x06, 0x01, 0x7f, 0x01, 0x41, 0x00, 0x0b]); // global0 = 0, mut
+        m.extend([0x07, 0x07, 0x01, 0x03, b'g', b'e', b't', 0x00, 0x01]); // export "get"=func1
+        m.extend([0x08, 0x01, 0x00]); // start section: func 0
+        let mut code = vec![0x0a, 0x00, 0x02];
+        for b in [&init_body[..], &get_body[..]] {
+            code.push(b.len() as u8);
+            code.extend_from_slice(b);
+        }
+        code[1] = (code.len() - 2) as u8;
+        m.extend(code);
+
+        let module = Module::decode(&m).expect("decode module with start");
+        // `get` returns 111 immediately — the start function already ran.
+        let mut inst = Instance::new(&module).expect("instantiate");
+        assert_eq!(inst.call_export("get", &[]).unwrap(), vec![Val::I32(111)]);
     }
 
     #[test]
