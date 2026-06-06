@@ -599,6 +599,21 @@ fn memory_op(name: &str) -> Option<(u8, u8)> {
     })
 }
 
+/// Resolves a branch label — `$name` to its depth on the label stack (0 =
+/// innermost), or a bare number to itself.
+fn resolve_label(s: &str, labels: &[String]) -> Result<u64, String> {
+    if let Some(stripped) = s.strip_prefix('$') {
+        labels
+            .iter()
+            .rev()
+            .position(|l| l == stripped)
+            .map(|d| d as u64)
+            .ok_or_else(|| format!("unknown label ${stripped}"))
+    } else {
+        s.parse::<u64>().map_err(|_| format!("bad label {s}"))
+    }
+}
+
 /// Resolves a `(type $t)` / `(type N)` annotation to a type index.
 fn resolve_type(ann: Option<&Sexpr>, types: &[String]) -> Result<u64, String> {
     if let Some(Sexpr::List(p)) = ann
@@ -706,6 +721,27 @@ fn emit_folded(
             out.push(0x11);
             leb_u(t, out);
             leb_u(0, out); // table index 0
+            return Ok(());
+        }
+        "br_table" => {
+            // (br_table L1 … Ln Ldefault (index-operand)): leading label atoms,
+            // then a folded index operand. The last label is the default.
+            let mut label_depths = Vec::new();
+            let mut rest = 1;
+            while let Some(Sexpr::Atom(s)) = inner.get(rest) {
+                label_depths.push(resolve_label(s, labels)?);
+                rest += 1;
+            }
+            if label_depths.is_empty() {
+                return Err(String::from("br_table needs at least a default label"));
+            }
+            // Emit the index operand(s), then the table.
+            emit_instrs(&inner[rest..], locals, funcs, globals, types, labels, out)?;
+            out.push(0x0e);
+            leb_u((label_depths.len() - 1) as u64, out); // count excludes default
+            for d in &label_depths {
+                leb_u(*d, out);
+            }
             return Ok(());
         }
         "block" | "loop" => {
@@ -1920,6 +1956,37 @@ mod tests {
         assert_eq!(parse_wat_int("0x10").unwrap(), 16);
         assert_eq!(parse_wat_int("-0x1").unwrap(), -1);
         assert_eq!(parse_wat_int("4_294_967_295").unwrap(), 4_294_967_295);
+    }
+
+    #[test]
+    fn spec_br_table_and_nested_control() {
+        // `br_table` indexes a label vector (clamping out-of-range to the default),
+        // and `br`/`br_if` to an outer block/loop exit through nesting.
+        let script = "(module \
+            (func (export \"sw\") (param i32) (result i32) \
+              (block $d (block $c (block $b (block $a \
+                (br_table $a $b $c $d (local.get 0))) \
+                (return (i32.const 10))) \
+                (return (i32.const 20))) \
+                (return (i32.const 30))) \
+              (i32.const 99)) \
+            (func (export \"sum\") (param i32) (result i32) \
+              (local $i i32) (local $acc i32) \
+              (block $break (loop $cont \
+                (br_if $break (i32.ge_s (local.get $i) (local.get 0))) \
+                (local.set $acc (i32.add (local.get $acc) (local.get $i))) \
+                (local.set $i (i32.add (local.get $i) (i32.const 1))) \
+                (br $cont))) \
+              (local.get $acc))) \
+            (assert_return (invoke \"sw\" (i32.const 0)) (i32.const 10)) \
+            (assert_return (invoke \"sw\" (i32.const 1)) (i32.const 20)) \
+            (assert_return (invoke \"sw\" (i32.const 2)) (i32.const 30)) \
+            (assert_return (invoke \"sw\" (i32.const 3)) (i32.const 99)) \
+            (assert_return (invoke \"sw\" (i32.const 7)) (i32.const 99)) \
+            (assert_return (invoke \"sum\" (i32.const 5)) (i32.const 10)) \
+            (assert_return (invoke \"sum\" (i32.const 10)) (i32.const 45))";
+        let n = run_wast(script).expect("br_table + nested control conformance passes");
+        assert_eq!(n, 7);
     }
 
     #[test]
