@@ -113,6 +113,11 @@ pub mod wasm_rt;
 #[cfg(feature = "alloc")]
 pub mod nbvm;
 
+/// Flat, fixed-record bytecode executed in place over a (possibly `mmap`'d) byte
+/// buffer — the true zero-copy reload path (Phase D′). Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod flatbc;
+
 /// The baseline machine-code JIT (Phase G): an x86-64 assembler + W^X executable
 /// memory (mapped via direct Linux syscalls, no libc) that lowers an arithmetic
 /// IR to native code. Real on `linux`/`x86_64`; a no-op fallback elsewhere.
