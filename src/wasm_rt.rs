@@ -55,6 +55,37 @@ impl Val {
             _ => Err(WasmRtError("type mismatch: expected f64")),
         }
     }
+
+    /// Marshals this WASM value to a JS value (a `NanBox` number) — the result
+    /// side of the JS↔WASM boundary.
+    #[must_use]
+    pub fn to_nanbox(self) -> crate::nanbox::NanBox {
+        crate::nanbox::NanBox::number(match self {
+            Val::I32(v) => f64::from(v),
+            Val::I64(v) => v as f64,
+            Val::F32(v) => f64::from(v),
+            Val::F64(v) => v,
+        })
+    }
+
+    /// Marshals a JS value (`NanBox`) into a WASM value of type `ty` — the
+    /// argument side of the boundary. Numbers and booleans convert; other JS
+    /// types are rejected.
+    #[must_use]
+    pub fn from_nanbox(v: crate::nanbox::NanBox, ty: ValType) -> Option<Val> {
+        use crate::nanbox::Unpacked;
+        let n = match v.unpack() {
+            Unpacked::Number(n) => n,
+            Unpacked::Bool(b) => f64::from(u8::from(b)),
+            _ => return None,
+        };
+        Some(match ty {
+            ValType::I32 => Val::I32(n as i32),
+            ValType::I64 => Val::I64(n as i64),
+            ValType::F32 => Val::F32(n as f32),
+            ValType::F64 => Val::F64(n),
+        })
+    }
 }
 
 /// A value type in a function signature.
@@ -415,6 +446,14 @@ impl Module {
     /// The number of imported functions (which occupy the low function indices).
     fn n_imported_funcs(&self) -> usize {
         self.func_imports.len()
+    }
+
+    /// The signature of function `index` (imports included).
+    #[must_use]
+    pub fn func_type(&self, index: u32) -> Option<&FuncType> {
+        self.func_types
+            .get(index as usize)
+            .and_then(|t| self.types.get(*t as usize))
     }
 
     /// The `(module, field)` names of the module's function imports, in the order
@@ -1142,6 +1181,45 @@ impl<'m> Instance<'m> {
         self.call(idx, args)
     }
 
+    /// Calls an exported function with **JS values** (`NanBox`), marshaling each
+    /// argument to the parameter's WASM type and each result back to a JS number.
+    /// This is the JS↔WASM call boundary the engine uses to invoke WASM from JS.
+    ///
+    /// # Errors
+    /// `WasmRtError("no such export")`, `"argument count mismatch"`, or
+    /// `"argument not coercible to wasm value"` (a non-numeric JS argument), else
+    /// as [`call`](Self::call).
+    pub fn call_export_js(
+        &mut self,
+        name: &str,
+        js_args: &[crate::nanbox::NanBox],
+    ) -> Result<Vec<crate::nanbox::NanBox>, WasmRtError> {
+        let idx = self
+            .module
+            .export(name)
+            .ok_or(WasmRtError("no such export"))?;
+        // Snapshot the parameter types so the immutable borrow ends before `call`.
+        let params: Vec<ValType> = {
+            let ty = self
+                .module
+                .func_type(idx)
+                .ok_or(WasmRtError("no such function"))?;
+            if js_args.len() != ty.params.len() {
+                return Err(WasmRtError("argument count mismatch"));
+            }
+            ty.params.clone()
+        };
+        let args: Vec<Val> = params
+            .iter()
+            .zip(js_args)
+            .map(|(t, v)| {
+                Val::from_nanbox(*v, *t).ok_or(WasmRtError("argument not coercible to wasm value"))
+            })
+            .collect::<Result<_, _>>()?;
+        let results = self.call(idx, &args)?;
+        Ok(results.into_iter().map(Val::to_nanbox).collect())
+    }
+
     /// The instance's linear memory (the bytes the JS side reads).
     #[must_use]
     pub fn memory(&self) -> &[u8] {
@@ -1671,6 +1749,54 @@ mod tests {
         // Out-of-bounds host writes are rejected.
         assert!(inst.write_memory(PAGE_SIZE, &[1, 2, 3, 4]).is_err());
         assert!(inst.read_memory(PAGE_SIZE, 4).is_none());
+    }
+
+    #[test]
+    fn js_value_marshaling_across_the_boundary() {
+        use crate::nanbox::{NanBox, Unpacked};
+        // Value conversions both ways.
+        assert_eq!(Val::I32(42).to_nanbox().unpack(), Unpacked::Number(42.0));
+        assert_eq!(Val::F64(3.5).to_nanbox().unpack(), Unpacked::Number(3.5));
+        assert_eq!(
+            Val::from_nanbox(NanBox::number(7.9), ValType::I32),
+            Some(Val::I32(7))
+        );
+        assert_eq!(
+            Val::from_nanbox(NanBox::number(2.5), ValType::F64),
+            Some(Val::F64(2.5))
+        );
+        assert_eq!(
+            Val::from_nanbox(NanBox::boolean(true), ValType::I32),
+            Some(Val::I32(1))
+        );
+        // A non-numeric JS value (null) is not coercible.
+        assert_eq!(Val::from_nanbox(NanBox::null(), ValType::I32), None);
+
+        // call_export_js: a WASM (i32,i32)->i32 add, invoked with JS numbers.
+        let body: Vec<u8> = vec![0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f]);
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x07, 0x07, 0x01, 0x03, b'a', b'd', b'd', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).unwrap();
+        let mut inst = Instance::new(&module).unwrap();
+        let out = inst
+            .call_export_js("add", &[NanBox::number(20.0), NanBox::number(22.0)])
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].unpack(), Unpacked::Number(42.0));
+        // A non-numeric JS argument is rejected at the boundary.
+        assert!(
+            inst.call_export_js("add", &[NanBox::null(), NanBox::number(1.0)])
+                .is_err()
+        );
+        // Wrong arity is rejected.
+        assert!(inst.call_export_js("add", &[NanBox::number(1.0)]).is_err());
     }
 
     #[test]
