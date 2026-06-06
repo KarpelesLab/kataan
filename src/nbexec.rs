@@ -246,6 +246,8 @@ const TYPED_ARRAY_KINDS: [(&str, u8); 9] = [
 ];
 const N_ARRAY_BUFFER: u16 = 177;
 const N_DATA_VIEW: u16 = 178;
+// `WebAssembly.validate` — decode a module and report well-formedness.
+const N_WASM_VALIDATE: u16 = 184;
 // `Object.prototype.*` methods (the receiver arrives as `this`).
 const N_OBJ_PROTO_TOSTRING: u16 = 179;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
@@ -615,6 +617,10 @@ impl<'a> Interp<'a> {
             let f = self.realm.new_native(id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
         }
+        // The `WebAssembly` namespace, backed by the in-house WASM engine
+        // (`wasm_rt`). `validate(bytes)` decodes a module and reports whether it
+        // is well-formed.
+        install_namespace(self, "WebAssembly", &[("validate", N_WASM_VALIDATE)]);
         // A minimal `Object.prototype` carrying the methods commonly invoked via
         // `Object.prototype.<m>.call(x)`. The receiver arrives as `this`.
         let obj_proto = self.realm.new_object();
@@ -1460,6 +1466,14 @@ impl<'a> Interp<'a> {
             // `Intl.NumberFormat(...)` / `Intl.DateTimeFormat(...)` called without
             // `new` build the same formatter object.
             N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => self.make_intl_formatter(id, args),
+            // `WebAssembly.validate(bytes)` — true iff `bytes` decodes to a
+            // well-formed module. Accepts an `ArrayBuffer` or a byte array.
+            N_WASM_VALIDATE => {
+                let ok = self
+                    .wasm_bytes(arg(0))
+                    .is_some_and(|b| crate::wasm_rt::Module::decode(&b).is_ok());
+                NanBox::boolean(ok)
+            }
             // `Object.prototype.*` methods — the receiver is `self.this_val`.
             N_OBJ_PROTO_TOSTRING => {
                 let this = self.this_val;
@@ -5714,6 +5728,28 @@ impl<'a> Interp<'a> {
 
     /// The tag used by `Object.prototype.toString` (`"[object <tag>]"`): a
     /// `Symbol.toStringTag` string property if present, else the built-in tag.
+    /// Extracts a byte vector from a JS `BufferSource`-ish value for the WASM
+    /// builtins: an `ArrayBuffer` (its `\0abytes` store) or a plain array of byte
+    /// numbers. Returns `None` if `v` isn't byte-like.
+    fn wasm_bytes(&self, v: NanBox) -> Option<Vec<u8>> {
+        let h = Handle::from_raw(v.as_handle()?);
+        // An ArrayBuffer keeps its bytes in a hidden array; fall back to treating
+        // the value itself as a byte array.
+        let arr = self
+            .realm
+            .get_property(h, ARRAY_BUFFER_BYTES)
+            .and_then(|b| b.as_handle())
+            .map(Handle::from_raw)
+            .unwrap_or(h);
+        let elems = self.realm.array_elements(arr)?;
+        Some(
+            elems
+                .iter()
+                .map(|e| e.as_number().unwrap_or(0.0) as u8)
+                .collect(),
+        )
+    }
+
     fn object_string_tag(&mut self, h: crate::heap::Handle) -> String {
         let tag_sym = self.well_known_symbol("toStringTag");
         let tag_key = self.member_key(tag_sym);
@@ -9849,6 +9885,18 @@ mod tests {
             run("let o={x:1}; Object.prototype.valueOf.call(o)===o"),
             "true"
         );
+    }
+
+    #[test]
+    fn webassembly_validate_builtin() {
+        assert_eq!(run("typeof WebAssembly"), "object");
+        assert_eq!(run("typeof WebAssembly.validate"), "function");
+        assert_eq!(
+            run("WebAssembly.validate([0,0x61,0x73,0x6d,1,0,0,0])"),
+            "true"
+        );
+        assert_eq!(run("WebAssembly.validate([0,0,0,0,1,0,0,0])"), "false");
+        assert_eq!(run("WebAssembly.validate([0,0x61])"), "false");
     }
 
     #[test]
