@@ -1274,7 +1274,7 @@ impl Module {
                 0xa3 => bin_f64!(|a, b| a / b),
                 0xa4 => bin_f64!(f64_min),
                 0xa5 => bin_f64!(f64_max),
-                // structured control: block / loop / if
+                // structured control: block / loop
                 0x02 | 0x03 => {
                     let _blocktype = r.byte()?; // 0x40 (empty) or a value type
                     let is_loop = op == 0x03;
@@ -1287,6 +1287,29 @@ impl Module {
                             // a `br 0` to a loop re-runs it; handled inside
                             // exec_block, so this arm is unreachable in practice.
                         }
+                        Flow::Branch(n) => return Ok(Flow::Branch(n.saturating_sub(1))),
+                        Flow::Normal => {}
+                    }
+                }
+                // if / else / end: pop the condition, run the chosen arm.
+                0x04 => {
+                    let _blocktype = r.byte()?;
+                    let cond = pop!().as_i32()? != 0;
+                    let body = &code[r.pos..];
+                    let inner_len = block_len(body)?; // includes the matching `end`
+                    let inner = &body[..inner_len - 1]; // exclude `end`
+                    let else_at = else_split(inner)?;
+                    let arm = if cond {
+                        &inner[..else_at.unwrap_or(inner.len())]
+                    } else {
+                        match else_at {
+                            Some(e) => &inner[e + 1..], // after the `else` byte
+                            None => &inner[inner.len()..],
+                        }
+                    };
+                    r.pos += inner_len;
+                    match self.exec(arm, locals, stack, store, host)? {
+                        Flow::Return => return Ok(Flow::Return),
                         Flow::Branch(n) => return Ok(Flow::Branch(n.saturating_sub(1))),
                         Flow::Normal => {}
                     }
@@ -1616,6 +1639,55 @@ enum Flow {
     Return,
     /// A `br`/`br_if` targeting the block `n` levels out.
     Branch(u32),
+}
+
+/// The byte offset of an `if` body's depth-0 `else` (0x05), or `None` if the `if`
+/// has no else clause. `code` is the if-body (sans the trailing `end`).
+fn else_split(code: &[u8]) -> Result<Option<usize>, WasmRtError> {
+    let mut r = Reader::new(code);
+    let mut depth = 0i32;
+    while !r.done() {
+        let at = r.pos;
+        let op = r.byte()?;
+        match op {
+            0x02..=0x04 => {
+                depth += 1;
+                r.byte()?; // blocktype
+            }
+            0x0b => depth -= 1, // end of a nested block (the body has no top `end`)
+            0x05 if depth == 0 => return Ok(Some(at)),
+            // Skip immediates so a literal `0x05` inside an operand isn't mistaken
+            // for an `else` (mirrors `block_len`).
+            0x20..=0x24 | 0x0c | 0x0d | 0x10 => {
+                r.u32()?;
+            }
+            0x11 => {
+                r.u32()?;
+                r.u32()?;
+            }
+            0x28..=0x3e => {
+                r.u32()?;
+                r.u32()?;
+            }
+            0x3f | 0x40 => {
+                r.byte()?;
+            }
+            0x41 => {
+                r.i32()?;
+            }
+            0x42 => {
+                r.i64()?;
+            }
+            0x43 => {
+                r.bytes(4)?;
+            }
+            0x44 => {
+                r.bytes(8)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 /// The byte length of a structured block's body up to and including its matching
@@ -2338,6 +2410,71 @@ mod tests {
             module.call(0, &[Val::I32(5)]).unwrap(),
             vec![Val::I32(expect)]
         );
+    }
+
+    #[test]
+    fn if_else_control_flow() {
+        // (func (export "abs") (param i32) (result i32)
+        //   local.get 0 i32.const 0 i32.lt_s   ;; n < 0 ?
+        //   if (result i32)
+        //     i32.const 0 local.get 0 i32.sub   ;; -n
+        //   else
+        //     local.get 0                       ;; n
+        //   end)
+        let body: Vec<u8> = vec![
+            0x00, 0x20, 0x00, 0x41, 0x00, 0x48, // n < 0
+            0x04, 0x7f, // if (result i32)
+            0x41, 0x00, 0x20, 0x00, 0x6b, // then: 0 - n
+            0x05, // else
+            0x20, 0x00, // n
+            0x0b, // end if
+            0x0b, // end func
+        ];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]); // (i32)->i32
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x07, 0x07, 0x01, 0x03, b'a', b'b', b's', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).expect("decode if/else module");
+        assert_eq!(module.call(0, &[Val::I32(-7)]).unwrap(), vec![Val::I32(7)]);
+        assert_eq!(module.call(0, &[Val::I32(5)]).unwrap(), vec![Val::I32(5)]);
+        assert_eq!(module.call(0, &[Val::I32(0)]).unwrap(), vec![Val::I32(0)]);
+
+        // An `if` with no else (the then-branch only runs when true).
+        // (func (export "clampneg") (param i32) (result i32)
+        //   local.get 0 local.get 0 i32.const 0 i32.lt_s
+        //   if  drop i32.const 0  end)   ;; if n<0 { return 0 } else keep n
+        // Simpler: push n; if (n<0) replace... use a local. Keep it minimal:
+        // (func (export "nz") (param i32) (result i32) (local i32)
+        //   local.get 0 local.set 1
+        //   local.get 0 if  i32.const 1 local.set 1  end
+        //   local.get 1)
+        let body2: Vec<u8> = vec![
+            0x01, 0x01, 0x7f, // 1 local: i32
+            0x20, 0x00, 0x21, 0x01, // l1 = arg
+            0x20, 0x00, // arg (cond)
+            0x04, 0x40, // if (no result)
+            0x41, 0x01, 0x21, 0x01, // l1 = 1
+            0x0b, // end if
+            0x20, 0x01, // l1
+            0x0b, // end func
+        ];
+        let mut m2 = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m2.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]);
+        m2.extend([0x03, 0x02, 0x01, 0x00]);
+        m2.extend([0x07, 0x06, 0x01, 0x02, b'n', b'z', 0x00, 0x00]);
+        m2.push(0x0a);
+        m2.push((body2.len() + 2) as u8);
+        m2.push(0x01);
+        m2.push(body2.len() as u8);
+        m2.extend(body2);
+        let module2 = Module::decode(&m2).expect("decode if-no-else module");
+        assert_eq!(module2.call(0, &[Val::I32(0)]).unwrap(), vec![Val::I32(0)]); // cond false
+        assert_eq!(module2.call(0, &[Val::I32(9)]).unwrap(), vec![Val::I32(1)]); // cond true
     }
 
     #[test]
