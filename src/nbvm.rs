@@ -335,6 +335,10 @@ struct Ctx<'a> {
     microtasks: alloc::collections::VecDeque<Microtask>,
     /// Per-function tiering state, keyed by function id.
     tiers: alloc::collections::BTreeMap<usize, TierState>,
+    /// Per-function native-code cache (Phase G JIT), keyed by function id.
+    /// `None` means "tried, not JIT-eligible". Present only where the JIT exists.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    jit_cache: alloc::collections::BTreeMap<usize, Option<alloc::rc::Rc<crate::jit::JitProto>>>,
     /// Function-call nesting depth (recursion guard).
     call_depth: usize,
 }
@@ -364,6 +368,8 @@ pub fn run_program(
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         tiers: alloc::collections::BTreeMap::new(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_cache: alloc::collections::BTreeMap::new(),
         call_depth: 0,
     };
     let value = call(&mut ctx, funcs, id, args)?;
@@ -386,6 +392,8 @@ pub fn run_program_capturing(
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         tiers: alloc::collections::BTreeMap::new(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_cache: alloc::collections::BTreeMap::new(),
         call_depth: 0,
     };
     let value = call(&mut ctx, funcs, id, args)?;
@@ -470,6 +478,28 @@ fn call_with_inner(
         Some(o) => o.as_slice(),
         None => proto.ops.as_slice(),
     };
+    // Native fast path (Phase G JIT): once a function is hot, try compiling it to
+    // machine code. Eligible functions are pure straight-line/looping integer
+    // arithmetic (no side effects), so running the native code is observationally
+    // equivalent to the interpreter; a non-integer/overflowing call deopts to
+    // `None` and we fall through to `run_frame`.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    if optimized.is_some() && !proto.is_async && proto.rest_from.is_none() && proto.n_captures == 0
+    {
+        let cached = match ctx.jit_cache.get(&id) {
+            Some(c) => c.clone(),
+            None => {
+                let compiled = crate::jit::JitProto::compile(&funcs[id]).map(alloc::rc::Rc::new);
+                ctx.jit_cache.insert(id, compiled.clone());
+                compiled
+            }
+        };
+        if let Some(jit) = cached
+            && let Some(result) = jit.call_guarded(args)
+        {
+            return Ok(result);
+        }
+    }
     // An `async` function: its synchronous body runs to completion, and its
     // result (or thrown value) settles a returned `Promise`. (No `await` yet —
     // a body that awaits falls back at compile time.)
@@ -507,6 +537,8 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         tiers: alloc::collections::BTreeMap::new(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_cache: alloc::collections::BTreeMap::new(),
         call_depth: 0,
     };
     Ok(run_frame(&mut ctx, &[], program, &mut regs)?.unwrap_or(NanBox::undefined()))
@@ -5331,6 +5363,40 @@ mod tests {
         let mut realm = Realm::new();
         let value = compile_and_run(&mut realm, &program).expect("compile+run");
         realm.to_display_string(value)
+    }
+
+    /// A hot integer function is called enough times to tier up; with the JIT
+    /// feature on Linux x86-64 it executes as native code, otherwise it stays in
+    /// the interpreter — either way the result must be identical.
+    #[test]
+    fn hot_integer_function_matches_interpreter() {
+        // f(i,2) = i*2 + i - 2 = 3i - 2; called 40 times (> TIER_UP_THRESHOLD).
+        // sum_{i=0..39}(3i - 2) = 3*780 - 80 = 2260.
+        assert_eq!(
+            bc("function f(a,b){ return a*b + a - b; } \
+                let t = 0; \
+                for (let i = 0; i < 40; i = i + 1) { t = t + f(i, 2); } \
+                t"),
+            "2260"
+        );
+        // A hot function that overflows the safe-integer range must still be
+        // correct (the JIT deopts to the interpreter when it would diverge).
+        assert_eq!(
+            bc("function sq(x){ return x*x; } \
+                let r = 0; \
+                for (let i = 0; i < 20; i = i + 1) { r = sq(100000000); } \
+                r"),
+            "10000000000000000"
+        );
+        // A hot function mixing integers and a non-integer argument: the call with
+        // a fractional value must yield the exact float result, not a deopt error.
+        assert_eq!(
+            bc("function g(a,b){ return a + b; } \
+                let s = 0; \
+                for (let i = 0; i < 30; i = i + 1) { s = g(i, 0.5); } \
+                s"),
+            "29.5"
+        );
     }
 
     #[test]
