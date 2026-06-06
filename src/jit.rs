@@ -132,6 +132,59 @@ pub enum BinOp2 {
     Xor,
 }
 
+/// A binary floating-point op for the float compiler. Unlike the integer path,
+/// `f64` arithmetic matches JS number semantics exactly, so no overflow/range
+/// guard is needed — and it supports division.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FBinOp {
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `/`
+    Div,
+}
+
+/// A floating-point register-machine instruction — straight-line `f64`
+/// arithmetic over a virtual-register file (each register an `f64` frame slot).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(missing_docs)] // field names mirror the IR
+pub enum FloatOp {
+    Arg { dst: u8, index: u8 },
+    Const { dst: u8, imm: f64 },
+    Bin { dst: u8, a: u8, b: u8, op: FBinOp },
+    Move { dst: u8, src: u8 },
+    Ret { src: u8 },
+}
+
+/// Interprets a [`FloatOp`] program — the oracle for [`JitFunction::compile_float`].
+#[must_use]
+pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
+    let mut regs = alloc::vec![0.0f64; n_regs];
+    for op in ops {
+        match *op {
+            FloatOp::Arg { dst, index } => {
+                regs[dst as usize] = args.get(index as usize).copied().unwrap_or(0.0);
+            }
+            FloatOp::Const { dst, imm } => regs[dst as usize] = imm,
+            FloatOp::Bin { dst, a, b, op } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                regs[dst as usize] = match op {
+                    FBinOp::Add => x + y,
+                    FBinOp::Sub => x - y,
+                    FBinOp::Mul => x * y,
+                    FBinOp::Div => x / y,
+                };
+            }
+            FloatOp::Move { dst, src } => regs[dst as usize] = regs[src as usize],
+            FloatOp::Ret { src } => return regs[src as usize],
+        }
+    }
+    0.0
+}
+
 /// A register-machine instruction over a flat virtual-register file — the model
 /// the bytecode VM uses. Each register is an `i64` slot in the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -677,6 +730,44 @@ impl X64Assembler {
         self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
+    // --- SSE2 scalar-double (f64) addressing, for the float compiler. `xmm0` is
+    // the accumulator; f64 args arrive in `xmm0..xmm3`; the result returns in
+    // `xmm0`. ModRM `0x85` selects `[rbp + disp32]` with reg field `xmm0`. ---
+
+    /// `movsd xmm0, [rbp+disp]`.
+    pub fn movsd_xmm0_mem(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0xf2, 0x0f, 0x10, 0x85]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `movsd [rbp+disp], xmm0`.
+    pub fn movsd_mem_xmm0(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0xf2, 0x0f, 0x11, 0x85]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `movsd [rbp+disp], xmm<arg>` — spill incoming f64 arg `arg` (0..=3) to a
+    /// frame slot.
+    pub fn store_arg_f64(&mut self, arg: usize, disp: i32) {
+        let modrm = match arg {
+            0 => 0x85,
+            1 => 0x8d,
+            2 => 0x95,
+            _ => 0x9d,
+        };
+        self.code.extend_from_slice(&[0xf2, 0x0f, 0x11, modrm]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `<addsd|subsd|mulsd|divsd> xmm0, [rbp+disp]`.
+    pub fn fbin_xmm0_mem(&mut self, op: FBinOp, disp: i32) {
+        let opcode = match op {
+            FBinOp::Add => 0x58,
+            FBinOp::Sub => 0x5c,
+            FBinOp::Mul => 0x59,
+            FBinOp::Div => 0x5e,
+        };
+        self.code.extend_from_slice(&[0xf2, 0x0f, opcode, 0x85]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
     /// `mov rax, rdi` — seed the accumulator with the first argument.
     pub fn mov_rax_rdi(&mut self) {
         self.code.extend_from_slice(&[0x48, 0x89, 0xf8]);
@@ -1029,6 +1120,100 @@ impl JitFunction {
         a.movabs_rax(i64::MAX);
         a.epilogue();
         Self::from_code(&a.finish())
+    }
+
+    /// Compiles a straight-line [`FloatOp`] program to a native `fn(f64…) -> f64`
+    /// (up to 4 `f64` args), homing each of `n_regs` registers to an `f64` frame
+    /// slot and computing in `xmm0` with SSE2. Unlike the integer path this needs
+    /// no overflow/range guard — `f64` arithmetic already matches JS numbers — and
+    /// it supports division. Returns `None` on the unavailable target, `>64`
+    /// registers, `>4` args, or a malformed program (bad index / no `Ret`).
+    #[must_use]
+    pub fn compile_float(n_regs: usize, n_args: usize, ops: &[FloatOp]) -> Option<Self> {
+        if n_regs > 64 || n_args > 4 {
+            return None;
+        }
+        let ok = |r: u8| (r as usize) < n_regs;
+        let disp = |r: u8| -((i32::from(r) + 1) * 8);
+        let frame = ((n_regs as u32 * 8) + 15) & !15;
+        let mut a = X64Assembler::new();
+        a.prologue(frame);
+        let mut has_ret = false;
+        for op in ops {
+            match *op {
+                FloatOp::Arg { dst, index } => {
+                    if !ok(dst) || index as usize >= n_args {
+                        return None;
+                    }
+                    a.store_arg_f64(index as usize, disp(dst));
+                }
+                FloatOp::Const { dst, imm } => {
+                    if !ok(dst) {
+                        return None;
+                    }
+                    // Store the constant's bit pattern into the slot.
+                    a.movabs_rax(imm.to_bits() as i64);
+                    a.store_rax(disp(dst));
+                }
+                FloatOp::Bin {
+                    dst,
+                    a: ra,
+                    b: rb,
+                    op,
+                } => {
+                    if !ok(dst) || !ok(ra) || !ok(rb) {
+                        return None;
+                    }
+                    a.movsd_xmm0_mem(disp(ra));
+                    a.fbin_xmm0_mem(op, disp(rb));
+                    a.movsd_mem_xmm0(disp(dst));
+                }
+                FloatOp::Move { dst, src } => {
+                    if !ok(dst) || !ok(src) {
+                        return None;
+                    }
+                    a.movsd_xmm0_mem(disp(src));
+                    a.movsd_mem_xmm0(disp(dst));
+                }
+                FloatOp::Ret { src } => {
+                    if !ok(src) {
+                        return None;
+                    }
+                    a.movsd_xmm0_mem(disp(src)); // result in xmm0
+                    a.epilogue();
+                    has_ret = true;
+                    break;
+                }
+            }
+        }
+        if !has_ret {
+            return None;
+        }
+        Self::from_code(&a.finish())
+    }
+
+    /// Calls a compiled float function with up to 4 `f64` arguments.
+    #[must_use]
+    pub fn call_args_f64(&self, args: &[f64]) -> f64 {
+        let mut a = [0.0f64; 4];
+        for (slot, v) in a.iter_mut().zip(args.iter()) {
+            *slot = *v;
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            // SAFETY: the compiled code follows the System V ABI for
+            // `extern "C" fn(f64 x4) -> f64` (args in xmm0..xmm3, result in xmm0);
+            // unused register args are ignored by the callee.
+            #[allow(unsafe_code)]
+            let f: extern "C" fn(f64, f64, f64, f64) -> f64 =
+                unsafe { core::mem::transmute(self.buf.ptr()) };
+            f(a[0], a[1], a[2], a[3])
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            let _ = a;
+            unreachable!("JitFunction cannot be constructed on this target")
+        }
     }
 
     /// Calls a compiled register-machine function with up to 6 `i64` arguments.
@@ -1620,6 +1805,76 @@ mod tests {
         assert!(JitFunction::compile_reg(2, 1, &[RegOp::Const { dst: 0, imm: 1 }]).is_none());
         // Arg index beyond declared args.
         assert!(JitFunction::compile_reg(2, 1, &[RegOp::Arg { dst: 0, index: 3 }]).is_none());
+    }
+
+    #[test]
+    fn float_jit_compiles_and_runs_with_division() {
+        // f(a, b) = (a + b) * a / b  — exercises SSE add/mul/div with non-integer
+        // values, which the integer path can't handle.
+        let ops = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Arg { dst: 1, index: 1 },
+            FloatOp::Bin {
+                dst: 2,
+                a: 0,
+                b: 1,
+                op: FBinOp::Add,
+            },
+            FloatOp::Bin {
+                dst: 2,
+                a: 2,
+                b: 0,
+                op: FBinOp::Mul,
+            },
+            FloatOp::Bin {
+                dst: 2,
+                a: 2,
+                b: 1,
+                op: FBinOp::Div,
+            },
+            FloatOp::Ret { src: 2 },
+        ];
+        let oracle = |a: f64, b: f64| (a + b) * a / b;
+        for (a, b) in [(1.5, 2.5), (10.0, 4.0), (-3.5, 0.5), (7.0, 7.0), (0.1, 0.3)] {
+            assert!((eval_float(&ops, 3, &[a, b]) - oracle(a, b)).abs() < 1e-12);
+            if let Some(f) = JitFunction::compile_float(3, 2, &ops) {
+                let got = f.call_args_f64(&[a, b]);
+                assert!(
+                    (got - oracle(a, b)).abs() < 1e-12,
+                    "jit f64 ({a},{b}): {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn float_jit_constants() {
+        // f(x) = x * 0.5 + 1.25
+        let ops = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Const { dst: 1, imm: 0.5 },
+            FloatOp::Const { dst: 2, imm: 1.25 },
+            FloatOp::Bin {
+                dst: 0,
+                a: 0,
+                b: 1,
+                op: FBinOp::Mul,
+            },
+            FloatOp::Bin {
+                dst: 0,
+                a: 0,
+                b: 2,
+                op: FBinOp::Add,
+            },
+            FloatOp::Ret { src: 0 },
+        ];
+        for x in [4.0, -2.0, 0.0, 100.5] {
+            let expect = x * 0.5 + 1.25;
+            assert_eq!(eval_float(&ops, 3, &[x]), expect);
+            if let Some(f) = JitFunction::compile_float(3, 1, &ops) {
+                assert_eq!(f.call_args_f64(&[x]), expect, "const f64 ({x})");
+            }
+        }
     }
 
     #[test]
