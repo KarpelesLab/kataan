@@ -1959,6 +1959,28 @@ mod tests {
     }
 
     #[test]
+    fn spec_loop_with_back_edge() {
+        // A `loop` + `br_if` back-edge: sum 1..=n by counting down. Exercises a
+        // branch target landing at the loop header (a backward jump).
+        let script = "(module \
+            (func (export \"sum\") (param $n i32) (result i32) \
+              (local $acc i32) \
+              (block $break \
+                (loop $cont \
+                  (br_if $break (i32.eqz (local.get $n))) \
+                  (local.set $acc (i32.add (local.get $acc) (local.get $n))) \
+                  (local.set $n (i32.sub (local.get $n) (i32.const 1))) \
+                  (br $cont))) \
+              (local.get $acc))) \
+            (assert_return (invoke \"sum\" (i32.const 5)) (i32.const 15)) \
+            (assert_return (invoke \"sum\" (i32.const 10)) (i32.const 55)) \
+            (assert_return (invoke \"sum\" (i32.const 0)) (i32.const 0)) \
+            (assert_return (invoke \"sum\" (i32.const 1)) (i32.const 1))";
+        let n = run_wast(script).expect("loop back-edge conformance passes");
+        assert_eq!(n, 4);
+    }
+
+    #[test]
     fn spec_typed_if_and_block_results() {
         // `if (result i32) (then …) (else …)` yields a value from the taken arm; a
         // `block (result i32)` yields the value left on its stack.
