@@ -1959,6 +1959,25 @@ mod tests {
     }
 
     #[test]
+    fn spec_reinterpret_and_promote_demote() {
+        // Bit-preserving reinterpret round-trips and the f32<->f64 width changes.
+        let script = "(module \
+            (func (export \"f2i\") (param f32) (result i32) (i32.reinterpret_f32 (local.get 0))) \
+            (func (export \"i2f\") (param i32) (result f32) (f32.reinterpret_i32 (local.get 0))) \
+            (func (export \"d2i\") (param f64) (result i64) (i64.reinterpret_f64 (local.get 0))) \
+            (func (export \"promote\") (param f32) (result f64) (f64.promote_f32 (local.get 0))) \
+            (func (export \"demote\") (param f64) (result f32) (f32.demote_f64 (local.get 0)))) \
+            (assert_return (invoke \"f2i\" (f32.const 1.0)) (i32.const 0x3f800000)) \
+            (assert_return (invoke \"i2f\" (i32.const 0x40490fdb)) (f32.const 3.14159274)) \
+            (assert_return (invoke \"d2i\" (f64.const 1.0)) (i64.const 0x3ff0000000000000)) \
+            (assert_return (invoke \"promote\" (f32.const 1.5)) (f64.const 1.5)) \
+            (assert_return (invoke \"demote\" (f64.const 1.5)) (f32.const 1.5)) \
+            (assert_return (invoke \"f2i\" (f32.const nan)) (i32.const 0x7fc00000))";
+        let n = run_wast(script).expect("reinterpret/promote/demote conformance passes");
+        assert_eq!(n, 6);
+    }
+
+    #[test]
     fn spec_br_table_and_nested_control() {
         // `br_table` indexes a label vector (clamping out-of-range to the default),
         // and `br`/`br_if` to an outer block/loop exit through nesting.
