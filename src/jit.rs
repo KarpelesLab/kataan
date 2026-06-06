@@ -196,6 +196,11 @@ pub enum FloatOp {
     Jump {
         target: usize,
     },
+    /// `reg[dst] = -reg[a]` — float unary minus (`0.0 - x`).
+    Neg {
+        dst: u8,
+        a: u8,
+    },
     Ret {
         src: u8,
     },
@@ -242,6 +247,10 @@ pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
                 }
             }
             FloatOp::Jump { target } => pc = target,
+            FloatOp::Neg { dst, a } => {
+                regs[dst as usize] = -regs[a as usize];
+                pc += 1;
+            }
             FloatOp::Ret { src } => return regs[src as usize],
         }
     }
@@ -1340,6 +1349,13 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                 written[*dst as usize] = true;
                 FloatOp::Lt { dst: d, a, b }
             }
+            // Float unary minus `-x` (`0.0 - x`).
+            Op::Neg { dst, a } => {
+                let a = read(&written, *a)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                FloatOp::Neg { dst: d, a }
+            }
             // Targets are nbvm op indices; the lowered stream prepends one `Arg`
             // per parameter, so each target shifts by `n_params`.
             Op::JumpIfFalse { cond, target } => FloatOp::JumpIfFalse {
@@ -1850,6 +1866,10 @@ impl X64Assembler {
     /// `xorpd xmm1, xmm1` — set `xmm1` to `+0.0`.
     pub fn zero_xmm1(&mut self) {
         self.code.extend_from_slice(&[0x66, 0x0f, 0x57, 0xc9]);
+    }
+    /// `xorpd xmm0, xmm0` — set `xmm0` to `+0.0`.
+    pub fn zero_xmm0(&mut self) {
+        self.code.extend_from_slice(&[0x66, 0x0f, 0x57, 0xc0]);
     }
     /// `ucomisd xmm0, xmm1`.
     pub fn ucomisd_xmm0_xmm1(&mut self) {
@@ -2458,6 +2478,15 @@ impl JitFunction {
                         return None;
                     }
                     a.jmp(labels[target]);
+                }
+                FloatOp::Neg { dst, a: ra } => {
+                    if !ok(dst) || !ok(ra) {
+                        return None;
+                    }
+                    // -x == 0.0 - x (NaN/∞ propagate correctly).
+                    a.zero_xmm0();
+                    a.fbin_xmm0_mem(FBinOp::Sub, disp(ra));
+                    a.movsd_mem_xmm0(disp(dst));
                 }
                 FloatOp::Ret { src } => {
                     if !ok(src) {
@@ -3803,6 +3832,30 @@ mod tests {
         }
         // B itself still works (its code wasn't disturbed).
         assert_eq!(b.call1(21), 42);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn float_neg_compiles_and_runs() {
+        // f(x) = -x + 1.5  (negation on the float path).
+        let ops = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Neg { dst: 1, a: 0 },
+            FloatOp::Const { dst: 2, imm: 1.5 },
+            FloatOp::Bin {
+                dst: 3,
+                a: 1,
+                b: 2,
+                op: FBinOp::Add,
+            },
+            FloatOp::Ret { src: 3 },
+        ];
+        let f = JitFunction::compile_float(4, 1, &ops).unwrap();
+        for x in [0.0f64, 2.5, -3.25, 100.0] {
+            let expect = -x + 1.5;
+            assert_eq!(f.call_args_f64(&[x]), expect, "-{x} + 1.5");
+            assert_eq!(eval_float(&ops, 4, &[x]), expect);
+        }
     }
 
     #[test]

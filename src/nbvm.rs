@@ -5621,6 +5621,15 @@ mod tests {
             ),
             "7.5"
         );
+        // A hot float function using unary minus on a fractional value (the float
+        // path's `Neg`): g(x) = -x + 0.5; sum of g(0.5) over 25 calls = 0.
+        assert_eq!(
+            bc("function g(x){ return -x + 0.5; } \
+                let s = 0; \
+                for (let i = 0; i < 25; i = i + 1) { s = g(0.5); } \
+                s"),
+            "0"
+        );
     }
 
     #[test]
