@@ -416,10 +416,7 @@ fn emit_op(
     match name {
         "i32.const" | "i64.const" => {
             out.push(if name == "i32.const" { 0x41 } else { 0x42 });
-            let n = imm
-                .ok_or("const needs a value")?
-                .parse::<i128>()
-                .map_err(|_| "bad const")? as i64;
+            let n = parse_wat_int(imm.ok_or("const needs a value")?)?;
             leb_i(n, out);
         }
         "f32.const" => {
@@ -1191,6 +1188,33 @@ fn section(id: u8, content: &[u8], out: &mut Vec<u8>) {
 }
 
 /// Parses a `(TYPE.const N)` value expression into a [`Val`].
+/// Parses a WAT integer literal: optional sign, optional `0x` hex, and `_`
+/// digit separators (e.g. `-0x8000_0000`, `4_294_967_295`). The value is parsed
+/// wide (`i128`) then truncated to the i64 the const opcode stores.
+fn parse_wat_int(s: &str) -> Result<i64, String> {
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let clean = body.replace('_', "");
+    let mag = if let Some(hex) = clean
+        .strip_prefix("0x")
+        .or_else(|| clean.strip_prefix("0X"))
+    {
+        u128::from_str_radix(hex, 16).map_err(|_| format!("bad integer {s}"))?
+    } else {
+        clean
+            .parse::<u128>()
+            .map_err(|_| format!("bad integer {s}"))?
+    };
+    // Wrap into i64 range (wast allows both signed and unsigned spellings).
+    Ok(if neg {
+        (mag as i128).wrapping_neg() as i64
+    } else {
+        mag as i64
+    })
+}
+
 fn parse_const(s: &Sexpr) -> Result<Val, String> {
     let Sexpr::List(items) = s else {
         return Err(String::from("expected (type.const N)"));
@@ -1198,12 +1222,7 @@ fn parse_const(s: &Sexpr) -> Result<Val, String> {
     let (Some(Sexpr::Atom(ty)), Some(Sexpr::Atom(n))) = (items.first(), items.get(1)) else {
         return Err(String::from("malformed const"));
     };
-    let parse_i = |s: &str| -> Result<i64, String> {
-        // wast allows unsigned literals; parse as i128 then truncate.
-        s.parse::<i128>()
-            .map(|v| v as i64)
-            .map_err(|_| format!("bad integer {s}"))
-    };
+    let parse_i = |s: &str| -> Result<i64, String> { parse_wat_int(s) };
     let parse_f = |s: &str| -> Result<f64, String> {
         match s {
             // The suite's `nan:canonical` / `nan:arithmetic` (and bare `nan`,
@@ -1709,6 +1728,26 @@ mod tests {
     }
 
     #[test]
+    fn wat_hex_and_underscore_int_literals() {
+        // Hex (`0x…`) and `_`-separated literals — the upstream `.wast` spelling.
+        let script = "(module \
+            (func (export \"k\") (result i32) (i32.const 0xff)) \
+            (func (export \"big\") (result i32) (i32.const 0xffff_ffff)) \
+            (func (export \"sep\") (result i32) (i32.const 1_000_000)) \
+            (func (export \"neg\") (result i32) (i32.const -0x80000000))) \
+            (assert_return (invoke \"k\")   (i32.const 255)) \
+            (assert_return (invoke \"big\") (i32.const -1)) \
+            (assert_return (invoke \"sep\") (i32.const 1000000)) \
+            (assert_return (invoke \"neg\") (i32.const -2147483648))";
+        let n = run_wast(script).expect("hex/underscore literals parse");
+        assert_eq!(n, 4);
+        // Direct parser check.
+        assert_eq!(parse_wat_int("0x10").unwrap(), 16);
+        assert_eq!(parse_wat_int("-0x1").unwrap(), -1);
+        assert_eq!(parse_wat_int("4_294_967_295").unwrap(), 4_294_967_295);
+    }
+
+    #[test]
     fn spec_bulk_memory_fill_and_copy() {
         // fill writes a byte run; copy moves a (possibly overlapping) run; both trap
         // out of bounds. `ld` reads a byte back.
@@ -1719,12 +1758,12 @@ mod tests {
             (func (export \"copy\") (param i32 i32 i32) \
               (memory.copy (local.get 0) (local.get 1) (local.get 2))) \
             (func (export \"ld\") (param i32) (result i32) (i32.load8_u (local.get 0)))) \
-            (invoke \"fill\" (i32.const 10) (i32.const 171) (i32.const 4)) \
-            (assert_return (invoke \"ld\" (i32.const 10)) (i32.const 171)) \
-            (assert_return (invoke \"ld\" (i32.const 13)) (i32.const 171)) \
+            (invoke \"fill\" (i32.const 10) (i32.const 0xab) (i32.const 4)) \
+            (assert_return (invoke \"ld\" (i32.const 10)) (i32.const 0xab)) \
+            (assert_return (invoke \"ld\" (i32.const 13)) (i32.const 0xab)) \
             (assert_return (invoke \"ld\" (i32.const 14)) (i32.const 0)) \
             (invoke \"copy\" (i32.const 20) (i32.const 10) (i32.const 4)) \
-            (assert_return (invoke \"ld\" (i32.const 22)) (i32.const 171)) \
+            (assert_return (invoke \"ld\" (i32.const 22)) (i32.const 0xab)) \
             (assert_trap   (invoke \"fill\" (i32.const 65534) (i32.const 1) (i32.const 4)))";
         let n = run_wast(script).expect("bulk-memory conformance passes");
         assert_eq!(n, 7);
