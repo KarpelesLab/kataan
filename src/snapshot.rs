@@ -83,6 +83,15 @@ pub enum SnapCell {
         /// the trap handler
         handler: SnapVal,
     },
+    /// a `RegExp`: its source, flags, and current `lastIndex`.
+    RegExp {
+        /// the pattern source
+        source: String,
+        /// the flag string (e.g. `"gi"`)
+        flags: String,
+        /// the stateful `lastIndex` search position
+        last_index: usize,
+    },
 }
 
 /// One captured scope frame: its `(name, value, is_const)` bindings.
@@ -133,6 +142,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             || realm.collection_is_set(*r).is_some()
             || realm.promise_state(*r).is_some()
             || realm.proxy_at(*r).is_some()
+            || realm.regexp_at(*r).is_some()
             || realm.array_elements(*r).is_some()
             || realm.object_keys(*r).is_some();
         if serializable {
@@ -205,6 +215,12 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                 &mut intern,
             );
             SnapCell::Proxy { target, handler }
+        } else if let Some((source, flags)) = realm.regexp_at(h) {
+            SnapCell::RegExp {
+                source,
+                flags,
+                last_index: realm.regex_last_index(h),
+            }
         } else if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
             let vals = elems
                 .iter()
@@ -301,6 +317,15 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 let d = realm.new_object();
                 (realm.new_proxy(d, d), None)
             }
+            SnapCell::RegExp {
+                source,
+                flags,
+                last_index,
+            } => {
+                let h = realm.new_regexp(source, flags);
+                realm.set_regex_last_index(h, *last_index);
+                (h, None)
+            }
         };
         handles.push(h);
         fn_chains.push(chain);
@@ -376,6 +401,8 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                     realm.proxy_set_targets(*h, Handle::from_raw(t), Handle::from_raw(hd));
                 }
             }
+            // A `RegExp` is fully materialized in pass 1 (no references to fill).
+            SnapCell::RegExp { .. } => {}
         }
     }
 
@@ -501,6 +528,16 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                 w_val(target, &mut out);
                 w_val(handler, &mut out);
             }
+            SnapCell::RegExp {
+                source,
+                flags,
+                last_index,
+            } => {
+                out.push(9);
+                w_str(source, &mut out);
+                w_str(flags, &mut out);
+                w_u32(*last_index as u32, &mut out);
+            }
         }
     }
     out
@@ -625,6 +662,16 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                 let target = r.val()?;
                 let handler = r.val()?;
                 SnapCell::Proxy { target, handler }
+            }
+            9 => {
+                let source = r.string()?;
+                let flags = r.string()?;
+                let last_index = r.u32()? as usize;
+                SnapCell::RegExp {
+                    source,
+                    flags,
+                    last_index,
+                }
             }
             t => return Err(SnapError::BadTag(t)),
         };
@@ -1145,6 +1192,30 @@ mod tests {
             realm2.string_value(Handle::from_raw(obj_tag.as_handle().unwrap())),
             Some(String::from("cap"))
         );
+    }
+
+    #[test]
+    fn snapshots_regexps() {
+        let mut realm = Realm::new();
+        // A RegExp with flags and an advanced lastIndex, reachable from an object.
+        let re = realm.new_regexp("\\d+", "gi");
+        realm.set_regex_last_index(re, 7);
+        let obj = realm.new_object();
+        realm.set_property(obj, "re", NanBox::handle(re.to_raw()));
+
+        let snap = capture(&realm, &[obj]);
+        let bytes = serialize(&snap);
+        let reloaded = deserialize(&bytes).expect("deserialize");
+        assert_eq!(reloaded, snap);
+        let mut realm2 = Realm::new();
+        let o2 = restore(&mut realm2, &reloaded)[0];
+
+        let re2 = Handle::from_raw(realm2.get_property(o2, "re").unwrap().as_handle().unwrap());
+        assert_eq!(
+            realm2.regexp_at(re2),
+            Some((String::from("\\d+"), String::from("gi")))
+        );
+        assert_eq!(realm2.regex_last_index(re2), 7, "lastIndex survives");
     }
 
     #[test]
