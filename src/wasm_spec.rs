@@ -1961,6 +1961,31 @@ mod tests {
     }
 
     #[test]
+    fn spec_integer_bit_ops() {
+        // Rotation and bit-counting ops on i32/i64.
+        let script = "(module \
+            (func (export \"rotl\") (param i32 i32) (result i32) \
+              (i32.rotl (local.get 0) (local.get 1))) \
+            (func (export \"rotr\") (param i32 i32) (result i32) \
+              (i32.rotr (local.get 0) (local.get 1))) \
+            (func (export \"popcnt\") (param i32) (result i32) (i32.popcnt (local.get 0))) \
+            (func (export \"clz\") (param i32) (result i32) (i32.clz (local.get 0))) \
+            (func (export \"ctz\") (param i32) (result i32) (i32.ctz (local.get 0))) \
+            (func (export \"popcnt64\") (param i64) (result i64) (i64.popcnt (local.get 0)))) \
+            (assert_return (invoke \"rotl\" (i32.const 1) (i32.const 4)) (i32.const 16)) \
+            (assert_return (invoke \"rotl\" (i32.const -2147483648) (i32.const 1)) (i32.const 1)) \
+            (assert_return (invoke \"rotr\" (i32.const 16) (i32.const 4)) (i32.const 1)) \
+            (assert_return (invoke \"rotr\" (i32.const 1) (i32.const 1)) (i32.const -2147483648)) \
+            (assert_return (invoke \"popcnt\" (i32.const 255)) (i32.const 8)) \
+            (assert_return (invoke \"clz\" (i32.const 1)) (i32.const 31)) \
+            (assert_return (invoke \"clz\" (i32.const 0)) (i32.const 32)) \
+            (assert_return (invoke \"ctz\" (i32.const 8)) (i32.const 3)) \
+            (assert_return (invoke \"popcnt64\" (i64.const -1)) (i64.const 64))";
+        let n = run_wast(script).expect("integer bit-op conformance passes");
+        assert_eq!(n, 9);
+    }
+
+    #[test]
     fn spec_unreachable_traps_and_nop() {
         // `unreachable` always traps; `nop` does nothing; a guarded `unreachable`
         // only traps on the taken branch (so `nop` paths still return).
