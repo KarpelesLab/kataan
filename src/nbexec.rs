@@ -828,7 +828,14 @@ impl<'a> Interp<'a> {
                         self.realm.bigint_at(h).unwrap_or_default()
                     }
                 } else {
-                    crate::bignum::BigInt::from_i128(self.realm.to_number(v) as i128)
+                    // From a number: only an exact integer converts; a fractional
+                    // or non-finite value is a `RangeError` (`BigInt(1.5)` throws).
+                    let num = self.realm.to_number(v);
+                    if !num.is_finite() || num != (num as i128) as f64 {
+                        let m = self.new_str("The number is not a safe integer");
+                        return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                    }
+                    crate::bignum::BigInt::from_i128(num as i128)
                 };
                 NanBox::handle(self.realm.new_bigint(n).to_raw())
             }
