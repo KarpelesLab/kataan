@@ -201,6 +201,12 @@ pub enum FloatOp {
         dst: u8,
         a: u8,
     },
+    /// `reg[dst] = !reg[a]` — JS logical-not: `1.0` if `reg[a]` is falsy (`±0.0`
+    /// or `NaN`), else `0.0`. (`ucomisd x, 0` sets ZF for both equal and NaN.)
+    Eqz {
+        dst: u8,
+        a: u8,
+    },
     Ret {
         src: u8,
     },
@@ -249,6 +255,11 @@ pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
             FloatOp::Jump { target } => pc = target,
             FloatOp::Neg { dst, a } => {
                 regs[dst as usize] = -regs[a as usize];
+                pc += 1;
+            }
+            FloatOp::Eqz { dst, a } => {
+                let x = regs[a as usize];
+                regs[dst as usize] = f64::from(u8::from(x == 0.0 || x.is_nan()));
                 pc += 1;
             }
             FloatOp::Ret { src } => return regs[src as usize],
@@ -1355,6 +1366,13 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                 let d = reg8(*dst)?;
                 written[*dst as usize] = true;
                 FloatOp::Neg { dst: d, a }
+            }
+            // Float logical-not `!x` — so `<=`/`>=`/`!==` (Lt/StrictEq + Not) JIT.
+            Op::Not { dst, a } => {
+                let a = read(&written, *a)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                FloatOp::Eqz { dst: d, a }
             }
             // Targets are nbvm op indices; the lowered stream prepends one `Arg`
             // per parameter, so each target shifts by `n_params`.
@@ -2486,6 +2504,19 @@ impl JitFunction {
                     // -x == 0.0 - x (NaN/∞ propagate correctly).
                     a.zero_xmm0();
                     a.fbin_xmm0_mem(FBinOp::Sub, disp(ra));
+                    a.movsd_mem_xmm0(disp(dst));
+                }
+                FloatOp::Eqz { dst, a: ra } => {
+                    if !ok(dst) || !ok(ra) {
+                        return None;
+                    }
+                    // `!x`: `ucomisd x, 0` sets ZF when x == 0 *or* x is NaN — both
+                    // the JS-falsy cases — so `sete` is exactly `!x`. → 0.0/1.0.
+                    a.movsd_xmm0_mem(disp(ra));
+                    a.zero_xmm1();
+                    a.ucomisd_xmm0_xmm1();
+                    a.sete_rax();
+                    a.cvtsi2sd_xmm0_rax();
                     a.movsd_mem_xmm0(disp(dst));
                 }
                 FloatOp::Ret { src } => {
@@ -3832,6 +3863,23 @@ mod tests {
         }
         // B itself still works (its code wasn't disturbed).
         assert_eq!(b.call1(21), 42);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn float_eqz_handles_zero_and_nan() {
+        // f(x) = !x  (1.0 for falsy x: ±0.0 or NaN; else 0.0).
+        let ops = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Eqz { dst: 1, a: 0 },
+            FloatOp::Ret { src: 1 },
+        ];
+        let f = JitFunction::compile_float(2, 1, &ops).unwrap();
+        for x in [0.0f64, -0.0, 1.5, -3.0, f64::NAN, f64::INFINITY] {
+            let expect = if x == 0.0 || x.is_nan() { 1.0 } else { 0.0 };
+            assert_eq!(f.call_args_f64(&[x]), expect, "!{x}");
+            assert_eq!(eval_float(&ops, 2, &[x]), expect);
+        }
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

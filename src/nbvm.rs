@@ -5630,6 +5630,15 @@ mod tests {
                 s"),
             "0"
         );
+        // A hot float function using `<=` (Lt + Not → the float path's `Eqz`):
+        // count how many of 0,0.5,..,9.5 are <= 4.5 → 10.
+        assert_eq!(
+            bc("function le(a,b){ return a <= b ? 1 : 0; } \
+                let c = 0; \
+                for (let x = 0.0; x < 10.0; x = x + 0.5) { c = c + le(x, 4.5); } \
+                c"),
+            "10"
+        );
     }
 
     #[test]
