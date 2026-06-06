@@ -140,8 +140,11 @@ pub struct Module {
     exports: Vec<(alloc::string::String, u32)>,
     /// Linear memory minimum size, in 64 KiB pages (`None` = no memory).
     mem_min_pages: Option<u32>,
-    /// Active data segments: `(constant byte offset, bytes)`.
-    data: Vec<(u32, Vec<u8>)>,
+    /// Data segments in declaration order: `(offset, bytes)`. `Some(off)` is an
+    /// *active* segment applied at instantiation; `None` is a *passive* segment,
+    /// copied on demand by `memory.init`. Both are indexed by `memory.init` /
+    /// `data.drop`.
+    data: Vec<(Option<u32>, Vec<u8>)>,
     /// Module globals: `(initial value, mutable)`.
     globals: Vec<(Val, bool)>,
     /// The function table (`funcref`): each slot is a function index, or `None`
@@ -180,6 +183,9 @@ const PAGE_SIZE: usize = 65536;
 struct Store {
     mem: Vec<u8>,
     globals: Vec<Val>,
+    /// Per data segment: `true` once `data.drop` has run (its bytes are released,
+    /// so a later `memory.init` of a non-zero length traps).
+    dropped: Vec<bool>,
 }
 
 /// LEB128 cursor over a byte slice.
@@ -1302,14 +1308,22 @@ impl Module {
         let count = s.u32()?;
         for _ in 0..count {
             let mode = s.u32()?;
-            // Mode 0 = active, memory 0, with an `i32.const off; end` offset expr.
-            if mode != 0 {
-                return Err(WasmRtError("unsupported data segment mode"));
-            }
-            let off = read_const_i32_expr(s)?;
+            // 0 = active (memory 0, offset expr); 1 = passive (bytes only);
+            // 2 = active with an explicit memory index (which must be 0 here).
+            let off = match mode {
+                0 => Some(read_const_i32_expr(s)? as u32),
+                1 => None,
+                2 => {
+                    if s.u32()? != 0 {
+                        return Err(WasmRtError("data segment: memory index must be 0"));
+                    }
+                    Some(read_const_i32_expr(s)? as u32)
+                }
+                _ => return Err(WasmRtError("unsupported data segment mode")),
+            };
             let len = s.u32()? as usize;
             let bytes = s.bytes(len)?.to_vec();
-            m.data.push((off as u32, bytes));
+            m.data.push((off, bytes));
         }
         Ok(())
     }
@@ -1374,6 +1388,9 @@ impl Module {
         let pages = self.mem_min_pages.unwrap_or(0) as usize;
         let mut mem = alloc::vec![0u8; pages * PAGE_SIZE];
         for (off, bytes) in &self.data {
+            // Only active segments are applied here; passive ones wait for
+            // `memory.init`.
+            let Some(off) = off else { continue };
             let start = *off as usize;
             let end = start
                 .checked_add(bytes.len())
@@ -1389,7 +1406,14 @@ impl Module {
             .map(|(_, _, t, _)| zero_val(*t))
             .collect();
         globals.extend(self.globals.iter().map(|(v, _)| *v));
-        Ok(Store { mem, globals })
+        // Active segments are applied above and then immediately dropped (per spec);
+        // passive segments stay live until an explicit `data.drop`.
+        let dropped: Vec<bool> = self.data.iter().map(|(off, _)| off.is_some()).collect();
+        Ok(Store {
+            mem,
+            globals,
+            dropped,
+        })
     }
 
     /// Calls function `index` with `args` over a fresh instance, dispatching any
@@ -2273,6 +2297,39 @@ impl Module {
                                 _ => return Err(WasmRtError("out of bounds memory access")),
                             }
                         }
+                        0x08 => {
+                            // memory.init: data segment index, reserved memory index,
+                            // then n/src/dst. Copies from the (passive) segment bytes.
+                            let seg = r.u32()? as usize;
+                            r.byte()?;
+                            let n = pop!().as_i32()? as u32 as usize;
+                            let src = pop!().as_i32()? as u32 as usize;
+                            let dst = pop!().as_i32()? as u32 as usize;
+                            // A dropped segment behaves as zero-length.
+                            let empty: Vec<u8> = Vec::new();
+                            let bytes = match self.data.get(seg) {
+                                Some(_) if store.dropped.get(seg).copied().unwrap_or(true) => {
+                                    &empty
+                                }
+                                Some((_, b)) => b,
+                                None => return Err(WasmRtError("memory.init: bad segment")),
+                            };
+                            match (src.checked_add(n), dst.checked_add(n)) {
+                                (Some(es), Some(ed))
+                                    if es <= bytes.len() && ed <= store.mem.len() =>
+                                {
+                                    store.mem[dst..ed].copy_from_slice(&bytes[src..es]);
+                                }
+                                _ => return Err(WasmRtError("out of bounds memory access")),
+                            }
+                        }
+                        0x09 => {
+                            // data.drop: release the segment's bytes.
+                            let seg = r.u32()? as usize;
+                            if let Some(d) = store.dropped.get_mut(seg) {
+                                *d = true;
+                            }
+                        }
                         _ => return Err(WasmRtError("unsupported 0xfc opcode")),
                     }
                 }
@@ -2393,6 +2450,7 @@ impl<'m> Instance<'m> {
         // segments (applied by `new_store`) carry over by re-applying them.
         if let Some(mut mem) = import_memory {
             for (off, bytes) in &module.data {
+                let Some(off) = off else { continue };
                 let start = *off as usize;
                 let end = start
                     .checked_add(bytes.len())

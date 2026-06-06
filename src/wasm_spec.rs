@@ -424,6 +424,8 @@ fn has_immediate(name: &str) -> bool {
             | "global.get"
             | "global.set"
             | "call"
+            | "memory.init"
+            | "data.drop"
             | "br"
             | "br_if"
             | "i32.const"
@@ -528,6 +530,22 @@ fn emit_op(
         // Bulk-memory ops carry their reserved memory index(es) after the sub-op.
         "memory.fill" => out.extend_from_slice(&[0xfc, 0x0b, 0x00]),
         "memory.copy" => out.extend_from_slice(&[0xfc, 0x0a, 0x00, 0x00]),
+        // `memory.init SEG` and `data.drop SEG` take a data-segment index immediate.
+        "memory.init" => {
+            out.extend_from_slice(&[0xfc, 0x08]);
+            leb_u(
+                parse_wat_int(imm.ok_or("memory.init needs a segment")?)? as u64,
+                out,
+            );
+            out.push(0x00); // reserved memory index
+        }
+        "data.drop" => {
+            out.extend_from_slice(&[0xfc, 0x09]);
+            leb_u(
+                parse_wat_int(imm.ok_or("data.drop needs a segment")?)? as u64,
+                out,
+            );
+        }
         "memory.size" => {
             out.push(0x3f);
             out.push(0x00); // reserved memory index
@@ -902,20 +920,26 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
                 }
             }
             Some(Sexpr::Atom(a)) if a == "data" => {
-                // (data (i32.const OFF) "bytes" …) — offset expr then byte strings.
+                // Active `(data (i32.const OFF) "bytes" …)` — an offset expr then the
+                // byte strings; or passive `(data "bytes" …)` — bytes only.
                 let mut offset = Vec::new();
-                if let Some(Sexpr::List(off)) = d.get(1)
-                    && let (Some(Sexpr::Atom(op)), Some(Sexpr::Atom(n))) = (off.first(), off.get(1))
-                {
-                    emit_op(op, Some(n), &[], &[], &[], &[], &mut offset)?;
-                }
-                offset.push(0x0b);
+                let bytes_from = if let Some(Sexpr::List(off)) = d.get(1) {
+                    if let (Some(Sexpr::Atom(op)), Some(Sexpr::Atom(n))) = (off.first(), off.get(1))
+                    {
+                        emit_op(op, Some(n), &[], &[], &[], &[], &mut offset)?;
+                    }
+                    offset.push(0x0b);
+                    2
+                } else {
+                    1 // passive: no offset expression
+                };
                 let mut bytes = Vec::new();
-                for it in &d[2..] {
+                for it in &d[bytes_from..] {
                     if let Sexpr::Str(s) = it {
                         bytes.extend_from_slice(s);
                     }
                 }
+                // `offset` is empty for a passive segment (mode 1).
                 data_segments.push((offset, bytes));
             }
             _ => {}
@@ -1192,13 +1216,18 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
         code.extend_from_slice(&b);
     }
     section(10, &code, &mut out);
-    // data section (id 11): each segment is memidx 0, offset expr, then bytes.
+    // data section (id 11): active `(0x00, offset-expr, bytes)` or, when the offset
+    // is absent, passive `(0x01, bytes)`.
     if !data_segments.is_empty() {
         let mut data = Vec::new();
         leb_u(data_segments.len() as u64, &mut data);
         for (offset, bytes) in &data_segments {
-            leb_u(0, &mut data); // memory index 0
-            data.extend_from_slice(offset);
+            if offset.is_empty() {
+                data.push(0x01); // passive
+            } else {
+                data.push(0x00); // active, memory 0
+                data.extend_from_slice(offset);
+            }
             leb_u(bytes.len() as u64, &mut data);
             data.extend_from_slice(bytes);
         }
@@ -1891,6 +1920,27 @@ mod tests {
         assert_eq!(parse_wat_int("0x10").unwrap(), 16);
         assert_eq!(parse_wat_int("-0x1").unwrap(), -1);
         assert_eq!(parse_wat_int("4_294_967_295").unwrap(), 4_294_967_295);
+    }
+
+    #[test]
+    fn spec_passive_data_init_and_drop() {
+        // A passive data segment is copied into memory by `memory.init`, then
+        // `data.drop` releases it so a later non-zero `memory.init` traps.
+        let script = "(module \
+            (memory 1) \
+            (data \"\\aa\\bb\\cc\\dd\") \
+            (func (export \"init\") (param i32 i32 i32) \
+              (memory.init 0 (local.get 0) (local.get 1) (local.get 2))) \
+            (func (export \"drop\") (data.drop 0)) \
+            (func (export \"ld\") (param i32) (result i32) (i32.load8_u (local.get 0)))) \
+            (invoke \"init\" (i32.const 5) (i32.const 0) (i32.const 4)) \
+            (assert_return (invoke \"ld\" (i32.const 5)) (i32.const 0xaa)) \
+            (assert_return (invoke \"ld\" (i32.const 8)) (i32.const 0xdd)) \
+            (assert_return (invoke \"ld\" (i32.const 9)) (i32.const 0)) \
+            (invoke \"drop\") \
+            (assert_trap (invoke \"init\" (i32.const 0) (i32.const 0) (i32.const 1)))";
+        let n = run_wast(script).expect("passive-data init/drop conformance passes");
+        assert_eq!(n, 6);
     }
 
     #[test]
