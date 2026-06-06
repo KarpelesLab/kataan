@@ -1959,6 +1959,30 @@ mod tests {
     }
 
     #[test]
+    fn spec_typed_if_and_block_results() {
+        // `if (result i32) (then …) (else …)` yields a value from the taken arm; a
+        // `block (result i32)` yields the value left on its stack.
+        let script = "(module \
+            (func (export \"absish\") (param i32) (result i32) \
+              (if (result i32) (i32.lt_s (local.get 0) (i32.const 0)) \
+                (then (i32.sub (i32.const 0) (local.get 0))) \
+                (else (local.get 0)))) \
+            (func (export \"clamp\") (param i32) (result i32) \
+              (if (result i32) (i32.gt_s (local.get 0) (i32.const 100)) \
+                (then (i32.const 100)) \
+                (else (local.get 0)))) \
+            (func (export \"blk\") (result i32) \
+              (block (result i32) (i32.const 7) (i32.const 35) (i32.add)))) \
+            (assert_return (invoke \"absish\" (i32.const -7)) (i32.const 7)) \
+            (assert_return (invoke \"absish\" (i32.const 5)) (i32.const 5)) \
+            (assert_return (invoke \"clamp\" (i32.const 250)) (i32.const 100)) \
+            (assert_return (invoke \"clamp\" (i32.const 42)) (i32.const 42)) \
+            (assert_return (invoke \"blk\") (i32.const 42))";
+        let n = run_wast(script).expect("typed if/block conformance passes");
+        assert_eq!(n, 5);
+    }
+
+    #[test]
     fn spec_select_and_drop() {
         // `select` picks one of two values by an i32 condition; `drop` discards the
         // top of the stack.
