@@ -473,6 +473,15 @@ fn emit_op(
             };
             leb_u(n, out);
         }
+        // Saturating truncations are 0xfc-prefixed (sub-opcode 0x00..=0x07).
+        "i32.trunc_sat_f32_s" => out.extend_from_slice(&[0xfc, 0x00]),
+        "i32.trunc_sat_f32_u" => out.extend_from_slice(&[0xfc, 0x01]),
+        "i32.trunc_sat_f64_s" => out.extend_from_slice(&[0xfc, 0x02]),
+        "i32.trunc_sat_f64_u" => out.extend_from_slice(&[0xfc, 0x03]),
+        "i64.trunc_sat_f32_s" => out.extend_from_slice(&[0xfc, 0x04]),
+        "i64.trunc_sat_f32_u" => out.extend_from_slice(&[0xfc, 0x05]),
+        "i64.trunc_sat_f64_s" => out.extend_from_slice(&[0xfc, 0x06]),
+        "i64.trunc_sat_f64_u" => out.extend_from_slice(&[0xfc, 0x07]),
         "memory.size" => {
             out.push(0x3f);
             out.push(0x00); // reserved memory index
@@ -1694,6 +1703,22 @@ mod tests {
             .call(0, &[Val::I32(5)])
             .unwrap();
         assert_eq!(r3, vec![Val::I32(16)]); // 5*3 + 1
+    }
+
+    #[test]
+    fn spec_trunc_sat_saturates() {
+        // Unlike `trunc`, `trunc_sat` never traps: NaN → 0, out-of-range → clamp.
+        let script = "(module \
+            (func (export \"ss\") (param f64) (result i32) (i32.trunc_sat_f64_s (local.get 0))) \
+            (func (export \"su\") (param f64) (result i32) (i32.trunc_sat_f64_u (local.get 0)))) \
+            (assert_return (invoke \"ss\" (f64.const 3.9)) (i32.const 3)) \
+            (assert_return (invoke \"ss\" (f64.const nan)) (i32.const 0)) \
+            (assert_return (invoke \"ss\" (f64.const 1e30)) (i32.const 2147483647)) \
+            (assert_return (invoke \"ss\" (f64.const -1e30)) (i32.const -2147483648)) \
+            (assert_return (invoke \"su\" (f64.const -1.0)) (i32.const 0)) \
+            (assert_return (invoke \"su\" (f64.const 1e30)) (i32.const -1))";
+        let n = run_wast(script).expect("trunc_sat conformance passes");
+        assert_eq!(n, 6);
     }
 
     #[test]

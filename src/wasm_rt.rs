@@ -1016,6 +1016,9 @@ impl Module {
                 0x44 => {
                     r.bytes(8)?;
                 }
+                0xfc => {
+                    r.u32()?; // 0xfc sub-opcode (trunc_sat: no further immediate)
+                }
                 _ => {}
             }
         }
@@ -2146,6 +2149,46 @@ impl Module {
                     let idx = pop!().as_i32()? as u32 as usize;
                     return Ok(Flow::Branch(labels.get(idx).copied().unwrap_or(default)));
                 }
+                // 0xfc-prefixed: the saturating truncations (non-trapping — Rust's
+                // float→int `as` cast already saturates: NaN→0, out-of-range→clamp).
+                0xfc => {
+                    let sub = r.u32()?;
+                    match sub {
+                        0x00 => {
+                            let a = pop!().as_f32()?;
+                            stack.push(Val::I32(a as i32)); // i32.trunc_sat_f32_s
+                        }
+                        0x01 => {
+                            let a = pop!().as_f32()?;
+                            stack.push(Val::I32(a as u32 as i32)); // i32.trunc_sat_f32_u
+                        }
+                        0x02 => {
+                            let a = pop!().as_f64()?;
+                            stack.push(Val::I32(a as i32)); // i32.trunc_sat_f64_s
+                        }
+                        0x03 => {
+                            let a = pop!().as_f64()?;
+                            stack.push(Val::I32(a as u32 as i32)); // i32.trunc_sat_f64_u
+                        }
+                        0x04 => {
+                            let a = pop!().as_f32()?;
+                            stack.push(Val::I64(a as i64)); // i64.trunc_sat_f32_s
+                        }
+                        0x05 => {
+                            let a = pop!().as_f32()?;
+                            stack.push(Val::I64(a as u64 as i64)); // i64.trunc_sat_f32_u
+                        }
+                        0x06 => {
+                            let a = pop!().as_f64()?;
+                            stack.push(Val::I64(a as i64)); // i64.trunc_sat_f64_s
+                        }
+                        0x07 => {
+                            let a = pop!().as_f64()?;
+                            stack.push(Val::I64(a as u64 as i64)); // i64.trunc_sat_f64_u
+                        }
+                        _ => return Err(WasmRtError("unsupported 0xfc opcode")),
+                    }
+                }
                 _ => return Err(WasmRtError("unsupported opcode")),
             }
         }
@@ -2516,6 +2559,9 @@ fn else_split(code: &[u8]) -> Result<Option<usize>, WasmRtError> {
             0x44 => {
                 r.bytes(8)?;
             }
+            0xfc => {
+                r.u32()?; // 0xfc sub-opcode
+            }
             _ => {}
         }
     }
@@ -2576,6 +2622,9 @@ fn block_len(code: &[u8]) -> Result<usize, WasmRtError> {
             }
             0x44 => {
                 r.bytes(8)?; // f64.const
+            }
+            0xfc => {
+                r.u32()?; // 0xfc sub-opcode
             }
             _ => {}
         }
