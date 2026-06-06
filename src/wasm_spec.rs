@@ -291,6 +291,8 @@ fn has_immediate(name: &str) -> bool {
             | "global.get"
             | "global.set"
             | "call"
+            | "br"
+            | "br_if"
             | "i32.const"
             | "i64.const"
             | "f32.const"
@@ -365,6 +367,15 @@ fn emit_op(
             out.push(0x10);
             leb_u(resolve(funcs, "function")?, out);
         }
+        // br/br_if take a numeric label depth (named labels not yet supported).
+        "br" | "br_if" => {
+            out.push(if name == "br" { 0x0c } else { 0x0d });
+            let n = imm
+                .ok_or("br needs a label")?
+                .parse::<u64>()
+                .map_err(|_| "br label must be numeric")?;
+            leb_u(n, out);
+        }
         _ => out.push(simple_opcode(name).ok_or_else(|| format!("unknown instruction {name}"))?),
     }
     Ok(())
@@ -404,7 +415,26 @@ fn emit_instrs(
     Ok(())
 }
 
+/// Reads an optional leading `$label` then an optional `(result T)` blocktype from
+/// `items`, returning the blocktype byte (`0x40` = empty) and how many items were
+/// consumed.
+fn block_type_of(items: &[Sexpr]) -> (u8, usize) {
+    let mut skip = 0;
+    if matches!(items.first(), Some(Sexpr::Atom(s)) if s.starts_with('$')) {
+        skip += 1; // a block label — not modeled, but consume it
+    }
+    if let Some(Sexpr::List(p)) = items.get(skip)
+        && p.first() == Some(&Sexpr::Atom(String::from("result")))
+        && let Some(Sexpr::Atom(t)) = p.get(1)
+        && let Some(b) = valtype_byte(t)
+    {
+        return (b, skip + 1);
+    }
+    (0x40, skip)
+}
+
 /// Emits a folded instruction `(op imm? operands…)`: operands first, then the op.
+/// Structured control (`block`/`loop`/`if`) is folded recursively.
 fn emit_folded(
     inner: &[Sexpr],
     locals: &[String],
@@ -414,6 +444,43 @@ fn emit_folded(
     let Some(Sexpr::Atom(name)) = inner.first() else {
         return Err(String::from("folded instruction needs a head opcode"));
     };
+    match name.as_str() {
+        "block" | "loop" => {
+            let (bt, skip) = block_type_of(&inner[1..]);
+            out.push(if name == "block" { 0x02 } else { 0x03 });
+            out.push(bt);
+            emit_instrs(&inner[1 + skip..], locals, funcs, out)?;
+            out.push(0x0b); // end
+            return Ok(());
+        }
+        "if" => {
+            // (if label? (result T)? cond* (then instr*) (else instr*)?)
+            let (bt, skip) = block_type_of(&inner[1..]);
+            let rest = &inner[1 + skip..];
+            let is_clause = |s: &Sexpr, kw: &str| matches!(s, Sexpr::List(p) if p.first() == Some(&Sexpr::Atom(String::from(kw))));
+            let then_at = rest
+                .iter()
+                .position(|s| is_clause(s, "then"))
+                .ok_or("if without a (then …) clause")?;
+            // The condition precedes `(then …)` and is emitted before the `if`.
+            emit_instrs(&rest[..then_at], locals, funcs, out)?;
+            out.push(0x04); // if
+            out.push(bt);
+            if let Sexpr::List(then_p) = &rest[then_at] {
+                emit_instrs(&then_p[1..], locals, funcs, out)?;
+            }
+            if let Some(else_s) = rest.get(then_at + 1)
+                && is_clause(else_s, "else")
+                && let Sexpr::List(else_p) = else_s
+            {
+                out.push(0x05); // else
+                emit_instrs(&else_p[1..], locals, funcs, out)?;
+            }
+            out.push(0x0b); // end
+            return Ok(());
+        }
+        _ => {}
+    }
     if has_immediate(name) {
         let imm = match inner.get(1) {
             Some(Sexpr::Atom(s)) => s.clone(),
@@ -941,6 +1008,32 @@ mod tests {
             wat_to_binary("(module (func (result i32) (local.get $nope)))").is_err(),
             "unknown $local rejected"
         );
+    }
+
+    #[test]
+    fn wat_structured_control_flow() {
+        // Folded `if`: abs via (if (result i32) cond (then …) (else …)).
+        let abs = "(module (func (export \"abs\") (param $x i32) (result i32) \
+                   (if (result i32) (i32.lt_s (local.get $x) (i32.const 0)) \
+                     (then (i32.sub (i32.const 0) (local.get $x))) \
+                     (else (local.get $x)))))";
+        let m = crate::wasm_rt::Module::decode(&wat_to_binary(abs).expect("compile if")).unwrap();
+        assert_eq!(m.call(0, &[Val::I32(-7)]).unwrap(), vec![Val::I32(7)]);
+        assert_eq!(m.call(0, &[Val::I32(5)]).unwrap(), vec![Val::I32(5)]);
+
+        // A `loop` with `br_if`: sum 1..=n.
+        // (local $i)(local $sum) loop: i=i+1; sum=sum+i; br_if (i < n) loop.
+        let sum = "(module (func (export \"sum\") (param $n i32) (result i32) \
+                   (local $i i32) (local $sum i32) \
+                   (loop \
+                     (local.set $i (i32.add (local.get $i) (i32.const 1))) \
+                     (local.set $sum (i32.add (local.get $sum) (local.get $i))) \
+                     (br_if 0 (i32.lt_s (local.get $i) (local.get $n)))) \
+                   (local.get $sum)))";
+        let m2 =
+            crate::wasm_rt::Module::decode(&wat_to_binary(sum).expect("compile loop")).unwrap();
+        assert_eq!(m2.call(0, &[Val::I32(5)]).unwrap(), vec![Val::I32(15)]); // 1+2+3+4+5
+        assert_eq!(m2.call(0, &[Val::I32(10)]).unwrap(), vec![Val::I32(55)]);
     }
 
     #[test]
