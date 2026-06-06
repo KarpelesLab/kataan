@@ -4859,14 +4859,17 @@ impl<'a> Interp<'a> {
                 "toLowerCase" => Some(self.new_str(&s.to_lowercase())),
                 "trim" => Some(self.new_str(s.trim())),
                 "charAt" => {
-                    let i = self.realm.to_number(arg(0)) as usize;
                     // UTF-16-indexed: the unit at `i` as a one-unit string (a
-                    // lone surrogate renders as U+FFFD via lossy decoding).
-                    let units: Vec<u16> = s.encode_utf16().collect();
-                    let out = units
-                        .get(i)
-                        .map(|&u| String::from_utf16_lossy(&[u]))
-                        .unwrap_or_default();
+                    // lone surrogate renders as U+FFFD via lossy decoding). A
+                    // negative index is out of range (`NaN`/no-arg → 0).
+                    let out = match str_char_index(self.realm.to_number(arg(0))) {
+                        Some(i) => s
+                            .encode_utf16()
+                            .nth(i)
+                            .map(|u| String::from_utf16_lossy(&[u]))
+                            .unwrap_or_default(),
+                        None => String::new(),
+                    };
                     Some(self.new_str(&out))
                 }
                 "includes" => {
@@ -5078,16 +5081,16 @@ impl<'a> Interp<'a> {
                 // `charCodeAt(i)` is the UTF-16 code unit at index `i` (NaN if
                 // out of range); a surrogate half reads as that 16-bit value.
                 "charCodeAt" => {
-                    let i = self.realm.to_number(arg(0)) as usize;
-                    Some(
-                        s.encode_utf16()
-                            .nth(i)
-                            .map_or(NanBox::number(f64::NAN), |u| NanBox::number(f64::from(u))),
-                    )
+                    // A negative or out-of-range index is `NaN` (`NaN`/no-arg → 0).
+                    let unit = str_char_index(self.realm.to_number(arg(0)))
+                        .and_then(|i| s.encode_utf16().nth(i));
+                    Some(unit.map_or(NanBox::number(f64::NAN), |u| NanBox::number(f64::from(u))))
                 }
                 // `codePointAt(i)` combines a surrogate pair at UTF-16 index `i`.
                 "codePointAt" => {
-                    let i = self.realm.to_number(arg(0)) as usize;
+                    let Some(i) = str_char_index(self.realm.to_number(arg(0))) else {
+                        return Ok(Some(NanBox::undefined()));
+                    };
                     let units: Vec<u16> = s.encode_utf16().collect();
                     Some(match units.get(i).copied() {
                         Some(u) if (0xD800..0xDC00).contains(&u) => {
@@ -9790,6 +9793,14 @@ fn parse_bigint(digits: &str) -> crate::bignum::BigInt {
 
 /// Normalizes an optional `fromIndex` for `indexOf`/`includes`: undefined → 0,
 /// negatives count from the end, clamped to `[0, len]`.
+/// `ToInteger` for a string index argument: `NaN` (and no-arg) → `Some(0)`, a
+/// non-negative integer → `Some(i)`, and a negative index → `None` (out of range,
+/// so `charAt` yields `""` and `charCodeAt`/`codePointAt` yield `NaN`/`undefined`).
+fn str_char_index(n: f64) -> Option<usize> {
+    let n = if n.is_nan() { 0.0 } else { n };
+    (n >= 0.0).then_some(n as usize)
+}
+
 fn array_from_index(realm: &Realm, arg: NanBox, len: usize) -> usize {
     if matches!(arg.unpack(), Unpacked::Undefined) {
         return 0;

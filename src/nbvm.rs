@@ -2075,8 +2075,17 @@ fn builtin_method(
                 NanBox::handle(ctx.realm.new_string(&repeated).to_raw())
             }
             "charAt" => {
-                let i = ctx.realm.to_number(arg0()) as usize;
-                let c = s.chars().nth(i).map(String::from).unwrap_or_default();
+                // ToInteger: `NaN`/no-arg → 0; a negative index is out of range → "".
+                let n = ctx.realm.to_number(arg0());
+                let n = if n.is_nan() { 0.0 } else { n };
+                let c = if n >= 0.0 {
+                    s.chars()
+                        .nth(n as usize)
+                        .map(String::from)
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 NanBox::handle(ctx.realm.new_string(&c).to_raw())
             }
             "split" => {
