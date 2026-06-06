@@ -197,6 +197,9 @@ pub fn eval(realm: &mut Realm, expr: &Expr) -> Result<NanBox, EvalError> {
             "Infinity" => Ok(NanBox::number(f64::INFINITY)),
             _ => Err(EvalError::Unsupported("variable reference")),
         },
+        // The optional-chain boundary; this evaluator already yields `undefined`
+        // for member access on a nullish value, so the chain just evaluates.
+        Expr::OptChain { expr, .. } => eval(realm, expr),
         _ => Err(EvalError::Unsupported("expression")),
     }
 }

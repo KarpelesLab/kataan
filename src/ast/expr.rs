@@ -86,6 +86,17 @@ pub enum Expr {
         span: Span,
     },
 
+    /// An optional-chain boundary wrapping a postfix chain that contains at least
+    /// one `?.`. It defines the *short-circuit target*: if any `?.` link inside
+    /// `expr` has a nullish base, the whole chain evaluates to `undefined`
+    /// (subsequent non-optional `.`/`[]`/`()` links are skipped). A non-optional
+    /// access on a value that merely *happens* to be nullish still throws.
+    OptChain {
+        /// the wrapped chain expression
+        expr: Box<Expr>,
+        span: Span,
+    },
+
     /// A prefix unary operation: `!x`, `-x`, `typeof x`, …
     Unary {
         op: UnaryOp,
@@ -170,6 +181,7 @@ impl Expr {
             | Expr::Member { span, .. }
             | Expr::Call { span, .. }
             | Expr::New { span, .. }
+            | Expr::OptChain { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Update { span, .. }
             | Expr::Binary { span, .. }

@@ -46,6 +46,11 @@ pub enum ExecError {
     NotCallable,
     /// A thrown JS value, propagating until a `catch` handles it.
     Throw(NanBox),
+    /// An optional-chain short-circuit: a `?.` link found a nullish base. It
+    /// propagates (past intervening non-optional links) up to the enclosing
+    /// `Expr::OptChain` boundary, which turns it into `undefined`. It is *not* a
+    /// throw, so `try`/`catch` never sees it.
+    OptShortCircuit,
 }
 
 /// The control-flow outcome of a statement.
@@ -7301,7 +7306,7 @@ impl<'a> Interp<'a> {
                 {
                     let recv = self.eval(object)?;
                     if *optional && matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                        return Ok(NanBox::undefined());
+                        return Err(ExecError::OptShortCircuit);
                     }
                     let args = self.eval_args(arguments)?;
                     if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property
@@ -7329,7 +7334,7 @@ impl<'a> Interp<'a> {
                     // Not a built-in method: read the member and call it.
                     let Some(raw) = recv.as_handle() else {
                         if *call_optional {
-                            return Ok(NanBox::undefined());
+                            return Err(ExecError::OptShortCircuit);
                         }
                         return Err(ExecError::NotCallable);
                     };
@@ -7337,18 +7342,24 @@ impl<'a> Interp<'a> {
                     // `f?.()` short-circuits when `f` is nullish.
                     if *call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null)
                     {
-                        return Ok(NanBox::undefined());
+                        return Err(ExecError::OptShortCircuit);
                     }
                     // Method call: `this` is the receiver.
                     return self.call_with_this(f, recv, &args);
                 }
                 let f = self.eval(callee)?;
                 if *call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                    return Ok(NanBox::undefined());
+                    return Err(ExecError::OptShortCircuit);
                 }
                 let args = self.eval_args(arguments)?;
                 self.call(f, &args)
             }
+            // The optional-chain boundary: a `?.` short-circuit inside becomes
+            // `undefined` here (the rest of the chain was skipped).
+            Expr::OptChain { expr, .. } => match self.eval(expr) {
+                Err(ExecError::OptShortCircuit) => Ok(NanBox::undefined()),
+                other => other,
+            },
             Expr::New {
                 callee, arguments, ..
             } => {
@@ -7485,7 +7496,8 @@ impl<'a> Interp<'a> {
                 let obj = self.eval(object)?;
                 if matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
                     if *optional {
-                        return Ok(NanBox::undefined());
+                        // Short-circuit the rest of the enclosing optional chain.
+                        return Err(ExecError::OptShortCircuit);
                     }
                     // `null.x` / `undefined.x` throws a catchable TypeError.
                     let msg = self.new_str("cannot read property of null or undefined");

@@ -545,6 +545,8 @@ impl<'src> Parser<'src> {
     /// primary or `new` expression. `allow_call` is false while parsing a
     /// `new` callee (so the parens bind to the `new`, not to a call).
     fn parse_tails(&mut self, mut expr: Expr, allow_call: bool) -> Result<Expr> {
+        let start = expr.span();
+        let mut saw_optional = false;
         loop {
             match self.peek() {
                 TokenKind::Dot => {
@@ -572,6 +574,7 @@ impl<'src> Parser<'src> {
                 }
                 TokenKind::QuestionDot => {
                     self.bump();
+                    saw_optional = true;
                     expr = self.parse_optional_tail(expr, allow_call)?;
                 }
                 TokenKind::LParen if allow_call => {
@@ -593,7 +596,19 @@ impl<'src> Parser<'src> {
                         span,
                     };
                 }
-                _ => return Ok(expr),
+                _ => {
+                    // A chain containing any `?.` becomes an `OptChain` so the
+                    // evaluator knows the short-circuit boundary (a nullish `?.`
+                    // base skips the rest of the chain → `undefined`).
+                    if saw_optional {
+                        let span = start.to(expr.span());
+                        expr = Expr::OptChain {
+                            expr: Box::new(expr),
+                            span,
+                        };
+                    }
+                    return Ok(expr);
+                }
             }
         }
     }

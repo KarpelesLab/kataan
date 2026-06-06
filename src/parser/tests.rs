@@ -144,6 +144,7 @@ fn sexpr(e: &Expr) -> String {
             let dot = if *optional { "?." } else { "." };
             format!("(member {dot} {} {})", sexpr(object), sexpr_key(property))
         }
+        Expr::OptChain { expr, .. } => format!("(optchain {})", sexpr(expr)),
         Expr::Call {
             callee,
             arguments,
@@ -469,10 +470,16 @@ fn new_expression() {
 
 #[test]
 fn optional_chaining() {
-    assert_eq!(sx("a?.b"), "(member ?. a b)");
-    assert_eq!(sx("a?.[b]"), "(member ?. a [b])");
-    assert_eq!(sx("a?.(x)"), "(?call a x)");
-    assert_eq!(sx("a?.b.c"), "(member . (member ?. a b) c)");
+    // A chain containing `?.` is wrapped in an `optchain` boundary (the
+    // short-circuit target); the trailing non-optional links stay inside it.
+    assert_eq!(sx("a?.b"), "(optchain (member ?. a b))");
+    assert_eq!(sx("a?.[b]"), "(optchain (member ?. a [b]))");
+    assert_eq!(sx("a?.(x)"), "(optchain (?call a x))");
+    assert_eq!(sx("a?.b.c"), "(optchain (member . (member ?. a b) c))");
+    // A plain chain (no `?.`) is not wrapped.
+    assert_eq!(sx("a.b.c"), "(member . (member . a b) c)");
+    // Parentheses end the chain: the outer `.c` is a fresh, unwrapped access.
+    assert_eq!(sx("(a?.b).c"), "(member . (optchain (member ?. a b)) c)");
 }
 
 #[test]

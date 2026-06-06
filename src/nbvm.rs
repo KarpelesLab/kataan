@@ -4981,6 +4981,11 @@ impl Compiler {
                 };
                 self.make_closure(&a.params, &body, a.is_async)
             }
+            // The optional-chain boundary: compile the inner chain. (The bytecode
+            // path keeps its existing per-link `?.` handling; cross-chain
+            // short-circuit is a known limitation — see the tree-walker for the
+            // spec-correct behavior.)
+            Expr::OptChain { expr, .. } => self.expr(expr),
             _ => Err(CompileError::Unsupported("expression")),
         }
     }
