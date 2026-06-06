@@ -807,6 +807,42 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_a_cross_kind_cycle() {
+        // A cycle threading three different cell kinds: object → array → object,
+        // and object → Map → object. The two-pass restore must rejoin them all to
+        // the *same* restored object under fresh handles.
+        let mut realm = Realm::new();
+        let a = realm.new_object();
+        let arr = realm.new_array(alloc::vec![NanBox::handle(a.to_raw())]); // arr[0] = a
+        let map = realm.new_collection(false);
+        realm.collection_set(map, NanBox::number(1.0), NanBox::handle(a.to_raw())); // map[1] = a
+        realm.set_property(a, "arr", NanBox::handle(arr.to_raw()));
+        realm.set_property(a, "map", NanBox::handle(map.to_raw()));
+
+        // Through the full serialize → bytes → deserialize → restore path.
+        let bytes = serialize(&capture(&realm, &[a]));
+        let mut realm2 = Realm::new();
+        let a2 = restore(&mut realm2, &deserialize(&bytes).expect("deserialize"))[0];
+
+        // arr[0] and map[1] both point back to the *same* restored `a2`.
+        let arr2 = Handle::from_raw(realm2.get_property(a2, "arr").unwrap().as_handle().unwrap());
+        assert_eq!(
+            realm2.array_elements(arr2).unwrap()[0].as_handle(),
+            Some(a2.to_raw()),
+            "array element rejoins the cycle"
+        );
+        let map2 = Handle::from_raw(realm2.get_property(a2, "map").unwrap().as_handle().unwrap());
+        assert_eq!(
+            realm2
+                .collection_get(map2, NanBox::number(1.0))
+                .unwrap()
+                .as_handle(),
+            Some(a2.to_raw()),
+            "map value rejoins the cycle"
+        );
+    }
+
+    #[test]
     fn serialize_round_trip_then_restore() {
         let mut realm = Realm::new();
         let leaf = realm.new_object();
