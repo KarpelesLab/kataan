@@ -5399,6 +5399,29 @@ mod tests {
         );
     }
 
+    /// A hot float function (division, non-integer values) runs identically
+    /// whether it takes the JIT's float path (with the `jit` feature on
+    /// Linux x86-64) or the interpreter.
+    #[test]
+    fn hot_float_function_matches_interpreter() {
+        // ratio(a,b) = (a + b) / b, called 30× past the tier-up threshold.
+        assert_eq!(
+            bc("function ratio(a,b){ return (a + b) / b; } \
+                let r = 0; \
+                for (let i = 0; i < 30; i = i + 1) { r = ratio(3, 2); } \
+                r"),
+            "2.5"
+        );
+        // A division producing a non-integer across many calls.
+        assert_eq!(
+            bc("function half(x){ return x / 2; } \
+                let s = 0; \
+                for (let i = 0; i < 25; i = i + 1) { s = half(7); } \
+                s"),
+            "3.5"
+        );
+    }
+
     #[test]
     fn bytecode_valueof_in_operators() {
         // User valueOf/toString honored in the bytecode VM's operators.

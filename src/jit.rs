@@ -411,6 +411,87 @@ pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
     Some(out)
 }
 
+/// `f64` value of a numeric `NanBox` constant (any finite number — the float
+/// path, unlike the integer path, has no range restriction).
+#[cfg(feature = "alloc")]
+fn nanbox_f64(v: crate::nanbox::NanBox) -> Option<f64> {
+    match v.unpack() {
+        crate::nanbox::Unpacked::Number(n) if n.is_finite() => Some(n),
+        _ => None,
+    }
+}
+
+/// Lowers a real bytecode-VM function to the **float** register IR — the `f64`
+/// fast path. Eligible iff it is straight-line numeric arithmetic: no captures,
+/// ≤ 64 registers, ≤ 4 params, only `Const` (any finite number),
+/// `Add`/`AddValue`/`Sub`/`Mul`/`Div`, `Move`, and a terminating `Return`. This
+/// covers `/` and non-integer values, which the integer path
+/// ([`lower_nbvm`]) rejects, but not branches/loops (the float compiler is
+/// straight-line). Returns `None` otherwise, with the same def-use safety check.
+#[cfg(feature = "alloc")]
+#[must_use]
+pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
+    use crate::nbvm::Op;
+    if proto.n_regs > 64 || proto.n_params > 4 || proto.n_captures != 0 {
+        return None;
+    }
+    let reg8 = |r: crate::nbvm::Reg| -> Option<u8> {
+        ((r as usize) < proto.n_regs).then(|| u8::try_from(r).ok())?
+    };
+    let mut written = alloc::vec![false; proto.n_regs];
+    for w in written.iter_mut().take(proto.n_params) {
+        *w = true;
+    }
+    let read = |w: &[bool], r: crate::nbvm::Reg| -> Option<u8> {
+        let r8 = reg8(r)?;
+        if *w.get(r as usize)? { Some(r8) } else { None }
+    };
+    let mut out = Vec::new();
+    for i in 0..proto.n_params {
+        out.push(FloatOp::Arg {
+            dst: u8::try_from(i).ok()?,
+            index: u8::try_from(i).ok()?,
+        });
+    }
+    let bin = |w: &mut [bool], dst, a, b, op| -> Option<FloatOp> {
+        let (a, b) = (read(w, a)?, read(w, b)?);
+        let d = reg8(dst)?;
+        w[dst as usize] = true;
+        Some(FloatOp::Bin { dst: d, a, b, op })
+    };
+    for op in &proto.ops {
+        let lowered = match op {
+            Op::LoadConst { dst, value } => {
+                let imm = nanbox_f64(*value)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                FloatOp::Const { dst: d, imm }
+            }
+            Op::Add { dst, a, b } | Op::AddValue { dst, a, b } => {
+                bin(&mut written, *dst, *a, *b, FBinOp::Add)?
+            }
+            Op::Sub { dst, a, b } => bin(&mut written, *dst, *a, *b, FBinOp::Sub)?,
+            Op::Mul { dst, a, b } => bin(&mut written, *dst, *a, *b, FBinOp::Mul)?,
+            Op::Div { dst, a, b } => bin(&mut written, *dst, *a, *b, FBinOp::Div)?,
+            Op::Move { dst, src } => {
+                let s = read(&written, *src)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                FloatOp::Move { dst: d, src: s }
+            }
+            Op::Return { src } => {
+                out.push(FloatOp::Ret {
+                    src: read(&written, *src)?,
+                });
+                return Some(out);
+            }
+            _ => return None,
+        };
+        out.push(lowered);
+    }
+    None
+}
+
 /// A bytecode-VM function compiled to native code, callable from the VM with
 /// `NanBox` values. This is the end-to-end fast path: it owns the compiled
 /// machine code and performs the unbox→native→rebox round-trip with an integer
@@ -420,44 +501,80 @@ pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
 pub struct JitProto {
     func: JitFunction,
     n_params: usize,
+    kind: JitKind,
+}
+
+/// Which native fast path a [`JitProto`] holds.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JitKind {
+    /// Integer arithmetic + branches/loops; guards args to exact integers and
+    /// deopts on overflow/range.
+    Int,
+    /// Straight-line `f64` arithmetic (incl. division); guards args to numbers.
+    Float,
 }
 
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 impl JitProto {
-    /// Compiles a `nbvm::FnProto` to native code if it is JIT-eligible (see
-    /// [`lower_nbvm`]); otherwise `None` (the caller runs it in the interpreter).
+    /// Compiles a `nbvm::FnProto` to native code if it is JIT-eligible.
+    /// Prefers the integer path ([`lower_nbvm`], which handles branches/loops);
+    /// otherwise tries the straight-line float path ([`lower_nbvm_float`], which
+    /// handles `/` and non-integer values). `None` if neither applies.
     #[must_use]
     pub fn compile(proto: &crate::nbvm::FnProto) -> Option<Self> {
-        let ops = lower_nbvm(proto)?;
-        let func = JitFunction::compile_reg(proto.n_regs, proto.n_params, &ops)?;
+        if let Some(ops) = lower_nbvm(proto) {
+            let func = JitFunction::compile_reg(proto.n_regs, proto.n_params, &ops)?;
+            return Some(Self {
+                func,
+                n_params: proto.n_params,
+                kind: JitKind::Int,
+            });
+        }
+        let ops = lower_nbvm_float(proto)?;
+        let func = JitFunction::compile_float(proto.n_regs, proto.n_params, &ops)?;
         Some(Self {
             func,
             n_params: proto.n_params,
+            kind: JitKind::Float,
         })
     }
 
-    /// Calls the native code with `NanBox` arguments. Returns the reboxed integer
-    /// result, or `None` to **deopt** to the interpreter when a precondition
-    /// fails: wrong argument count, or any argument is not an exact integer.
+    /// Calls the native code with `NanBox` arguments, or `None` to **deopt** to
+    /// the interpreter (wrong arity; an argument that isn't the kind this path
+    /// requires; or, for the integer path, an overflow/out-of-range result).
     #[must_use]
     pub fn call_guarded(&self, args: &[crate::nanbox::NanBox]) -> Option<crate::nanbox::NanBox> {
         if args.len() != self.n_params {
             return None;
         }
-        // Guard: every argument must be an exact integer for the integer fast
-        // path to be valid; otherwise bail so the interpreter handles it.
-        let mut ints = [0i64; 6];
-        for (slot, a) in ints.iter_mut().zip(args.iter()) {
-            *slot = nanbox_int(*a)?;
-        }
-        let r = self.func.call_args(&ints[..self.n_params]);
-        // The native code returns a value in ±2^53 on success, or a sentinel
-        // outside that range when an intermediate result overflowed / left the
-        // exact-integer range — in which case we deopt to the interpreter.
-        if (-SAFE_INT_MAX..=SAFE_INT_MAX).contains(&r) {
-            Some(crate::nanbox::NanBox::number(r as f64))
-        } else {
-            None
+        match self.kind {
+            JitKind::Int => {
+                // Guard: every argument must be an exact integer.
+                let mut ints = [0i64; 6];
+                for (slot, a) in ints.iter_mut().zip(args.iter()) {
+                    *slot = nanbox_int(*a)?;
+                }
+                let r = self.func.call_args(&ints[..self.n_params]);
+                // A result outside ±2^53 is the overflow/range deopt sentinel.
+                if (-SAFE_INT_MAX..=SAFE_INT_MAX).contains(&r) {
+                    Some(crate::nanbox::NanBox::number(r as f64))
+                } else {
+                    None
+                }
+            }
+            JitKind::Float => {
+                // Guard: every argument must be a (finite) JS number.
+                let mut fs = [0.0f64; 4];
+                for (slot, a) in fs.iter_mut().zip(args.iter()) {
+                    *slot = match a.unpack() {
+                        crate::nanbox::Unpacked::Number(n) => n,
+                        _ => return None,
+                    };
+                }
+                let r = self.func.call_args_f64(&fs[..self.n_params]);
+                Some(crate::nanbox::NanBox::number(r))
+            }
         }
     }
 }
@@ -1705,6 +1822,40 @@ mod tests {
                 "jit sum 0..{n}"
             );
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn float_jitproto_runs_division_function() {
+        use crate::nanbox::{NanBox, Unpacked};
+        // A function using `/` and non-integer values takes the float path.
+        let src = "function f(a, b) { return (a + b) * a / b; } f;";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let protos = crate::nbvm::compile_program(&program).expect("compile");
+        let p = protos.iter().find(|p| p.n_params == 2).unwrap();
+        // It does NOT lower to the integer path (Div), but DOES to the float path.
+        assert!(
+            lower_nbvm(p).is_none(),
+            "division shouldn't take the integer path"
+        );
+        assert!(lower_nbvm_float(p).is_some(), "should take the float path");
+        let jit = JitProto::compile(p).expect("float JIT");
+
+        let oracle = |a: f64, b: f64| (a + b) * a / b;
+        for (a, b) in [(1.5, 2.5), (10.0, 4.0), (-3.0, 0.5), (7.0, 7.0)] {
+            let r = jit
+                .call_guarded(&[NanBox::number(a), NanBox::number(b)])
+                .expect("number args run natively");
+            match r.unpack() {
+                Unpacked::Number(v) => assert!((v - oracle(a, b)).abs() < 1e-12, "{v}"),
+                _ => panic!("expected number"),
+            }
+        }
+        // A non-number argument deopts.
+        assert!(
+            jit.call_guarded(&[NanBox::null(), NanBox::number(1.0)])
+                .is_none()
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
