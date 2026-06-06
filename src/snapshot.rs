@@ -1212,6 +1212,31 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_preserve_object_key_order() {
+        let mut realm = Realm::new();
+        // Insertion order matters for JS object enumeration; it must survive the
+        // snapshot round-trip unchanged (no reordering, no dropped keys).
+        let obj = realm.new_object();
+        for k in ["zebra", "apple", "_mid", "Last", "n2"] {
+            let v = NanBox::handle(realm.new_string(k).to_raw());
+            realm.set_property(obj, k, v);
+        }
+        let before = realm.object_keys(obj).unwrap();
+
+        let snap = capture(&realm, &[obj]);
+        let bytes = serialize(&snap);
+        let reloaded = deserialize(&bytes).expect("deserialize");
+        let mut realm2 = Realm::new();
+        let o2 = restore(&mut realm2, &reloaded)[0];
+
+        assert_eq!(
+            realm2.object_keys(o2).unwrap(),
+            before,
+            "object key insertion order is preserved across the snapshot"
+        );
+    }
+
+    #[test]
     fn snapshots_regexps() {
         let mut realm = Realm::new();
         // A RegExp with flags and an advanced lastIndex, reachable from an object.
