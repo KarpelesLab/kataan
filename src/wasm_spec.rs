@@ -290,22 +290,68 @@ fn simple_opcode(name: &str) -> Option<u8> {
         "i32.gt_s" => 0x4a,
         "i32.gt_u" => 0x4b,
         "i32.le_s" => 0x4c,
+        "i32.le_u" => 0x4d,
         "i32.ge_s" => 0x4e,
+        "i32.ge_u" => 0x4f,
+        "i64.eqz" => 0x50,
+        "i64.eq" => 0x51,
+        "i64.ne" => 0x52,
+        "i64.lt_s" => 0x53,
+        "i64.lt_u" => 0x54,
+        "i64.gt_s" => 0x55,
+        "i64.gt_u" => 0x56,
+        "i64.le_s" => 0x57,
+        "i64.le_u" => 0x58,
+        "i64.ge_s" => 0x59,
+        "i64.ge_u" => 0x5a,
+        "f32.eq" => 0x5b,
+        "f32.ne" => 0x5c,
+        "f32.lt" => 0x5d,
+        "f32.gt" => 0x5e,
+        "f32.le" => 0x5f,
+        "f32.ge" => 0x60,
+        "f64.eq" => 0x61,
+        "f64.ne" => 0x62,
+        "f64.lt" => 0x63,
+        "f64.gt" => 0x64,
+        "f64.le" => 0x65,
+        "f64.ge" => 0x66,
         "i32.add" => 0x6a,
         "i32.sub" => 0x6b,
         "i32.mul" => 0x6c,
         "i32.div_s" => 0x6d,
         "i32.div_u" => 0x6e,
         "i32.rem_s" => 0x6f,
+        "i32.rem_u" => 0x70,
         "i32.and" => 0x71,
         "i32.or" => 0x72,
         "i32.xor" => 0x73,
         "i32.shl" => 0x74,
         "i32.shr_s" => 0x75,
         "i32.shr_u" => 0x76,
+        "i32.rotl" => 0x77,
+        "i32.rotr" => 0x78,
         "i64.add" => 0x7c,
         "i64.sub" => 0x7d,
         "i64.mul" => 0x7e,
+        "i64.div_s" => 0x7f,
+        "i64.div_u" => 0x80,
+        "i64.rem_s" => 0x81,
+        "i64.rem_u" => 0x82,
+        "i64.and" => 0x83,
+        "i64.or" => 0x84,
+        "i64.xor" => 0x85,
+        "i64.shl" => 0x86,
+        "i64.shr_s" => 0x87,
+        "i64.shr_u" => 0x88,
+        "i64.rotl" => 0x89,
+        "i64.rotr" => 0x8a,
+        "i32.clz" => 0x67,
+        "i32.ctz" => 0x68,
+        "i32.popcnt" => 0x69,
+        "i64.clz" => 0x79,
+        "i64.ctz" => 0x7a,
+        "i64.popcnt" => 0x7b,
         "f32.abs" => 0x8b,
         "f32.neg" => 0x8c,
         "f32.ceil" => 0x8d,
@@ -421,12 +467,12 @@ fn emit_op(
         }
         "f32.const" => {
             out.push(0x43);
-            let v: f32 = imm.ok_or("f32.const")?.parse().map_err(|_| "bad f32")?;
+            let v = parse_wat_float(imm.ok_or("f32.const")?)? as f32;
             out.extend_from_slice(&v.to_le_bytes());
         }
         "f64.const" => {
             out.push(0x44);
-            let v: f64 = imm.ok_or("f64.const")?.parse().map_err(|_| "bad f64")?;
+            let v = parse_wat_float(imm.ok_or("f64.const")?)?;
             out.extend_from_slice(&v.to_le_bytes());
         }
         "local.get" => {
@@ -1215,6 +1261,68 @@ fn parse_wat_int(s: &str) -> Result<i64, String> {
     })
 }
 
+/// Parses a WAT float literal: the special spellings `inf`/`-inf`/`+inf` and the
+/// suite's `nan` family (`nan`, `±nan`, `nan:canonical`/`:arithmetic`/`:0x…` — all
+/// just a NaN here, matched leniently by `vals_match`), hex floats (`0x1.8p1`),
+/// and ordinary decimal (incl. `_` separators) via the standard parser.
+fn parse_wat_float(s: &str) -> Result<f64, String> {
+    match s {
+        _ if s.starts_with("-nan") => return Ok(-f64::NAN),
+        _ if s.starts_with("nan") || s.starts_with("+nan") => return Ok(f64::NAN),
+        "inf" | "+inf" => return Ok(f64::INFINITY),
+        "-inf" => return Ok(f64::NEG_INFINITY),
+        _ => {}
+    }
+    let clean = s.replace('_', "");
+    if let Some(v) = parse_hex_float(&clean) {
+        return Ok(v);
+    }
+    clean.parse::<f64>().map_err(|_| format!("bad float {s}"))
+}
+
+/// Parses a hex float `±0x<int>.<frac>p±<exp>` (the `.frac`/`pexp` parts optional),
+/// returning `None` if `s` is not hex-float syntax. Power-of-two scaling is done by
+/// repeated multiply/halve (no `f64::powi`, which is unavailable in `no_std`).
+fn parse_hex_float(s: &str) -> Option<f64> {
+    let (neg, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let body = rest
+        .strip_prefix("0x")
+        .or_else(|| rest.strip_prefix("0X"))?;
+    let (mant, exp) = match body.find(['p', 'P']) {
+        Some(i) => (&body[..i], body[i + 1..].parse::<i32>().ok()?),
+        None => (body, 0),
+    };
+    let (int_part, frac_part) = match mant.find('.') {
+        Some(i) => (&mant[..i], &mant[i + 1..]),
+        None => (mant, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    let mut value = 0.0f64;
+    for c in int_part.chars() {
+        value = value * 16.0 + f64::from(c.to_digit(16)?);
+    }
+    let mut scale = 1.0 / 16.0;
+    for c in frac_part.chars() {
+        value += f64::from(c.to_digit(16)?) * scale;
+        scale /= 16.0;
+    }
+    let mut e = exp;
+    while e > 0 {
+        value *= 2.0;
+        e -= 1;
+    }
+    while e < 0 {
+        value *= 0.5;
+        e += 1;
+    }
+    Some(if neg { -value } else { value })
+}
+
 fn parse_const(s: &Sexpr) -> Result<Val, String> {
     let Sexpr::List(items) = s else {
         return Err(String::from("expected (type.const N)"));
@@ -1222,23 +1330,11 @@ fn parse_const(s: &Sexpr) -> Result<Val, String> {
     let (Some(Sexpr::Atom(ty)), Some(Sexpr::Atom(n))) = (items.first(), items.get(1)) else {
         return Err(String::from("malformed const"));
     };
-    let parse_i = |s: &str| -> Result<i64, String> { parse_wat_int(s) };
-    let parse_f = |s: &str| -> Result<f64, String> {
-        match s {
-            // The suite's `nan:canonical` / `nan:arithmetic` (and bare `nan`,
-            // `nan:0x…`) all denote a NaN — matched leniently by `vals_match`.
-            _ if s.starts_with("-nan") => Ok(-f64::NAN),
-            _ if s.starts_with("nan") || s.starts_with("+nan") => Ok(f64::NAN),
-            "inf" | "+inf" => Ok(f64::INFINITY),
-            "-inf" => Ok(f64::NEG_INFINITY),
-            _ => s.parse::<f64>().map_err(|_| format!("bad float {s}")),
-        }
-    };
     Ok(match ty.as_str() {
-        "i32.const" => Val::I32(parse_i(n)? as i32),
-        "i64.const" => Val::I64(parse_i(n)?),
-        "f32.const" => Val::F32(parse_f(n)? as f32),
-        "f64.const" => Val::F64(parse_f(n)?),
+        "i32.const" => Val::I32(parse_wat_int(n)? as i32),
+        "i64.const" => Val::I64(parse_wat_int(n)?),
+        "f32.const" => Val::F32(parse_wat_float(n)? as f32),
+        "f64.const" => Val::F64(parse_wat_float(n)?),
         other => return Err(format!("unknown const type {other}")),
     })
 }
@@ -1725,6 +1821,29 @@ mod tests {
             .call(0, &[Val::I32(5)])
             .unwrap();
         assert_eq!(r3, vec![Val::I32(16)]); // 5*3 + 1
+    }
+
+    #[test]
+    fn wat_float_literals_hex_inf_nan() {
+        // Hex floats, inf, and nan in *module bodies* (not just assertion operands).
+        let script = "(module \
+            (func (export \"a\") (result f64) (f64.const 0x1.8p1)) \
+            (func (export \"b\") (result f64) (f64.const 0x10)) \
+            (func (export \"inf\") (result f64) (f64.const inf)) \
+            (func (export \"ninf\") (result f64) (f64.const -inf)) \
+            (func (export \"isnan\") (result i32) (f64.ne (f64.const nan) (f64.const nan)))) \
+            (assert_return (invoke \"a\") (f64.const 3.0)) \
+            (assert_return (invoke \"b\") (f64.const 16.0)) \
+            (assert_return (invoke \"inf\") (f64.const inf)) \
+            (assert_return (invoke \"ninf\") (f64.const -inf)) \
+            (assert_return (invoke \"isnan\") (i32.const 1))";
+        let n = run_wast(script).expect("hex/inf/nan float literals parse");
+        assert_eq!(n, 5);
+        // Direct hex-float checks.
+        assert_eq!(parse_hex_float("0x1.8p1"), Some(3.0));
+        assert_eq!(parse_hex_float("0x1p-1"), Some(0.5));
+        assert_eq!(parse_hex_float("-0x1.0p4"), Some(-16.0));
+        assert_eq!(parse_hex_float("12.5"), None); // not hex
     }
 
     #[test]
