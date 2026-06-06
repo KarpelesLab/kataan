@@ -377,7 +377,37 @@ impl Module {
                 _ => {}
             }
         }
+        m.validate()?;
         Ok(m)
+    }
+
+    /// Structural validation run after decoding: rejects modules whose
+    /// cross-references are out of range (the cheap, always-checkable part of
+    /// WebAssembly validation — enough that `assert_invalid`-style malformed
+    /// modules are refused rather than failing only at run time).
+    fn validate(&self) -> Result<(), WasmRtError> {
+        let n_funcs = self.func_types.len(); // imports + defined
+        let n_defined = n_funcs.saturating_sub(self.func_imports.len());
+        // Every defined function must have exactly one code body.
+        if self.bodies.len() != n_defined {
+            return Err(WasmRtError("function and code section counts differ"));
+        }
+        // Every function's declared type index must exist.
+        if self
+            .func_types
+            .iter()
+            .any(|&t| t as usize >= self.types.len())
+        {
+            return Err(WasmRtError("function references an invalid type index"));
+        }
+        // Exports and the start function must reference real functions.
+        if self.exports.iter().any(|(_, i)| *i as usize >= n_funcs) {
+            return Err(WasmRtError("export references an invalid function index"));
+        }
+        if self.start.is_some_and(|s| s as usize >= n_funcs) {
+            return Err(WasmRtError("start references an invalid function index"));
+        }
+        Ok(())
     }
 
     fn decode_types(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
@@ -2597,6 +2627,46 @@ mod tests {
         let module2 = Module::decode(&m2).expect("decode if-no-else module");
         assert_eq!(module2.call(0, &[Val::I32(0)]).unwrap(), vec![Val::I32(0)]); // cond false
         assert_eq!(module2.call(0, &[Val::I32(9)]).unwrap(), vec![Val::I32(1)]); // cond true
+    }
+
+    #[test]
+    fn validate_rejects_bad_cross_references() {
+        // A valid baseline: (func (export "f") (result i32) i32.const 1).
+        let valid = || -> Vec<u8> {
+            let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+            m.extend([0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f]); // type ()->i32
+            m.extend([0x03, 0x02, 0x01, 0x00]); // func0: type0
+            m.extend([0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00]); // export f=func0
+            m.extend([0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x01, 0x0b]); // code
+            m
+        };
+        assert!(Module::decode(&valid()).is_ok(), "baseline must decode");
+
+        // Export referencing a non-existent function index (5).
+        let mut bad_export = valid();
+        let n = bad_export.len();
+        bad_export[n - 9] = 0x05; // the export's function index byte → 5
+        assert!(
+            Module::decode(&bad_export).is_err(),
+            "bad export index rejected"
+        );
+
+        // Function section declaring 2 functions but only 1 code body.
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f]);
+        m.extend([0x03, 0x03, 0x02, 0x00, 0x00]); // 2 funcs, both type0
+        m.extend([0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x01, 0x0b]); // only 1 body
+        assert!(
+            Module::decode(&m).is_err(),
+            "function/code count mismatch rejected"
+        );
+
+        // A function declaring type index 9 (only 1 type exists).
+        let mut m2 = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m2.extend([0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f]);
+        m2.extend([0x03, 0x02, 0x01, 0x09]); // func0: type9 (invalid)
+        m2.extend([0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x01, 0x0b]);
+        assert!(Module::decode(&m2).is_err(), "invalid type index rejected");
     }
 
     #[test]
