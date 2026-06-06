@@ -8797,6 +8797,7 @@ impl<'a> Interp<'a> {
                 N_REGEXP => self.realm.regexp_at(oh).is_some(),
                 N_MAP | N_SET | N_WEAKMAP | N_WEAKSET => self.realm.collection_is_set(oh).is_some(),
                 N_DATE => self.realm.date_at(oh).is_some(),
+                N_PROMISE => self.realm.promise_state(oh).is_some(),
                 _ => false,
             });
         }
