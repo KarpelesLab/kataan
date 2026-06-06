@@ -147,6 +147,12 @@ pub struct Interp<'a> {
     /// One-shot: a pending `new.target` set by `construct`, consumed by the next
     /// non-arrow invocation (so `new.target` is the constructor inside it).
     pending_new_target: Option<NanBox>,
+    /// Persistent mutable state (memory/globals) of each live WASM instance, keyed
+    /// by an instance id stored on the instance's export wrappers — so a
+    /// `WebAssembly.Instance`'s memory and globals survive across export calls.
+    wasm_states: alloc::collections::BTreeMap<u32, crate::wasm_rt::InstanceState>,
+    /// Next WASM-instance id to hand out.
+    wasm_next_id: u32,
     /// When running a generator body eagerly, the buffer `yield` appends to.
     gen_sink: Option<Vec<NanBox>>,
     /// The `Symbol.for` global registry: shared symbols keyed by string.
@@ -279,6 +285,9 @@ const WASM_EXPORT: &str = "\u{0}wexport";
 const WASM_IMPORTS: &str = "\u{0}wimports";
 /// Marks an object built by `new WebAssembly.Module(...)`.
 const WASM_IS_MODULE: &str = "\u{0}wmodule";
+/// The instance id on a WASM export wrapper's data object (keys `wasm_states`, so
+/// memory/globals persist across calls of the same instance).
+const WASM_INSTANCE_ID: &str = "\u{0}winst";
 // `Object.prototype.*` methods (the receiver arrives as `this`).
 const N_OBJ_PROTO_TOSTRING: u16 = 179;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
@@ -423,6 +432,8 @@ impl<'a> Interp<'a> {
             this_val: NanBox::undefined(),
             new_target: NanBox::undefined(),
             pending_new_target: None,
+            wasm_states: alloc::collections::BTreeMap::new(),
+            wasm_next_id: 0,
             gen_sink: None,
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
@@ -6098,6 +6109,19 @@ impl<'a> Interp<'a> {
         }
         .map_err(|e| self.wasm_compile_error(e.0))?;
 
+        // Resume this instance's persistent memory/globals from its prior call, so
+        // mutable state (a counter global, written linear memory, …) carries over.
+        let inst_id = self
+            .realm
+            .get_property(data, WASM_INSTANCE_ID)
+            .and_then(|v| v.as_number())
+            .map(|n| n as u32);
+        if let Some(id) = inst_id
+            && let Some(state) = self.wasm_states.get(&id)
+        {
+            inst.import_state(state);
+        }
+
         // The import dispatcher: marshal Vals → JS, call the JS import, marshal the
         // result back. Borrows `self` (the engine) directly — sound because the
         // instance state (`inst`) is a separate object.
@@ -6126,6 +6150,10 @@ impl<'a> Interp<'a> {
             return Err(e); // propagate a JS exception thrown by an import
         }
         let results = results.map_err(|e| self.wasm_compile_error(e.0))?;
+        // Persist the post-call memory/globals so the next call sees them.
+        if let Some(id) = inst_id {
+            self.wasm_states.insert(id, inst.export_state());
+        }
         Ok(results
             .first()
             .map_or(NanBox::undefined(), |v| v.to_nanbox()))
@@ -6173,6 +6201,10 @@ impl<'a> Interp<'a> {
         let module = crate::wasm_rt::Module::decode(&bytes)
             .map_err(|_| self.wasm_compile_error("invalid module"))?;
         let names: Vec<String> = module.export_names().iter().map(|s| (*s).into()).collect();
+        // A fresh instance id ties every export wrapper to one persistent state
+        // entry, so the instance's memory/globals survive across export calls.
+        let inst_id = self.wasm_next_id;
+        self.wasm_next_id = self.wasm_next_id.wrapping_add(1);
         let exports = self.realm.new_object();
         for name in names {
             let data = self.realm.new_object();
@@ -6180,6 +6212,8 @@ impl<'a> Interp<'a> {
             self.realm.set_property(data, WASM_IMPORTS, imports_obj);
             let name_v = self.new_str(&name);
             self.realm.set_property(data, WASM_EXPORT, name_v);
+            self.realm
+                .set_property(data, WASM_INSTANCE_ID, NanBox::number(f64::from(inst_id)));
             let f = self.realm.new_bound_native(N_WASM_CALL, data);
             self.realm
                 .set_property(exports, &name, NanBox::handle(f.to_raw()));

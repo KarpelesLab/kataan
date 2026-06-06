@@ -2380,6 +2380,22 @@ impl Module {
 /// stateful object the JS↔WASM boundary exchanges data through — host code reads
 /// and writes the instance's linear memory to pass strings, arrays, and buffers
 /// in and out, and a mutable global keeps state between invocations.
+/// A snapshot of an instance's mutable state (linear memory, globals, dropped data
+/// segments), carried across separate `call_export` invocations so a JS
+/// `WebAssembly.Instance` keeps persistent state instead of re-initializing per
+/// call. Owned (no module borrow), so a host can stash it between calls.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InstanceState {
+    /// linear memory bytes
+    pub mem: Vec<u8>,
+    /// global values, in index order
+    pub globals: Vec<Val>,
+    /// per-data-segment dropped flags
+    pub dropped: Vec<bool>,
+}
+
+/// An instantiated module: the decoded `module` plus its mutable `store` (linear
+/// memory, globals) and the host functions bound to its imports.
 pub struct Instance<'m> {
     module: &'m Module,
     store: Store,
@@ -2573,6 +2589,25 @@ impl<'m> Instance<'m> {
             .export(name)
             .ok_or(WasmRtError("no such export"))?;
         self.call(idx, args)
+    }
+
+    /// Snapshots the instance's mutable state (memory, globals, dropped segments).
+    #[must_use]
+    pub fn export_state(&self) -> InstanceState {
+        InstanceState {
+            mem: self.store.mem.clone(),
+            globals: self.store.globals.clone(),
+            dropped: self.store.dropped.clone(),
+        }
+    }
+
+    /// Overwrites the instance's mutable state with a previously exported snapshot
+    /// (e.g. to resume a JS `WebAssembly.Instance` with the state from its prior
+    /// call). The module identity must match the one the state came from.
+    pub fn import_state(&mut self, state: &InstanceState) {
+        self.store.mem = state.mem.clone();
+        self.store.globals.clone_from(&state.globals);
+        self.store.dropped.clone_from(&state.dropped);
     }
 
     /// Calls an exported function with **JS values** (`NanBox`), marshaling each

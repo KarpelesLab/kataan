@@ -117,12 +117,14 @@ WebAssembly spec test suite**.
 - **Reference types & tables:** `funcref`/`externref`, `table.*` ops, multiple
   tables, `call_indirect` type checks and traps, element segments (active /
   passive / declarative), `ref.func`/`ref.null`/`ref.is_null`.
-- **The JS ↔ WASM boundary (the "non-numeric" surface):** the full
-  `WebAssembly.*` object graph (`Module`, `Instance`, `Memory`, `Table`, `Global`,
-  `compile`/`instantiate`(`Streaming`), `validate`), imports/exports of functions,
-  memories, tables, and globals, the `externref` bridge to JS values, and
-  linear-memory ↔ typed-array views. Traps surface as JS exceptions; JS callbacks
-  are callable as WASM imports.
+- **The JS ↔ WASM boundary (the "non-numeric" surface):** *Done:* `validate`,
+  `instantiate` (→ `{module, instance}`), the `Module`/`Instance` constructors,
+  `compile` (→ `Promise<Module>`), host-function imports (JS callable from WASM),
+  and **stateful instances** — mutable globals and linear memory now persist across
+  export calls, each instance independent. *Remaining:* the `Memory`/`Table`/
+  `Global` objects (and `.buffer` ↔ typed-array views), `compileStreaming`/
+  `instantiateStreaming`, the `externref` bridge to JS values, and imported
+  memories/tables/globals. Traps already surface as JS exceptions.
 - **Post-MVP proposals (prioritized):** SIMD (`v128`), threads + `Atomics` on
   shared memory, multi-memory, tail calls, extended-const, then GC types and
   exception handling as they stabilize.
