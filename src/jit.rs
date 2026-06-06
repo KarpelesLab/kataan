@@ -225,6 +225,16 @@ pub enum FloatOp {
         a: u8,
         b: u8,
     },
+    /// `reg[dst] = floor(reg[a])` — `Math.floor` (SSE4.1 `roundsd`, gated).
+    Floor {
+        dst: u8,
+        a: u8,
+    },
+    /// `reg[dst] = ceil(reg[a])` — `Math.ceil` (SSE4.1 `roundsd`, gated).
+    Ceil {
+        dst: u8,
+        a: u8,
+    },
     /// `reg[dst] = !reg[a]` — JS logical-not: `1.0` if `reg[a]` is falsy (`±0.0`
     /// or `NaN`), else `0.0`. (`ucomisd x, 0` sets ZF for both equal and NaN.)
     Eqz {
@@ -324,6 +334,14 @@ pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
                 } else {
                     y
                 };
+                pc += 1;
+            }
+            FloatOp::Floor { dst, a } => {
+                regs[dst as usize] = regs[a as usize].floor();
+                pc += 1;
+            }
+            FloatOp::Ceil { dst, a } => {
+                regs[dst as usize] = regs[a as usize].ceil();
                 pc += 1;
             }
             FloatOp::Eqz { dst, a } => {
@@ -1517,6 +1535,24 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                     FloatOp::Abs { dst: d, a }
                 }
             }
+            // `Math.floor(x)` / `Math.ceil(x)` — one SSE4.1 `roundsd` each, but only
+            // if this CPU has SSE4.1; otherwise bail so the whole function stays in
+            // the interpreter (the baseline is only SSE2).
+            Op::CallNative { dst, native, args }
+                if (*native == crate::nbvm::NB_MATH_FLOOR
+                    || *native == crate::nbvm::NB_MATH_CEIL)
+                    && args.len() == 1
+                    && std::is_x86_feature_detected!("sse4.1") =>
+            {
+                let a = read(&written, args[0])?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                if *native == crate::nbvm::NB_MATH_FLOOR {
+                    FloatOp::Floor { dst: d, a }
+                } else {
+                    FloatOp::Ceil { dst: d, a }
+                }
+            }
             // `Math.max(a, b)` / `Math.min(a, b)` — two-argument f64 intrinsics with
             // JS NaN/±0 semantics (handled in codegen). Also pure → JIT-safe.
             Op::CallNative { dst, native, args }
@@ -2050,6 +2086,13 @@ impl X64Assembler {
     /// `sqrtsd xmm0, xmm0` — `xmm0 = sqrt(xmm0)`.
     pub fn sqrtsd_xmm0(&mut self) {
         self.code.extend_from_slice(&[0xf2, 0x0f, 0x51, 0xc0]);
+    }
+    /// `roundsd xmm0, xmm0, imm8` (SSE4.1). `mode`: 0x09 = floor, 0x0a = ceil,
+    /// 0x0b = trunc, 0x08 = nearest (the `0x08` bit suppresses the precision
+    /// exception). The caller must ensure SSE4.1 is present.
+    pub fn roundsd_xmm0(&mut self, mode: u8) {
+        self.code
+            .extend_from_slice(&[0x66, 0x0f, 0x3a, 0x0b, 0xc0, mode]);
     }
     /// `movsd xmm1, [rbp+disp]`.
     pub fn movsd_xmm1_mem(&mut self, disp: i32) {
@@ -2733,6 +2776,20 @@ impl JitFunction {
                     }
                     a.movsd_xmm0_mem(disp(ra));
                     a.sqrtsd_xmm0();
+                    a.movsd_mem_xmm0(disp(dst));
+                }
+                FloatOp::Floor { dst, a: ra } | FloatOp::Ceil { dst, a: ra } => {
+                    // `roundsd` is SSE4.1; refuse to emit it on hardware without it.
+                    if !ok(dst) || !ok(ra) || !std::is_x86_feature_detected!("sse4.1") {
+                        return None;
+                    }
+                    let mode = if matches!(op, FloatOp::Floor { .. }) {
+                        0x09
+                    } else {
+                        0x0a
+                    };
+                    a.movsd_xmm0_mem(disp(ra));
+                    a.roundsd_xmm0(mode);
                     a.movsd_mem_xmm0(disp(dst));
                 }
                 FloatOp::Abs { dst, a: ra } => {
@@ -4177,6 +4234,40 @@ mod tests {
         ];
         let g = JitFunction::compile_float(2, 1, &neg).unwrap();
         assert!(g.call_args_f64(&[-1.0]).is_nan(), "sqrt(-1) is NaN");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn float_floor_ceil_native() {
+        if !std::is_x86_feature_detected!("sse4.1") {
+            return; // roundsd unavailable; the lowering bails and this is moot
+        }
+        let floor = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Floor { dst: 1, a: 0 },
+            FloatOp::Ret { src: 1 },
+        ];
+        let ceil = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Ceil { dst: 1, a: 0 },
+            FloatOp::Ret { src: 1 },
+        ];
+        let ff = JitFunction::compile_float(2, 1, &floor).unwrap();
+        let fc = JitFunction::compile_float(2, 1, &ceil).unwrap();
+        for x in [3.7f64, -3.2, 2.0, -0.4, 1e6, -7.999] {
+            assert_eq!(
+                ff.call_args_f64(&[x]).to_bits(),
+                x.floor().to_bits(),
+                "floor({x})"
+            );
+            assert_eq!(
+                fc.call_args_f64(&[x]).to_bits(),
+                x.ceil().to_bits(),
+                "ceil({x})"
+            );
+            assert_eq!(eval_float(&floor, 2, &[x]), x.floor());
+            assert_eq!(eval_float(&ceil, 2, &[x]), x.ceil());
+        }
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

@@ -242,8 +242,8 @@ const NB_CONSOLE_LOG: u16 = 0;
 pub(crate) const NB_MATH_MAX: u16 = 1;
 pub(crate) const NB_MATH_MIN: u16 = 2;
 pub(crate) const NB_MATH_ABS: u16 = 3;
-const NB_MATH_FLOOR: u16 = 4;
-const NB_MATH_CEIL: u16 = 5;
+pub(crate) const NB_MATH_FLOOR: u16 = 4;
+pub(crate) const NB_MATH_CEIL: u16 = 5;
 const NB_MATH_ROUND: u16 = 6;
 pub(crate) const NB_MATH_SQRT: u16 = 7;
 const NB_MATH_POW: u16 = 8;
@@ -5752,6 +5752,18 @@ mod tests {
                 r + r2"
             ),
             "10"
+        );
+        // A hot float function using `Math.floor`/`Math.ceil` (the float path's
+        // `Floor`/`Ceil` via SSE4.1 `roundsd`, or the interpreter fallback on older
+        // CPUs — either way the result matches): floor(3.2) + ceil(3.7) = 3 + 4 = 7.
+        assert_eq!(
+            bc(
+                "function fc(x){ return Math.floor(x) + Math.ceil(x + 0.5); } \
+                let r = 0; \
+                for (let i = 0; i < 40; i = i + 1) { r = fc(3.2); } \
+                r"
+            ),
+            "7"
         );
     }
 
