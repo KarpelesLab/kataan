@@ -963,6 +963,13 @@ impl<'a> Interp<'a> {
                 value
             }
             N_OBJECT_KEYS => {
+                // A proxy with an `ownKeys` trap drives `Object.keys` itself.
+                if let Some(raw) = arg(0).as_handle()
+                    && let Some(keys) = self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
+                {
+                    let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_str(k)).collect();
+                    return Ok(NanBox::handle(self.realm.new_array(boxed).to_raw()));
+                }
                 let target = arg(0)
                     .as_handle()
                     .map(|raw| self.proxy_key_target(Handle::from_raw(raw)));
@@ -3439,6 +3446,67 @@ impl<'a> Interp<'a> {
             h = target;
         }
         h
+    }
+
+    /// `Object.keys` for a proxy that defines an `ownKeys` trap: invoke the trap,
+    /// then keep each string key whose property is enumerable — via the
+    /// `getOwnPropertyDescriptor` trap if present, else the target. Returns `None`
+    /// when there is no `ownKeys` trap (so the caller uses the target's keys).
+    fn proxy_own_enumerable_keys(
+        &mut self,
+        proxy: Handle,
+    ) -> Result<Option<Vec<String>>, ExecError> {
+        let Some((target, handler)) = self.realm.proxy_at(proxy) else {
+            return Ok(None);
+        };
+        let own_trap = self
+            .realm
+            .get_property(handler, "ownKeys")
+            .unwrap_or(NanBox::undefined());
+        if !own_trap
+            .as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            return Ok(None);
+        }
+        let target_box = NanBox::handle(target.to_raw());
+        let keys = self.call(own_trap, &[target_box])?;
+        let keys = self.iterate_values(keys)?;
+        let gopd = self
+            .realm
+            .get_property(handler, "getOwnPropertyDescriptor")
+            .unwrap_or(NanBox::undefined());
+        let gopd_callable = gopd
+            .as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
+        let mut out = Vec::new();
+        for k in keys {
+            // Only string keys participate in `Object.keys` (symbols are skipped).
+            let Some(name) = k
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.string_value(h))
+            else {
+                continue;
+            };
+            let enumerable = if gopd_callable {
+                let kbox = self.new_str(&name);
+                let desc = self.call(gopd, &[target_box, kbox])?;
+                desc.as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                    .is_some_and(|v| self.realm.truthy(v))
+            } else {
+                // No descriptor trap: forward to the target — an own, enumerable
+                // property only (a key the target lacks is not enumerable).
+                self.realm.has_own(target, &name)
+                    && self.realm.property_is_enumerable(target, &name)
+            };
+            if enumerable {
+                out.push(name);
+            }
+        }
+        Ok(Some(out))
     }
 
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
