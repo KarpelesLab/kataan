@@ -70,6 +70,45 @@ pub fn eval_arith(ops: &[ArithOp], arg: i64) -> i64 {
     ops.iter().fold(arg, |acc, op| op.eval(acc))
 }
 
+/// A stack-machine instruction — the shape the register VM lowers integer
+/// expressions to. Compiled to native code over the hardware stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackOp {
+    /// Push argument `0` or `1`.
+    Arg(u8),
+    /// Push an `i64` constant.
+    Const(i64),
+    /// Pop `b`, pop `a`, push `a + b`.
+    Add,
+    /// Pop `b`, pop `a`, push `a - b`.
+    Sub,
+    /// Pop `b`, pop `a`, push `a * b`.
+    Mul,
+}
+
+/// Evaluates a [`StackOp`] program over two `i64` arguments — the interpreter
+/// oracle for the JIT-compiled stack machine. Returns the value left on top.
+#[must_use]
+pub fn eval_stack(ops: &[StackOp], args: [i64; 2]) -> i64 {
+    let mut stack: Vec<i64> = Vec::new();
+    for op in ops {
+        match *op {
+            StackOp::Arg(i) => stack.push(args[i as usize & 1]),
+            StackOp::Const(n) => stack.push(n),
+            StackOp::Add | StackOp::Sub | StackOp::Mul => {
+                let b = stack.pop().unwrap_or(0);
+                let a = stack.pop().unwrap_or(0);
+                stack.push(match op {
+                    StackOp::Add => a.wrapping_add(b),
+                    StackOp::Sub => a.wrapping_sub(b),
+                    _ => a.wrapping_mul(b),
+                });
+            }
+        }
+    }
+    stack.pop().unwrap_or(0)
+}
+
 /// The reference for [`JitFunction::compile_sum_1_to_n`]: `sum(1..=n)` for
 /// `n >= 0`, else `0`.
 #[must_use]
@@ -200,6 +239,40 @@ impl X64Assembler {
     pub fn je(&mut self, label: Label) {
         self.code.extend_from_slice(&[0x0f, 0x84]);
         self.emit_rel32(label);
+    }
+
+    /// `push rdi` / `push rsi` / `push rax` — onto the native stack.
+    pub fn push_rdi(&mut self) {
+        self.code.push(0x57);
+    }
+    /// `push rsi`.
+    pub fn push_rsi(&mut self) {
+        self.code.push(0x56);
+    }
+    /// `push rax`.
+    pub fn push_rax(&mut self) {
+        self.code.push(0x50);
+    }
+    /// `pop rax`.
+    pub fn pop_rax(&mut self) {
+        self.code.push(0x58);
+    }
+    /// `pop rcx`.
+    pub fn pop_rcx(&mut self) {
+        self.code.push(0x59);
+    }
+    /// `movabs rax, imm64`.
+    pub fn movabs_rax(&mut self, imm: i64) {
+        self.code.extend_from_slice(&[0x48, 0xb8]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+    /// `sub rax, rcx`.
+    pub fn sub_rax_rcx(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x29, 0xc8]);
+    }
+    /// `imul rax, rcx`.
+    pub fn imul_rax_rcx(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x0f, 0xaf, 0xc1]);
     }
 
     /// `mov rax, rdi` — seed the accumulator with the first argument.
@@ -365,6 +438,58 @@ impl JitFunction {
         a.dec_rcx();
         a.jmp(loop_top);
         a.bind(done);
+        a.ret();
+        Self::from_code(&a.finish())
+    }
+
+    /// Compiles a [`StackOp`] program to a native `fn(i64, i64) -> i64`, using
+    /// the hardware stack for operands: a push-instruction per `Arg`/`Const`, a
+    /// `pop rcx; pop rax; <op> rax, rcx; push rax` per binary op, and a final
+    /// `pop rax; ret`. Each program is stack-balanced, so `rsp` is restored and
+    /// no calls occur, keeping the ABI happy without explicit alignment. Returns
+    /// `None` on the unavailable target or a malformed (non-single-result)
+    /// program.
+    #[must_use]
+    pub fn compile_stack(ops: &[StackOp]) -> Option<Self> {
+        // Validate that the program leaves exactly one value (a quick verifier,
+        // the spirit of §2.2's bytecode validation).
+        let mut depth: i32 = 0;
+        for op in ops {
+            match op {
+                StackOp::Arg(_) | StackOp::Const(_) => depth += 1,
+                StackOp::Add | StackOp::Sub | StackOp::Mul => {
+                    if depth < 2 {
+                        return None;
+                    }
+                    depth -= 1;
+                }
+            }
+        }
+        if depth != 1 {
+            return None;
+        }
+        let mut a = X64Assembler::new();
+        for op in ops {
+            match *op {
+                StackOp::Arg(0) => a.push_rdi(),
+                StackOp::Arg(_) => a.push_rsi(),
+                StackOp::Const(n) => {
+                    a.movabs_rax(n);
+                    a.push_rax();
+                }
+                StackOp::Add | StackOp::Sub | StackOp::Mul => {
+                    a.pop_rcx(); // b
+                    a.pop_rax(); // a
+                    match op {
+                        StackOp::Add => a.add_rax_rcx(),
+                        StackOp::Sub => a.sub_rax_rcx(),
+                        _ => a.imul_rax_rcx(),
+                    }
+                    a.push_rax();
+                }
+            }
+        }
+        a.pop_rax();
         a.ret();
         Self::from_code(&a.finish())
     }
@@ -609,6 +734,40 @@ mod tests {
         assert_eq!(sub.call2(50, 8), 42);
         assert_eq!(mul.call2(6, 7), 42);
         assert_eq!(mul.call2(-3, 4), -12);
+    }
+
+    #[test]
+    fn stack_machine_compiles_and_runs() {
+        // (a + b) * (a - 3)
+        let prog = [
+            StackOp::Arg(0),
+            StackOp::Arg(1),
+            StackOp::Add,
+            StackOp::Arg(0),
+            StackOp::Const(3),
+            StackOp::Sub,
+            StackOp::Mul,
+        ];
+        let oracle = |a: i64, b: i64| (a + b) * (a - 3);
+        for (a, b) in [(7, 2), (10, -4), (0, 0), (-5, 5), (1000, 1)] {
+            assert_eq!(eval_stack(&prog, [a, b]), oracle(a, b));
+            if let Some(f) = JitFunction::compile_stack(&prog) {
+                assert_eq!(f.call2(a, b), oracle(a, b), "jit stack ({a},{b})");
+            }
+        }
+    }
+
+    #[test]
+    fn stack_machine_rejects_malformed() {
+        assert!(
+            JitFunction::compile_stack(&[StackOp::Add]).is_none(),
+            "underflow"
+        );
+        assert!(
+            JitFunction::compile_stack(&[StackOp::Arg(0), StackOp::Arg(1)]).is_none(),
+            "two results"
+        );
+        assert!(JitFunction::compile_stack(&[]).is_none(), "empty");
     }
 
     #[test]
