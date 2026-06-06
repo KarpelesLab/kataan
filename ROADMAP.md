@@ -149,13 +149,15 @@ moving GC. "Complete" means *any* live heap snapshots, reloads zero-copy, and
   properties** — non-enumerable ones and the engine's internal `\0`-prefixed slots
   — with a per-property hidden flag, so bound-function target/this/args, typed-array
   kind, error `stack`, and the `constructor` back-reference round-trip
-  (`snapshots_preserve_non_enumerable_and_hidden_slots`), and an object's
-  `[[Prototype]]` link now round-trips so `Object.create(p)` / inheritance chains
-  resolve through the restored chain (`snapshots_preserve_prototype_links`).
-  *Remaining:* accessor (getter/setter) properties in the object cell;
-  generator/async suspension state (depends on Track 3 lazy frames); the
-  `ArrayBuffer` backing-buffer *identity* shared across typed-array views — audit
-  each remaining `Cell` variant.
+  (`snapshots_preserve_non_enumerable_and_hidden_slots`), an object's
+  `[[Prototype]]` link round-trips so `Object.create(p)` / inheritance chains
+  resolve through the restored chain (`snapshots_preserve_prototype_links`), and
+  accessor (getter/setter) properties round-trip with their functions and
+  enumerability (`snapshots_preserve_accessor_properties`) — so object-cell fidelity
+  is now complete (data + non-enumerable + internal slots + accessors + prototype).
+  *Remaining:* generator/async suspension state (depends on Track 3 lazy frames);
+  the `ArrayBuffer` backing-buffer *identity* shared across typed-array views —
+  audit each remaining non-object `Cell` variant.
 - **End-to-end restore-and-execute.** *In place:* a restored closure now runs and
   carries its snapshotted captured state, independent of the original
   (`snapshot_restores_an_executable_closure`) — restored state is executable, not

@@ -54,6 +54,9 @@ pub enum SnapCell {
     Object {
         /// own data properties, each with its non-enumerable flag
         props: Vec<(String, SnapVal, bool)>,
+        /// own accessor properties: `(key, getter, setter, hidden)` — getter/setter
+        /// are references to function cells (or `Undefined` when absent)
+        accessors: Vec<(String, SnapVal, SnapVal, bool)>,
         /// the prototype link (`Null` if none)
         proto: SnapVal,
     },
@@ -248,17 +251,30 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             SnapCell::Array(vals)
         } else if realm.object_keys(h).is_some() {
             // All own *data* properties, including non-enumerable + internal slots
-            // (private `#` fields and accessor properties are skipped). Each pair
-            // records whether the property is hidden (non-enumerable).
+            // (private `#` fields and accessor keys are handled separately). Each
+            // pair records whether the property is hidden (non-enumerable).
+            let accessor_keys = realm.object_accessor_keys(h);
             let props = realm
                 .object_all_keys(h)
                 .into_iter()
-                .filter(|k| !k.starts_with('#'))
+                .filter(|k| !k.starts_with('#') && !accessor_keys.contains(k))
                 .map(|k| {
                     let v = realm.get_property(h, &k).unwrap_or(NanBox::undefined());
                     let sv = snap_val(v, &mut index_of, &mut order, &mut intern);
                     let hidden = !realm.property_is_enumerable(h, &k);
                     (k, sv, hidden)
+                })
+                .collect();
+            // Accessor (getter/setter) properties: capture each function reference.
+            let accessors = accessor_keys
+                .into_iter()
+                .filter(|k| !k.starts_with('#'))
+                .filter_map(|k| {
+                    let (g, s) = realm.accessor(h, &k)?;
+                    let gv = snap_val(g, &mut index_of, &mut order, &mut intern);
+                    let sv = snap_val(s, &mut index_of, &mut order, &mut intern);
+                    let hidden = !realm.property_is_enumerable(h, &k);
+                    Some((k, gv, sv, hidden))
                 })
                 .collect();
             // The `[[Prototype]]` link (captured as a ref, or Null when absent).
@@ -271,12 +287,17 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                 ),
                 None => SnapVal::Null,
             };
-            SnapCell::Object { props, proto }
+            SnapCell::Object {
+                props,
+                accessors,
+                proto,
+            }
         } else {
             // An unsupported cell kind: record it as an empty object so indices
             // stay aligned (its references are dropped).
             SnapCell::Object {
                 props: Vec::new(),
+                accessors: Vec::new(),
                 proto: SnapVal::Null,
             }
         };
@@ -390,10 +411,22 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 let elems: Vec<NanBox> = vals.iter().map(|v| resolve(v, &handles)).collect();
                 realm.array_set_all(*h, elems);
             }
-            SnapCell::Object { props, proto } => {
+            SnapCell::Object {
+                props,
+                accessors,
+                proto,
+            } => {
                 for (k, v, hidden) in props {
                     let val = resolve(v, &handles);
                     realm.set_property(*h, k, val);
+                    if *hidden {
+                        realm.mark_hidden(*h, k);
+                    }
+                }
+                for (k, g, s, hidden) in accessors {
+                    let getter = resolve(g, &handles);
+                    let setter = resolve(s, &handles);
+                    realm.define_accessor(*h, k, getter, setter);
                     if *hidden {
                         realm.mark_hidden(*h, k);
                     }
@@ -525,12 +558,23 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                     w_val(v, &mut out);
                 }
             }
-            SnapCell::Object { props, proto } => {
+            SnapCell::Object {
+                props,
+                accessors,
+                proto,
+            } => {
                 out.push(2);
                 w_u32(props.len() as u32, &mut out);
                 for (k, v, hidden) in props {
                     w_str(k, &mut out);
                     w_val(v, &mut out);
+                    out.push(u8::from(*hidden));
+                }
+                w_u32(accessors.len() as u32, &mut out);
+                for (k, g, s, hidden) in accessors {
+                    w_str(k, &mut out);
+                    w_val(g, &mut out);
+                    w_val(s, &mut out);
                     out.push(u8::from(*hidden));
                 }
                 w_val(proto, &mut out);
@@ -673,8 +717,21 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                     let hidden = r.u8()? != 0;
                     props.push((k, v, hidden));
                 }
+                let na = r.u32()? as usize;
+                let mut accessors = Vec::with_capacity(na);
+                for _ in 0..na {
+                    let k = r.string()?;
+                    let g = r.val()?;
+                    let s = r.val()?;
+                    let hidden = r.u8()? != 0;
+                    accessors.push((k, g, s, hidden));
+                }
                 let proto = r.val()?;
-                SnapCell::Object { props, proto }
+                SnapCell::Object {
+                    props,
+                    accessors,
+                    proto,
+                }
             }
             3 => SnapCell::Date(r.f64()?),
             4 => SnapCell::BigInt(r.string()?),
@@ -1247,6 +1304,56 @@ mod tests {
         assert_eq!(
             realm2.string_value(Handle::from_raw(obj_tag.as_handle().unwrap())),
             Some(String::from("cap"))
+        );
+    }
+
+    #[test]
+    fn snapshots_preserve_accessor_properties() {
+        use crate::env::Scope;
+        let mut realm = Realm::new();
+        // A getter and setter (closures over `func_id`s 11 and 12) installed as an
+        // accessor property, marked non-enumerable like a class accessor.
+        let getter = realm.new_function(11, Scope::root());
+        let setter = realm.new_function(12, Scope::root());
+        let obj = realm.new_object();
+        realm.define_accessor(
+            obj,
+            "value",
+            NanBox::handle(getter.to_raw()),
+            NanBox::handle(setter.to_raw()),
+        );
+        realm.mark_hidden(obj, "value");
+
+        let snap = deserialize(&serialize(&capture(&realm, &[obj]))).expect("round-trip");
+        let mut realm2 = Realm::new();
+        let o2 = restore(&mut realm2, &snap)[0];
+
+        // The accessor survives as an accessor (not a data prop), non-enumerable,
+        // with both functions restored to the same code identities.
+        let (g2, s2) = realm2.accessor(o2, "value").expect("accessor restored");
+        assert_eq!(
+            realm2
+                .function_at(Handle::from_raw(g2.as_handle().unwrap()))
+                .map(|(id, _)| id),
+            Some(11),
+            "getter restored"
+        );
+        assert_eq!(
+            realm2
+                .function_at(Handle::from_raw(s2.as_handle().unwrap()))
+                .map(|(id, _)| id),
+            Some(12),
+            "setter restored"
+        );
+        assert!(
+            !realm2.property_is_enumerable(o2, "value"),
+            "non-enumerable kept"
+        );
+        // It is an accessor, so there's no plain data slot of the same name.
+        assert_eq!(
+            realm2.get_property(o2, "value"),
+            None,
+            "no shadow data slot"
         );
     }
 
