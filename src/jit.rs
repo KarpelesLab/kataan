@@ -465,6 +465,123 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
     out
 }
 
+/// The registers an op reads or writes (`dst` first if it has one).
+fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
+    match *op {
+        RegOp::Arg { dst, .. } | RegOp::Const { dst, .. } => (Some(dst), [None, None]),
+        RegOp::Move { dst, src } => (Some(dst), [Some(src), None]),
+        RegOp::Bin { dst, a, b, .. } | RegOp::Lt { dst, a, b } => (Some(dst), [Some(a), Some(b)]),
+        RegOp::JumpIfFalse { cond, .. } => (None, [Some(cond), None]),
+        RegOp::Ret { src } => (None, [Some(src), None]),
+        RegOp::Jump { .. } => (None, [None, None]),
+    }
+}
+
+/// A **linear-scan register allocator**: computes each virtual register's live
+/// interval (first..=last instruction it appears in) and reassigns registers so
+/// that values whose intervals don't overlap share storage. Returns the rewritten
+/// program and the reduced register count. The interval is taken over linear
+/// instruction order — conservative across branches/loops (it never aliases two
+/// values that are simultaneously live), so the result is observationally
+/// identical with a smaller frame. This is the classic allocator algorithm; here
+/// the "registers" it colors are the frame slots `compile_reg` emits.
+#[must_use]
+pub fn allocate_reg(ops: &[RegOp], n_regs: usize) -> (Vec<RegOp>, usize) {
+    // Live interval [first, last] (in linear order) for each used register.
+    let mut first = alloc::vec![usize::MAX; n_regs];
+    let mut last = alloc::vec![0usize; n_regs];
+    for (i, op) in ops.iter().enumerate() {
+        let (dst, srcs) = op_regs(op);
+        for r in dst.into_iter().chain(srcs.into_iter().flatten()) {
+            let r = r as usize;
+            first[r] = first[r].min(i);
+            last[r] = last[r].max(i);
+        }
+    }
+    // Loop-aware extension: a register live across a loop body `[target, j]` (a
+    // backward branch at `j` to `target <= j`) must hold its slot for the whole
+    // loop — otherwise a register defined inside the loop could reuse its slot and
+    // clobber the value the next iteration reads. Extend such intervals to span
+    // the loop, iterating to a fixpoint to handle nesting.
+    loop {
+        let mut changed = false;
+        for (j, op) in ops.iter().enumerate() {
+            let (RegOp::Jump { target } | RegOp::JumpIfFalse { target, .. }) = *op else {
+                continue;
+            };
+            if target > j {
+                continue; // forward branch — not a loop back-edge
+            }
+            for r in 0..n_regs {
+                if first[r] != usize::MAX && first[r] <= j && last[r] >= target {
+                    let (nf, nl) = (first[r].min(target), last[r].max(j));
+                    if nf != first[r] || nl != last[r] {
+                        first[r] = nf;
+                        last[r] = nl;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Intervals of registers that actually appear, sorted by start.
+    let mut intervals: Vec<(usize, usize, u8)> = (0..n_regs)
+        .filter(|&r| first[r] != usize::MAX)
+        .map(|r| (first[r], last[r], r as u8))
+        .collect();
+    intervals.sort_unstable();
+
+    // Linear scan: `slot_free_at[s]` is the instruction index after which slot `s`
+    // is free again (one past its current occupant's last use).
+    let mut mapping = alloc::vec![0u8; n_regs];
+    let mut slot_end: Vec<usize> = Vec::new(); // slot -> last index it's busy until
+    for (start, end, vreg) in intervals {
+        // Find a slot free at `start` (its occupant's interval ended before).
+        let slot = slot_end.iter().position(|&e| e < start).unwrap_or_else(|| {
+            slot_end.push(0);
+            slot_end.len() - 1
+        });
+        slot_end[slot] = end;
+        mapping[vreg as usize] = slot as u8;
+    }
+    let new_n = slot_end.len().max(1);
+
+    // Rewrite the program with the slot assignment.
+    let m = |r: u8| mapping[r as usize];
+    let out = ops
+        .iter()
+        .map(|op| match *op {
+            RegOp::Arg { dst, index } => RegOp::Arg { dst: m(dst), index },
+            RegOp::Const { dst, imm } => RegOp::Const { dst: m(dst), imm },
+            RegOp::Move { dst, src } => RegOp::Move {
+                dst: m(dst),
+                src: m(src),
+            },
+            RegOp::Bin { dst, a, b, op } => RegOp::Bin {
+                dst: m(dst),
+                a: m(a),
+                b: m(b),
+                op,
+            },
+            RegOp::Lt { dst, a, b } => RegOp::Lt {
+                dst: m(dst),
+                a: m(a),
+                b: m(b),
+            },
+            RegOp::JumpIfFalse { cond, target } => RegOp::JumpIfFalse {
+                cond: m(cond),
+                target,
+            },
+            RegOp::Jump { target } => RegOp::Jump { target },
+            RegOp::Ret { src } => RegOp::Ret { src: m(src) },
+        })
+        .collect();
+    (out, new_n)
+}
+
 /// Constant folding with propagation: a `Bin`/`Lt`/`Move` over known-constant
 /// operands becomes a `Const`. Stays sound across control flow by clearing all
 /// known constants at any jump target and after a branch.
@@ -899,9 +1016,11 @@ impl JitProto {
     #[must_use]
     pub fn compile(proto: &crate::nbvm::FnProto) -> Option<Self> {
         if let Some(ops) = lower_nbvm(proto) {
-            // Optimize (constant-fold) before native codegen — the optimizing tier.
+            // Optimizing tier: fold/simplify/copy-prop/DCE, then register-allocate
+            // (shrinking the frame) before native codegen.
             let ops = optimize_reg(&ops, proto.n_regs);
-            let func = JitFunction::compile_reg(proto.n_regs, proto.n_params, &ops)?;
+            let (ops, n_regs) = allocate_reg(&ops, proto.n_regs);
+            let func = JitFunction::compile_reg(n_regs, proto.n_params, &ops)?;
             return Some(Self {
                 func,
                 n_params: proto.n_params,
@@ -2451,6 +2570,107 @@ mod tests {
         // Observationally identical.
         assert_eq!(eval_reg(&opt, 4, &[]), eval_reg(&ops, 4, &[]));
         assert_eq!(eval_reg(&opt, 4, &[]), 10);
+    }
+
+    #[test]
+    fn register_allocator_reuses_slots() {
+        // Each temporary is used once then dead, so all collapse to few slots:
+        // t0=arg0; t1=t0+t0; t2=t1+t1; t3=t2+t2; ret t3  (uses regs 0,1,2,3).
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Bin {
+                dst: 1,
+                a: 0,
+                b: 0,
+                op: BinOp2::Add,
+            },
+            RegOp::Bin {
+                dst: 2,
+                a: 1,
+                b: 1,
+                op: BinOp2::Add,
+            },
+            RegOp::Bin {
+                dst: 3,
+                a: 2,
+                b: 2,
+                op: BinOp2::Add,
+            },
+            RegOp::Ret { src: 3 },
+        ];
+        let (alloc, n) = allocate_reg(&ops, 4);
+        // The chain's intervals overlap pairwise (each value lives across the next
+        // op that reads it), so allocation needs only 2 slots, not 4.
+        assert!(n <= 2, "allocated to {n} slots: {alloc:?}");
+        // Observationally identical: f(x) = ((x+x)+(x+x))+... = 8x.
+        for x in [0i64, 1, 3, -5, 100] {
+            assert_eq!(eval_reg(&alloc, n, &[x]), eval_reg(&ops, 4, &[x]));
+            assert_eq!(eval_reg(&alloc, n, &[x]), 8 * x);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn allocated_program_runs_natively() {
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Arg { dst: 1, index: 1 },
+            RegOp::Bin {
+                dst: 2,
+                a: 0,
+                b: 1,
+                op: BinOp2::Add,
+            },
+            RegOp::Bin {
+                dst: 3,
+                a: 2,
+                b: 0,
+                op: BinOp2::Mul,
+            },
+            RegOp::Ret { src: 3 },
+        ];
+        let (alloc, n) = allocate_reg(&ops, 4);
+        let f = JitFunction::compile_reg(n, 2, &alloc).unwrap();
+        let oracle = |a: i64, b: i64| (a + b) * a;
+        for (a, b) in [(3, 4), (10, -2), (0, 5)] {
+            assert_eq!(f.call_args(&[a, b]), oracle(a, b), "alloc native ({a},{b})");
+        }
+    }
+
+    #[test]
+    fn allocator_preserves_a_loop() {
+        // The sum(0..n) loop must survive allocation (branch targets unchanged,
+        // overlapping live ranges kept distinct).
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Const { dst: 1, imm: 0 },
+            RegOp::Const { dst: 2, imm: 0 },
+            RegOp::Const { dst: 3, imm: 1 },
+            RegOp::Lt { dst: 4, a: 2, b: 0 },
+            RegOp::JumpIfFalse { cond: 4, target: 9 },
+            RegOp::Bin {
+                dst: 1,
+                a: 1,
+                b: 2,
+                op: BinOp2::Add,
+            },
+            RegOp::Bin {
+                dst: 2,
+                a: 2,
+                b: 3,
+                op: BinOp2::Add,
+            },
+            RegOp::Jump { target: 4 },
+            RegOp::Ret { src: 1 },
+        ];
+        let (alloc, n) = allocate_reg(&ops, 5);
+        for x in [0i64, 1, 5, 10, 50] {
+            assert_eq!(
+                eval_reg(&alloc, n, &[x]),
+                x * (x - 1) / 2,
+                "loop sum 0..{x}"
+            );
+        }
     }
 
     #[test]
