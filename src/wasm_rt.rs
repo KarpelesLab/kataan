@@ -1321,6 +1321,17 @@ impl Module {
                         return Ok(Flow::Branch(depth));
                     }
                 }
+                // br_table: a computed branch — pick labels[index], else default.
+                0x0e => {
+                    let count = r.u32()? as usize;
+                    let mut labels = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        labels.push(r.u32()?);
+                    }
+                    let default = r.u32()?;
+                    let idx = pop!().as_i32()? as u32 as usize;
+                    return Ok(Flow::Branch(labels.get(idx).copied().unwrap_or(default)));
+                }
                 _ => return Err(WasmRtError("unsupported opcode")),
             }
         }
@@ -1661,6 +1672,13 @@ fn else_split(code: &[u8]) -> Result<Option<usize>, WasmRtError> {
             0x20..=0x24 | 0x0c | 0x0d | 0x10 => {
                 r.u32()?;
             }
+            0x0e => {
+                // br_table: count + (count+1) label depths.
+                let c = r.u32()?;
+                for _ in 0..=c {
+                    r.u32()?;
+                }
+            }
             0x11 => {
                 r.u32()?;
                 r.u32()?;
@@ -1711,6 +1729,13 @@ fn block_len(code: &[u8]) -> Result<usize, WasmRtError> {
             // Skip immediates of the ops that carry them.
             0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x0c | 0x0d | 0x10 => {
                 r.u32()?;
+            }
+            0x0e => {
+                // br_table: count + (count+1) label depths.
+                let c = r.u32()?;
+                for _ in 0..=c {
+                    r.u32()?;
+                }
             }
             // call_indirect carries two immediates (typeidx, tableidx).
             0x11 => {
@@ -2410,6 +2435,49 @@ mod tests {
             module.call(0, &[Val::I32(5)]).unwrap(),
             vec![Val::I32(expect)]
         );
+    }
+
+    #[test]
+    fn br_table_computed_branch() {
+        // (func (export "sw") (param i32) (result i32)
+        //   (block (block (block
+        //     local.get 0
+        //     br_table 0 1 2 2      ;; 0->b0, 1->b1, else->b2(default)
+        //   ) ;; b0 reached → return 10
+        //     i32.const 10 return)
+        //   ;; b1 → return 20
+        //     i32.const 20 return)
+        //   ;; b2/default → return 30
+        //   i32.const 30 return)
+        let body: Vec<u8> = vec![
+            0x00, // 0 locals
+            0x02, 0x40, // block (outer, depth target for default)
+            0x02, 0x40, // block
+            0x02, 0x40, // block (innermost)
+            0x20, 0x00, // local.get 0
+            0x0e, 0x02, 0x00, 0x01, 0x02, // br_table {0,1} default 2
+            0x0b, // end innermost  -> falls here for index 0
+            0x41, 0x0a, 0x0f, // i32.const 10; return
+            0x0b, // end middle     -> index 1
+            0x41, 0x14, 0x0f, // i32.const 20; return
+            0x0b, // end outer      -> default
+            0x41, 0x1e, 0x0f, // i32.const 30; return
+            0x0b, // end func
+        ];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]);
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x07, 0x06, 0x01, 0x02, b's', b'w', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).expect("decode br_table module");
+        assert_eq!(module.call(0, &[Val::I32(0)]).unwrap(), vec![Val::I32(10)]);
+        assert_eq!(module.call(0, &[Val::I32(1)]).unwrap(), vec![Val::I32(20)]);
+        assert_eq!(module.call(0, &[Val::I32(2)]).unwrap(), vec![Val::I32(30)]); // default
+        assert_eq!(module.call(0, &[Val::I32(99)]).unwrap(), vec![Val::I32(30)]); // out-of-range → default
     }
 
     #[test]
