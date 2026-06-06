@@ -829,8 +829,10 @@ impl Module {
         while !r.done() {
             let op = r.byte()?;
             match op {
-                0x0b => return Ok(Flow::Normal), // end
-                0x0f => return Ok(Flow::Return), // return
+                0x00 => return Err(WasmRtError("unreachable executed")), // unreachable (trap)
+                0x01 => {}                                               // nop
+                0x0b => return Ok(Flow::Normal),                         // end
+                0x0f => return Ok(Flow::Return),                         // return
                 0x1a => {
                     pop!(); // drop
                 }
@@ -2595,6 +2597,43 @@ mod tests {
         let module2 = Module::decode(&m2).expect("decode if-no-else module");
         assert_eq!(module2.call(0, &[Val::I32(0)]).unwrap(), vec![Val::I32(0)]); // cond false
         assert_eq!(module2.call(0, &[Val::I32(9)]).unwrap(), vec![Val::I32(1)]); // cond true
+    }
+
+    #[test]
+    fn nop_and_unreachable() {
+        // (func (export "f") (param i32) (result i32)
+        //   nop local.get 0 nop i32.const 1 i32.add nop)   ;; nops are no-ops
+        let body: Vec<u8> = vec![
+            0x00, // 0 locals
+            0x01, 0x20, 0x00, 0x01, 0x41, 0x01, 0x6a,
+            0x01, // nop; get0; nop; const1; add; nop
+            0x0b,
+        ];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]);
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).expect("decode nop module");
+        assert_eq!(module.call(0, &[Val::I32(41)]).unwrap(), vec![Val::I32(42)]);
+
+        // (func (export "boom") (result i32) unreachable) — traps.
+        let body2: Vec<u8> = vec![0x00, 0x00, 0x0b]; // 0 locals; unreachable; end
+        let mut m2 = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m2.extend([0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f]); // ()->i32
+        m2.extend([0x03, 0x02, 0x01, 0x00]);
+        m2.extend([0x07, 0x08, 0x01, 0x04, b'b', b'o', b'o', b'm', 0x00, 0x00]);
+        m2.push(0x0a);
+        m2.push((body2.len() + 2) as u8);
+        m2.push(0x01);
+        m2.push(body2.len() as u8);
+        m2.extend(body2);
+        let module2 = Module::decode(&m2).expect("decode unreachable module");
+        assert!(module2.call(0, &[]).is_err(), "unreachable must trap");
     }
 
     #[test]
