@@ -668,6 +668,15 @@ impl<'a> Interp<'a> {
         {
             self.realm
                 .set_property(obj_ns, "prototype", NanBox::handle(obj_proto.to_raw()));
+            // `({}).constructor === Object` (non-enumerable, inherited via the
+            // default object prototype), and `Object.name === "Object"`.
+            self.realm.set_hidden_property(
+                obj_proto,
+                "constructor",
+                NanBox::handle(obj_ns.to_raw()),
+            );
+            let name = self.new_str("Object");
+            self.realm.set_hidden_property(obj_ns, "name", name);
         }
         // Newly-created plain objects now inherit from `Object.prototype`.
         self.realm.set_default_object_proto(obj_proto);

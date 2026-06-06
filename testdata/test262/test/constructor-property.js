@@ -26,3 +26,8 @@ assert.sameValue(Object.keys(f).join(","), "x", "only the data field is enumerab
 
 // Foo.prototype.constructor === Foo (the back-reference lives on the prototype).
 assert.sameValue(Foo.prototype.constructor, Foo, "prototype.constructor");
+
+// Plain objects inherit `constructor === Object` via Object.prototype.
+assert.sameValue(({}).constructor, Object, "({}).constructor is Object");
+assert.sameValue(({}).constructor.name, "Object", "Object.name");
+assert.sameValue(Object.keys({ z: 1 }).indexOf("constructor"), -1, "inherited constructor is not an own key");
