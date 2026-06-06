@@ -109,6 +109,66 @@ pub fn eval_stack(ops: &[StackOp], args: [i64; 2]) -> i64 {
     stack.pop().unwrap_or(0)
 }
 
+/// A binary op for the register compiler (`op_rax_mem`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp2 {
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `&`
+    And,
+    /// `|`
+    Or,
+    /// `^`
+    Xor,
+}
+
+/// A register-machine instruction over a flat virtual-register file — the model
+/// the bytecode VM uses. Each register is an `i64` slot in the frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(missing_docs)] // field names (dst/a/b/op/imm/index/src) mirror the IR
+pub enum RegOp {
+    /// `reg[dst] = arg[index]`
+    Arg { dst: u8, index: u8 },
+    /// `reg[dst] = imm`
+    Const { dst: u8, imm: i64 },
+    /// `reg[dst] = reg[a] <op> reg[b]`
+    Bin { dst: u8, a: u8, b: u8, op: BinOp2 },
+    /// return `reg[src]`
+    Ret { src: u8 },
+}
+
+/// Interprets a [`RegOp`] program (the oracle for [`JitFunction::compile_reg`]).
+/// `n_regs` registers; `args` are the function arguments.
+#[must_use]
+pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
+    let mut regs = alloc::vec![0i64; n_regs];
+    for op in ops {
+        match *op {
+            RegOp::Arg { dst, index } => {
+                regs[dst as usize] = args.get(index as usize).copied().unwrap_or(0);
+            }
+            RegOp::Const { dst, imm } => regs[dst as usize] = imm,
+            RegOp::Bin { dst, a, b, op } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                regs[dst as usize] = match op {
+                    BinOp2::Add => x.wrapping_add(y),
+                    BinOp2::Sub => x.wrapping_sub(y),
+                    BinOp2::Mul => x.wrapping_mul(y),
+                    BinOp2::And => x & y,
+                    BinOp2::Or => x | y,
+                    BinOp2::Xor => x ^ y,
+                };
+            }
+            RegOp::Ret { src } => return regs[src as usize],
+        }
+    }
+    0
+}
+
 /// The reference for [`JitFunction::compile_sum_1_to_n`]: `sum(1..=n)` for
 /// `n >= 0`, else `0`.
 #[must_use]
@@ -273,6 +333,61 @@ impl X64Assembler {
     /// `imul rax, rcx`.
     pub fn imul_rax_rcx(&mut self) {
         self.code.extend_from_slice(&[0x48, 0x0f, 0xaf, 0xc1]);
+    }
+
+    // --- stack-frame (rbp-relative) addressing, for the register compiler ---
+
+    /// `push rbp; mov rbp, rsp; sub rsp, frame` — a standard frame prologue.
+    pub fn prologue(&mut self, frame: u32) {
+        self.code.push(0x55); // push rbp
+        self.code.extend_from_slice(&[0x48, 0x89, 0xe5]); // mov rbp, rsp
+        self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
+        self.code.extend_from_slice(&frame.to_le_bytes());
+    }
+
+    /// `leave; ret` — restore `rsp`/`rbp` and return (`rax` holds the result).
+    pub fn epilogue(&mut self) {
+        self.code.push(0xc9); // leave
+        self.code.push(0xc3); // ret
+    }
+
+    /// `mov [rbp+disp], <arg register>` — spill incoming integer arg `i` (0..=5,
+    /// in `rdi/rsi/rdx/rcx/r8/r9`) to its frame slot.
+    pub fn store_arg(&mut self, arg: usize, disp: i32) {
+        match arg {
+            0 => self.code.extend_from_slice(&[0x48, 0x89, 0xbd]), // rdi
+            1 => self.code.extend_from_slice(&[0x48, 0x89, 0xb5]), // rsi
+            2 => self.code.extend_from_slice(&[0x48, 0x89, 0x95]), // rdx
+            3 => self.code.extend_from_slice(&[0x48, 0x89, 0x8d]), // rcx
+            4 => self.code.extend_from_slice(&[0x4c, 0x89, 0x85]), // r8
+            _ => self.code.extend_from_slice(&[0x4c, 0x89, 0x8d]), // r9
+        }
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `mov rax, [rbp+disp]`.
+    pub fn load_rax(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x48, 0x8b, 0x85]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `mov [rbp+disp], rax`.
+    pub fn store_rax(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x48, 0x89, 0x85]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `<op> rax, [rbp+disp]` for `add`/`sub`/`imul`/`and`/`or`/`xor`.
+    pub fn op_rax_mem(&mut self, op: BinOp2, disp: i32) {
+        match op {
+            BinOp2::Add => self.code.extend_from_slice(&[0x48, 0x03, 0x85]),
+            BinOp2::Sub => self.code.extend_from_slice(&[0x48, 0x2b, 0x85]),
+            BinOp2::Mul => self.code.extend_from_slice(&[0x48, 0x0f, 0xaf, 0x85]),
+            BinOp2::And => self.code.extend_from_slice(&[0x48, 0x23, 0x85]),
+            BinOp2::Or => self.code.extend_from_slice(&[0x48, 0x0b, 0x85]),
+            BinOp2::Xor => self.code.extend_from_slice(&[0x48, 0x33, 0x85]),
+        }
+        self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
     /// `mov rax, rdi` — seed the accumulator with the first argument.
@@ -492,6 +607,98 @@ impl JitFunction {
         a.pop_rax();
         a.ret();
         Self::from_code(&a.finish())
+    }
+
+    /// Compiles a [`RegOp`] register-machine program (up to 6 integer args) to a
+    /// native function, using a stack frame: each of `n_regs` virtual registers
+    /// is homed to an `i64` slot at `[rbp - (r+1)*8]` (a spill-everything
+    /// allocation, with `rax`/`rcx` as scratch). Returns `None` on the
+    /// unavailable target, `>64` registers, or a malformed program (a register or
+    /// arg index out of range, or no `Ret`).
+    #[must_use]
+    pub fn compile_reg(n_regs: usize, n_args: usize, ops: &[RegOp]) -> Option<Self> {
+        if n_regs > 64 || n_args > 6 {
+            return None;
+        }
+        let ok_reg = |r: u8| (r as usize) < n_regs;
+        let disp = |r: u8| -((i32::from(r) + 1) * 8);
+        // Frame: n_regs slots, rounded up to 16-byte alignment.
+        let frame = ((n_regs as u32 * 8) + 15) & !15;
+        let mut a = X64Assembler::new();
+        a.prologue(frame);
+        // Spill the incoming arguments to their register slots (RegOp::Arg reads
+        // them back, so only the first `n_args` registers' Arg ops matter, but we
+        // store all declared args up front for simplicity).
+        let mut has_ret = false;
+        for op in ops {
+            match *op {
+                RegOp::Arg { dst, index } => {
+                    if !ok_reg(dst) || index as usize >= n_args {
+                        return None;
+                    }
+                    a.store_arg(index as usize, disp(dst));
+                }
+                RegOp::Const { dst, imm } => {
+                    if !ok_reg(dst) {
+                        return None;
+                    }
+                    a.movabs_rax(imm);
+                    a.store_rax(disp(dst));
+                }
+                RegOp::Bin {
+                    dst,
+                    a: ra,
+                    b: rb,
+                    op,
+                } => {
+                    if !ok_reg(dst) || !ok_reg(ra) || !ok_reg(rb) {
+                        return None;
+                    }
+                    a.load_rax(disp(ra));
+                    a.op_rax_mem(op, disp(rb));
+                    a.store_rax(disp(dst));
+                }
+                RegOp::Ret { src } => {
+                    if !ok_reg(src) {
+                        return None;
+                    }
+                    a.load_rax(disp(src));
+                    a.epilogue();
+                    has_ret = true;
+                    break;
+                }
+            }
+        }
+        if !has_ret {
+            return None;
+        }
+        Self::from_code(&a.finish())
+    }
+
+    /// Calls a compiled register-machine function with up to 6 `i64` arguments.
+    #[must_use]
+    pub fn call_args(&self, args: &[i64]) -> i64 {
+        // The compiled code reads only the args it declared; pad to 6 so the call
+        // matches a fixed 6-arg System V signature.
+        let mut a = [0i64; 6];
+        for (slot, v) in a.iter_mut().zip(args.iter()) {
+            *slot = *v;
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            // SAFETY: the compiled code follows the System V ABI for
+            // `extern "C" fn(i64 x6) -> i64`; reading fewer than 6 args is sound
+            // (extra register args are simply ignored by the callee).
+            #[allow(unsafe_code)]
+            let f: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                unsafe { core::mem::transmute(self.buf.ptr()) };
+            f(a[0], a[1], a[2], a[3], a[4], a[5])
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            let _ = a;
+            unreachable!("JitFunction cannot be constructed on this target")
+        }
     }
 
     /// Calls the compiled function with one argument.
@@ -768,6 +975,99 @@ mod tests {
             "two results"
         );
         assert!(JitFunction::compile_stack(&[]).is_none(), "empty");
+    }
+
+    #[test]
+    fn register_machine_compiles_and_runs() {
+        // r0=arg0, r1=arg1, r2=arg2; r3 = (r0 + r1) * r2 - r0 ; ret r3
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Arg { dst: 1, index: 1 },
+            RegOp::Arg { dst: 2, index: 2 },
+            RegOp::Bin {
+                dst: 3,
+                a: 0,
+                b: 1,
+                op: BinOp2::Add,
+            },
+            RegOp::Bin {
+                dst: 3,
+                a: 3,
+                b: 2,
+                op: BinOp2::Mul,
+            },
+            RegOp::Bin {
+                dst: 3,
+                a: 3,
+                b: 0,
+                op: BinOp2::Sub,
+            },
+            RegOp::Ret { src: 3 },
+        ];
+        let oracle = |a: i64, b: i64, c: i64| (a + b) * c - a;
+        for (a, b, c) in [
+            (2, 3, 4),
+            (10, -5, 2),
+            (0, 0, 9),
+            (-7, 7, -1),
+            (100, 1, 1000),
+        ] {
+            assert_eq!(eval_reg(&ops, 4, &[a, b, c]), oracle(a, b, c));
+            if let Some(f) = JitFunction::compile_reg(4, 3, &ops) {
+                assert_eq!(
+                    f.call_args(&[a, b, c]),
+                    oracle(a, b, c),
+                    "jit reg ({a},{b},{c})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn register_machine_uses_constants_and_many_regs() {
+        // A wider program exercising the spill-everything frame (>2 live regs).
+        // r0=arg0; r1=100; r2=r0*r1; r3=7; r4=r2|r3; r5=r4^r0; ret r5
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Const { dst: 1, imm: 100 },
+            RegOp::Bin {
+                dst: 2,
+                a: 0,
+                b: 1,
+                op: BinOp2::Mul,
+            },
+            RegOp::Const { dst: 3, imm: 7 },
+            RegOp::Bin {
+                dst: 4,
+                a: 2,
+                b: 3,
+                op: BinOp2::Or,
+            },
+            RegOp::Bin {
+                dst: 5,
+                a: 4,
+                b: 0,
+                op: BinOp2::Xor,
+            },
+            RegOp::Ret { src: 5 },
+        ];
+        let oracle = |a: i64| ((a * 100) | 7) ^ a;
+        for a in [0i64, 1, 5, 42, -3, 12345] {
+            assert_eq!(eval_reg(&ops, 6, &[a]), oracle(a));
+            if let Some(f) = JitFunction::compile_reg(6, 1, &ops) {
+                assert_eq!(f.call_args(&[a]), oracle(a), "jit reg const ({a})");
+            }
+        }
+    }
+
+    #[test]
+    fn register_machine_rejects_malformed() {
+        // Register index out of range.
+        assert!(JitFunction::compile_reg(2, 1, &[RegOp::Ret { src: 5 }]).is_none());
+        // No Ret.
+        assert!(JitFunction::compile_reg(2, 1, &[RegOp::Const { dst: 0, imm: 1 }]).is_none());
+        // Arg index beyond declared args.
+        assert!(JitFunction::compile_reg(2, 1, &[RegOp::Arg { dst: 0, index: 3 }]).is_none());
     }
 
     #[test]
