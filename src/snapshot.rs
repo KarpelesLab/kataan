@@ -11,9 +11,9 @@
 //! which is exactly the pointer relocation a snapshot reload performs, and
 //! handles cycles correctly.
 //!
-//! Covers the core value cells (objects, arrays, strings) plus the primitive
-//! `NanBox` values; richer cells (functions/closures, promises, proxies) are a
-//! later extension. Pure, safe `alloc`-only Rust.
+//! Covers the value cells (objects, arrays, strings, `Date`, `BigInt`) plus the
+//! primitive `NanBox` values; richer cells (functions/closures, promises,
+//! proxies) are a later extension. Pure, safe `alloc`-only Rust.
 
 use crate::heap::Handle;
 use crate::nanbox::{NanBox, Unpacked};
@@ -46,6 +46,10 @@ pub enum SnapCell {
     Array(Vec<SnapVal>),
     /// an object: enumerable own `(key, value)` pairs
     Object(Vec<(String, SnapVal)>),
+    /// a `Date` (millisecond timestamp)
+    Date(f64),
+    /// a `BigInt` (its base-10 digit string)
+    BigInt(String),
 }
 
 /// A captured object graph: the reachable cells (index-addressed) plus the
@@ -81,8 +85,10 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
 
     let mut root_indices = Vec::new();
     for r in roots {
-        // Only object-like cells (string/array/object) are serializable roots.
+        // Only value cells (string/date/bigint/array/object) are serializable roots.
         let serializable = realm.string_value(*r).is_some()
+            || realm.date_at(*r).is_some()
+            || realm.bigint_at(*r).is_some()
             || realm.array_elements(*r).is_some()
             || realm.object_keys(*r).is_some();
         if serializable {
@@ -98,6 +104,10 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
         pos += 1;
         let cell = if let Some(s) = realm.string_value(h) {
             SnapCell::Str(s)
+        } else if let Some(ms) = realm.date_at(h) {
+            SnapCell::Date(ms)
+        } else if let Some(bi) = realm.bigint_at(h) {
+            SnapCell::BigInt(bi.to_str_radix(10))
         } else if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
             let vals = elems
                 .iter()
@@ -158,6 +168,11 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
         .iter()
         .map(|c| match c {
             SnapCell::Str(s) => realm.new_string(s),
+            SnapCell::Date(ms) => realm.new_date(*ms),
+            SnapCell::BigInt(s) => {
+                let bi = crate::bignum::BigInt::from_str_radix(s, 10).unwrap_or_default();
+                realm.new_bigint(bi)
+            }
             SnapCell::Array(_) => realm.new_array(Vec::new()),
             SnapCell::Object(_) => realm.new_object(),
         })
@@ -177,7 +192,8 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
     };
     for (cell, h) in snap.cells.iter().zip(&handles) {
         match cell {
-            SnapCell::Str(_) => {}
+            // Reference-free cells were built fully in pass 1.
+            SnapCell::Str(_) | SnapCell::Date(_) | SnapCell::BigInt(_) => {}
             SnapCell::Array(vals) => {
                 let elems: Vec<NanBox> = vals.iter().map(|v| resolve(v, &handles)).collect();
                 realm.array_set_all(*h, elems);
@@ -273,6 +289,14 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                     w_val(v, &mut out);
                 }
             }
+            SnapCell::Date(ms) => {
+                out.push(3);
+                out.extend_from_slice(&ms.to_le_bytes());
+            }
+            SnapCell::BigInt(digits) => {
+                out.push(4);
+                w_str(digits, &mut out);
+            }
         }
     }
     out
@@ -358,6 +382,8 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                 }
                 SnapCell::Object(pairs)
             }
+            3 => SnapCell::Date(r.f64()?),
+            4 => SnapCell::BigInt(r.string()?),
             t => return Err(SnapError::BadTag(t)),
         };
         cells.push(cell);
@@ -520,6 +546,46 @@ mod tests {
         assert_eq!(
             deserialize(&good[..good.len() - 1]),
             Err(SnapError::Truncated)
+        );
+    }
+
+    #[test]
+    fn snapshots_dates_and_bigints() {
+        let mut realm = Realm::new();
+        // An object holding a Date and a BigInt, plus a Date root array.
+        let when = realm.new_date(1_592_217_045_123.0);
+        let big = realm.new_bigint(
+            crate::bignum::BigInt::from_str_radix("123456789012345678901234567890", 10).unwrap(),
+        );
+        let obj = realm.new_object();
+        realm.set_property(obj, "when", NanBox::handle(when.to_raw()));
+        realm.set_property(obj, "big", NanBox::handle(big.to_raw()));
+
+        // capture → serialize → deserialize → restore.
+        let snap = capture(&realm, &[obj]);
+        let bytes = serialize(&snap);
+        let reloaded = deserialize(&bytes).expect("deserialize");
+        assert_eq!(reloaded, snap);
+        let mut realm2 = Realm::new();
+        let o2 = restore(&mut realm2, &reloaded)[0];
+
+        // The Date timestamp and BigInt digits survive.
+        let when2 = realm2
+            .get_property(o2, "when")
+            .unwrap()
+            .as_handle()
+            .unwrap();
+        assert_eq!(
+            realm2.date_at(Handle::from_raw(when2)),
+            Some(1_592_217_045_123.0)
+        );
+        let big2 = realm2.get_property(o2, "big").unwrap().as_handle().unwrap();
+        assert_eq!(
+            realm2
+                .bigint_at(Handle::from_raw(big2))
+                .unwrap()
+                .to_str_radix(10),
+            "123456789012345678901234567890"
         );
     }
 
