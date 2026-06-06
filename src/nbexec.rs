@@ -256,6 +256,7 @@ const N_WASM_CALL: u16 = 186;
 // Hidden slots on a WASM export wrapper's data object.
 const WASM_BYTES: &str = "\u{0}wbytes";
 const WASM_EXPORT: &str = "\u{0}wexport";
+const WASM_IMPORTS: &str = "\u{0}wimports";
 // `Object.prototype.*` methods (the receiver arrives as `this`).
 const N_OBJ_PROTO_TOSTRING: u16 = 179;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
@@ -1502,10 +1503,13 @@ impl<'a> Interp<'a> {
                     module.export_names().iter().map(|s| (*s).into()).collect();
                 let bytes_arr = arg(0); // the original buffer, kept for re-decode
                 let exports = self.realm.new_object();
+                let imports_obj = arg(1); // the optional importObject
                 for name in names {
-                    // The wrapper's data object carries the bytes + export name.
+                    // The wrapper's data object carries the bytes + export name +
+                    // the import object (for modules that import host functions).
                     let data = self.realm.new_object();
                     self.realm.set_property(data, WASM_BYTES, bytes_arr);
+                    self.realm.set_property(data, WASM_IMPORTS, imports_obj);
                     let name_v = self.new_str(&name);
                     self.realm.set_property(data, WASM_EXPORT, name_v);
                     let f = self.realm.new_bound_native(N_WASM_CALL, data);
@@ -5799,14 +5803,101 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
             .and_then(|h| self.realm.string_value(h))
             .ok_or_else(|| self.wasm_compile_error("missing export name"))?;
+        let imports_obj = self
+            .realm
+            .get_property(data, WASM_IMPORTS)
+            .unwrap_or(NanBox::undefined());
         let module = crate::wasm_rt::Module::decode(&bytes)
             .map_err(|_| self.wasm_compile_error("invalid module"))?;
-        let mut inst = crate::wasm_rt::Instance::new(&module)
-            .map_err(|_| self.wasm_compile_error("instantiation failed"))?;
-        let results = inst
-            .call_export_js(&name, args)
-            .map_err(|e| self.wasm_compile_error(e.0))?;
-        Ok(results.first().copied().unwrap_or(NanBox::undefined()))
+
+        // Resolve each function import to a JS function: importObject[mod][field].
+        let import_names: Vec<(String, String)> = module
+            .import_names()
+            .iter()
+            .map(|(m, f)| ((*m).into(), (*f).into()))
+            .collect();
+        let mut import_fns: Vec<NanBox> = Vec::with_capacity(import_names.len());
+        for (m, f) in &import_names {
+            let ns = imports_obj
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.get_property(h, m))
+                .unwrap_or(NanBox::undefined());
+            let func = ns
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.get_property(h, f))
+                .unwrap_or(NanBox::undefined());
+            import_fns.push(func);
+        }
+        // The result type of each import (to marshal the JS return back to a Val).
+        let import_results: Vec<Vec<crate::wasm_rt::ValType>> = (0..import_names.len())
+            .map(|i| {
+                module
+                    .func_type(i as u32)
+                    .map(|t| t.results.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        // Marshal the export's arguments per its parameter types.
+        let export_idx = module
+            .export(&name)
+            .ok_or_else(|| self.wasm_compile_error("no such export"))?;
+        let params = module
+            .func_type(export_idx)
+            .map(|t| t.params.clone())
+            .unwrap_or_default();
+        if args.len() != params.len() {
+            return Err(self.wasm_compile_error("argument count mismatch"));
+        }
+        let val_args: Vec<crate::wasm_rt::Val> = params
+            .iter()
+            .zip(args)
+            .map(|(t, v)| {
+                crate::wasm_rt::Val::from_nanbox(*v, *t)
+                    .ok_or_else(|| self.wasm_compile_error("argument not coercible to wasm value"))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut inst = if import_names.is_empty() {
+            crate::wasm_rt::Instance::new(&module)
+        } else {
+            crate::wasm_rt::Instance::with_host_imports(&module)
+        }
+        .map_err(|e| self.wasm_compile_error(e.0))?;
+
+        // The import dispatcher: marshal Vals → JS, call the JS import, marshal the
+        // result back. Borrows `self` (the engine) directly — sound because the
+        // instance state (`inst`) is a separate object.
+        let mut thrown: Option<ExecError> = None;
+        let results = {
+            let me: &mut Self = self;
+            let mut host = |i: usize, wargs: &[crate::wasm_rt::Val]| {
+                let nbargs: Vec<NanBox> = wargs.iter().map(|v| v.to_nanbox()).collect();
+                match me.call(import_fns[i], &nbargs) {
+                    Ok(r) => import_results[i]
+                        .iter()
+                        .map(|t| {
+                            crate::wasm_rt::Val::from_nanbox(r, *t)
+                                .ok_or(crate::wasm_rt::WasmRtError("import result not coercible"))
+                        })
+                        .collect(),
+                    Err(e) => {
+                        thrown = Some(e);
+                        Err(crate::wasm_rt::WasmRtError("host import threw"))
+                    }
+                }
+            };
+            inst.call_export_with_host(&name, &val_args, &mut host)
+        };
+        if let Some(e) = thrown {
+            return Err(e); // propagate a JS exception thrown by an import
+        }
+        let results = results.map_err(|e| self.wasm_compile_error(e.0))?;
+        Ok(results
+            .first()
+            .map_or(NanBox::undefined(), |v| v.to_nanbox()))
     }
 
     /// A thrown `WebAssembly`-style `TypeError` for compile/instantiate failures.

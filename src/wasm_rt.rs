@@ -156,6 +156,13 @@ pub struct Module {
 /// inside a WASM module.
 pub type HostFunc = alloc::boxed::Box<dyn Fn(&[Val]) -> Result<Vec<Val>, WasmRtError>>;
 
+/// The import dispatcher threaded through execution: given an imported function
+/// index and its arguments, produce the results. Threading it as a parameter
+/// (rather than storing a closure) lets the dispatcher borrow the host engine
+/// mutably — so a JS function can be invoked for an import — without aliasing the
+/// instance state.
+pub type ImportHost<'a> = &'a mut dyn FnMut(usize, &[Val]) -> Result<Vec<Val>, WasmRtError>;
+
 /// One linear-memory page, in bytes (WebAssembly fixes this at 64 KiB).
 const PAGE_SIZE: usize = 65536;
 
@@ -164,9 +171,6 @@ const PAGE_SIZE: usize = 65536;
 struct Store {
     mem: Vec<u8>,
     globals: Vec<Val>,
-    /// Host functions backing the module's imports (index-aligned with
-    /// `Module::func_imports`). Empty for an import-free `Module::call`.
-    host_funcs: Vec<HostFunc>,
 }
 
 /// LEB128 cursor over a byte slice.
@@ -682,31 +686,30 @@ impl Module {
             .map(|(_, _, t, _)| zero_val(*t))
             .collect();
         globals.extend(self.globals.iter().map(|(v, _)| *v));
-        Ok(Store {
-            mem,
-            globals,
-            host_funcs: Vec::new(),
-        })
+        Ok(Store { mem, globals })
     }
 
-    /// Calls function `index` with `args`, returning the results. Allocates a
-    /// fresh instance (memory + globals) for the invocation.
+    /// Calls function `index` with `args` over a fresh instance, dispatching any
+    /// imported function through `host`.
     ///
     /// # Errors
     /// Returns `WasmRtError` on a type mismatch, a missing function, or an
     /// unsupported instruction.
     pub fn call(&self, index: u32, args: &[Val]) -> Result<Vec<Val>, WasmRtError> {
         let mut store = self.new_store()?;
-        self.call_with_store(index, args, &mut store)
+        // No host: an imported call (which an import-free module has none of) errors.
+        let mut none = |_i: usize, _a: &[Val]| Err(WasmRtError("missing host function for import"));
+        self.call_with_store(index, args, &mut store, &mut none)
     }
 
-    /// Like [`call`](Self::call) but over a caller-provided instance store
-    /// (shared across nested `call`s).
+    /// Like [`call`](Self::call) but over a caller-provided instance store and
+    /// import dispatcher (both shared across nested `call`s).
     fn call_with_store(
         &self,
         index: u32,
         args: &[Val],
         store: &mut Store,
+        host: ImportHost,
     ) -> Result<Vec<Val>, WasmRtError> {
         let ty = self
             .func_types
@@ -716,14 +719,10 @@ impl Module {
         if args.len() != ty.params.len() {
             return Err(WasmRtError("argument count mismatch"));
         }
-        // A function import dispatches to its host function.
+        // A function import dispatches through the host callback.
         let n_imp = self.n_imported_funcs();
         if (index as usize) < n_imp {
-            let host = store
-                .host_funcs
-                .get(index as usize)
-                .ok_or(WasmRtError("missing host function for import"))?;
-            return host(args);
+            return host(index as usize, args);
         }
         let body = self
             .bodies
@@ -735,7 +734,7 @@ impl Module {
             locals.push(zero_val(*lt));
         }
         let mut stack: Vec<Val> = Vec::new();
-        self.exec(&body.code, &mut locals, &mut stack, store)?;
+        self.exec(&body.code, &mut locals, &mut stack, store, host)?;
         // Take the result count off the top of the stack.
         let n = ty.results.len();
         if stack.len() < n {
@@ -753,6 +752,7 @@ impl Module {
         locals: &mut [Val],
         stack: &mut Vec<Val>,
         store: &mut Store,
+        host: ImportHost,
     ) -> Result<Flow, WasmRtError> {
         let mut r = Reader::new(code);
         macro_rules! pop {
@@ -877,7 +877,7 @@ impl Module {
                         return Err(WasmRtError("call argument underflow"));
                     }
                     let cargs = stack.split_off(stack.len() - n);
-                    let res = self.call_with_store(callee, &cargs, store)?;
+                    let res = self.call_with_store(callee, &cargs, store, host)?;
                     stack.extend(res);
                 }
                 // call_indirect: typeidx, tableidx; pop the table index, look up
@@ -906,7 +906,7 @@ impl Module {
                         return Err(WasmRtError("call argument underflow"));
                     }
                     let cargs = stack.split_off(stack.len() - n);
-                    let res = self.call_with_store(func, &cargs, store)?;
+                    let res = self.call_with_store(func, &cargs, store, host)?;
                     stack.extend(res);
                 }
                 // --- linear memory ---
@@ -1197,7 +1197,7 @@ impl Module {
                     let _blocktype = r.byte()?; // 0x40 (empty) or a value type
                     let is_loop = op == 0x03;
                     let (consumed, flow) =
-                        self.exec_block(&code[r.pos..], locals, stack, store, is_loop)?;
+                        self.exec_block(&code[r.pos..], locals, stack, store, host, is_loop)?;
                     r.pos += consumed;
                     match flow {
                         Flow::Return => return Ok(Flow::Return),
@@ -1231,12 +1231,13 @@ impl Module {
         locals: &mut [Val],
         stack: &mut Vec<Val>,
         store: &mut Store,
+        host: ImportHost,
         is_loop: bool,
     ) -> Result<(usize, Flow), WasmRtError> {
         let inner_len = block_len(code)?;
         let inner = &code[..inner_len - 1]; // exclude the matching `end`
         loop {
-            match self.exec(inner, locals, stack, store)? {
+            match self.exec(inner, locals, stack, store, host)? {
                 Flow::Branch(0) => {
                     if is_loop {
                         continue; // re-run the loop body
@@ -1259,6 +1260,9 @@ impl Module {
 pub struct Instance<'m> {
     module: &'m Module,
     store: Store,
+    /// Host functions backing the module's function imports (index-aligned with
+    /// `Module::func_imports`); dispatched by `call`'s default import host.
+    host_funcs: Vec<HostFunc>,
 }
 
 impl<'m> Instance<'m> {
@@ -1321,7 +1325,6 @@ impl<'m> Instance<'m> {
             return Err(WasmRtError("import count mismatch"));
         }
         let mut store = module.new_store()?;
-        store.host_funcs = host_funcs;
         // Imported globals occupy the first slots of the global space.
         for (i, v) in import_globals.into_iter().enumerate() {
             store.globals[i] = v;
@@ -1339,7 +1342,11 @@ impl<'m> Instance<'m> {
             }
             store.mem = mem;
         }
-        let mut inst = Self { module, store };
+        let mut inst = Self {
+            module,
+            store,
+            host_funcs,
+        };
         // The `start` function runs automatically at instantiation (after memory
         // and globals are set up), initializing the instance.
         if let Some(start) = module.start {
@@ -1355,7 +1362,80 @@ impl<'m> Instance<'m> {
     /// Returns `WasmRtError` on a type mismatch, a missing function, or an
     /// unsupported instruction / trap.
     pub fn call(&mut self, index: u32, args: &[Val]) -> Result<Vec<Val>, WasmRtError> {
-        self.module.call_with_store(index, args, &mut self.store)
+        // Destructure so the import host (borrowing `host_funcs`) and the store
+        // (borrowed mutably) are independent field borrows, not both via `self`.
+        let Instance {
+            module,
+            store,
+            host_funcs,
+        } = self;
+        let mut host = |i: usize, a: &[Val]| {
+            host_funcs
+                .get(i)
+                .ok_or(WasmRtError("missing host function for import"))?(a)
+        };
+        module.call_with_store(index, args, store, &mut host)
+    }
+
+    /// Instantiates `module` whose function imports are dispatched through an
+    /// external [`ImportHost`] (e.g. one that calls JS) supplied per call to
+    /// [`call_export_with_host`](Self::call_export_with_host), rather than bound
+    /// `HostFunc`s. Only function imports are supported on this path.
+    ///
+    /// # Errors
+    /// `WasmRtError` if the module imports a global or memory (unsupported here),
+    /// or a data segment is out of bounds.
+    pub fn with_host_imports(module: &'m Module) -> Result<Self, WasmRtError> {
+        if module.n_imported_globals() != 0 || module.mem_imported {
+            return Err(WasmRtError(
+                "unsupported import kind for host instantiation",
+            ));
+        }
+        let store = module.new_store()?;
+        let mut inst = Self {
+            module,
+            store,
+            host_funcs: Vec::new(),
+        };
+        if let Some(start) = module.start {
+            inst.call(start, &[])?; // start with no host imports
+        }
+        Ok(inst)
+    }
+
+    /// Calls function `index` over this instance, dispatching imported functions
+    /// through `host` (which may invoke host-engine functions — e.g. JS). The
+    /// instance's own `host_funcs` are ignored on this path.
+    ///
+    /// # Errors
+    /// As [`call`](Self::call).
+    pub fn call_with_host(
+        &mut self,
+        index: u32,
+        args: &[Val],
+        host: ImportHost,
+    ) -> Result<Vec<Val>, WasmRtError> {
+        self.module
+            .call_with_store(index, args, &mut self.store, host)
+    }
+
+    /// Resolves an exported function by name and calls it, dispatching imports
+    /// through `host`.
+    ///
+    /// # Errors
+    /// `WasmRtError("no such export")` if `name` is not exported, else as
+    /// [`call_with_host`](Self::call_with_host).
+    pub fn call_export_with_host(
+        &mut self,
+        name: &str,
+        args: &[Val],
+        host: ImportHost,
+    ) -> Result<Vec<Val>, WasmRtError> {
+        let idx = self
+            .module
+            .export(name)
+            .ok_or(WasmRtError("no such export"))?;
+        self.call_with_host(idx, args, host)
     }
 
     /// Resolves an exported function by name and calls it.
