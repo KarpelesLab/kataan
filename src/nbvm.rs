@@ -3258,6 +3258,10 @@ struct Compiler {
     /// point (`switch` does *not* push here — `continue` targets the nearest
     /// loop).
     continue_sites: Vec<Vec<usize>>,
+    /// Per enclosing optional-chain (`Expr::OptChain`): the `?.`-link jump indices
+    /// awaiting the chain end. A nullish `?.` base jumps here, short-circuiting the
+    /// whole remaining chain to `undefined`.
+    optchain_ends: Vec<Vec<usize>>,
     /// Active statement labels → the `break_sites`/`continue_sites` stack index
     /// of the loop they label (for `break label` / `continue label`).
     labels: Vec<(String, usize)>,
@@ -4462,18 +4466,26 @@ impl Compiler {
             } => {
                 let obj = self.expr(object)?;
                 if *optional {
-                    // `obj?.prop` — short-circuit to `undefined` when nullish.
-                    let dst = self.alloc();
-                    self.ops.push(Op::LoadConst {
-                        dst,
-                        value: NanBox::undefined(),
-                    });
                     let go = self.emit_not_nullish(obj)?;
-                    let jf = self.emit_jump_if_false(go);
-                    let v = self.member_read(obj, property)?;
-                    self.ops.push(Op::Move { dst, src: v });
-                    self.patch(jf);
-                    Ok(dst)
+                    let jf = self.emit_jump_if_false(go); // jump when nullish
+                    if self.optchain_ends.is_empty() {
+                        // Defensive (a `?.` not wrapped by the parser): per-link skip.
+                        let dst = self.alloc();
+                        self.ops.push(Op::LoadConst {
+                            dst,
+                            value: NanBox::undefined(),
+                        });
+                        let v = self.member_read(obj, property)?;
+                        self.ops.push(Op::Move { dst, src: v });
+                        self.patch(jf);
+                        Ok(dst)
+                    } else {
+                        // A nullish base short-circuits the *whole* enclosing chain:
+                        // jump to the `OptChain` end (where the result stays
+                        // `undefined`), skipping the rest of the chain's links.
+                        self.optchain_ends.last_mut().unwrap().push(jf);
+                        self.member_read(obj, property)
+                    }
                 } else {
                     self.member_read(obj, property)
                 }
@@ -4981,11 +4993,30 @@ impl Compiler {
                 };
                 self.make_closure(&a.params, &body, a.is_async)
             }
-            // The optional-chain boundary: compile the inner chain. (The bytecode
-            // path keeps its existing per-link `?.` handling; cross-chain
-            // short-circuit is a known limitation — see the tree-walker for the
-            // spec-correct behavior.)
-            Expr::OptChain { expr, .. } => self.expr(expr),
+            // The optional-chain boundary. Allocate the result (defaulting to
+            // `undefined`), then compile the inner chain: each `?.` link with a
+            // nullish base jumps here, leaving the result `undefined`; otherwise the
+            // chain's value is moved in. This makes a nullish `?.` base short-circuit
+            // the *entire* remaining chain (`a?.b.c.d`).
+            Expr::OptChain { expr, .. } => {
+                let result = self.alloc();
+                self.ops.push(Op::LoadConst {
+                    dst: result,
+                    value: NanBox::undefined(),
+                });
+                self.optchain_ends.push(Vec::new());
+                let v = self.expr(expr)?;
+                self.ops.push(Op::Move {
+                    dst: result,
+                    src: v,
+                });
+                let sites = self.optchain_ends.pop().unwrap_or_default();
+                let end = self.ops.len();
+                for s in sites {
+                    self.patch_to(s, end);
+                }
+                Ok(result)
+            }
             _ => Err(CompileError::Unsupported("expression")),
         }
     }
@@ -5410,6 +5441,22 @@ mod tests {
         let mut realm = Realm::new();
         let value = compile_and_run(&mut realm, &program).expect("compile+run");
         realm.to_display_string(value)
+    }
+
+    #[test]
+    fn optional_chain_short_circuits_whole_chain() {
+        // A nullish `?.` base short-circuits the entire chain (not just one link).
+        assert_eq!(bc("let n = null; n?.a.b.c"), "undefined");
+        assert_eq!(bc("let o = {a:{b:7}}; o?.a?.b"), "7");
+        assert_eq!(bc("let o = {a:{b:7}}; o?.x?.y.z"), "undefined");
+        // `??` over a short-circuited chain takes the fallback.
+        assert_eq!(bc("let n = null; n?.a.b ?? 42"), "42");
+        // A genuinely-present intermediate that is nullish still throws on a plain
+        // access — caught here to confirm it is NOT silently short-circuited.
+        assert_eq!(
+            bc("let o = {a:{}}; let r; try { r = o.a?.zzz.qqq; } catch (e) { r = 'threw'; } r"),
+            "threw"
+        );
     }
 
     /// A hot integer function is called enough times to tier up; with the JIT
