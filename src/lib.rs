@@ -102,6 +102,12 @@ pub mod json;
 #[cfg(feature = "alloc")]
 pub mod wasm;
 
+/// The WebAssembly execution engine (Phase H): decodes and *runs* `.wasm`
+/// binaries — the peer engine proper, distinct from `wasm` (JS→WASM). Needs
+/// `alloc`.
+#[cfg(feature = "alloc")]
+pub mod wasm_rt;
+
 /// A minimal register VM over the `Realm`/`NanBox` representation — the proof
 /// that the performance object model executes code. Needs `alloc`.
 #[cfg(feature = "alloc")]
