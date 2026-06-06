@@ -1440,6 +1440,18 @@ fn nanbox_f64(v: crate::nanbox::NanBox) -> Option<f64> {
 /// `Add`/`AddValue`/`Sub`/`Mul`/`Div`, `Move`, and a terminating `Return`. This
 /// covers `/` and non-integer values, which the integer path
 /// ([`lower_nbvm`]) rejects, but not branches/loops (the float compiler is
+/// Whether this CPU supports SSE4.1 (needed for `roundsd`). `is_x86_feature_detected!`
+/// only exists on x86 targets, so it is `cfg`-gated; everywhere else this is `false`
+/// (the JIT only emits machine code on x86-64 Linux anyway).
+#[cfg(all(feature = "alloc", target_arch = "x86_64"))]
+fn has_sse41() -> bool {
+    std::is_x86_feature_detected!("sse4.1")
+}
+#[cfg(all(feature = "alloc", not(target_arch = "x86_64")))]
+fn has_sse41() -> bool {
+    false
+}
+
 /// straight-line). Returns `None` otherwise, with the same def-use safety check.
 #[cfg(feature = "alloc")]
 #[must_use]
@@ -1542,7 +1554,7 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                 if (*native == crate::nbvm::NB_MATH_FLOOR
                     || *native == crate::nbvm::NB_MATH_CEIL)
                     && args.len() == 1
-                    && std::is_x86_feature_detected!("sse4.1") =>
+                    && has_sse41() =>
             {
                 let a = read(&written, args[0])?;
                 let d = reg8(*dst)?;
@@ -2780,7 +2792,7 @@ impl JitFunction {
                 }
                 FloatOp::Floor { dst, a: ra } | FloatOp::Ceil { dst, a: ra } => {
                     // `roundsd` is SSE4.1; refuse to emit it on hardware without it.
-                    if !ok(dst) || !ok(ra) || !std::is_x86_feature_detected!("sse4.1") {
+                    if !ok(dst) || !ok(ra) || !has_sse41() {
                         return None;
                     }
                     let mode = if matches!(op, FloatOp::Floor { .. }) {
