@@ -285,6 +285,8 @@ pub enum RegOp {
     Lt { dst: u8, a: u8, b: u8 },
     /// `reg[dst] = (reg[a] == 0) as 0/1` — JS logical-not of an integer (`!x`).
     Eqz { dst: u8, a: u8 },
+    /// `reg[dst] = (reg[a] == reg[b]) as 0/1` — strict equality of integers.
+    Eq { dst: u8, a: u8, b: u8 },
     /// `reg[dst] = -reg[a]` — JS unary minus of an integer (`-x`).
     Neg { dst: u8, a: u8 },
     /// `reg[dst] = ~ToInt32(reg[a])` — JS bitwise-not (`~x`); result is an i32.
@@ -363,6 +365,10 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
             }
             RegOp::Eqz { dst, a } => {
                 regs[dst as usize] = i64::from(regs[a as usize] == 0);
+                pc += 1;
+            }
+            RegOp::Eq { dst, a, b } => {
+                regs[dst as usize] = i64::from(regs[a as usize] == regs[b as usize]);
                 pc += 1;
             }
             RegOp::Neg { dst, a } => {
@@ -477,6 +483,11 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 dst,
                 a: resolve(&copy_of, a),
             },
+            RegOp::Eq { dst, a, b } => RegOp::Eq {
+                dst,
+                a: resolve(&copy_of, a),
+                b: resolve(&copy_of, b),
+            },
             RegOp::Neg { dst, a } => RegOp::Neg {
                 dst,
                 a: resolve(&copy_of, a),
@@ -527,6 +538,7 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
             | RegOp::Bin { dst, .. }
             | RegOp::Lt { dst, .. }
             | RegOp::Eqz { dst, .. }
+            | RegOp::Eq { dst, .. }
             | RegOp::Neg { dst, .. }
             | RegOp::BitNot32 { dst, .. }
             | RegOp::Mod { dst, .. }
@@ -558,6 +570,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
         match *op {
             RegOp::Bin { a, b, .. }
             | RegOp::Lt { a, b, .. }
+            | RegOp::Eq { a, b, .. }
             | RegOp::Mod { a, b, .. }
             | RegOp::Bit32 { a, b, .. }
             | RegOp::Shift32 { a, b, .. } => {
@@ -594,6 +607,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
         | RegOp::Move { dst, .. }
         | RegOp::Lt { dst, .. }
         | RegOp::Eqz { dst, .. }
+        | RegOp::Eq { dst, .. }
         | RegOp::Neg { dst, .. }
         | RegOp::BitNot32 { dst, .. }
         | RegOp::Mod { dst, .. }
@@ -634,6 +648,7 @@ fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
         RegOp::Move { dst, src } => (Some(dst), [Some(src), None]),
         RegOp::Bin { dst, a, b, .. }
         | RegOp::Lt { dst, a, b }
+        | RegOp::Eq { dst, a, b }
         | RegOp::Mod { dst, a, b }
         | RegOp::Bit32 { dst, a, b, .. }
         | RegOp::Shift32 { dst, a, b, .. } => (Some(dst), [Some(a), Some(b)]),
@@ -745,6 +760,11 @@ pub fn allocate_reg(ops: &[RegOp], n_regs: usize) -> (Vec<RegOp>, usize) {
             RegOp::Eqz { dst, a } => RegOp::Eqz {
                 dst: m(dst),
                 a: m(a),
+            },
+            RegOp::Eq { dst, a, b } => RegOp::Eq {
+                dst: m(dst),
+                a: m(a),
+                b: m(b),
             },
             RegOp::Neg { dst, a } => RegOp::Neg {
                 dst: m(dst),
@@ -876,6 +896,16 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 } else {
                     known[dst as usize] = None;
                     RegOp::Eqz { dst, a }
+                }
+            }
+            RegOp::Eq { dst, a, b } => {
+                if let (Some(x), Some(y)) = (known[a as usize], known[b as usize]) {
+                    let v = i64::from(x == y);
+                    known[dst as usize] = Some(v);
+                    RegOp::Const { dst, imm: v }
+                } else {
+                    known[dst as usize] = None;
+                    RegOp::Eq { dst, a, b }
                 }
             }
             RegOp::Neg { dst, a } => {
@@ -1173,6 +1203,14 @@ pub fn lower_nbvm_with(
                 let d = reg8(*dst)?;
                 written[*dst as usize] = true;
                 RegOp::Eqz { dst: d, a }
+            }
+            // `===` of two integers is numeric equality (both are guarded exact
+            // integers on this path); `!==` is this followed by `Not` (→ `Eqz`).
+            Op::StrictEq { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Eq { dst: d, a, b }
             }
             // JS unary minus of an integer: `-x`. The native code guards i64::MIN
             // overflow and the exact-integer range, so it never diverges.
@@ -2294,6 +2332,15 @@ impl JitFunction {
                     a.load_rax(disp(ra));
                     a.test_rax_rax();
                     a.sete_rax(); // rax = (reg[ra] == 0) ? 1 : 0
+                    a.store_rax(disp(dst));
+                }
+                RegOp::Eq { dst, a: ra, b: rb } => {
+                    if !ok_reg(dst) || !ok_reg(ra) || !ok_reg(rb) {
+                        return None;
+                    }
+                    a.load_rax(disp(ra));
+                    a.cmp_rax_mem(disp(rb));
+                    a.sete_rax(); // rax = (reg[ra] == reg[rb]) ? 1 : 0
                     a.store_rax(disp(dst));
                 }
                 RegOp::Neg { dst, a: ra } => {

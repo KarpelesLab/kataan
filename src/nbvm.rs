@@ -5502,6 +5502,28 @@ mod tests {
         );
     }
 
+    /// A hot function using `===` / `!==` (compiled to `StrictEq` [+ `Not`]) must
+    /// JIT (lowered to `Eq` [/ `Eqz`]) and match the interpreter.
+    #[test]
+    fn hot_function_with_strict_eq_matches_interpreter() {
+        // count i in 0..40 with i === 7 → exactly 1.
+        assert_eq!(
+            bc("function is7(x){ return x === 7 ? 1 : 0; } \
+                let c = 0; \
+                for (let i = 0; i < 40; i = i + 1) { c = c + is7(i); } \
+                c"),
+            "1"
+        );
+        // count i in 0..40 with i !== 0 → 39.
+        assert_eq!(
+            bc("function nz(x){ return x !== 0 ? 1 : 0; } \
+                let c = 0; \
+                for (let i = 0; i < 40; i = i + 1) { c = c + nz(i); } \
+                c"),
+            "39"
+        );
+    }
+
     /// A hot function using unary minus (`-x`) must JIT (lowered to `Neg`) and
     /// match the interpreter.
     #[test]
