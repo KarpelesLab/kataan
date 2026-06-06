@@ -7,9 +7,10 @@
 //! *script* parser (`run_wast`) that ingests the suite's S-expression command
 //! stream — `(module binary …)` plus `assert_return`/`assert_trap`/
 //! `assert_invalid`/`invoke` — and drives it through the [`crate::wasm_rt`]
-//! engine. (Modules in the binary form cover the embedded-bytes path; a full WAT
-//! *module* text parser for the inline `(module (func …))` form is the remaining
-//! extension.)
+//! engine. Modules may be given in `(module binary "\NN…")` form *or* as inline
+//! WAT text — `(module (func …))` — which `wat_to_binary` compiles (func
+//! signatures, locals, exports, and a flat/folded instruction body over the
+//! common opcode set).
 //!
 //! Pure, safe `alloc`-only Rust.
 
@@ -201,6 +202,351 @@ fn parse_wast_string(b: &[u8], start: usize) -> Result<(Vec<u8>, usize), String>
     Err(String::from("unterminated string"))
 }
 
+// --- WAT (WebAssembly Text) → binary, for inline `(module (func …))` modules ---
+
+fn leb_u(mut v: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+fn leb_i(mut v: i64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        let done = (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0);
+        out.push(if done { byte } else { byte | 0x80 });
+        if done {
+            break;
+        }
+    }
+}
+
+fn valtype_byte(name: &str) -> Option<u8> {
+    Some(match name {
+        "i32" => 0x7f,
+        "i64" => 0x7e,
+        "f32" => 0x7d,
+        "f64" => 0x7c,
+        _ => return None,
+    })
+}
+
+/// The opcode of an instruction that carries no immediate operand.
+fn simple_opcode(name: &str) -> Option<u8> {
+    Some(match name {
+        "drop" => 0x1a,
+        "select" => 0x1b,
+        "return" => 0x0f,
+        "i32.eqz" => 0x45,
+        "i32.eq" => 0x46,
+        "i32.ne" => 0x47,
+        "i32.lt_s" => 0x48,
+        "i32.lt_u" => 0x49,
+        "i32.gt_s" => 0x4a,
+        "i32.gt_u" => 0x4b,
+        "i32.le_s" => 0x4c,
+        "i32.ge_s" => 0x4e,
+        "i32.add" => 0x6a,
+        "i32.sub" => 0x6b,
+        "i32.mul" => 0x6c,
+        "i32.div_s" => 0x6d,
+        "i32.div_u" => 0x6e,
+        "i32.rem_s" => 0x6f,
+        "i32.and" => 0x71,
+        "i32.or" => 0x72,
+        "i32.xor" => 0x73,
+        "i32.shl" => 0x74,
+        "i32.shr_s" => 0x75,
+        "i32.shr_u" => 0x76,
+        "i64.add" => 0x7c,
+        "i64.sub" => 0x7d,
+        "i64.mul" => 0x7e,
+        "f64.add" => 0xa0,
+        "f64.sub" => 0xa1,
+        "f64.mul" => 0xa2,
+        "f64.div" => 0xa3,
+        "i32.wrap_i64" => 0xa7,
+        "i64.extend_i32_s" => 0xac,
+        "f64.convert_i32_s" => 0xb7,
+        _ => return None,
+    })
+}
+
+/// Whether `name` takes one immediate operand (an index or constant).
+fn has_immediate(name: &str) -> bool {
+    matches!(
+        name,
+        "local.get"
+            | "local.set"
+            | "local.tee"
+            | "global.get"
+            | "global.set"
+            | "call"
+            | "i32.const"
+            | "i64.const"
+            | "f32.const"
+            | "f64.const"
+    )
+}
+
+/// Emits one instruction by name with its optional immediate.
+fn emit_op(name: &str, imm: Option<&str>, out: &mut Vec<u8>) -> Result<(), String> {
+    let idx = || -> Result<u64, String> {
+        imm.ok_or_else(|| format!("{name} needs an immediate"))?
+            .parse::<u64>()
+            .map_err(|_| format!("bad index for {name}"))
+    };
+    match name {
+        "i32.const" | "i64.const" => {
+            out.push(if name == "i32.const" { 0x41 } else { 0x42 });
+            let n = imm
+                .ok_or("const needs a value")?
+                .parse::<i128>()
+                .map_err(|_| "bad const")? as i64;
+            leb_i(n, out);
+        }
+        "f32.const" => {
+            out.push(0x43);
+            let v: f32 = imm.ok_or("f32.const")?.parse().map_err(|_| "bad f32")?;
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        "f64.const" => {
+            out.push(0x44);
+            let v: f64 = imm.ok_or("f64.const")?.parse().map_err(|_| "bad f64")?;
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        "local.get" => {
+            out.push(0x20);
+            leb_u(idx()?, out);
+        }
+        "local.set" => {
+            out.push(0x21);
+            leb_u(idx()?, out);
+        }
+        "local.tee" => {
+            out.push(0x22);
+            leb_u(idx()?, out);
+        }
+        "global.get" => {
+            out.push(0x23);
+            leb_u(idx()?, out);
+        }
+        "global.set" => {
+            out.push(0x24);
+            leb_u(idx()?, out);
+        }
+        "call" => {
+            out.push(0x10);
+            leb_u(idx()?, out);
+        }
+        _ => out.push(simple_opcode(name).ok_or_else(|| format!("unknown instruction {name}"))?),
+    }
+    Ok(())
+}
+
+/// Emits a flat sequence of instructions (each an atom — possibly consuming the
+/// next atom as an immediate — or a folded `(op …)` list).
+fn emit_instrs(items: &[Sexpr], out: &mut Vec<u8>) -> Result<(), String> {
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i] {
+            Sexpr::List(inner) => {
+                emit_folded(inner, out)?;
+                i += 1;
+            }
+            Sexpr::Atom(name) => {
+                if has_immediate(name) {
+                    let imm = match items.get(i + 1) {
+                        Some(Sexpr::Atom(s)) => s.as_str(),
+                        _ => return Err(format!("{name} needs an immediate")),
+                    };
+                    emit_op(name, Some(imm), out)?;
+                    i += 2;
+                } else {
+                    emit_op(name, None, out)?;
+                    i += 1;
+                }
+            }
+            Sexpr::Str(_) => return Err(String::from("unexpected string in function body")),
+        }
+    }
+    Ok(())
+}
+
+/// Emits a folded instruction `(op imm? operands…)`: operands first, then the op.
+fn emit_folded(inner: &[Sexpr], out: &mut Vec<u8>) -> Result<(), String> {
+    let Some(Sexpr::Atom(name)) = inner.first() else {
+        return Err(String::from("folded instruction needs a head opcode"));
+    };
+    if has_immediate(name) {
+        let imm = match inner.get(1) {
+            Some(Sexpr::Atom(s)) => s.clone(),
+            _ => return Err(format!("{name} needs an immediate")),
+        };
+        emit_instrs(&inner[2..], out)?;
+        emit_op(name, Some(&imm), out)?;
+    } else {
+        emit_instrs(&inner[1..], out)?;
+        emit_op(name, None, out)?;
+    }
+    Ok(())
+}
+
+/// A parsed `(func …)`: signature, locals, and encoded body bytes.
+struct WatFunc {
+    export: Option<String>,
+    params: Vec<u8>,
+    results: Vec<u8>,
+    locals: Vec<u8>,
+    body: Vec<u8>,
+}
+
+/// Compiles an inline `(module (func …)…)` text module to a binary module.
+fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
+    let mut funcs: Vec<WatFunc> = Vec::new();
+    for field in &items[1..] {
+        let Sexpr::List(f) = field else { continue };
+        if f.first() != Some(&Sexpr::Atom(String::from("func"))) {
+            continue;
+        }
+        let mut wf = WatFunc {
+            export: None,
+            params: Vec::new(),
+            results: Vec::new(),
+            locals: Vec::new(),
+            body: Vec::new(),
+        };
+        let mut body_items: Vec<Sexpr> = Vec::new();
+        for part in &f[1..] {
+            match part {
+                Sexpr::List(p) => match p.first() {
+                    Some(Sexpr::Atom(a)) if a == "export" => {
+                        if let Some(Sexpr::Str(s)) = p.get(1) {
+                            wf.export = Some(String::from_utf8_lossy(s).into_owned());
+                        }
+                    }
+                    Some(Sexpr::Atom(a)) if a == "param" => {
+                        for t in &p[1..] {
+                            if let Sexpr::Atom(t) = t {
+                                wf.params.push(valtype_byte(t).ok_or("bad param type")?);
+                            }
+                        }
+                    }
+                    Some(Sexpr::Atom(a)) if a == "result" => {
+                        for t in &p[1..] {
+                            if let Sexpr::Atom(t) = t {
+                                wf.results.push(valtype_byte(t).ok_or("bad result type")?);
+                            }
+                        }
+                    }
+                    Some(Sexpr::Atom(a)) if a == "local" => {
+                        for t in &p[1..] {
+                            if let Sexpr::Atom(t) = t {
+                                wf.locals.push(valtype_byte(t).ok_or("bad local type")?);
+                            }
+                        }
+                    }
+                    // A folded instruction.
+                    _ => body_items.push(part.clone()),
+                },
+                // A flat instruction atom.
+                Sexpr::Atom(_) => body_items.push(part.clone()),
+                Sexpr::Str(_) => {}
+            }
+        }
+        emit_instrs(&body_items, &mut wf.body)?;
+        funcs.push(wf);
+    }
+
+    // Assemble the binary sections.
+    let mut out = alloc::vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    // type section (one signature per function; no dedup, which is valid).
+    let mut types = Vec::new();
+    leb_u(funcs.len() as u64, &mut types);
+    for f in &funcs {
+        types.push(0x60);
+        leb_u(f.params.len() as u64, &mut types);
+        types.extend_from_slice(&f.params);
+        leb_u(f.results.len() as u64, &mut types);
+        types.extend_from_slice(&f.results);
+    }
+    section(1, &types, &mut out);
+    // function section.
+    let mut fns = Vec::new();
+    leb_u(funcs.len() as u64, &mut fns);
+    for i in 0..funcs.len() {
+        leb_u(i as u64, &mut fns);
+    }
+    section(3, &fns, &mut out);
+    // export section.
+    let exported: Vec<(usize, &String)> = funcs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| f.export.as_ref().map(|n| (i, n)))
+        .collect();
+    let mut exp = Vec::new();
+    leb_u(exported.len() as u64, &mut exp);
+    for (i, name) in &exported {
+        leb_u(name.len() as u64, &mut exp);
+        exp.extend_from_slice(name.as_bytes());
+        exp.push(0x00); // func export
+        leb_u(*i as u64, &mut exp);
+    }
+    section(7, &exp, &mut out);
+    // code section.
+    let mut code = Vec::new();
+    leb_u(funcs.len() as u64, &mut code);
+    for f in &funcs {
+        let mut b = Vec::new();
+        leb_u(f.locals.len() as u64, &mut b); // one run per local
+        for t in &f.locals {
+            leb_u(1, &mut b);
+            b.push(*t);
+        }
+        b.extend_from_slice(&f.body);
+        b.push(0x0b); // end
+        leb_u(b.len() as u64, &mut code);
+        code.extend_from_slice(&b);
+    }
+    section(10, &code, &mut out);
+    Ok(out)
+}
+
+/// Compiles a WAT text module — `(module (func …)…)` — to a binary WebAssembly
+/// module. Supports func definitions with `(export …)`, `(param …)`,
+/// `(result …)`, `(local …)`, and a flat/folded instruction body over the
+/// common opcode set.
+///
+/// # Errors
+/// A parse error, or an unknown instruction / type.
+pub fn wat_to_binary(src: &str) -> Result<Vec<u8>, String> {
+    let exprs = parse_sexprs(src)?;
+    for e in &exprs {
+        if let Sexpr::List(items) = e
+            && items.first() == Some(&Sexpr::Atom(String::from("module")))
+        {
+            return parse_wat_module(items);
+        }
+    }
+    Err(String::from("no (module …) found"))
+}
+
+/// Appends section `id` with `content` (length-prefixed) to `out`.
+fn section(id: u8, content: &[u8], out: &mut Vec<u8>) {
+    out.push(id);
+    leb_u(content.len() as u64, out);
+    out.extend_from_slice(content);
+}
+
 /// Parses a `(TYPE.const N)` value expression into a [`Val`].
 fn parse_const(s: &Sexpr) -> Result<Val, String> {
     let Sexpr::List(items) = s else {
@@ -286,14 +632,21 @@ pub fn run_wast(src: &str) -> Result<usize, String> {
         match head {
             "module" => {
                 executed += flush(&mut cur, &mut batch)?;
-                // (module binary "…" "…") — concatenate the byte strings.
-                let mut bytes = Vec::new();
-                for it in &items[1..] {
-                    if let Sexpr::Str(s) = it {
-                        bytes.extend_from_slice(s);
-                    }
-                }
-                cur = Some(bytes);
+                cur = Some(
+                    if items.get(1) == Some(&Sexpr::Atom(String::from("binary"))) {
+                        // (module binary "…" "…") — concatenate the byte strings.
+                        let mut bytes = Vec::new();
+                        for it in &items[2..] {
+                            if let Sexpr::Str(s) = it {
+                                bytes.extend_from_slice(s);
+                            }
+                        }
+                        bytes
+                    } else {
+                        // (module (func …)…) — compile the text module to binary.
+                        parse_wat_module(items)?
+                    },
+                );
             }
             "assert_return" => {
                 let (func, args) = parse_invoke(items.get(1).ok_or("assert_return needs invoke")?)?;
@@ -496,6 +849,47 @@ mod tests {
         } else {
             panic!("expected a list");
         }
+    }
+
+    #[test]
+    fn wat_text_module_compiles_and_runs() {
+        // Folded form.
+        let folded = "(module (func (export \"add\") (param i32 i32) (result i32) \
+                      (i32.add (local.get 0) (local.get 1))))";
+        let bin = wat_to_binary(folded).expect("compile folded WAT");
+        let r = crate::wasm_rt::Module::decode(&bin)
+            .unwrap()
+            .call(0, &[Val::I32(20), Val::I32(22)])
+            .unwrap();
+        assert_eq!(r, vec![Val::I32(42)]);
+
+        // Flat (stack) form — same function.
+        let flat = "(module (func (export \"add\") (param i32 i32) (result i32) \
+                    local.get 0 local.get 1 i32.add))";
+        let bin2 = wat_to_binary(flat).expect("compile flat WAT");
+        assert_eq!(bin, bin2, "folded and flat compile to the same binary");
+
+        // A function with a local and a const.
+        let withlocal = "(module (func (export \"f\") (param i32) (result i32) (local i32) \
+                         (local.set 1 (i32.mul (local.get 0) (i32.const 3))) \
+                         (i32.add (local.get 1) (i32.const 1))))";
+        let bin3 = wat_to_binary(withlocal).expect("compile local WAT");
+        let r3 = crate::wasm_rt::Module::decode(&bin3)
+            .unwrap()
+            .call(0, &[Val::I32(5)])
+            .unwrap();
+        assert_eq!(r3, vec![Val::I32(16)]); // 5*3 + 1
+    }
+
+    #[test]
+    fn wast_runs_a_text_module() {
+        // A .wast script whose module is WAT *text* (not binary).
+        let script = "(module (func (export \"sub\") (param i32 i32) (result i32) \
+                      (i32.sub (local.get 0) (local.get 1))))\n\
+                      (assert_return (invoke \"sub\" (i32.const 10) (i32.const 4)) (i32.const 6))\n\
+                      (assert_return (invoke \"sub\" (i32.const 0) (i32.const 7)) (i32.const -7))";
+        let n = run_wast(script).expect("text-module wast passes");
+        assert_eq!(n, 2);
     }
 
     #[test]
