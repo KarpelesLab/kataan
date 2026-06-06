@@ -5228,11 +5228,16 @@ impl<'a> Interp<'a> {
                             self.realm.to_display_string(arg(0))
                         };
                     // `null`/`undefined` render empty; an object element is run
-                    // through ToString (so a custom `toString` is honored).
+                    // through ToString (so a custom `toString` is honored). The
+                    // receiver array seeds the cycle set, so a self-reference (or a
+                    // mutual cycle back to it) renders empty rather than recursing.
                     let mut parts: Vec<String> = Vec::with_capacity(elems.len());
                     for e in &elems {
                         let s = match e.unpack() {
                             Unpacked::Null | Unpacked::Undefined => String::new(),
+                            // A direct self-reference back to the receiver renders
+                            // empty (per `Array.prototype.join`), without recursing.
+                            Unpacked::Handle(raw) if raw == handle.to_raw() => String::new(),
                             _ => {
                                 let p = self.coerce_object(*e, "string")?;
                                 self.realm.to_display_string(p)

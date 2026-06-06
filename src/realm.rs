@@ -1061,6 +1061,18 @@ impl Realm {
     /// `","`; a plain object is `"[object Object]"`.
     #[must_use]
     pub fn to_display_string(&self, v: NanBox) -> alloc::string::String {
+        self.to_display_string_seen(v, &mut Vec::new())
+    }
+
+    /// `to_display_string` tracking the array/proxy handles currently being
+    /// rendered, so a self-referential array (`a.push(a); a.toString()`) renders
+    /// the recursive element as empty — per `Array.prototype.join`'s cycle rule —
+    /// instead of overflowing the stack.
+    pub(crate) fn to_display_string_seen(
+        &self,
+        v: NanBox,
+        seen: &mut Vec<Handle>,
+    ) -> alloc::string::String {
         use crate::nanbox::Unpacked;
         match v.unpack() {
             Unpacked::Undefined => "undefined".into(),
@@ -1076,6 +1088,13 @@ impl Realm {
             Unpacked::Handle(raw) => match self.heap.get(Handle::from_raw(raw)) {
                 Some(Cell::Str(r)) => r.materialize(),
                 Some(Cell::Array(elems)) => {
+                    let h = Handle::from_raw(raw);
+                    // A circular reference back to this array renders empty.
+                    if seen.contains(&h) {
+                        return alloc::string::String::new();
+                    }
+                    seen.push(h);
+                    let elems = elems.clone();
                     let parts: Vec<alloc::string::String> = elems
                         .iter()
                         .map(|e| {
@@ -1083,10 +1102,11 @@ impl Realm {
                             if matches!(e.unpack(), Unpacked::Undefined | Unpacked::Null) {
                                 alloc::string::String::new()
                             } else {
-                                self.to_display_string(*e)
+                                self.to_display_string_seen(*e, seen)
                             }
                         })
                         .collect();
+                    seen.pop();
                     parts.join(",")
                 }
                 Some(Cell::Object(_)) => "[object Object]".into(),
@@ -1108,7 +1128,14 @@ impl Realm {
                 Some(Cell::BigInt(n)) => alloc::format!("{n}"),
                 // A proxy renders as its target would.
                 Some(Cell::Proxy { target, .. }) => {
-                    self.to_display_string(NanBox::handle(target.to_raw()))
+                    let h = Handle::from_raw(raw);
+                    if seen.contains(&h) {
+                        return alloc::string::String::new();
+                    }
+                    seen.push(h);
+                    let s = self.to_display_string_seen(NanBox::handle(target.to_raw()), seen);
+                    seen.pop();
+                    s
                 }
                 None => "undefined".into(), // stale handle
             },

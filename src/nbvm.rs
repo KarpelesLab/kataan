@@ -1847,6 +1847,8 @@ fn builtin_method(
                     .iter()
                     .map(|e| match e.unpack() {
                         Unpacked::Undefined | Unpacked::Null => String::new(),
+                        // A direct self-reference renders empty (no recursion).
+                        Unpacked::Handle(raw) if raw == h.to_raw() => String::new(),
                         _ => ctx.realm.to_display_string(*e),
                     })
                     .collect();
