@@ -105,6 +105,10 @@ pub enum Op {
     NewString { dst: Reg, value: String },
     /// `dst = a new array of `len` `undefined` elements`.
     NewArray { dst: Reg, len: usize },
+    /// `new Array(arg)` with a single argument: a number is the new array's
+    /// length (a `RangeError` if invalid/too large); anything else is its sole
+    /// element.
+    NewArrayCtor { dst: Reg, arg: Reg },
     /// `dst = arr[index]` (index taken from a register, `undefined` if absent).
     GetElem { dst: Reg, arr: Reg, index: Reg },
     /// `arr[index] = src` (grows the array if needed).
@@ -1110,6 +1114,25 @@ fn run_frame(
             }
             Op::NewArray { dst, len } => {
                 let handle = ctx.realm.new_array(vec![NanBox::undefined(); *len]);
+                regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            }
+            Op::NewArrayCtor { dst, arg } => {
+                let v = regs[*arg as usize];
+                let handle = if let Some(n) = v.as_number() {
+                    // A number is the length: must be a non-negative integer that
+                    // fits uint32 (and, to avoid OOM in this dense model, a sane cap).
+                    if n < 0.0 || n > f64::from(u32::MAX) || n != f64::from(n as u32) {
+                        let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                        return Err(VmError::Thrown(e));
+                    }
+                    if n > 100_000_000.0 {
+                        let e = make_error(ctx.realm, "RangeError", "Array length too large");
+                        return Err(VmError::Thrown(e));
+                    }
+                    ctx.realm.new_array(vec![NanBox::undefined(); n as usize])
+                } else {
+                    ctx.realm.new_array(vec![v])
+                };
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::GetElem { dst, arr, index } => {
@@ -4892,6 +4915,15 @@ impl Compiler {
                 // `new Array(...items)` → an array of the arguments.
                 if &*id.name == "Array" && self.classes.get("Array").is_none() {
                     let dst = self.alloc();
+                    // `new Array(n)` with one argument: a number is the length, any
+                    // other value is the sole element (decided at runtime).
+                    if arguments.len() == 1
+                        && let crate::ast::Argument::Item(e) = &arguments[0]
+                    {
+                        let arg = self.expr(e)?;
+                        self.ops.push(Op::NewArrayCtor { dst, arg });
+                        return Ok(dst);
+                    }
                     self.ops.push(Op::NewArray { dst, len: 0 });
                     for a in arguments {
                         if let crate::ast::Argument::Item(e) = a {

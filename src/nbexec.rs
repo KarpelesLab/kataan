@@ -2804,7 +2804,18 @@ impl<'a> Interp<'a> {
             let elems = if args.len() == 1
                 && let Some(n) = args[0].as_number()
             {
-                alloc::vec![NanBox::undefined(); n.max(0.0) as usize]
+                // A single number is the length: a non-negative integer fitting
+                // uint32 (capped here to avoid OOM in this dense model). Otherwise a
+                // `RangeError`.
+                if n < 0.0
+                    || n > f64::from(u32::MAX)
+                    || n > 100_000_000.0
+                    || n != f64::from(n as u32)
+                {
+                    let m = self.new_str("Invalid array length");
+                    return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                }
+                alloc::vec![NanBox::undefined(); n as usize]
             } else {
                 args.to_vec()
             };

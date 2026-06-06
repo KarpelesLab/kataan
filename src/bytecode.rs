@@ -313,6 +313,7 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
         | Op::Neg { dst, a: obj }
         | Op::Not { dst, a: obj }
         | Op::Move { dst, src: obj }
+        | Op::NewArrayCtor { dst, arg: obj }
         | Op::GetProp { dst, obj, .. } => {
             reg(*dst)?;
             reg(*obj)
@@ -628,6 +629,11 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(24, out);
             w_reg(*dst, out);
             w_usize(*len, out);
+        }
+        Op::NewArrayCtor { dst, arg } => {
+            w_u8(54, out);
+            w_reg(*dst, out);
+            w_reg(*arg, out);
         }
         Op::GetElem { dst, arr, index } => bin(25, *dst, *arr, *index, out),
         Op::SetElem { arr, index, src } => bin(26, *arr, *index, *src, out),
@@ -1000,6 +1006,10 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         51 => Op::PopHandler,
         52 => Op::Throw { src: r.reg()? },
         53 => Op::Return { src: r.reg()? },
+        54 => Op::NewArrayCtor {
+            dst: r.reg()?,
+            arg: r.reg()?,
+        },
         t => return Err(DecodeError::BadTag(t)),
     })
 }
