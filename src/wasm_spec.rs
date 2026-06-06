@@ -1824,6 +1824,33 @@ mod tests {
     }
 
     #[test]
+    fn spec_numeric_edge_cases() {
+        // The fiddly numeric corners upstream iNN/fNN.wast probe: shift-count
+        // masking, rotate, clz/ctz/popcnt, signed remainder, and NaN comparisons.
+        let script = "(module \
+            (func (export \"shl\")  (param i32 i32) (result i32) (i32.shl (local.get 0) (local.get 1))) \
+            (func (export \"rotl\") (param i32 i32) (result i32) (i32.rotl (local.get 0) (local.get 1))) \
+            (func (export \"clz\")  (param i32) (result i32) (i32.clz (local.get 0))) \
+            (func (export \"ctz\")  (param i32) (result i32) (i32.ctz (local.get 0))) \
+            (func (export \"pop\")  (param i32) (result i32) (i32.popcnt (local.get 0))) \
+            (func (export \"rems\") (param i32 i32) (result i32) (i32.rem_s (local.get 0) (local.get 1))) \
+            (func (export \"nanlt\")(param f64) (result i32) (f64.lt (local.get 0) (local.get 0))) \
+            (func (export \"nane\") (param f64) (result i32) (f64.eq (local.get 0) (local.get 0)))) \
+            (assert_return (invoke \"shl\"  (i32.const 1) (i32.const 32)) (i32.const 1)) \
+            (assert_return (invoke \"shl\"  (i32.const 1) (i32.const 33)) (i32.const 2)) \
+            (assert_return (invoke \"rotl\" (i32.const 0x12345678) (i32.const 4)) (i32.const 0x23456781)) \
+            (assert_return (invoke \"clz\"  (i32.const 1)) (i32.const 31)) \
+            (assert_return (invoke \"clz\"  (i32.const 0)) (i32.const 32)) \
+            (assert_return (invoke \"ctz\"  (i32.const 0x80000000)) (i32.const 31)) \
+            (assert_return (invoke \"pop\"  (i32.const 0xffffffff)) (i32.const 32)) \
+            (assert_return (invoke \"rems\" (i32.const -7) (i32.const 3)) (i32.const -1)) \
+            (assert_return (invoke \"nanlt\" (f64.const nan)) (i32.const 0)) \
+            (assert_return (invoke \"nane\"  (f64.const nan)) (i32.const 0))";
+        let n = run_wast(script).expect("numeric edge-case conformance passes");
+        assert_eq!(n, 10);
+    }
+
+    #[test]
     fn wat_float_literals_hex_inf_nan() {
         // Hex floats, inf, and nan in *module bodies* (not just assertion operands).
         let script = "(module \
