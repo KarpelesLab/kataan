@@ -494,6 +494,84 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
     Ok(Snapshot { cells, roots })
 }
 
+#[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+pub use mmap::restore_file;
+
+/// The `mmap`-backed snapshot reload — the zero-copy D′ path for heap snapshots:
+/// a `KSNP` artifact is mapped read-only and deserialized in place, then restored.
+#[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+mod mmap {
+    use super::{Snapshot, deserialize, restore};
+    use crate::heap::Handle;
+    use crate::realm::Realm;
+    use alloc::vec::Vec;
+    use std::os::unix::io::AsRawFd;
+
+    const PROT_READ: usize = 0x1;
+    const MAP_PRIVATE: usize = 0x02;
+    const SYS_MMAP: usize = 9;
+    const SYS_MUNMAP: usize = 11;
+
+    /// SAFETY: issues the `syscall` instruction with the System V syscall ABI.
+    #[allow(unsafe_code)]
+    unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+        let ret: isize;
+        // SAFETY: a single syscall with documented inputs/clobbers.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") n as isize => ret,
+                in("rdi") a1, in("rsi") a2, in("rdx") a3,
+                in("r10") a4, in("r8") a5, in("r9") 0usize,
+                out("rcx") _, out("r11") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        ret
+    }
+
+    /// Reloads the snapshot at `path` from a memory mapping and restores it into
+    /// `realm`, returning the new root handles — the `mmap` zero-copy reload path.
+    ///
+    /// # Errors
+    /// `io::Error` on a failed open/`mmap`, or `InvalidData` wrapping the
+    /// [`SnapError`](super::SnapError) if the mapped bytes don't deserialize.
+    pub fn restore_file(realm: &mut Realm, path: &str) -> std::io::Result<Vec<Handle>> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty snapshot",
+            ));
+        }
+        let fd = file.as_raw_fd() as usize;
+        // SAFETY: a standard read-only file mapping.
+        #[allow(unsafe_code)]
+        let raw = unsafe { syscall6(SYS_MMAP, 0, len, PROT_READ, MAP_PRIVATE, fd) };
+        if (-4095..0).contains(&raw) {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ptr = raw as *const u8;
+        // SAFETY: `ptr..ptr+len` is a valid read-only mapping of the whole file,
+        // alive until the `munmap` below; deserialize only reads it.
+        #[allow(unsafe_code)]
+        let parsed: Result<Snapshot, super::SnapError> = {
+            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+            deserialize(bytes)
+        };
+        // SAFETY: unmapping exactly the region we mapped.
+        #[allow(unsafe_code)]
+        unsafe {
+            syscall6(SYS_MUNMAP, ptr as usize, len, 0, 0, 0);
+        }
+        let snap = parsed.map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, alloc::format!("{e:?}"))
+        })?;
+        Ok(restore(realm, &snap))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +727,51 @@ mod tests {
         assert_eq!(
             deserialize(&good[..good.len() - 1]),
             Err(SnapError::Truncated)
+        );
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn mmap_reload_restores_a_snapshot() {
+        let mut realm = Realm::new();
+        let obj = realm.new_object();
+        let name = NanBox::handle(realm.new_string("mapped").to_raw());
+        realm.set_property(obj, "name", name);
+        realm.set_property(obj, "n", NanBox::number(99.0));
+        let arr = realm.new_array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)]);
+        realm.set_property(obj, "items", NanBox::handle(arr.to_raw()));
+
+        // Serialize to a temp file, then reload it via the mmap zero-copy path.
+        let bytes = serialize(&capture(&realm, &[obj]));
+        let path = std::format!("/tmp/kataan-snap-{}.ksnp", std::process::id());
+        std::fs::write(&path, &bytes).expect("write snapshot");
+
+        let mut realm2 = Realm::new();
+        let roots = restore_file(&mut realm2, &path).expect("mmap reload");
+        let _ = std::fs::remove_file(&path);
+
+        let r2 = roots[0];
+        let name2 = realm2
+            .get_property(r2, "name")
+            .unwrap()
+            .as_handle()
+            .unwrap();
+        assert_eq!(
+            realm2.string_value(Handle::from_raw(name2)),
+            Some(String::from("mapped"))
+        );
+        assert_eq!(realm2.get_property(r2, "n"), Some(NanBox::number(99.0)));
+        let items = realm2
+            .get_property(r2, "items")
+            .unwrap()
+            .as_handle()
+            .unwrap();
+        assert_eq!(
+            realm2
+                .array_elements(Handle::from_raw(items))
+                .unwrap()
+                .len(),
+            2
         );
     }
 
