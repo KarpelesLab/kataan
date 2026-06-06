@@ -587,7 +587,10 @@ impl Module {
                 0x51..=0x5a => (&[I64, I64], Some(I32)), // i64 compares
                 0x79..=0x7b => (&[I64], Some(I64)),      // i64 clz/ctz/popcnt
                 0x7c..=0x8a => (&[I64, I64], Some(I64)), // i64 binary
+                0x5b..=0x60 => (&[F32, F32], Some(I32)), // f32 compares
                 0x61..=0x66 => (&[F64, F64], Some(I32)), // f64 compares
+                0x8b..=0x91 => (&[F32], Some(F32)),      // f32 unary (abs/neg/…/sqrt)
+                0x92..=0x98 => (&[F32, F32], Some(F32)), // f32 binary
                 0x99..=0x9f => (&[F64], Some(F64)),      // f64 unary
                 0xa0..=0xa5 => (&[F64, F64], Some(F64)), // f64 binary
                 0xa7 => (&[I64], Some(I32)),             // i32.wrap_i64
@@ -3188,6 +3191,13 @@ mod tests {
         assert!(
             Module::decode(&module(&[0x00, 0x6a])).is_ok(),
             "unreachable makes the rest of the block polymorphic"
+        );
+
+        // f32 typing: `f32.add` (0x92) on i32 operands is rejected.
+        // local.get 0; local.get 0; f32.add  → wrong (operands are i32).
+        assert!(
+            Module::decode(&module(&[0x20, 0x00, 0x20, 0x00, 0x92])).is_err(),
+            "f32.add on i32 operands must be rejected"
         );
     }
 
