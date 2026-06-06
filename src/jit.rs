@@ -207,6 +207,13 @@ pub enum FloatOp {
         dst: u8,
         a: u8,
     },
+    /// `reg[dst] = (reg[a] === reg[b]) ? 1.0 : 0.0` — JS numeric strict equality:
+    /// ordered *and* equal, so `NaN === NaN` is `0.0` and `+0.0 === -0.0` is `1.0`.
+    Eq {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
     Ret {
         src: u8,
     },
@@ -260,6 +267,11 @@ pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
             FloatOp::Eqz { dst, a } => {
                 let x = regs[a as usize];
                 regs[dst as usize] = f64::from(u8::from(x == 0.0 || x.is_nan()));
+                pc += 1;
+            }
+            FloatOp::Eq { dst, a, b } => {
+                // Rust f64 `==` is IEEE ordered equality: NaN != NaN, +0.0 == -0.0.
+                regs[dst as usize] = f64::from(u8::from(regs[a as usize] == regs[b as usize]));
                 pc += 1;
             }
             FloatOp::Ret { src } => return regs[src as usize],
@@ -1420,6 +1432,13 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                 written[*dst as usize] = true;
                 FloatOp::Eqz { dst: d, a }
             }
+            // Float strict equality `===` (numeric, NaN-aware); `!==` adds `Not`.
+            Op::StrictEq { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                FloatOp::Eq { dst: d, a, b }
+            }
             // Targets are nbvm op indices; the lowered stream prepends one `Arg`
             // per parameter, so each target shifts by `n_params`.
             Op::JumpIfFalse { cond, target } => FloatOp::JumpIfFalse {
@@ -1934,6 +1953,14 @@ impl X64Assembler {
     /// `xorpd xmm0, xmm0` — set `xmm0` to `+0.0`.
     pub fn zero_xmm0(&mut self) {
         self.code.extend_from_slice(&[0x66, 0x0f, 0x57, 0xc0]);
+    }
+    /// `sete al; setnp cl; and al, cl; movzx rax, al` — after a `ucomisd`, leaves
+    /// `rax = (ordered && equal) ? 1 : 0` (false for NaN; true for `+0` vs `-0`).
+    pub fn ordered_equal_rax(&mut self) {
+        self.code.extend_from_slice(&[0x0f, 0x94, 0xc0]); // sete al
+        self.code.extend_from_slice(&[0x0f, 0x9b, 0xc1]); // setnp cl
+        self.code.extend_from_slice(&[0x20, 0xc8]); // and al, cl
+        self.code.extend_from_slice(&[0x48, 0x0f, 0xb6, 0xc0]); // movzx rax, al
     }
     /// `ucomisd xmm0, xmm1`.
     pub fn ucomisd_xmm0_xmm1(&mut self) {
@@ -2571,6 +2598,18 @@ impl JitFunction {
                     a.zero_xmm1();
                     a.ucomisd_xmm0_xmm1();
                     a.sete_rax();
+                    a.cvtsi2sd_xmm0_rax();
+                    a.movsd_mem_xmm0(disp(dst));
+                }
+                FloatOp::Eq { dst, a: ra, b: rb } => {
+                    if !ok(dst) || !ok(ra) || !ok(rb) {
+                        return None;
+                    }
+                    // Numeric `===`: ordered (ZF) and not-unordered (¬PF). `ucomisd`
+                    // sets ZF for equal *and* NaN, so AND with ¬PF excludes NaN.
+                    a.movsd_xmm0_mem(disp(ra));
+                    a.ucomisd_xmm0_mem(disp(rb));
+                    a.ordered_equal_rax();
                     a.cvtsi2sd_xmm0_rax();
                     a.movsd_mem_xmm0(disp(dst));
                 }
@@ -3918,6 +3957,31 @@ mod tests {
         }
         // B itself still works (its code wasn't disturbed).
         assert_eq!(b.call1(21), 42);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn float_eq_is_nan_aware() {
+        // f(a,b) = (a === b) ? 1.0 : 0.0.
+        let ops = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Arg { dst: 1, index: 1 },
+            FloatOp::Eq { dst: 2, a: 0, b: 1 },
+            FloatOp::Ret { src: 2 },
+        ];
+        let f = JitFunction::compile_float(3, 2, &ops).unwrap();
+        let cases = [
+            (1.5, 1.5, 1.0),
+            (1.5, 2.5, 0.0),
+            (0.0, -0.0, 1.0),          // +0 === -0
+            (f64::NAN, f64::NAN, 0.0), // NaN !== NaN
+            (f64::NAN, 1.0, 0.0),
+            (f64::INFINITY, f64::INFINITY, 1.0),
+        ];
+        for (a, b, expect) in cases {
+            assert_eq!(f.call_args_f64(&[a, b]), expect, "{a} === {b}");
+            assert_eq!(eval_float(&ops, 3, &[a, b]), expect);
+        }
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

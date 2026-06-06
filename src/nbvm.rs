@@ -5670,6 +5670,15 @@ mod tests {
                 c"),
             "10"
         );
+        // A hot float function using `===` (the float path's `Eq`): count how many
+        // of 0,0.5,..,4.5 equal 2.5 → exactly 1.
+        assert_eq!(
+            bc("function eq(a,b){ return a === b ? 1 : 0; } \
+                let c = 0; \
+                for (let x = 0.0; x < 5.0; x = x + 0.5) { c = c + eq(x, 2.5); } \
+                c"),
+            "1"
+        );
     }
 
     #[test]
