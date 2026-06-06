@@ -5539,6 +5539,19 @@ mod tests {
         );
     }
 
+    /// A hot function using bitwise-not `~x` must JIT (lowered to `BitNot32`).
+    #[test]
+    fn hot_function_with_bitnot_matches_interpreter() {
+        // ~x == -x - 1; f(x) = ~x + x == -1 for every x. Sum over 0..20 → -20.
+        assert_eq!(
+            bc("function f(x){ return (~x) + x; } \
+                let s = 0; \
+                for (let i = 0; i < 20; i = i + 1) { s = s + f(i); } \
+                s"),
+            "-20"
+        );
+    }
+
     /// A hot function using JS shifts `<<` / `>>` / `>>>` must JIT (lowered to
     /// `Shift32`) and match the interpreter.
     #[test]

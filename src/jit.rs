@@ -267,6 +267,8 @@ pub enum RegOp {
     Eqz { dst: u8, a: u8 },
     /// `reg[dst] = -reg[a]` — JS unary minus of an integer (`-x`).
     Neg { dst: u8, a: u8 },
+    /// `reg[dst] = ~ToInt32(reg[a])` — JS bitwise-not (`~x`); result is an i32.
+    BitNot32 { dst: u8, a: u8 },
     /// `reg[dst] = ToInt32(reg[a]) <op> ToInt32(reg[b])` — a JS 32-bit bitwise op
     /// (`&`/`|`/`^`). Both operands are truncated to `i32` first, so the result is
     /// the exact 32-bit value (always within ±2^53), needing no range guard. `op`
@@ -342,6 +344,10 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
             }
             RegOp::Neg { dst, a } => {
                 regs[dst as usize] = regs[a as usize].wrapping_neg();
+                pc += 1;
+            }
+            RegOp::BitNot32 { dst, a } => {
+                regs[dst as usize] = i64::from(!(regs[a as usize] as i32));
                 pc += 1;
             }
             RegOp::Bit32 { dst, a, b, op } => {
@@ -446,6 +452,10 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 dst,
                 a: resolve(&copy_of, a),
             },
+            RegOp::BitNot32 { dst, a } => RegOp::BitNot32 {
+                dst,
+                a: resolve(&copy_of, a),
+            },
             RegOp::Bit32 { dst, a, b, op } => RegOp::Bit32 {
                 dst,
                 a: resolve(&copy_of, a),
@@ -484,6 +494,7 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
             | RegOp::Lt { dst, .. }
             | RegOp::Eqz { dst, .. }
             | RegOp::Neg { dst, .. }
+            | RegOp::BitNot32 { dst, .. }
             | RegOp::Bit32 { dst, .. }
             | RegOp::Shift32 { dst, .. }
             | RegOp::Call { dst, .. }
@@ -517,7 +528,10 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
                 used.insert(a);
                 used.insert(b);
             }
-            RegOp::Move { src, .. } | RegOp::Eqz { a: src, .. } | RegOp::Neg { a: src, .. } => {
+            RegOp::Move { src, .. }
+            | RegOp::Eqz { a: src, .. }
+            | RegOp::Neg { a: src, .. }
+            | RegOp::BitNot32 { a: src, .. } => {
                 used.insert(src);
             }
             RegOp::JumpIfFalse { cond, .. } => {
@@ -545,6 +559,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
         | RegOp::Lt { dst, .. }
         | RegOp::Eqz { dst, .. }
         | RegOp::Neg { dst, .. }
+        | RegOp::BitNot32 { dst, .. }
         | RegOp::Bit32 { dst, .. }
         | RegOp::Shift32 { dst, .. }
         | RegOp::Arg { dst, .. } => used.contains(&dst),
@@ -584,7 +599,9 @@ fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
         | RegOp::Lt { dst, a, b }
         | RegOp::Bit32 { dst, a, b, .. }
         | RegOp::Shift32 { dst, a, b, .. } => (Some(dst), [Some(a), Some(b)]),
-        RegOp::Eqz { dst, a } | RegOp::Neg { dst, a } => (Some(dst), [Some(a), None]),
+        RegOp::Eqz { dst, a } | RegOp::Neg { dst, a } | RegOp::BitNot32 { dst, a } => {
+            (Some(dst), [Some(a), None])
+        }
         RegOp::JumpIfFalse { cond, .. } => (None, [Some(cond), None]),
         RegOp::Ret { src } => (None, [Some(src), None]),
         RegOp::Jump { .. } => (None, [None, None]),
@@ -692,6 +709,10 @@ pub fn allocate_reg(ops: &[RegOp], n_regs: usize) -> (Vec<RegOp>, usize) {
                 a: m(a),
             },
             RegOp::Neg { dst, a } => RegOp::Neg {
+                dst: m(dst),
+                a: m(a),
+            },
+            RegOp::BitNot32 { dst, a } => RegOp::BitNot32 {
                 dst: m(dst),
                 a: m(a),
             },
@@ -827,6 +848,16 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                         known[dst as usize] = None;
                         RegOp::Neg { dst, a }
                     }
+                }
+            }
+            RegOp::BitNot32 { dst, a } => {
+                if let Some(x) = known[a as usize] {
+                    let v = i64::from(!(x as i32));
+                    known[dst as usize] = Some(v);
+                    RegOp::Const { dst, imm: v }
+                } else {
+                    known[dst as usize] = None;
+                    RegOp::BitNot32 { dst, a }
                 }
             }
             RegOp::Bit32 { dst, a, b, op } => {
@@ -1084,6 +1115,13 @@ pub fn lower_nbvm_with(
                 let d = reg8(*dst)?;
                 written[*dst as usize] = true;
                 RegOp::Neg { dst: d, a }
+            }
+            // JS bitwise-not `~x` = `~ToInt32(x)`; the native code truncates to i32.
+            Op::BitNot { dst, a } => {
+                let a = read(&written, *a)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::BitNot32 { dst: d, a }
             }
             // JS 32-bit bitwise `&`/`|`/`^`: ToInt32 both operands then combine.
             // The native code truncates to i32 first, so it matches JS semantics
@@ -1637,6 +1675,11 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x48, opc, 0xc8]);
     }
 
+    /// `not eax` — 32-bit bitwise complement (writing `eax` zeroes the upper 32).
+    pub fn not_eax(&mut self) {
+        self.code.extend_from_slice(&[0xf7, 0xd0]);
+    }
+
     /// `shl/sar/shr eax, cl` — a 32-bit shift of `eax` by `cl` (masked to 5 bits;
     /// writing `eax` zeroes the upper 32 bits of `rax`, i.e. zero-extends).
     pub fn shift_eax_cl(&mut self, op: ShiftOp) {
@@ -2120,6 +2163,16 @@ impl JitFunction {
                     a.load_rax(disp(ra));
                     a.cmp_rax_mem(disp(rb));
                     a.setl_rax();
+                    a.store_rax(disp(dst));
+                }
+                RegOp::BitNot32 { dst, a: ra } => {
+                    if !ok_reg(dst) || !ok_reg(ra) {
+                        return None;
+                    }
+                    // `not eax` complements the low 32 bits; sign-extend the i32.
+                    a.load_rax(disp(ra));
+                    a.not_eax();
+                    a.to_int32_rax();
                     a.store_rax(disp(dst));
                 }
                 RegOp::Eqz { dst, a: ra } => {
