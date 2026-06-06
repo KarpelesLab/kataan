@@ -266,6 +266,123 @@ fn val_type(b: u8) -> Result<ValType, WasmRtError> {
     }
 }
 
+/// A structured-control frame for operand-stack type validation: the block's
+/// input/output value types, the value-stack height at entry, and whether the
+/// block is currently in an `unreachable` (polymorphic-stack) state.
+struct Ctrl {
+    is_loop: bool,
+    ins: Vec<ValType>,
+    outs: Vec<ValType>,
+    height: usize,
+    unreachable: bool,
+}
+
+/// The WebAssembly operand-stack type checker: a value-type stack (where `None`
+/// is the polymorphic "unknown" pushed after `unreachable`) plus a control stack.
+/// Implements the standard validation algorithm — branch-target arities, block
+/// in/out matching, and unreachable polymorphism.
+struct TypeChecker {
+    vals: Vec<Option<ValType>>,
+    ctrls: Vec<Ctrl>,
+}
+
+impl TypeChecker {
+    fn new() -> Self {
+        Self {
+            vals: Vec::new(),
+            ctrls: Vec::new(),
+        }
+    }
+    fn push(&mut self, t: ValType) {
+        self.vals.push(Some(t));
+    }
+    /// Pops one operand, honoring the current block's floor (below which a pop is
+    /// an underflow if reachable, or the polymorphic `Unknown` if unreachable).
+    fn pop(&mut self) -> Result<Option<ValType>, WasmRtError> {
+        let frame = self
+            .ctrls
+            .last()
+            .ok_or(WasmRtError("control stack empty"))?;
+        if self.vals.len() == frame.height {
+            if frame.unreachable {
+                return Ok(None);
+            }
+            return Err(WasmRtError("operand stack underflow"));
+        }
+        Ok(self.vals.pop().unwrap())
+    }
+    /// Pops one operand requiring type `t` (an `Unknown` matches anything).
+    fn pop_expect(&mut self, t: ValType) -> Result<(), WasmRtError> {
+        match self.pop()? {
+            Some(g) if g != t => Err(WasmRtError("operand type mismatch")),
+            _ => Ok(()),
+        }
+    }
+    fn pop_many(&mut self, ts: &[ValType]) -> Result<(), WasmRtError> {
+        for t in ts.iter().rev() {
+            self.pop_expect(*t)?;
+        }
+        Ok(())
+    }
+    fn push_many(&mut self, ts: &[ValType]) {
+        for t in ts {
+            self.push(*t);
+        }
+    }
+    fn push_ctrl(&mut self, is_loop: bool, ins: Vec<ValType>, outs: Vec<ValType>) {
+        let frame = Ctrl {
+            is_loop,
+            ins: ins.clone(),
+            outs,
+            height: self.vals.len(),
+            unreachable: false,
+        };
+        self.ctrls.push(frame);
+        self.push_many(&ins);
+    }
+    /// Ends the current block: its output types must be exactly on top; returns
+    /// them so the caller can re-push them onto the enclosing block.
+    fn pop_ctrl(&mut self) -> Result<Vec<ValType>, WasmRtError> {
+        let outs = self
+            .ctrls
+            .last()
+            .ok_or(WasmRtError("control stack empty"))?
+            .outs
+            .clone();
+        self.pop_many(&outs)?;
+        let frame = self.ctrls.pop().unwrap();
+        if self.vals.len() != frame.height {
+            return Err(WasmRtError("block leaves extra operands"));
+        }
+        Ok(outs)
+    }
+    /// The types a branch to label `n` (0 = innermost) transfers: a loop's inputs,
+    /// any other block's outputs.
+    fn label_types(&self, n: usize) -> Option<Vec<ValType>> {
+        let len = self.ctrls.len();
+        if n >= len {
+            return None;
+        }
+        let frame = &self.ctrls[len - 1 - n];
+        Some(if frame.is_loop {
+            frame.ins.clone()
+        } else {
+            frame.outs.clone()
+        })
+    }
+    /// Enters the `unreachable` state for the current block: the stack is reset to
+    /// the block floor and subsequent pops yield the polymorphic `Unknown`.
+    fn set_unreachable(&mut self) -> Result<(), WasmRtError> {
+        let frame = self
+            .ctrls
+            .last_mut()
+            .ok_or(WasmRtError("control stack empty"))?;
+        self.vals.truncate(frame.height);
+        frame.unreachable = true;
+        Ok(())
+    }
+}
+
 /// The zero value for a value type (local/global default).
 fn zero_val(t: ValType) -> Val {
     match t {
@@ -445,26 +562,19 @@ impl Module {
         }
     }
 
-    /// Operand-stack **type** validation for a *straight-line* function body: it
-    /// simulates the operand stack's value types through the numeric, local,
-    /// global, memory, const, drop/select, and call instructions, rejecting a type
-    /// mismatch, a stack underflow, or a wrong final result type. Bodies that use
-    /// structured control flow (block/loop/if/br/…) or any instruction not modeled
-    /// here are validated conservatively (accepted) — so this never rejects a valid
-    /// module, only ill-typed straight-line ones.
+    /// Operand-stack **type** validation for a function body, control-flow aware:
+    /// a [`TypeChecker`] simulates the value-type stack through numeric, local,
+    /// global, memory, const, drop/select, and call instructions *and* the full
+    /// structured control flow (block/loop/if/else/end, br/br_if/br_table/return,
+    /// unreachable) — branch-target arities, block in/out matching, and the
+    /// polymorphic stack after `unreachable`. Rejects type mismatches, stack
+    /// underflow, and wrong block/function result types. An instruction whose
+    /// stack effect isn't modeled (or a multi-value block type) makes validation
+    /// bail conservatively (accept), so a valid module is never rejected.
     fn validate_types(&self, ty: &FuncType, body: &FuncBody) -> Result<(), WasmRtError> {
         use ValType::{F32, F64, I32, I64};
         let mut locals: Vec<ValType> = ty.params.clone();
         locals.extend_from_slice(&body.locals);
-        let mut stack: Vec<ValType> = Vec::new();
-        // Pop the top operand, requiring it to be `t`.
-        fn need(stack: &mut Vec<ValType>, t: ValType) -> Result<(), WasmRtError> {
-            match stack.pop() {
-                Some(g) if g == t => Ok(()),
-                Some(_) => Err(WasmRtError("operand type mismatch")),
-                None => Err(WasmRtError("operand stack underflow")),
-            }
-        }
         // (pops top-to-bottom, push) for a fixed-signature instruction.
         type Effect = (&'static [ValType], Option<ValType>);
         let simple: fn(u8) -> Option<Effect> = |op| {
@@ -491,96 +601,200 @@ impl Module {
                 _ => return None,
             })
         };
+        // Parse a block type: empty (0x40) or a single result; `None` signals a
+        // multi-value (type-index) block, which we don't model — bail to accept.
+        type BlockType = Option<(Vec<ValType>, Vec<ValType>)>;
+        let block_type = |r: &mut Reader| -> Result<BlockType, WasmRtError> {
+            let b = r.byte()?;
+            if b == 0x40 {
+                Ok(Some((Vec::new(), Vec::new())))
+            } else if let Ok(t) = val_type(b) {
+                Ok(Some((Vec::new(), alloc::vec![t])))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let mut tc = TypeChecker::new();
+        // The function body is an implicit block producing the function's results.
+        tc.push_ctrl(false, Vec::new(), ty.results.clone());
         let mut r = Reader::new(&body.code);
         while !r.done() {
             let op = r.byte()?;
             match op {
-                // Control flow / unmodeled-here: validate conservatively.
-                0x00 | 0x02..=0x05 | 0x0c..=0x0f | 0x11 => return Ok(()),
-                0x0b => {
-                    // Final `end`: the stack must be exactly the result types.
-                    if stack != ty.results {
-                        return Err(WasmRtError("function result type mismatch"));
-                    }
-                    return Ok(());
+                0x00 => tc.set_unreachable()?, // unreachable
+                0x01 => {}                     // nop
+                0x02 | 0x03 => {
+                    // block / loop
+                    let Some((ins, outs)) = block_type(&mut r)? else {
+                        return Ok(());
+                    };
+                    tc.pop_many(&ins)?;
+                    tc.push_ctrl(op == 0x03, ins, outs);
                 }
-                0x01 => {} // nop
+                0x04 => {
+                    // if: pop the i32 condition, then open a (then) block.
+                    let Some((ins, outs)) = block_type(&mut r)? else {
+                        return Ok(());
+                    };
+                    tc.pop_expect(I32)?;
+                    tc.pop_many(&ins)?;
+                    tc.push_ctrl(false, ins, outs);
+                }
+                0x05 => {
+                    // else: close the then-arm, reopen with the same in/out.
+                    let frame = tc.ctrls.last().ok_or(WasmRtError("else without if"))?;
+                    let (ins, outs) = (frame.ins.clone(), frame.outs.clone());
+                    tc.pop_many(&outs)?;
+                    if tc.vals.len() != tc.ctrls.last().unwrap().height {
+                        return Err(WasmRtError("then-branch leaves extra operands"));
+                    }
+                    tc.ctrls.pop();
+                    tc.push_ctrl(false, ins, outs);
+                }
+                0x0b => {
+                    // end: close the block; push its results to the parent (or, for
+                    // the function block, finish).
+                    let outs = tc.pop_ctrl()?;
+                    if tc.ctrls.is_empty() {
+                        return Ok(());
+                    }
+                    tc.push_many(&outs);
+                }
+                0x0c => {
+                    // br
+                    let n = r.u32()? as usize;
+                    let lt = tc
+                        .label_types(n)
+                        .ok_or(WasmRtError("branch label out of range"))?;
+                    tc.pop_many(&lt)?;
+                    tc.set_unreachable()?;
+                }
+                0x0d => {
+                    // br_if
+                    let n = r.u32()? as usize;
+                    let lt = tc
+                        .label_types(n)
+                        .ok_or(WasmRtError("branch label out of range"))?;
+                    tc.pop_expect(I32)?;
+                    tc.pop_many(&lt)?;
+                    tc.push_many(&lt);
+                }
+                0x0e => {
+                    // br_table: all labels must share the default's arity.
+                    let count = r.u32()?;
+                    let mut labels = Vec::with_capacity(count as usize + 1);
+                    for _ in 0..=count {
+                        labels.push(r.u32()? as usize);
+                    }
+                    tc.pop_expect(I32)?;
+                    let default = *labels.last().unwrap();
+                    let dlt = tc
+                        .label_types(default)
+                        .ok_or(WasmRtError("br_table default out of range"))?;
+                    for &n in &labels {
+                        let lt = tc
+                            .label_types(n)
+                            .ok_or(WasmRtError("br_table label out of range"))?;
+                        if lt.len() != dlt.len() {
+                            return Err(WasmRtError("br_table label arity mismatch"));
+                        }
+                    }
+                    tc.pop_many(&dlt)?;
+                    tc.set_unreachable()?;
+                }
+                0x0f => {
+                    // return
+                    tc.pop_many(&ty.results.clone())?;
+                    tc.set_unreachable()?;
+                }
                 0x1a => {
-                    stack.pop().ok_or(WasmRtError("drop on empty stack"))?;
+                    tc.pop()?; // drop (any operand)
                 }
                 0x1b => {
-                    need(&mut stack, I32)?; // select condition
-                    let a = stack.pop().ok_or(WasmRtError("select underflow"))?;
-                    let b = stack.pop().ok_or(WasmRtError("select underflow"))?;
-                    if a != b {
+                    tc.pop_expect(I32)?; // select condition
+                    let a = tc.pop()?;
+                    let b = tc.pop()?;
+                    if let (Some(x), Some(y)) = (a, b)
+                        && x != y
+                    {
                         return Err(WasmRtError("select arms differ in type"));
                     }
-                    stack.push(a);
+                    tc.vals.push(a.or(b));
                 }
                 0x20 => {
                     let i = r.u32()? as usize;
-                    stack.push(*locals.get(i).ok_or(WasmRtError("bad local"))?);
+                    tc.push(*locals.get(i).ok_or(WasmRtError("bad local"))?);
                 }
                 0x21 => {
                     let i = r.u32()? as usize;
-                    need(&mut stack, *locals.get(i).ok_or(WasmRtError("bad local"))?)?;
+                    tc.pop_expect(*locals.get(i).ok_or(WasmRtError("bad local"))?)?;
                 }
                 0x22 => {
                     let i = r.u32()? as usize;
                     let t = *locals.get(i).ok_or(WasmRtError("bad local"))?;
-                    need(&mut stack, t)?;
-                    stack.push(t);
+                    tc.pop_expect(t)?;
+                    tc.push(t);
                 }
                 0x23 => {
                     let t = self
                         .global_type(r.u32()?)
                         .ok_or(WasmRtError("bad global"))?;
-                    stack.push(t);
+                    tc.push(t);
                 }
                 0x24 => {
                     let t = self
                         .global_type(r.u32()?)
                         .ok_or(WasmRtError("bad global"))?;
-                    need(&mut stack, t)?;
+                    tc.pop_expect(t)?;
                 }
                 0x41 => {
                     r.i32()?;
-                    stack.push(I32);
+                    tc.push(I32);
                 }
                 0x42 => {
                     r.i64()?;
-                    stack.push(I64);
+                    tc.push(I64);
                 }
                 0x43 => {
                     r.bytes(4)?;
-                    stack.push(F32);
+                    tc.push(F32);
                 }
                 0x44 => {
                     r.bytes(8)?;
-                    stack.push(F64);
+                    tc.push(F64);
                 }
                 0x10 => {
                     let cty = self
                         .func_type(r.u32()?)
                         .ok_or(WasmRtError("bad call target"))?
                         .clone();
-                    for p in cty.params.iter().rev() {
-                        need(&mut stack, *p)?;
-                    }
-                    stack.extend(cty.results.iter().copied());
+                    tc.pop_many(&cty.params)?;
+                    tc.push_many(&cty.results);
+                }
+                0x11 => {
+                    let t = r.u32()?;
+                    r.u32()?; // table index
+                    let cty = self
+                        .types
+                        .get(t as usize)
+                        .ok_or(WasmRtError("bad type"))?
+                        .clone();
+                    tc.pop_expect(I32)?; // the table index operand
+                    tc.pop_many(&cty.params)?;
+                    tc.push_many(&cty.results);
                 }
                 // Memory loads: pop the i32 address, push the loaded type.
                 0x28..=0x35 => {
                     r.u32()?;
                     r.u32()?;
-                    need(&mut stack, I32)?;
-                    let t = match op {
+                    tc.pop_expect(I32)?;
+                    tc.push(match op {
                         0x29 | 0x30..=0x35 => I64,
                         0x2a => F32,
                         0x2b => F64,
                         _ => I32,
-                    };
-                    stack.push(t);
+                    });
                 }
                 // Memory stores: pop the value then the i32 address.
                 0x36..=0x3e => {
@@ -592,25 +806,23 @@ impl Module {
                         0x39 => F64,
                         _ => I32,
                     };
-                    need(&mut stack, vt)?;
-                    need(&mut stack, I32)?;
+                    tc.pop_expect(vt)?;
+                    tc.pop_expect(I32)?;
                 }
                 0x3f => {
                     r.byte()?;
-                    stack.push(I32); // memory.size
+                    tc.push(I32); // memory.size
                 }
                 0x40 => {
                     r.byte()?;
-                    need(&mut stack, I32)?;
-                    stack.push(I32); // memory.grow
+                    tc.pop_expect(I32)?;
+                    tc.push(I32); // memory.grow
                 }
                 _ => {
                     if let Some((pops, push)) = simple(op) {
-                        for t in pops {
-                            need(&mut stack, *t)?;
-                        }
+                        tc.pop_many(pops)?;
                         if let Some(t) = push {
-                            stack.push(t);
+                            tc.push(t);
                         }
                     } else {
                         return Ok(()); // unmodeled opcode: accept conservatively
@@ -2947,6 +3159,35 @@ mod tests {
         assert!(
             Module::decode(&module(&[0x20, 0x00, 0x6a])).is_err(),
             "i32.add with one operand must be rejected"
+        );
+
+        // Control-flow aware: an `if (result i32)` whose then-branch yields i64.
+        // local.get 0; if (result i32) { i64.const 1 } else { i32.const 0 } end
+        // The then-arm leaves an i64 where the block declares i32 → rejected.
+        assert!(
+            Module::decode(&module(&[
+                0x20, 0x00, // local.get 0 (condition)
+                0x04, 0x7f, // if (result i32)
+                0x42, 0x01, // i64.const 1   <-- wrong type
+                0x05, // else
+                0x41, 0x00, // i32.const 0
+                0x0b, // end if
+            ]))
+            .is_err(),
+            "if-result type mismatch must be rejected"
+        );
+
+        // A well-typed block: (block (result i32) i32.const 7) is accepted.
+        assert!(
+            Module::decode(&module(&[0x02, 0x7f, 0x41, 0x07, 0x0b])).is_ok(),
+            "well-typed block must be accepted"
+        );
+
+        // After `unreachable`, the stack is polymorphic: `unreachable i32.add` is
+        // valid (the add's operands come from the polymorphic stack).
+        assert!(
+            Module::decode(&module(&[0x00, 0x6a])).is_ok(),
+            "unreachable makes the rest of the block polymorphic"
         );
     }
 
