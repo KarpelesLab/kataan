@@ -140,6 +140,9 @@ pub struct Module {
     exports: Vec<(alloc::string::String, u32)>,
     /// Linear memory minimum size, in 64 KiB pages (`None` = no memory).
     mem_min_pages: Option<u32>,
+    /// Linear memory maximum size in pages, if the limits declared one. A
+    /// `memory.grow` past this returns -1.
+    mem_max_pages: Option<u32>,
     /// Data segments in declaration order: `(offset, bytes)`. `Some(off)` is an
     /// *active* segment applied at instantiation; `None` is a *passive* segment,
     /// copied on demand by `memory.init`. Both are indexed by `memory.init` /
@@ -186,6 +189,8 @@ struct Store {
     /// Per data segment: `true` once `data.drop` has run (its bytes are released,
     /// so a later `memory.init` of a non-zero length traps).
     dropped: Vec<bool>,
+    /// The memory's declared maximum in pages (the limits' upper bound), if any.
+    mem_max_pages: Option<u32>,
 }
 
 /// LEB128 cursor over a byte slice.
@@ -1216,7 +1221,7 @@ impl Module {
             let flag = s.byte()?;
             let min = s.u32()?;
             if flag == 1 {
-                let _max = s.u32()?;
+                m.mem_max_pages = Some(s.u32()?);
             }
             m.mem_min_pages = Some(min);
         }
@@ -1413,6 +1418,7 @@ impl Module {
             mem,
             globals,
             dropped,
+            mem_max_pages: self.mem_max_pages,
         })
     }
 
@@ -1759,15 +1765,15 @@ impl Module {
                     let _reserved = r.byte()?;
                     let delta = pop!().as_i32()? as u32 as usize;
                     let old = store.mem.len() / PAGE_SIZE;
-                    // Grow by `delta` pages (no max enforced here); -1 on failure.
-                    if store
-                        .mem
-                        .len()
-                        .checked_add(delta * PAGE_SIZE)
-                        .filter(|n| *n <= 0x1_0000 * PAGE_SIZE)
-                        .is_some()
-                    {
-                        store.mem.resize(store.mem.len() + delta * PAGE_SIZE, 0);
+                    let new_pages = old + delta;
+                    // The hard ceiling is 2^16 pages (4 GiB); a declared maximum
+                    // (the limits' upper bound) further caps growth. Either failure
+                    // leaves memory untouched and returns -1.
+                    let ceiling = store
+                        .mem_max_pages
+                        .map_or(0x1_0000, |m| (m as usize).min(0x1_0000));
+                    if new_pages <= ceiling {
+                        store.mem.resize(new_pages * PAGE_SIZE, 0);
                         stack.push(Val::I32(old as i32));
                     } else {
                         stack.push(Val::I32(-1));

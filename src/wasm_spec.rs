@@ -1959,6 +1959,28 @@ mod tests {
     }
 
     #[test]
+    fn spec_memory_grow_and_size() {
+        // `memory.size` reports current pages; `memory.grow` returns the old size
+        // (or -1 on failure) and makes the new bytes accessible.
+        let script = "(module \
+            (memory 1 3) \
+            (func (export \"size\") (result i32) (memory.size)) \
+            (func (export \"grow\") (param i32) (result i32) (memory.grow (local.get 0))) \
+            (func (export \"st\") (param i32 i32) (i32.store (local.get 0) (local.get 1))) \
+            (func (export \"ld\") (param i32) (result i32) (i32.load (local.get 0)))) \
+            (assert_return (invoke \"size\") (i32.const 1)) \
+            (assert_return (invoke \"grow\" (i32.const 1)) (i32.const 1)) \
+            (assert_return (invoke \"size\") (i32.const 2)) \
+            (invoke \"st\" (i32.const 65536) (i32.const 777)) \
+            (assert_return (invoke \"ld\" (i32.const 65536)) (i32.const 777)) \
+            (assert_return (invoke \"grow\" (i32.const 5)) (i32.const -1)) \
+            (assert_return (invoke \"size\") (i32.const 2)) \
+            (assert_trap (invoke \"ld\" (i32.const 200000)))";
+        let n = run_wast(script).expect("memory.grow/size conformance passes");
+        assert_eq!(n, 8);
+    }
+
+    #[test]
     fn spec_reinterpret_and_promote_demote() {
         // Bit-preserving reinterpret round-trips and the f32<->f64 width changes.
         let script = "(module \
