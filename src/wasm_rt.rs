@@ -789,6 +789,14 @@ impl Module {
                 stack.push(Val::I64($f(a, b)));
             }};
         }
+        // i64 comparison → i32 boolean.
+        macro_rules! cmp_i64 {
+            ($f:expr) => {{
+                let b = pop!().as_i64()?;
+                let a = pop!().as_i64()?;
+                stack.push(Val::I32(i32::from($f(a, b))));
+            }};
+        }
         macro_rules! bin_f64 {
             ($f:expr) => {{
                 let b = pop!().as_f64()?;
@@ -992,9 +1000,25 @@ impl Module {
                 0x46 => bin_i32!(|a, b| i32::from(a == b)),
                 0x47 => bin_i32!(|a, b| i32::from(a != b)),
                 0x48 => bin_i32!(|a, b| i32::from(a < b)), // lt_s
+                0x49 => bin_i32!(|a: i32, b: i32| i32::from((a as u32) < b as u32)), // lt_u
                 0x4a => bin_i32!(|a, b| i32::from(a > b)), // gt_s
+                0x4b => bin_i32!(|a: i32, b: i32| i32::from((a as u32) > b as u32)), // gt_u
                 0x4c => bin_i32!(|a, b| i32::from(a <= b)), // le_s
+                0x4d => bin_i32!(|a: i32, b: i32| i32::from((a as u32) <= b as u32)), // le_u
                 0x4e => bin_i32!(|a, b| i32::from(a >= b)), // ge_s
+                0x4f => bin_i32!(|a: i32, b: i32| i32::from((a as u32) >= b as u32)), // ge_u
+                0x67 => {
+                    let a = pop!().as_i32()?;
+                    stack.push(Val::I32(a.leading_zeros() as i32)); // clz
+                }
+                0x68 => {
+                    let a = pop!().as_i32()?;
+                    stack.push(Val::I32(a.trailing_zeros() as i32)); // ctz
+                }
+                0x69 => {
+                    let a = pop!().as_i32()?;
+                    stack.push(Val::I32(a.count_ones() as i32)); // popcnt
+                }
                 0x6a => bin_i32!(i32::wrapping_add),
                 0x6b => bin_i32!(i32::wrapping_sub),
                 0x6c => bin_i32!(i32::wrapping_mul),
@@ -1006,15 +1030,81 @@ impl Module {
                     }
                     stack.push(Val::I32(a.wrapping_div(b))); // div_s
                 }
+                0x6e => {
+                    let b = pop!().as_i32()? as u32;
+                    let a = pop!().as_i32()? as u32;
+                    if b == 0 {
+                        return Err(WasmRtError("integer divide by zero"));
+                    }
+                    stack.push(Val::I32((a / b) as i32)); // div_u
+                }
+                0x6f => {
+                    let b = pop!().as_i32()?;
+                    let a = pop!().as_i32()?;
+                    if b == 0 {
+                        return Err(WasmRtError("integer divide by zero"));
+                    }
+                    stack.push(Val::I32(a.wrapping_rem(b))); // rem_s
+                }
+                0x70 => {
+                    let b = pop!().as_i32()? as u32;
+                    let a = pop!().as_i32()? as u32;
+                    if b == 0 {
+                        return Err(WasmRtError("integer divide by zero"));
+                    }
+                    stack.push(Val::I32((a % b) as i32)); // rem_u
+                }
                 0x71 => bin_i32!(|a, b| a & b),
                 0x72 => bin_i32!(|a, b| a | b),
                 0x73 => bin_i32!(|a, b| a ^ b),
                 0x74 => bin_i32!(|a: i32, b: i32| a.wrapping_shl(b as u32)),
                 0x75 => bin_i32!(|a: i32, b: i32| a.wrapping_shr(b as u32)), // shr_s
-                // i64 arithmetic
+                0x76 => bin_i32!(|a: i32, b: i32| ((a as u32).wrapping_shr(b as u32)) as i32), // shr_u
+                0x77 => bin_i32!(|a: i32, b: i32| a.rotate_left(b as u32)),
+                0x78 => bin_i32!(|a: i32, b: i32| a.rotate_right(b as u32)),
+                // i64 comparisons (→ i32)
+                0x50 => {
+                    let a = pop!().as_i64()?;
+                    stack.push(Val::I32(i32::from(a == 0))); // i64.eqz
+                }
+                0x51 => cmp_i64!(|a, b| a == b),
+                0x52 => cmp_i64!(|a, b| a != b),
+                0x53 => cmp_i64!(|a, b| a < b), // lt_s
+                0x54 => cmp_i64!(|a: i64, b: i64| (a as u64) < b as u64), // lt_u
+                0x55 => cmp_i64!(|a, b| a > b), // gt_s
+                0x56 => cmp_i64!(|a: i64, b: i64| (a as u64) > b as u64), // gt_u
+                0x57 => cmp_i64!(|a, b| a <= b), // le_s
+                0x59 => cmp_i64!(|a, b| a >= b), // ge_s
+                // i64 arithmetic / bitwise
                 0x7c => bin_i64!(i64::wrapping_add),
                 0x7d => bin_i64!(i64::wrapping_sub),
                 0x7e => bin_i64!(i64::wrapping_mul),
+                0x7f => {
+                    let b = pop!().as_i64()?;
+                    let a = pop!().as_i64()?;
+                    if b == 0 {
+                        return Err(WasmRtError("integer divide by zero"));
+                    }
+                    stack.push(Val::I64(a.wrapping_div(b))); // i64.div_s
+                }
+                0x83 => bin_i64!(|a, b| a & b),
+                0x84 => bin_i64!(|a, b| a | b),
+                0x85 => bin_i64!(|a, b| a ^ b),
+                0x86 => bin_i64!(|a: i64, b: i64| a.wrapping_shl(b as u32)),
+                0x87 => bin_i64!(|a: i64, b: i64| a.wrapping_shr(b as u32)), // shr_s
+                // conversions
+                0xa7 => {
+                    let a = pop!().as_i64()?;
+                    stack.push(Val::I32(a as i32)); // i32.wrap_i64
+                }
+                0xac => {
+                    let a = pop!().as_i32()?;
+                    stack.push(Val::I64(i64::from(a))); // i64.extend_i32_s
+                }
+                0xad => {
+                    let a = pop!().as_i32()? as u32;
+                    stack.push(Val::I64(i64::from(a))); // i64.extend_i32_u
+                }
                 // --- floating point ---
                 0x43 => {
                     let v = f32::from_le_bytes(r.bytes(4)?.try_into().unwrap());
@@ -1986,6 +2076,106 @@ mod tests {
 
         // A missing import binding is rejected at instantiation.
         assert!(Instance::with_imports(&module, vec![]).is_err());
+    }
+
+    /// Helper: a single-result `(i32,i32)->i32` module whose body is `local.get 0
+    /// local.get 1 <opcode bytes>`.
+    fn binop_i32_module(opcode: &[u8]) -> Vec<u8> {
+        let mut body: Vec<u8> = vec![0x00, 0x20, 0x00, 0x20, 0x01];
+        body.extend_from_slice(opcode);
+        body.push(0x0b);
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f]);
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        m
+    }
+
+    #[test]
+    fn extended_integer_ops() {
+        let run = |opcode: &[u8], a: i32, b: i32| -> Val {
+            let m = binop_i32_module(opcode);
+            Module::decode(&m)
+                .unwrap()
+                .call(0, &[Val::I32(a), Val::I32(b)])
+                .unwrap()[0]
+        };
+        // Unsigned compare: -1 (0xFFFFFFFF) is the largest u32.
+        assert_eq!(run(&[0x49], -1, 1), Val::I32(0)); // lt_u: -1 < 1 ? no (huge)
+        assert_eq!(run(&[0x4b], -1, 1), Val::I32(1)); // gt_u: yes
+        // div_u / rem_u.
+        assert_eq!(run(&[0x6e], -2, 3), Val::I32((((-2i32) as u32) / 3) as i32)); // div_u
+        assert_eq!(run(&[0x70], 17, 5), Val::I32(2)); // rem_u
+        assert_eq!(run(&[0x6f], -17, 5), Val::I32(-2)); // rem_s
+        // shr_u vs shr_s.
+        assert_eq!(
+            run(&[0x76], -8, 1),
+            Val::I32((((-8i32) as u32) >> 1) as i32)
+        ); // shr_u
+        // rotl / rotr.
+        assert_eq!(
+            run(&[0x77], 0x1234_5678, 8),
+            Val::I32(0x1234_5678i32.rotate_left(8))
+        );
+        assert_eq!(
+            run(&[0x78], 0x1234_5678, 4),
+            Val::I32(0x1234_5678i32.rotate_right(4))
+        );
+
+        // Unary clz/ctz/popcnt via a 1-arg module.
+        let unary = |opcode: u8, x: i32| -> i32 {
+            let mut body: Vec<u8> = vec![0x00, 0x20, 0x00, opcode, 0x0b];
+            let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+            m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]);
+            m.extend([0x03, 0x02, 0x01, 0x00]);
+            m.extend([0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00]);
+            m.push(0x0a);
+            m.push((body.len() + 2) as u8);
+            m.push(0x01);
+            m.push(body.len() as u8);
+            m.append(&mut body);
+            match Module::decode(&m).unwrap().call(0, &[Val::I32(x)]).unwrap()[0] {
+                Val::I32(v) => v,
+                _ => panic!(),
+            }
+        };
+        assert_eq!(unary(0x67, 1), 31); // clz(1)
+        assert_eq!(unary(0x68, 8), 3); // ctz(8)
+        assert_eq!(unary(0x69, 0xff), 8); // popcnt(0xff)
+    }
+
+    #[test]
+    fn i64_ops_and_conversions() {
+        // (func (export "f") (param i32) (result i32)
+        //   local.get 0 i64.extend_i32_s   ;; i64
+        //   i64.const 1000000000000 i64.add ;; + 1e12 (needs i64)
+        //   i32.wrap_i64)                    ;; back to i32 (wraps)
+        let mut body: Vec<u8> = vec![0x00, 0x20, 0x00, 0xac]; // local.get0; i64.extend_i32_s
+        body.push(0x42); // i64.const
+        // 1000000000000 = 0xE8D4A51000; LEB128 signed:
+        body.extend([0x80, 0xa0, 0x94, 0xa5, 0x8d, 0x1d]);
+        body.extend([0x7c, 0xa7, 0x0b]); // i64.add; i32.wrap_i64; end
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]);
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).expect("decode i64 module");
+        // f(5) = wrap(5 + 1e12). 1e12 mod 2^32 = 1000000000000 & 0xFFFFFFFF.
+        let expect = (5i64 + 1_000_000_000_000i64) as i32;
+        assert_eq!(
+            module.call(0, &[Val::I32(5)]).unwrap(),
+            vec![Val::I32(expect)]
+        );
     }
 
     #[test]
