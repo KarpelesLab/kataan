@@ -139,21 +139,33 @@ pub enum RegOp {
     Bin { dst: u8, a: u8, b: u8, op: BinOp2 },
     /// `reg[dst] = reg[src]`
     Move { dst: u8, src: u8 },
+    /// `reg[dst] = (reg[a] < reg[b]) as 0/1` (signed)
+    Lt { dst: u8, a: u8, b: u8 },
+    /// if `reg[cond] == 0`, jump to op index `target`
+    JumpIfFalse { cond: u8, target: usize },
+    /// unconditional jump to op index `target`
+    Jump { target: usize },
     /// return `reg[src]`
     Ret { src: u8 },
 }
 
-/// Interprets a [`RegOp`] program (the oracle for [`JitFunction::compile_reg`]).
-/// `n_regs` registers; `args` are the function arguments.
+/// Interprets a [`RegOp`] program (the oracle for [`JitFunction::compile_reg`]),
+/// with a program counter so branches/loops are handled. `n_regs` registers;
+/// `args` are the function arguments.
 #[must_use]
 pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
     let mut regs = alloc::vec![0i64; n_regs];
-    for op in ops {
-        match *op {
+    let mut pc = 0usize;
+    while pc < ops.len() {
+        match ops[pc] {
             RegOp::Arg { dst, index } => {
                 regs[dst as usize] = args.get(index as usize).copied().unwrap_or(0);
+                pc += 1;
             }
-            RegOp::Const { dst, imm } => regs[dst as usize] = imm,
+            RegOp::Const { dst, imm } => {
+                regs[dst as usize] = imm;
+                pc += 1;
+            }
             RegOp::Bin { dst, a, b, op } => {
                 let (x, y) = (regs[a as usize], regs[b as usize]);
                 regs[dst as usize] = match op {
@@ -164,8 +176,24 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
                     BinOp2::Or => x | y,
                     BinOp2::Xor => x ^ y,
                 };
+                pc += 1;
             }
-            RegOp::Move { dst, src } => regs[dst as usize] = regs[src as usize],
+            RegOp::Move { dst, src } => {
+                regs[dst as usize] = regs[src as usize];
+                pc += 1;
+            }
+            RegOp::Lt { dst, a, b } => {
+                regs[dst as usize] = i64::from(regs[a as usize] < regs[b as usize]);
+                pc += 1;
+            }
+            RegOp::JumpIfFalse { cond, target } => {
+                if regs[cond as usize] == 0 {
+                    pc = target;
+                } else {
+                    pc += 1;
+                }
+            }
+            RegOp::Jump { target } => pc = target,
             RegOp::Ret { src } => return regs[src as usize],
         }
     }
@@ -255,16 +283,38 @@ pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
                 dst: reg8(*dst)?,
                 src: reg8(*src)?,
             },
-            Op::Return { src } => {
-                out.push(RegOp::Ret { src: reg8(*src)? });
-                return Some(out);
-            }
+            Op::Lt { dst, a, b } => RegOp::Lt {
+                dst: reg8(*dst)?,
+                a: reg8(*a)?,
+                b: reg8(*b)?,
+            },
+            // Branch targets are nbvm op indices; the lowered stream prepends one
+            // `Arg` per parameter, so every target shifts by `n_params`.
+            Op::JumpIfFalse { cond, target } => RegOp::JumpIfFalse {
+                cond: reg8(*cond)?,
+                target: target.checked_add(proto.n_params)?,
+            },
+            Op::Jump { target } => RegOp::Jump {
+                target: target.checked_add(proto.n_params)?,
+            },
+            Op::Return { src } => RegOp::Ret { src: reg8(*src)? },
             _ => return None,
         };
         out.push(lowered);
     }
-    // Fell off the end without a `Return` — not JIT-eligible.
-    None
+    // Eligible only if it terminates (the last op returns, so control never falls
+    // off the end of the emitted code) and every branch target is in range.
+    if !matches!(out.last(), Some(RegOp::Ret { .. })) {
+        return None;
+    }
+    for op in &out {
+        if let RegOp::JumpIfFalse { target, .. } | RegOp::Jump { target } = op
+            && *target >= out.len()
+        {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// A bytecode-VM function compiled to native code, callable from the VM with
@@ -519,6 +569,24 @@ impl X64Assembler {
         self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
+    /// `cmp rax, [rbp+disp]`.
+    pub fn cmp_rax_mem(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x48, 0x3b, 0x85]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `test rax, rax` (sets flags from `rax`).
+    pub fn test_rax_rax(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x85, 0xc0]);
+    }
+
+    /// `setl al; movzx rax, al` — `rax = (signed less-than flag) ? 1 : 0`, after a
+    /// `cmp`.
+    pub fn setl_rax(&mut self) {
+        self.code.extend_from_slice(&[0x0f, 0x9c, 0xc0]); // setl al
+        self.code.extend_from_slice(&[0x48, 0x0f, 0xb6, 0xc0]); // movzx rax, al
+    }
+
     /// `<op> rax, [rbp+disp]` for `add`/`sub`/`imul`/`and`/`or`/`xor`.
     pub fn op_rax_mem(&mut self, op: BinOp2, disp: i32) {
         match op {
@@ -767,12 +835,13 @@ impl JitFunction {
         // Frame: n_regs slots, rounded up to 16-byte alignment.
         let frame = ((n_regs as u32 * 8) + 15) & !15;
         let mut a = X64Assembler::new();
+        // One label per op so any op can be a branch target; bound just before
+        // that op's code is emitted.
+        let labels: Vec<Label> = (0..ops.len()).map(|_| a.new_label()).collect();
         a.prologue(frame);
-        // Spill the incoming arguments to their register slots (RegOp::Arg reads
-        // them back, so only the first `n_args` registers' Arg ops matter, but we
-        // store all declared args up front for simplicity).
         let mut has_ret = false;
-        for op in ops {
+        for (i, op) in ops.iter().enumerate() {
+            a.bind(labels[i]);
             match *op {
                 RegOp::Arg { dst, index } => {
                     if !ok_reg(dst) || index as usize >= n_args {
@@ -807,6 +876,29 @@ impl JitFunction {
                     a.load_rax(disp(src));
                     a.store_rax(disp(dst));
                 }
+                RegOp::Lt { dst, a: ra, b: rb } => {
+                    if !ok_reg(dst) || !ok_reg(ra) || !ok_reg(rb) {
+                        return None;
+                    }
+                    a.load_rax(disp(ra));
+                    a.cmp_rax_mem(disp(rb));
+                    a.setl_rax();
+                    a.store_rax(disp(dst));
+                }
+                RegOp::JumpIfFalse { cond, target } => {
+                    if !ok_reg(cond) || target >= ops.len() {
+                        return None;
+                    }
+                    a.load_rax(disp(cond));
+                    a.test_rax_rax();
+                    a.je(labels[target]); // jump if rax == 0 (falsy)
+                }
+                RegOp::Jump { target } => {
+                    if target >= ops.len() {
+                        return None;
+                    }
+                    a.jmp(labels[target]);
+                }
                 RegOp::Ret { src } => {
                     if !ok_reg(src) {
                         return None;
@@ -814,7 +906,7 @@ impl JitFunction {
                     a.load_rax(disp(src));
                     a.epilogue();
                     has_ret = true;
-                    break;
+                    // Do NOT break: later ops may be branch targets.
                 }
             }
         }
@@ -1247,6 +1339,38 @@ mod tests {
             }
         }
         assert!(tested, "expected an integer arithmetic proto to lower");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn jit_compiles_a_real_loop() {
+        use crate::nanbox::{NanBox, Unpacked};
+        // A real counted loop with a comparison and a backward branch.
+        let src = "function f(n){ let s = 0; for (let i = 0; i < n; i = i + 1) { s = s + i; } return s; } f;";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let protos = crate::nbvm::compile_program(&program).expect("compile");
+        let p = protos.iter().find(|p| p.n_params == 1).expect("f's proto");
+        let lowered = lower_nbvm(p).expect("loop should lower (Lt/JumpIfFalse/Jump)");
+        // The IR oracle computes sum(0..n).
+        for n in [0i64, 1, 5, 10, 50] {
+            assert_eq!(
+                eval_reg(&lowered, p.n_regs, &[n]),
+                n * (n - 1) / 2,
+                "sum 0..{n}"
+            );
+        }
+        // And the JIT runs it natively, end-to-end with the NanBox guard.
+        let jit = JitProto::compile(p).expect("loop JIT-compiles");
+        for n in [0i64, 1, 5, 10, 50, 100] {
+            let r = jit
+                .call_guarded(&[NanBox::number(n as f64)])
+                .expect("native loop");
+            assert_eq!(
+                r.unpack(),
+                Unpacked::Number((n * (n - 1) / 2) as f64),
+                "jit sum 0..{n}"
+            );
+        }
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
