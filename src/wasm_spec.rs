@@ -340,6 +340,7 @@ fn emit_op(
     imm: Option<&str>,
     locals: &[String],
     funcs: &[String],
+    globals: &[String],
     labels: &[String],
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
@@ -392,11 +393,11 @@ fn emit_op(
         }
         "global.get" => {
             out.push(0x23);
-            leb_u(idx()?, out);
+            leb_u(resolve(globals, "global")?, out);
         }
         "global.set" => {
             out.push(0x24);
-            leb_u(idx()?, out);
+            leb_u(resolve(globals, "global")?, out);
         }
         "call" => {
             out.push(0x10);
@@ -430,6 +431,7 @@ fn emit_instrs(
     items: &[Sexpr],
     locals: &[String],
     funcs: &[String],
+    globals: &[String],
     labels: &mut Vec<String>,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
@@ -437,7 +439,7 @@ fn emit_instrs(
     while i < items.len() {
         match &items[i] {
             Sexpr::List(inner) => {
-                emit_folded(inner, locals, funcs, labels, out)?;
+                emit_folded(inner, locals, funcs, globals, labels, out)?;
                 i += 1;
             }
             Sexpr::Atom(name) => {
@@ -446,10 +448,10 @@ fn emit_instrs(
                         Some(Sexpr::Atom(s)) => s.as_str(),
                         _ => return Err(format!("{name} needs an immediate")),
                     };
-                    emit_op(name, Some(imm), locals, funcs, labels, out)?;
+                    emit_op(name, Some(imm), locals, funcs, globals, labels, out)?;
                     i += 2;
                 } else {
-                    emit_op(name, None, locals, funcs, labels, out)?;
+                    emit_op(name, None, locals, funcs, globals, labels, out)?;
                     i += 1;
                 }
             }
@@ -487,6 +489,7 @@ fn emit_folded(
     inner: &[Sexpr],
     locals: &[String],
     funcs: &[String],
+    globals: &[String],
     labels: &mut Vec<String>,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
@@ -499,7 +502,7 @@ fn emit_folded(
             out.push(if name == "block" { 0x02 } else { 0x03 });
             out.push(bt);
             labels.push(label);
-            emit_instrs(&inner[1 + skip..], locals, funcs, labels, out)?;
+            emit_instrs(&inner[1 + skip..], locals, funcs, globals, labels, out)?;
             labels.pop();
             out.push(0x0b); // end
             return Ok(());
@@ -515,19 +518,19 @@ fn emit_folded(
                 .ok_or("if without a (then …) clause")?;
             // The condition precedes `(then …)`, emitted before the `if` (so it
             // doesn't see the if's own label).
-            emit_instrs(&rest[..then_at], locals, funcs, labels, out)?;
+            emit_instrs(&rest[..then_at], locals, funcs, globals, labels, out)?;
             out.push(0x04); // if
             out.push(bt);
             labels.push(label);
             if let Sexpr::List(then_p) = &rest[then_at] {
-                emit_instrs(&then_p[1..], locals, funcs, labels, out)?;
+                emit_instrs(&then_p[1..], locals, funcs, globals, labels, out)?;
             }
             if let Some(else_s) = rest.get(then_at + 1)
                 && is_clause(else_s, "else")
                 && let Sexpr::List(else_p) = else_s
             {
                 out.push(0x05); // else
-                emit_instrs(&else_p[1..], locals, funcs, labels, out)?;
+                emit_instrs(&else_p[1..], locals, funcs, globals, labels, out)?;
             }
             labels.pop();
             out.push(0x0b); // end
@@ -540,11 +543,11 @@ fn emit_folded(
             Some(Sexpr::Atom(s)) => s.clone(),
             _ => return Err(format!("{name} needs an immediate")),
         };
-        emit_instrs(&inner[2..], locals, funcs, labels, out)?;
-        emit_op(name, Some(&imm), locals, funcs, labels, out)?;
+        emit_instrs(&inner[2..], locals, funcs, globals, labels, out)?;
+        emit_op(name, Some(&imm), locals, funcs, globals, labels, out)?;
     } else {
-        emit_instrs(&inner[1..], locals, funcs, labels, out)?;
-        emit_op(name, None, locals, funcs, labels, out)?;
+        emit_instrs(&inner[1..], locals, funcs, globals, labels, out)?;
+        emit_op(name, None, locals, funcs, globals, labels, out)?;
     }
     Ok(())
 }
@@ -565,6 +568,50 @@ struct WatFunc {
 
 /// Compiles an inline `(module (func …)…)` text module to a binary module.
 fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
+    // First, collect `(global $name? (mut? T) (init))` declarations: their names
+    // (for `global.get/set $g`) and the encoded global-section entries.
+    let mut global_names: Vec<String> = Vec::new();
+    let mut global_section: Vec<u8> = Vec::new();
+    for field in &items[1..] {
+        let Sexpr::List(g) = field else { continue };
+        if g.first() != Some(&Sexpr::Atom(String::from("global"))) {
+            continue;
+        }
+        let mut k = 1;
+        let mut name = String::new();
+        if let Some(Sexpr::Atom(s)) = g.get(k)
+            && let Some(nm) = s.strip_prefix('$')
+        {
+            name = nm.into();
+            k += 1;
+        }
+        // The type: `T` (immutable) or `(mut T)`.
+        let (vt, is_mut) = match g.get(k) {
+            Some(Sexpr::Atom(t)) => (valtype_byte(t), false),
+            Some(Sexpr::List(m)) if m.first() == Some(&Sexpr::Atom(String::from("mut"))) => (
+                m.get(1).and_then(|x| match x {
+                    Sexpr::Atom(t) => valtype_byte(t),
+                    _ => None,
+                }),
+                true,
+            ),
+            _ => (None, false),
+        };
+        let vt = vt.ok_or("bad global type")?;
+        k += 1;
+        global_section.push(vt);
+        global_section.push(u8::from(is_mut));
+        // Init expression: a single folded constant `(T.const N)`.
+        if let Some(Sexpr::List(init)) = g.get(k)
+            && let (Some(Sexpr::Atom(op)), Some(Sexpr::Atom(n))) = (init.first(), init.get(1))
+        {
+            emit_op(op, Some(n), &[], &[], &[], &[], &mut global_section)?;
+        }
+        global_section.push(0x0b); // end of init expr
+        global_names.push(name);
+    }
+    let n_globals = global_names.len();
+
     let mut funcs: Vec<WatFunc> = Vec::new();
     for field in &items[1..] {
         let Sexpr::List(f) = field else { continue };
@@ -657,6 +704,7 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
             &f.body_items,
             &f.local_names,
             &func_names,
+            &global_names,
             &mut labels,
             &mut body,
         )?;
@@ -683,6 +731,13 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
         leb_u(i as u64, &mut fns);
     }
     section(3, &fns, &mut out);
+    // global section (id 6): count + the collected per-global entries.
+    if n_globals > 0 {
+        let mut globals = Vec::new();
+        leb_u(n_globals as u64, &mut globals);
+        globals.extend_from_slice(&global_section);
+        section(6, &globals, &mut out);
+    }
     // export section.
     let exported: Vec<(usize, &String)> = funcs
         .iter()
@@ -1047,6 +1102,36 @@ mod tests {
         } else {
             panic!("expected a list");
         }
+    }
+
+    #[test]
+    fn wat_globals_compile_and_run() {
+        // A mutable global `$counter` (init 100) and an immutable `$base` (init 5):
+        // bump(d) adds d to $counter and returns it + $base.
+        let src = "(module \
+            (global $counter (mut i32) (i32.const 100)) \
+            (global $base i32 (i32.const 5)) \
+            (func (export \"bump\") (param $d i32) (result i32) \
+              (global.set $counter (i32.add (global.get $counter) (local.get $d))) \
+              (i32.add (global.get $counter) (global.get $base))))";
+        let bin = wat_to_binary(src).expect("compile WAT with globals");
+        let module = crate::wasm_rt::Module::decode(&bin).expect("decode");
+        let mut inst = crate::wasm_rt::Instance::new(&module).expect("instantiate");
+        // Globals persist across calls on a persistent instance:
+        // 100+10 + 5 = 115, then 110+20 + 5 = 135.
+        assert_eq!(
+            inst.call_export("bump", &[Val::I32(10)]).unwrap(),
+            vec![Val::I32(115)]
+        );
+        assert_eq!(
+            inst.call_export("bump", &[Val::I32(20)]).unwrap(),
+            vec![Val::I32(135)]
+        );
+        // An unknown global name is rejected.
+        assert!(
+            wat_to_binary("(module (func (result i32) (global.get $nope)))").is_err(),
+            "unknown $global rejected"
+        );
     }
 
     #[test]
