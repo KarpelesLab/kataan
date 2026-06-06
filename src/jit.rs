@@ -177,6 +177,13 @@ pub enum FloatOp {
         b: u8,
         op: FBinOp,
     },
+    /// `reg[dst] = reg[a] % reg[b]` — float remainder (`a - trunc(a/b)*b`, JS `%`).
+    /// Emitted via `roundsd` (SSE4.1), so lowering gates on its presence.
+    Mod {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
     Move {
         dst: u8,
         src: u8,
@@ -276,6 +283,13 @@ pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
                     FBinOp::Mul => x * y,
                     FBinOp::Div => x / y,
                 };
+                pc += 1;
+            }
+            FloatOp::Mod { dst, a, b } => {
+                // Matches the emitted `a - trunc(a/b)*b`; Rust's `%` on f64 is the
+                // same IEEE remainder (sign of the dividend), as is JS `%`.
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                regs[dst as usize] = x - (x / y).trunc() * y;
                 pc += 1;
             }
             FloatOp::Move { dst, src } => {
@@ -1498,6 +1512,13 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
             Op::Sub { dst, a, b } => bin(&mut written, *dst, *a, *b, FBinOp::Sub)?,
             Op::Mul { dst, a, b } => bin(&mut written, *dst, *a, *b, FBinOp::Mul)?,
             Op::Div { dst, a, b } => bin(&mut written, *dst, *a, *b, FBinOp::Div)?,
+            // Float `%` (`a - trunc(a/b)*b`) needs `roundsd` — SSE4.1 only.
+            Op::Mod { dst, a, b } if has_sse41() => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                FloatOp::Mod { dst: d, a, b }
+            }
             Op::Move { dst, src } => {
                 let s = read(&written, *src)?;
                 let d = reg8(*dst)?;
@@ -2130,6 +2151,15 @@ impl X64Assembler {
     /// `addsd xmm0, xmm1` — used to coalesce a NaN operand into a NaN result.
     pub fn addsd_xmm0_xmm1(&mut self) {
         self.code.extend_from_slice(&[0xf2, 0x0f, 0x58, 0xc1]);
+    }
+    /// `subsd xmm1, xmm0` — `xmm1 = xmm1 - xmm0` (used by float `%`).
+    pub fn subsd_xmm1_xmm0(&mut self) {
+        self.code.extend_from_slice(&[0xf2, 0x0f, 0x5c, 0xc8]);
+    }
+    /// `movsd [rbp+disp], xmm1`.
+    pub fn movsd_mem_xmm1(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0xf2, 0x0f, 0x11, 0x8d]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
     }
     /// `jp label` — jump if parity (an unordered `ucomisd`, i.e. a NaN operand).
     pub fn jp(&mut self, label: Label) {
@@ -2803,6 +2833,20 @@ impl JitFunction {
                     a.movsd_xmm0_mem(disp(ra));
                     a.roundsd_xmm0(mode);
                     a.movsd_mem_xmm0(disp(dst));
+                }
+                FloatOp::Mod { dst, a: ra, b: rb } => {
+                    // dst = a - trunc(a/b)*b. `roundsd` (trunc) is SSE4.1. Reads
+                    // [a]/[b] before writing [dst], so dst may alias a or b.
+                    if !ok(dst) || !ok(ra) || !ok(rb) || !has_sse41() {
+                        return None;
+                    }
+                    a.movsd_xmm1_mem(disp(ra)); // xmm1 = a (preserved)
+                    a.movsd_xmm0_mem(disp(ra)); // xmm0 = a
+                    a.fbin_xmm0_mem(FBinOp::Div, disp(rb)); // xmm0 = a/b
+                    a.roundsd_xmm0(0x0b); // xmm0 = trunc(a/b)
+                    a.fbin_xmm0_mem(FBinOp::Mul, disp(rb)); // xmm0 = trunc(a/b)*b
+                    a.subsd_xmm1_xmm0(); // xmm1 = a - trunc(a/b)*b
+                    a.movsd_mem_xmm1(disp(dst));
                 }
                 FloatOp::Abs { dst, a: ra } => {
                     if !ok(dst) || !ok(ra) {
@@ -4151,6 +4195,42 @@ mod tests {
                 assert!(
                     (got - oracle(a, b)).abs() < 1e-12,
                     "jit f64 ({a},{b}): {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn float_jit_modulo() {
+        // f(a, b) = a % b — float remainder via `a - trunc(a/b)*b`.
+        let ops = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Arg { dst: 1, index: 1 },
+            FloatOp::Mod { dst: 0, a: 0, b: 1 },
+            FloatOp::Ret { src: 0 },
+        ];
+        let oracle = |a: f64, b: f64| a % b; // Rust f64 `%` is the same IEEE remainder
+        for (a, b) in [
+            (10.0, 3.0),
+            (10.5, 3.0),
+            (-10.5, 3.0),
+            (10.5, -3.0),
+            (7.0, 7.0),
+            (1.0, 0.25),
+            (5.5, 2.2),
+        ] {
+            let want = oracle(a, b);
+            assert!(
+                (eval_float(&ops, 2, &[a, b]) - want).abs() < 1e-12,
+                "oracle ({a} % {b})"
+            );
+            // The compiled path only exists on SSE4.1 hardware (roundsd); when it
+            // does, it must agree with the oracle.
+            if let Some(f) = JitFunction::compile_float(2, 2, &ops) {
+                let got = f.call_args_f64(&[a, b]);
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "jit ({a} % {b}): {got} vs {want}"
                 );
             }
         }
