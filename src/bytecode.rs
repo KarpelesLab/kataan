@@ -1004,11 +1004,143 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
     })
 }
 
+/// Zero-copy reload of a `KTBC` artifact from a memory-mapped file (`ROADMAP.md`
+/// §2.2, "mmap reload"). Re-exported when available.
+#[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+pub use mmap::load_file;
+
+/// `mmap`-based file loading via direct Linux syscalls — no libc, honoring the
+/// "no foreign code" charter (the same audited carve-out as the JIT). The
+/// mapped, read-only file bytes are decoded in place, then unmapped.
+#[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+mod mmap {
+    use super::{FnProto, deserialize};
+    use alloc::vec::Vec;
+    use std::os::unix::io::AsRawFd;
+
+    const PROT_READ: usize = 0x1;
+    const MAP_PRIVATE: usize = 0x02;
+    const SYS_MMAP: usize = 9;
+    const SYS_MUNMAP: usize = 11;
+
+    /// SAFETY: executes the `syscall` instruction with the System V syscall ABI
+    /// registers; caller supplies a valid number/arguments.
+    #[allow(unsafe_code)]
+    unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+        let ret: isize;
+        // SAFETY: a single syscall with documented inputs/clobbers.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") n as isize => ret,
+                in("rdi") a1, in("rsi") a2, in("rdx") a3,
+                in("r10") a4, in("r8") a5, in("r9") 0usize,
+                out("rcx") _, out("r11") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        ret
+    }
+
+    /// Loads and decodes a compiled program from `path` by memory-mapping the
+    /// file read-only and decoding directly over the mapped bytes — no
+    /// intermediate copy of the file contents into a buffer.
+    ///
+    /// # Errors
+    /// Returns an `io::Error` on a failed open/`mmap`, or `InvalidData` if the
+    /// mapped bytes are not a valid `KTBC` artifact.
+    pub fn load_file(path: &str) -> std::io::Result<Vec<FnProto>> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty artifact",
+            ));
+        }
+        let fd = file.as_raw_fd() as usize;
+        // mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0)
+        // SAFETY: a standard read-only file mapping; the kernel returns the
+        // mapping address or a small negative errno.
+        #[allow(unsafe_code)]
+        let raw = unsafe { syscall6(SYS_MMAP, 0, len, PROT_READ, MAP_PRIVATE, fd) };
+        if (-4095..0).contains(&raw) {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ptr = raw as *const u8;
+        // SAFETY: `ptr..ptr+len` is a valid, initialized, read-only mapping of
+        // the whole file, alive until the `munmap` below. `deserialize` only
+        // reads it and copies what it needs into owned `FnProto`s.
+        #[allow(unsafe_code)]
+        let result = {
+            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+            deserialize(bytes)
+        };
+        // SAFETY: unmapping exactly the region we mapped.
+        #[allow(unsafe_code)]
+        unsafe {
+            syscall6(SYS_MUNMAP, ptr as usize, len, 0, 0, 0);
+        }
+        result.map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, alloc::format!("{e:?}"))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::Parser;
     use crate::realm::Realm;
+
+    /// Compiling a program, serializing it, and reloading it via the `mmap` file
+    /// path reproduces the same bytecode and runs identically.
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn mmap_reload_runs_identically() {
+        let src = "function f(n){ let s=0; for(let i=1;i<=n;i++) s+=i; return s; } f(10) + 1";
+        let program = Parser::parse_program(src).expect("parse");
+        let protos = crate::nbvm::compile_program(&program).expect("compile");
+        let bytes = serialize(&protos);
+
+        // Write to a unique temp file, mmap-load it back, compare.
+        let dir = std::env::temp_dir();
+        let path = dir.join(alloc::format!(
+            "kataan_mmap_{}.ktbc",
+            std::process::id() as u64
+        ));
+        let path_str = path.to_str().unwrap();
+        std::fs::write(&path, &bytes).expect("write artifact");
+
+        let reloaded = load_file(path_str).expect("mmap load");
+        std::fs::remove_file(&path).ok();
+
+        // The mmap-loaded program is byte-identical to the original.
+        assert_eq!(
+            serialize(&reloaded),
+            bytes,
+            "mmap reload not byte-identical"
+        );
+        // ...and runs to the same result (sum 1..=10 = 55, +1 = 56).
+        let mut realm = Realm::new();
+        let (value, _out) =
+            crate::nbvm::run_program_capturing(&mut realm, &reloaded, 0, &[]).expect("run");
+        assert_eq!(realm.to_display_string(value), "56");
+    }
+
+    /// `load_file` rejects a non-artifact (bad magic) without UB.
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn mmap_reload_rejects_garbage() {
+        let path = std::env::temp_dir().join(alloc::format!(
+            "kataan_mmap_bad_{}.ktbc",
+            std::process::id() as u64
+        ));
+        std::fs::write(&path, b"not a ktbc file at all").unwrap();
+        let r = load_file(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+        assert!(r.is_err(), "garbage must be rejected");
+    }
 
     /// Compiles `src`, round-trips its bytecode through the codec, runs the
     /// reloaded program, and returns its completion display string.
