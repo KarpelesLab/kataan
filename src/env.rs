@@ -107,6 +107,23 @@ impl Scope {
         }
     }
 
+    /// This frame's own `(name, value, is_const)` bindings (not the parent
+    /// chain) — for snapshotting a closure's captured environment.
+    #[must_use]
+    pub fn local_bindings(&self) -> alloc::vec::Vec<(String, NanBox, bool)> {
+        let data = self.0.borrow();
+        data.vars
+            .iter()
+            .map(|(k, v)| (k.clone(), *v, data.consts.contains(k)))
+            .collect()
+    }
+
+    /// This scope's enclosing scope, if any.
+    #[must_use]
+    pub fn parent(&self) -> Option<Scope> {
+        self.0.borrow().parent.clone()
+    }
+
     /// Visits every heap [`Handle`] reachable from this scope chain's bindings
     /// (for GC tracing of a closure's captured values).
     pub fn for_each_handle(&self, visit: &mut dyn FnMut(Handle)) {
