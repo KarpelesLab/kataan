@@ -92,6 +92,12 @@ pub enum SnapCell {
         /// the stateful `lastIndex` search position
         last_index: usize,
     },
+    /// a `Symbol`: its description (identity is re-minted on restore but stays
+    /// consistent within the snapshot, since the cell is interned once).
+    Symbol {
+        /// the symbol's description string
+        description: String,
+    },
 }
 
 /// One captured scope frame: its `(name, value, is_const)` bindings.
@@ -143,6 +149,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             || realm.promise_state(*r).is_some()
             || realm.proxy_at(*r).is_some()
             || realm.regexp_at(*r).is_some()
+            || realm.symbol_at(*r).is_some()
             || realm.array_elements(*r).is_some()
             || realm.object_keys(*r).is_some();
         if serializable {
@@ -221,6 +228,8 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                 flags,
                 last_index: realm.regex_last_index(h),
             }
+        } else if let Some((description, _id)) = realm.symbol_at(h) {
+            SnapCell::Symbol { description }
         } else if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
             let vals = elems
                 .iter()
@@ -326,6 +335,7 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 realm.set_regex_last_index(h, *last_index);
                 (h, None)
             }
+            SnapCell::Symbol { description } => (realm.new_symbol(description), None),
         };
         handles.push(h);
         fn_chains.push(chain);
@@ -401,8 +411,8 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                     realm.proxy_set_targets(*h, Handle::from_raw(t), Handle::from_raw(hd));
                 }
             }
-            // A `RegExp` is fully materialized in pass 1 (no references to fill).
-            SnapCell::RegExp { .. } => {}
+            // A `RegExp`/`Symbol` is fully materialized in pass 1 (no refs to fill).
+            SnapCell::RegExp { .. } | SnapCell::Symbol { .. } => {}
         }
     }
 
@@ -537,6 +547,10 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                 w_str(source, &mut out);
                 w_str(flags, &mut out);
                 w_u32(*last_index as u32, &mut out);
+            }
+            SnapCell::Symbol { description } => {
+                out.push(10);
+                w_str(description, &mut out);
             }
         }
     }
@@ -673,6 +687,9 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                     last_index,
                 }
             }
+            10 => SnapCell::Symbol {
+                description: r.string()?,
+            },
             t => return Err(SnapError::BadTag(t)),
         };
         cells.push(cell);
@@ -1216,6 +1233,34 @@ mod tests {
             Some((String::from("\\d+"), String::from("gi")))
         );
         assert_eq!(realm2.regex_last_index(re2), 7, "lastIndex survives");
+    }
+
+    #[test]
+    fn snapshots_symbols() {
+        let mut realm = Realm::new();
+        // One symbol referenced from two array slots — its in-snapshot identity
+        // must survive (both slots reload to the *same* restored symbol).
+        let sym = realm.new_symbol("tag");
+        let arr = realm.new_array(alloc::vec![
+            NanBox::handle(sym.to_raw()),
+            NanBox::handle(sym.to_raw()),
+        ]);
+
+        let snap = capture(&realm, &[arr]);
+        let bytes = serialize(&snap);
+        let reloaded = deserialize(&bytes).expect("deserialize");
+        assert_eq!(reloaded, snap);
+        let mut realm2 = Realm::new();
+        let a2 = restore(&mut realm2, &reloaded)[0];
+
+        let e0 = realm2.get_element(a2, 0).as_handle().unwrap();
+        let e1 = realm2.get_element(a2, 1).as_handle().unwrap();
+        assert_eq!(e0, e1, "shared symbol identity preserved");
+        assert_eq!(
+            realm2.symbol_at(Handle::from_raw(e0)).map(|(d, _)| d),
+            Some(String::from("tag")),
+            "description round-trips"
+        );
     }
 
     #[test]
