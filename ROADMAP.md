@@ -151,11 +151,12 @@ moving GC. "Complete" means *any* live heap snapshots, reloads zero-copy, and
   kind, byte offset, backing buffer identity), generator/async suspension state
   (depends on Track 3 lazy frames), error stacks, `Map`/`Set` ordering already
   covered — audit every `Cell` variant for completeness.
-- **End-to-end restore-and-execute.** A test (and supported API) that runs a
-  program, snapshots the initialized heap, reloads it into a fresh runtime holding
-  the same code, and **calls a restored closure** — proving restored state is
-  executable, not just structurally equal. Requires a runtime entry that binds a
-  restored realm + the matching function table and invokes a value.
+- **End-to-end restore-and-execute.** *In place:* a restored closure now runs and
+  carries its snapshotted captured state, independent of the original
+  (`snapshot_restores_an_executable_closure`) — restored state is executable, not
+  just structurally equal. *Remaining:* a supported public/C API that binds a
+  restored realm + the matching function table into a **fresh runtime** and
+  invokes a value (the cross-runtime reload path, vs the same-runtime test today).
 - **The shared, versioned, mmap-able artifact store (code-cache, §6):**
   content-addressed by source hash + host tag; lazy per-function bodies faulted in
   on first call; **module-local atom remap** on load; IC slots load reset; the

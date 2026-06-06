@@ -9976,6 +9976,62 @@ mod tests {
         assert_eq!(run("f(10); function f(n) { return n; } f(10)"), "10");
     }
 
+    /// End-to-end D′: a live closure's captured state survives capture →
+    /// serialize → deserialize → restore *and remains executable* — the restored
+    /// closure runs, carries the snapshotted captured value, and is independent of
+    /// the original. (Same interpreter, so its function table already holds the
+    /// bodies the snapshot's `func_id`s refer to.)
+    #[test]
+    fn snapshot_restores_an_executable_closure() {
+        use crate::snapshot::{capture, deserialize, restore, serialize};
+
+        let program = Parser::parse_program(
+            "function counter(){ var n = 0; return function(){ return ++n; }; } counter()",
+        )
+        .expect("parse");
+        let mut interp = Interp::new();
+        let f = interp.run(&program).expect("exec");
+        let fh = Handle::from_raw(f.as_handle().expect("closure handle"));
+
+        // Advance the original to n = 2, then snapshot it there.
+        assert_eq!(interp.call(f, &[]).unwrap().as_number(), Some(1.0));
+        assert_eq!(interp.call(f, &[]).unwrap().as_number(), Some(2.0));
+        let snap = capture(&interp.realm, &[fh]);
+
+        // Full on-disk round-trip.
+        let snap = deserialize(&serialize(&snap)).expect("deserialize");
+
+        // Restore into the same runtime (whose function table still has the body).
+        let restored = restore(&mut interp.realm, &snap);
+        let f2 = NanBox::handle(restored[0].to_raw());
+
+        // The original kept counting (n was 2 → 3); the restored closure starts
+        // from the *snapshotted* n = 2 → 3, proving it both executes and carries
+        // the captured value.
+        assert_eq!(
+            interp.call(f, &[]).unwrap().as_number(),
+            Some(3.0),
+            "original continues"
+        );
+        assert_eq!(
+            interp.call(f2, &[]).unwrap().as_number(),
+            Some(3.0),
+            "restored from snapshot"
+        );
+
+        // Independence: advancing the restored copy does not move the original.
+        assert_eq!(
+            interp.call(f2, &[]).unwrap().as_number(),
+            Some(4.0),
+            "restored advances"
+        );
+        assert_eq!(
+            interp.call(f, &[]).unwrap().as_number(),
+            Some(4.0),
+            "original unaffected by restore"
+        );
+    }
+
     #[test]
     fn closures_capture_their_scope() {
         // A returned inner function still sees the enclosing variable.
