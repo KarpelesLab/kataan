@@ -7,29 +7,44 @@ tri-modal model proven out in the sibling projects
 [`purecrypto`](https://github.com/KarpelesLab/purecrypto) (cryptography) and
 [`rsurl`](https://github.com/KarpelesLab/rsurl) (HTTP/curl).
 
-> **Status: early but running (Phases C–F).** The lexer and the full
-> ECMAScript parser are complete, and a tree-walking interpreter executes real
-> programs — functions/closures, classes with inheritance, objects/arrays,
-> destructuring, getters/setters, `Map`/`Set`, error handling, an in-house
-> `RegExp` engine, `Date`, `Promise` with a microtask queue, and a basic event
-> loop (`setTimeout`), plus a substantial standard library (Math, JSON,
-> Object/Array/String/Number). A **register bytecode VM** is now the primary
-> execution path (`kataan run` and the C ABI), compiling nearly all of the
-> common language directly — every operator (incl. `++`/`--`/`typeof`/`delete`/
-> spread), objects/arrays, method calls with `call`/`apply`/`bind`, `new`, all
-> loops + `for-of`/`for-in`/`switch`/`try`-`catch`-`finally`,
-> functions/recursion, **closures** (incl. recursive and mutually-recursive),
-> destructuring (incl. rest), rest/spread arguments, **classes** with
-> `extends`/`super` inheritance and getters/setters, and **generators** +
-> **`async`/`await`** (on the VM's suspendable frames) — falling back to the
-> tree-walker only for the few constructs it doesn't yet compile (`yield*`,
-> async generators, …). Compiled
-> bytecode can be serialized, reloaded, and run without the source, and a
-> dual-path conformance suite checks both execution paths agree. Kataan works as
-> a CLI/REPL, a Rust library, and a C library (`kt_eval`). The
-> performance-oriented object model (NaN-boxing, hidden classes, GC), JIT tiers,
-> the full host runtime, and the
-> WASM engine are being built out per the [roadmap](ROADMAP.md).
+> **Status: running and broadly conformant; advanced tiers in active build-out.**
+> The lexer and the full ECMAScript parser are complete, and **two execution
+> engines** run real programs and are checked to agree on every test:
+>
+> - a **tree-walking interpreter** (the default / corpus engine), and
+> - a **register bytecode VM** (the primary path for `kataan run` and the C ABI),
+>   compiling nearly all of the common language directly — every operator,
+>   objects/arrays, method calls with `call`/`apply`/`bind`, `new`/`new.target`,
+>   all loops + `for-of`/`for-in`/`switch`/`try`-`catch`-`finally`,
+>   closures (incl. mutual recursion), destructuring, rest/spread, **classes**
+>   with `extends`/`super` and getters/setters, generators (incl. `yield*` and
+>   `.throw()`), and `async`/`await` — falling back to the tree-walker for the
+>   handful of constructs it doesn't yet compile.
+>
+> A **dual-path Test262-style conformance corpus (510/510) passes on both
+> engines**, covering closures, classes/inheritance, optional chaining, the
+> iterator protocol, `Map`/`Set`/`WeakMap`, `Symbol`, `BigInt`, `Promise` +
+> async/await, `Proxy`/`Reflect`, typed arrays, `Date`, an in-house `RegExp`,
+> and a large standard library (Math, JSON, Object/Array/String/Number). Compiled
+> bytecode can be serialized, reloaded, and run without the source.
+>
+> Three advanced tiers are real and tested, though each has named work remaining:
+>
+> - a **machine-code JIT** (x86-64 / Linux, behind `jit`) with an optimizing
+>   integer path (four-pass optimizer + register allocator) and a float path
+>   covering `+ - * / %`, comparisons, control flow, and the SSE-expressible
+>   `Math` intrinsics (`sqrt`/`abs`/`min`/`max`/`floor`/`ceil`/`trunc`), emitting
+>   into W^X memory via raw syscalls; object/string ops stay interpreted;
+> - a pure-Rust, `no_std` **WebAssembly engine** — full MVP plus sign-extension,
+>   saturating conversion, bulk-memory, multi-value, and typed structured
+>   control — driven by a `.wast`/WAT spec harness (a spec-derived corpus, not
+>   yet the full upstream suite);
+> - a **zero-copy "D′" snapshot tier** atop the moving GC: a verified codec that
+>   `mmap`-reloads a heap (eleven reference cell kinds, cross-kind cycles,
+>   insertion-order-preserving) and runs it in place.
+>
+> Kataan works as a CLI/REPL, a Rust library, and a C library (`kt_eval`). See
+> the [roadmap](ROADMAP.md) for the full design and milestone plan.
 
 ## Why
 
@@ -143,7 +158,7 @@ assert_eq!(tokens.last().unwrap().kind, TokenKind::Eof);
 | `host`    |   ✓     | Host runtime: event loop, timers, console, encoding, URL, streams. |
 | `fetch`   |         | `fetch` / Node `http(s)` over `rsurl`.                             |
 | `crypto`  |         | `crypto.getRandomValues` / WebCrypto over `purecrypto`.            |
-| `jit`     |         | Baseline + optimizing JIT tiers (later phases).                    |
+| `jit`     |         | Machine-code JIT (x86-64/Linux): optimizing integer + float paths. |
 | `ffi`     |         | The C ABI (the only place broad `unsafe` is allowed).             |
 | `cli`     |   ✓     | The `kataan` command-line tool.                                   |
 
