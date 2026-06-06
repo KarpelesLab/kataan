@@ -12,8 +12,8 @@
 //! handles cycles correctly.
 //!
 //! Covers the value cells (objects, arrays, strings, `Date`, `BigInt`),
-//! functions/closures (code id + captured scope chain), and `Map`/`Set`
-//! collections, plus the primitive `NanBox` values; promises/proxies are a later
+//! functions/closures (code id + captured scope chain), `Map`/`Set` collections,
+//! and settled `Promise`s, plus the primitive `NanBox` values; proxies are a later
 //! extension. Pure, safe `alloc`-only Rust.
 
 use crate::heap::Handle;
@@ -68,6 +68,14 @@ pub enum SnapCell {
         /// the entries, in insertion order
         entries: Vec<(SnapVal, SnapVal)>,
     },
+    /// a `Promise`: its settlement status (0 pending, 1 fulfilled, 2 rejected) and
+    /// value/reason. Pending reactions are runtime-coupled and not captured.
+    Promise {
+        /// 0 = pending, 1 = fulfilled, 2 = rejected
+        status: u8,
+        /// the fulfillment value or rejection reason
+        value: SnapVal,
+    },
 }
 
 /// One captured scope frame: its `(name, value, is_const)` bindings.
@@ -116,6 +124,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             || realm.bigint_at(*r).is_some()
             || realm.function_at(*r).is_some()
             || realm.collection_is_set(*r).is_some()
+            || realm.promise_state(*r).is_some()
             || realm.array_elements(*r).is_some()
             || realm.object_keys(*r).is_some();
         if serializable {
@@ -162,6 +171,18 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                 })
                 .collect();
             SnapCell::Collection { is_set, entries }
+        } else if let Some(state) = realm.promise_state(h) {
+            let (status, value) = {
+                let s = state.borrow();
+                let status = match s.status {
+                    crate::cell::PromiseStatus::Pending => 0u8,
+                    crate::cell::PromiseStatus::Fulfilled => 1,
+                    crate::cell::PromiseStatus::Rejected => 2,
+                };
+                (status, s.value)
+            };
+            let value = snap_val(value, &mut index_of, &mut order, &mut intern);
+            SnapCell::Promise { status, value }
         } else if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
             let vals = elems
                 .iter()
@@ -251,6 +272,7 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 (realm.new_function(*func_id, innermost), Some(chain))
             }
             SnapCell::Collection { is_set, .. } => (realm.new_collection(*is_set), None),
+            SnapCell::Promise { .. } => (realm.new_promise(), None),
         };
         handles.push(h);
         fn_chains.push(chain);
@@ -304,6 +326,18 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 for (k, v) in entries {
                     let (key, val) = (resolve(k, &handles), resolve(v, &handles));
                     realm.collection_set(*h, key, val);
+                }
+            }
+            SnapCell::Promise { status, value } => {
+                let val = resolve(value, &handles);
+                if let Some(state) = realm.promise_state(*h) {
+                    let mut s = state.borrow_mut();
+                    s.status = match status {
+                        1 => crate::cell::PromiseStatus::Fulfilled,
+                        2 => crate::cell::PromiseStatus::Rejected,
+                        _ => crate::cell::PromiseStatus::Pending,
+                    };
+                    s.value = val;
                 }
             }
         }
@@ -421,6 +455,11 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                     w_val(v, &mut out);
                 }
             }
+            SnapCell::Promise { status, value } => {
+                out.push(7);
+                out.push(*status);
+                w_val(value, &mut out);
+            }
         }
     }
     out
@@ -535,6 +574,11 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                     entries.push((k, v));
                 }
                 SnapCell::Collection { is_set, entries }
+            }
+            7 => {
+                let status = r.u8()?;
+                let value = r.val()?;
+                SnapCell::Promise { status, value }
             }
             t => return Err(SnapError::BadTag(t)),
         };
@@ -937,6 +981,52 @@ mod tests {
             realm2.string_value(Handle::from_raw(obj_tag.as_handle().unwrap())),
             Some(String::from("cap"))
         );
+    }
+
+    #[test]
+    fn snapshots_settled_promises() {
+        let mut realm = Realm::new();
+        // A fulfilled promise (value = an object) and a rejected one (reason = 42).
+        let fulfilled = realm.new_promise();
+        let payload = realm.new_object();
+        let tag = NanBox::handle(realm.new_string("ok").to_raw());
+        realm.set_property(payload, "tag", tag);
+        {
+            let st = realm.promise_state(fulfilled).unwrap();
+            let mut s = st.borrow_mut();
+            s.status = crate::cell::PromiseStatus::Fulfilled;
+            s.value = NanBox::handle(payload.to_raw());
+        }
+        let rejected = realm.new_promise();
+        {
+            let st = realm.promise_state(rejected).unwrap();
+            let mut s = st.borrow_mut();
+            s.status = crate::cell::PromiseStatus::Rejected;
+            s.value = NanBox::number(42.0);
+        }
+
+        let snap = capture(&realm, &[fulfilled, rejected]);
+        let bytes = serialize(&snap);
+        let reloaded = deserialize(&bytes).expect("deserialize");
+        assert_eq!(reloaded, snap);
+        let mut realm2 = Realm::new();
+        let roots = restore(&mut realm2, &reloaded);
+
+        // The fulfilled promise's status + object value survive.
+        let st = realm2.promise_state(roots[0]).unwrap();
+        let s = st.borrow();
+        assert_eq!(s.status, crate::cell::PromiseStatus::Fulfilled);
+        let obj = Handle::from_raw(s.value.as_handle().unwrap());
+        let tag2 = realm2.get_property(obj, "tag").unwrap();
+        assert_eq!(
+            realm2.string_value(Handle::from_raw(tag2.as_handle().unwrap())),
+            Some(String::from("ok"))
+        );
+        // The rejected promise's reason survives.
+        let st2 = realm2.promise_state(roots[1]).unwrap();
+        let s2 = st2.borrow();
+        assert_eq!(s2.status, crate::cell::PromiseStatus::Rejected);
+        assert_eq!(s2.value, NanBox::number(42.0));
     }
 
     #[test]
