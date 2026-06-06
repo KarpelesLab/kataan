@@ -901,11 +901,22 @@ impl<'a> Interp<'a> {
                 value
             }
             N_OBJECT_KEYS => {
-                let keys = arg(0)
+                let target = arg(0)
                     .as_handle()
-                    .map(|raw| self.proxy_key_target(Handle::from_raw(raw)))
-                    .and_then(|h| self.realm.object_keys(h))
-                    .unwrap_or_default();
+                    .map(|raw| self.proxy_key_target(Handle::from_raw(raw)));
+                let mut keys: Vec<alloc::string::String> = Vec::new();
+                if let Some(h) = target {
+                    // An array's own enumerable keys are its integer indices (in
+                    // ascending order) — stored as elements, not named properties.
+                    if let Some(len) = self.realm.array_length(h) {
+                        for i in 0..len {
+                            keys.push(alloc::format!("{i}"));
+                        }
+                    }
+                    if let Some(named) = self.realm.object_keys(h) {
+                        keys.extend(named);
+                    }
+                }
                 let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_str(k)).collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
@@ -1224,6 +1235,10 @@ impl<'a> Interp<'a> {
                 let mut vals = Vec::new();
                 if let Some(raw) = arg(0).as_handle() {
                     let h = self.proxy_key_target(Handle::from_raw(raw));
+                    // Array index values come from element access (ascending) first.
+                    if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
+                        vals.extend(elems);
+                    }
                     for k in self.realm.object_keys(h).unwrap_or_default() {
                         vals.push(
                             self.realm
@@ -1266,19 +1281,30 @@ impl<'a> Interp<'a> {
                 target
             }
             N_OBJECT_ENTRIES => {
-                let mut pairs = Vec::new();
+                let mut entries: Vec<(alloc::string::String, NanBox)> = Vec::new();
                 if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
                     let h = self.proxy_key_target(h);
+                    // Array index entries (ascending) before named ones.
+                    if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
+                        for (i, v) in elems.into_iter().enumerate() {
+                            entries.push((alloc::format!("{i}"), v));
+                        }
+                    }
                     for k in self.realm.object_keys(h).unwrap_or_default() {
                         let v = self
                             .realm
                             .get_property(h, &k)
                             .unwrap_or(NanBox::undefined());
-                        let key = self.new_str(&k);
-                        let pair = self.realm.new_array(alloc::vec![key, v]);
-                        pairs.push(NanBox::handle(pair.to_raw()));
+                        entries.push((k, v));
                     }
                 }
+                let pairs: Vec<NanBox> = entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let key = self.new_str(&k);
+                        NanBox::handle(self.realm.new_array(alloc::vec![key, v]).to_raw())
+                    })
+                    .collect();
                 NanBox::handle(self.realm.new_array(pairs).to_raw())
             }
             N_ARRAY_FROM => {

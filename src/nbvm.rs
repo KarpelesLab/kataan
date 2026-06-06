@@ -2212,22 +2212,31 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                 .first()
                 .and_then(|a| a.as_handle())
                 .map(Handle::from_raw);
-            let keys = h.and_then(|h| ctx.realm.object_keys(h)).unwrap_or_default();
-            let mut out = Vec::with_capacity(keys.len());
-            for k in keys {
+            // Build `(key, value)` pairs. An array's own enumerable keys are its
+            // integer indices (stored as elements, ascending) before any named
+            // properties — and the index values come from element access.
+            let mut pairs: Vec<(String, NanBox)> = Vec::new();
+            if let Some(h) = h {
+                if let Some(elems) = ctx.realm.array_elements(h).map(<[_]>::to_vec) {
+                    for (i, v) in elems.into_iter().enumerate() {
+                        pairs.push((alloc::format!("{i}"), v));
+                    }
+                }
+                if let Some(named) = ctx.realm.object_keys(h) {
+                    for k in named {
+                        let v = ctx.realm.get_property(h, &k).unwrap_or(NanBox::undefined());
+                        pairs.push((k, v));
+                    }
+                }
+            }
+            let mut out = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
                 let item = match native {
                     NB_OBJECT_KEYS => NanBox::handle(ctx.realm.new_string(&k).to_raw()),
-                    NB_OBJECT_VALUES => ctx
-                        .realm
-                        .get_property(h.unwrap(), &k)
-                        .unwrap_or(NanBox::undefined()),
+                    NB_OBJECT_VALUES => v,
                     _ => {
                         let key = NanBox::handle(ctx.realm.new_string(&k).to_raw());
-                        let val = ctx
-                            .realm
-                            .get_property(h.unwrap(), &k)
-                            .unwrap_or(NanBox::undefined());
-                        NanBox::handle(ctx.realm.new_array(alloc::vec![key, val]).to_raw())
+                        NanBox::handle(ctx.realm.new_array(alloc::vec![key, v]).to_raw())
                     }
                 };
                 out.push(item);
