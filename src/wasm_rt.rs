@@ -141,6 +141,9 @@ pub struct Module {
     /// Imported functions, occupying the low function indices `0..n_imported_funcs`
     /// (module name, field name, type index). The host supplies their behavior.
     func_imports: Vec<(alloc::string::String, alloc::string::String, u32)>,
+    /// Imported globals, occupying the low global indices before module-defined
+    /// globals (module name, field name, type, mutable). The host supplies values.
+    global_imports: Vec<(alloc::string::String, alloc::string::String, ValType, bool)>,
 }
 
 /// A host function backing an `import` — receives the WASM call's arguments and
@@ -426,8 +429,11 @@ impl Module {
                     }
                 }
                 0x03 => {
-                    s.byte()?; // valtype
-                    s.byte()?; // mutability
+                    // A global import: it occupies the next global index, before
+                    // any module-defined global.
+                    let vt = val_type(s.byte()?)?;
+                    let mutable = s.byte()? == 1;
+                    m.global_imports.push((module, field, vt, mutable));
                 }
                 _ => return Err(WasmRtError("unsupported import kind")),
             }
@@ -446,6 +452,21 @@ impl Module {
     /// The number of imported functions (which occupy the low function indices).
     fn n_imported_funcs(&self) -> usize {
         self.func_imports.len()
+    }
+
+    /// The number of imported globals (which occupy the low global indices).
+    fn n_imported_globals(&self) -> usize {
+        self.global_imports.len()
+    }
+
+    /// Whether global `index` (imports + defined) is mutable.
+    fn global_mutable(&self, index: usize) -> Option<bool> {
+        let n = self.n_imported_globals();
+        if index < n {
+            self.global_imports.get(index).map(|(_, _, _, m)| *m)
+        } else {
+            self.globals.get(index - n).map(|(_, m)| *m)
+        }
     }
 
     /// The signature of function `index` (imports included).
@@ -644,7 +665,14 @@ impl Module {
                 .ok_or(WasmRtError("data segment out of bounds"))?;
             mem[start..end].copy_from_slice(bytes);
         }
-        let globals = self.globals.iter().map(|(v, _)| *v).collect();
+        // Global index space: imported globals (zero-initialized; the host may
+        // override them) first, then module-defined globals.
+        let mut globals: Vec<Val> = self
+            .global_imports
+            .iter()
+            .map(|(_, _, t, _)| zero_val(*t))
+            .collect();
+        globals.extend(self.globals.iter().map(|(v, _)| *v));
         Ok(Store {
             mem,
             globals,
@@ -811,7 +839,7 @@ impl Module {
                 }
                 0x24 => {
                     let i = r.u32()? as usize;
-                    if !self.globals.get(i).is_some_and(|(_, m)| *m) {
+                    if !self.global_mutable(i).unwrap_or(false) {
                         return Err(WasmRtError("set of immutable/undefined global"));
                     }
                     let v = pop!();
@@ -1156,11 +1184,32 @@ impl<'m> Instance<'m> {
         module: &'m Module,
         host_funcs: Vec<HostFunc>,
     ) -> Result<Self, WasmRtError> {
-        if host_funcs.len() != module.n_imported_funcs() {
+        Self::instantiate(module, host_funcs, Vec::new())
+    }
+
+    /// Instantiates `module` binding both function imports (`host_funcs`) and
+    /// **global imports** (`import_globals`, in declaration order — the values
+    /// the host supplies for the module's imported globals).
+    ///
+    /// # Errors
+    /// `WasmRtError("import count mismatch")` if either list's length doesn't
+    /// match the module's imports, or a data segment is out of bounds.
+    pub fn instantiate(
+        module: &'m Module,
+        host_funcs: Vec<HostFunc>,
+        import_globals: Vec<Val>,
+    ) -> Result<Self, WasmRtError> {
+        if host_funcs.len() != module.n_imported_funcs()
+            || import_globals.len() != module.n_imported_globals()
+        {
             return Err(WasmRtError("import count mismatch"));
         }
         let mut store = module.new_store()?;
         store.host_funcs = host_funcs;
+        // Imported globals occupy the first slots of the global space.
+        for (i, v) in import_globals.into_iter().enumerate() {
+            store.globals[i] = v;
+        }
         Ok(Self { module, store })
     }
 
@@ -1892,6 +1941,45 @@ mod tests {
 
         // A missing import binding is rejected at instantiation.
         assert!(Instance::with_imports(&module, vec![]).is_err());
+    }
+
+    #[test]
+    fn imported_global_supplied_by_host() {
+        // (import "env" "base" (global i32))   ;; global 0, imported
+        // (global (mut i32) (i32.const 100))    ;; global 1, defined
+        // (func (export "sum") (result i32) global.get 0 global.get 1 i32.add)
+        let body: Vec<u8> = vec![0x00, 0x23, 0x00, 0x23, 0x01, 0x6a, 0x0b];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f]); // type ()->i32
+        // import: "env"."base" global i32 (immutable)
+        m.extend([
+            0x02, 0x0d, 0x01, 0x03, b'e', b'n', b'v', 0x04, b'b', b'a', b's', b'e', 0x03, 0x7f,
+            0x00,
+        ]);
+        m.extend([0x03, 0x02, 0x01, 0x00]); // func 0: type 0
+        // defined global1 = 100 (mut). i32.const 100 needs 2 LEB bytes (0x64 alone
+        // is -28: the 0x40 sign bit is set).
+        m.extend([0x06, 0x07, 0x01, 0x7f, 0x01, 0x41, 0xe4, 0x00, 0x0b]);
+        m.extend([0x07, 0x07, 0x01, 0x03, b's', b'u', b'm', 0x00, 0x00]); // export "sum"
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+
+        let module = Module::decode(&m).expect("decode imported-global module");
+        // Supply the imported global value; sum = base + 100.
+        let mut inst = Instance::instantiate(&module, alloc::vec![], alloc::vec![Val::I32(7)])
+            .expect("instantiate with imported global");
+        assert_eq!(inst.call_export("sum", &[]).unwrap(), vec![Val::I32(107)]);
+
+        // A different supplied value flows through.
+        let mut inst2 =
+            Instance::instantiate(&module, alloc::vec![], alloc::vec![Val::I32(-50)]).unwrap();
+        assert_eq!(inst2.call_export("sum", &[]).unwrap(), vec![Val::I32(50)]);
+
+        // Omitting the imported global value is rejected.
+        assert!(Instance::new(&module).is_err());
     }
 
     #[test]
