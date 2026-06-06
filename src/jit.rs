@@ -70,6 +70,19 @@ pub fn eval_arith(ops: &[ArithOp], arg: i64) -> i64 {
     ops.iter().fold(arg, |acc, op| op.eval(acc))
 }
 
+/// The reference for [`JitFunction::compile_sum_1_to_n`]: `sum(1..=n)` for
+/// `n >= 0`, else `0`.
+#[must_use]
+pub fn eval_sum_1_to_n(n: i64) -> i64 {
+    let mut acc = 0i64;
+    let mut i = n;
+    while i > 0 {
+        acc = acc.wrapping_add(i);
+        i -= 1;
+    }
+    acc
+}
+
 /// A minimal x86-64 machine-code emitter (System V AMD64 ABI).
 ///
 /// Only the instructions the arithmetic IR needs are encoded. The accumulator
@@ -78,7 +91,15 @@ pub fn eval_arith(ops: &[ArithOp], arg: i64) -> i64 {
 #[derive(Default)]
 pub struct X64Assembler {
     code: Vec<u8>,
+    /// Per-label byte offset (`usize::MAX` until [`bind`](Self::bind)).
+    labels: Vec<usize>,
+    /// Pending `rel32` jump fixups: `(operand offset in `code`, target label)`.
+    fixups: Vec<(usize, usize)>,
 }
+
+/// A branch target in an [`X64Assembler`], resolved by [`X64Assembler::bind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Label(usize);
 
 impl X64Assembler {
     /// A new, empty assembler.
@@ -87,10 +108,98 @@ impl X64Assembler {
         Self::default()
     }
 
-    /// The emitted machine code.
+    /// The emitted machine code (call [`finish`](Self::finish) first to resolve
+    /// jumps).
     #[must_use]
     pub fn code(&self) -> &[u8] {
         &self.code
+    }
+
+    /// Allocates a fresh, unbound label.
+    pub fn new_label(&mut self) -> Label {
+        self.labels.push(usize::MAX);
+        Label(self.labels.len() - 1)
+    }
+
+    /// Binds `label` to the current emission point.
+    pub fn bind(&mut self, label: Label) {
+        self.labels[label.0] = self.code.len();
+    }
+
+    /// Resolves every recorded `rel32` jump fixup; call once after emission.
+    /// Returns the finished machine code.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<u8> {
+        for (at, label) in core::mem::take(&mut self.fixups) {
+            let target = self.labels[label];
+            debug_assert_ne!(target, usize::MAX, "unbound label in jump");
+            // `rel32` is relative to the instruction *after* the 4-byte operand.
+            let rel = (target as i64) - (at as i64 + 4);
+            let bytes = (rel as i32).to_le_bytes();
+            self.code[at..at + 4].copy_from_slice(&bytes);
+        }
+        self.code
+    }
+
+    /// Emits a `rel32` jump operand placeholder targeting `label`.
+    fn emit_rel32(&mut self, label: Label) {
+        self.fixups.push((self.code.len(), label.0));
+        self.code.extend_from_slice(&[0, 0, 0, 0]);
+    }
+
+    /// `cmp rax, imm32`.
+    pub fn cmp_rax_imm(&mut self, imm: i32) {
+        self.code.extend_from_slice(&[0x48, 0x3d]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `test rcx, rcx` (sets flags from `rcx`).
+    pub fn test_rcx_rcx(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x85, 0xc9]);
+    }
+
+    /// `mov rcx, rdi` — copy the first argument into the loop counter.
+    pub fn mov_rcx_rdi(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x89, 0xf9]);
+    }
+
+    /// `xor rax, rax` (`rax = 0`).
+    pub fn zero_rax(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x31, 0xc0]);
+    }
+
+    /// `add rax, rcx`.
+    pub fn add_rax_rcx(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x01, 0xc8]);
+    }
+
+    /// `dec rcx`.
+    pub fn dec_rcx(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0xff, 0xc9]);
+    }
+
+    /// `jmp label` (32-bit relative).
+    pub fn jmp(&mut self, label: Label) {
+        self.code.push(0xe9);
+        self.emit_rel32(label);
+    }
+
+    /// `jle label` — jump if signed `<=` (after a `cmp`/`test`).
+    pub fn jle(&mut self, label: Label) {
+        self.code.extend_from_slice(&[0x0f, 0x8e]);
+        self.emit_rel32(label);
+    }
+
+    /// `jg label` — jump if signed `>`.
+    pub fn jg(&mut self, label: Label) {
+        self.code.extend_from_slice(&[0x0f, 0x8f]);
+        self.emit_rel32(label);
+    }
+
+    /// `je label` — jump if equal.
+    pub fn je(&mut self, label: Label) {
+        self.code.extend_from_slice(&[0x0f, 0x84]);
+        self.emit_rel32(label);
     }
 
     /// `mov rax, rdi` — seed the accumulator with the first argument.
@@ -209,7 +318,7 @@ impl JitFunction {
             }
         }
         a.ret();
-        Self::from_code(a.code())
+        Self::from_code(&a.finish())
     }
 
     /// Compiles a native binary op `fn(i64, i64) -> i64` (`a <op> b`).
@@ -223,7 +332,41 @@ impl JitFunction {
             BinOp::Mul => a.imul_rax_rsi(),
         }
         a.ret();
-        Self::from_code(a.code())
+        Self::from_code(&a.finish())
+    }
+
+    /// Compiles a native counted loop: `fn(n) -> sum(1..=n)` for `n >= 0`, else
+    /// `0`. Demonstrates real native control flow (a backward branch). The
+    /// emitted code is:
+    ///
+    /// ```text
+    ///   xor   rax, rax        ; acc = 0
+    ///   mov   rcx, rdi        ; i   = n
+    /// loop:
+    ///   test  rcx, rcx
+    ///   jle   done            ; while i > 0
+    ///   add   rax, rcx        ; acc += i
+    ///   dec   rcx             ; i--
+    ///   jmp   loop
+    /// done:
+    ///   ret
+    /// ```
+    #[must_use]
+    pub fn compile_sum_1_to_n() -> Option<Self> {
+        let mut a = X64Assembler::new();
+        let loop_top = a.new_label();
+        let done = a.new_label();
+        a.zero_rax();
+        a.mov_rcx_rdi();
+        a.bind(loop_top);
+        a.test_rcx_rcx();
+        a.jle(done);
+        a.add_rax_rcx();
+        a.dec_rcx();
+        a.jmp(loop_top);
+        a.bind(done);
+        a.ret();
+        Self::from_code(&a.finish())
     }
 
     /// Calls the compiled function with one argument.
@@ -466,6 +609,42 @@ mod tests {
         assert_eq!(sub.call2(50, 8), 42);
         assert_eq!(mul.call2(6, 7), 42);
         assert_eq!(mul.call2(-3, 4), -12);
+    }
+
+    #[test]
+    fn native_loop_sum() {
+        if !available() {
+            return;
+        }
+        let f = JitFunction::compile_sum_1_to_n().expect("jit available");
+        for n in [0i64, 1, 2, 5, 10, 100, 1000] {
+            assert_eq!(f.call1(n), n * (n + 1) / 2, "sum 1..={n}");
+            assert_eq!(f.call1(n), eval_sum_1_to_n(n));
+        }
+        // A negative argument yields 0 (the loop never runs).
+        assert_eq!(f.call1(-5), 0);
+    }
+
+    #[test]
+    fn label_backpatch_forward_and_backward() {
+        // A forward jump (skip) and a backward jump (loop) resolve to correct
+        // rel32 offsets.
+        let mut a = X64Assembler::new();
+        let back = a.new_label();
+        let fwd = a.new_label();
+        a.bind(back);
+        a.zero_rax();
+        a.jmp(fwd); // forward
+        a.add_rax_imm(99); // skipped
+        a.bind(fwd);
+        a.je(back); // backward operand is negative
+        a.ret();
+        let code = a.finish();
+        // The forward jmp at offset 4 (E9 at 3) targets the `je` site; its rel32
+        // must be non-negative; the backward `je` rel32 must be negative.
+        // jmp E9 is at index 3, operand at 4..8.
+        let jmp_rel = i32::from_le_bytes([code[4], code[5], code[6], code[7]]);
+        assert!(jmp_rel >= 0, "forward jump is non-negative");
     }
 
     #[test]
