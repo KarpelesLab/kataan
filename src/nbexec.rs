@@ -1384,7 +1384,7 @@ impl<'a> Interp<'a> {
             // unlike Rust's round-half-away-from-zero.
             N_MATH_ROUND => {
                 let n = self.realm.to_number(arg(0));
-                NanBox::number(if n.is_finite() { (n + 0.5).floor() } else { n })
+                NanBox::number(crate::common::js_round(n))
             }
             #[cfg(feature = "std")]
             N_MATH_SQRT => NanBox::number(self.realm.to_number(arg(0)).sqrt()),

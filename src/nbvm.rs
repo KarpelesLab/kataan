@@ -2161,7 +2161,7 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             let val = match native {
                 NB_MATH_FLOOR => a.floor(),
                 NB_MATH_CEIL => a.ceil(),
-                NB_MATH_ROUND => a.round(),
+                NB_MATH_ROUND => crate::common::js_round(a),
                 NB_MATH_SQRT => a.sqrt(),
                 _ => a.powf(args.get(1).and_then(|v| v.as_number()).unwrap_or(f64::NAN)),
             };
