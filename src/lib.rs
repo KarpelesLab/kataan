@@ -97,6 +97,11 @@ pub mod realm;
 #[cfg(feature = "alloc")]
 pub mod json;
 
+/// Heap snapshots of the live `Cell` object graph — capture an initialized heap
+/// and restore it into a fresh realm (Phase D′ heap-snapshot tier). Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod snapshot;
+
 /// The WebAssembly peer engine: lowers the numeric subset of JS functions to
 /// WebAssembly text (WAT) — a second compilation target. Needs `alloc`.
 #[cfg(feature = "alloc")]
