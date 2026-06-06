@@ -94,6 +94,7 @@ fn sexpr(e: &Expr) -> String {
         Expr::PrivateName(name, _) => format!("#{name}"),
         Expr::This(_) => "this".into(),
         Expr::Super(_) => "super".into(),
+        Expr::NewTarget(_) => "new.target".into(),
         Expr::Template(t) => sexpr_template(t),
         Expr::TaggedTemplate { tag, quasi, .. } => {
             format!("(tagged {} {})", sexpr(tag), sexpr_template(quasi))
@@ -529,7 +530,9 @@ fn templates() {
 
 #[test]
 fn deferred_features() {
-    assert!(perr("new.target").contains("new.target"));
+    // `new.target` now parses; only a bare `new.<other>` meta-property is an error.
+    assert_eq!(sx("new.target"), "new.target");
+    assert!(perr("new.foo").contains("expected `target`"));
     // A non-pattern array element is still an invalid destructuring target.
     assert!(perr("[a + b] = c").contains("invalid assignment target"));
 }

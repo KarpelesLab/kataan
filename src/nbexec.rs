@@ -141,6 +141,12 @@ pub struct Interp<'a> {
     rng_state: u64,
     /// The current `this` binding (method/constructor receiver).
     this_val: NanBox,
+    /// `new.target` for the current invocation (the constructor when reached via
+    /// `new`, else `undefined`; arrows inherit the enclosing value).
+    new_target: NanBox,
+    /// One-shot: a pending `new.target` set by `construct`, consumed by the next
+    /// non-arrow invocation (so `new.target` is the constructor inside it).
+    pending_new_target: Option<NanBox>,
     /// When running a generator body eagerly, the buffer `yield` appends to.
     gen_sink: Option<Vec<NanBox>>,
     /// The `Symbol.for` global registry: shared symbols keyed by string.
@@ -404,6 +410,8 @@ impl<'a> Interp<'a> {
             // A fixed non-zero seed (deterministic, but advances per call).
             rng_state: 0x9E37_79B9_7F4A_7C15,
             this_val: NanBox::undefined(),
+            new_target: NanBox::undefined(),
+            pending_new_target: None,
             gen_sink: None,
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
@@ -2681,6 +2689,18 @@ impl<'a> Interp<'a> {
             core::mem::replace(&mut self.this_val, bound)
         };
         let saved_home = core::mem::replace(&mut self.current_home, def.home_class);
+        // A non-arrow invocation establishes its own `new.target`: the constructor
+        // when reached via `new` (passed through the one-shot `pending_new_target`),
+        // else `undefined`. An arrow inherits the enclosing `new.target`.
+        let saved_target = if def.is_arrow {
+            self.new_target
+        } else {
+            let nt = self
+                .pending_new_target
+                .take()
+                .unwrap_or(NanBox::undefined());
+            core::mem::replace(&mut self.new_target, nt)
+        };
         // A generator body runs eagerly into a fresh yield buffer.
         let saved_sink = if def.is_generator {
             Some(self.gen_sink.replace(Vec::new()))
@@ -2715,6 +2735,7 @@ impl<'a> Interp<'a> {
         self.current = saved;
         self.this_val = saved_this;
         self.current_home = saved_home;
+        self.new_target = saved_target;
         // A generator call returns an iterator over the values it yielded.
         if def.is_generator {
             let collected = self.gen_sink.take().unwrap_or_default();
@@ -2775,6 +2796,8 @@ impl<'a> Interp<'a> {
         }
         // `new UserClass(...)`.
         if let Some((class_id, env)) = self.realm.class_at(handle) {
+            // `new.target` inside the class constructor is the class itself.
+            self.pending_new_target = Some(callee);
             let inst = self.instantiate(class_id, &env, args)?;
             // `instance.constructor === TheClass` (non-enumerable back-reference).
             if let Some(ih) = inst.as_handle().map(Handle::from_raw) {
@@ -2793,6 +2816,8 @@ impl<'a> Interp<'a> {
             let this = NanBox::handle(instance.to_raw());
             // Record the constructor for `instanceof` (hidden, GC-traced slot).
             self.realm.set_hidden_property(instance, CTOR_KEY, callee);
+            // `new.target` inside the constructor body is the constructor itself.
+            self.pending_new_target = Some(callee);
             let ret = self.call_with_this(callee, this, args)?;
             if let Some(rh) = ret.as_handle().map(Handle::from_raw)
                 && (self.realm.is_array(rh) || self.realm.object_keys(rh).is_some())
@@ -3585,8 +3610,16 @@ impl<'a> Interp<'a> {
 
         self.realm.set_class_tag(instance, class_id);
         let saved_this = core::mem::replace(&mut self.this_val, this_val);
+        // `new.target` (the class reached via `new`, passed through the one-shot)
+        // holds for the whole constructor, incl. a base reached via `super(...)`.
+        let nt = self
+            .pending_new_target
+            .take()
+            .unwrap_or(NanBox::undefined());
+        let saved_target = core::mem::replace(&mut self.new_target, nt);
         let result = self.run_constructor(class_id, env, instance, args);
         self.this_val = saved_this;
+        self.new_target = saved_target;
         result?;
         Ok(this_val)
     }
@@ -7201,6 +7234,7 @@ impl<'a> Interp<'a> {
                 self.call(tagf, &args)
             }
             Expr::This(_) => Ok(self.this_val),
+            Expr::NewTarget(_) => Ok(self.new_target),
             Expr::Await { argument, .. } => {
                 let v = self.eval(argument)?;
                 self.await_value(v)

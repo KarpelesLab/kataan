@@ -50,6 +50,9 @@ pub enum Expr {
     This(Span),
     /// The `super` keyword (only valid inside methods; validated later).
     Super(Span),
+    /// `new.target` — the constructor invoked via `new` in the current call, or
+    /// `undefined` for an ordinary call.
+    NewTarget(Span),
 
     /// An array literal, e.g. `[1, , ...xs]`. Elisions are
     /// [`ArrayElement::Hole`].
@@ -170,6 +173,7 @@ impl Expr {
             | Expr::PrivateName(_, span)
             | Expr::This(span)
             | Expr::Super(span)
+            | Expr::NewTarget(span)
             | Expr::Bool { span, .. }
             | Expr::Number { span, .. }
             | Expr::BigInt { span, .. }

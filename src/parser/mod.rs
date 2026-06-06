@@ -520,7 +520,14 @@ impl<'src> Parser<'src> {
         let start = self.cur_span();
         self.bump(); // `new`
         if self.at(TokenKind::Dot) {
-            return Err(self.err("`new.target` is not supported yet"));
+            self.bump(); // `.`
+            // The only valid meta-property here is `new.target` (`target` is a
+            // contextual keyword).
+            if self.at(TokenKind::Keyword(Kw::Target)) {
+                self.bump();
+                return Ok(Expr::NewTarget(start.to(self.prev_span())));
+            }
+            return Err(self.err("expected `target` after `new.`"));
         }
         let callee = if self.at(TokenKind::Keyword(Kw::New)) {
             self.parse_new()?
