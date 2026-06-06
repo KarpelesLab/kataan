@@ -992,6 +992,87 @@ impl Module {
     }
 }
 
+/// A live, **instantiated** module: linear memory and globals that persist across
+/// calls (unlike [`Module::call`], which uses a throwaway store). This is the
+/// stateful object the JS↔WASM boundary exchanges data through — host code reads
+/// and writes the instance's linear memory to pass strings, arrays, and buffers
+/// in and out, and a mutable global keeps state between invocations.
+pub struct Instance<'m> {
+    module: &'m Module,
+    store: Store,
+}
+
+impl<'m> Instance<'m> {
+    /// Instantiates `module`: allocates its linear memory (with data segments
+    /// applied) and initial globals.
+    ///
+    /// # Errors
+    /// Returns `WasmRtError` if a data segment is out of bounds.
+    pub fn new(module: &'m Module) -> Result<Self, WasmRtError> {
+        Ok(Self {
+            module,
+            store: module.new_store()?,
+        })
+    }
+
+    /// Calls function `index` with `args` over this instance's **persistent**
+    /// state — memory writes and global mutations are visible to later calls.
+    ///
+    /// # Errors
+    /// Returns `WasmRtError` on a type mismatch, a missing function, or an
+    /// unsupported instruction / trap.
+    pub fn call(&mut self, index: u32, args: &[Val]) -> Result<Vec<Val>, WasmRtError> {
+        self.module.call_with_store(index, args, &mut self.store)
+    }
+
+    /// Resolves an exported function by name and calls it.
+    ///
+    /// # Errors
+    /// `WasmRtError("no such export")` if `name` is not an exported function,
+    /// else as [`call`](Self::call).
+    pub fn call_export(&mut self, name: &str, args: &[Val]) -> Result<Vec<Val>, WasmRtError> {
+        let idx = self
+            .module
+            .export(name)
+            .ok_or(WasmRtError("no such export"))?;
+        self.call(idx, args)
+    }
+
+    /// The instance's linear memory (the bytes the JS side reads).
+    #[must_use]
+    pub fn memory(&self) -> &[u8] {
+        &self.store.mem
+    }
+
+    /// The instance's linear memory, mutable (the JS side writes here before a
+    /// call that consumes the data).
+    #[must_use]
+    pub fn memory_mut(&mut self) -> &mut [u8] {
+        &mut self.store.mem
+    }
+
+    /// Reads `len` bytes of linear memory at `offset` (e.g. to pull a result
+    /// buffer back to the host), or `None` if out of bounds.
+    #[must_use]
+    pub fn read_memory(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        self.store.mem.get(offset..offset.checked_add(len)?)
+    }
+
+    /// Writes `bytes` into linear memory at `offset` (e.g. to hand input to a
+    /// WASM function).
+    ///
+    /// # Errors
+    /// `WasmRtError("out of bounds memory access")` if the range doesn't fit.
+    pub fn write_memory(&mut self, offset: usize, bytes: &[u8]) -> Result<(), WasmRtError> {
+        let end = offset
+            .checked_add(bytes.len())
+            .filter(|e| *e <= self.store.mem.len())
+            .ok_or(WasmRtError("out of bounds memory access"))?;
+        self.store.mem[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
 /// The completion of an instruction stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
@@ -1434,6 +1515,99 @@ mod tests {
         assert_eq!(
             module.call(d, &[Val::I32(1), Val::I32(1), Val::I32(5)]),
             Err(WasmRtError("undefined element (call_indirect)"))
+        );
+    }
+
+    #[test]
+    fn instance_memory_persists_and_is_host_accessible() {
+        // (memory 1)
+        // (func (export "store") (param i32 i32) i32.store)   ;; mem[p0] = p1
+        // (func (export "load") (param i32) (result i32) local.get 0 i32.load)
+        let store_body: Vec<u8> = vec![0x00, 0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, 0x0b];
+        let load_body: Vec<u8> = vec![0x00, 0x20, 0x00, 0x28, 0x02, 0x00, 0x0b];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // types: 0 = (i32 i32)->(), 1 = (i32)->i32
+        m.extend([
+            0x01, 0x0b, 0x02, 0x60, 0x02, 0x7f, 0x7f, 0x00, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+        ]);
+        m.extend([0x03, 0x03, 0x02, 0x00, 0x01]); // funcs: f0:type0, f1:type1
+        m.extend([0x05, 0x03, 0x01, 0x00, 0x01]); // memory min 1
+        m.extend([
+            0x07, 0x10, 0x02, // exports: 2
+            0x05, b's', b't', b'o', b'r', b'e', 0x00, 0x00, // "store" func0
+            0x04, b'l', b'o', b'a', b'd', 0x00, 0x01, // "load" func1
+        ]);
+        let mut code = vec![0x0a, 0x00, 0x02];
+        for b in [&store_body[..], &load_body[..]] {
+            code.push(b.len() as u8);
+            code.extend_from_slice(b);
+        }
+        code[1] = (code.len() - 2) as u8;
+        m.extend(code);
+
+        let module = Module::decode(&m).expect("decode");
+        let mut inst = Instance::new(&module).expect("instantiate");
+
+        // A WASM store is visible to a later WASM load (memory persists).
+        inst.call_export("store", &[Val::I32(16), Val::I32(12345)])
+            .unwrap();
+        assert_eq!(
+            inst.call_export("load", &[Val::I32(16)]).unwrap(),
+            vec![Val::I32(12345)]
+        );
+        // ...and visible to the host, which reads the raw little-endian bytes.
+        assert_eq!(inst.read_memory(16, 4).unwrap(), &12345i32.to_le_bytes());
+
+        // The host writes input into memory; WASM reads it back.
+        inst.write_memory(32, &999i32.to_le_bytes()).unwrap();
+        assert_eq!(
+            inst.call_export("load", &[Val::I32(32)]).unwrap(),
+            vec![Val::I32(999)]
+        );
+        // Out-of-bounds host writes are rejected.
+        assert!(inst.write_memory(PAGE_SIZE, &[1, 2, 3, 4]).is_err());
+        assert!(inst.read_memory(PAGE_SIZE, 4).is_none());
+    }
+
+    #[test]
+    fn instance_global_accumulates_across_calls() {
+        // A mutable global persists across Instance calls (unlike Module::call,
+        // which resets per invocation).
+        // (global (mut i32) (i32.const 0))
+        // (func (export "inc") (param i32) (result i32)
+        //   global.get 0 local.get 0 i32.add global.set 0 global.get 0)
+        let body: Vec<u8> = vec![
+            0x00, 0x23, 0x00, 0x20, 0x00, 0x6a, 0x24, 0x00, 0x23, 0x00, 0x0b,
+        ];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]);
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x06, 0x06, 0x01, 0x7f, 0x01, 0x41, 0x00, 0x0b]); // mutable global = 0
+        m.extend([0x07, 0x07, 0x01, 0x03, b'i', b'n', b'c', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).expect("decode");
+        let mut inst = Instance::new(&module).expect("instantiate");
+        assert_eq!(
+            inst.call_export("inc", &[Val::I32(5)]).unwrap(),
+            vec![Val::I32(5)]
+        );
+        assert_eq!(
+            inst.call_export("inc", &[Val::I32(10)]).unwrap(),
+            vec![Val::I32(15)]
+        );
+        assert_eq!(
+            inst.call_export("inc", &[Val::I32(100)]).unwrap(),
+            vec![Val::I32(115)]
+        );
+        // A fresh instance starts over.
+        let mut inst2 = Instance::new(&module).unwrap();
+        assert_eq!(
+            inst2.call_export("inc", &[Val::I32(7)]).unwrap(),
+            vec![Val::I32(7)]
         );
     }
 
