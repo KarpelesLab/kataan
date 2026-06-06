@@ -1656,6 +1656,20 @@ mod tests {
     }
 
     #[test]
+    fn spec_div_overflow_and_traps() {
+        // i32.div_s(INT_MIN, -1) overflows → traps; rem_s of the same is 0 (no trap).
+        let script = "(module \
+            (func (export \"divs\") (param i32 i32) (result i32) (i32.div_s (local.get 0) (local.get 1))) \
+            (func (export \"rems\") (param i32 i32) (result i32) (i32.rem_s (local.get 0) (local.get 1)))) \
+            (assert_trap   (invoke \"divs\" (i32.const -2147483648) (i32.const -1))) \
+            (assert_return (invoke \"rems\" (i32.const -2147483648) (i32.const -1)) (i32.const 0)) \
+            (assert_return (invoke \"divs\" (i32.const -2147483648) (i32.const 1)) (i32.const -2147483648)) \
+            (assert_trap   (invoke \"divs\" (i32.const 1) (i32.const 0)))";
+        let n = run_wast(script).expect("div overflow/trap conformance passes");
+        assert_eq!(n, 4);
+    }
+
+    #[test]
     fn spec_conformance_corpus() {
         // A spec-format `.wast` conformance corpus (WAT text modules + assertions)
         // exercising a broad slice of the engine through the harness, in the shape

@@ -1618,7 +1618,10 @@ impl Module {
                     if b == 0 {
                         return Err(WasmRtError("integer divide by zero"));
                     }
-                    stack.push(Val::I32(a.wrapping_div(b))); // div_s
+                    if a == i32::MIN && b == -1 {
+                        return Err(WasmRtError("integer overflow")); // i32.div_s overflow
+                    }
+                    stack.push(Val::I32(a / b)); // div_s
                 }
                 0x6e => {
                     let b = pop!().as_i32()? as u32;
@@ -1675,7 +1678,10 @@ impl Module {
                     if b == 0 {
                         return Err(WasmRtError("integer divide by zero"));
                     }
-                    stack.push(Val::I64(a.wrapping_div(b))); // i64.div_s
+                    if a == i64::MIN && b == -1 {
+                        return Err(WasmRtError("integer overflow")); // i64.div_s overflow
+                    }
+                    stack.push(Val::I64(a / b)); // i64.div_s
                 }
                 0x58 => cmp_i64!(|a: i64, b: i64| (a as u64) <= b as u64), // le_u
                 0x5a => cmp_i64!(|a: i64, b: i64| (a as u64) >= b as u64), // ge_u
