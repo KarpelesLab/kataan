@@ -407,6 +407,91 @@ impl Module {
         if self.start.is_some_and(|s| s as usize >= n_funcs) {
             return Err(WasmRtError("start references an invalid function index"));
         }
+        // Body-level index validation: every local/global/call/type reference in
+        // each defined function must be in range.
+        let n_imp = self.func_imports.len();
+        let n_globals = self.global_imports.len() + self.globals.len();
+        for (i, body) in self.bodies.iter().enumerate() {
+            let ty = self
+                .func_types
+                .get(n_imp + i)
+                .and_then(|t| self.types.get(*t as usize))
+                .ok_or(WasmRtError("function has no type"))?;
+            let n_locals = ty.params.len() + body.locals.len();
+            self.validate_body(&body.code, n_locals, n_globals, n_funcs)?;
+        }
+        Ok(())
+    }
+
+    /// Scans one function body, checking every index immediate is in range.
+    fn validate_body(
+        &self,
+        code: &[u8],
+        n_locals: usize,
+        n_globals: usize,
+        n_funcs: usize,
+    ) -> Result<(), WasmRtError> {
+        let mut r = Reader::new(code);
+        while !r.done() {
+            match r.byte()? {
+                0x20..=0x22 => {
+                    if r.u32()? as usize >= n_locals {
+                        return Err(WasmRtError("local index out of range"));
+                    }
+                }
+                0x23 | 0x24 => {
+                    if r.u32()? as usize >= n_globals {
+                        return Err(WasmRtError("global index out of range"));
+                    }
+                }
+                0x10 => {
+                    if r.u32()? as usize >= n_funcs {
+                        return Err(WasmRtError("call target out of range"));
+                    }
+                }
+                0x11 => {
+                    let t = r.u32()?;
+                    r.u32()?; // table index
+                    if t as usize >= self.types.len() {
+                        return Err(WasmRtError("call_indirect type out of range"));
+                    }
+                }
+                // Skip the immediates of the remaining instructions (mirrors the
+                // control-flow scanners) so indices aren't misread.
+                0x02..=0x04 => {
+                    r.byte()?;
+                }
+                0x0c | 0x0d => {
+                    r.u32()?;
+                }
+                0x0e => {
+                    let c = r.u32()?;
+                    for _ in 0..=c {
+                        r.u32()?;
+                    }
+                }
+                0x28..=0x3e => {
+                    r.u32()?;
+                    r.u32()?;
+                }
+                0x3f | 0x40 => {
+                    r.byte()?;
+                }
+                0x41 => {
+                    r.i32()?;
+                }
+                0x42 => {
+                    r.i64()?;
+                }
+                0x43 => {
+                    r.bytes(4)?;
+                }
+                0x44 => {
+                    r.bytes(8)?;
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -2667,6 +2752,26 @@ mod tests {
         m2.extend([0x03, 0x02, 0x01, 0x09]); // func0: type9 (invalid)
         m2.extend([0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x01, 0x0b]);
         assert!(Module::decode(&m2).is_err(), "invalid type index rejected");
+
+        // A body reading local 3 in a (i32)->i32 function (only local 0 exists).
+        // body = local.get 3; end.
+        let mut m3 = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m3.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]); // (i32)->i32
+        m3.extend([0x03, 0x02, 0x01, 0x00]);
+        m3.extend([0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00]);
+        m3.extend([0x0a, 0x06, 0x01, 0x04, 0x00, 0x20, 0x03, 0x0b]); // local.get 3
+        assert!(Module::decode(&m3).is_err(), "out-of-range local rejected");
+
+        // A body calling function 4 (only function 0 exists).
+        let mut m4 = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m4.extend([0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f]);
+        m4.extend([0x03, 0x02, 0x01, 0x00]);
+        m4.extend([0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00]);
+        m4.extend([0x0a, 0x06, 0x01, 0x04, 0x00, 0x10, 0x04, 0x0b]); // call 4
+        assert!(
+            Module::decode(&m4).is_err(),
+            "out-of-range call target rejected"
+        );
     }
 
     #[test]
