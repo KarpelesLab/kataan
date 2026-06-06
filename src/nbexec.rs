@@ -2736,7 +2736,12 @@ impl<'a> Interp<'a> {
         }
         // `new UserClass(...)`.
         if let Some((class_id, env)) = self.realm.class_at(handle) {
-            return self.instantiate(class_id, &env, args);
+            let inst = self.instantiate(class_id, &env, args)?;
+            // `instance.constructor === TheClass` (non-enumerable back-reference).
+            if let Some(ih) = inst.as_handle().map(Handle::from_raw) {
+                self.realm.set_hidden_property(ih, "constructor", callee);
+            }
+            return Ok(inst);
         }
         // `new constructorFunction(...)`: bind a fresh object as `this`, run the
         // body, and return it — unless the function explicitly returned an object

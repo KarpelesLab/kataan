@@ -54,6 +54,12 @@ pub struct Realm {
     /// moving collection; distinct closures sharing an id share a prototype — a
     /// bounded approximation, see `[[latent-engine-conformance-bugs]]`.)
     fn_protos: alloc::collections::BTreeMap<u32, Handle>,
+    /// The function handle to use as a prototype's `constructor` back-reference,
+    /// keyed by function id (the most recent closure created for that id). Set when
+    /// a function is allocated; read when its `.prototype` is first materialized so
+    /// `Foo.prototype.constructor === Foo` (and thus `instance.constructor`). Same
+    /// id-keyed, GC-quiescent caveat as `fn_protos`.
+    fn_ctor: alloc::collections::BTreeMap<u32, Handle>,
     /// Auxiliary named-property objects for non-object cells (arrays, functions),
     /// which have no inline object part. Keyed by the cell's handle. Not a GC root
     /// and not relocated on a moving collection — sound only because collection is
@@ -87,6 +93,7 @@ impl Realm {
             next_symbol_id: 1,
             symbols_by_id: alloc::collections::BTreeMap::new(),
             fn_protos: alloc::collections::BTreeMap::new(),
+            fn_ctor: alloc::collections::BTreeMap::new(),
             aux_props: alloc::collections::BTreeMap::new(),
             frozen_arrays: alloc::collections::BTreeSet::new(),
             default_object_proto: None,
@@ -117,6 +124,11 @@ impl Realm {
         }
         let proto = self.new_object();
         self.fn_protos.insert(func_id, proto);
+        // Back-link `proto.constructor` to the function (non-enumerable), so
+        // `instance.constructor === Foo` and `instance.constructor.name`.
+        if let Some(ctor) = self.fn_ctor.get(&func_id).copied() {
+            self.set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
+        }
         proto
     }
 
@@ -230,7 +242,15 @@ impl Realm {
 
     /// Allocates a closure: a function-table index plus its captured scope.
     pub fn new_function(&mut self, func_id: u32, env: crate::env::Scope) -> Handle {
-        self.heap.alloc(Cell::Function { func_id, env })
+        let h = self.heap.alloc(Cell::Function { func_id, env });
+        // Remember this function as the `constructor` for its `.prototype` (set when
+        // the prototype is first materialized). If the prototype already exists,
+        // link it now.
+        self.fn_ctor.insert(func_id, h);
+        if let Some(proto) = self.fn_protos.get(&func_id).copied() {
+            self.set_hidden_property(proto, "constructor", NanBox::handle(h.to_raw()));
+        }
+        h
     }
 
     /// The `(func_id, captured env)` of the function at `handle`, or `None` if it
