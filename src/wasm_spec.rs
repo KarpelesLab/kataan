@@ -1688,6 +1688,39 @@ mod tests {
     }
 
     #[test]
+    fn wast_full_module_surface_conformance() {
+        // A single upstream-style `.wast` exercising the whole module surface
+        // together: a type + table + elem + call_indirect, a mutable global, linear
+        // memory with a data segment, and control flow — driven by assertions.
+        let script = "\
+(module
+  (type $unop (func (param i32) (result i32)))
+  (table 2 funcref)
+  (memory 1)
+  (global $hits (mut i32) (i32.const 0))
+  (data (i32.const 0) \"\\2a\\00\\00\\00\")
+  (func $sq   (param $x i32) (result i32) (i32.mul (local.get $x) (local.get $x)))
+  (func $negv (param $x i32) (result i32) (i32.sub (i32.const 0) (local.get $x)))
+  (elem (i32.const 0) $sq $negv)
+  (func (export \"apply\") (param $i i32) (param $x i32) (result i32)
+    (global.set $hits (i32.add (global.get $hits) (i32.const 1)))
+    (call_indirect (type $unop) (local.get $x) (local.get $i)))
+  (func (export \"hits\")   (result i32) (global.get $hits))
+  (func (export \"mem42\")  (result i32) (i32.load (i32.const 0)))
+  (func (export \"clamp\")  (param $x i32) (result i32)
+    (if (result i32) (i32.lt_s (local.get $x) (i32.const 0))
+      (then (i32.const 0)) (else (local.get $x)))))
+(assert_return (invoke \"apply\" (i32.const 0) (i32.const 9))  (i32.const 81))
+(assert_return (invoke \"apply\" (i32.const 1) (i32.const 9))  (i32.const -9))
+(assert_return (invoke \"hits\")                               (i32.const 2))
+(assert_return (invoke \"mem42\")                              (i32.const 42))
+(assert_return (invoke \"clamp\" (i32.const -5))               (i32.const 0))
+(assert_return (invoke \"clamp\" (i32.const 7))                (i32.const 7))";
+        let n = run_wast(script).expect("full-surface conformance passes");
+        assert_eq!(n, 6, "all six assertions executed");
+    }
+
+    #[test]
     fn wast_conformance_with_control_flow() {
         // An upstream-style `.wast`: a real WAT text module with named functions,
         // loops, `if`, and inter-function calls, driven by assert_return/assert_trap
