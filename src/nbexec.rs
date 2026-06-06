@@ -7804,6 +7804,35 @@ impl<'a> Interp<'a> {
 
     /// Reads a named member, honoring class statics and accessor getters before
     /// ordinary property/length access.
+    /// The global constructor a built-in heap value reports as its `.constructor`
+    /// (so `[].constructor === Array`), resolved by the value's cell kind. Returns
+    /// the actual global binding (identity-equal to `Array`, `Object`, …), or
+    /// `None` for kinds without a distinct constructor.
+    fn builtin_constructor_for(&mut self, handle: crate::heap::Handle) -> Option<NanBox> {
+        let name = if self.realm.is_array(handle) {
+            "Array"
+        } else if self.realm.string_value(handle).is_some() {
+            "String"
+        } else if self.realm.regexp_at(handle).is_some() {
+            "RegExp"
+        } else if self.realm.bigint_at(handle).is_some() {
+            "BigInt"
+        } else if self.realm.date_at(handle).is_some() {
+            "Date"
+        } else if let Some(is_set) = self.realm.collection_is_set(handle) {
+            if is_set { "Set" } else { "Map" }
+        } else if self.realm.promise_state(handle).is_some() {
+            "Promise"
+        } else if self.realm.object_keys(handle).is_some() {
+            // A plain object reports `Object`. (Error objects are handled earlier in
+            // `read_member`, before their prototype's generic `constructor`.)
+            "Object"
+        } else {
+            return None;
+        };
+        self.current.get(name)
+    }
+
     fn read_member(
         &mut self,
         handle: crate::heap::Handle,
@@ -7842,6 +7871,23 @@ impl<'a> Interp<'a> {
                 return self.call(trap, &[NanBox::handle(target.to_raw()), key, recv]);
             }
             return self.read_member(target, name);
+        }
+        // An error object's `.constructor` is its specific error global — its
+        // prototype otherwise reports a generic `Object`. Recognized by an own
+        // `name` in the error family plus a `message` (so a user `new Foo()`,
+        // whose constructor resolves through its prototype, is never matched).
+        if name == "constructor" {
+            let nm = self
+                .realm
+                .get_property(handle, "name")
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_default();
+            if ERROR_NAMES.contains(&nm.as_str())
+                && self.realm.get_property(handle, "message").is_some()
+                && let Some(ctor) = self.current.get(&nm)
+            {
+                return Ok(ctor);
+            }
         }
         // Well-known `Symbol.iterator` / `Symbol.asyncIterator` (lazily created).
         if self.realm.native_at(handle) == Some(N_SYMBOL)
@@ -8005,8 +8051,11 @@ impl<'a> Interp<'a> {
             let this = NanBox::handle(handle.to_raw());
             return self.call_with_this(getter, this, &[]);
         }
-        // RegExp introspection properties.
-        if let Some((source, flags)) = self.realm.regexp_at(handle) {
+        // RegExp introspection properties. (`constructor` falls through to the
+        // built-in-constructor fallback below.)
+        if name != "constructor"
+            && let Some((source, flags)) = self.realm.regexp_at(handle)
+        {
             return Ok(match name {
                 "source" => self.new_str(&source),
                 "flags" => self.new_str(&flags),
@@ -8109,6 +8158,14 @@ impl<'a> Interp<'a> {
                     .unwrap_or(NanBox::undefined()));
             }
             cur = self.realm.object_proto(p);
+        }
+        // A built-in value with no own/inherited `constructor` reports its global
+        // constructor (`[].constructor === Array`); user functions/classes resolve
+        // theirs through the prototype walk above and never reach here.
+        if name == "constructor"
+            && let Some(ctor) = self.builtin_constructor_for(handle)
+        {
+            return Ok(ctor);
         }
         Ok(direct)
     }
