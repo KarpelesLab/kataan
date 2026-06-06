@@ -785,6 +785,25 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
     // Second pass: now that every function's index is known, build the function
     // symbol table and emit each body (so `call $name` resolves).
     let func_names: Vec<String> = funcs.iter().map(|f| f.name.clone()).collect();
+    // A `(start $f)` declaration: the function run at instantiation.
+    let mut start_func: Option<u32> = None;
+    for field in &items[1..] {
+        if let Sexpr::List(s) = field
+            && s.first() == Some(&Sexpr::Atom(String::from("start")))
+            && let Some(Sexpr::Atom(r)) = s.get(1)
+        {
+            let idx = if let Some(nm) = r.strip_prefix('$') {
+                func_names
+                    .iter()
+                    .position(|n| n == nm)
+                    .map(|p| p as u32)
+                    .ok_or_else(|| format!("unknown start function ${nm}"))?
+            } else {
+                r.parse::<u32>().map_err(|_| "bad start index")?
+            };
+            start_func = Some(idx);
+        }
+    }
     for f in &mut funcs {
         let mut body = Vec::new();
         let mut labels: Vec<String> = Vec::new();
@@ -858,6 +877,12 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
         leb_u(*i as u64, &mut exp);
     }
     section(7, &exp, &mut out);
+    // start section (id 8): the function index run at instantiation.
+    if let Some(idx) = start_func {
+        let mut s = Vec::new();
+        leb_u(u64::from(idx), &mut s);
+        section(8, &s, &mut out);
+    }
     // code section.
     let mut code = Vec::new();
     leb_u(funcs.len() as u64, &mut code);
@@ -1245,6 +1270,21 @@ mod tests {
             inst.call_export("rt", &[Val::I32(-12345)]).unwrap(),
             vec![Val::I32(-12345)]
         );
+    }
+
+    #[test]
+    fn wat_start_function_runs_at_instantiation() {
+        // `(start $init)` runs `$init` at instantiation, setting `$g` to 77;
+        // `get` returns it without any explicit call.
+        let src = "(module \
+            (global $g (mut i32) (i32.const 0)) \
+            (func $init (global.set $g (i32.const 77))) \
+            (func (export \"get\") (result i32) (global.get $g)) \
+            (start $init))";
+        let bin = wat_to_binary(src).expect("compile WAT with start");
+        let module = crate::wasm_rt::Module::decode(&bin).expect("decode");
+        let mut inst = crate::wasm_rt::Instance::new(&module).expect("instantiate");
+        assert_eq!(inst.call_export("get", &[]).unwrap(), vec![Val::I32(77)]);
     }
 
     #[test]
