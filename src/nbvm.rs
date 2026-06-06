@@ -486,14 +486,8 @@ fn call_with_inner(
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     if optimized.is_some() && !proto.is_async && proto.rest_from.is_none() && proto.n_captures == 0
     {
-        let cached = match ctx.jit_cache.get(&id) {
-            Some(c) => c.clone(),
-            None => {
-                let compiled = crate::jit::JitProto::compile(&funcs[id]).map(alloc::rc::Rc::new);
-                ctx.jit_cache.insert(id, compiled.clone());
-                compiled
-            }
-        };
+        let mut stack = alloc::collections::BTreeSet::new();
+        let cached = ensure_jit(&mut ctx.jit_cache, funcs, id, &mut stack);
         if let Some(jit) = cached
             && let Some(result) = jit.call_guarded(args)
         {
@@ -513,6 +507,47 @@ fn call_with_inner(
         return Ok(NanBox::handle(p.to_raw()));
     }
     Ok(run_frame(ctx, funcs, body, &mut regs)?.unwrap_or(NanBox::undefined()))
+}
+
+/// Compiles function `id` to native code (memoized in `cache`), first compiling
+/// any function it statically calls so their code addresses can be wired into a
+/// native call. Returns the compiled function, or `None` if it isn't JIT-eligible.
+///
+/// `stack` guards against recursion: a function reached while already being
+/// compiled (direct or mutual recursion) is left unregistered, so the recursive
+/// call simply bails the caller's JIT — sound, just not accelerated.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn ensure_jit(
+    cache: &mut alloc::collections::BTreeMap<usize, Option<alloc::rc::Rc<crate::jit::JitProto>>>,
+    funcs: &[FnProto],
+    id: usize,
+    stack: &mut alloc::collections::BTreeSet<usize>,
+) -> Option<alloc::rc::Rc<crate::jit::JitProto>> {
+    if let Some(c) = cache.get(&id) {
+        return c.clone();
+    }
+    if stack.contains(&id) {
+        return None; // recursion: this function is mid-compilation
+    }
+    stack.insert(id);
+    // Resolve each statically-called function to its compiled code address.
+    let mut registry = alloc::collections::BTreeMap::new();
+    for op in &funcs[id].ops {
+        if let Op::Call { func, .. } = op {
+            let fid = *func as usize;
+            if fid != id
+                && fid < funcs.len()
+                && let Some(j) = ensure_jit(cache, funcs, fid, stack)
+            {
+                registry.insert(*func, j.code_ptr() as u64);
+            }
+        }
+    }
+    stack.remove(&id);
+    let compiled =
+        crate::jit::JitProto::compile_with_registry(&funcs[id], &registry).map(alloc::rc::Rc::new);
+    cache.insert(id, compiled.clone());
+    compiled
 }
 
 /// Why execution stopped abnormally.
@@ -5396,6 +5431,46 @@ mod tests {
                 for (let i = 0; i < 30; i = i + 1) { s = g(i, 0.5); } \
                 s"),
             "29.5"
+        );
+    }
+
+    /// A hot function that *calls another function* — with the JIT on Linux
+    /// x86-64 the callee is compiled first and wired as a native call inside the
+    /// caller's machine code; either way the result must match the interpreter.
+    #[test]
+    fn hot_function_with_a_call_matches_interpreter() {
+        // triple(x) = x*3; f(x) = triple(x) + x = 4x. Called 40 times (> threshold).
+        // sum_{i=0..39}(4i) = 4 * 780 = 3120.
+        assert_eq!(
+            bc("function triple(x){ return x*3; } \
+                function f(x){ return triple(x) + x; } \
+                let t = 0; \
+                for (let i = 0; i < 40; i = i + 1) { t = t + f(i); } \
+                t"),
+            "3120"
+        );
+        // Nested calls: a(x)=x+1; b(x)=a(x)*2; c(x)=b(x)+a(x). c(x)=3(x+1)=3x+3.
+        // sum_{i=0..29}(3i+3) = 3*435 + 90 = 1395.
+        assert_eq!(
+            bc("function a(x){ return x+1; } \
+                function b(x){ return a(x)*2; } \
+                function c(x){ return b(x) + a(x); } \
+                let t = 0; \
+                for (let i = 0; i < 30; i = i + 1) { t = t + c(i); } \
+                t"),
+            "1395"
+        );
+        // A callee that overflows the safe-integer range must still give the right
+        // answer: the callee deopts → the caller's post-call guard deopts → the
+        // interpreter runs it (and `1e16 + 1` rounds back to `1e16` in f64, exactly
+        // as the interpreter computes — the point is JIT and interpreter agree).
+        assert_eq!(
+            bc("function sq(x){ return x*x; } \
+                function h(x){ return sq(x) + 1; } \
+                let r = 0; \
+                for (let i = 0; i < 20; i = i + 1) { r = h(100000000); } \
+                r"),
+            "10000000000000000"
         );
     }
 

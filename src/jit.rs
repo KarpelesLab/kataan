@@ -1896,10 +1896,15 @@ impl JitFunction {
                     }
                     a.movabs_rax(code_ptr as i64);
                     a.call_rax();
-                    a.store_rax(disp(dst));
                     // The callee clobbered the caller-saved bounds regs; reload.
                     a.movabs_r11(SAFE_INT_MAX);
                     a.movabs_r10(-SAFE_INT_MAX);
+                    // Range-guard the result: a legitimate callee result is in
+                    // ±2^53, while a callee *deopt* returns the i64::MAX sentinel
+                    // (out of range), so this propagates the callee's deopt to the
+                    // caller instead of silently using the sentinel as a value.
+                    guard!(a, false);
+                    a.store_rax(disp(dst));
                 }
             }
         }
