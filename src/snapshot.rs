@@ -923,6 +923,26 @@ mod tests {
         scope.declare("cap", NanBox::number(7.0));
         let func = realm.new_function(3, scope);
         realm.set_property(obj, "fn", NanBox::handle(func.to_raw()));
+        // The remaining cell kinds: Date, BigInt, a settled Promise, and a Proxy —
+        // so the mmap reload exercises all nine reference cell kinds.
+        let date = realm.new_date(1234.0);
+        realm.set_property(obj, "date", NanBox::handle(date.to_raw()));
+        let big = realm
+            .new_bigint(crate::bignum::BigInt::from_str_radix("90071992547409930", 10).unwrap());
+        realm.set_property(obj, "big", NanBox::handle(big.to_raw()));
+        let prom = realm.new_promise();
+        {
+            let st = realm.promise_state(prom).unwrap();
+            let mut s = st.borrow_mut();
+            s.status = crate::cell::PromiseStatus::Fulfilled;
+            s.value = NanBox::number(8.0);
+        }
+        realm.set_property(obj, "prom", NanBox::handle(prom.to_raw()));
+        let target = realm.new_object();
+        realm.set_property(target, "t", NanBox::number(1.0));
+        let handler = realm.new_object();
+        let proxy = realm.new_proxy(target, handler);
+        realm.set_property(obj, "proxy", NanBox::handle(proxy.to_raw()));
 
         // Serialize to a temp file, then reload it via the mmap zero-copy path.
         let bytes = serialize(&capture(&realm, &[obj]));
@@ -966,6 +986,42 @@ mod tests {
         let (fid, sc) = realm2.function_at(fn2).expect("restored closure");
         assert_eq!(fid, 3);
         assert_eq!(sc.get("cap"), Some(NanBox::number(7.0)));
+        // Date / BigInt / Promise / Proxy all came through the mmap reload.
+        let date2 = Handle::from_raw(
+            realm2
+                .get_property(r2, "date")
+                .unwrap()
+                .as_handle()
+                .unwrap(),
+        );
+        assert_eq!(realm2.date_at(date2), Some(1234.0));
+        let big2 = Handle::from_raw(realm2.get_property(r2, "big").unwrap().as_handle().unwrap());
+        assert_eq!(
+            realm2.bigint_at(big2).map(|b| b.to_str_radix(10)),
+            Some(String::from("90071992547409930"))
+        );
+        let prom2 = Handle::from_raw(
+            realm2
+                .get_property(r2, "prom")
+                .unwrap()
+                .as_handle()
+                .unwrap(),
+        );
+        {
+            let s = realm2.promise_state(prom2).unwrap();
+            let s = s.borrow();
+            assert!(matches!(s.status, crate::cell::PromiseStatus::Fulfilled));
+            assert_eq!(s.value, NanBox::number(8.0));
+        }
+        let proxy2 = Handle::from_raw(
+            realm2
+                .get_property(r2, "proxy")
+                .unwrap()
+                .as_handle()
+                .unwrap(),
+        );
+        let (t2, _h2) = realm2.proxy_at(proxy2).expect("restored proxy");
+        assert_eq!(realm2.get_property(t2, "t"), Some(NanBox::number(1.0)));
 
         // The mmap-reloaded heap is a valid moving-GC heap: compaction keeps it.
         let mut roots2 = [r2];
