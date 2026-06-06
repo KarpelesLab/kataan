@@ -308,14 +308,28 @@ fn simple_opcode(name: &str) -> Option<u8> {
         "i64.mul" => 0x7e,
         "f32.abs" => 0x8b,
         "f32.neg" => 0x8c,
+        "f32.ceil" => 0x8d,
+        "f32.floor" => 0x8e,
+        "f32.trunc" => 0x8f,
+        "f32.nearest" => 0x90,
         "f32.sqrt" => 0x91,
         "f32.add" => 0x92,
         "f32.sub" => 0x93,
         "f32.mul" => 0x94,
         "f32.div" => 0x95,
+        "f32.min" => 0x96,
+        "f32.max" => 0x97,
+        "f32.copysign" => 0x98,
         "f64.abs" => 0x99,
         "f64.neg" => 0x9a,
+        "f64.ceil" => 0x9b,
+        "f64.floor" => 0x9c,
+        "f64.trunc" => 0x9d,
+        "f64.nearest" => 0x9e,
         "f64.sqrt" => 0x9f,
+        "f64.min" => 0xa4,
+        "f64.max" => 0xa5,
+        "f64.copysign" => 0xa6,
         "f64.add" => 0xa0,
         "f64.sub" => 0xa1,
         "f64.mul" => 0xa2,
@@ -1675,6 +1689,27 @@ mod tests {
             .call(0, &[Val::I32(5)])
             .unwrap();
         assert_eq!(r3, vec![Val::I32(16)]); // 5*3 + 1
+    }
+
+    #[test]
+    fn spec_float_rounding_and_copysign() {
+        let script = "(module \
+            (func (export \"ceil\")  (param f64) (result f64) (f64.ceil (local.get 0))) \
+            (func (export \"floor\") (param f64) (result f64) (f64.floor (local.get 0))) \
+            (func (export \"trunc\") (param f64) (result f64) (f64.trunc (local.get 0))) \
+            (func (export \"near\")  (param f64) (result f64) (f64.nearest (local.get 0))) \
+            (func (export \"cs\")    (param f64) (param f64) (result f64) (f64.copysign (local.get 0) (local.get 1)))) \
+            (assert_return (invoke \"ceil\"  (f64.const 2.3)) (f64.const 3)) \
+            (assert_return (invoke \"floor\" (f64.const 2.7)) (f64.const 2)) \
+            (assert_return (invoke \"floor\" (f64.const -2.3)) (f64.const -3)) \
+            (assert_return (invoke \"trunc\" (f64.const -2.7)) (f64.const -2)) \
+            (assert_return (invoke \"near\"  (f64.const 2.5)) (f64.const 2)) \
+            (assert_return (invoke \"near\"  (f64.const 3.5)) (f64.const 4)) \
+            (assert_return (invoke \"near\"  (f64.const -1.5)) (f64.const -2)) \
+            (assert_return (invoke \"cs\"    (f64.const 3) (f64.const -1)) (f64.const -3)) \
+            (assert_return (invoke \"cs\"    (f64.const -3) (f64.const 1)) (f64.const 3))";
+        let n = run_wast(script).expect("rounding/copysign conformance passes");
+        assert_eq!(n, 9);
     }
 
     #[test]

@@ -266,6 +266,63 @@ fn val_type(b: u8) -> Result<ValType, WasmRtError> {
     }
 }
 
+/// `f32::trunc` for `no_std`.
+fn f32_trunc(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i64 - 127;
+    if exp < 0 {
+        f32::from_bits(bits & (1 << 31))
+    } else if exp >= 23 {
+        x
+    } else {
+        f32::from_bits(bits & !((1u32 << (23 - exp)) - 1))
+    }
+}
+/// Round half-to-even, with the sign of zero preserved (WebAssembly `nearest`).
+fn f64_nearest(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() || x == 0.0 {
+        return x;
+    }
+    let t = f64_trunc(x);
+    let diff = f64_abs(x - t);
+    let away = if x > 0.0 { 1.0 } else { -1.0 };
+    let r = if diff < 0.5 {
+        t
+    } else if diff > 0.5 {
+        t + away
+    } else if (t as i64) % 2 == 0 {
+        t // already even
+    } else {
+        t + away
+    };
+    if r == 0.0 && x < 0.0 { -0.0 } else { r }
+}
+fn f32_nearest(x: f32) -> f32 {
+    f64_nearest(f64::from(x)) as f32
+}
+fn f64_floor(x: f64) -> f64 {
+    let t = f64_trunc(x);
+    if t > x { t - 1.0 } else { t }
+}
+fn f64_ceil(x: f64) -> f64 {
+    let t = f64_trunc(x);
+    if t < x { t + 1.0 } else { t }
+}
+fn f32_floor(x: f32) -> f32 {
+    let t = f32_trunc(x);
+    if t > x { t - 1.0 } else { t }
+}
+fn f32_ceil(x: f32) -> f32 {
+    let t = f32_trunc(x);
+    if t < x { t + 1.0 } else { t }
+}
+fn f64_copysign(a: f64, b: f64) -> f64 {
+    f64::from_bits((a.to_bits() & 0x7fff_ffff_ffff_ffff) | (b.to_bits() & (1 << 63)))
+}
+fn f32_copysign(a: f32, b: f32) -> f32 {
+    f32::from_bits((a.to_bits() & 0x7fff_ffff) | (b.to_bits() & (1 << 31)))
+}
+
 /// `i32.trunc_f64_s` and friends: truncate `a` toward zero, trapping on NaN/∞ or
 /// when the result is outside the target integer range (per the spec — Rust's
 /// `as` saturates, which is *not* the WebAssembly behavior).
@@ -639,7 +696,7 @@ impl Module {
                 0x8b..=0x91 => (&[F32], Some(F32)),      // f32 unary (abs/neg/…/sqrt)
                 0x92..=0x98 => (&[F32, F32], Some(F32)), // f32 binary
                 0x99..=0x9f => (&[F64], Some(F64)),      // f64 unary
-                0xa0..=0xa5 => (&[F64, F64], Some(F64)), // f64 binary
+                0xa0..=0xa6 => (&[F64, F64], Some(F64)), // f64 binary (+ copysign)
                 0xa7 => (&[I64], Some(I32)),             // i32.wrap_i64
                 0xaa | 0xab => (&[F64], Some(I32)),      // i32.trunc_f64
                 0xac | 0xad => (&[I32], Some(I64)),      // i64.extend_i32
@@ -1945,6 +2002,22 @@ impl Module {
                     let a = pop!().as_f32()?;
                     stack.push(Val::F32(-a));
                 }
+                0x8d => {
+                    let a = pop!().as_f32()?;
+                    stack.push(Val::F32(f32_ceil(a)));
+                }
+                0x8e => {
+                    let a = pop!().as_f32()?;
+                    stack.push(Val::F32(f32_floor(a)));
+                }
+                0x8f => {
+                    let a = pop!().as_f32()?;
+                    stack.push(Val::F32(f32_trunc(a)));
+                }
+                0x90 => {
+                    let a = pop!().as_f32()?;
+                    stack.push(Val::F32(f32_nearest(a)));
+                }
                 0x91 => {
                     let a = pop!().as_f32()?;
                     stack.push(Val::F32(f32_sqrt(a)));
@@ -1955,6 +2028,7 @@ impl Module {
                 0x95 => bin_f32!(|a, b| a / b),
                 0x96 => bin_f32!(f32_min),
                 0x97 => bin_f32!(f32_max),
+                0x98 => bin_f32!(f32_copysign),
                 // f64 unary / arithmetic
                 0x99 => {
                     let a = pop!().as_f64()?;
@@ -1963,6 +2037,22 @@ impl Module {
                 0x9a => {
                     let a = pop!().as_f64()?;
                     stack.push(Val::F64(-a));
+                }
+                0x9b => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::F64(f64_ceil(a)));
+                }
+                0x9c => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::F64(f64_floor(a)));
+                }
+                0x9d => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::F64(f64_trunc(a)));
+                }
+                0x9e => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::F64(f64_nearest(a)));
                 }
                 0x9f => {
                     let a = pop!().as_f64()?;
@@ -1974,6 +2064,7 @@ impl Module {
                 0xa3 => bin_f64!(|a, b| a / b),
                 0xa4 => bin_f64!(f64_min),
                 0xa5 => bin_f64!(f64_max),
+                0xa6 => bin_f64!(f64_copysign),
                 // structured control: block / loop
                 0x02 | 0x03 => {
                     let _blocktype = r.byte()?; // 0x40 (empty) or a value type
