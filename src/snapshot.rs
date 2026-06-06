@@ -13,8 +13,8 @@
 //!
 //! Covers the value cells (objects, arrays, strings, `Date`, `BigInt`),
 //! functions/closures (code id + captured scope chain), `Map`/`Set` collections,
-//! and settled `Promise`s, plus the primitive `NanBox` values; proxies are a later
-//! extension. Pure, safe `alloc`-only Rust.
+//! settled `Promise`s, and `Proxy`s, plus the primitive `NanBox` values — the full
+//! set of reference cell kinds. Pure, safe `alloc`-only Rust.
 
 use crate::heap::Handle;
 use crate::nanbox::{NanBox, Unpacked};
@@ -76,6 +76,13 @@ pub enum SnapCell {
         /// the fulfillment value or rejection reason
         value: SnapVal,
     },
+    /// a `Proxy`: references to its target and handler objects.
+    Proxy {
+        /// the wrapped target
+        target: SnapVal,
+        /// the trap handler
+        handler: SnapVal,
+    },
 }
 
 /// One captured scope frame: its `(name, value, is_const)` bindings.
@@ -125,6 +132,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             || realm.function_at(*r).is_some()
             || realm.collection_is_set(*r).is_some()
             || realm.promise_state(*r).is_some()
+            || realm.proxy_at(*r).is_some()
             || realm.array_elements(*r).is_some()
             || realm.object_keys(*r).is_some();
         if serializable {
@@ -183,6 +191,20 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             };
             let value = snap_val(value, &mut index_of, &mut order, &mut intern);
             SnapCell::Promise { status, value }
+        } else if let Some((target, handler)) = realm.proxy_at(h) {
+            let target = snap_val(
+                NanBox::handle(target.to_raw()),
+                &mut index_of,
+                &mut order,
+                &mut intern,
+            );
+            let handler = snap_val(
+                NanBox::handle(handler.to_raw()),
+                &mut index_of,
+                &mut order,
+                &mut intern,
+            );
+            SnapCell::Proxy { target, handler }
         } else if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
             let vals = elems
                 .iter()
@@ -273,6 +295,12 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
             }
             SnapCell::Collection { is_set, .. } => (realm.new_collection(*is_set), None),
             SnapCell::Promise { .. } => (realm.new_promise(), None),
+            SnapCell::Proxy { .. } => {
+                // A placeholder proxy (a dummy object for both slots); pass 2 fills
+                // in the real target/handler once every cell's handle exists.
+                let d = realm.new_object();
+                (realm.new_proxy(d, d), None)
+            }
         };
         handles.push(h);
         fn_chains.push(chain);
@@ -338,6 +366,14 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                         _ => crate::cell::PromiseStatus::Pending,
                     };
                     s.value = val;
+                }
+            }
+            SnapCell::Proxy { target, handler } => {
+                if let (Some(t), Some(hd)) = (
+                    resolve(target, &handles).as_handle(),
+                    resolve(handler, &handles).as_handle(),
+                ) {
+                    realm.proxy_set_targets(*h, Handle::from_raw(t), Handle::from_raw(hd));
                 }
             }
         }
@@ -460,6 +496,11 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                 out.push(*status);
                 w_val(value, &mut out);
             }
+            SnapCell::Proxy { target, handler } => {
+                out.push(8);
+                w_val(target, &mut out);
+                w_val(handler, &mut out);
+            }
         }
     }
     out
@@ -579,6 +620,11 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                 let status = r.u8()?;
                 let value = r.val()?;
                 SnapCell::Promise { status, value }
+            }
+            8 => {
+                let target = r.val()?;
+                let handler = r.val()?;
+                SnapCell::Proxy { target, handler }
             }
             t => return Err(SnapError::BadTag(t)),
         };
@@ -980,6 +1026,34 @@ mod tests {
         assert_eq!(
             realm2.string_value(Handle::from_raw(obj_tag.as_handle().unwrap())),
             Some(String::from("cap"))
+        );
+    }
+
+    #[test]
+    fn snapshots_proxies() {
+        let mut realm = Realm::new();
+        // A proxy over a target object { v: 7 } with a handler { tag: "h" }.
+        let target = realm.new_object();
+        realm.set_property(target, "v", NanBox::number(7.0));
+        let handler = realm.new_object();
+        let htag = NanBox::handle(realm.new_string("h").to_raw());
+        realm.set_property(handler, "tag", htag);
+        let proxy = realm.new_proxy(target, handler);
+
+        let snap = capture(&realm, &[proxy]);
+        let bytes = serialize(&snap);
+        let reloaded = deserialize(&bytes).expect("deserialize");
+        assert_eq!(reloaded, snap);
+        let mut realm2 = Realm::new();
+        let p2 = restore(&mut realm2, &reloaded)[0];
+
+        // The proxy's target and handler survive, with their properties.
+        let (t2, h2) = realm2.proxy_at(p2).expect("restored proxy");
+        assert_eq!(realm2.get_property(t2, "v"), Some(NanBox::number(7.0)));
+        let tag = realm2.get_property(h2, "tag").unwrap();
+        assert_eq!(
+            realm2.string_value(Handle::from_raw(tag.as_handle().unwrap())),
+            Some(String::from("h"))
         );
     }
 

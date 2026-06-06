@@ -203,6 +203,20 @@ impl Realm {
         }
     }
 
+    /// Rewrites the `target`/`handler` of the proxy at `handle`. Used by snapshot
+    /// restore to fill a placeholder proxy once its referents are allocated.
+    pub fn proxy_set_targets(&mut self, handle: Handle, target: Handle, handler: Handle) {
+        if let Some(Cell::Proxy {
+            target: t,
+            handler: h,
+            ..
+        }) = self.heap.get_mut(handle)
+        {
+            *t = target;
+            *h = handler;
+        }
+    }
+
     /// The value of the `BigInt` at `handle` (cloned), if it is one.
     #[must_use]
     pub fn bigint_at(&self, handle: Handle) -> Option<crate::bignum::BigInt> {
