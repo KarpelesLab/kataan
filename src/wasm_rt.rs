@@ -107,7 +107,15 @@ pub struct Module {
     /// The function table (`funcref`): each slot is a function index, or `None`
     /// for an uninitialized slot (traps on `call_indirect`).
     table: Vec<Option<u32>>,
+    /// Imported functions, occupying the low function indices `0..n_imported_funcs`
+    /// (module name, field name, type index). The host supplies their behavior.
+    func_imports: Vec<(alloc::string::String, alloc::string::String, u32)>,
 }
+
+/// A host function backing an `import` — receives the WASM call's arguments and
+/// returns its results. This is how a JS (or Rust) function is callable from
+/// inside a WASM module.
+pub type HostFunc = alloc::boxed::Box<dyn Fn(&[Val]) -> Result<Vec<Val>, WasmRtError>>;
 
 /// One linear-memory page, in bytes (WebAssembly fixes this at 64 KiB).
 const PAGE_SIZE: usize = 65536;
@@ -117,6 +125,9 @@ const PAGE_SIZE: usize = 65536;
 struct Store {
     mem: Vec<u8>,
     globals: Vec<Val>,
+    /// Host functions backing the module's imports (index-aligned with
+    /// `Module::func_imports`). Empty for an import-free `Module::call`.
+    host_funcs: Vec<HostFunc>,
 }
 
 /// LEB128 cursor over a byte slice.
@@ -309,6 +320,7 @@ impl Module {
             match id {
                 0 => {} // custom section: ignore
                 1 => Self::decode_types(&mut s, &mut m)?,
+                2 => Self::decode_imports(&mut s, &mut m)?,
                 3 => Self::decode_functions(&mut s, &mut m)?,
                 4 => Self::decode_table(&mut s, &mut m)?,
                 5 => Self::decode_memory(&mut s, &mut m)?,
@@ -345,12 +357,74 @@ impl Module {
         Ok(())
     }
 
+    fn decode_imports(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
+        let count = s.u32()?;
+        for _ in 0..count {
+            let mlen = s.u32()? as usize;
+            let module = alloc::string::String::from_utf8(s.bytes(mlen)?.to_vec())
+                .map_err(|_| WasmRtError("bad import module name"))?;
+            let flen = s.u32()? as usize;
+            let field = alloc::string::String::from_utf8(s.bytes(flen)?.to_vec())
+                .map_err(|_| WasmRtError("bad import field name"))?;
+            let kind = s.byte()?;
+            match kind {
+                0x00 => {
+                    // A function import: its type index. It occupies the next
+                    // function index, before any module-defined function, so push
+                    // it onto `func_types` now (the import section precedes the
+                    // function section).
+                    let type_idx = s.u32()?;
+                    m.func_types.push(type_idx);
+                    m.func_imports.push((module, field, type_idx));
+                }
+                // table (0x01) / memory (0x02) / global (0x03) imports carry a
+                // descriptor we skip for now (only function imports are wired).
+                0x01 => {
+                    s.byte()?; // elemtype
+                    let flag = s.byte()?;
+                    s.u32()?;
+                    if flag == 1 {
+                        s.u32()?;
+                    }
+                }
+                0x02 => {
+                    let flag = s.byte()?;
+                    s.u32()?;
+                    if flag == 1 {
+                        s.u32()?;
+                    }
+                }
+                0x03 => {
+                    s.byte()?; // valtype
+                    s.byte()?; // mutability
+                }
+                _ => return Err(WasmRtError("unsupported import kind")),
+            }
+        }
+        Ok(())
+    }
+
     fn decode_functions(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
         let count = s.u32()?;
         for _ in 0..count {
             m.func_types.push(s.u32()?);
         }
         Ok(())
+    }
+
+    /// The number of imported functions (which occupy the low function indices).
+    fn n_imported_funcs(&self) -> usize {
+        self.func_imports.len()
+    }
+
+    /// The `(module, field)` names of the module's function imports, in the order
+    /// the host must supply [`HostFunc`]s to [`Instance::with_imports`].
+    #[must_use]
+    pub fn import_names(&self) -> Vec<(&str, &str)> {
+        self.func_imports
+            .iter()
+            .map(|(m, f, _)| (m.as_str(), f.as_str()))
+            .collect()
     }
 
     fn decode_memory(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
@@ -526,7 +600,11 @@ impl Module {
             mem[start..end].copy_from_slice(bytes);
         }
         let globals = self.globals.iter().map(|(v, _)| *v).collect();
-        Ok(Store { mem, globals })
+        Ok(Store {
+            mem,
+            globals,
+            host_funcs: Vec::new(),
+        })
     }
 
     /// Calls function `index` with `args`, returning the results. Allocates a
@@ -553,13 +631,22 @@ impl Module {
             .get(index as usize)
             .and_then(|t| self.types.get(*t as usize))
             .ok_or(WasmRtError("no such function"))?;
-        let body = self
-            .bodies
-            .get(index as usize)
-            .ok_or(WasmRtError("no such function body"))?;
         if args.len() != ty.params.len() {
             return Err(WasmRtError("argument count mismatch"));
         }
+        // A function import dispatches to its host function.
+        let n_imp = self.n_imported_funcs();
+        if (index as usize) < n_imp {
+            let host = store
+                .host_funcs
+                .get(index as usize)
+                .ok_or(WasmRtError("missing host function for import"))?;
+            return host(args);
+        }
+        let body = self
+            .bodies
+            .get(index as usize - n_imp)
+            .ok_or(WasmRtError("no such function body"))?;
         // Locals = parameters, then zero-initialized declared locals.
         let mut locals: Vec<Val> = args.to_vec();
         for lt in &body.locals {
@@ -1003,16 +1090,33 @@ pub struct Instance<'m> {
 }
 
 impl<'m> Instance<'m> {
-    /// Instantiates `module`: allocates its linear memory (with data segments
-    /// applied) and initial globals.
+    /// Instantiates `module` with no imports.
     ///
     /// # Errors
-    /// Returns `WasmRtError` if a data segment is out of bounds.
+    /// Returns `WasmRtError` if a data segment is out of bounds, or the module
+    /// declares function imports (use [`with_imports`](Self::with_imports)).
     pub fn new(module: &'m Module) -> Result<Self, WasmRtError> {
-        Ok(Self {
-            module,
-            store: module.new_store()?,
-        })
+        Self::with_imports(module, Vec::new())
+    }
+
+    /// Instantiates `module`, binding `host_funcs` to its function imports (in
+    /// declaration order — see [`Module::import_names`]). This is how a host
+    /// (e.g. JS) function becomes callable from inside the module.
+    ///
+    /// # Errors
+    /// `WasmRtError("import count mismatch")` if the number of host functions
+    /// doesn't match the module's function imports, or a data segment is out of
+    /// bounds.
+    pub fn with_imports(
+        module: &'m Module,
+        host_funcs: Vec<HostFunc>,
+    ) -> Result<Self, WasmRtError> {
+        if host_funcs.len() != module.n_imported_funcs() {
+            return Err(WasmRtError("import count mismatch"));
+        }
+        let mut store = module.new_store()?;
+        store.host_funcs = host_funcs;
+        Ok(Self { module, store })
     }
 
     /// Calls function `index` with `args` over this instance's **persistent**
@@ -1567,6 +1671,54 @@ mod tests {
         // Out-of-bounds host writes are rejected.
         assert!(inst.write_memory(PAGE_SIZE, &[1, 2, 3, 4]).is_err());
         assert!(inst.read_memory(PAGE_SIZE, 4).is_none());
+    }
+
+    #[test]
+    fn host_function_import_is_callable_from_wasm() {
+        // (import "env" "triple" (func (type 0)))           ;; func 0 (i32)->i32
+        // (func (export "run") (param i32) (result i32)
+        //   local.get 0 call 0  i32.const 1 i32.add)         ;; triple(p0) + 1
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]); // type0 (i32)->i32
+        // import section: 1 import, "env"."triple", func type 0
+        m.extend([
+            0x02, 0x0e, 0x01, 0x03, b'e', b'n', b'v', 0x06, b't', b'r', b'i', b'p', b'l', b'e',
+            0x00, 0x00,
+        ]);
+        // function section: 1 defined func, type 0 (this is func index 1)
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        // export "run" = func 1 (the defined function)
+        m.extend([0x07, 0x07, 0x01, 0x03, b'r', b'u', b'n', 0x00, 0x01]);
+        // code: body of func 1: local.get 0, call 0 (import), i32.const 1, i32.add, end
+        let body: Vec<u8> = vec![0x00, 0x20, 0x00, 0x10, 0x00, 0x41, 0x01, 0x6a, 0x0b];
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+
+        let module = Module::decode(&m).expect("decode import module");
+        assert_eq!(module.import_names(), vec![("env", "triple")]);
+
+        // Supply the host function (here a Rust closure; in the engine it bridges
+        // to a JS function): triple(x) = x * 3.
+        let host: HostFunc = alloc::boxed::Box::new(|args: &[Val]| {
+            let x = args[0].as_i32()?;
+            Ok(vec![Val::I32(x.wrapping_mul(3))])
+        });
+        let mut inst = Instance::with_imports(&module, vec![host]).expect("instantiate");
+        // run(10) = triple(10) + 1 = 31.
+        assert_eq!(
+            inst.call_export("run", &[Val::I32(10)]).unwrap(),
+            vec![Val::I32(31)]
+        );
+        assert_eq!(
+            inst.call_export("run", &[Val::I32(-2)]).unwrap(),
+            vec![Val::I32(-5)]
+        );
+
+        // A missing import binding is rejected at instantiation.
+        assert!(Instance::with_imports(&module, vec![]).is_err());
     }
 
     #[test]
