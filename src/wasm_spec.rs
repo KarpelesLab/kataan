@@ -420,9 +420,57 @@ fn emit_op(
             };
             leb_u(n, out);
         }
-        _ => out.push(simple_opcode(name).ok_or_else(|| format!("unknown instruction {name}"))?),
+        "memory.size" => {
+            out.push(0x3f);
+            out.push(0x00); // reserved memory index
+        }
+        "memory.grow" => {
+            out.push(0x40);
+            out.push(0x00);
+        }
+        _ => {
+            if let Some((opcode, align)) = memory_op(name) {
+                // Default memarg: natural alignment, offset 0. (`offset=`/`align=`
+                // memarg atoms aren't modeled — the suite usually omits them.)
+                out.push(opcode);
+                leb_u(u64::from(align), out);
+                leb_u(0, out);
+            } else {
+                out.push(simple_opcode(name).ok_or_else(|| format!("unknown instruction {name}"))?);
+            }
+        }
     }
     Ok(())
+}
+
+/// A memory load/store opcode and its natural alignment (log2 of the byte width).
+fn memory_op(name: &str) -> Option<(u8, u8)> {
+    Some(match name {
+        "i32.load" => (0x28, 2),
+        "i64.load" => (0x29, 3),
+        "f32.load" => (0x2a, 2),
+        "f64.load" => (0x2b, 3),
+        "i32.load8_s" => (0x2c, 0),
+        "i32.load8_u" => (0x2d, 0),
+        "i32.load16_s" => (0x2e, 1),
+        "i32.load16_u" => (0x2f, 1),
+        "i64.load8_s" => (0x30, 0),
+        "i64.load8_u" => (0x31, 0),
+        "i64.load16_s" => (0x32, 1),
+        "i64.load16_u" => (0x33, 1),
+        "i64.load32_s" => (0x34, 2),
+        "i64.load32_u" => (0x35, 2),
+        "i32.store" => (0x36, 2),
+        "i64.store" => (0x37, 3),
+        "f32.store" => (0x38, 2),
+        "f64.store" => (0x39, 3),
+        "i32.store8" => (0x3a, 0),
+        "i32.store16" => (0x3b, 1),
+        "i64.store8" => (0x3c, 0),
+        "i64.store16" => (0x3d, 1),
+        "i64.store32" => (0x3e, 2),
+        _ => return None,
+    })
 }
 
 /// Emits a flat sequence of instructions (each an atom — possibly consuming the
@@ -612,6 +660,46 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
     }
     let n_globals = global_names.len();
 
+    // Collect `(memory N M?)` (at most one in the MVP) and `(data (offset) "…")`.
+    let mut memory: Option<(u32, Option<u32>)> = None;
+    let mut data_segments: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (offset-expr, bytes)
+    for field in &items[1..] {
+        let Sexpr::List(d) = field else { continue };
+        match d.first() {
+            Some(Sexpr::Atom(a)) if a == "memory" => {
+                // skip an optional `$name`
+                let nums: Vec<u32> = d[1..]
+                    .iter()
+                    .filter_map(|s| match s {
+                        Sexpr::Atom(n) => n.parse::<u32>().ok(),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(&min) = nums.first() {
+                    memory = Some((min, nums.get(1).copied()));
+                }
+            }
+            Some(Sexpr::Atom(a)) if a == "data" => {
+                // (data (i32.const OFF) "bytes" …) — offset expr then byte strings.
+                let mut offset = Vec::new();
+                if let Some(Sexpr::List(off)) = d.get(1)
+                    && let (Some(Sexpr::Atom(op)), Some(Sexpr::Atom(n))) = (off.first(), off.get(1))
+                {
+                    emit_op(op, Some(n), &[], &[], &[], &[], &mut offset)?;
+                }
+                offset.push(0x0b);
+                let mut bytes = Vec::new();
+                for it in &d[2..] {
+                    if let Sexpr::Str(s) = it {
+                        bytes.extend_from_slice(s);
+                    }
+                }
+                data_segments.push((offset, bytes));
+            }
+            _ => {}
+        }
+    }
+
     let mut funcs: Vec<WatFunc> = Vec::new();
     for field in &items[1..] {
         let Sexpr::List(f) = field else { continue };
@@ -731,6 +819,23 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
         leb_u(i as u64, &mut fns);
     }
     section(3, &fns, &mut out);
+    // memory section (id 5): a single memory's limits.
+    if let Some((min, max)) = memory {
+        let mut mem = Vec::new();
+        leb_u(1, &mut mem); // one memory
+        match max {
+            Some(m) => {
+                mem.push(0x01); // has-max flag
+                leb_u(u64::from(min), &mut mem);
+                leb_u(u64::from(m), &mut mem);
+            }
+            None => {
+                mem.push(0x00);
+                leb_u(u64::from(min), &mut mem);
+            }
+        }
+        section(5, &mem, &mut out);
+    }
     // global section (id 6): count + the collected per-global entries.
     if n_globals > 0 {
         let mut globals = Vec::new();
@@ -769,6 +874,18 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
         code.extend_from_slice(&b);
     }
     section(10, &code, &mut out);
+    // data section (id 11): each segment is memidx 0, offset expr, then bytes.
+    if !data_segments.is_empty() {
+        let mut data = Vec::new();
+        leb_u(data_segments.len() as u64, &mut data);
+        for (offset, bytes) in &data_segments {
+            leb_u(0, &mut data); // memory index 0
+            data.extend_from_slice(offset);
+            leb_u(bytes.len() as u64, &mut data);
+            data.extend_from_slice(bytes);
+        }
+        section(11, &data, &mut out);
+    }
     Ok(out)
 }
 
@@ -1102,6 +1219,32 @@ mod tests {
         } else {
             panic!("expected a list");
         }
+    }
+
+    #[test]
+    fn wat_memory_and_data_compile_and_run() {
+        // 1-page memory with a data segment writing 0x44332211 (LE) at offset 0;
+        // `load` reads it back, `rt` stores then reloads an arg.
+        let src = "(module \
+            (memory 1) \
+            (data (i32.const 0) \"\\11\\22\\33\\44\") \
+            (func (export \"load\") (result i32) (i32.load (i32.const 0))) \
+            (func (export \"rt\") (param $v i32) (result i32) \
+              (i32.store (i32.const 8) (local.get $v)) \
+              (i32.load (i32.const 8))))";
+        let bin = wat_to_binary(src).expect("compile WAT with memory + data");
+        let module = crate::wasm_rt::Module::decode(&bin).expect("decode");
+        let mut inst = crate::wasm_rt::Instance::new(&module).expect("instantiate");
+        // The data segment little-endian bytes form 0x44332211.
+        assert_eq!(
+            inst.call_export("load", &[]).unwrap(),
+            vec![Val::I32(0x4433_2211)]
+        );
+        // store/reload round-trips an arbitrary value.
+        assert_eq!(
+            inst.call_export("rt", &[Val::I32(-12345)]).unwrap(),
+            vec![Val::I32(-12345)]
+        );
     }
 
     #[test]
