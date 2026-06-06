@@ -132,6 +132,17 @@ pub enum BinOp2 {
     Xor,
 }
 
+/// A JS 32-bit shift op (the count is masked to 5 bits; operand is `ToInt32`d).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShiftOp {
+    /// `<<` — left shift (result reinterpreted as a signed i32)
+    Shl,
+    /// `>>` — sign-propagating (arithmetic) right shift
+    Sar,
+    /// `>>>` — zero-filling (logical) right shift (result is an unsigned u32)
+    Shr,
+}
+
 /// A binary floating-point op for the float compiler. Unlike the integer path,
 /// `f64` arithmetic matches JS number semantics exactly, so no overflow/range
 /// guard is needed — and it supports division.
@@ -261,6 +272,10 @@ pub enum RegOp {
     /// the exact 32-bit value (always within ±2^53), needing no range guard. `op`
     /// is one of `And`/`Or`/`Xor`.
     Bit32 { dst: u8, a: u8, b: u8, op: BinOp2 },
+    /// `reg[dst] = reg[a] <op> (reg[b] & 31)` — a JS 32-bit shift (`<<`/`>>`/`>>>`).
+    /// The operand is taken as 32 bits and the result re-extended (signed for
+    /// `<<`/`>>`, unsigned for `>>>`); always within ±2^53, so no range guard.
+    Shift32 { dst: u8, a: u8, b: u8, op: ShiftOp },
     /// if `reg[cond] == 0`, jump to op index `target`
     JumpIfFalse { cond: u8, target: usize },
     /// unconditional jump to op index `target`
@@ -338,6 +353,15 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
                     _ => x & y,
                 };
                 regs[dst as usize] = i64::from(v);
+                pc += 1;
+            }
+            RegOp::Shift32 { dst, a, b, op } => {
+                let count = (regs[b as usize] as u32) & 31;
+                regs[dst as usize] = match op {
+                    ShiftOp::Shl => i64::from((regs[a as usize] as i32).wrapping_shl(count)),
+                    ShiftOp::Sar => i64::from((regs[a as usize] as i32).wrapping_shr(count)),
+                    ShiftOp::Shr => i64::from((regs[a as usize] as u32).wrapping_shr(count)),
+                };
                 pc += 1;
             }
             RegOp::JumpIfFalse { cond, target } => {
@@ -428,6 +452,12 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 b: resolve(&copy_of, b),
                 op,
             },
+            RegOp::Shift32 { dst, a, b, op } => RegOp::Shift32 {
+                dst,
+                a: resolve(&copy_of, a),
+                b: resolve(&copy_of, b),
+                op,
+            },
             RegOp::Move { dst, src } => RegOp::Move {
                 dst,
                 src: resolve(&copy_of, src),
@@ -455,6 +485,7 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
             | RegOp::Eqz { dst, .. }
             | RegOp::Neg { dst, .. }
             | RegOp::Bit32 { dst, .. }
+            | RegOp::Shift32 { dst, .. }
             | RegOp::Call { dst, .. }
             | RegOp::Arg { dst, .. } => invalidate(&mut copy_of, dst),
             RegOp::JumpIfFalse { .. } | RegOp::Jump { .. } => {
@@ -479,7 +510,10 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
     let mut used: BTreeSet<u8> = BTreeSet::new();
     for op in ops {
         match *op {
-            RegOp::Bin { a, b, .. } | RegOp::Lt { a, b, .. } | RegOp::Bit32 { a, b, .. } => {
+            RegOp::Bin { a, b, .. }
+            | RegOp::Lt { a, b, .. }
+            | RegOp::Bit32 { a, b, .. }
+            | RegOp::Shift32 { a, b, .. } => {
                 used.insert(a);
                 used.insert(b);
             }
@@ -512,6 +546,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
         | RegOp::Eqz { dst, .. }
         | RegOp::Neg { dst, .. }
         | RegOp::Bit32 { dst, .. }
+        | RegOp::Shift32 { dst, .. }
         | RegOp::Arg { dst, .. } => used.contains(&dst),
     };
     // `newpos[old]` = new index of the first surviving op at-or-after `old`.
@@ -545,9 +580,10 @@ fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
     match *op {
         RegOp::Arg { dst, .. } | RegOp::Const { dst, .. } => (Some(dst), [None, None]),
         RegOp::Move { dst, src } => (Some(dst), [Some(src), None]),
-        RegOp::Bin { dst, a, b, .. } | RegOp::Lt { dst, a, b } | RegOp::Bit32 { dst, a, b, .. } => {
-            (Some(dst), [Some(a), Some(b)])
-        }
+        RegOp::Bin { dst, a, b, .. }
+        | RegOp::Lt { dst, a, b }
+        | RegOp::Bit32 { dst, a, b, .. }
+        | RegOp::Shift32 { dst, a, b, .. } => (Some(dst), [Some(a), Some(b)]),
         RegOp::Eqz { dst, a } | RegOp::Neg { dst, a } => (Some(dst), [Some(a), None]),
         RegOp::JumpIfFalse { cond, .. } => (None, [Some(cond), None]),
         RegOp::Ret { src } => (None, [Some(src), None]),
@@ -660,6 +696,12 @@ pub fn allocate_reg(ops: &[RegOp], n_regs: usize) -> (Vec<RegOp>, usize) {
                 a: m(a),
             },
             RegOp::Bit32 { dst, a, b, op } => RegOp::Bit32 {
+                dst: m(dst),
+                a: m(a),
+                b: m(b),
+                op,
+            },
+            RegOp::Shift32 { dst, a, b, op } => RegOp::Shift32 {
                 dst: m(dst),
                 a: m(a),
                 b: m(b),
@@ -801,6 +843,21 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 } else {
                     known[dst as usize] = None;
                     RegOp::Bit32 { dst, a, b, op }
+                }
+            }
+            RegOp::Shift32 { dst, a, b, op } => {
+                if let (Some(x), Some(y)) = (known[a as usize], known[b as usize]) {
+                    let count = (y as u32) & 31;
+                    let v = match op {
+                        ShiftOp::Shl => i64::from((x as i32).wrapping_shl(count)),
+                        ShiftOp::Sar => i64::from((x as i32).wrapping_shr(count)),
+                        ShiftOp::Shr => i64::from((x as u32).wrapping_shr(count)),
+                    };
+                    known[dst as usize] = Some(v);
+                    RegOp::Const { dst, imm: v }
+                } else {
+                    known[dst as usize] = None;
+                    RegOp::Shift32 { dst, a, b, op }
                 }
             }
             RegOp::Arg { dst, .. } => {
@@ -1050,6 +1107,28 @@ pub fn lower_nbvm_with(
                     a,
                     b,
                     op: bop,
+                }
+            }
+            // JS 32-bit shifts `<<`/`>>`/`>>>` (count masked to 5 bits).
+            Op::ValueBin { dst, op, a, b }
+                if matches!(
+                    *op,
+                    crate::nbvm::VB_SHL | crate::nbvm::VB_SHR | crate::nbvm::VB_USHR
+                ) =>
+            {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                let sop = match *op {
+                    crate::nbvm::VB_SHL => ShiftOp::Shl,
+                    crate::nbvm::VB_SHR => ShiftOp::Sar,
+                    _ => ShiftOp::Shr,
+                };
+                RegOp::Shift32 {
+                    dst: d,
+                    a,
+                    b,
+                    op: sop,
                 }
             }
             // Branch targets are nbvm op indices; the lowered stream prepends one
@@ -1556,6 +1635,17 @@ impl X64Assembler {
             _ => 0x21,
         };
         self.code.extend_from_slice(&[0x48, opc, 0xc8]);
+    }
+
+    /// `shl/sar/shr eax, cl` — a 32-bit shift of `eax` by `cl` (masked to 5 bits;
+    /// writing `eax` zeroes the upper 32 bits of `rax`, i.e. zero-extends).
+    pub fn shift_eax_cl(&mut self, op: ShiftOp) {
+        let modrm = match op {
+            ShiftOp::Shl => 0xe0, // /4
+            ShiftOp::Sar => 0xf8, // /7
+            ShiftOp::Shr => 0xe8, // /5
+        };
+        self.code.extend_from_slice(&[0xd3, modrm]);
     }
 
     /// `cmp rax, [rbp+disp]`.
@@ -2066,6 +2156,26 @@ impl JitFunction {
                     a.load_rcx(disp(rb));
                     a.to_int32_rcx();
                     a.bit_rax_rcx(op);
+                    a.store_rax(disp(dst));
+                }
+                RegOp::Shift32 {
+                    dst,
+                    a: ra,
+                    b: rb,
+                    op,
+                } => {
+                    if !ok_reg(dst) || !ok_reg(ra) || !ok_reg(rb) {
+                        return None;
+                    }
+                    // 32-bit shift of the operand by `cl` (count masked to 5 bits).
+                    // The 32-bit op zero-extends; `<<`/`>>` then sign-extend the i32
+                    // result, `>>>` keeps the zero-extended u32. Always in ±2^53.
+                    a.load_rax(disp(ra));
+                    a.load_rcx(disp(rb));
+                    a.shift_eax_cl(op);
+                    if matches!(op, ShiftOp::Shl | ShiftOp::Sar) {
+                        a.to_int32_rax(); // sign-extend the signed i32 result
+                    }
                     a.store_rax(disp(dst));
                 }
                 RegOp::JumpIfFalse { cond, target } => {
@@ -3167,6 +3277,37 @@ mod tests {
             assert_eq!(f.call_args(&[a, b]), expect, "({a:#x} & {b:#x})");
             assert_eq!(eval_reg(&ops, 3, &[a, b]), expect);
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn shift32_matches_js_semantics() {
+        let run = |op: ShiftOp, a: i64, b: i64| -> i64 {
+            let ops = [
+                RegOp::Arg { dst: 0, index: 0 },
+                RegOp::Arg { dst: 1, index: 1 },
+                RegOp::Shift32 {
+                    dst: 2,
+                    a: 0,
+                    b: 1,
+                    op,
+                },
+                RegOp::Ret { src: 2 },
+            ];
+            let (alloc, n) = allocate_reg(&optimize_reg(&ops, 3), 3);
+            let f = JitFunction::compile_reg(n, 2, &alloc).unwrap();
+            let got = f.call_args(&[a, b]);
+            assert_eq!(got, eval_reg(&ops, 3, &[a, b]), "jit vs oracle");
+            got
+        };
+        // << : 1 << 4 == 16; count masked to 5 bits: 1 << 33 == 1 << 1 == 2.
+        assert_eq!(run(ShiftOp::Shl, 1, 4), 16);
+        assert_eq!(run(ShiftOp::Shl, 1, 33), 2);
+        // >> : arithmetic — -8 >> 1 == -4 (sign-propagating).
+        assert_eq!(run(ShiftOp::Sar, -8, 1), -4);
+        // >>> : logical — -1 >>> 0 == 0xFFFFFFFF (4294967295, an unsigned u32).
+        assert_eq!(run(ShiftOp::Shr, -1, 0), 0xFFFF_FFFF);
+        assert_eq!(run(ShiftOp::Shr, -8, 1), 0x7FFF_FFFC);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

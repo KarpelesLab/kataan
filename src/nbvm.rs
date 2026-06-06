@@ -227,9 +227,12 @@ pub(crate) const VB_BIT_AND: u8 = 1;
 pub(crate) const VB_BIT_OR: u8 = 2;
 /// `Op::ValueBin` op code for `^`.
 pub(crate) const VB_BIT_XOR: u8 = 3;
-const VB_SHL: u8 = 4;
-const VB_SHR: u8 = 5;
-const VB_USHR: u8 = 6;
+/// `Op::ValueBin` op code for `<<`.
+pub(crate) const VB_SHL: u8 = 4;
+/// `Op::ValueBin` op code for `>>`.
+pub(crate) const VB_SHR: u8 = 5;
+/// `Op::ValueBin` op code for `>>>`.
+pub(crate) const VB_USHR: u8 = 6;
 const VB_LOOSE_EQ: u8 = 7;
 const VB_LOOSE_NEQ: u8 = 8;
 
@@ -5533,6 +5536,21 @@ mod tests {
                 for (let i = 0; i < 20; i = i + 1) { s = s + rt(i); } \
                 s"),
             "190"
+        );
+    }
+
+    /// A hot function using JS shifts `<<` / `>>` / `>>>` must JIT (lowered to
+    /// `Shift32`) and match the interpreter.
+    #[test]
+    fn hot_function_with_shifts_matches_interpreter() {
+        // f(x) = (x << 2) + (x >> 1); sum over 0..20.
+        // sum(4i) = 4*190 = 760; sum(floor(i/2)) for i=0..19 = 90; total 850.
+        assert_eq!(
+            bc("function f(x){ return (x << 2) + (x >> 1); } \
+                let s = 0; \
+                for (let i = 0; i < 20; i = i + 1) { s = s + f(i); } \
+                s"),
+            "850"
         );
     }
 
