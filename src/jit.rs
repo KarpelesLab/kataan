@@ -267,6 +267,50 @@ pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
     None
 }
 
+/// A bytecode-VM function compiled to native code, callable from the VM with
+/// `NanBox` values. This is the end-to-end fast path: it owns the compiled
+/// machine code and performs the unbox→native→rebox round-trip with an integer
+/// **type guard** at the boundary (a non-integer argument deopts to the
+/// interpreter, exactly as the optimizing tier's guards will).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub struct JitProto {
+    func: JitFunction,
+    n_params: usize,
+}
+
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+impl JitProto {
+    /// Compiles a `nbvm::FnProto` to native code if it is JIT-eligible (see
+    /// [`lower_nbvm`]); otherwise `None` (the caller runs it in the interpreter).
+    #[must_use]
+    pub fn compile(proto: &crate::nbvm::FnProto) -> Option<Self> {
+        let ops = lower_nbvm(proto)?;
+        let func = JitFunction::compile_reg(proto.n_regs, proto.n_params, &ops)?;
+        Some(Self {
+            func,
+            n_params: proto.n_params,
+        })
+    }
+
+    /// Calls the native code with `NanBox` arguments. Returns the reboxed integer
+    /// result, or `None` to **deopt** to the interpreter when a precondition
+    /// fails: wrong argument count, or any argument is not an exact integer.
+    #[must_use]
+    pub fn call_guarded(&self, args: &[crate::nanbox::NanBox]) -> Option<crate::nanbox::NanBox> {
+        if args.len() != self.n_params {
+            return None;
+        }
+        // Guard: every argument must be an exact integer for the integer fast
+        // path to be valid; otherwise bail so the interpreter handles it.
+        let mut ints = [0i64; 6];
+        for (slot, a) in ints.iter_mut().zip(args.iter()) {
+            *slot = nanbox_int(*a)?;
+        }
+        let r = self.func.call_args(&ints[..self.n_params]);
+        Some(crate::nanbox::NanBox::number(r as f64))
+    }
+}
+
 /// The reference for [`JitFunction::compile_sum_1_to_n`]: `sum(1..=n)` for
 /// `n >= 0`, else `0`.
 #[must_use]
@@ -1203,6 +1247,45 @@ mod tests {
             }
         }
         assert!(tested, "expected an integer arithmetic proto to lower");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn jit_proto_end_to_end_with_deopt_guard() {
+        use crate::nanbox::{NanBox, Unpacked};
+        let src = "function f(a, b) { return a * b + a - b; } f;";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let protos = crate::nbvm::compile_program(&program).expect("compile");
+        let p = protos.iter().find(|p| p.n_params == 2).expect("f's proto");
+        let jit = JitProto::compile(p).expect("f should JIT-compile");
+
+        // Integer args → native execution, reboxed: 6*7 + 6 - 7 = 41.
+        let r = jit
+            .call_guarded(&[NanBox::number(6.0), NanBox::number(7.0)])
+            .expect("integer args run natively");
+        assert_eq!(r.unpack(), Unpacked::Number(41.0));
+        let r = jit
+            .call_guarded(&[NanBox::number(-3.0), NanBox::number(4.0)])
+            .unwrap();
+        assert_eq!(r.unpack(), Unpacked::Number(-3.0 * 4.0 + -3.0 - 4.0));
+
+        // A non-integer argument deopts (the guard fails) → None.
+        assert!(
+            jit.call_guarded(&[NanBox::number(1.5), NanBox::number(2.0)])
+                .is_none(),
+            "non-integer arg must deopt"
+        );
+        // A non-number argument deopts too.
+        assert!(
+            jit.call_guarded(&[NanBox::boolean(true), NanBox::number(2.0)])
+                .is_none(),
+            "boolean arg must deopt"
+        );
+        // Wrong arity deopts.
+        assert!(
+            jit.call_guarded(&[NanBox::number(1.0)]).is_none(),
+            "arity mismatch deopts"
+        );
     }
 
     #[test]
