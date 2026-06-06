@@ -254,6 +254,8 @@ pub enum RegOp {
     Lt { dst: u8, a: u8, b: u8 },
     /// `reg[dst] = (reg[a] == 0) as 0/1` — JS logical-not of an integer (`!x`).
     Eqz { dst: u8, a: u8 },
+    /// `reg[dst] = -reg[a]` — JS unary minus of an integer (`-x`).
+    Neg { dst: u8, a: u8 },
     /// if `reg[cond] == 0`, jump to op index `target`
     JumpIfFalse { cond: u8, target: usize },
     /// unconditional jump to op index `target`
@@ -316,6 +318,10 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
             }
             RegOp::Eqz { dst, a } => {
                 regs[dst as usize] = i64::from(regs[a as usize] == 0);
+                pc += 1;
+            }
+            RegOp::Neg { dst, a } => {
+                regs[dst as usize] = regs[a as usize].wrapping_neg();
                 pc += 1;
             }
             RegOp::JumpIfFalse { cond, target } => {
@@ -396,6 +402,10 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 dst,
                 a: resolve(&copy_of, a),
             },
+            RegOp::Neg { dst, a } => RegOp::Neg {
+                dst,
+                a: resolve(&copy_of, a),
+            },
             RegOp::Move { dst, src } => RegOp::Move {
                 dst,
                 src: resolve(&copy_of, src),
@@ -421,6 +431,7 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
             | RegOp::Bin { dst, .. }
             | RegOp::Lt { dst, .. }
             | RegOp::Eqz { dst, .. }
+            | RegOp::Neg { dst, .. }
             | RegOp::Call { dst, .. }
             | RegOp::Arg { dst, .. } => invalidate(&mut copy_of, dst),
             RegOp::JumpIfFalse { .. } | RegOp::Jump { .. } => {
@@ -449,7 +460,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
                 used.insert(a);
                 used.insert(b);
             }
-            RegOp::Move { src, .. } | RegOp::Eqz { a: src, .. } => {
+            RegOp::Move { src, .. } | RegOp::Eqz { a: src, .. } | RegOp::Neg { a: src, .. } => {
                 used.insert(src);
             }
             RegOp::JumpIfFalse { cond, .. } => {
@@ -476,6 +487,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
         | RegOp::Move { dst, .. }
         | RegOp::Lt { dst, .. }
         | RegOp::Eqz { dst, .. }
+        | RegOp::Neg { dst, .. }
         | RegOp::Arg { dst, .. } => used.contains(&dst),
     };
     // `newpos[old]` = new index of the first surviving op at-or-after `old`.
@@ -510,7 +522,7 @@ fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
         RegOp::Arg { dst, .. } | RegOp::Const { dst, .. } => (Some(dst), [None, None]),
         RegOp::Move { dst, src } => (Some(dst), [Some(src), None]),
         RegOp::Bin { dst, a, b, .. } | RegOp::Lt { dst, a, b } => (Some(dst), [Some(a), Some(b)]),
-        RegOp::Eqz { dst, a } => (Some(dst), [Some(a), None]),
+        RegOp::Eqz { dst, a } | RegOp::Neg { dst, a } => (Some(dst), [Some(a), None]),
         RegOp::JumpIfFalse { cond, .. } => (None, [Some(cond), None]),
         RegOp::Ret { src } => (None, [Some(src), None]),
         RegOp::Jump { .. } => (None, [None, None]),
@@ -614,6 +626,10 @@ pub fn allocate_reg(ops: &[RegOp], n_regs: usize) -> (Vec<RegOp>, usize) {
                 b: m(b),
             },
             RegOp::Eqz { dst, a } => RegOp::Eqz {
+                dst: m(dst),
+                a: m(a),
+            },
+            RegOp::Neg { dst, a } => RegOp::Neg {
                 dst: m(dst),
                 a: m(a),
             },
@@ -722,6 +738,21 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 } else {
                     known[dst as usize] = None;
                     RegOp::Eqz { dst, a }
+                }
+            }
+            RegOp::Neg { dst, a } => {
+                // Fold only when the negation stays in the exact-integer range, so
+                // the native overflow guard remains reachable otherwise.
+                match known[a as usize] {
+                    Some(x) if (-SAFE_INT_MAX..=SAFE_INT_MAX).contains(&x.wrapping_neg()) => {
+                        let v = x.wrapping_neg();
+                        known[dst as usize] = Some(v);
+                        RegOp::Const { dst, imm: v }
+                    }
+                    _ => {
+                        known[dst as usize] = None;
+                        RegOp::Neg { dst, a }
+                    }
                 }
             }
             RegOp::Arg { dst, .. } => {
@@ -940,6 +971,14 @@ pub fn lower_nbvm_with(
                 let d = reg8(*dst)?;
                 written[*dst as usize] = true;
                 RegOp::Eqz { dst: d, a }
+            }
+            // JS unary minus of an integer: `-x`. The native code guards i64::MIN
+            // overflow and the exact-integer range, so it never diverges.
+            Op::Neg { dst, a } => {
+                let a = read(&written, *a)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Neg { dst: d, a }
             }
             // Branch targets are nbvm op indices; the lowered stream prepends one
             // `Arg` per parameter, so every target shifts by `n_params`.
@@ -1901,6 +1940,15 @@ impl JitFunction {
                     a.load_rax(disp(ra));
                     a.test_rax_rax();
                     a.sete_rax(); // rax = (reg[ra] == 0) ? 1 : 0
+                    a.store_rax(disp(dst));
+                }
+                RegOp::Neg { dst, a: ra } => {
+                    if !ok_reg(dst) || !ok_reg(ra) {
+                        return None;
+                    }
+                    a.load_rax(disp(ra));
+                    a.neg_rax();
+                    guard!(a, true); // deopt on i64::MIN overflow or out-of-range
                     a.store_rax(disp(dst));
                 }
                 RegOp::JumpIfFalse { cond, target } => {

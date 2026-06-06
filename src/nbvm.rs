@@ -5496,6 +5496,20 @@ mod tests {
         );
     }
 
+    /// A hot function using unary minus (`-x`) must JIT (lowered to `Neg`) and
+    /// match the interpreter.
+    #[test]
+    fn hot_function_with_neg_matches_interpreter() {
+        // g(x) = -x + 100; sum over 0..20 → sum(100 - i) = 2000 - 190 = 1810.
+        assert_eq!(
+            bc("function g(x){ return -x + 100; } \
+                let s = 0; \
+                for (let i = 0; i < 20; i = i + 1) { s = s + g(i); } \
+                s"),
+            "1810"
+        );
+    }
+
     /// A hot float function (division, non-integer values) runs identically
     /// whether it takes the JIT's float path (with the `jit` feature on
     /// Linux x86-64) or the interpreter.
