@@ -201,6 +201,16 @@ pub enum FloatOp {
         dst: u8,
         a: u8,
     },
+    /// `reg[dst] = sqrt(reg[a])` — `Math.sqrt` (the SSE2 `sqrtsd`).
+    Sqrt {
+        dst: u8,
+        a: u8,
+    },
+    /// `reg[dst] = |reg[a]|` — `Math.abs` (clears the f64 sign bit).
+    Abs {
+        dst: u8,
+        a: u8,
+    },
     /// `reg[dst] = !reg[a]` — JS logical-not: `1.0` if `reg[a]` is falsy (`±0.0`
     /// or `NaN`), else `0.0`. (`ucomisd x, 0` sets ZF for both equal and NaN.)
     Eqz {
@@ -262,6 +272,14 @@ pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
             FloatOp::Jump { target } => pc = target,
             FloatOp::Neg { dst, a } => {
                 regs[dst as usize] = -regs[a as usize];
+                pc += 1;
+            }
+            FloatOp::Sqrt { dst, a } => {
+                regs[dst as usize] = regs[a as usize].sqrt();
+                pc += 1;
+            }
+            FloatOp::Abs { dst, a } => {
+                regs[dst as usize] = regs[a as usize].abs();
                 pc += 1;
             }
             FloatOp::Eqz { dst, a } => {
@@ -1439,6 +1457,22 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                 written[*dst as usize] = true;
                 FloatOp::Eq { dst: d, a, b }
             }
+            // `Math.sqrt(x)` / `Math.abs(x)` — pure single-argument f64 intrinsics
+            // (one SSE instruction; no realm access, so JIT-safe on the float path).
+            Op::CallNative { dst, native, args }
+                if (*native == crate::nbvm::NB_MATH_SQRT
+                    || *native == crate::nbvm::NB_MATH_ABS)
+                    && args.len() == 1 =>
+            {
+                let a = read(&written, args[0])?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                if *native == crate::nbvm::NB_MATH_SQRT {
+                    FloatOp::Sqrt { dst: d, a }
+                } else {
+                    FloatOp::Abs { dst: d, a }
+                }
+            }
             // Targets are nbvm op indices; the lowered stream prepends one `Arg`
             // per parameter, so each target shifts by `n_params`.
             Op::JumpIfFalse { cond, target } => FloatOp::JumpIfFalse {
@@ -1953,6 +1987,17 @@ impl X64Assembler {
     /// `xorpd xmm0, xmm0` — set `xmm0` to `+0.0`.
     pub fn zero_xmm0(&mut self) {
         self.code.extend_from_slice(&[0x66, 0x0f, 0x57, 0xc0]);
+    }
+    /// `sqrtsd xmm0, xmm0` — `xmm0 = sqrt(xmm0)`.
+    pub fn sqrtsd_xmm0(&mut self) {
+        self.code.extend_from_slice(&[0xf2, 0x0f, 0x51, 0xc0]);
+    }
+    /// `xmm0 = |xmm0|` — clear the f64 sign bit by `and`ing with `0x7fff…` built
+    /// in `xmm1` (`pcmpeqd` → all-ones, `psrlq 1` → mask, `andpd`).
+    pub fn abs_xmm0(&mut self) {
+        self.code.extend_from_slice(&[0x66, 0x0f, 0x76, 0xc9]); // pcmpeqd xmm1, xmm1
+        self.code.extend_from_slice(&[0x66, 0x0f, 0x73, 0xd1, 0x01]); // psrlq xmm1, 1
+        self.code.extend_from_slice(&[0x66, 0x0f, 0x54, 0xc1]); // andpd xmm0, xmm1
     }
     /// `sete al; setnp cl; and al, cl; movzx rax, al` — after a `ucomisd`, leaves
     /// `rax = (ordered && equal) ? 1 : 0` (false for NaN; true for `+0` vs `-0`).
@@ -2586,6 +2631,22 @@ impl JitFunction {
                     // -x == 0.0 - x (NaN/∞ propagate correctly).
                     a.zero_xmm0();
                     a.fbin_xmm0_mem(FBinOp::Sub, disp(ra));
+                    a.movsd_mem_xmm0(disp(dst));
+                }
+                FloatOp::Sqrt { dst, a: ra } => {
+                    if !ok(dst) || !ok(ra) {
+                        return None;
+                    }
+                    a.movsd_xmm0_mem(disp(ra));
+                    a.sqrtsd_xmm0();
+                    a.movsd_mem_xmm0(disp(dst));
+                }
+                FloatOp::Abs { dst, a: ra } => {
+                    if !ok(dst) || !ok(ra) {
+                        return None;
+                    }
+                    a.movsd_xmm0_mem(disp(ra));
+                    a.abs_xmm0();
                     a.movsd_mem_xmm0(disp(dst));
                 }
                 FloatOp::Eqz { dst, a: ra } => {
@@ -3957,6 +4018,36 @@ mod tests {
         }
         // B itself still works (its code wasn't disturbed).
         assert_eq!(b.call1(21), 42);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn float_sqrt_and_abs_native() {
+        // f(x) = sqrt(|x|).
+        let ops = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Abs { dst: 1, a: 0 },
+            FloatOp::Sqrt { dst: 2, a: 1 },
+            FloatOp::Ret { src: 2 },
+        ];
+        let f = JitFunction::compile_float(3, 1, &ops).unwrap();
+        for x in [4.0f64, -9.0, 2.0, 0.0, -0.0, 1e6, 0.25] {
+            let expect = x.abs().sqrt();
+            let got = f.call_args_f64(&[x]);
+            assert!(
+                (got - expect).abs() < 1e-12 || (got.is_nan() && expect.is_nan()),
+                "sqrt(|{x}|): got {got}, want {expect}"
+            );
+            assert_eq!(eval_float(&ops, 3, &[x]), expect);
+        }
+        // sqrt of a negative is NaN (no abs).
+        let neg = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Sqrt { dst: 1, a: 0 },
+            FloatOp::Ret { src: 1 },
+        ];
+        let g = JitFunction::compile_float(2, 1, &neg).unwrap();
+        assert!(g.call_args_f64(&[-1.0]).is_nan(), "sqrt(-1) is NaN");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

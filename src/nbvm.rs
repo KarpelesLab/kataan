@@ -241,11 +241,11 @@ const VB_LOOSE_NEQ: u8 = 8;
 const NB_CONSOLE_LOG: u16 = 0;
 const NB_MATH_MAX: u16 = 1;
 const NB_MATH_MIN: u16 = 2;
-const NB_MATH_ABS: u16 = 3;
+pub(crate) const NB_MATH_ABS: u16 = 3;
 const NB_MATH_FLOOR: u16 = 4;
 const NB_MATH_CEIL: u16 = 5;
 const NB_MATH_ROUND: u16 = 6;
-const NB_MATH_SQRT: u16 = 7;
+pub(crate) const NB_MATH_SQRT: u16 = 7;
 const NB_MATH_POW: u16 = 8;
 const NB_STRING: u16 = 9;
 const NB_NUMBER: u16 = 10;
@@ -5730,6 +5730,15 @@ mod tests {
                 for (let x = 0.0; x < 5.0; x = x + 0.5) { c = c + eq(x, 2.5); } \
                 c"),
             "1"
+        );
+        // A hot float function using `Math.sqrt`/`Math.abs` (the float path's `Sqrt`
+        // and `Abs`, lowered from the Math native calls): h(-6.25) = sqrt(6.25) = 2.5.
+        assert_eq!(
+            bc("function h(x){ return Math.sqrt(Math.abs(x)); } \
+                let r = 0; \
+                for (let i = 0; i < 40; i = i + 1) { r = h(-6.25); } \
+                r"),
+            "2.5"
         );
     }
 
