@@ -256,6 +256,11 @@ pub enum RegOp {
     Eqz { dst: u8, a: u8 },
     /// `reg[dst] = -reg[a]` — JS unary minus of an integer (`-x`).
     Neg { dst: u8, a: u8 },
+    /// `reg[dst] = ToInt32(reg[a]) <op> ToInt32(reg[b])` — a JS 32-bit bitwise op
+    /// (`&`/`|`/`^`). Both operands are truncated to `i32` first, so the result is
+    /// the exact 32-bit value (always within ±2^53), needing no range guard. `op`
+    /// is one of `And`/`Or`/`Xor`.
+    Bit32 { dst: u8, a: u8, b: u8, op: BinOp2 },
     /// if `reg[cond] == 0`, jump to op index `target`
     JumpIfFalse { cond: u8, target: usize },
     /// unconditional jump to op index `target`
@@ -322,6 +327,17 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
             }
             RegOp::Neg { dst, a } => {
                 regs[dst as usize] = regs[a as usize].wrapping_neg();
+                pc += 1;
+            }
+            RegOp::Bit32 { dst, a, b, op } => {
+                let (x, y) = (regs[a as usize] as i32, regs[b as usize] as i32);
+                let v = match op {
+                    BinOp2::And => x & y,
+                    BinOp2::Or => x | y,
+                    BinOp2::Xor => x ^ y,
+                    _ => x & y,
+                };
+                regs[dst as usize] = i64::from(v);
                 pc += 1;
             }
             RegOp::JumpIfFalse { cond, target } => {
@@ -406,6 +422,12 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 dst,
                 a: resolve(&copy_of, a),
             },
+            RegOp::Bit32 { dst, a, b, op } => RegOp::Bit32 {
+                dst,
+                a: resolve(&copy_of, a),
+                b: resolve(&copy_of, b),
+                op,
+            },
             RegOp::Move { dst, src } => RegOp::Move {
                 dst,
                 src: resolve(&copy_of, src),
@@ -432,6 +454,7 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
             | RegOp::Lt { dst, .. }
             | RegOp::Eqz { dst, .. }
             | RegOp::Neg { dst, .. }
+            | RegOp::Bit32 { dst, .. }
             | RegOp::Call { dst, .. }
             | RegOp::Arg { dst, .. } => invalidate(&mut copy_of, dst),
             RegOp::JumpIfFalse { .. } | RegOp::Jump { .. } => {
@@ -456,7 +479,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
     let mut used: BTreeSet<u8> = BTreeSet::new();
     for op in ops {
         match *op {
-            RegOp::Bin { a, b, .. } | RegOp::Lt { a, b, .. } => {
+            RegOp::Bin { a, b, .. } | RegOp::Lt { a, b, .. } | RegOp::Bit32 { a, b, .. } => {
                 used.insert(a);
                 used.insert(b);
             }
@@ -488,6 +511,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
         | RegOp::Lt { dst, .. }
         | RegOp::Eqz { dst, .. }
         | RegOp::Neg { dst, .. }
+        | RegOp::Bit32 { dst, .. }
         | RegOp::Arg { dst, .. } => used.contains(&dst),
     };
     // `newpos[old]` = new index of the first surviving op at-or-after `old`.
@@ -521,7 +545,9 @@ fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
     match *op {
         RegOp::Arg { dst, .. } | RegOp::Const { dst, .. } => (Some(dst), [None, None]),
         RegOp::Move { dst, src } => (Some(dst), [Some(src), None]),
-        RegOp::Bin { dst, a, b, .. } | RegOp::Lt { dst, a, b } => (Some(dst), [Some(a), Some(b)]),
+        RegOp::Bin { dst, a, b, .. } | RegOp::Lt { dst, a, b } | RegOp::Bit32 { dst, a, b, .. } => {
+            (Some(dst), [Some(a), Some(b)])
+        }
         RegOp::Eqz { dst, a } | RegOp::Neg { dst, a } => (Some(dst), [Some(a), None]),
         RegOp::JumpIfFalse { cond, .. } => (None, [Some(cond), None]),
         RegOp::Ret { src } => (None, [Some(src), None]),
@@ -632,6 +658,12 @@ pub fn allocate_reg(ops: &[RegOp], n_regs: usize) -> (Vec<RegOp>, usize) {
             RegOp::Neg { dst, a } => RegOp::Neg {
                 dst: m(dst),
                 a: m(a),
+            },
+            RegOp::Bit32 { dst, a, b, op } => RegOp::Bit32 {
+                dst: m(dst),
+                a: m(a),
+                b: m(b),
+                op,
             },
             RegOp::JumpIfFalse { cond, target } => RegOp::JumpIfFalse {
                 cond: m(cond),
@@ -753,6 +785,22 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                         known[dst as usize] = None;
                         RegOp::Neg { dst, a }
                     }
+                }
+            }
+            RegOp::Bit32 { dst, a, b, op } => {
+                if let (Some(x), Some(y)) = (known[a as usize], known[b as usize]) {
+                    let (x, y) = (x as i32, y as i32);
+                    let v = i64::from(match op {
+                        BinOp2::And => x & y,
+                        BinOp2::Or => x | y,
+                        BinOp2::Xor => x ^ y,
+                        _ => x & y,
+                    });
+                    known[dst as usize] = Some(v);
+                    RegOp::Const { dst, imm: v }
+                } else {
+                    known[dst as usize] = None;
+                    RegOp::Bit32 { dst, a, b, op }
                 }
             }
             RegOp::Arg { dst, .. } => {
@@ -979,6 +1027,30 @@ pub fn lower_nbvm_with(
                 let d = reg8(*dst)?;
                 written[*dst as usize] = true;
                 RegOp::Neg { dst: d, a }
+            }
+            // JS 32-bit bitwise `&`/`|`/`^`: ToInt32 both operands then combine.
+            // The native code truncates to i32 first, so it matches JS semantics
+            // for any in-range integer operand (i64 bitwise would not).
+            Op::ValueBin { dst, op, a, b }
+                if matches!(
+                    *op,
+                    crate::nbvm::VB_BIT_AND | crate::nbvm::VB_BIT_OR | crate::nbvm::VB_BIT_XOR
+                ) =>
+            {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                let bop = match *op {
+                    crate::nbvm::VB_BIT_AND => BinOp2::And,
+                    crate::nbvm::VB_BIT_OR => BinOp2::Or,
+                    _ => BinOp2::Xor,
+                };
+                RegOp::Bit32 {
+                    dst: d,
+                    a,
+                    b,
+                    op: bop,
+                }
             }
             // Branch targets are nbvm op indices; the lowered stream prepends one
             // `Arg` per parameter, so every target shifts by `n_params`.
@@ -1457,6 +1529,33 @@ impl X64Assembler {
     pub fn store_rax(&mut self, disp: i32) {
         self.code.extend_from_slice(&[0x48, 0x89, 0x85]);
         self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `mov rcx, [rbp+disp]`.
+    pub fn load_rcx(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x48, 0x8b, 0x8d]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `movsxd rax, eax` — truncate `rax` to 32 bits then sign-extend (JS ToInt32).
+    pub fn to_int32_rax(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x63, 0xc0]);
+    }
+
+    /// `movsxd rcx, ecx` — JS ToInt32 of `rcx`.
+    pub fn to_int32_rcx(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x63, 0xc9]);
+    }
+
+    /// `<op> rax, rcx` for the bitwise ops `and`/`or`/`xor` (others unused here).
+    pub fn bit_rax_rcx(&mut self, op: BinOp2) {
+        let opc = match op {
+            BinOp2::And => 0x21,
+            BinOp2::Or => 0x09,
+            BinOp2::Xor => 0x31,
+            _ => 0x21,
+        };
+        self.code.extend_from_slice(&[0x48, opc, 0xc8]);
     }
 
     /// `cmp rax, [rbp+disp]`.
@@ -1949,6 +2048,24 @@ impl JitFunction {
                     a.load_rax(disp(ra));
                     a.neg_rax();
                     guard!(a, true); // deopt on i64::MIN overflow or out-of-range
+                    a.store_rax(disp(dst));
+                }
+                RegOp::Bit32 {
+                    dst,
+                    a: ra,
+                    b: rb,
+                    op,
+                } => {
+                    if !ok_reg(dst) || !ok_reg(ra) || !ok_reg(rb) {
+                        return None;
+                    }
+                    // ToInt32 each operand (truncate to 32 bits, sign-extend), then
+                    // the bitwise op. The result is an exact i32 → no range guard.
+                    a.load_rax(disp(ra));
+                    a.to_int32_rax();
+                    a.load_rcx(disp(rb));
+                    a.to_int32_rcx();
+                    a.bit_rax_rcx(op);
                     a.store_rax(disp(dst));
                 }
                 RegOp::JumpIfFalse { cond, target } => {
@@ -3018,6 +3135,37 @@ mod tests {
                 x * (x - 1) / 2,
                 "loop sum 0..{x}"
             );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn bit32_matches_js_toint32_semantics() {
+        // f(a,b) = a & b, with JS ToInt32 truncation.
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Arg { dst: 1, index: 1 },
+            RegOp::Bit32 {
+                dst: 2,
+                a: 0,
+                b: 1,
+                op: BinOp2::And,
+            },
+            RegOp::Ret { src: 2 },
+        ];
+        let (alloc, n) = allocate_reg(&optimize_reg(&ops, 3), 3);
+        let f = JitFunction::compile_reg(n, 2, &alloc).unwrap();
+        // Including a value above 2^32 to exercise ToInt32 truncation:
+        // (2^32 + 0xF0) & 0xFF  ==  0xF0  (the high bits are dropped).
+        for (a, b) in [
+            (0xFF, 0x0F),
+            (0xF0F0, 0x0FF0),
+            (1 << 32 | 0xF0, 0xFF),
+            (-1, 0x1234),
+        ] {
+            let expect = i64::from((a as i32) & (b as i32));
+            assert_eq!(f.call_args(&[a, b]), expect, "({a:#x} & {b:#x})");
+            assert_eq!(eval_reg(&ops, 3, &[a, b]), expect);
         }
     }
 

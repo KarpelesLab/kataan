@@ -221,9 +221,12 @@ pub enum Op {
 
 // `Op::ValueBin` op codes.
 const VB_POW: u8 = 0;
-const VB_BIT_AND: u8 = 1;
-const VB_BIT_OR: u8 = 2;
-const VB_BIT_XOR: u8 = 3;
+/// `Op::ValueBin` op code for `&` (exposed for the JIT's bitwise lowering).
+pub(crate) const VB_BIT_AND: u8 = 1;
+/// `Op::ValueBin` op code for `|`.
+pub(crate) const VB_BIT_OR: u8 = 2;
+/// `Op::ValueBin` op code for `^`.
+pub(crate) const VB_BIT_XOR: u8 = 3;
 const VB_SHL: u8 = 4;
 const VB_SHR: u8 = 5;
 const VB_USHR: u8 = 6;
@@ -5507,6 +5510,29 @@ mod tests {
                 for (let i = 0; i < 20; i = i + 1) { s = s + g(i); } \
                 s"),
             "1810"
+        );
+    }
+
+    /// A hot function using JS bitwise `&` / `|` / `^` must JIT (lowered to
+    /// `Bit32` with ToInt32 truncation) and match the interpreter.
+    #[test]
+    fn hot_function_with_bitwise_matches_interpreter() {
+        // mask(x) = (x & 7) | 16; sum over 0..40 of mask(i):
+        // each i contributes (i%8) + 16; sum_{i=0..39}(i&7) = 5*(0+..+7)=140; +40*16=640 → 780.
+        assert_eq!(
+            bc("function mask(x){ return (x & 7) | 16; } \
+                let s = 0; \
+                for (let i = 0; i < 40; i = i + 1) { s = s + mask(i); } \
+                s"),
+            "780"
+        );
+        // xor is its own inverse: (x ^ 255) ^ 255 == x for x in 0..20 → sum = 190.
+        assert_eq!(
+            bc("function rt(x){ return (x ^ 255) ^ 255; } \
+                let s = 0; \
+                for (let i = 0; i < 20; i = i + 1) { s = s + rt(i); } \
+                s"),
+            "190"
         );
     }
 
