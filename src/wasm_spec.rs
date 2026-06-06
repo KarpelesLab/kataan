@@ -279,6 +279,8 @@ fn valtype_byte(name: &str) -> Option<u8> {
 /// The opcode of an instruction that carries no immediate operand.
 fn simple_opcode(name: &str) -> Option<u8> {
     Some(match name {
+        "unreachable" => 0x00,
+        "nop" => 0x01,
         "drop" => 0x1a,
         "select" => 0x1b,
         "return" => 0x0f,
@@ -1956,6 +1958,24 @@ mod tests {
         assert_eq!(parse_wat_int("0x10").unwrap(), 16);
         assert_eq!(parse_wat_int("-0x1").unwrap(), -1);
         assert_eq!(parse_wat_int("4_294_967_295").unwrap(), 4_294_967_295);
+    }
+
+    #[test]
+    fn spec_unreachable_traps_and_nop() {
+        // `unreachable` always traps; `nop` does nothing; a guarded `unreachable`
+        // only traps on the taken branch (so `nop` paths still return).
+        let script = "(module \
+            (func (export \"boom\") (result i32) (unreachable)) \
+            (func (export \"guard\") (param i32) (result i32) \
+              (nop) \
+              (if (result i32) (local.get 0) \
+                (then (nop) (i32.const 1)) \
+                (else (unreachable))))) \
+            (assert_trap (invoke \"boom\")) \
+            (assert_return (invoke \"guard\" (i32.const 1)) (i32.const 1)) \
+            (assert_trap (invoke \"guard\" (i32.const 0)))";
+        let n = run_wast(script).expect("unreachable/nop conformance passes");
+        assert_eq!(n, 3);
     }
 
     #[test]
