@@ -38,6 +38,14 @@ pub enum Assertion {
         /// the call arguments
         args: Vec<Val>,
     },
+    /// a bare `invoke`: call `func` for its side effects; no result check, but a
+    /// trap is still an error.
+    Invoke {
+        /// the exported function name
+        func: &'static str,
+        /// the call arguments
+        args: Vec<Val>,
+    },
 }
 
 /// Runs every [`Assertion`] against a freshly-instantiated `module_bytes`.
@@ -65,6 +73,10 @@ pub fn run_assertions(module_bytes: &[u8], asserts: &[Assertion]) -> Result<usiz
                 if inst.call_export(func, args).is_ok() {
                     return Err(format!("assert {i}: {func}({args:?}) did not trap"));
                 }
+            }
+            Assertion::Invoke { func, args } => {
+                inst.call_export(func, args)
+                    .map_err(|e| format!("invoke {i}: {func} trapped: {}", e.0))?;
             }
         }
     }
@@ -1245,12 +1257,12 @@ pub fn run_wast(src: &str) -> Result<usize, String> {
                 batch.push(Assertion::Trap { func, args });
             }
             "invoke" => {
+                // A bare `invoke` runs in sequence with the batch's assertions, so
+                // its side effects (global/memory mutations) are visible to later
+                // asserts on the same instance.
                 let (func, args) = parse_invoke(cmd)?;
                 let func: &'static str = alloc::boxed::Box::leak(func.into_boxed_str());
-                // An `invoke` with no expectation: any non-error result is fine.
-                // Model it as a Return with whatever it yields by skipping the
-                // check — simplest is to run it standalone here.
-                let _ = (func, args);
+                batch.push(Assertion::Invoke { func, args });
             }
             "assert_invalid" | "assert_malformed" => {
                 executed += flush(&mut cur, &mut batch)?;
@@ -1772,6 +1784,23 @@ mod tests {
             (assert_return (invoke \"dd\" (f64.const 0.0)) (f64.const nan:canonical)) \
             (assert_return (invoke \"negz\") (f64.const -0.0))";
         let n = run_wast(script).expect("nan/signed-zero .wast passes");
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn wast_bare_invoke_runs_in_sequence() {
+        // A bare `(invoke "bump")` mutates a global between assertions; the later
+        // `assert_return (invoke "get")` must observe the side effect.
+        let script = "(module \
+            (global $n (mut i32) (i32.const 0)) \
+            (func (export \"bump\") (global.set $n (i32.add (global.get $n) (i32.const 5)))) \
+            (func (export \"get\") (result i32) (global.get $n))) \
+            (assert_return (invoke \"get\") (i32.const 0)) \
+            (invoke \"bump\") \
+            (invoke \"bump\") \
+            (assert_return (invoke \"get\") (i32.const 10))";
+        // 4 commands run against the one instance, in order.
+        let n = run_wast(script).expect("bare-invoke sequence passes");
         assert_eq!(n, 4);
     }
 
