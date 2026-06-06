@@ -1959,6 +1959,31 @@ mod tests {
     }
 
     #[test]
+    fn spec_i64_operations() {
+        // i64 arithmetic/comparison/bitwise edge cases: wrapping, signed vs unsigned
+        // division and comparison, rotate, and clz/ctz on 64-bit values.
+        let script = "(module \
+            (func (export \"mul\") (param i64 i64) (result i64) (i64.mul (local.get 0) (local.get 1))) \
+            (func (export \"divu\") (param i64 i64) (result i64) (i64.div_u (local.get 0) (local.get 1))) \
+            (func (export \"ltu\") (param i64 i64) (result i32) (i64.lt_u (local.get 0) (local.get 1))) \
+            (func (export \"lts\") (param i64 i64) (result i32) (i64.lt_s (local.get 0) (local.get 1))) \
+            (func (export \"rotl\") (param i64 i64) (result i64) (i64.rotl (local.get 0) (local.get 1))) \
+            (func (export \"clz\") (param i64) (result i64) (i64.clz (local.get 0))) \
+            (func (export \"shru\") (param i64 i64) (result i64) (i64.shr_u (local.get 0) (local.get 1)))) \
+            (assert_return (invoke \"mul\" (i64.const 0x100000000) (i64.const 0x100000000)) (i64.const 0)) \
+            (assert_return (invoke \"divu\" (i64.const -1) (i64.const 2)) (i64.const 0x7fffffffffffffff)) \
+            (assert_return (invoke \"ltu\" (i64.const -1) (i64.const 1)) (i32.const 0)) \
+            (assert_return (invoke \"lts\" (i64.const -1) (i64.const 1)) (i32.const 1)) \
+            (assert_return (invoke \"rotl\" (i64.const 0x1) (i64.const 4)) (i64.const 0x10)) \
+            (assert_return (invoke \"clz\" (i64.const 1)) (i64.const 63)) \
+            (assert_return (invoke \"clz\" (i64.const 0)) (i64.const 64)) \
+            (assert_return (invoke \"shru\" (i64.const -1) (i64.const 60)) (i64.const 0xf)) \
+            (assert_trap (invoke \"divu\" (i64.const 1) (i64.const 0)))";
+        let n = run_wast(script).expect("i64 operations conformance passes");
+        assert_eq!(n, 9);
+    }
+
+    #[test]
     fn spec_memory_grow_and_size() {
         // `memory.size` reports current pages; `memory.grow` returns the old size
         // (or -1 on failure) and makes the new bytes accessible.
