@@ -37,3 +37,14 @@ assert.sameValue(threw, true, "Instance requires a Module");
 var threwM = false;
 try { new WebAssembly.Module(new Uint8Array([1, 2, 3])); } catch (e) { threwM = true; }
 assert.sameValue(threwM, true, "invalid module throws");
+
+// WebAssembly.compile is async: a Promise<Module>, rejected (not thrown) on bad
+// bytes. Assertions run in the microtask callbacks the harness drains.
+assert.sameValue(typeof WebAssembly.compile, "function", "compile exists");
+WebAssembly.compile(bytes).then(function (m) {
+  assert.sameValue(new WebAssembly.Instance(m).exports.add(20, 22), 42, "compiled module instantiates");
+});
+WebAssembly.compile(new Uint8Array([1, 2, 3])).then(
+  function () { assert.sameValue(true, false, "bad bytes should reject"); },
+  function (e) { assert.sameValue(e instanceof TypeError, true, "compile rejects on bad bytes"); }
+);

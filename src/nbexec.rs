@@ -271,6 +271,8 @@ const N_FUNCTION: u16 = 187;
 const N_WASM_MODULE: u16 = 188;
 /// `new WebAssembly.Instance(module, imports?)` — an instance with `.exports`.
 const N_WASM_INSTANCE: u16 = 189;
+/// `WebAssembly.compile(bytes)` — async compile → `Promise<Module>`.
+const N_WASM_COMPILE: u16 = 190;
 // Hidden slots on a WASM export wrapper's data object.
 const WASM_BYTES: &str = "\u{0}wbytes";
 const WASM_EXPORT: &str = "\u{0}wexport";
@@ -660,6 +662,7 @@ impl<'a> Interp<'a> {
                 ("instantiate", N_WASM_INSTANTIATE),
                 ("Module", N_WASM_MODULE),
                 ("Instance", N_WASM_INSTANCE),
+                ("compile", N_WASM_COMPILE),
             ],
         );
         // A minimal `Object.prototype` carrying the methods commonly invoked via
@@ -1584,6 +1587,17 @@ impl<'a> Interp<'a> {
                 self.realm
                     .set_property(result, "module", NanBox::handle(module.to_raw()));
                 NanBox::handle(result.to_raw())
+            }
+            // `WebAssembly.compile(bytes)` → `Promise<Module>` (rejected, not thrown,
+            // on a bad module).
+            N_WASM_COMPILE => {
+                let p = self.realm.new_promise();
+                match self.make_wasm_module(arg(0)) {
+                    Ok(module) => self.settle(p, module, true),
+                    Err(ExecError::Throw(err)) => self.settle(p, err, false),
+                    Err(other) => return Err(other),
+                }
+                NanBox::handle(p.to_raw())
             }
             // `Object.prototype.*` methods — the receiver is `self.this_val`.
             N_OBJ_PROTO_TOSTRING => {
@@ -2863,22 +2877,7 @@ impl<'a> Interp<'a> {
         // `new WebAssembly.Module(bytes)` — decode/validate, keep the bytes so a
         // later `new WebAssembly.Instance(module)` can instantiate it.
         if id == N_WASM_MODULE {
-            let bytes = self
-                .wasm_bytes(args.first().copied().unwrap_or(NanBox::undefined()))
-                .ok_or_else(|| self.wasm_compile_error("invalid module source"))?;
-            crate::wasm_rt::Module::decode(&bytes)
-                .map_err(|_| self.wasm_compile_error("invalid module"))?;
-            let module = self.realm.new_object();
-            // The original buffer is retained for instantiation/`instanceof`.
-            self.realm.set_property(
-                module,
-                WASM_BYTES,
-                args.first().copied().unwrap_or(NanBox::undefined()),
-            );
-            self.realm.mark_hidden(module, WASM_BYTES);
-            self.realm
-                .set_hidden_property(module, WASM_IS_MODULE, NanBox::boolean(true));
-            return Ok(NanBox::handle(module.to_raw()));
+            return self.make_wasm_module(args.first().copied().unwrap_or(NanBox::undefined()));
         }
         // `new WebAssembly.Instance(module, importObject?)` → `{ exports: {…} }`.
         if id == N_WASM_INSTANCE {
@@ -6141,6 +6140,22 @@ impl<'a> Interp<'a> {
     fn wasm_type_error(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);
         ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
+    }
+
+    /// Decodes/validates `bytes_arr` and builds a `WebAssembly.Module` object that
+    /// retains the source bytes (for later instantiation), or throws a `TypeError`.
+    fn make_wasm_module(&mut self, bytes_arr: NanBox) -> Result<NanBox, ExecError> {
+        let bytes = self
+            .wasm_bytes(bytes_arr)
+            .ok_or_else(|| self.wasm_compile_error("invalid module source"))?;
+        crate::wasm_rt::Module::decode(&bytes)
+            .map_err(|_| self.wasm_compile_error("invalid module"))?;
+        let module = self.realm.new_object();
+        self.realm.set_property(module, WASM_BYTES, bytes_arr);
+        self.realm.mark_hidden(module, WASM_BYTES);
+        self.realm
+            .set_hidden_property(module, WASM_IS_MODULE, NanBox::boolean(true));
+        Ok(NanBox::handle(module.to_raw()))
     }
 
     /// Builds an instance object (`{ exports: {…} }`) from module `bytes_arr` (the
