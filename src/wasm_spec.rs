@@ -306,6 +306,7 @@ fn emit_op(
     imm: Option<&str>,
     locals: &[String],
     funcs: &[String],
+    labels: &[String],
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
     // Resolves an index immediate against a symbol table: `$name` → its position,
@@ -367,13 +368,21 @@ fn emit_op(
             out.push(0x10);
             leb_u(resolve(funcs, "function")?, out);
         }
-        // br/br_if take a numeric label depth (named labels not yet supported).
+        // br/br_if: a numeric label depth, or a `$name` resolved against the
+        // enclosing label stack (depth 0 = innermost).
         "br" | "br_if" => {
             out.push(if name == "br" { 0x0c } else { 0x0d });
-            let n = imm
-                .ok_or("br needs a label")?
-                .parse::<u64>()
-                .map_err(|_| "br label must be numeric")?;
+            let s = imm.ok_or("br needs a label")?;
+            let n = if let Some(stripped) = s.strip_prefix('$') {
+                labels
+                    .iter()
+                    .rev()
+                    .position(|l| l == stripped)
+                    .map(|d| d as u64)
+                    .ok_or_else(|| format!("unknown label ${stripped}"))?
+            } else {
+                s.parse::<u64>().map_err(|_| "br label must be numeric")?
+            };
             leb_u(n, out);
         }
         _ => out.push(simple_opcode(name).ok_or_else(|| format!("unknown instruction {name}"))?),
@@ -387,13 +396,14 @@ fn emit_instrs(
     items: &[Sexpr],
     locals: &[String],
     funcs: &[String],
+    labels: &mut Vec<String>,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
     let mut i = 0;
     while i < items.len() {
         match &items[i] {
             Sexpr::List(inner) => {
-                emit_folded(inner, locals, funcs, out)?;
+                emit_folded(inner, locals, funcs, labels, out)?;
                 i += 1;
             }
             Sexpr::Atom(name) => {
@@ -402,10 +412,10 @@ fn emit_instrs(
                         Some(Sexpr::Atom(s)) => s.as_str(),
                         _ => return Err(format!("{name} needs an immediate")),
                     };
-                    emit_op(name, Some(imm), locals, funcs, out)?;
+                    emit_op(name, Some(imm), locals, funcs, labels, out)?;
                     i += 2;
                 } else {
-                    emit_op(name, None, locals, funcs, out)?;
+                    emit_op(name, None, locals, funcs, labels, out)?;
                     i += 1;
                 }
             }
@@ -416,21 +426,25 @@ fn emit_instrs(
 }
 
 /// Reads an optional leading `$label` then an optional `(result T)` blocktype from
-/// `items`, returning the blocktype byte (`0x40` = empty) and how many items were
-/// consumed.
-fn block_type_of(items: &[Sexpr]) -> (u8, usize) {
+/// `items`, returning the label (empty if none), the blocktype byte (`0x40` =
+/// empty), and how many items were consumed.
+fn block_type_of(items: &[Sexpr]) -> (String, u8, usize) {
     let mut skip = 0;
-    if matches!(items.first(), Some(Sexpr::Atom(s)) if s.starts_with('$')) {
-        skip += 1; // a block label — not modeled, but consume it
+    let mut label = String::new();
+    if let Some(Sexpr::Atom(s)) = items.first()
+        && let Some(name) = s.strip_prefix('$')
+    {
+        label = name.into();
+        skip += 1;
     }
     if let Some(Sexpr::List(p)) = items.get(skip)
         && p.first() == Some(&Sexpr::Atom(String::from("result")))
         && let Some(Sexpr::Atom(t)) = p.get(1)
         && let Some(b) = valtype_byte(t)
     {
-        return (b, skip + 1);
+        return (label, b, skip + 1);
     }
-    (0x40, skip)
+    (label, 0x40, skip)
 }
 
 /// Emits a folded instruction `(op imm? operands…)`: operands first, then the op.
@@ -439,6 +453,7 @@ fn emit_folded(
     inner: &[Sexpr],
     locals: &[String],
     funcs: &[String],
+    labels: &mut Vec<String>,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
     let Some(Sexpr::Atom(name)) = inner.first() else {
@@ -446,36 +461,41 @@ fn emit_folded(
     };
     match name.as_str() {
         "block" | "loop" => {
-            let (bt, skip) = block_type_of(&inner[1..]);
+            let (label, bt, skip) = block_type_of(&inner[1..]);
             out.push(if name == "block" { 0x02 } else { 0x03 });
             out.push(bt);
-            emit_instrs(&inner[1 + skip..], locals, funcs, out)?;
+            labels.push(label);
+            emit_instrs(&inner[1 + skip..], locals, funcs, labels, out)?;
+            labels.pop();
             out.push(0x0b); // end
             return Ok(());
         }
         "if" => {
             // (if label? (result T)? cond* (then instr*) (else instr*)?)
-            let (bt, skip) = block_type_of(&inner[1..]);
+            let (label, bt, skip) = block_type_of(&inner[1..]);
             let rest = &inner[1 + skip..];
             let is_clause = |s: &Sexpr, kw: &str| matches!(s, Sexpr::List(p) if p.first() == Some(&Sexpr::Atom(String::from(kw))));
             let then_at = rest
                 .iter()
                 .position(|s| is_clause(s, "then"))
                 .ok_or("if without a (then …) clause")?;
-            // The condition precedes `(then …)` and is emitted before the `if`.
-            emit_instrs(&rest[..then_at], locals, funcs, out)?;
+            // The condition precedes `(then …)`, emitted before the `if` (so it
+            // doesn't see the if's own label).
+            emit_instrs(&rest[..then_at], locals, funcs, labels, out)?;
             out.push(0x04); // if
             out.push(bt);
+            labels.push(label);
             if let Sexpr::List(then_p) = &rest[then_at] {
-                emit_instrs(&then_p[1..], locals, funcs, out)?;
+                emit_instrs(&then_p[1..], locals, funcs, labels, out)?;
             }
             if let Some(else_s) = rest.get(then_at + 1)
                 && is_clause(else_s, "else")
                 && let Sexpr::List(else_p) = else_s
             {
                 out.push(0x05); // else
-                emit_instrs(&else_p[1..], locals, funcs, out)?;
+                emit_instrs(&else_p[1..], locals, funcs, labels, out)?;
             }
+            labels.pop();
             out.push(0x0b); // end
             return Ok(());
         }
@@ -486,11 +506,11 @@ fn emit_folded(
             Some(Sexpr::Atom(s)) => s.clone(),
             _ => return Err(format!("{name} needs an immediate")),
         };
-        emit_instrs(&inner[2..], locals, funcs, out)?;
-        emit_op(name, Some(&imm), locals, funcs, out)?;
+        emit_instrs(&inner[2..], locals, funcs, labels, out)?;
+        emit_op(name, Some(&imm), locals, funcs, labels, out)?;
     } else {
-        emit_instrs(&inner[1..], locals, funcs, out)?;
-        emit_op(name, None, locals, funcs, out)?;
+        emit_instrs(&inner[1..], locals, funcs, labels, out)?;
+        emit_op(name, None, locals, funcs, labels, out)?;
     }
     Ok(())
 }
@@ -598,7 +618,14 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
     let func_names: Vec<String> = funcs.iter().map(|f| f.name.clone()).collect();
     for f in &mut funcs {
         let mut body = Vec::new();
-        emit_instrs(&f.body_items, &f.local_names, &func_names, &mut body)?;
+        let mut labels: Vec<String> = Vec::new();
+        emit_instrs(
+            &f.body_items,
+            &f.local_names,
+            &func_names,
+            &mut labels,
+            &mut body,
+        )?;
         f.body = body;
     }
 
@@ -1021,19 +1048,32 @@ mod tests {
         assert_eq!(m.call(0, &[Val::I32(-7)]).unwrap(), vec![Val::I32(7)]);
         assert_eq!(m.call(0, &[Val::I32(5)]).unwrap(), vec![Val::I32(5)]);
 
-        // A `loop` with `br_if`: sum 1..=n.
-        // (local $i)(local $sum) loop: i=i+1; sum=sum+i; br_if (i < n) loop.
+        // A `loop` with a *named* label `br_if $loop`: sum 1..=n.
         let sum = "(module (func (export \"sum\") (param $n i32) (result i32) \
                    (local $i i32) (local $sum i32) \
-                   (loop \
+                   (loop $loop \
                      (local.set $i (i32.add (local.get $i) (i32.const 1))) \
                      (local.set $sum (i32.add (local.get $sum) (local.get $i))) \
-                     (br_if 0 (i32.lt_s (local.get $i) (local.get $n)))) \
+                     (br_if $loop (i32.lt_s (local.get $i) (local.get $n)))) \
                    (local.get $sum)))";
         let m2 =
             crate::wasm_rt::Module::decode(&wat_to_binary(sum).expect("compile loop")).unwrap();
         assert_eq!(m2.call(0, &[Val::I32(5)]).unwrap(), vec![Val::I32(15)]); // 1+2+3+4+5
         assert_eq!(m2.call(0, &[Val::I32(10)]).unwrap(), vec![Val::I32(55)]);
+        // The named `$loop` compiles to the same binary as the numeric depth `0`.
+        let numeric = sum
+            .replace("loop $loop", "loop")
+            .replace("br_if $loop", "br_if 0");
+        assert_eq!(
+            wat_to_binary(&numeric).unwrap(),
+            wat_to_binary(sum).unwrap(),
+            "named label ≡ numeric depth 0"
+        );
+        // A branch to an *outer* named block from inside a loop (depth 1) compiles.
+        let outer = "(module (func (export \"f\") (result i32) \
+                     (block $done (result i32) \
+                       (loop $l (br $done (i32.const 7))) )))";
+        assert!(wat_to_binary(outer).is_ok(), "nested named labels compile");
     }
 
     #[test]
