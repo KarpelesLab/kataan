@@ -266,6 +266,39 @@ fn val_type(b: u8) -> Result<ValType, WasmRtError> {
     }
 }
 
+/// `i32.trunc_f64_s` and friends: truncate `a` toward zero, trapping on NaN/∞ or
+/// when the result is outside the target integer range (per the spec — Rust's
+/// `as` saturates, which is *not* the WebAssembly behavior).
+fn trunc_i32_s(a: f64) -> Result<i32, WasmRtError> {
+    let t = f64_trunc(a);
+    if a.is_nan() || !(-2_147_483_648.0..=2_147_483_647.0).contains(&t) {
+        return Err(WasmRtError("integer overflow"));
+    }
+    Ok(t as i32)
+}
+fn trunc_i32_u(a: f64) -> Result<i32, WasmRtError> {
+    let t = f64_trunc(a);
+    if a.is_nan() || !(0.0..=4_294_967_295.0).contains(&t) {
+        return Err(WasmRtError("integer overflow"));
+    }
+    Ok(t as u32 as i32)
+}
+fn trunc_i64_s(a: f64) -> Result<i64, WasmRtError> {
+    let t = f64_trunc(a);
+    // 2^63 is representable; 2^63-1 is not, so the upper bound is exclusive 2^63.
+    if a.is_nan() || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&t) {
+        return Err(WasmRtError("integer overflow"));
+    }
+    Ok(t as i64)
+}
+fn trunc_i64_u(a: f64) -> Result<i64, WasmRtError> {
+    let t = f64_trunc(a);
+    if a.is_nan() || !(0.0..18_446_744_073_709_551_616.0).contains(&t) {
+        return Err(WasmRtError("integer overflow"));
+    }
+    Ok(t as u64 as i64)
+}
+
 /// A structured-control frame for operand-stack type validation: the block's
 /// input/output value types, the value-stack height at entry, and whether the
 /// block is currently in an `unreachable` (polymorphic-stack) state.
@@ -398,6 +431,20 @@ fn zero_val(t: ValType) -> Val {
 
 fn f64_abs(x: f64) -> f64 {
     f64::from_bits(x.to_bits() & 0x7fff_ffff_ffff_ffff)
+}
+
+/// `f64::trunc` for `no_std` (round toward zero, by masking the fraction bits).
+fn f64_trunc(x: f64) -> f64 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    if exp < 0 {
+        // |x| < 1 → truncates to ±0 (keep the sign bit).
+        f64::from_bits(bits & (1 << 63))
+    } else if exp >= 52 {
+        x // already an integer (or NaN/∞)
+    } else {
+        f64::from_bits(bits & !((1u64 << (52 - exp)) - 1))
+    }
 }
 fn f32_abs(x: f32) -> f32 {
     f32::from_bits(x.to_bits() & 0x7fff_ffff)
@@ -1734,19 +1781,21 @@ impl Module {
                     let a = pop!().as_i64()?;
                     stack.push(Val::I32(a as i32)); // i32.wrap_i64
                 }
-                0xaa | 0xab => {
-                    let a = pop!().as_f64()?; // i32.trunc_f64_s / _u (we hold f64)
-                    if a.is_nan() || a.is_infinite() {
-                        return Err(WasmRtError("invalid conversion to integer"));
-                    }
-                    stack.push(Val::I32(a as i32));
+                0xaa => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::I32(trunc_i32_s(a)?)); // i32.trunc_f64_s
                 }
-                0xb0 | 0xb1 => {
-                    let a = pop!().as_f64()?; // i64.trunc_f64_s / _u
-                    if a.is_nan() || a.is_infinite() {
-                        return Err(WasmRtError("invalid conversion to integer"));
-                    }
-                    stack.push(Val::I64(a as i64));
+                0xab => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::I32(trunc_i32_u(a)?)); // i32.trunc_f64_u
+                }
+                0xb0 => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::I64(trunc_i64_s(a)?)); // i64.trunc_f64_s
+                }
+                0xb1 => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::I64(trunc_i64_u(a)?)); // i64.trunc_f64_u
                 }
                 0xac => {
                     let a = pop!().as_i32()?;
@@ -1793,20 +1842,22 @@ impl Module {
                     let a = pop!().as_i64()? as u64;
                     stack.push(Val::F32(a as f32)); // f32.convert_i64_u
                 }
-                // Integer truncations from f32 (trap on NaN/∞).
-                0xa8 | 0xa9 => {
-                    let a = pop!().as_f32()?;
-                    if a.is_nan() || a.is_infinite() {
-                        return Err(WasmRtError("invalid conversion to integer"));
-                    }
-                    stack.push(Val::I32(a as i32)); // i32.trunc_f32_s / _u
+                // Integer truncations from f32 (trap on NaN/∞ and out-of-range).
+                0xa8 => {
+                    let a = f64::from(pop!().as_f32()?);
+                    stack.push(Val::I32(trunc_i32_s(a)?)); // i32.trunc_f32_s
                 }
-                0xae | 0xaf => {
-                    let a = pop!().as_f32()?;
-                    if a.is_nan() || a.is_infinite() {
-                        return Err(WasmRtError("invalid conversion to integer"));
-                    }
-                    stack.push(Val::I64(a as i64)); // i64.trunc_f32_s / _u
+                0xa9 => {
+                    let a = f64::from(pop!().as_f32()?);
+                    stack.push(Val::I32(trunc_i32_u(a)?)); // i32.trunc_f32_u
+                }
+                0xae => {
+                    let a = f64::from(pop!().as_f32()?);
+                    stack.push(Val::I64(trunc_i64_s(a)?)); // i64.trunc_f32_s
+                }
+                0xaf => {
+                    let a = f64::from(pop!().as_f32()?);
+                    stack.push(Val::I64(trunc_i64_u(a)?)); // i64.trunc_f32_u
                 }
                 // Bit-level reinterpretations (no value change, only the type).
                 0xbc => {

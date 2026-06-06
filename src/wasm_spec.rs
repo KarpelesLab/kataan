@@ -321,8 +321,29 @@ fn simple_opcode(name: &str) -> Option<u8> {
         "f64.mul" => 0xa2,
         "f64.div" => 0xa3,
         "i32.wrap_i64" => 0xa7,
+        "i32.trunc_f32_s" => 0xa8,
+        "i32.trunc_f32_u" => 0xa9,
+        "i32.trunc_f64_s" => 0xaa,
+        "i32.trunc_f64_u" => 0xab,
         "i64.extend_i32_s" => 0xac,
+        "i64.extend_i32_u" => 0xad,
+        "i64.trunc_f32_s" => 0xae,
+        "i64.trunc_f32_u" => 0xaf,
+        "i64.trunc_f64_s" => 0xb0,
+        "i64.trunc_f64_u" => 0xb1,
+        "f32.convert_i32_s" => 0xb2,
+        "f32.convert_i32_u" => 0xb3,
+        "f32.convert_i64_s" => 0xb4,
+        "f32.convert_i64_u" => 0xb5,
+        "f32.demote_f64" => 0xb6,
         "f64.convert_i32_s" => 0xb7,
+        "f64.convert_i32_u" => 0xb8,
+        "f64.convert_i64_s" => 0xb9,
+        "f64.promote_f32" => 0xbb,
+        "i32.reinterpret_f32" => 0xbc,
+        "i64.reinterpret_f64" => 0xbd,
+        "f32.reinterpret_i32" => 0xbe,
+        "f64.reinterpret_i64" => 0xbf,
         _ => return None,
     })
 }
@@ -1653,6 +1674,24 @@ mod tests {
             .call(0, &[Val::I32(5)])
             .unwrap();
         assert_eq!(r3, vec![Val::I32(16)]); // 5*3 + 1
+    }
+
+    #[test]
+    fn spec_trunc_range_traps() {
+        // (No `;;` comments — `\`-continued Rust strings have no real newlines, so a
+        // WAT line comment would swallow the rest of the script.)
+        let script = "(module \
+            (func (export \"ts\") (param f64) (result i32) (i32.trunc_f64_s (local.get 0))) \
+            (func (export \"tu\") (param f64) (result i32) (i32.trunc_f64_u (local.get 0)))) \
+            (assert_return (invoke \"ts\" (f64.const -3.9)) (i32.const -3)) \
+            (assert_return (invoke \"ts\" (f64.const 2147483647.0)) (i32.const 2147483647)) \
+            (assert_trap   (invoke \"ts\" (f64.const 2147483648.0))) \
+            (assert_trap   (invoke \"ts\" (f64.const nan))) \
+            (assert_return (invoke \"tu\" (f64.const 4294967295.0)) (i32.const -1)) \
+            (assert_trap   (invoke \"tu\" (f64.const -1.0))) \
+            (assert_trap   (invoke \"tu\" (f64.const 4294967296.0)))";
+        let n = run_wast(script).expect("trunc range-trap conformance passes");
+        assert_eq!(n, 7);
     }
 
     #[test]
