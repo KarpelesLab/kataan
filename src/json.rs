@@ -12,43 +12,80 @@ use crate::realm::Realm;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// Returned when `JSON.stringify` hits a circular structure (the caller throws a
+/// `TypeError`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Circular;
+
 /// Serializes `v` to a JSON string, or `None` when it has no JSON form
 /// (`undefined` or a function — which `JSON.stringify` omits).
 #[must_use]
 pub fn stringify(realm: &Realm, v: NanBox) -> Option<String> {
+    stringify_seen(realm, v, &mut Vec::new()).unwrap_or(None)
+}
+
+/// `JSON.stringify` that reports a circular reference as `Err(())` (so the caller
+/// can throw the spec's `TypeError`) instead of recursing forever.
+///
+/// # Errors
+/// `Err(())` when `v` contains a cycle.
+pub fn try_stringify(realm: &Realm, v: NanBox) -> Result<Option<String>, Circular> {
+    stringify_seen(realm, v, &mut Vec::new())
+}
+
+/// Like [`stringify`], but tracking the ancestor handles in `seen` so a cycle is
+/// detected (returning `Err(())`) rather than overflowing the stack.
+fn stringify_seen(
+    realm: &Realm,
+    v: NanBox,
+    seen: &mut Vec<Handle>,
+) -> Result<Option<String>, Circular> {
     match v.unpack() {
-        Unpacked::Undefined => None,
-        Unpacked::Null => Some(String::from("null")),
-        Unpacked::Bool(b) => Some(String::from(if b { "true" } else { "false" })),
+        Unpacked::Undefined => Ok(None),
+        Unpacked::Null => Ok(Some(String::from("null"))),
+        Unpacked::Bool(b) => Ok(Some(String::from(if b { "true" } else { "false" }))),
         // Spec `ToString` (`0` for `-0`, exponential for ≥ 1e21).
-        Unpacked::Number(n) => Some(if n.is_finite() {
+        Unpacked::Number(n) => Ok(Some(if n.is_finite() {
             realm.to_display_string(v)
         } else {
             String::from("null")
-        }),
+        })),
         Unpacked::Handle(raw) => {
             let h = Handle::from_raw(raw);
             if let Some(s) = realm.string_value(h) {
-                return Some(quote(&s));
+                return Ok(Some(quote(&s)));
             }
-            if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
-                let parts: Vec<String> = elems
-                    .iter()
-                    .map(|e| stringify(realm, *e).unwrap_or_else(|| String::from("null")))
-                    .collect();
-                return Some(alloc::format!("[{}]", parts.join(",")));
+            let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
+            if is_container {
+                if seen.contains(&h) {
+                    return Err(Circular); // circular structure
+                }
+                seen.push(h);
             }
-            if let Some(keys) = realm.object_keys(h) {
+            let result = if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
+                let mut parts = Vec::with_capacity(elems.len());
+                for e in &elems {
+                    parts.push(
+                        stringify_seen(realm, *e, seen)?.unwrap_or_else(|| String::from("null")),
+                    );
+                }
+                Some(alloc::format!("[{}]", parts.join(",")))
+            } else if let Some(keys) = realm.object_keys(h) {
                 let mut parts = Vec::new();
                 for k in keys {
                     let val = realm.get_property(h, &k).unwrap_or(NanBox::undefined());
-                    if let Some(s) = stringify(realm, val) {
+                    if let Some(s) = stringify_seen(realm, val, seen)? {
                         parts.push(alloc::format!("{}:{}", quote(&k), s));
                     }
                 }
-                return Some(alloc::format!("{{{}}}", parts.join(",")));
+                Some(alloc::format!("{{{}}}", parts.join(",")))
+            } else {
+                None // a function
+            };
+            if is_container {
+                seen.pop();
             }
-            None // a function
+            Ok(result)
         }
     }
 }
@@ -57,48 +94,77 @@ pub fn stringify(realm: &Realm, v: NanBox) -> Option<String> {
 /// per nesting level — newlines and indentation between members.
 #[must_use]
 pub fn stringify_pretty(realm: &Realm, v: NanBox, indent: &str) -> Option<String> {
-    stringify_at(realm, v, indent, "")
+    stringify_at(realm, v, indent, "", &mut Vec::new()).unwrap_or(None)
 }
 
-fn stringify_at(realm: &Realm, v: NanBox, indent: &str, cur: &str) -> Option<String> {
+/// Cycle-checked variant of [`stringify_pretty`] (see [`try_stringify`]).
+///
+/// # Errors
+/// `Err(())` when `v` contains a cycle.
+pub fn try_stringify_pretty(
+    realm: &Realm,
+    v: NanBox,
+    indent: &str,
+) -> Result<Option<String>, Circular> {
+    stringify_at(realm, v, indent, "", &mut Vec::new())
+}
+
+fn stringify_at(
+    realm: &Realm,
+    v: NanBox,
+    indent: &str,
+    cur: &str,
+    seen: &mut Vec<Handle>,
+) -> Result<Option<String>, Circular> {
     match v.unpack() {
         Unpacked::Handle(raw) => {
             let h = Handle::from_raw(raw);
             if let Some(s) = realm.string_value(h) {
-                return Some(quote(&s));
+                return Ok(Some(quote(&s)));
             }
             let inner = alloc::format!("{cur}{indent}");
-            if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
-                if elems.is_empty() {
-                    return Some(String::from("[]"));
+            let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
+            if is_container {
+                if seen.contains(&h) {
+                    return Err(Circular); // circular structure
                 }
-                let parts: Vec<String> = elems
-                    .iter()
-                    .map(|e| {
-                        let s = stringify_at(realm, *e, indent, &inner)
-                            .unwrap_or_else(|| String::from("null"));
-                        alloc::format!("{inner}{s}")
-                    })
-                    .collect();
-                return Some(alloc::format!("[\n{}\n{cur}]", parts.join(",\n")));
+                seen.push(h);
             }
-            if let Some(keys) = realm.object_keys(h) {
+            let result = if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
+                if elems.is_empty() {
+                    Some(String::from("[]"))
+                } else {
+                    let mut parts = Vec::with_capacity(elems.len());
+                    for e in &elems {
+                        let s = stringify_at(realm, *e, indent, &inner, seen)?
+                            .unwrap_or_else(|| String::from("null"));
+                        parts.push(alloc::format!("{inner}{s}"));
+                    }
+                    Some(alloc::format!("[\n{}\n{cur}]", parts.join(",\n")))
+                }
+            } else if let Some(keys) = realm.object_keys(h) {
                 let mut parts = Vec::new();
                 for k in keys {
                     let val = realm.get_property(h, &k).unwrap_or(NanBox::undefined());
-                    if let Some(s) = stringify_at(realm, val, indent, &inner) {
+                    if let Some(s) = stringify_at(realm, val, indent, &inner, seen)? {
                         parts.push(alloc::format!("{inner}{}: {}", quote(&k), s));
                     }
                 }
                 if parts.is_empty() {
-                    return Some(String::from("{}"));
+                    Some(String::from("{}"))
+                } else {
+                    Some(alloc::format!("{{\n{}\n{cur}}}", parts.join(",\n")))
                 }
-                return Some(alloc::format!("{{\n{}\n{cur}}}", parts.join(",\n")));
+            } else {
+                None
+            };
+            if is_container {
+                seen.pop();
             }
-            None
+            Ok(result)
         }
         // Primitives render the same with or without indentation.
-        _ => stringify(realm, v),
+        _ => stringify_seen(realm, v, seen),
     }
 }
 

@@ -881,7 +881,13 @@ impl<'a> Interp<'a> {
                     // Interpreter-aware: honors `toJSON` and invokes getters.
                     self.json_to_string(value)?
                 } else {
-                    crate::json::stringify_pretty(&self.realm, value, &indent)
+                    match crate::json::try_stringify_pretty(&self.realm, value, &indent) {
+                        Ok(r) => r,
+                        Err(crate::json::Circular) => {
+                            let m = self.new_str("Converting circular structure to JSON");
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
+                    }
                 };
                 match result {
                     Some(s) => NanBox::handle(self.realm.new_string(&s).to_raw()),
@@ -1953,6 +1959,16 @@ impl<'a> Interp<'a> {
     /// Interpreter-aware `JSON.stringify` (compact): honors a `toJSON` method and
     /// invokes getters, unlike the realm-only `json_stringify`.
     fn json_to_string(&mut self, v: NanBox) -> Result<Option<String>, ExecError> {
+        self.json_to_string_seen(v, &mut Vec::new())
+    }
+
+    /// `JSON.stringify` serialization tracking the ancestor handles in `seen`, so a
+    /// circular structure throws a `TypeError` rather than overflowing the stack.
+    fn json_to_string_seen(
+        &mut self,
+        v: NanBox,
+        seen: &mut Vec<Handle>,
+    ) -> Result<Option<String>, ExecError> {
         if let Some(h) = v.as_handle().map(Handle::from_raw) {
             // A `Date` serializes as its ISO string (its built-in `toJSON`).
             if let Some(ms) = self.realm.date_at(h) {
@@ -1980,7 +1996,7 @@ impl<'a> Interp<'a> {
                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
             {
                 let r = self.call_with_this(tj, v, &[])?;
-                return self.json_to_string(r);
+                return self.json_to_string_seen(r, seen);
             }
         }
         match v.unpack() {
@@ -1999,27 +2015,38 @@ impl<'a> Interp<'a> {
                 if let Some(s) = self.realm.string_value(h) {
                     return Ok(Some(json_quote(&s)));
                 }
+                // A container that is already an ancestor is a cycle → TypeError.
+                if (self.realm.array_elements(h).is_some() || self.realm.object_keys(h).is_some())
+                    && seen.contains(&h)
+                {
+                    let m = self.new_str("Converting circular structure to JSON");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
+                    seen.push(h);
                     let mut parts = Vec::with_capacity(elems.len());
                     for e in elems {
                         parts.push(
-                            self.json_to_string(e)?
+                            self.json_to_string_seen(e, seen)?
                                 .unwrap_or_else(|| String::from("null")),
                         );
                     }
+                    seen.pop();
                     return Ok(Some(alloc::format!("[{}]", parts.join(","))));
                 }
                 if self.realm.object_keys(h).is_some() {
                     // Enumerable keys (incl. accessors), read via read_member so
                     // getters are invoked.
                     let keys = self.realm.object_keys(h).unwrap_or_default();
+                    seen.push(h);
                     let mut parts = Vec::new();
                     for k in keys {
                         let val = self.read_member(h, &k)?;
-                        if let Some(s) = self.json_to_string(val)? {
+                        if let Some(s) = self.json_to_string_seen(val, seen)? {
                             parts.push(alloc::format!("{}:{}", json_quote(&k), s));
                         }
                     }
+                    seen.pop();
                     return Ok(Some(alloc::format!("{{{}}}", parts.join(","))));
                 }
                 Ok(None) // a function
