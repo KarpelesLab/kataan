@@ -7876,7 +7876,9 @@ impl<'a> Interp<'a> {
                 "MAX_SAFE_INTEGER" => return Ok(NanBox::number(9_007_199_254_740_991.0)),
                 "MIN_SAFE_INTEGER" => return Ok(NanBox::number(-9_007_199_254_740_991.0)),
                 "MAX_VALUE" => return Ok(NanBox::number(f64::MAX)),
-                "MIN_VALUE" => return Ok(NanBox::number(f64::MIN_POSITIVE)),
+                // The smallest positive value is the least *subnormal* (5e-324),
+                // not Rust's `MIN_POSITIVE` (the smallest *normal*, 2.2e-308).
+                "MIN_VALUE" => return Ok(NanBox::number(f64::from_bits(1))),
                 "EPSILON" => return Ok(NanBox::number(f64::EPSILON)),
                 "POSITIVE_INFINITY" => return Ok(NanBox::number(f64::INFINITY)),
                 "NEGATIVE_INFINITY" => return Ok(NanBox::number(f64::NEG_INFINITY)),
