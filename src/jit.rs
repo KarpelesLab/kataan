@@ -311,15 +311,83 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
     0
 }
 
-/// An optimization pass over the integer register IR — the first tier of the
-/// optimizing JIT. It does **constant folding** (a `Bin` of two known constants,
-/// or a `Move`/`Lt` over knowns, becomes a `Const`) with constant propagation,
-/// staying sound across control flow by clearing all known constants at any jump
-/// target and after a branch (a register may hold a different value when reached
-/// from elsewhere). The result is observationally identical to the input — same
-/// [`eval_reg`] for all inputs — but with constant subexpressions pre-computed.
+/// The optimizing-JIT pass over the integer register IR: **constant folding**
+/// (with propagation) followed by **dead-code elimination**. The result is
+/// observationally identical to the input — same [`eval_reg`] for all inputs —
+/// but constant subexpressions are pre-computed and never-read computations are
+/// removed.
 #[must_use]
 pub fn optimize_reg(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
+    dce_reg(&fold_constants(ops, n_regs))
+}
+
+/// Removes ops whose destination register is never read (anywhere), then remaps
+/// branch targets to the surviving instructions. Sound: a never-read result
+/// cannot affect the function's value, and a dropped arithmetic op only means the
+/// native code no longer deopts on its (unused) overflow — the final value is
+/// unchanged. `Ret`/`Jump`/`JumpIfFalse` are always kept; a jump to a removed op
+/// is retargeted to the next surviving op (the removed op had no effect).
+#[must_use]
+pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
+    use alloc::collections::BTreeSet;
+    let mut used: BTreeSet<u8> = BTreeSet::new();
+    for op in ops {
+        match *op {
+            RegOp::Bin { a, b, .. } | RegOp::Lt { a, b, .. } => {
+                used.insert(a);
+                used.insert(b);
+            }
+            RegOp::Move { src, .. } => {
+                used.insert(src);
+            }
+            RegOp::JumpIfFalse { cond, .. } => {
+                used.insert(cond);
+            }
+            RegOp::Ret { src } => {
+                used.insert(src);
+            }
+            RegOp::Const { .. } | RegOp::Arg { .. } | RegOp::Jump { .. } => {}
+        }
+    }
+    let keep = |op: &RegOp| match *op {
+        RegOp::Ret { .. } | RegOp::Jump { .. } | RegOp::JumpIfFalse { .. } => true,
+        RegOp::Const { dst, .. }
+        | RegOp::Bin { dst, .. }
+        | RegOp::Move { dst, .. }
+        | RegOp::Lt { dst, .. }
+        | RegOp::Arg { dst, .. } => used.contains(&dst),
+    };
+    // `newpos[old]` = new index of the first surviving op at-or-after `old`.
+    let mut newpos = alloc::vec![0usize; ops.len() + 1];
+    let mut n = 0;
+    for (i, op) in ops.iter().enumerate() {
+        newpos[i] = n;
+        if keep(op) {
+            n += 1;
+        }
+    }
+    newpos[ops.len()] = n;
+    let mut out = Vec::with_capacity(n);
+    for op in ops.iter().filter(|o| keep(o)) {
+        out.push(match *op {
+            RegOp::JumpIfFalse { cond, target } => RegOp::JumpIfFalse {
+                cond,
+                target: newpos.get(target).copied().unwrap_or(n),
+            },
+            RegOp::Jump { target } => RegOp::Jump {
+                target: newpos.get(target).copied().unwrap_or(n),
+            },
+            other => other,
+        });
+    }
+    out
+}
+
+/// Constant folding with propagation: a `Bin`/`Lt`/`Move` over known-constant
+/// operands becomes a `Const`. Stays sound across control flow by clearing all
+/// known constants at any jump target and after a branch.
+#[must_use]
+pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
     // Every op index that is a branch target: constants can't be assumed there.
     let mut is_target = alloc::vec![false; ops.len()];
     for op in ops {
@@ -2234,17 +2302,40 @@ mod tests {
             },
             RegOp::Ret { src: 3 },
         ];
+        // Folding collapses everything to `r3 = 10`; DCE then drops the
+        // now-unread r0/r1/r2 — five ops become `Const r3=10; Ret r3`.
         let opt = optimize_reg(&ops, 4);
-        // The two Bins became Consts.
-        assert!(
-            matches!(opt[2], RegOp::Const { imm: 5, .. })
-                && matches!(opt[3], RegOp::Const { imm: 10, .. }),
-            "constant subexpressions folded: {opt:?}"
-        );
+        assert_eq!(opt.len(), 2, "folded + DCE'd to two ops: {opt:?}");
+        assert!(matches!(opt[0], RegOp::Const { imm: 10, .. }));
+        assert!(matches!(opt[1], RegOp::Ret { .. }));
         // Observationally identical.
-        for _ in 0..1 {
-            assert_eq!(eval_reg(&opt, 4, &[]), eval_reg(&ops, 4, &[]));
-            assert_eq!(eval_reg(&opt, 4, &[]), 10);
+        assert_eq!(eval_reg(&opt, 4, &[]), eval_reg(&ops, 4, &[]));
+        assert_eq!(eval_reg(&opt, 4, &[]), 10);
+    }
+
+    #[test]
+    fn dce_removes_dead_ops_and_remaps_branches() {
+        // r0=arg0; r9=999 (dead, never read); loop: cond=r0<r0(false immediately
+        // here we just test target remap) ... keep it simple: a dead const before
+        // a branch, ensure the jump target still lands correctly after removal.
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },           // 0
+            RegOp::Const { dst: 9, imm: 999 },         // 1 dead (r9 never read)
+            RegOp::Const { dst: 1, imm: 0 },           // 2
+            RegOp::Lt { dst: 2, a: 1, b: 0 },          // 3
+            RegOp::JumpIfFalse { cond: 2, target: 6 }, // 4 -> op 6 (Ret)
+            RegOp::Jump { target: 6 },                 // 5
+            RegOp::Ret { src: 1 },                     // 6
+        ];
+        let opt = dce_reg(&ops);
+        // The dead Const(r9) is gone; nothing else (all other dsts are read).
+        assert!(
+            !opt.iter().any(|o| matches!(o, RegOp::Const { dst: 9, .. })),
+            "dead const removed: {opt:?}"
+        );
+        // Branch targets still resolve to the Ret, and the program is equivalent.
+        for x in [0i64, 5, -3] {
+            assert_eq!(eval_reg(&opt, 10, &[x]), eval_reg(&ops, 10, &[x]));
         }
     }
 
