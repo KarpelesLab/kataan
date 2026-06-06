@@ -21,6 +21,12 @@
 
 use alloc::vec::Vec;
 
+/// `2^53` — the largest magnitude an `f64` represents every integer below
+/// exactly. The integer JIT keeps a value only while it stays within ±this; a
+/// result outside the range deopts, since `i64` and `f64` arithmetic diverge
+/// beyond it.
+const SAFE_INT_MAX: i64 = 9_007_199_254_740_992;
+
 /// An arithmetic operation in the JIT's tiny IR, applied left-to-right to a
 /// running accumulator seeded with the function's `i64` argument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,7 +363,14 @@ impl JitProto {
             *slot = nanbox_int(*a)?;
         }
         let r = self.func.call_args(&ints[..self.n_params]);
-        Some(crate::nanbox::NanBox::number(r as f64))
+        // The native code returns a value in ±2^53 on success, or a sentinel
+        // outside that range when an intermediate result overflowed / left the
+        // exact-integer range — in which case we deopt to the interpreter.
+        if (-SAFE_INT_MAX..=SAFE_INT_MAX).contains(&r) {
+            Some(crate::nanbox::NanBox::number(r as f64))
+        } else {
+            None
+        }
     }
 }
 
@@ -573,6 +586,35 @@ impl X64Assembler {
     pub fn cmp_rax_mem(&mut self, disp: i32) {
         self.code.extend_from_slice(&[0x48, 0x3b, 0x85]);
         self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `movabs r11, imm64` — load the upper safe-integer bound (`+2^53`).
+    pub fn movabs_r11(&mut self, imm: i64) {
+        self.code.extend_from_slice(&[0x49, 0xbb]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+    /// `movabs r10, imm64` — load the lower safe-integer bound (`-2^53`).
+    pub fn movabs_r10(&mut self, imm: i64) {
+        self.code.extend_from_slice(&[0x49, 0xba]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+    /// `cmp rax, r11`.
+    pub fn cmp_rax_r11(&mut self) {
+        self.code.extend_from_slice(&[0x4c, 0x39, 0xd8]);
+    }
+    /// `cmp rax, r10`.
+    pub fn cmp_rax_r10(&mut self) {
+        self.code.extend_from_slice(&[0x4c, 0x39, 0xd0]);
+    }
+    /// `jo label` — jump if the last arithmetic op signed-overflowed.
+    pub fn jo(&mut self, label: Label) {
+        self.code.extend_from_slice(&[0x0f, 0x80]);
+        self.emit_rel32(label);
+    }
+    /// `jl label` — jump if signed `<`.
+    pub fn jl(&mut self, label: Label) {
+        self.code.extend_from_slice(&[0x0f, 0x8c]);
+        self.emit_rel32(label);
     }
 
     /// `test rax, rax` (sets flags from `rax`).
@@ -836,9 +878,29 @@ impl JitFunction {
         let frame = ((n_regs as u32 * 8) + 15) & !15;
         let mut a = X64Assembler::new();
         // One label per op so any op can be a branch target; bound just before
-        // that op's code is emitted.
+        // that op's code is emitted. Plus a shared deopt trampoline.
         let labels: Vec<Label> = (0..ops.len()).map(|_| a.new_label()).collect();
+        let deopt = a.new_label();
         a.prologue(frame);
+        // Hoist the safe-integer bounds (±2^53) into scratch regs r10/r11, so the
+        // per-op range guard is two register compares. Loaded after the prologue;
+        // r10/r11 are caller-saved and not argument registers, so no arg clobber.
+        a.movabs_r11(SAFE_INT_MAX);
+        a.movabs_r10(-SAFE_INT_MAX);
+        // Emits the deopt guard for a result in `rax`: a signed-overflow check
+        // (when `ovf`) and a ±2^53 range check, so every value the JIT keeps is a
+        // value `f64` represents exactly — else it bails to the interpreter.
+        macro_rules! guard {
+            ($asm:expr, $ovf:expr) => {{
+                if $ovf {
+                    $asm.jo(deopt);
+                }
+                $asm.cmp_rax_r11();
+                $asm.jg(deopt);
+                $asm.cmp_rax_r10();
+                $asm.jl(deopt);
+            }};
+        }
         let mut has_ret = false;
         for (i, op) in ops.iter().enumerate() {
             a.bind(labels[i]);
@@ -867,6 +929,10 @@ impl JitFunction {
                     }
                     a.load_rax(disp(ra));
                     a.op_rax_mem(op, disp(rb));
+                    // Add/Sub/Mul can overflow i64; And/Or/Xor cannot, but all can
+                    // leave the exact-integer range, so range-check every result.
+                    let can_overflow = matches!(op, BinOp2::Add | BinOp2::Sub | BinOp2::Mul);
+                    guard!(a, can_overflow);
                     a.store_rax(disp(dst));
                 }
                 RegOp::Move { dst, src } => {
@@ -913,6 +979,13 @@ impl JitFunction {
         if !has_ret {
             return None;
         }
+        // The deopt trampoline: return a sentinel outside the safe-integer range
+        // (`i64::MAX`), which the caller recognizes as "bail to the interpreter".
+        // Unreachable by fall-through (every `Ret` returns); reached only by the
+        // guard jumps above.
+        a.bind(deopt);
+        a.movabs_rax(i64::MAX);
+        a.epilogue();
         Self::from_code(&a.finish())
     }
 
@@ -1339,6 +1412,40 @@ mod tests {
             }
         }
         assert!(tested, "expected an integer arithmetic proto to lower");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn jit_deopts_on_overflow_and_range() {
+        use crate::nanbox::{NanBox, Unpacked};
+        // f(a,b) = a * b. Within ±2^53 it runs natively; beyond it must deopt
+        // (i64 and f64 would diverge), returning None so the interpreter takes over.
+        let src = "function f(a, b) { return a * b; } f;";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let protos = crate::nbvm::compile_program(&program).expect("compile");
+        let p = protos.iter().find(|p| p.n_params == 2).unwrap();
+        let jit = JitProto::compile(p).expect("f compiles");
+
+        // In range → native result.
+        let r = jit
+            .call_guarded(&[NanBox::number(1000.0), NanBox::number(1000.0)])
+            .unwrap();
+        assert_eq!(r.unpack(), Unpacked::Number(1_000_000.0));
+
+        // 2^30 * 2^30 = 2^60 > 2^53 → deopt (None), NOT a wrong wrapped answer.
+        let big = (1i64 << 30) as f64;
+        assert!(
+            jit.call_guarded(&[NanBox::number(big), NanBox::number(big)])
+                .is_none(),
+            "a product beyond 2^53 must deopt, not return a wrapped i64"
+        );
+        // A result that overflows i64 entirely also deopts.
+        let huge = 3_000_000_000.0; // 3e9; 3e9 * 3e9 = 9e18 ~ i64 overflow
+        assert!(
+            jit.call_guarded(&[NanBox::number(huge), NanBox::number(huge)])
+                .is_none(),
+            "i64-overflowing product must deopt"
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
