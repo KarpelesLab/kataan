@@ -137,6 +137,8 @@ pub enum RegOp {
     Const { dst: u8, imm: i64 },
     /// `reg[dst] = reg[a] <op> reg[b]`
     Bin { dst: u8, a: u8, b: u8, op: BinOp2 },
+    /// `reg[dst] = reg[src]`
+    Move { dst: u8, src: u8 },
     /// return `reg[src]`
     Ret { src: u8 },
 }
@@ -163,10 +165,106 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
                     BinOp2::Xor => x ^ y,
                 };
             }
+            RegOp::Move { dst, src } => regs[dst as usize] = regs[src as usize],
             RegOp::Ret { src } => return regs[src as usize],
         }
     }
     0
+}
+
+/// If `v` is a `NanBox` whole number that fits an `i64` losslessly, its integer
+/// value — the JIT integer fast path only applies to such constants.
+#[cfg(feature = "alloc")]
+fn nanbox_int(v: crate::nanbox::NanBox) -> Option<i64> {
+    match v.unpack() {
+        crate::nanbox::Unpacked::Number(n) if n.is_finite() => {
+            let i = n as i64;
+            // Lossless round-trip and within the exact-integer range (±2^53).
+            if (i as f64) == n
+                && (-9.007_199_254_740_992e15..=9.007_199_254_740_992e15).contains(&n)
+            {
+                Some(i)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Lowers a real bytecode-VM function (`nbvm::FnProto`) to the JIT's register IR,
+/// **iff** it is a straight-line integer function the baseline JIT can handle:
+/// no captures, ≤ 64 registers, ≤ 6 params, and only `LoadConst` (of an integer),
+/// `Add`/`Sub`/`Mul`, `Move`, and a terminating `Return`. Any other op (calls,
+/// branches, property access, non-integer constants, …) makes it return `None`,
+/// so the caller falls back to the interpreter.
+///
+/// This is the bridge from the VM's instruction stream to native code: a `proto`
+/// produced by `nbvm::compile_program` over real JS source can be compiled with
+/// [`JitFunction::compile_reg`] and run natively.
+#[cfg(feature = "alloc")]
+#[must_use]
+pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
+    use crate::nbvm::Op;
+    if proto.n_regs > 64 || proto.n_params > 6 || proto.n_captures != 0 {
+        return None;
+    }
+    let reg8 = |r: crate::nbvm::Reg| -> Option<u8> {
+        if (r as usize) < proto.n_regs {
+            u8::try_from(r).ok()
+        } else {
+            None
+        }
+    };
+    let mut out = Vec::new();
+    // Parameters arrive in registers `0..n_params`; seed them from the args.
+    for i in 0..proto.n_params {
+        out.push(RegOp::Arg {
+            dst: u8::try_from(i).ok()?,
+            index: u8::try_from(i).ok()?,
+        });
+    }
+    for op in &proto.ops {
+        let lowered = match op {
+            Op::LoadConst { dst, value } => RegOp::Const {
+                dst: reg8(*dst)?,
+                imm: nanbox_int(*value)?,
+            },
+            // `Add` is the numeric-typed add; `AddValue` is the general `+`
+            // (string-or-number). The integer fast path treats both as integer
+            // addition — a real deopt guard would verify the operands are ints.
+            Op::Add { dst, a, b } | Op::AddValue { dst, a, b } => RegOp::Bin {
+                dst: reg8(*dst)?,
+                a: reg8(*a)?,
+                b: reg8(*b)?,
+                op: BinOp2::Add,
+            },
+            Op::Sub { dst, a, b } => RegOp::Bin {
+                dst: reg8(*dst)?,
+                a: reg8(*a)?,
+                b: reg8(*b)?,
+                op: BinOp2::Sub,
+            },
+            Op::Mul { dst, a, b } => RegOp::Bin {
+                dst: reg8(*dst)?,
+                a: reg8(*a)?,
+                b: reg8(*b)?,
+                op: BinOp2::Mul,
+            },
+            Op::Move { dst, src } => RegOp::Move {
+                dst: reg8(*dst)?,
+                src: reg8(*src)?,
+            },
+            Op::Return { src } => {
+                out.push(RegOp::Ret { src: reg8(*src)? });
+                return Some(out);
+            }
+            _ => return None,
+        };
+        out.push(lowered);
+    }
+    // Fell off the end without a `Return` — not JIT-eligible.
+    None
 }
 
 /// The reference for [`JitFunction::compile_sum_1_to_n`]: `sum(1..=n)` for
@@ -658,6 +756,13 @@ impl JitFunction {
                     a.op_rax_mem(op, disp(rb));
                     a.store_rax(disp(dst));
                 }
+                RegOp::Move { dst, src } => {
+                    if !ok_reg(dst) || !ok_reg(src) {
+                        return None;
+                    }
+                    a.load_rax(disp(src));
+                    a.store_rax(disp(dst));
+                }
                 RegOp::Ret { src } => {
                     if !ok_reg(src) {
                         return None;
@@ -1056,6 +1161,59 @@ mod tests {
             assert_eq!(eval_reg(&ops, 6, &[a]), oracle(a));
             if let Some(f) = JitFunction::compile_reg(6, 1, &ops) {
                 assert_eq!(f.call_args(&[a]), oracle(a), "jit reg const ({a})");
+            }
+        }
+    }
+
+    #[test]
+    fn lowers_real_nbvm_constant_function() {
+        // A real program compiled by the VM's compiler; `1 + 2*3` folds to a
+        // single integer `LoadConst` + `Return` (n_params = 0).
+        let program = crate::parser::Parser::parse_program("1 + 2 * 3").expect("parse");
+        let protos = crate::nbvm::compile_program(&program).expect("compile");
+        let lowered = lower_nbvm(&protos[0]).expect("top-level should lower");
+        assert_eq!(eval_reg(&lowered, protos[0].n_regs, &[]), 7);
+        if let Some(f) = JitFunction::compile_reg(protos[0].n_regs, 0, &lowered) {
+            assert_eq!(f.call_args(&[]), 7, "JIT runs real compiled bytecode");
+        }
+    }
+
+    #[test]
+    fn lowers_and_jits_a_real_arithmetic_function() {
+        // Compile a real integer arithmetic function and JIT one of its protos.
+        let src = "function f(a, b) { return a * b + a - b; } f;";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let protos = crate::nbvm::compile_program(&program).expect("compile");
+        // Find the proto that lowers and takes two params (the body of `f`).
+        let mut tested = false;
+        for p in &protos {
+            if p.n_params != 2 {
+                continue;
+            }
+            if let Some(lowered) = lower_nbvm(p) {
+                let oracle = |a: i64, b: i64| a * b + a - b;
+                for (a, b) in [(2, 3), (10, -4), (0, 7), (-5, -5), (123, 2)] {
+                    let via_ir = eval_reg(&lowered, p.n_regs, &[a, b]);
+                    assert_eq!(via_ir, oracle(a, b), "lowered IR matches semantics");
+                    if let Some(f) = JitFunction::compile_reg(p.n_regs, 2, &lowered) {
+                        assert_eq!(f.call_args(&[a, b]), oracle(a, b), "JIT matches ({a},{b})");
+                    }
+                }
+                tested = true;
+            }
+        }
+        assert!(tested, "expected an integer arithmetic proto to lower");
+    }
+
+    #[test]
+    fn does_not_lower_non_integer_functions() {
+        // A function with a call / property access must not be JIT-lowered.
+        let src = "function g(a){ return Math.max(a, 1); } g;";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let protos = crate::nbvm::compile_program(&program).expect("compile");
+        for p in &protos {
+            if p.n_params == 1 {
+                assert!(lower_nbvm(p).is_none(), "g uses a call, must not lower");
             }
         }
     }
