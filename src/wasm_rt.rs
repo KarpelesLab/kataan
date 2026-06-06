@@ -711,6 +711,8 @@ impl Module {
                 0xbb => (&[F32], Some(F64)),             // f64.promote_f32
                 0xbc => (&[F32], Some(I32)),             // i32.reinterpret_f32
                 0xbd => (&[F64], Some(I64)),             // i64.reinterpret_f64
+                0xc0 | 0xc1 => (&[I32], Some(I32)),      // i32.extend8/16_s
+                0xc2..=0xc4 => (&[I64], Some(I64)),      // i64.extend8/16/32_s
                 0xbe => (&[I32], Some(F32)),             // f32.reinterpret_i32
                 0xbf => (&[I64], Some(F64)),             // f64.reinterpret_i64
                 _ => return None,
@@ -1936,6 +1938,27 @@ impl Module {
                 0xbf => {
                     let a = pop!().as_i64()?;
                     stack.push(Val::F64(f64::from_bits(a as u64))); // f64.reinterpret_i64
+                }
+                // Sign-extension operators (standardized into the core spec).
+                0xc0 => {
+                    let a = pop!().as_i32()?;
+                    stack.push(Val::I32(i32::from(a as i8))); // i32.extend8_s
+                }
+                0xc1 => {
+                    let a = pop!().as_i32()?;
+                    stack.push(Val::I32(i32::from(a as i16))); // i32.extend16_s
+                }
+                0xc2 => {
+                    let a = pop!().as_i64()?;
+                    stack.push(Val::I64(i64::from(a as i8))); // i64.extend8_s
+                }
+                0xc3 => {
+                    let a = pop!().as_i64()?;
+                    stack.push(Val::I64(i64::from(a as i16))); // i64.extend16_s
+                }
+                0xc4 => {
+                    let a = pop!().as_i64()?;
+                    stack.push(Val::I64(i64::from(a as i32))); // i64.extend32_s
                 }
                 // select: pop cond, then b, then a; push `cond ? a : b`.
                 0x1b => {

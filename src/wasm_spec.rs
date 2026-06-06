@@ -359,6 +359,11 @@ fn simple_opcode(name: &str) -> Option<u8> {
         "i64.reinterpret_f64" => 0xbd,
         "f32.reinterpret_i32" => 0xbe,
         "f64.reinterpret_i64" => 0xbf,
+        "i32.extend8_s" => 0xc0,
+        "i32.extend16_s" => 0xc1,
+        "i64.extend8_s" => 0xc2,
+        "i64.extend16_s" => 0xc3,
+        "i64.extend32_s" => 0xc4,
         _ => return None,
     })
 }
@@ -1689,6 +1694,22 @@ mod tests {
             .call(0, &[Val::I32(5)])
             .unwrap();
         assert_eq!(r3, vec![Val::I32(16)]); // 5*3 + 1
+    }
+
+    #[test]
+    fn spec_sign_extension_ops() {
+        let script = "(module \
+            (func (export \"e8\")  (param i32) (result i32) (i32.extend8_s (local.get 0))) \
+            (func (export \"e16\") (param i32) (result i32) (i32.extend16_s (local.get 0))) \
+            (func (export \"e832\")(param i64) (result i64) (i64.extend32_s (local.get 0)))) \
+            (assert_return (invoke \"e8\"  (i32.const 255)) (i32.const -1)) \
+            (assert_return (invoke \"e8\"  (i32.const 127)) (i32.const 127)) \
+            (assert_return (invoke \"e8\"  (i32.const 128)) (i32.const -128)) \
+            (assert_return (invoke \"e16\" (i32.const 65535)) (i32.const -1)) \
+            (assert_return (invoke \"e16\" (i32.const 32768)) (i32.const -32768)) \
+            (assert_return (invoke \"e832\"(i64.const 4294967295)) (i64.const -1))";
+        let n = run_wast(script).expect("sign-extension conformance passes");
+        assert_eq!(n, 6);
     }
 
     #[test]
