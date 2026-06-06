@@ -48,8 +48,15 @@ pub enum SnapCell {
     /// an object: own `(key, value, hidden)` data properties — including
     /// non-enumerable ones and the engine's internal `\0`-prefixed slots (so
     /// typed-array kind, bound-function target/this/args, error `stack`, etc.
-    /// survive). `hidden` is true for a non-enumerable property.
-    Object(Vec<(String, SnapVal, bool)>),
+    /// survive). `hidden` is true for a non-enumerable property. `proto` is a
+    /// reference to the `[[Prototype]]` object (or `Null` when there is none), so
+    /// `Object.create(p)` / inheritance chains round-trip.
+    Object {
+        /// own data properties, each with its non-enumerable flag
+        props: Vec<(String, SnapVal, bool)>,
+        /// the prototype link (`Null` if none)
+        proto: SnapVal,
+    },
     /// a `Date` (millisecond timestamp)
     Date(f64),
     /// a `BigInt` (its base-10 digit string)
@@ -243,7 +250,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             // All own *data* properties, including non-enumerable + internal slots
             // (private `#` fields and accessor properties are skipped). Each pair
             // records whether the property is hidden (non-enumerable).
-            let pairs = realm
+            let props = realm
                 .object_all_keys(h)
                 .into_iter()
                 .filter(|k| !k.starts_with('#'))
@@ -254,11 +261,24 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                     (k, sv, hidden)
                 })
                 .collect();
-            SnapCell::Object(pairs)
+            // The `[[Prototype]]` link (captured as a ref, or Null when absent).
+            let proto = match realm.object_proto(h) {
+                Some(p) => snap_val(
+                    NanBox::handle(p.to_raw()),
+                    &mut index_of,
+                    &mut order,
+                    &mut intern,
+                ),
+                None => SnapVal::Null,
+            };
+            SnapCell::Object { props, proto }
         } else {
             // An unsupported cell kind: record it as an empty object so indices
             // stay aligned (its references are dropped).
-            SnapCell::Object(Vec::new())
+            SnapCell::Object {
+                props: Vec::new(),
+                proto: SnapVal::Null,
+            }
         };
         cells.push(cell);
     }
@@ -307,7 +327,7 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 (realm.new_bigint(bi), None)
             }
             SnapCell::Array(_) => (realm.new_array(Vec::new()), None),
-            SnapCell::Object(_) => (realm.new_object(), None),
+            SnapCell::Object { .. } => (realm.new_object(), None),
             SnapCell::Function { func_id, frames } => {
                 // Build empty scopes outermost→innermost; the function closes over
                 // the innermost. `chain[j]` corresponds to `frames[n-1-j]`.
@@ -370,13 +390,16 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 let elems: Vec<NanBox> = vals.iter().map(|v| resolve(v, &handles)).collect();
                 realm.array_set_all(*h, elems);
             }
-            SnapCell::Object(pairs) => {
-                for (k, v, hidden) in pairs {
+            SnapCell::Object { props, proto } => {
+                for (k, v, hidden) in props {
                     let val = resolve(v, &handles);
                     realm.set_property(*h, k, val);
                     if *hidden {
                         realm.mark_hidden(*h, k);
                     }
+                }
+                if let Some(p) = resolve(proto, &handles).as_handle() {
+                    realm.set_object_proto(*h, Some(Handle::from_raw(p)));
                 }
             }
             SnapCell::Function { frames, .. } => {
@@ -502,14 +525,15 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                     w_val(v, &mut out);
                 }
             }
-            SnapCell::Object(pairs) => {
+            SnapCell::Object { props, proto } => {
                 out.push(2);
-                w_u32(pairs.len() as u32, &mut out);
-                for (k, v, hidden) in pairs {
+                w_u32(props.len() as u32, &mut out);
+                for (k, v, hidden) in props {
                     w_str(k, &mut out);
                     w_val(v, &mut out);
                     out.push(u8::from(*hidden));
                 }
+                w_val(proto, &mut out);
             }
             SnapCell::Date(ms) => {
                 out.push(3);
@@ -642,14 +666,15 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
             }
             2 => {
                 let n = r.u32()? as usize;
-                let mut pairs = Vec::with_capacity(n);
+                let mut props = Vec::with_capacity(n);
                 for _ in 0..n {
                     let k = r.string()?;
                     let v = r.val()?;
                     let hidden = r.u8()? != 0;
-                    pairs.push((k, v, hidden));
+                    props.push((k, v, hidden));
                 }
-                SnapCell::Object(pairs)
+                let proto = r.val()?;
+                SnapCell::Object { props, proto }
             }
             3 => SnapCell::Date(r.f64()?),
             4 => SnapCell::BigInt(r.string()?),
@@ -1223,6 +1248,43 @@ mod tests {
             realm2.string_value(Handle::from_raw(obj_tag.as_handle().unwrap())),
             Some(String::from("cap"))
         );
+    }
+
+    #[test]
+    fn snapshots_preserve_prototype_links() {
+        let mut realm = Realm::new();
+        // A prototype with a method-ish property, and a child created over it
+        // (`Object.create(proto)` shape) carrying its own property.
+        let proto = realm.new_object();
+        let pv = NanBox::handle(realm.new_string("inherited").to_raw());
+        realm.set_property(proto, "kind", pv);
+        let child = realm.new_object_with_proto(Some(proto));
+        let cv = NanBox::handle(realm.new_string("own").to_raw());
+        realm.set_property(child, "self", cv);
+
+        let snap = deserialize(&serialize(&capture(&realm, &[child]))).expect("round-trip");
+        let mut realm2 = Realm::new();
+        let c2 = restore(&mut realm2, &snap)[0];
+
+        // The child's own property and its prototype link both survive, and the
+        // inherited property resolves through the restored chain.
+        let proto2 = realm2.object_proto(c2).expect("prototype link restored");
+        let inherited = realm2
+            .get_property(proto2, "kind")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| realm2.string_value(h));
+        assert_eq!(
+            inherited,
+            Some(String::from("inherited")),
+            "inherited prop via proto"
+        );
+        let own = realm2
+            .get_property(c2, "self")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| realm2.string_value(h));
+        assert_eq!(own, Some(String::from("own")), "own prop kept");
     }
 
     #[test]
