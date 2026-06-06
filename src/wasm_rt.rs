@@ -938,6 +938,34 @@ impl Module {
                     let v = u16::from_le_bytes(store.mem[a..a + 2].try_into().unwrap());
                     stack.push(Val::I32(i32::from(v))); // i32.load16_u
                 }
+                0x30 => {
+                    let a = mem_addr!(r, 1);
+                    stack.push(Val::I64(i64::from(store.mem[a] as i8))); // i64.load8_s
+                }
+                0x31 => {
+                    let a = mem_addr!(r, 1);
+                    stack.push(Val::I64(i64::from(store.mem[a]))); // i64.load8_u
+                }
+                0x32 => {
+                    let a = mem_addr!(r, 2);
+                    let v = i16::from_le_bytes(store.mem[a..a + 2].try_into().unwrap());
+                    stack.push(Val::I64(i64::from(v))); // i64.load16_s
+                }
+                0x33 => {
+                    let a = mem_addr!(r, 2);
+                    let v = u16::from_le_bytes(store.mem[a..a + 2].try_into().unwrap());
+                    stack.push(Val::I64(i64::from(v))); // i64.load16_u
+                }
+                0x34 => {
+                    let a = mem_addr!(r, 4);
+                    let v = i32::from_le_bytes(store.mem[a..a + 4].try_into().unwrap());
+                    stack.push(Val::I64(i64::from(v))); // i64.load32_s
+                }
+                0x35 => {
+                    let a = mem_addr!(r, 4);
+                    let v = u32::from_le_bytes(store.mem[a..a + 4].try_into().unwrap());
+                    stack.push(Val::I64(i64::from(v))); // i64.load32_u
+                }
                 0x36 => {
                     let v = {
                         let v = pop!().as_i32()?;
@@ -969,6 +997,30 @@ impl Module {
                         (a, v)
                     };
                     store.mem[a..a + 2].copy_from_slice(&(v as u16).to_le_bytes()); // i32.store16
+                }
+                0x3c => {
+                    let (a, v) = {
+                        let v = pop!().as_i64()?;
+                        let a = mem_addr!(r, 1);
+                        (a, v)
+                    };
+                    store.mem[a] = v as u8; // i64.store8
+                }
+                0x3d => {
+                    let (a, v) = {
+                        let v = pop!().as_i64()?;
+                        let a = mem_addr!(r, 2);
+                        (a, v)
+                    };
+                    store.mem[a..a + 2].copy_from_slice(&(v as u16).to_le_bytes()); // i64.store16
+                }
+                0x3e => {
+                    let (a, v) = {
+                        let v = pop!().as_i64()?;
+                        let a = mem_addr!(r, 4);
+                        (a, v)
+                    };
+                    store.mem[a..a + 4].copy_from_slice(&(v as u32).to_le_bytes()); // i64.store32
                 }
                 0x3f => {
                     let _reserved = r.byte()?;
@@ -2543,6 +2595,40 @@ mod tests {
         let module2 = Module::decode(&m2).expect("decode if-no-else module");
         assert_eq!(module2.call(0, &[Val::I32(0)]).unwrap(), vec![Val::I32(0)]); // cond false
         assert_eq!(module2.call(0, &[Val::I32(9)]).unwrap(), vec![Val::I32(1)]); // cond true
+    }
+
+    #[test]
+    fn i64_narrow_memory_ops() {
+        // (memory 1)
+        // (func (export "rt") (param i64) (result i64)
+        //   i32.const 0 local.get 0 i64.store32   ;; store low 32 bits at addr 0
+        //   i32.const 0 i64.load32_u)             ;; reload them, zero-extended
+        let body: Vec<u8> = vec![
+            0x00, // 0 locals
+            0x41, 0x00, 0x20, 0x00, 0x3e, 0x02,
+            0x00, // i32.const 0; local.get 0; i64.store32 a=2 o=0
+            0x41, 0x00, 0x35, 0x02, 0x00, // i32.const 0; i64.load32_u a=2 o=0
+            0x0b,
+        ];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7e, 0x01, 0x7e]); // (i64)->i64
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x05, 0x03, 0x01, 0x00, 0x01]); // memory: 1 page
+        m.extend([0x07, 0x06, 0x01, 0x02, b'r', b't', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).expect("decode i64 narrow mem module");
+        // Storing 0x1_FFFF_FFFF and loading32_u keeps only the low 32 bits (zero-ext).
+        let r = module.call(0, &[Val::I64(0x1_FFFF_FFFF)]).unwrap();
+        assert_eq!(r, vec![Val::I64(0xFFFF_FFFF)]);
+        // A small positive value round-trips exactly.
+        assert_eq!(
+            module.call(0, &[Val::I64(12345)]).unwrap(),
+            vec![Val::I64(12345)]
+        );
     }
 
     #[test]
