@@ -482,6 +482,9 @@ fn emit_op(
         "i64.trunc_sat_f32_u" => out.extend_from_slice(&[0xfc, 0x05]),
         "i64.trunc_sat_f64_s" => out.extend_from_slice(&[0xfc, 0x06]),
         "i64.trunc_sat_f64_u" => out.extend_from_slice(&[0xfc, 0x07]),
+        // Bulk-memory ops carry their reserved memory index(es) after the sub-op.
+        "memory.fill" => out.extend_from_slice(&[0xfc, 0x0b, 0x00]),
+        "memory.copy" => out.extend_from_slice(&[0xfc, 0x0a, 0x00, 0x00]),
         "memory.size" => {
             out.push(0x3f);
             out.push(0x00); // reserved memory index
@@ -1703,6 +1706,28 @@ mod tests {
             .call(0, &[Val::I32(5)])
             .unwrap();
         assert_eq!(r3, vec![Val::I32(16)]); // 5*3 + 1
+    }
+
+    #[test]
+    fn spec_bulk_memory_fill_and_copy() {
+        // fill writes a byte run; copy moves a (possibly overlapping) run; both trap
+        // out of bounds. `ld` reads a byte back.
+        let script = "(module \
+            (memory 1) \
+            (func (export \"fill\") (param i32 i32 i32) \
+              (memory.fill (local.get 0) (local.get 1) (local.get 2))) \
+            (func (export \"copy\") (param i32 i32 i32) \
+              (memory.copy (local.get 0) (local.get 1) (local.get 2))) \
+            (func (export \"ld\") (param i32) (result i32) (i32.load8_u (local.get 0)))) \
+            (invoke \"fill\" (i32.const 10) (i32.const 171) (i32.const 4)) \
+            (assert_return (invoke \"ld\" (i32.const 10)) (i32.const 171)) \
+            (assert_return (invoke \"ld\" (i32.const 13)) (i32.const 171)) \
+            (assert_return (invoke \"ld\" (i32.const 14)) (i32.const 0)) \
+            (invoke \"copy\" (i32.const 20) (i32.const 10) (i32.const 4)) \
+            (assert_return (invoke \"ld\" (i32.const 22)) (i32.const 171)) \
+            (assert_trap   (invoke \"fill\" (i32.const 65534) (i32.const 1) (i32.const 4)))";
+        let n = run_wast(script).expect("bulk-memory conformance passes");
+        assert_eq!(n, 7);
     }
 
     #[test]

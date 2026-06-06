@@ -254,6 +254,28 @@ impl<'a> Reader<'a> {
     fn done(&self) -> bool {
         self.pos >= self.bytes.len()
     }
+    /// Consumes a `0xfc`-prefixed opcode's sub-opcode and its immediates (so a
+    /// body scan steps over `memory.copy`/`fill`/`init`/`data.drop`/`trunc_sat`).
+    fn skip_fc(&mut self) -> Result<(), WasmRtError> {
+        match self.u32()? {
+            0x08 => {
+                self.u32()?; // memory.init: data index …
+                self.byte()?; // … + reserved memory index
+            }
+            0x09 => {
+                self.u32()?; // data.drop: data index
+            }
+            0x0a => {
+                self.byte()?; // memory.copy: two reserved memory indices
+                self.byte()?;
+            }
+            0x0b => {
+                self.byte()?; // memory.fill: one reserved memory index
+            }
+            _ => {} // trunc_sat (0x00..=0x07): no further immediate
+        }
+        Ok(())
+    }
 }
 
 fn val_type(b: u8) -> Result<ValType, WasmRtError> {
@@ -1017,7 +1039,7 @@ impl Module {
                     r.bytes(8)?;
                 }
                 0xfc => {
-                    r.u32()?; // 0xfc sub-opcode (trunc_sat: no further immediate)
+                    r.skip_fc()?;
                 }
                 _ => {}
             }
@@ -2186,6 +2208,35 @@ impl Module {
                             let a = pop!().as_f64()?;
                             stack.push(Val::I64(a as u64 as i64)); // i64.trunc_sat_f64_u
                         }
+                        0x0a => {
+                            // memory.copy: two reserved memory indices, then n/src/dst.
+                            r.byte()?;
+                            r.byte()?;
+                            let n = pop!().as_i32()? as u32 as usize;
+                            let src = pop!().as_i32()? as u32 as usize;
+                            let dst = pop!().as_i32()? as u32 as usize;
+                            match (src.checked_add(n), dst.checked_add(n)) {
+                                (Some(es), Some(ed))
+                                    if es <= store.mem.len() && ed <= store.mem.len() =>
+                                {
+                                    store.mem.copy_within(src..es, dst); // overlap-safe
+                                }
+                                _ => return Err(WasmRtError("out of bounds memory access")),
+                            }
+                        }
+                        0x0b => {
+                            // memory.fill: one reserved memory index, then n/val/dst.
+                            r.byte()?;
+                            let n = pop!().as_i32()? as u32 as usize;
+                            let val = pop!().as_i32()? as u8;
+                            let dst = pop!().as_i32()? as u32 as usize;
+                            match dst.checked_add(n) {
+                                Some(end) if end <= store.mem.len() => {
+                                    store.mem[dst..end].fill(val);
+                                }
+                                _ => return Err(WasmRtError("out of bounds memory access")),
+                            }
+                        }
                         _ => return Err(WasmRtError("unsupported 0xfc opcode")),
                     }
                 }
@@ -2560,7 +2611,7 @@ fn else_split(code: &[u8]) -> Result<Option<usize>, WasmRtError> {
                 r.bytes(8)?;
             }
             0xfc => {
-                r.u32()?; // 0xfc sub-opcode
+                r.skip_fc()?;
             }
             _ => {}
         }
@@ -2624,7 +2675,7 @@ fn block_len(code: &[u8]) -> Result<usize, WasmRtError> {
                 r.bytes(8)?; // f64.const
             }
             0xfc => {
-                r.u32()?; // 0xfc sub-opcode
+                r.skip_fc()?;
             }
             _ => {}
         }
