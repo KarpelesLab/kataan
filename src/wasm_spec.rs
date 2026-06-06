@@ -1959,6 +1959,24 @@ mod tests {
     }
 
     #[test]
+    fn spec_mutable_global_across_calls() {
+        // A mutable global persists across separate exported-function calls:
+        // `bump` adds to it and returns the new value, `get` reads it back.
+        let script = "(module \
+            (global $counter (mut i32) (i32.const 0)) \
+            (func (export \"bump\") (param i32) (result i32) \
+              (global.set $counter (i32.add (global.get $counter) (local.get 0))) \
+              (global.get $counter)) \
+            (func (export \"get\") (result i32) (global.get $counter))) \
+            (assert_return (invoke \"bump\" (i32.const 5)) (i32.const 5)) \
+            (assert_return (invoke \"bump\" (i32.const 3)) (i32.const 8)) \
+            (assert_return (invoke \"get\") (i32.const 8)) \
+            (assert_return (invoke \"bump\" (i32.const -10)) (i32.const -2))";
+        let n = run_wast(script).expect("mutable global conformance passes");
+        assert_eq!(n, 4);
+    }
+
+    #[test]
     fn spec_loop_with_back_edge() {
         // A `loop` + `br_if` back-edge: sum 1..=n by counting down. Exercises a
         // branch target landing at the loop header (a backward jump).
