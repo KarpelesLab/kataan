@@ -901,7 +901,7 @@ impl<'a> Interp<'a> {
                 let value = self.json_parse(&chars, &mut pos)?;
                 skip_ws(&chars, &mut pos);
                 if pos != chars.len() {
-                    return Err(ExecError::Throw(self.new_str("Unexpected token in JSON")));
+                    return Err(self.json_error("Unexpected token in JSON"));
                 }
                 // An optional `reviver` transforms each value bottom-up.
                 let reviver = arg(1);
@@ -1800,9 +1800,16 @@ impl<'a> Interp<'a> {
         value
     }
 
+    /// A `SyntaxError` for a malformed `JSON.parse` input (the spec error type, so
+    /// `catch (e) { e instanceof SyntaxError }` works).
+    fn json_error(&mut self, msg: &str) -> ExecError {
+        let m = self.new_str(msg);
+        ExecError::Throw(self.make_error(N_ERROR_BASE + 3, Some(m)))
+    }
+
     fn json_parse(&mut self, c: &[char], pos: &mut usize) -> Result<NanBox, ExecError> {
         skip_ws(c, pos);
-        let err = |s: &mut Self| ExecError::Throw(s.new_str("Unexpected end of JSON input"));
+        let err = |s: &mut Self| s.json_error("Unexpected end of JSON input");
         let Some(&ch) = c.get(*pos) else {
             return Err(err(self));
         };
@@ -1832,7 +1839,7 @@ impl<'a> Interp<'a> {
                             *pos += 1;
                             break;
                         }
-                        _ => return Err(ExecError::Throw(self.new_str("Expected ',' or ']'"))),
+                        _ => return Err(self.json_error("Expected ',' or ']'")),
                     }
                 }
                 Ok(NanBox::handle(self.realm.new_array(elems).to_raw()))
@@ -1848,12 +1855,12 @@ impl<'a> Interp<'a> {
                 loop {
                     skip_ws(c, pos);
                     if c.get(*pos) != Some(&'"') {
-                        return Err(ExecError::Throw(self.new_str("Expected property name")));
+                        return Err(self.json_error("Expected property name"));
                     }
                     let key = self.json_string(c, pos)?;
                     skip_ws(c, pos);
                     if c.get(*pos) != Some(&':') {
-                        return Err(ExecError::Throw(self.new_str("Expected ':'")));
+                        return Err(self.json_error("Expected ':'"));
                     }
                     *pos += 1;
                     let v = self.json_parse(c, pos)?;
@@ -1865,7 +1872,7 @@ impl<'a> Interp<'a> {
                             *pos += 1;
                             break;
                         }
-                        _ => return Err(ExecError::Throw(self.new_str("Expected ',' or '}'"))),
+                        _ => return Err(self.json_error("Expected ',' or '}'")),
                     }
                 }
                 Ok(NanBox::handle(obj.to_raw()))
@@ -1884,9 +1891,9 @@ impl<'a> Interp<'a> {
                 let text: String = c[start..*pos].iter().collect();
                 text.parse::<f64>()
                     .map(NanBox::number)
-                    .map_err(|_| ExecError::Throw(self.new_str("Invalid number in JSON")))
+                    .map_err(|_| self.json_error("Invalid number in JSON"))
             }
-            _ => Err(ExecError::Throw(self.new_str("Unexpected token in JSON"))),
+            _ => Err(self.json_error("Unexpected token in JSON")),
         }
     }
 
@@ -1901,7 +1908,7 @@ impl<'a> Interp<'a> {
             *pos += word.len();
             Ok(value)
         } else {
-            Err(ExecError::Throw(self.new_str("Unexpected token in JSON")))
+            Err(self.json_error("Unexpected token in JSON"))
         }
     }
 
@@ -1913,9 +1920,7 @@ impl<'a> Interp<'a> {
         loop {
             match c.get(*pos) {
                 None => {
-                    return Err(ExecError::Throw(
-                        self.new_str("Unterminated string in JSON"),
-                    ));
+                    return Err(self.json_error("Unterminated string in JSON"));
                 }
                 Some('"') => {
                     *pos += 1;
@@ -1938,13 +1943,11 @@ impl<'a> Interp<'a> {
                             let code = u32::from_str_radix(&hex, 16)
                                 .ok()
                                 .and_then(char::from_u32)
-                                .ok_or_else(|| {
-                                    ExecError::Throw(self.new_str("Invalid \\u escape in JSON"))
-                                })?;
+                                .ok_or_else(|| self.json_error("Invalid \\u escape in JSON"))?;
                             out.push(code);
                             *pos += 4;
                         }
-                        _ => return Err(ExecError::Throw(self.new_str("Invalid escape in JSON"))),
+                        _ => return Err(self.json_error("Invalid escape in JSON")),
                     }
                     *pos += 1;
                 }
