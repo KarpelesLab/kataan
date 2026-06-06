@@ -107,6 +107,12 @@ pub mod wasm;
 #[cfg(feature = "alloc")]
 pub mod nbvm;
 
+/// The baseline machine-code JIT (Phase G): an x86-64 assembler + W^X executable
+/// memory (mapped via direct Linux syscalls, no libc) that lowers an arithmetic
+/// IR to native code. Real on `linux`/`x86_64`; a no-op fallback elsewhere.
+#[cfg(feature = "jit")]
+pub mod jit;
+
 /// A portable `KTBC` serialization codec for the bytecode VM's compiled programs
 /// (the code cache — `ROADMAP.md` Phase D′). Needs `alloc`.
 #[cfg(feature = "alloc")]
