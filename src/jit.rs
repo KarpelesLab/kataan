@@ -269,6 +269,9 @@ pub enum RegOp {
     Neg { dst: u8, a: u8 },
     /// `reg[dst] = ~ToInt32(reg[a])` — JS bitwise-not (`~x`); result is an i32.
     BitNot32 { dst: u8, a: u8 },
+    /// `reg[dst] = reg[a] % reg[b]` — integer remainder (JS `%` on integers). A
+    /// zero divisor deopts (JS yields `NaN`, which isn't an integer).
+    Mod { dst: u8, a: u8, b: u8 },
     /// `reg[dst] = ToInt32(reg[a]) <op> ToInt32(reg[b])` — a JS 32-bit bitwise op
     /// (`&`/`|`/`^`). Both operands are truncated to `i32` first, so the result is
     /// the exact 32-bit value (always within ±2^53), needing no range guard. `op`
@@ -348,6 +351,12 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
             }
             RegOp::BitNot32 { dst, a } => {
                 regs[dst as usize] = i64::from(!(regs[a as usize] as i32));
+                pc += 1;
+            }
+            RegOp::Mod { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                // The JIT deopts on y == 0; the oracle is only consulted for y != 0.
+                regs[dst as usize] = if y == 0 { 0 } else { x.wrapping_rem(y) };
                 pc += 1;
             }
             RegOp::Bit32 { dst, a, b, op } => {
@@ -456,6 +465,11 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 dst,
                 a: resolve(&copy_of, a),
             },
+            RegOp::Mod { dst, a, b } => RegOp::Mod {
+                dst,
+                a: resolve(&copy_of, a),
+                b: resolve(&copy_of, b),
+            },
             RegOp::Bit32 { dst, a, b, op } => RegOp::Bit32 {
                 dst,
                 a: resolve(&copy_of, a),
@@ -495,6 +509,7 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
             | RegOp::Eqz { dst, .. }
             | RegOp::Neg { dst, .. }
             | RegOp::BitNot32 { dst, .. }
+            | RegOp::Mod { dst, .. }
             | RegOp::Bit32 { dst, .. }
             | RegOp::Shift32 { dst, .. }
             | RegOp::Call { dst, .. }
@@ -523,6 +538,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
         match *op {
             RegOp::Bin { a, b, .. }
             | RegOp::Lt { a, b, .. }
+            | RegOp::Mod { a, b, .. }
             | RegOp::Bit32 { a, b, .. }
             | RegOp::Shift32 { a, b, .. } => {
                 used.insert(a);
@@ -560,6 +576,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
         | RegOp::Eqz { dst, .. }
         | RegOp::Neg { dst, .. }
         | RegOp::BitNot32 { dst, .. }
+        | RegOp::Mod { dst, .. }
         | RegOp::Bit32 { dst, .. }
         | RegOp::Shift32 { dst, .. }
         | RegOp::Arg { dst, .. } => used.contains(&dst),
@@ -597,6 +614,7 @@ fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
         RegOp::Move { dst, src } => (Some(dst), [Some(src), None]),
         RegOp::Bin { dst, a, b, .. }
         | RegOp::Lt { dst, a, b }
+        | RegOp::Mod { dst, a, b }
         | RegOp::Bit32 { dst, a, b, .. }
         | RegOp::Shift32 { dst, a, b, .. } => (Some(dst), [Some(a), Some(b)]),
         RegOp::Eqz { dst, a } | RegOp::Neg { dst, a } | RegOp::BitNot32 { dst, a } => {
@@ -715,6 +733,11 @@ pub fn allocate_reg(ops: &[RegOp], n_regs: usize) -> (Vec<RegOp>, usize) {
             RegOp::BitNot32 { dst, a } => RegOp::BitNot32 {
                 dst: m(dst),
                 a: m(a),
+            },
+            RegOp::Mod { dst, a, b } => RegOp::Mod {
+                dst: m(dst),
+                a: m(a),
+                b: m(b),
             },
             RegOp::Bit32 { dst, a, b, op } => RegOp::Bit32 {
                 dst: m(dst),
@@ -858,6 +881,21 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 } else {
                     known[dst as usize] = None;
                     RegOp::BitNot32 { dst, a }
+                }
+            }
+            RegOp::Mod { dst, a, b } => {
+                // Fold only when the divisor is a known non-zero constant (a zero
+                // divisor must still reach the native deopt, not be folded).
+                match (known[a as usize], known[b as usize]) {
+                    (Some(x), Some(y)) if y != 0 => {
+                        let v = x.wrapping_rem(y);
+                        known[dst as usize] = Some(v);
+                        RegOp::Const { dst, imm: v }
+                    }
+                    _ => {
+                        known[dst as usize] = None;
+                        RegOp::Mod { dst, a, b }
+                    }
                 }
             }
             RegOp::Bit32 { dst, a, b, op } => {
@@ -1086,6 +1124,14 @@ pub fn lower_nbvm_with(
                     b,
                     op: BinOp2::Mul,
                 }
+            }
+            // Integer remainder `%`. The native code deopts on a zero divisor
+            // (JS yields NaN) and on a non-integer/overflowing result via guards.
+            Op::Mod { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Mod { dst: d, a, b }
             }
             Op::Move { dst, src } => {
                 let s = read(&written, *src)?;
@@ -1680,6 +1726,19 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0xf7, 0xd0]);
     }
 
+    /// `cqo` — sign-extend `rax` into `rdx:rax` (for a signed `idiv`).
+    pub fn cqo(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x99]);
+    }
+    /// `idiv rcx` — signed divide `rdx:rax` by `rcx` (quotient→rax, remainder→rdx).
+    pub fn idiv_rcx(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0xf7, 0xf9]);
+    }
+    /// `mov rax, rdx` — move the `idiv` remainder into `rax`.
+    pub fn mov_rax_rdx(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x89, 0xd0]);
+    }
+
     /// `shl/sar/shr eax, cl` — a 32-bit shift of `eax` by `cl` (masked to 5 bits;
     /// writing `eax` zeroes the upper 32 bits of `rax`, i.e. zero-extends).
     pub fn shift_eax_cl(&mut self, op: ShiftOp) {
@@ -2173,6 +2232,21 @@ impl JitFunction {
                     a.load_rax(disp(ra));
                     a.not_eax();
                     a.to_int32_rax();
+                    a.store_rax(disp(dst));
+                }
+                RegOp::Mod { dst, a: ra, b: rb } => {
+                    if !ok_reg(dst) || !ok_reg(ra) || !ok_reg(rb) {
+                        return None;
+                    }
+                    // Deopt on a zero divisor (JS `%0` is NaN); else signed idiv,
+                    // keeping the remainder (rdx). |rem| < |b| ≤ 2^53 → in range.
+                    a.load_rcx(disp(rb));
+                    a.test_rcx_rcx();
+                    a.je(deopt);
+                    a.load_rax(disp(ra));
+                    a.cqo();
+                    a.idiv_rcx();
+                    a.mov_rax_rdx();
                     a.store_rax(disp(dst));
                 }
                 RegOp::Eqz { dst, a: ra } => {
@@ -3330,6 +3404,27 @@ mod tests {
             assert_eq!(f.call_args(&[a, b]), expect, "({a:#x} & {b:#x})");
             assert_eq!(eval_reg(&ops, 3, &[a, b]), expect);
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn mod_compiles_and_deopts_on_zero() {
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Arg { dst: 1, index: 1 },
+            RegOp::Mod { dst: 2, a: 0, b: 1 },
+            RegOp::Ret { src: 2 },
+        ];
+        let (alloc, n) = allocate_reg(&optimize_reg(&ops, 3), 3);
+        let f = JitFunction::compile_reg(n, 2, &alloc).unwrap();
+        // JS `%`: sign follows the dividend.
+        for (a, b) in [(17, 5), (-17, 5), (17, -5), (100, 10), (3, 7)] {
+            let expect = a % b;
+            assert_eq!(f.call_args(&[a, b]), expect, "{a} % {b}");
+            assert_eq!(eval_reg(&ops, 3, &[a, b]), expect);
+        }
+        // Divide-by-zero deopts: the sentinel (out of ±2^53) signals "bail".
+        assert_eq!(f.call_args(&[5, 0]), i64::MAX, "% 0 must deopt");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

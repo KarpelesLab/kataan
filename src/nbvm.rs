@@ -5539,6 +5539,28 @@ mod tests {
         );
     }
 
+    /// A hot function using `%` must JIT (lowered to `Mod`) and match the
+    /// interpreter — including the JS sign-follows-dividend rule.
+    #[test]
+    fn hot_function_with_mod_matches_interpreter() {
+        // count i in 0..40 with i % 7 == 0: i = 0,7,14,21,28,35 → 6.
+        assert_eq!(
+            bc("function isMul7(x){ return (x % 7) == 0 ? 1 : 0; } \
+                let c = 0; \
+                for (let i = 0; i < 40; i = i + 1) { c = c + isMul7(i); } \
+                c"),
+            "6"
+        );
+        // sum of (i % 10) for i in 0..20 → (0+..+9) + (0+..+9) = 90.
+        assert_eq!(
+            bc("function r(x){ return x % 10; } \
+                let s = 0; \
+                for (let i = 0; i < 20; i = i + 1) { s = s + r(i); } \
+                s"),
+            "90"
+        );
+    }
+
     /// A hot function using bitwise-not `~x` must JIT (lowered to `BitNot32`).
     #[test]
     fn hot_function_with_bitnot_matches_interpreter() {
