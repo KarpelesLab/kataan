@@ -1484,6 +1484,20 @@ impl X64Assembler {
     pub fn ret(&mut self) {
         self.code.push(0xc3);
     }
+
+    /// `call rax` — an indirect native call through `rax` (holding the callee's
+    /// code address). The System V ABI requires `rsp` 16-byte aligned here.
+    pub fn call_rax(&mut self) {
+        self.code.extend_from_slice(&[0xff, 0xd0]);
+    }
+    /// `sub rsp, imm8`.
+    pub fn sub_rsp_imm8(&mut self, imm: u8) {
+        self.code.extend_from_slice(&[0x48, 0x83, 0xec, imm]);
+    }
+    /// `add rsp, imm8`.
+    pub fn add_rsp_imm8(&mut self, imm: u8) {
+        self.code.extend_from_slice(&[0x48, 0x83, 0xc4, imm]);
+    }
 }
 
 /// Whether the JIT can emit and run native code on this target.
@@ -1858,6 +1872,27 @@ impl JitFunction {
             return None;
         }
         Self::from_code(&a.finish())
+    }
+
+    /// Wraps already-emitted machine `code` into a callable region (the entry
+    /// point for hand-assembled functions, e.g. one that calls another).
+    #[must_use]
+    pub fn from_machine_code(code: &[u8]) -> Option<Self> {
+        Self::from_code(code)
+    }
+
+    /// The executable entry address of this function — the target a *caller's*
+    /// native code emits a `call` to (intra-JIT calls). `0` if unavailable.
+    #[must_use]
+    pub fn code_ptr(&self) -> usize {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.buf.ptr() as usize
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            0
+        }
     }
 
     /// Calls a compiled float function with up to 4 `f64` arguments.
@@ -2965,6 +3000,38 @@ mod tests {
                 assert_eq!(f.call_args_f64(&[x]), expect, "const f64 ({x})");
             }
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn jit_code_calls_another_jit_function() {
+        // Callee B(x) = x * 2 (a compiled arithmetic function).
+        let b = JitFunction::compile_arith(&[ArithOp::MulImm(2)]).expect("compile B");
+        let b_ptr = b.code_ptr();
+        assert_ne!(b_ptr, 0);
+
+        // Caller A(x) = B(x) + 1, hand-assembled to *call B's native code*:
+        //   sub rsp, 8        ; align rsp to 16 before the call (System V)
+        //   movabs rax, B     ; B's entry address
+        //   call rax          ; B(rdi) -> rax   (rdi = A's arg, untouched)
+        //   add rsp, 8
+        //   add rax, 1
+        //   ret
+        let mut a = X64Assembler::new();
+        a.sub_rsp_imm8(8);
+        a.movabs_rax(b_ptr as i64);
+        a.call_rax();
+        a.add_rsp_imm8(8);
+        a.add_rax_imm(1);
+        a.ret();
+        let af = JitFunction::from_machine_code(&a.finish()).expect("compile A");
+
+        // A(x) = 2*x + 1, computed by A natively calling B natively.
+        for x in [0i64, 1, 5, -3, 1000] {
+            assert_eq!(af.call1(x), 2 * x + 1, "A({x}) via native call to B");
+        }
+        // B itself still works (its code wasn't disturbed).
+        assert_eq!(b.call1(21), 42);
     }
 
     #[test]
