@@ -248,6 +248,14 @@ const N_ARRAY_BUFFER: u16 = 177;
 const N_DATA_VIEW: u16 = 178;
 // `WebAssembly.validate` — decode a module and report well-formedness.
 const N_WASM_VALIDATE: u16 = 184;
+// `WebAssembly.instantiate` — build an instance object with callable exports.
+const N_WASM_INSTANTIATE: u16 = 185;
+// A WASM export wrapper (a bound native whose target carries the module bytes +
+// the export name).
+const N_WASM_CALL: u16 = 186;
+// Hidden slots on a WASM export wrapper's data object.
+const WASM_BYTES: &str = "\u{0}wbytes";
+const WASM_EXPORT: &str = "\u{0}wexport";
 // `Object.prototype.*` methods (the receiver arrives as `this`).
 const N_OBJ_PROTO_TOSTRING: u16 = 179;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
@@ -620,7 +628,14 @@ impl<'a> Interp<'a> {
         // The `WebAssembly` namespace, backed by the in-house WASM engine
         // (`wasm_rt`). `validate(bytes)` decodes a module and reports whether it
         // is well-formed.
-        install_namespace(self, "WebAssembly", &[("validate", N_WASM_VALIDATE)]);
+        install_namespace(
+            self,
+            "WebAssembly",
+            &[
+                ("validate", N_WASM_VALIDATE),
+                ("instantiate", N_WASM_INSTANTIATE),
+            ],
+        );
         // A minimal `Object.prototype` carrying the methods commonly invoked via
         // `Object.prototype.<m>.call(x)`. The receiver arrives as `this`.
         let obj_proto = self.realm.new_object();
@@ -1473,6 +1488,37 @@ impl<'a> Interp<'a> {
                     .wasm_bytes(arg(0))
                     .is_some_and(|b| crate::wasm_rt::Module::decode(&b).is_ok());
                 NanBox::boolean(ok)
+            }
+            // `WebAssembly.instantiate(bytes)` → `{ instance: { exports: {…} } }`,
+            // each export a callable wrapper. (Synchronous, unlike the spec's
+            // Promise; a stateful module re-instantiates per call.)
+            N_WASM_INSTANTIATE => {
+                let bytes = self
+                    .wasm_bytes(arg(0))
+                    .ok_or_else(|| self.wasm_compile_error("invalid module source"))?;
+                let module = crate::wasm_rt::Module::decode(&bytes)
+                    .map_err(|_| self.wasm_compile_error("invalid module"))?;
+                let names: Vec<String> =
+                    module.export_names().iter().map(|s| (*s).into()).collect();
+                let bytes_arr = arg(0); // the original buffer, kept for re-decode
+                let exports = self.realm.new_object();
+                for name in names {
+                    // The wrapper's data object carries the bytes + export name.
+                    let data = self.realm.new_object();
+                    self.realm.set_property(data, WASM_BYTES, bytes_arr);
+                    let name_v = self.new_str(&name);
+                    self.realm.set_property(data, WASM_EXPORT, name_v);
+                    let f = self.realm.new_bound_native(N_WASM_CALL, data);
+                    self.realm
+                        .set_property(exports, &name, NanBox::handle(f.to_raw()));
+                }
+                let instance = self.realm.new_object();
+                self.realm
+                    .set_property(instance, "exports", NanBox::handle(exports.to_raw()));
+                let result = self.realm.new_object();
+                self.realm
+                    .set_property(result, "instance", NanBox::handle(instance.to_raw()));
+                NanBox::handle(result.to_raw())
             }
             // `Object.prototype.*` methods — the receiver is `self.this_val`.
             N_OBJ_PROTO_TOSTRING => {
@@ -2488,6 +2534,11 @@ impl<'a> Interp<'a> {
         }
         // A bound native (promise resolve/reject) carries its target.
         if let Some((id, target)) = self.realm.bound_native_at(handle) {
+            // A WASM export wrapper: decode the carried module, instantiate, and
+            // invoke the named export through the JS-value boundary.
+            if id == N_WASM_CALL {
+                return self.call_wasm_export(target, args);
+            }
             let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
             match id {
                 N_RESOLVE => self.resolve_with(target, arg0),
@@ -5728,6 +5779,42 @@ impl<'a> Interp<'a> {
 
     /// The tag used by `Object.prototype.toString` (`"[object <tag>]"`): a
     /// `Symbol.toStringTag` string property if present, else the built-in tag.
+    /// Invokes a WASM export wrapper: `data` carries the module bytes and the
+    /// export name; decode, instantiate, marshal `args` across the JS↔WASM
+    /// boundary, and return the (first) result as a JS value.
+    fn call_wasm_export(
+        &mut self,
+        data: crate::heap::Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let bytes = self
+            .realm
+            .get_property(data, WASM_BYTES)
+            .and_then(|v| self.wasm_bytes(v))
+            .ok_or_else(|| self.wasm_compile_error("missing module bytes"))?;
+        let name = self
+            .realm
+            .get_property(data, WASM_EXPORT)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .ok_or_else(|| self.wasm_compile_error("missing export name"))?;
+        let module = crate::wasm_rt::Module::decode(&bytes)
+            .map_err(|_| self.wasm_compile_error("invalid module"))?;
+        let mut inst = crate::wasm_rt::Instance::new(&module)
+            .map_err(|_| self.wasm_compile_error("instantiation failed"))?;
+        let results = inst
+            .call_export_js(&name, args)
+            .map_err(|e| self.wasm_compile_error(e.0))?;
+        Ok(results.first().copied().unwrap_or(NanBox::undefined()))
+    }
+
+    /// A thrown `WebAssembly`-style `TypeError` for compile/instantiate failures.
+    fn wasm_compile_error(&mut self, msg: &str) -> ExecError {
+        let m = self.new_str(msg);
+        ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
+    }
+
     /// Extracts a byte vector from a JS `BufferSource`-ish value for the WASM
     /// builtins: an `ArrayBuffer` (its `\0abytes` store) or a plain array of byte
     /// numbers. Returns `None` if `v` isn't byte-like.
@@ -9885,6 +9972,14 @@ mod tests {
             run("let o={x:1}; Object.prototype.valueOf.call(o)===o"),
             "true"
         );
+    }
+
+    #[test]
+    fn webassembly_instantiate_and_call() {
+        let setup = "var b=[0,0x61,0x73,0x6d,1,0,0,0, 1,7,1,0x60,2,0x7f,0x7f,1,0x7f, 3,2,1,0, 7,7,1,3,0x61,0x64,0x64,0,0, 0xa,9,1,7,0,0x20,0,0x20,1,0x6a,0xb]; var e=WebAssembly.instantiate(b).instance.exports; ";
+        assert_eq!(run(&alloc::format!("{setup} typeof e.add")), "function");
+        assert_eq!(run(&alloc::format!("{setup} e.add(20,22)")), "42");
+        assert_eq!(run(&alloc::format!("{setup} e.add(-5,8)")), "3");
     }
 
     #[test]

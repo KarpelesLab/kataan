@@ -616,6 +616,12 @@ impl Module {
         Ok(())
     }
 
+    /// The names of all exported functions, in declaration order.
+    #[must_use]
+    pub fn export_names(&self) -> Vec<&str> {
+        self.exports.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
     /// The index of an exported function, or `None`.
     #[must_use]
     pub fn export(&self, name: &str) -> Option<u32> {
