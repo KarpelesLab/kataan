@@ -78,7 +78,14 @@ pub struct Module {
     bodies: Vec<FuncBody>,
     /// `name -> func_index`.
     exports: Vec<(alloc::string::String, u32)>,
+    /// Linear memory minimum size, in 64 KiB pages (`None` = no memory).
+    mem_min_pages: Option<u32>,
+    /// Active data segments: `(constant byte offset, bytes)`.
+    data: Vec<(u32, Vec<u8>)>,
 }
+
+/// One linear-memory page, in bytes (WebAssembly fixes this at 64 KiB).
+const PAGE_SIZE: usize = 65536;
 
 /// LEB128 cursor over a byte slice.
 struct Reader<'a> {
@@ -162,6 +169,19 @@ fn val_type(b: u8) -> Result<ValType, WasmRtError> {
     }
 }
 
+/// Reads a constant `i32.const N; end` initializer expression (data/element
+/// segment offsets and `i32` globals).
+fn read_const_i32_expr(s: &mut Reader) -> Result<i32, WasmRtError> {
+    if s.byte()? != 0x41 {
+        return Err(WasmRtError("expected i32.const in const expr"));
+    }
+    let v = s.i32()?;
+    if s.byte()? != 0x0b {
+        return Err(WasmRtError("expected end of const expr"));
+    }
+    Ok(v)
+}
+
 impl Module {
     /// Decodes a WebAssembly binary module.
     ///
@@ -185,10 +205,11 @@ impl Module {
                 0 => {} // custom section: ignore
                 1 => Self::decode_types(&mut s, &mut m)?,
                 3 => Self::decode_functions(&mut s, &mut m)?,
+                5 => Self::decode_memory(&mut s, &mut m)?,
                 7 => Self::decode_exports(&mut s, &mut m)?,
                 10 => Self::decode_code(&mut s, &mut m)?,
-                // Other sections (import/table/memory/global/data) are skipped
-                // for now; they land with the non-numeric surface.
+                11 => Self::decode_data(&mut s, &mut m)?,
+                // Other sections (import/table/global) are skipped for now.
                 _ => {}
             }
         }
@@ -220,6 +241,36 @@ impl Module {
         let count = s.u32()?;
         for _ in 0..count {
             m.func_types.push(s.u32()?);
+        }
+        Ok(())
+    }
+
+    fn decode_memory(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
+        let count = s.u32()?;
+        if count > 0 {
+            // limits: flag (0 = min only, 1 = min+max), then min (and max).
+            let flag = s.byte()?;
+            let min = s.u32()?;
+            if flag == 1 {
+                let _max = s.u32()?;
+            }
+            m.mem_min_pages = Some(min);
+        }
+        Ok(())
+    }
+
+    fn decode_data(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
+        let count = s.u32()?;
+        for _ in 0..count {
+            let mode = s.u32()?;
+            // Mode 0 = active, memory 0, with an `i32.const off; end` offset expr.
+            if mode != 0 {
+                return Err(WasmRtError("unsupported data segment mode"));
+            }
+            let off = read_const_i32_expr(s)?;
+            let len = s.u32()? as usize;
+            let bytes = s.bytes(len)?.to_vec();
+            m.data.push((off as u32, bytes));
         }
         Ok(())
     }
@@ -272,12 +323,41 @@ impl Module {
             .map(|(_, i)| *i)
     }
 
-    /// Calls function `index` with `args`, returning the results.
+    /// Allocates and initializes this module's linear memory (min pages, with
+    /// the active data segments written in).
+    fn new_memory(&self) -> Result<Vec<u8>, WasmRtError> {
+        let pages = self.mem_min_pages.unwrap_or(0) as usize;
+        let mut mem = alloc::vec![0u8; pages * PAGE_SIZE];
+        for (off, bytes) in &self.data {
+            let start = *off as usize;
+            let end = start
+                .checked_add(bytes.len())
+                .filter(|e| *e <= mem.len())
+                .ok_or(WasmRtError("data segment out of bounds"))?;
+            mem[start..end].copy_from_slice(bytes);
+        }
+        Ok(mem)
+    }
+
+    /// Calls function `index` with `args`, returning the results. Allocates a
+    /// fresh linear memory for the invocation.
     ///
     /// # Errors
     /// Returns `WasmRtError` on a type mismatch, a missing function, or an
     /// unsupported instruction.
     pub fn call(&self, index: u32, args: &[Val]) -> Result<Vec<Val>, WasmRtError> {
+        let mut mem = self.new_memory()?;
+        self.call_with_mem(index, args, &mut mem)
+    }
+
+    /// Like [`call`](Self::call) but over a caller-provided linear memory (shared
+    /// across nested `call`s).
+    fn call_with_mem(
+        &self,
+        index: u32,
+        args: &[Val],
+        mem: &mut Vec<u8>,
+    ) -> Result<Vec<Val>, WasmRtError> {
         let ty = self
             .func_types
             .get(index as usize)
@@ -299,7 +379,7 @@ impl Module {
             });
         }
         let mut stack: Vec<Val> = Vec::new();
-        self.exec(&body.code, &mut locals, &mut stack)?;
+        self.exec(&body.code, &mut locals, &mut stack, mem)?;
         // Take the result count off the top of the stack.
         let n = ty.results.len();
         if stack.len() < n {
@@ -316,12 +396,28 @@ impl Module {
         code: &[u8],
         locals: &mut [Val],
         stack: &mut Vec<Val>,
+        mem: &mut Vec<u8>,
     ) -> Result<Flow, WasmRtError> {
         let mut r = Reader::new(code);
         macro_rules! pop {
             () => {
                 stack.pop().ok_or(WasmRtError("stack underflow"))?
             };
+        }
+        // Computes a bounds-checked effective address for a memory access of
+        // `size` bytes: `popped_base (u32) + offset`.
+        macro_rules! mem_addr {
+            ($r:expr, $size:expr) => {{
+                let _align = $r.u32()?;
+                let offset = $r.u32()?;
+                let base = pop!().as_i32()? as u32 as u64;
+                let addr = base + u64::from(offset);
+                let end = addr + $size as u64;
+                if end > mem.len() as u64 {
+                    return Err(WasmRtError("out of bounds memory access"));
+                }
+                addr as usize
+            }};
         }
         macro_rules! bin_i32 {
             ($f:expr) => {{
@@ -375,8 +471,90 @@ impl Module {
                         return Err(WasmRtError("call argument underflow"));
                     }
                     let cargs = stack.split_off(stack.len() - n);
-                    let res = self.call(callee, &cargs)?;
+                    let res = self.call_with_mem(callee, &cargs, mem)?;
                     stack.extend(res);
+                }
+                // --- linear memory ---
+                0x28 => {
+                    let a = mem_addr!(r, 4);
+                    let v = i32::from_le_bytes(mem[a..a + 4].try_into().unwrap());
+                    stack.push(Val::I32(v)); // i32.load
+                }
+                0x29 => {
+                    let a = mem_addr!(r, 8);
+                    let v = i64::from_le_bytes(mem[a..a + 8].try_into().unwrap());
+                    stack.push(Val::I64(v)); // i64.load
+                }
+                0x2c => {
+                    let a = mem_addr!(r, 1);
+                    stack.push(Val::I32(i32::from(mem[a] as i8))); // i32.load8_s
+                }
+                0x2d => {
+                    let a = mem_addr!(r, 1);
+                    stack.push(Val::I32(i32::from(mem[a]))); // i32.load8_u
+                }
+                0x2e => {
+                    let a = mem_addr!(r, 2);
+                    let v = i16::from_le_bytes(mem[a..a + 2].try_into().unwrap());
+                    stack.push(Val::I32(i32::from(v))); // i32.load16_s
+                }
+                0x2f => {
+                    let a = mem_addr!(r, 2);
+                    let v = u16::from_le_bytes(mem[a..a + 2].try_into().unwrap());
+                    stack.push(Val::I32(i32::from(v))); // i32.load16_u
+                }
+                0x36 => {
+                    let v = {
+                        let v = pop!().as_i32()?;
+                        let a = mem_addr!(r, 4);
+                        (a, v)
+                    };
+                    mem[v.0..v.0 + 4].copy_from_slice(&v.1.to_le_bytes()); // i32.store
+                }
+                0x37 => {
+                    let (a, v) = {
+                        let v = pop!().as_i64()?;
+                        let a = mem_addr!(r, 8);
+                        (a, v)
+                    };
+                    mem[a..a + 8].copy_from_slice(&v.to_le_bytes()); // i64.store
+                }
+                0x3a => {
+                    let (a, v) = {
+                        let v = pop!().as_i32()?;
+                        let a = mem_addr!(r, 1);
+                        (a, v)
+                    };
+                    mem[a] = v as u8; // i32.store8
+                }
+                0x3b => {
+                    let (a, v) = {
+                        let v = pop!().as_i32()?;
+                        let a = mem_addr!(r, 2);
+                        (a, v)
+                    };
+                    mem[a..a + 2].copy_from_slice(&(v as u16).to_le_bytes()); // i32.store16
+                }
+                0x3f => {
+                    let _reserved = r.byte()?;
+                    stack.push(Val::I32((mem.len() / PAGE_SIZE) as i32)); // memory.size
+                }
+                0x40 => {
+                    let _reserved = r.byte()?;
+                    let delta = pop!().as_i32()? as u32 as usize;
+                    let old = mem.len() / PAGE_SIZE;
+                    // Grow by `delta` pages (no max enforced here); -1 on failure.
+                    if mem
+                        .len()
+                        .checked_add(delta * PAGE_SIZE)
+                        .filter(|n| *n <= 0x1_0000 * PAGE_SIZE)
+                        .is_some()
+                    {
+                        mem.resize(mem.len() + delta * PAGE_SIZE, 0);
+                        stack.push(Val::I32(old as i32));
+                    } else {
+                        stack.push(Val::I32(-1));
+                    }
                 }
                 // i32 arithmetic / bitwise
                 0x45 => {
@@ -414,7 +592,7 @@ impl Module {
                     let _blocktype = r.byte()?; // 0x40 (empty) or a value type
                     let is_loop = op == 0x03;
                     let (consumed, flow) =
-                        self.exec_block(&code[r.pos..], locals, stack, is_loop)?;
+                        self.exec_block(&code[r.pos..], locals, stack, mem, is_loop)?;
                     r.pos += consumed;
                     match flow {
                         Flow::Return => return Ok(Flow::Return),
@@ -447,12 +625,13 @@ impl Module {
         code: &[u8],
         locals: &mut [Val],
         stack: &mut Vec<Val>,
+        mem: &mut Vec<u8>,
         is_loop: bool,
     ) -> Result<(usize, Flow), WasmRtError> {
         let inner_len = block_len(code)?;
         let inner = &code[..inner_len - 1]; // exclude the matching `end`
         loop {
-            match self.exec(inner, locals, stack)? {
+            match self.exec(inner, locals, stack, mem)? {
                 Flow::Branch(0) => {
                     if is_loop {
                         continue; // re-run the loop body
@@ -499,6 +678,15 @@ fn block_len(code: &[u8]) -> Result<usize, WasmRtError> {
             // Skip immediates of the ops that carry them.
             0x20 | 0x21 | 0x22 | 0x0c | 0x0d | 0x10 => {
                 r.u32()?;
+            }
+            // Memory load/store ops carry a memarg (align + offset, two LEBs).
+            0x28..=0x3e => {
+                r.u32()?;
+                r.u32()?;
+            }
+            // memory.size / memory.grow carry a reserved byte.
+            0x3f | 0x40 => {
+                r.byte()?;
             }
             0x41 => {
                 r.i32()?;
@@ -616,6 +804,95 @@ mod tests {
                 "sum 1..={n}"
             );
         }
+    }
+
+    #[test]
+    fn memory_store_then_load() {
+        // (memory 1)
+        // (func (export "f") (param i32) (result i32)
+        //   i32.const 0  local.get 0  i32.store          ;; mem[0] = arg
+        //   i32.const 0  i32.load                          ;; return mem[0]
+        //   i32.const 4  i32.const 99  i32.store           ;; mem[4] = 99
+        //   i32.const 4  i32.load  i32.add)                ;; + mem[4]
+        // memarg = align(0x02 for i32) + offset(0x00)
+        let body: Vec<u8> = vec![
+            0x00, // 0 local runs
+            0x41, 0x00, 0x20, 0x00, 0x36, 0x02, 0x00, // i32.store mem[0]=arg
+            0x41, 0x00, 0x28, 0x02, 0x00, // i32.load mem[0]
+            // i32.const 99 needs 2 LEB bytes (0x63 alone is -29: sign bit set).
+            0x41, 0x04, 0x41, 0xe3, 0x00, 0x36, 0x02, 0x00, // i32.store mem[4]=99
+            0x41, 0x04, 0x28, 0x02, 0x00, // i32.load mem[4]
+            0x6a, // i32.add
+            0x0b, // end
+        ];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]); // (i32)->i32
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x05, 0x03, 0x01, 0x00, 0x01]); // memory: 1 mem, min 1 page
+        m.extend([0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).expect("decode mem module");
+        let f = module.export("f").unwrap();
+        // f(arg) = arg + 99
+        assert_eq!(module.call(f, &[Val::I32(1)]).unwrap(), vec![Val::I32(100)]);
+        assert_eq!(
+            module.call(f, &[Val::I32(-50)]).unwrap(),
+            vec![Val::I32(49)]
+        );
+    }
+
+    #[test]
+    fn data_segment_and_load8() {
+        // (memory 1) (data (i32.const 2) "\07\09")
+        // (func (export "g") (result i32)
+        //   i32.const 2 i32.load8_u  i32.const 3 i32.load8_u  i32.add)  ;; 7 + 9
+        let body: Vec<u8> = vec![
+            0x00, 0x41, 0x02, 0x2d, 0x00, 0x00, // i32.load8_u mem[2]
+            0x41, 0x03, 0x2d, 0x00, 0x00, // i32.load8_u mem[3]
+            0x6a, 0x0b,
+        ];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f]); // ()->i32
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x05, 0x03, 0x01, 0x00, 0x01]); // memory min 1
+        m.extend([0x07, 0x05, 0x01, 0x01, b'g', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        // data section: 1 segment, mode 0, offset (i32.const 2; end), 2 bytes 07 09
+        m.extend([0x0b, 0x08, 0x01, 0x00, 0x41, 0x02, 0x0b, 0x02, 0x07, 0x09]);
+        let module = Module::decode(&m).expect("decode data module");
+        let g = module.export("g").unwrap();
+        assert_eq!(module.call(g, &[]).unwrap(), vec![Val::I32(16)]); // 7 + 9
+    }
+
+    #[test]
+    fn memory_out_of_bounds_traps() {
+        // (memory 1) (func (export "h") (result i32) i32.const 100000 i32.load)
+        // address 100000 is past one 64 KiB page.
+        let body: Vec<u8> = vec![0x00, 0x41, 0xa0, 0x8d, 0x06, 0x28, 0x02, 0x00, 0x0b];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f]);
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x05, 0x03, 0x01, 0x00, 0x01]);
+        m.extend([0x07, 0x05, 0x01, 0x01, b'h', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).unwrap();
+        let h = module.export("h").unwrap();
+        assert_eq!(
+            module.call(h, &[]),
+            Err(WasmRtError("out of bounds memory access"))
+        );
     }
 
     #[test]
