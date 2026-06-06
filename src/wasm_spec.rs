@@ -303,23 +303,25 @@ fn emit_op(
     name: &str,
     imm: Option<&str>,
     locals: &[String],
+    funcs: &[String],
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
-    let idx = || -> Result<u64, String> {
+    // Resolves an index immediate against a symbol table: `$name` → its position,
+    // a bare number → itself.
+    let resolve = |table: &[String], kind: &str| -> Result<u64, String> {
         let s = imm.ok_or_else(|| format!("{name} needs an immediate"))?;
-        // A `$name` reference resolves against the local symbol table; a bare
-        // number is the index directly.
         if let Some(stripped) = s.strip_prefix('$') {
-            locals
+            table
                 .iter()
                 .position(|n| n == stripped)
                 .map(|p| p as u64)
-                .ok_or_else(|| format!("unknown local ${stripped}"))
+                .ok_or_else(|| format!("unknown {kind} ${stripped}"))
         } else {
             s.parse::<u64>()
                 .map_err(|_| format!("bad index for {name}"))
         }
     };
+    let idx = || resolve(locals, "local");
     match name {
         "i32.const" | "i64.const" => {
             out.push(if name == "i32.const" { 0x41 } else { 0x42 });
@@ -361,7 +363,7 @@ fn emit_op(
         }
         "call" => {
             out.push(0x10);
-            leb_u(idx()?, out);
+            leb_u(resolve(funcs, "function")?, out);
         }
         _ => out.push(simple_opcode(name).ok_or_else(|| format!("unknown instruction {name}"))?),
     }
@@ -370,12 +372,17 @@ fn emit_op(
 
 /// Emits a flat sequence of instructions (each an atom — possibly consuming the
 /// next atom as an immediate — or a folded `(op …)` list).
-fn emit_instrs(items: &[Sexpr], locals: &[String], out: &mut Vec<u8>) -> Result<(), String> {
+fn emit_instrs(
+    items: &[Sexpr],
+    locals: &[String],
+    funcs: &[String],
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
     let mut i = 0;
     while i < items.len() {
         match &items[i] {
             Sexpr::List(inner) => {
-                emit_folded(inner, locals, out)?;
+                emit_folded(inner, locals, funcs, out)?;
                 i += 1;
             }
             Sexpr::Atom(name) => {
@@ -384,10 +391,10 @@ fn emit_instrs(items: &[Sexpr], locals: &[String], out: &mut Vec<u8>) -> Result<
                         Some(Sexpr::Atom(s)) => s.as_str(),
                         _ => return Err(format!("{name} needs an immediate")),
                     };
-                    emit_op(name, Some(imm), locals, out)?;
+                    emit_op(name, Some(imm), locals, funcs, out)?;
                     i += 2;
                 } else {
-                    emit_op(name, None, locals, out)?;
+                    emit_op(name, None, locals, funcs, out)?;
                     i += 1;
                 }
             }
@@ -398,7 +405,12 @@ fn emit_instrs(items: &[Sexpr], locals: &[String], out: &mut Vec<u8>) -> Result<
 }
 
 /// Emits a folded instruction `(op imm? operands…)`: operands first, then the op.
-fn emit_folded(inner: &[Sexpr], locals: &[String], out: &mut Vec<u8>) -> Result<(), String> {
+fn emit_folded(
+    inner: &[Sexpr],
+    locals: &[String],
+    funcs: &[String],
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
     let Some(Sexpr::Atom(name)) = inner.first() else {
         return Err(String::from("folded instruction needs a head opcode"));
     };
@@ -407,21 +419,26 @@ fn emit_folded(inner: &[Sexpr], locals: &[String], out: &mut Vec<u8>) -> Result<
             Some(Sexpr::Atom(s)) => s.clone(),
             _ => return Err(format!("{name} needs an immediate")),
         };
-        emit_instrs(&inner[2..], locals, out)?;
-        emit_op(name, Some(&imm), locals, out)?;
+        emit_instrs(&inner[2..], locals, funcs, out)?;
+        emit_op(name, Some(&imm), locals, funcs, out)?;
     } else {
-        emit_instrs(&inner[1..], locals, out)?;
-        emit_op(name, None, locals, out)?;
+        emit_instrs(&inner[1..], locals, funcs, out)?;
+        emit_op(name, None, locals, funcs, out)?;
     }
     Ok(())
 }
 
-/// A parsed `(func …)`: signature, locals, and encoded body bytes.
+/// A parsed `(func …)`: signature, locals, and (after the second pass) the encoded
+/// body bytes. `name`/`body_items`/`local_names` support resolving `$name`
+/// references once every function's index is known.
 struct WatFunc {
+    name: String,
     export: Option<String>,
     params: Vec<u8>,
     results: Vec<u8>,
     locals: Vec<u8>,
+    local_names: Vec<String>,
+    body_items: Vec<Sexpr>,
     body: Vec<u8>,
 }
 
@@ -434,10 +451,13 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
             continue;
         }
         let mut wf = WatFunc {
+            name: String::new(),
             export: None,
             params: Vec::new(),
             results: Vec::new(),
             locals: Vec::new(),
+            local_names: Vec::new(),
+            body_items: Vec::new(),
             body: Vec::new(),
         };
         let mut body_items: Vec<Sexpr> = Vec::new();
@@ -491,15 +511,28 @@ fn parse_wat_module(items: &[Sexpr]) -> Result<Vec<u8>, String> {
                     // A folded instruction.
                     _ => body_items.push(part.clone()),
                 },
-                // A leading `$name` is the function's own name (skip it); any other
-                // atom is a flat instruction.
-                Sexpr::Atom(s) if s.starts_with('$') => {}
+                // A leading `$name` is the function's own name; record it (for
+                // `call $name`). Any other atom is a flat instruction.
+                Sexpr::Atom(s) if s.starts_with('$') => {
+                    if wf.name.is_empty() {
+                        wf.name = s[1..].into();
+                    }
+                }
                 Sexpr::Atom(_) => body_items.push(part.clone()),
                 Sexpr::Str(_) => {}
             }
         }
-        emit_instrs(&body_items, &local_names, &mut wf.body)?;
+        wf.local_names = local_names;
+        wf.body_items = body_items;
         funcs.push(wf);
+    }
+    // Second pass: now that every function's index is known, build the function
+    // symbol table and emit each body (so `call $name` resolves).
+    let func_names: Vec<String> = funcs.iter().map(|f| f.name.clone()).collect();
+    for f in &mut funcs {
+        let mut body = Vec::new();
+        emit_instrs(&f.body_items, &f.local_names, &func_names, &mut body)?;
+        f.body = body;
     }
 
     // Assemble the binary sections.
@@ -907,6 +940,27 @@ mod tests {
         assert!(
             wat_to_binary("(module (func (result i32) (local.get $nope)))").is_err(),
             "unknown $local rejected"
+        );
+    }
+
+    #[test]
+    fn wat_call_resolves_function_names() {
+        // `$caller` calls `$callee` by name; the order is declaration order.
+        let src = "(module \
+                   (func $callee (param $x i32) (result i32) (i32.mul (local.get $x) (i32.const 3))) \
+                   (func $caller (export \"run\") (param $x i32) (result i32) \
+                     (i32.add (call $callee (local.get $x)) (local.get $x))))";
+        let bin = wat_to_binary(src).expect("compile call-by-name WAT");
+        // run(x) = callee(x) + x = 3x + x = 4x.
+        let r = crate::wasm_rt::Module::decode(&bin)
+            .unwrap()
+            .call(1, &[Val::I32(10)])
+            .unwrap();
+        assert_eq!(r, vec![Val::I32(40)]);
+        // An unknown function name is rejected.
+        assert!(
+            wat_to_binary("(module (func (call $nope)))").is_err(),
+            "unknown $function rejected"
         );
     }
 
