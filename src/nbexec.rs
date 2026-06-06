@@ -5440,6 +5440,31 @@ impl<'a> Interp<'a> {
                 }
                 // `fill(value, start?, end?)` — mutate in place, return the array.
                 // `start`/`end` default to `0`/`len`; negatives count from the end.
+                // `TypedArray.prototype.set(source, offset?)`: copy a source array's
+                // elements into this typed array starting at `offset`, coercing each
+                // to the element type. (Only typed arrays have `set`.)
+                "set" if self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some() => {
+                    let offset = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        0
+                    } else {
+                        self.realm.to_number(arg(1)).max(0.0) as usize
+                    };
+                    if let Some(src) = arg(0).as_handle().map(Handle::from_raw)
+                        && let Some(src_elems) = self.realm.array_elements(src).map(<[_]>::to_vec)
+                    {
+                        // Out-of-range writes are a RangeError, per spec.
+                        if offset + src_elems.len() > elems.len() {
+                            let m = self.new_str("offset is out of bounds");
+                            return Err(ExecError::Throw(
+                                self.make_error(N_ERROR_BASE + 2, Some(m)),
+                            ));
+                        }
+                        for (j, v) in src_elems.into_iter().enumerate() {
+                            self.set_element_coerced(handle, offset + j, v);
+                        }
+                    }
+                    return Ok(Some(NanBox::undefined()));
+                }
                 "fill" => {
                     let len = elems.len();
                     let value = arg(0);
