@@ -2036,8 +2036,20 @@ fn builtin_method(
                 NanBox::number(i.map_or(-1.0, |i| i as f64))
             }
             "repeat" => {
-                let n = ctx.realm.to_number(arg0()).max(0.0) as usize;
-                NanBox::handle(ctx.realm.new_string(&s.repeat(n)).to_raw())
+                // Negative / non-finite / overflowing counts would panic on
+                // `str::repeat`; clamp to an empty string instead (the spec's
+                // `RangeError` can't be raised from this native return path).
+                let nf = ctx.realm.to_number(arg0());
+                let n = if nf.is_finite() && nf >= 0.0 {
+                    nf as usize
+                } else {
+                    0
+                };
+                let repeated = match n.checked_mul(s.len()) {
+                    Some(_) => s.repeat(n),
+                    None => String::new(),
+                };
+                NanBox::handle(ctx.realm.new_string(&repeated).to_raw())
             }
             "charAt" => {
                 let i = ctx.realm.to_number(arg0()) as usize;

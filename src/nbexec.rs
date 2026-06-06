@@ -4873,8 +4873,15 @@ impl<'a> Interp<'a> {
                     Some(NanBox::number(idx))
                 }
                 "repeat" => {
-                    let n = self.realm.to_number(arg(0));
-                    let n = if n >= 0.0 { n as usize } else { 0 };
+                    // A negative or `+Infinity` count is a `RangeError`; a finite
+                    // count whose product with the length overflows would panic, so
+                    // it is a `RangeError` too (an unrepresentable string length).
+                    let nf = self.realm.to_number(arg(0));
+                    let n = nf as usize;
+                    if nf < 0.0 || nf.is_infinite() || n.checked_mul(s.len()).is_none() {
+                        let m = self.new_str("Invalid count value");
+                        return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                    }
                     Some(self.new_str(&s.repeat(n)))
                 }
                 "startsWith" => {
