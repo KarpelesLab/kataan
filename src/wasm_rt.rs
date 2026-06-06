@@ -104,6 +104,9 @@ pub struct Module {
     data: Vec<(u32, Vec<u8>)>,
     /// Module globals: `(initial value, mutable)`.
     globals: Vec<(Val, bool)>,
+    /// The function table (`funcref`): each slot is a function index, or `None`
+    /// for an uninitialized slot (traps on `call_indirect`).
+    table: Vec<Option<u32>>,
 }
 
 /// One linear-memory page, in bytes (WebAssembly fixes this at 64 KiB).
@@ -307,12 +310,14 @@ impl Module {
                 0 => {} // custom section: ignore
                 1 => Self::decode_types(&mut s, &mut m)?,
                 3 => Self::decode_functions(&mut s, &mut m)?,
+                4 => Self::decode_table(&mut s, &mut m)?,
                 5 => Self::decode_memory(&mut s, &mut m)?,
                 6 => Self::decode_globals(&mut s, &mut m)?,
                 7 => Self::decode_exports(&mut s, &mut m)?,
+                9 => Self::decode_elements(&mut s, &mut m)?,
                 10 => Self::decode_code(&mut s, &mut m)?,
                 11 => Self::decode_data(&mut s, &mut m)?,
-                // Other sections (import/table/global) are skipped for now.
+                // Other sections (import/start) are skipped for now.
                 _ => {}
             }
         }
@@ -358,6 +363,43 @@ impl Module {
                 let _max = s.u32()?;
             }
             m.mem_min_pages = Some(min);
+        }
+        Ok(())
+    }
+
+    fn decode_table(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
+        let count = s.u32()?;
+        for _ in 0..count {
+            let _elemtype = s.byte()?; // 0x70 funcref (or 0x6f externref)
+            let flag = s.byte()?;
+            let min = s.u32()?;
+            if flag == 1 {
+                let _max = s.u32()?;
+            }
+            // One table per module (multi-table is post-MVP); size to `min`.
+            m.table = alloc::vec![None; min as usize];
+        }
+        Ok(())
+    }
+
+    fn decode_elements(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
+        let count = s.u32()?;
+        for _ in 0..count {
+            let mode = s.u32()?;
+            // Mode 0 = active, table 0, with an `i32.const off; end` offset.
+            if mode != 0 {
+                return Err(WasmRtError("unsupported element segment mode"));
+            }
+            let off = read_const_i32_expr(s)? as usize;
+            let n = s.u32()? as usize;
+            for i in 0..n {
+                let func = s.u32()?;
+                let slot = off + i;
+                if slot >= m.table.len() {
+                    return Err(WasmRtError("element segment out of bounds"));
+                }
+                m.table[slot] = Some(func);
+            }
         }
         Ok(())
     }
@@ -661,6 +703,35 @@ impl Module {
                     let res = self.call_with_store(callee, &cargs, store)?;
                     stack.extend(res);
                 }
+                // call_indirect: typeidx, tableidx; pop the table index, look up
+                // the function, check its signature, call it.
+                0x11 => {
+                    let type_idx = r.u32()? as usize;
+                    let _table_idx = r.u32()?; // 0x00 (reserved in the MVP)
+                    let idx = pop!().as_i32()? as usize;
+                    let func = self
+                        .table
+                        .get(idx)
+                        .copied()
+                        .flatten()
+                        .ok_or(WasmRtError("undefined element (call_indirect)"))?;
+                    // The dynamic signature must match the static expected type.
+                    let expected = self.types.get(type_idx);
+                    let actual = self
+                        .func_types
+                        .get(func as usize)
+                        .and_then(|t| self.types.get(*t as usize));
+                    if expected.is_none() || expected != actual {
+                        return Err(WasmRtError("indirect call type mismatch"));
+                    }
+                    let n = expected.unwrap().params.len();
+                    if stack.len() < n {
+                        return Err(WasmRtError("call argument underflow"));
+                    }
+                    let cargs = stack.split_off(stack.len() - n);
+                    let res = self.call_with_store(func, &cargs, store)?;
+                    stack.extend(res);
+                }
                 // --- linear memory ---
                 0x28 => {
                     let a = mem_addr!(r, 4);
@@ -952,6 +1023,11 @@ fn block_len(code: &[u8]) -> Result<usize, WasmRtError> {
             }
             // Skip immediates of the ops that carry them.
             0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x0c | 0x0d | 0x10 => {
+                r.u32()?;
+            }
+            // call_indirect carries two immediates (typeidx, tableidx).
+            0x11 => {
+                r.u32()?;
                 r.u32()?;
             }
             // Memory load/store ops carry a memarg (align + offset, two LEBs).
@@ -1299,6 +1375,66 @@ mod tests {
         assert_eq!(f64_max(-0.0, 0.0), 0.0);
         assert!(f64_min(f64::NAN, 1.0).is_nan());
         assert_eq!(f64_min(2.0, 5.0), 2.0);
+    }
+
+    #[test]
+    fn call_indirect_dispatches_through_table() {
+        // Two functions of type (i32,i32)->i32: add (func 0) and sub (func 1).
+        // A dispatcher (func 2, type (i32,i32,i32)->i32) calls table[arg2](a,b).
+        //   (table 2 funcref) (elem (i32.const 0) 0 1)
+        //   func 2: local.get 0  local.get 1  local.get 2  call_indirect (type 0)
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // types: 0 = (i32 i32)->i32, 1 = (i32 i32 i32)->i32
+        m.extend([
+            0x01, 0x0e, 0x02, // section, size, 2 types
+            0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, // (i32 i32)->i32
+            0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, // (i32 i32 i32)->i32
+        ]);
+        // functions: func0:type0, func1:type0, func2:type1
+        m.extend([0x03, 0x04, 0x03, 0x00, 0x00, 0x01]);
+        // table: 1 table, funcref(0x70), limits min 2
+        m.extend([0x04, 0x04, 0x01, 0x70, 0x00, 0x02]);
+        // export "dispatch" = func 2
+        m.extend([
+            0x07, 0x0c, 0x01, 0x08, b'd', b'i', b's', b'p', b'a', b't', b'c', b'h', 0x00, 0x02,
+        ]);
+        // element segment: active table 0, offset i32.const 0, funcs [0,1]
+        m.extend([0x09, 0x08, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x02, 0x00, 0x01]);
+        // code: 3 bodies
+        let add_body = [0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b]; // a+b
+        let sub_body = [0x00, 0x20, 0x00, 0x20, 0x01, 0x6b, 0x0b]; // a-b
+        // dispatcher: local.get 0,1,2 ; call_indirect type 0 table 0
+        let disp_body = [
+            0x00, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0x11, 0x00, 0x00, 0x0b,
+        ];
+        let mut code = vec![0x0a, 0x00, 0x03]; // section id, size placeholder, 3 bodies
+        for b in [&add_body[..], &sub_body[..], &disp_body[..]] {
+            code.push(b.len() as u8);
+            code.extend_from_slice(b);
+        }
+        code[1] = (code.len() - 2) as u8; // patch section size
+        m.extend(code);
+
+        let module = Module::decode(&m).expect("decode call_indirect module");
+        let d = module.export("dispatch").unwrap();
+        // dispatch(10, 3, 0) -> add -> 13 ; dispatch(10, 3, 1) -> sub -> 7
+        assert_eq!(
+            module
+                .call(d, &[Val::I32(10), Val::I32(3), Val::I32(0)])
+                .unwrap(),
+            vec![Val::I32(13)]
+        );
+        assert_eq!(
+            module
+                .call(d, &[Val::I32(10), Val::I32(3), Val::I32(1)])
+                .unwrap(),
+            vec![Val::I32(7)]
+        );
+        // Out-of-range table index traps.
+        assert_eq!(
+            module.call(d, &[Val::I32(1), Val::I32(1), Val::I32(5)]),
+            Err(WasmRtError("undefined element (call_indirect)"))
+        );
     }
 
     #[test]
