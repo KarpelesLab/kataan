@@ -1751,6 +1751,47 @@ mod tests {
         assert!(inst.read_memory(PAGE_SIZE, 4).is_none());
     }
 
+    /// End-to-end: compile a JS numeric function to a WASM binary with the
+    /// `wasm` compiler, then decode and run it with this engine — the two WASM
+    /// halves (JS→WASM lowering and the execution engine) meeting in the middle.
+    #[test]
+    fn runs_wasm_compiled_from_js() {
+        use crate::nanbox::{NanBox, Unpacked};
+        for (src, name, args, expect) in [
+            (
+                "function add(a, b){ return a + b; }",
+                "add",
+                alloc::vec![3.0, 4.0],
+                7.0,
+            ),
+            (
+                "function poly(x){ return x * x - 2 * x + 1; }",
+                "poly",
+                alloc::vec![5.0],
+                16.0,
+            ),
+            (
+                "function avg(a, b){ return (a + b) / 2; }",
+                "avg",
+                alloc::vec![3.0, 10.0],
+                6.5,
+            ),
+        ] {
+            let program = crate::parser::Parser::parse_program(src).expect("parse");
+            let binary = crate::wasm::compile_module_binary(&program).expect("compile to wasm");
+            let module = Module::decode(&binary).expect("decode compiled wasm");
+            let mut inst = Instance::new(&module).expect("instantiate");
+            // Invoke through the JS-value boundary with NanBox numbers.
+            let js_args: Vec<NanBox> = args.iter().map(|a| NanBox::number(*a)).collect();
+            let out = inst.call_export_js(name, &js_args).expect("call");
+            assert_eq!(out.len(), 1);
+            match out[0].unpack() {
+                Unpacked::Number(v) => assert!((v - expect).abs() < 1e-12, "{name}: {v}"),
+                _ => panic!("expected a number"),
+            }
+        }
+    }
+
     #[test]
     fn js_value_marshaling_across_the_boundary() {
         use crate::nanbox::{NanBox, Unpacked};
