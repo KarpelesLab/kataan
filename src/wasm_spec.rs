@@ -1959,6 +1959,30 @@ mod tests {
     }
 
     #[test]
+    fn spec_f32_operations() {
+        // f32 arithmetic at single precision, NaN-propagating min/max with ±0, the
+        // ordered comparisons, and abs/neg/sqrt.
+        let script = "(module \
+            (func (export \"add\") (param f32 f32) (result f32) (f32.add (local.get 0) (local.get 1))) \
+            (func (export \"div\") (param f32 f32) (result f32) (f32.div (local.get 0) (local.get 1))) \
+            (func (export \"min\") (param f32 f32) (result f32) (f32.min (local.get 0) (local.get 1))) \
+            (func (export \"max\") (param f32 f32) (result f32) (f32.max (local.get 0) (local.get 1))) \
+            (func (export \"sqrt\") (param f32) (result f32) (f32.sqrt (local.get 0))) \
+            (func (export \"lt\") (param f32 f32) (result i32) (f32.lt (local.get 0) (local.get 1))) \
+            (func (export \"copysign\") (param f32 f32) (result f32) (f32.copysign (local.get 0) (local.get 1)))) \
+            (assert_return (invoke \"add\" (f32.const 0.1) (f32.const 0.2)) (f32.const 0.3)) \
+            (assert_return (invoke \"div\" (f32.const 1.0) (f32.const 0.0)) (f32.const inf)) \
+            (assert_return (invoke \"min\" (f32.const 0.0) (f32.const -0.0)) (f32.const -0.0)) \
+            (assert_return (invoke \"max\" (f32.const 0.0) (f32.const -0.0)) (f32.const 0.0)) \
+            (assert_return (invoke \"min\" (f32.const nan) (f32.const 1.0)) (f32.const nan)) \
+            (assert_return (invoke \"sqrt\" (f32.const 16.0)) (f32.const 4.0)) \
+            (assert_return (invoke \"lt\" (f32.const nan) (f32.const nan)) (i32.const 0)) \
+            (assert_return (invoke \"copysign\" (f32.const 5.0) (f32.const -1.0)) (f32.const -5.0))";
+        let n = run_wast(script).expect("f32 operations conformance passes");
+        assert_eq!(n, 8);
+    }
+
+    #[test]
     fn spec_i64_operations() {
         // i64 arithmetic/comparison/bitwise edge cases: wrapping, signed vs unsigned
         // division and comparison, rotate, and clz/ctz on 64-bit values.
