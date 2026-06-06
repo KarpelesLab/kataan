@@ -252,6 +252,8 @@ pub enum RegOp {
     Move { dst: u8, src: u8 },
     /// `reg[dst] = (reg[a] < reg[b]) as 0/1` (signed)
     Lt { dst: u8, a: u8, b: u8 },
+    /// `reg[dst] = (reg[a] == 0) as 0/1` — JS logical-not of an integer (`!x`).
+    Eqz { dst: u8, a: u8 },
     /// if `reg[cond] == 0`, jump to op index `target`
     JumpIfFalse { cond: u8, target: usize },
     /// unconditional jump to op index `target`
@@ -310,6 +312,10 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
             }
             RegOp::Lt { dst, a, b } => {
                 regs[dst as usize] = i64::from(regs[a as usize] < regs[b as usize]);
+                pc += 1;
+            }
+            RegOp::Eqz { dst, a } => {
+                regs[dst as usize] = i64::from(regs[a as usize] == 0);
                 pc += 1;
             }
             RegOp::JumpIfFalse { cond, target } => {
@@ -386,6 +392,10 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 a: resolve(&copy_of, a),
                 b: resolve(&copy_of, b),
             },
+            RegOp::Eqz { dst, a } => RegOp::Eqz {
+                dst,
+                a: resolve(&copy_of, a),
+            },
             RegOp::Move { dst, src } => RegOp::Move {
                 dst,
                 src: resolve(&copy_of, src),
@@ -410,6 +420,7 @@ pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
             RegOp::Const { dst, .. }
             | RegOp::Bin { dst, .. }
             | RegOp::Lt { dst, .. }
+            | RegOp::Eqz { dst, .. }
             | RegOp::Call { dst, .. }
             | RegOp::Arg { dst, .. } => invalidate(&mut copy_of, dst),
             RegOp::JumpIfFalse { .. } | RegOp::Jump { .. } => {
@@ -438,7 +449,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
                 used.insert(a);
                 used.insert(b);
             }
-            RegOp::Move { src, .. } => {
+            RegOp::Move { src, .. } | RegOp::Eqz { a: src, .. } => {
                 used.insert(src);
             }
             RegOp::JumpIfFalse { cond, .. } => {
@@ -464,6 +475,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
         | RegOp::Bin { dst, .. }
         | RegOp::Move { dst, .. }
         | RegOp::Lt { dst, .. }
+        | RegOp::Eqz { dst, .. }
         | RegOp::Arg { dst, .. } => used.contains(&dst),
     };
     // `newpos[old]` = new index of the first surviving op at-or-after `old`.
@@ -498,6 +510,7 @@ fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
         RegOp::Arg { dst, .. } | RegOp::Const { dst, .. } => (Some(dst), [None, None]),
         RegOp::Move { dst, src } => (Some(dst), [Some(src), None]),
         RegOp::Bin { dst, a, b, .. } | RegOp::Lt { dst, a, b } => (Some(dst), [Some(a), Some(b)]),
+        RegOp::Eqz { dst, a } => (Some(dst), [Some(a), None]),
         RegOp::JumpIfFalse { cond, .. } => (None, [Some(cond), None]),
         RegOp::Ret { src } => (None, [Some(src), None]),
         RegOp::Jump { .. } => (None, [None, None]),
@@ -600,6 +613,10 @@ pub fn allocate_reg(ops: &[RegOp], n_regs: usize) -> (Vec<RegOp>, usize) {
                 a: m(a),
                 b: m(b),
             },
+            RegOp::Eqz { dst, a } => RegOp::Eqz {
+                dst: m(dst),
+                a: m(a),
+            },
             RegOp::JumpIfFalse { cond, target } => RegOp::JumpIfFalse {
                 cond: m(cond),
                 target,
@@ -695,6 +712,16 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 } else {
                     known[dst as usize] = None;
                     RegOp::Lt { dst, a, b }
+                }
+            }
+            RegOp::Eqz { dst, a } => {
+                if let Some(x) = known[a as usize] {
+                    let v = i64::from(x == 0);
+                    known[dst as usize] = Some(v);
+                    RegOp::Const { dst, imm: v }
+                } else {
+                    known[dst as usize] = None;
+                    RegOp::Eqz { dst, a }
                 }
             }
             RegOp::Arg { dst, .. } => {
@@ -904,6 +931,15 @@ pub fn lower_nbvm_with(
                 let d = reg8(*dst)?;
                 written[*dst as usize] = true;
                 RegOp::Lt { dst: d, a, b }
+            }
+            // JS logical-not of an integer: `!x == (x == 0)`. Sound on the integer
+            // path, where every register value is an exact guarded integer — so
+            // `<=`/`>=`/`!==` (compiled to `Lt`/`StrictEq` + `Not`) now JIT.
+            Op::Not { dst, a } => {
+                let a = read(&written, *a)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Eqz { dst: d, a }
             }
             // Branch targets are nbvm op indices; the lowered stream prepends one
             // `Arg` per parameter, so every target shifts by `n_params`.
@@ -1431,6 +1467,12 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x48, 0x0f, 0xb6, 0xc0]); // movzx rax, al
     }
 
+    /// `sete al; movzx rax, al` — `rax = (zero flag) ? 1 : 0`, after a `test`/`cmp`.
+    pub fn sete_rax(&mut self) {
+        self.code.extend_from_slice(&[0x0f, 0x94, 0xc0]); // sete al
+        self.code.extend_from_slice(&[0x48, 0x0f, 0xb6, 0xc0]); // movzx rax, al
+    }
+
     /// `<op> rax, [rbp+disp]` for `add`/`sub`/`imul`/`and`/`or`/`xor`.
     pub fn op_rax_mem(&mut self, op: BinOp2, disp: i32) {
         match op {
@@ -1850,6 +1892,15 @@ impl JitFunction {
                     a.load_rax(disp(ra));
                     a.cmp_rax_mem(disp(rb));
                     a.setl_rax();
+                    a.store_rax(disp(dst));
+                }
+                RegOp::Eqz { dst, a: ra } => {
+                    if !ok_reg(dst) || !ok_reg(ra) {
+                        return None;
+                    }
+                    a.load_rax(disp(ra));
+                    a.test_rax_rax();
+                    a.sete_rax(); // rax = (reg[ra] == 0) ? 1 : 0
                     a.store_rax(disp(dst));
                 }
                 RegOp::JumpIfFalse { cond, target } => {
@@ -2919,6 +2970,27 @@ mod tests {
                 x * (x - 1) / 2,
                 "loop sum 0..{x}"
             );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn eqz_compiles_and_runs() {
+        // f(x) = !(x < 5)  ≡  (x < 5) then Eqz → (x >= 5).
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Const { dst: 1, imm: 5 },
+            RegOp::Lt { dst: 2, a: 0, b: 1 },
+            RegOp::Eqz { dst: 2, a: 2 },
+            RegOp::Ret { src: 2 },
+        ];
+        let opt = optimize_reg(&ops, 3);
+        let (alloc, n) = allocate_reg(&opt, 3);
+        let f = JitFunction::compile_reg(n, 1, &alloc).unwrap();
+        for x in [0i64, 4, 5, 6, 100, -3] {
+            let expect = i64::from(x >= 5); // !(x < 5)
+            assert_eq!(f.call1(x), expect, "!(x<5) at x={x}");
+            assert_eq!(eval_reg(&ops, 3, &[x]), expect);
         }
     }
 

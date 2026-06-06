@@ -5474,6 +5474,28 @@ mod tests {
         );
     }
 
+    /// A hot function using `<=` / `>=` / `!==` — which compile to `Lt`/`StrictEq`
+    /// + `Not` — must JIT and match the interpreter (the `Not` lowers to `Eqz`).
+    #[test]
+    fn hot_function_with_not_matches_interpreter() {
+        // count how many of 0..40 are <= 20: 21.
+        assert_eq!(
+            bc("function le(a,b){ return a <= b ? 1 : 0; } \
+                let c = 0; \
+                for (let i = 0; i < 40; i = i + 1) { c = c + le(i, 20); } \
+                c"),
+            "21"
+        );
+        // f(x) = (x >= 10) ? x : 0; sum over 0..20 → sum_{i=10..19} i = 145.
+        assert_eq!(
+            bc("function ge(x){ return x >= 10 ? x : 0; } \
+                let s = 0; \
+                for (let i = 0; i < 20; i = i + 1) { s = s + ge(i); } \
+                s"),
+            "145"
+        );
+    }
+
     /// A hot float function (division, non-integer values) runs identically
     /// whether it takes the JIT's float path (with the `jit` feature on
     /// Linux x86-64) or the interpreter.
