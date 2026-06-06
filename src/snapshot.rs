@@ -11,10 +11,10 @@
 //! which is exactly the pointer relocation a snapshot reload performs, and
 //! handles cycles correctly.
 //!
-//! Covers the value cells (objects, arrays, strings, `Date`, `BigInt`) and
-//! functions/closures (code id + captured scope chain), plus the primitive
-//! `NanBox` values; promises/proxies are a later extension. Pure, safe
-//! `alloc`-only Rust.
+//! Covers the value cells (objects, arrays, strings, `Date`, `BigInt`),
+//! functions/closures (code id + captured scope chain), and `Map`/`Set`
+//! collections, plus the primitive `NanBox` values; promises/proxies are a later
+//! extension. Pure, safe `alloc`-only Rust.
 
 use crate::heap::Handle;
 use crate::nanbox::{NanBox, Unpacked};
@@ -59,6 +59,14 @@ pub enum SnapCell {
         func_id: u32,
         /// the captured lexical environment, innermost frame first
         frames: Vec<SnapFrame>,
+    },
+    /// a `Map` (`is_set == false`) or `Set` (`is_set == true`): its `(key, value)`
+    /// entries in insertion order (a `Set` stores `value` as both).
+    Collection {
+        /// whether this is a `Set` (else a `Map`)
+        is_set: bool,
+        /// the entries, in insertion order
+        entries: Vec<(SnapVal, SnapVal)>,
     },
 }
 
@@ -107,6 +115,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             || realm.date_at(*r).is_some()
             || realm.bigint_at(*r).is_some()
             || realm.function_at(*r).is_some()
+            || realm.collection_is_set(*r).is_some()
             || realm.array_elements(*r).is_some()
             || realm.object_keys(*r).is_some();
         if serializable {
@@ -140,6 +149,19 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                 cur = s.parent();
             }
             SnapCell::Function { func_id, frames }
+        } else if let Some(is_set) = realm.collection_is_set(h) {
+            let entries = realm
+                .collection_entries(h)
+                .unwrap_or_default()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        snap_val(*k, &mut index_of, &mut order, &mut intern),
+                        snap_val(*v, &mut index_of, &mut order, &mut intern),
+                    )
+                })
+                .collect();
+            SnapCell::Collection { is_set, entries }
         } else if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
             let vals = elems
                 .iter()
@@ -228,6 +250,7 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                     .unwrap_or_else(crate::env::Scope::root);
                 (realm.new_function(*func_id, innermost), Some(chain))
             }
+            SnapCell::Collection { is_set, .. } => (realm.new_collection(*is_set), None),
         };
         handles.push(h);
         fn_chains.push(chain);
@@ -275,6 +298,12 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                             }
                         }
                     }
+                }
+            }
+            SnapCell::Collection { entries, .. } => {
+                for (k, v) in entries {
+                    let (key, val) = (resolve(k, &handles), resolve(v, &handles));
+                    realm.collection_set(*h, key, val);
                 }
             }
         }
@@ -383,6 +412,15 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                     }
                 }
             }
+            SnapCell::Collection { is_set, entries } => {
+                out.push(6);
+                out.push(u8::from(*is_set));
+                w_u32(entries.len() as u32, &mut out);
+                for (k, v) in entries {
+                    w_val(k, &mut out);
+                    w_val(v, &mut out);
+                }
+            }
         }
     }
     out
@@ -486,6 +524,17 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                     frames.push(SnapFrame { vars });
                 }
                 SnapCell::Function { func_id, frames }
+            }
+            6 => {
+                let is_set = r.u8()? != 0;
+                let n = r.u32()? as usize;
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let k = r.val()?;
+                    let v = r.val()?;
+                    entries.push((k, v));
+                }
+                SnapCell::Collection { is_set, entries }
             }
             t => return Err(SnapError::BadTag(t)),
         };
@@ -888,6 +937,55 @@ mod tests {
             realm2.string_value(Handle::from_raw(obj_tag.as_handle().unwrap())),
             Some(String::from("cap"))
         );
+    }
+
+    #[test]
+    fn snapshots_maps_and_sets() {
+        let mut realm = Realm::new();
+        // A Map { 1 → "one", 2 → obj{tag:"two"} } and a Set { 10, 20, 30 }.
+        let map = realm.new_collection(false);
+        let one = NanBox::handle(realm.new_string("one").to_raw());
+        realm.collection_set(map, NanBox::number(1.0), one);
+        let two_obj = realm.new_object();
+        let two_tag = NanBox::handle(realm.new_string("two").to_raw());
+        realm.set_property(two_obj, "tag", two_tag);
+        realm.collection_set(map, NanBox::number(2.0), NanBox::handle(two_obj.to_raw()));
+
+        let set = realm.new_collection(true);
+        for n in [10.0, 20.0, 30.0] {
+            realm.collection_set(set, NanBox::number(n), NanBox::number(n));
+        }
+
+        // Both as roots: capture → serialize → deserialize → restore.
+        let snap = capture(&realm, &[map, set]);
+        let bytes = serialize(&snap);
+        let reloaded = deserialize(&bytes).expect("deserialize");
+        assert_eq!(reloaded, snap);
+        let mut realm2 = Realm::new();
+        let roots = restore(&mut realm2, &reloaded);
+        let (m2, s2) = (roots[0], roots[1]);
+
+        // The Map survived: 1 → "one", and 2 → an object with tag "two".
+        assert_eq!(realm2.collection_is_set(m2), Some(false));
+        let v1 = realm2.collection_get(m2, NanBox::number(1.0)).unwrap();
+        assert_eq!(
+            realm2.string_value(Handle::from_raw(v1.as_handle().unwrap())),
+            Some(String::from("one"))
+        );
+        let v2 = realm2.collection_get(m2, NanBox::number(2.0)).unwrap();
+        let tag = realm2
+            .get_property(Handle::from_raw(v2.as_handle().unwrap()), "tag")
+            .unwrap();
+        assert_eq!(
+            realm2.string_value(Handle::from_raw(tag.as_handle().unwrap())),
+            Some(String::from("two"))
+        );
+
+        // The Set survived with its three members.
+        assert_eq!(realm2.collection_is_set(s2), Some(true));
+        assert_eq!(realm2.collection_size(s2), Some(3));
+        assert!(realm2.collection_has(s2, NanBox::number(20.0)));
+        assert!(!realm2.collection_has(s2, NanBox::number(99.0)));
     }
 
     #[test]
