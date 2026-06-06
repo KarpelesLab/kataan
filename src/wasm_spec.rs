@@ -339,6 +339,7 @@ fn simple_opcode(name: &str) -> Option<u8> {
         "f64.convert_i32_s" => 0xb7,
         "f64.convert_i32_u" => 0xb8,
         "f64.convert_i64_s" => 0xb9,
+        "f64.convert_i64_u" => 0xba,
         "f64.promote_f32" => 0xbb,
         "i32.reinterpret_f32" => 0xbc,
         "i64.reinterpret_f64" => 0xbd,
@@ -1674,6 +1675,20 @@ mod tests {
             .call(0, &[Val::I32(5)])
             .unwrap();
         assert_eq!(r3, vec![Val::I32(16)]); // 5*3 + 1
+    }
+
+    #[test]
+    fn spec_convert_i64_signedness() {
+        // -1 as i64 converts to -1.0 signed but 1.8446744e19 (2^64-1) unsigned.
+        let script = "(module \
+            (func (export \"cs\") (param i64) (result f64) (f64.convert_i64_s (local.get 0))) \
+            (func (export \"cu\") (param i64) (result f64) (f64.convert_i64_u (local.get 0)))) \
+            (assert_return (invoke \"cs\" (i64.const -1)) (f64.const -1)) \
+            (assert_return (invoke \"cu\" (i64.const -1)) (f64.const 18446744073709551616)) \
+            (assert_return (invoke \"cu\" (i64.const 0)) (f64.const 0)) \
+            (assert_return (invoke \"cs\" (i64.const 1000000)) (f64.const 1000000))";
+        let n = run_wast(script).expect("convert_i64 signedness passes");
+        assert_eq!(n, 4);
     }
 
     #[test]

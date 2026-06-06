@@ -650,7 +650,7 @@ impl Module {
                 0xb4 | 0xb5 => (&[I64], Some(F32)),      // f32.convert_i64
                 0xb6 => (&[F64], Some(F32)),             // f32.demote_f64
                 0xb7 | 0xb8 => (&[I32], Some(F64)),      // f64.convert_i32
-                0xb9 => (&[I64], Some(F64)),             // f64.convert_i64
+                0xb9 | 0xba => (&[I64], Some(F64)),      // f64.convert_i64_s/_u
                 0xbb => (&[F32], Some(F64)),             // f64.promote_f32
                 0xbc => (&[F32], Some(I32)),             // i32.reinterpret_f32
                 0xbd => (&[F64], Some(I64)),             // i64.reinterpret_f64
@@ -1816,6 +1816,10 @@ impl Module {
                 0xb9 => {
                     let a = pop!().as_i64()?;
                     stack.push(Val::F64(a as f64)); // f64.convert_i64_s
+                }
+                0xba => {
+                    let a = pop!().as_i64()? as u64;
+                    stack.push(Val::F64(a as f64)); // f64.convert_i64_u
                 }
                 0xbb => {
                     let a = pop!().as_f32()?;
