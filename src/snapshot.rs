@@ -653,6 +653,82 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_survive_a_moving_gc_compaction() {
+        // D′ atop a moving GC: a snapshot taken *after* the heap has been compacted
+        // (survivors relocated, references rewritten) must still capture the graph.
+        let mut realm = Realm::new();
+        // Allocate garbage first so compaction has slots to reclaim/relocate.
+        for i in 0..8 {
+            let g = realm.new_object();
+            realm.set_property(g, "junk", NanBox::number(f64::from(i)));
+        }
+        // The live graph: root { name:"keep", child:{ tag:"leaf" }, items:[1,2,3] }.
+        let leaf = realm.new_object();
+        let leaf_tag = NanBox::handle(realm.new_string("leaf").to_raw());
+        realm.set_property(leaf, "tag", leaf_tag);
+        let arr = realm.new_array(alloc::vec![
+            NanBox::number(1.0),
+            NanBox::number(2.0),
+            NanBox::number(3.0),
+        ]);
+        let root = realm.new_object();
+        let name = NanBox::handle(realm.new_string("keep").to_raw());
+        realm.set_property(root, "name", name);
+        realm.set_property(root, "child", NanBox::handle(leaf.to_raw()));
+        realm.set_property(root, "items", NanBox::handle(arr.to_raw()));
+
+        // Compact: only `root` is a root, so the 8 garbage objects are reclaimed and
+        // the survivors relocated. `root` is rewritten in place to its new slot.
+        let mut roots = [root];
+        realm.compact(&mut roots);
+        let root = roots[0];
+
+        // Snapshot the post-compaction heap and restore it into a fresh realm.
+        let snap = capture(&realm, &[root]);
+        let bytes = serialize(&snap);
+        let reloaded = deserialize(&bytes).expect("deserialize");
+        let mut realm2 = Realm::new();
+        let r2 = restore(&mut realm2, &reloaded)[0];
+
+        // The whole graph survived the relocation intact.
+        let name2 = realm2
+            .get_property(r2, "name")
+            .unwrap()
+            .as_handle()
+            .unwrap();
+        assert_eq!(
+            realm2.string_value(Handle::from_raw(name2)),
+            Some(String::from("keep"))
+        );
+        let child = realm2
+            .get_property(r2, "child")
+            .unwrap()
+            .as_handle()
+            .unwrap();
+        let ctag = realm2
+            .get_property(Handle::from_raw(child), "tag")
+            .unwrap()
+            .as_handle()
+            .unwrap();
+        assert_eq!(
+            realm2.string_value(Handle::from_raw(ctag)),
+            Some(String::from("leaf"))
+        );
+        let items = realm2
+            .get_property(r2, "items")
+            .unwrap()
+            .as_handle()
+            .unwrap();
+        assert_eq!(
+            realm2
+                .array_elements(Handle::from_raw(items))
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
     fn snapshots_functions_and_closures() {
         use crate::env::Scope;
         let mut realm = Realm::new();
