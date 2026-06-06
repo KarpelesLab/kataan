@@ -55,7 +55,7 @@ pub fn run_assertions(module_bytes: &[u8], asserts: &[Assertion]) -> Result<usiz
                 let got = inst
                     .call_export(func, args)
                     .map_err(|e| format!("assert {i}: {func} errored: {}", e.0))?;
-                if &got != expect {
+                if !vals_match(&got, expect) {
                     return Err(format!(
                         "assert {i}: {func}({args:?}) = {got:?}, expected {expect:?}"
                     ));
@@ -69,6 +69,30 @@ pub fn run_assertions(module_bytes: &[u8], asserts: &[Assertion]) -> Result<usiz
         }
     }
     Ok(asserts.len())
+}
+
+/// Spec-faithful result matching: a `NaN` expectation matches *any* `NaN` result
+/// (the suite's `nan:canonical`/`nan:arithmetic`), other floats match by exact bit
+/// pattern (so `+0.0` ≠ `-0.0`), and integers match by value.
+fn vals_match(got: &[Val], expect: &[Val]) -> bool {
+    got.len() == expect.len()
+        && got.iter().zip(expect).all(|(g, e)| match (g, e) {
+            (Val::F32(g), Val::F32(e)) => {
+                if e.is_nan() {
+                    g.is_nan()
+                } else {
+                    g.to_bits() == e.to_bits()
+                }
+            }
+            (Val::F64(g), Val::F64(e)) => {
+                if e.is_nan() {
+                    g.is_nan()
+                } else {
+                    g.to_bits() == e.to_bits()
+                }
+            }
+            _ => g == e,
+        })
 }
 
 /// Checks `assert_invalid`/`assert_malformed`: the bytes must **fail** to decode.
@@ -270,6 +294,16 @@ fn simple_opcode(name: &str) -> Option<u8> {
         "i64.add" => 0x7c,
         "i64.sub" => 0x7d,
         "i64.mul" => 0x7e,
+        "f32.abs" => 0x8b,
+        "f32.neg" => 0x8c,
+        "f32.sqrt" => 0x91,
+        "f32.add" => 0x92,
+        "f32.sub" => 0x93,
+        "f32.mul" => 0x94,
+        "f32.div" => 0x95,
+        "f64.abs" => 0x99,
+        "f64.neg" => 0x9a,
+        "f64.sqrt" => 0x9f,
         "f64.add" => 0xa0,
         "f64.sub" => 0xa1,
         "f64.mul" => 0xa2,
@@ -725,8 +759,10 @@ fn parse_const(s: &Sexpr) -> Result<Val, String> {
     };
     let parse_f = |s: &str| -> Result<f64, String> {
         match s {
-            "nan" | "+nan" => Ok(f64::NAN),
-            "-nan" => Ok(-f64::NAN),
+            // The suite's `nan:canonical` / `nan:arithmetic` (and bare `nan`,
+            // `nan:0x…`) all denote a NaN — matched leniently by `vals_match`.
+            _ if s.starts_with("-nan") => Ok(-f64::NAN),
+            _ if s.starts_with("nan") || s.starts_with("+nan") => Ok(f64::NAN),
             "inf" | "+inf" => Ok(f64::INFINITY),
             "-inf" => Ok(f64::NEG_INFINITY),
             _ => s.parse::<f64>().map_err(|_| format!("bad float {s}")),
@@ -1208,6 +1244,22 @@ mod tests {
 (assert_trap   (invoke \"div\" (i32.const 1) (i32.const 0)))";
         let n = run_wast(script).expect("control-flow .wast conformance passes");
         assert_eq!(n, 8, "all eight assertions executed");
+    }
+
+    #[test]
+    fn wast_nan_and_signed_zero_matching() {
+        // A NaN-producing function: f(x) = x / x  (0/0 = NaN, n/n = 1).
+        // `assert_return … (f64.const nan)` must match the NaN result, and a
+        // `nan:canonical` token is accepted too. Signed-zero distinguishes by bits.
+        let script = "(module \
+            (func (export \"dd\") (param $x f64) (result f64) (f64.div (local.get $x) (local.get $x))) \
+            (func (export \"negz\") (result f64) (f64.neg (f64.const 0.0)))) \
+            (assert_return (invoke \"dd\" (f64.const 0.0)) (f64.const nan)) \
+            (assert_return (invoke \"dd\" (f64.const 5.0)) (f64.const 1.0)) \
+            (assert_return (invoke \"dd\" (f64.const 0.0)) (f64.const nan:canonical)) \
+            (assert_return (invoke \"negz\") (f64.const -0.0))";
+        let n = run_wast(script).expect("nan/signed-zero .wast passes");
+        assert_eq!(n, 4);
     }
 
     #[test]
