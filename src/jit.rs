@@ -500,31 +500,34 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 }
             }
             RegOp::Bin { dst, a, b, op } => {
-                match (known[a as usize], known[b as usize]) {
-                    (Some(x), Some(y)) => {
-                        let v = match op {
-                            BinOp2::Add => x.wrapping_add(y),
-                            BinOp2::Sub => x.wrapping_sub(y),
-                            BinOp2::Mul => x.wrapping_mul(y),
-                            BinOp2::And => x & y,
-                            BinOp2::Or => x | y,
-                            BinOp2::Xor => x ^ y,
-                        };
-                        // Only fold when the result stays in the exact-integer
-                        // range, so the native code's overflow/range deopt is
-                        // still reachable for genuinely out-of-range arithmetic.
-                        if (-SAFE_INT_MAX..=SAFE_INT_MAX).contains(&v) {
-                            known[dst as usize] = Some(v);
-                            RegOp::Const { dst, imm: v }
-                        } else {
-                            known[dst as usize] = None;
-                            RegOp::Bin { dst, a, b, op }
-                        }
-                    }
-                    _ => {
+                let (ka, kb) = (known[a as usize], known[b as usize]);
+                if let (Some(x), Some(y)) = (ka, kb) {
+                    // Both constant: fold, but only when the result stays in the
+                    // exact-integer range so the native overflow/range deopt is
+                    // still reachable for genuinely out-of-range arithmetic.
+                    let v = match op {
+                        BinOp2::Add => x.wrapping_add(y),
+                        BinOp2::Sub => x.wrapping_sub(y),
+                        BinOp2::Mul => x.wrapping_mul(y),
+                        BinOp2::And => x & y,
+                        BinOp2::Or => x | y,
+                        BinOp2::Xor => x ^ y,
+                    };
+                    if (-SAFE_INT_MAX..=SAFE_INT_MAX).contains(&v) {
+                        known[dst as usize] = Some(v);
+                        RegOp::Const { dst, imm: v }
+                    } else {
                         known[dst as usize] = None;
                         RegOp::Bin { dst, a, b, op }
                     }
+                } else if let Some(simplified) = simplify_bin(dst, a, b, op, ka, kb, &mut known) {
+                    // Algebraic identity / strength reduction (x+0, x*1, x*0,
+                    // x-x, x^x, …). All operands are already in ±2^53, so the
+                    // simplified form needs no extra guard.
+                    simplified
+                } else {
+                    known[dst as usize] = None;
+                    RegOp::Bin { dst, a, b, op }
                 }
             }
             RegOp::Lt { dst, a, b } => {
@@ -551,6 +554,61 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
         out.push(lowered);
     }
     out
+}
+
+/// Algebraic identities / strength reduction for `dst = a <op> b`, given which
+/// operands are known constants (`ka`/`kb`). Returns the simplified op (a `Move`
+/// or `Const`) and updates `known[dst]`, or `None` if no identity applies. Every
+/// register value is already within ±2^53, so the simplified forms are exact.
+fn simplify_bin(
+    dst: u8,
+    a: u8,
+    b: u8,
+    op: BinOp2,
+    ka: Option<i64>,
+    kb: Option<i64>,
+    known: &mut [Option<i64>],
+) -> Option<RegOp> {
+    use BinOp2::{Add, And, Mul, Or, Sub, Xor};
+    // `dst = a` (a Move forwarding the value of register `r`).
+    let mov = |known: &mut [Option<i64>], r: u8| {
+        known[dst as usize] = known[r as usize];
+        Some(RegOp::Move { dst, src: r })
+    };
+    // `dst = c` (a constant).
+    let con = |known: &mut [Option<i64>], c: i64| {
+        known[dst as usize] = Some(c);
+        Some(RegOp::Const { dst, imm: c })
+    };
+    // Identities with a constant right operand.
+    if let Some(y) = kb {
+        match (op, y) {
+            (Add, 0) | (Sub, 0) | (Or, 0) | (Xor, 0) | (Mul, 1) | (And, -1) => {
+                return mov(known, a);
+            }
+            (Mul, 0) | (And, 0) => return con(known, 0),
+            (Or, -1) => return con(known, -1),
+            _ => {}
+        }
+    }
+    // Identities with a constant left operand (commutative ops).
+    if let Some(x) = ka {
+        match (op, x) {
+            (Add, 0) | (Or, 0) | (Xor, 0) | (Mul, 1) | (And, -1) => return mov(known, b),
+            (Mul, 0) | (And, 0) => return con(known, 0),
+            (Or, -1) => return con(known, -1),
+            _ => {}
+        }
+    }
+    // Identities on the same register: x-x = 0, x^x = 0, x&x = x, x|x = x.
+    if a == b {
+        match op {
+            Sub | Xor => return con(known, 0),
+            And | Or => return mov(known, a),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// If `v` is a `NanBox` whole number that fits an `i64` losslessly, its integer
@@ -2393,6 +2451,95 @@ mod tests {
         // Observationally identical.
         assert_eq!(eval_reg(&opt, 4, &[]), eval_reg(&ops, 4, &[]));
         assert_eq!(eval_reg(&opt, 4, &[]), 10);
+    }
+
+    #[test]
+    fn strength_reduction_identities() {
+        // For each identity, build  r1 = arg0;  r2 = <const or arg>;  r3 = r1 <op> r2;  ret r3
+        // and check the optimized program matches the algebraic identity.
+        type Case = (&'static [RegOp], fn(i64) -> i64);
+        let cases: &[Case] = &[
+            // x + 0 = x
+            (
+                &[
+                    RegOp::Arg { dst: 0, index: 0 },
+                    RegOp::Const { dst: 1, imm: 0 },
+                    RegOp::Bin {
+                        dst: 2,
+                        a: 0,
+                        b: 1,
+                        op: BinOp2::Add,
+                    },
+                    RegOp::Ret { src: 2 },
+                ],
+                |x| x,
+            ),
+            // x * 1 = x
+            (
+                &[
+                    RegOp::Arg { dst: 0, index: 0 },
+                    RegOp::Const { dst: 1, imm: 1 },
+                    RegOp::Bin {
+                        dst: 2,
+                        a: 0,
+                        b: 1,
+                        op: BinOp2::Mul,
+                    },
+                    RegOp::Ret { src: 2 },
+                ],
+                |x| x,
+            ),
+            // x * 0 = 0
+            (
+                &[
+                    RegOp::Arg { dst: 0, index: 0 },
+                    RegOp::Const { dst: 1, imm: 0 },
+                    RegOp::Bin {
+                        dst: 2,
+                        a: 0,
+                        b: 1,
+                        op: BinOp2::Mul,
+                    },
+                    RegOp::Ret { src: 2 },
+                ],
+                |_x| 0,
+            ),
+            // x - x = 0
+            (
+                &[
+                    RegOp::Arg { dst: 0, index: 0 },
+                    RegOp::Bin {
+                        dst: 2,
+                        a: 0,
+                        b: 0,
+                        op: BinOp2::Sub,
+                    },
+                    RegOp::Ret { src: 2 },
+                ],
+                |_x| 0,
+            ),
+            // x ^ x = 0
+            (
+                &[
+                    RegOp::Arg { dst: 0, index: 0 },
+                    RegOp::Bin {
+                        dst: 2,
+                        a: 0,
+                        b: 0,
+                        op: BinOp2::Xor,
+                    },
+                    RegOp::Ret { src: 2 },
+                ],
+                |_x| 0,
+            ),
+        ];
+        for (ops, oracle) in cases {
+            let opt = optimize_reg(ops, 3);
+            for x in [0i64, 5, -7, 1234] {
+                assert_eq!(eval_reg(&opt, 3, &[x]), oracle(x));
+                assert_eq!(eval_reg(&opt, 3, &[x]), eval_reg(ops, 3, &[x]));
+            }
+        }
     }
 
     #[test]
