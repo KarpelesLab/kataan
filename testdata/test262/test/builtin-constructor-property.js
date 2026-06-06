@@ -28,3 +28,12 @@ assert.sameValue((new Sub()).constructor, Sub, "subclass");
 // name is still an Object.
 assert.sameValue(({ constructor: 42 }).constructor, 42, "explicit constructor wins");
 assert.sameValue(({ name: "TypeError" }).constructor, Object, "name alone is not an error");
+
+// Primitive number/boolean/bigint/symbol report their wrapper constructor.
+assert.sameValue((5).constructor, Number, "number primitive");
+assert.sameValue((3.14).constructor, Number, "float primitive");
+assert.sameValue(true.constructor, Boolean, "boolean primitive");
+assert.sameValue((5n).constructor, BigInt, "bigint primitive");
+assert.sameValue(Symbol().constructor, Symbol, "symbol primitive");
+// A non-constructor read on a primitive is still undefined.
+assert.sameValue((5).nope, undefined, "unknown primitive property");

@@ -7639,6 +7639,21 @@ impl<'a> Interp<'a> {
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(msg))));
                 }
                 let Some(raw) = obj.as_handle() else {
+                    // A number/boolean primitive reports its wrapper constructor
+                    // (`(5).constructor === Number`); other reads are `undefined`
+                    // here (method calls go through the call path).
+                    if let PropertyKey::Ident(n) | PropertyKey::Str(n) = property
+                        && n.as_ref() == "constructor"
+                    {
+                        let name = if obj.as_number().is_some() {
+                            "Number"
+                        } else if matches!(obj.unpack(), Unpacked::Bool(_)) {
+                            "Boolean"
+                        } else {
+                            return Ok(NanBox::undefined());
+                        };
+                        return Ok(self.current.get(name).unwrap_or(NanBox::undefined()));
+                    }
                     return Ok(NanBox::undefined());
                 };
                 let handle = crate::heap::Handle::from_raw(raw);
@@ -7817,6 +7832,8 @@ impl<'a> Interp<'a> {
             "RegExp"
         } else if self.realm.bigint_at(handle).is_some() {
             "BigInt"
+        } else if self.realm.symbol_at(handle).is_some() {
+            "Symbol"
         } else if self.realm.date_at(handle).is_some() {
             "Date"
         } else if let Some(is_set) = self.realm.collection_is_set(handle) {
