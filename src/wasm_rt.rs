@@ -24,19 +24,35 @@ pub enum Val {
     I32(i32),
     /// 64-bit integer.
     I64(i64),
+    /// 32-bit float.
+    F32(f32),
+    /// 64-bit float.
+    F64(f64),
 }
 
 impl Val {
     fn as_i32(self) -> Result<i32, WasmRtError> {
         match self {
             Val::I32(v) => Ok(v),
-            Val::I64(_) => Err(WasmRtError("type mismatch: expected i32")),
+            _ => Err(WasmRtError("type mismatch: expected i32")),
         }
     }
     fn as_i64(self) -> Result<i64, WasmRtError> {
         match self {
             Val::I64(v) => Ok(v),
-            Val::I32(_) => Err(WasmRtError("type mismatch: expected i64")),
+            _ => Err(WasmRtError("type mismatch: expected i64")),
+        }
+    }
+    fn as_f32(self) -> Result<f32, WasmRtError> {
+        match self {
+            Val::F32(v) => Ok(v),
+            _ => Err(WasmRtError("type mismatch: expected f32")),
+        }
+    }
+    fn as_f64(self) -> Result<f64, WasmRtError> {
+        match self {
+            Val::F64(v) => Ok(v),
+            _ => Err(WasmRtError("type mismatch: expected f64")),
         }
     }
 }
@@ -48,6 +64,10 @@ pub enum ValType {
     I32,
     /// `i64`
     I64,
+    /// `f32`
+    F32,
+    /// `f64`
+    F64,
 }
 
 /// A function type `(params) -> (results)`.
@@ -174,8 +194,81 @@ fn val_type(b: u8) -> Result<ValType, WasmRtError> {
     match b {
         0x7f => Ok(ValType::I32),
         0x7e => Ok(ValType::I64),
+        0x7d => Ok(ValType::F32),
+        0x7c => Ok(ValType::F64),
         _ => Err(WasmRtError("unsupported value type")),
     }
+}
+
+/// The zero value for a value type (local/global default).
+fn zero_val(t: ValType) -> Val {
+    match t {
+        ValType::I32 => Val::I32(0),
+        ValType::I64 => Val::I64(0),
+        ValType::F32 => Val::F32(0.0),
+        ValType::F64 => Val::F64(0.0),
+    }
+}
+
+// Pure-`core` float helpers — `f64::abs`/`min`/`max`/`sqrt` live in `std`, but
+// the engine is `alloc`-only, so they are reimplemented here over `core`.
+
+fn f64_abs(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() & 0x7fff_ffff_ffff_ffff)
+}
+fn f32_abs(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() & 0x7fff_ffff)
+}
+
+/// WebAssembly `min`: NaN-propagating, with `-0 < +0`.
+fn f64_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        // ±0: the negative zero is the minimum.
+        if a.is_sign_negative() { a } else { b }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+fn f64_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        if a.is_sign_positive() { a } else { b }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+fn f32_min(a: f32, b: f32) -> f32 {
+    f64_min(f64::from(a), f64::from(b)) as f32
+}
+fn f32_max(a: f32, b: f32) -> f32 {
+    f64_max(f64::from(a), f64::from(b)) as f32
+}
+
+/// `sqrt` via Newton–Raphson with a bit-hack initial guess (no `std`/libm).
+fn f64_sqrt(x: f64) -> f64 {
+    if x.is_nan() || x < 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 || x.is_infinite() {
+        return x; // sqrt(±0) = ±0, sqrt(+inf) = +inf
+    }
+    // Initial guess: halve the biased exponent (the classic bit approximation).
+    let mut g = f64::from_bits((x.to_bits() >> 1) + (0x1ff8_0000_0000_0000));
+    // A handful of Newton iterations converge to full f64 precision.
+    for _ in 0..6 {
+        g = 0.5 * (g + x / g);
+    }
+    g
+}
+fn f32_sqrt(x: f32) -> f32 {
+    f64_sqrt(f64::from(x)) as f32
 }
 
 /// Reads a constant `i32.const N; end` initializer expression (data/element
@@ -286,6 +379,26 @@ impl Module {
                         return Err(WasmRtError("expected end of global init"));
                     }
                     Val::I64(v)
+                }
+                ValType::F32 => {
+                    if s.byte()? != 0x43 {
+                        return Err(WasmRtError("expected f32.const global init"));
+                    }
+                    let v = f32::from_le_bytes(s.bytes(4)?.try_into().unwrap());
+                    if s.byte()? != 0x0b {
+                        return Err(WasmRtError("expected end of global init"));
+                    }
+                    Val::F32(v)
+                }
+                ValType::F64 => {
+                    if s.byte()? != 0x44 {
+                        return Err(WasmRtError("expected f64.const global init"));
+                    }
+                    let v = f64::from_le_bytes(s.bytes(8)?.try_into().unwrap());
+                    if s.byte()? != 0x0b {
+                        return Err(WasmRtError("expected end of global init"));
+                    }
+                    Val::F64(v)
                 }
             };
             m.globals.push((init, mutable));
@@ -408,10 +521,7 @@ impl Module {
         // Locals = parameters, then zero-initialized declared locals.
         let mut locals: Vec<Val> = args.to_vec();
         for lt in &body.locals {
-            locals.push(match lt {
-                ValType::I32 => Val::I32(0),
-                ValType::I64 => Val::I64(0),
-            });
+            locals.push(zero_val(*lt));
         }
         let mut stack: Vec<Val> = Vec::new();
         self.exec(&body.code, &mut locals, &mut stack, store)?;
@@ -466,6 +576,35 @@ impl Module {
                 let b = pop!().as_i64()?;
                 let a = pop!().as_i64()?;
                 stack.push(Val::I64($f(a, b)));
+            }};
+        }
+        macro_rules! bin_f64 {
+            ($f:expr) => {{
+                let b = pop!().as_f64()?;
+                let a = pop!().as_f64()?;
+                stack.push(Val::F64($f(a, b)));
+            }};
+        }
+        // f64 comparison → i32 boolean.
+        macro_rules! cmp_f64 {
+            ($f:expr) => {{
+                let b = pop!().as_f64()?;
+                let a = pop!().as_f64()?;
+                stack.push(Val::I32(i32::from($f(a, b))));
+            }};
+        }
+        macro_rules! bin_f32 {
+            ($f:expr) => {{
+                let b = pop!().as_f32()?;
+                let a = pop!().as_f32()?;
+                stack.push(Val::F32($f(a, b)));
+            }};
+        }
+        macro_rules! cmp_f32 {
+            ($f:expr) => {{
+                let b = pop!().as_f32()?;
+                let a = pop!().as_f32()?;
+                stack.push(Val::I32(i32::from($f(a, b))));
             }};
         }
         while !r.done() {
@@ -636,6 +775,93 @@ impl Module {
                 0x7c => bin_i64!(i64::wrapping_add),
                 0x7d => bin_i64!(i64::wrapping_sub),
                 0x7e => bin_i64!(i64::wrapping_mul),
+                // --- floating point ---
+                0x43 => {
+                    let v = f32::from_le_bytes(r.bytes(4)?.try_into().unwrap());
+                    stack.push(Val::F32(v)); // f32.const
+                }
+                0x44 => {
+                    let v = f64::from_le_bytes(r.bytes(8)?.try_into().unwrap());
+                    stack.push(Val::F64(v)); // f64.const
+                }
+                0x2a => {
+                    let a = mem_addr!(r, 4);
+                    let v = f32::from_le_bytes(store.mem[a..a + 4].try_into().unwrap());
+                    stack.push(Val::F32(v)); // f32.load
+                }
+                0x2b => {
+                    let a = mem_addr!(r, 8);
+                    let v = f64::from_le_bytes(store.mem[a..a + 8].try_into().unwrap());
+                    stack.push(Val::F64(v)); // f64.load
+                }
+                0x38 => {
+                    let (a, v) = {
+                        let v = pop!().as_f32()?;
+                        let a = mem_addr!(r, 4);
+                        (a, v)
+                    };
+                    store.mem[a..a + 4].copy_from_slice(&v.to_le_bytes()); // f32.store
+                }
+                0x39 => {
+                    let (a, v) = {
+                        let v = pop!().as_f64()?;
+                        let a = mem_addr!(r, 8);
+                        (a, v)
+                    };
+                    store.mem[a..a + 8].copy_from_slice(&v.to_le_bytes()); // f64.store
+                }
+                // f32 comparisons
+                0x5b => cmp_f32!(|a, b| a == b),
+                0x5c => cmp_f32!(|a, b| a != b),
+                0x5d => cmp_f32!(|a, b| a < b),
+                0x5e => cmp_f32!(|a, b| a > b),
+                0x5f => cmp_f32!(|a, b| a <= b),
+                0x60 => cmp_f32!(|a, b| a >= b),
+                // f64 comparisons
+                0x61 => cmp_f64!(|a, b| a == b),
+                0x62 => cmp_f64!(|a, b| a != b),
+                0x63 => cmp_f64!(|a, b| a < b),
+                0x64 => cmp_f64!(|a, b| a > b),
+                0x65 => cmp_f64!(|a, b| a <= b),
+                0x66 => cmp_f64!(|a, b| a >= b),
+                // f32 unary / arithmetic
+                0x8b => {
+                    let a = pop!().as_f32()?;
+                    stack.push(Val::F32(f32_abs(a)));
+                }
+                0x8c => {
+                    let a = pop!().as_f32()?;
+                    stack.push(Val::F32(-a));
+                }
+                0x91 => {
+                    let a = pop!().as_f32()?;
+                    stack.push(Val::F32(f32_sqrt(a)));
+                }
+                0x92 => bin_f32!(|a, b| a + b),
+                0x93 => bin_f32!(|a, b| a - b),
+                0x94 => bin_f32!(|a, b| a * b),
+                0x95 => bin_f32!(|a, b| a / b),
+                0x96 => bin_f32!(f32_min),
+                0x97 => bin_f32!(f32_max),
+                // f64 unary / arithmetic
+                0x99 => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::F64(f64_abs(a)));
+                }
+                0x9a => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::F64(-a));
+                }
+                0x9f => {
+                    let a = pop!().as_f64()?;
+                    stack.push(Val::F64(f64_sqrt(a)));
+                }
+                0xa0 => bin_f64!(|a, b| a + b),
+                0xa1 => bin_f64!(|a, b| a - b),
+                0xa2 => bin_f64!(|a, b| a * b),
+                0xa3 => bin_f64!(|a, b| a / b),
+                0xa4 => bin_f64!(f64_min),
+                0xa5 => bin_f64!(f64_max),
                 // structured control: block / loop / if
                 0x02 | 0x03 => {
                     let _blocktype = r.byte()?; // 0x40 (empty) or a value type
@@ -742,6 +968,12 @@ fn block_len(code: &[u8]) -> Result<usize, WasmRtError> {
             }
             0x42 => {
                 r.i64()?;
+            }
+            0x43 => {
+                r.bytes(4)?; // f32.const
+            }
+            0x44 => {
+                r.bytes(8)?; // f64.const
             }
             _ => {}
         }
@@ -997,6 +1229,76 @@ mod tests {
             module.call(h, &[]),
             Err(WasmRtError("out of bounds memory access"))
         );
+    }
+
+    #[test]
+    fn f64_arithmetic_and_sqrt() {
+        // (func (export "f") (param f64 f64) (result f64)
+        //   local.get 0  local.get 1  f64.add  f64.sqrt)   ;; sqrt(a + b)
+        let body: Vec<u8> = vec![0x00, 0x20, 0x00, 0x20, 0x01, 0xa0, 0x9f, 0x0b];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x07, 0x01, 0x60, 0x02, 0x7c, 0x7c, 0x01, 0x7c]); // (f64 f64)->f64
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).expect("decode f64 module");
+        let f = module.export("f").unwrap();
+        // sqrt(9 + 16) = 5
+        let r = module.call(f, &[Val::F64(9.0), Val::F64(16.0)]).unwrap();
+        match r[..] {
+            [Val::F64(v)] => assert!((v - 5.0).abs() < 1e-9, "got {v}"),
+            _ => panic!("expected one f64, got {r:?}"),
+        }
+        // sqrt(2) ≈ 1.4142135623730951
+        let r = module.call(f, &[Val::F64(2.0), Val::F64(0.0)]).unwrap();
+        match r[..] {
+            [Val::F64(v)] => assert!((v - core::f64::consts::SQRT_2).abs() < 1e-12, "got {v}"),
+            _ => panic!("expected one f64"),
+        }
+    }
+
+    #[test]
+    fn f64_const_and_compare() {
+        // (func (export "lt") (param f64) (result i32)
+        //   local.get 0  f64.const 3.5  f64.lt)   ;; arg < 3.5
+        let mut body: Vec<u8> = vec![0x00, 0x20, 0x00, 0x44];
+        body.extend(3.5f64.to_le_bytes());
+        body.extend([0x63, 0x0b]); // f64.lt, end
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7c, 0x01, 0x7f]); // (f64)->i32
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        m.extend([0x07, 0x06, 0x01, 0x02, b'l', b't', 0x00, 0x00]);
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+        let module = Module::decode(&m).expect("decode compare module");
+        let lt = module.export("lt").unwrap();
+        assert_eq!(
+            module.call(lt, &[Val::F64(2.0)]).unwrap(),
+            vec![Val::I32(1)]
+        );
+        assert_eq!(
+            module.call(lt, &[Val::F64(9.0)]).unwrap(),
+            vec![Val::I32(0)]
+        );
+    }
+
+    #[test]
+    fn float_helpers_match_semantics() {
+        assert_eq!(f64_sqrt(144.0), 12.0);
+        assert_eq!(f64_sqrt(0.0), 0.0);
+        assert!(f64_sqrt(-1.0).is_nan());
+        assert_eq!(f64_abs(-3.5), 3.5);
+        assert_eq!(f64_min(-0.0, 0.0), -0.0);
+        assert_eq!(f64_max(-0.0, 0.0), 0.0);
+        assert!(f64_min(f64::NAN, 1.0).is_nan());
+        assert_eq!(f64_min(2.0, 5.0), 2.0);
     }
 
     #[test]
