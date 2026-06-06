@@ -274,6 +274,7 @@ const NB_ARRAY_IS_ARRAY: u16 = 28;
 const NB_OBJECT_FROM_ENTRIES: u16 = 29;
 const NB_PROMISE_RESOLVE: u16 = 30;
 const NB_PROMISE_REJECT: u16 = 31;
+pub(crate) const NB_MATH_TRUNC: u16 = 32;
 
 /// Built-in globals the tree-walker provides as bare values. An unknown
 /// identifier that is *not* one of these throws a `ReferenceError` at runtime
@@ -2223,21 +2224,22 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             NanBox::number(val)
         }
         #[cfg(feature = "std")]
-        NB_MATH_FLOOR | NB_MATH_CEIL | NB_MATH_ROUND | NB_MATH_SQRT | NB_MATH_POW => {
+        NB_MATH_FLOOR | NB_MATH_CEIL | NB_MATH_ROUND | NB_MATH_SQRT | NB_MATH_POW
+        | NB_MATH_TRUNC => {
             let a = args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
             let val = match native {
                 NB_MATH_FLOOR => a.floor(),
                 NB_MATH_CEIL => a.ceil(),
                 NB_MATH_ROUND => crate::common::js_round(a),
                 NB_MATH_SQRT => a.sqrt(),
+                NB_MATH_TRUNC => a.trunc(),
                 _ => a.powf(args.get(1).and_then(|v| v.as_number()).unwrap_or(f64::NAN)),
             };
             NanBox::number(val)
         }
         #[cfg(not(feature = "std"))]
-        NB_MATH_FLOOR | NB_MATH_CEIL | NB_MATH_ROUND | NB_MATH_SQRT | NB_MATH_POW => {
-            NanBox::number(f64::NAN)
-        }
+        NB_MATH_FLOOR | NB_MATH_CEIL | NB_MATH_ROUND | NB_MATH_SQRT | NB_MATH_POW
+        | NB_MATH_TRUNC => NanBox::number(f64::NAN),
         NB_STRING => {
             let s = ctx
                 .realm
@@ -2765,6 +2767,7 @@ fn native_call(callee: &Expr) -> Option<u16> {
         ("Math", "abs") => Some(NB_MATH_ABS),
         ("Math", "floor") => Some(NB_MATH_FLOOR),
         ("Math", "ceil") => Some(NB_MATH_CEIL),
+        ("Math", "trunc") => Some(NB_MATH_TRUNC),
         ("Math", "round") => Some(NB_MATH_ROUND),
         ("Math", "sqrt") => Some(NB_MATH_SQRT),
         ("Math", "pow") => Some(NB_MATH_POW),

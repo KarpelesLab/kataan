@@ -242,6 +242,11 @@ pub enum FloatOp {
         dst: u8,
         a: u8,
     },
+    /// `reg[dst] = trunc(reg[a])` — `Math.trunc` (SSE4.1 `roundsd`, gated).
+    Trunc {
+        dst: u8,
+        a: u8,
+    },
     /// `reg[dst] = !reg[a]` — JS logical-not: `1.0` if `reg[a]` is falsy (`±0.0`
     /// or `NaN`), else `0.0`. (`ucomisd x, 0` sets ZF for both equal and NaN.)
     Eqz {
@@ -352,6 +357,10 @@ pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
             }
             FloatOp::Floor { dst, a } => {
                 regs[dst as usize] = regs[a as usize].floor();
+                pc += 1;
+            }
+            FloatOp::Trunc { dst, a } => {
+                regs[dst as usize] = regs[a as usize].trunc();
                 pc += 1;
             }
             FloatOp::Ceil { dst, a } => {
@@ -1568,12 +1577,13 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                     FloatOp::Abs { dst: d, a }
                 }
             }
-            // `Math.floor(x)` / `Math.ceil(x)` — one SSE4.1 `roundsd` each, but only
-            // if this CPU has SSE4.1; otherwise bail so the whole function stays in
-            // the interpreter (the baseline is only SSE2).
+            // `Math.floor(x)` / `Math.ceil(x)` / `Math.trunc(x)` — one SSE4.1
+            // `roundsd` each, but only if this CPU has SSE4.1; otherwise bail so the
+            // whole function stays in the interpreter (the baseline is only SSE2).
             Op::CallNative { dst, native, args }
                 if (*native == crate::nbvm::NB_MATH_FLOOR
-                    || *native == crate::nbvm::NB_MATH_CEIL)
+                    || *native == crate::nbvm::NB_MATH_CEIL
+                    || *native == crate::nbvm::NB_MATH_TRUNC)
                     && args.len() == 1
                     && has_sse41() =>
             {
@@ -1582,8 +1592,10 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                 written[*dst as usize] = true;
                 if *native == crate::nbvm::NB_MATH_FLOOR {
                     FloatOp::Floor { dst: d, a }
-                } else {
+                } else if *native == crate::nbvm::NB_MATH_CEIL {
                     FloatOp::Ceil { dst: d, a }
+                } else {
+                    FloatOp::Trunc { dst: d, a }
                 }
             }
             // `Math.max(a, b)` / `Math.min(a, b)` — two-argument f64 intrinsics with
@@ -2820,15 +2832,18 @@ impl JitFunction {
                     a.sqrtsd_xmm0();
                     a.movsd_mem_xmm0(disp(dst));
                 }
-                FloatOp::Floor { dst, a: ra } | FloatOp::Ceil { dst, a: ra } => {
+                FloatOp::Floor { dst, a: ra }
+                | FloatOp::Ceil { dst, a: ra }
+                | FloatOp::Trunc { dst, a: ra } => {
                     // `roundsd` is SSE4.1; refuse to emit it on hardware without it.
                     if !ok(dst) || !ok(ra) || !has_sse41() {
                         return None;
                     }
-                    let mode = if matches!(op, FloatOp::Floor { .. }) {
-                        0x09
-                    } else {
-                        0x0a
+                    // roundsd mode: 0x09 floor, 0x0a ceil, 0x0b truncate-toward-zero.
+                    let mode = match op {
+                        FloatOp::Floor { .. } => 0x09,
+                        FloatOp::Ceil { .. } => 0x0a,
+                        _ => 0x0b,
                     };
                     a.movsd_xmm0_mem(disp(ra));
                     a.roundsd_xmm0(mode);
@@ -4359,6 +4374,21 @@ mod tests {
             );
             assert_eq!(eval_float(&floor, 2, &[x]), x.floor());
             assert_eq!(eval_float(&ceil, 2, &[x]), x.ceil());
+        }
+        // `Math.trunc` — roundsd toward zero (0x0b). Preserves the sign of zero.
+        let trunc = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Trunc { dst: 1, a: 0 },
+            FloatOp::Ret { src: 1 },
+        ];
+        let ft = JitFunction::compile_float(2, 1, &trunc).unwrap();
+        for x in [3.7f64, -3.7, 3.2, -0.5, 2.0, -0.0, 1e6, -7.999] {
+            assert_eq!(
+                ft.call_args_f64(&[x]).to_bits(),
+                x.trunc().to_bits(),
+                "trunc({x})"
+            );
+            assert_eq!(eval_float(&trunc, 2, &[x]).to_bits(), x.trunc().to_bits());
         }
     }
 
