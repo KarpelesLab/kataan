@@ -1172,6 +1172,45 @@ mod tests {
     }
 
     #[test]
+    fn wast_conformance_with_control_flow() {
+        // An upstream-style `.wast`: a real WAT text module with named functions,
+        // loops, `if`, and inter-function calls, driven by assert_return/assert_trap
+        // through the full WAT → binary → decode → validate → execute pipeline.
+        let script = "\
+(module
+  (func $abs (export \"abs\") (param $x i32) (result i32)
+    (if (result i32) (i32.lt_s (local.get $x) (i32.const 0))
+      (then (i32.sub (i32.const 0) (local.get $x)))
+      (else (local.get $x))))
+  (func $fact (export \"fact\") (param $n i32) (result i32)
+    (local $acc i32) (local $i i32)
+    (local.set $acc (i32.const 1))
+    (local.set $i (i32.const 1))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.gt_s (local.get $i) (local.get $n)))
+        (local.set $acc (i32.mul (local.get $acc) (local.get $i)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)))
+    (local.get $acc))
+  (func $absfact (export \"absfact\") (param $x i32) (result i32)
+    ;; fact(abs(x)) — exercises inter-function calls by name
+    (call $fact (call $abs (local.get $x))))
+  (func $div (export \"div\") (param $a i32) (param $b i32) (result i32)
+    (i32.div_s (local.get $a) (local.get $b))))
+(assert_return (invoke \"abs\" (i32.const -9)) (i32.const 9))
+(assert_return (invoke \"abs\" (i32.const 4)) (i32.const 4))
+(assert_return (invoke \"fact\" (i32.const 0)) (i32.const 1))
+(assert_return (invoke \"fact\" (i32.const 5)) (i32.const 120))
+(assert_return (invoke \"fact\" (i32.const 6)) (i32.const 720))
+(assert_return (invoke \"absfact\" (i32.const -4)) (i32.const 24))
+(assert_return (invoke \"div\" (i32.const 20) (i32.const 4)) (i32.const 5))
+(assert_trap   (invoke \"div\" (i32.const 1) (i32.const 0)))";
+        let n = run_wast(script).expect("control-flow .wast conformance passes");
+        assert_eq!(n, 8, "all eight assertions executed");
+    }
+
+    #[test]
     fn wast_runs_a_text_module() {
         // A .wast script whose module is WAT *text* (not binary).
         let script = "(module (func (export \"sub\") (param i32 i32) (result i32) \
