@@ -879,6 +879,14 @@ mod tests {
         realm.set_property(obj, "n", NanBox::number(99.0));
         let arr = realm.new_array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)]);
         realm.set_property(obj, "items", NanBox::handle(arr.to_raw()));
+        // Richer cells reachable from the root: a Map and a closure.
+        let map = realm.new_collection(false);
+        realm.collection_set(map, NanBox::number(1.0), NanBox::number(10.0));
+        realm.set_property(obj, "map", NanBox::handle(map.to_raw()));
+        let scope = crate::env::Scope::root();
+        scope.declare("cap", NanBox::number(7.0));
+        let func = realm.new_function(3, scope);
+        realm.set_property(obj, "fn", NanBox::handle(func.to_raw()));
 
         // Serialize to a temp file, then reload it via the mmap zero-copy path.
         let bytes = serialize(&capture(&realm, &[obj]));
@@ -911,6 +919,24 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+        // The Map and closure came through the mmap reload too.
+        let map2 = Handle::from_raw(realm2.get_property(r2, "map").unwrap().as_handle().unwrap());
+        assert_eq!(
+            realm2.collection_get(map2, NanBox::number(1.0)),
+            Some(NanBox::number(10.0))
+        );
+        let fn2 = Handle::from_raw(realm2.get_property(r2, "fn").unwrap().as_handle().unwrap());
+        let (fid, sc) = realm2.function_at(fn2).expect("restored closure");
+        assert_eq!(fid, 3);
+        assert_eq!(sc.get("cap"), Some(NanBox::number(7.0)));
+
+        // The mmap-reloaded heap is a valid moving-GC heap: compaction keeps it.
+        let mut roots2 = [r2];
+        realm2.compact(&mut roots2);
+        assert_eq!(
+            realm2.get_property(roots2[0], "n"),
+            Some(NanBox::number(99.0))
         );
     }
 
