@@ -1959,6 +1959,23 @@ mod tests {
     }
 
     #[test]
+    fn spec_select_and_drop() {
+        // `select` picks one of two values by an i32 condition; `drop` discards the
+        // top of the stack.
+        let script = "(module \
+            (func (export \"sel\") (param i32 i32 i32) (result i32) \
+              (select (local.get 0) (local.get 1) (local.get 2))) \
+            (func (export \"drop2\") (param i32 i32) (result i32) \
+              (local.get 0) (local.get 1) (drop))) \
+            (assert_return (invoke \"sel\" (i32.const 10) (i32.const 20) (i32.const 1)) (i32.const 10)) \
+            (assert_return (invoke \"sel\" (i32.const 10) (i32.const 20) (i32.const 0)) (i32.const 20)) \
+            (assert_return (invoke \"sel\" (i32.const 10) (i32.const 20) (i32.const -5)) (i32.const 10)) \
+            (assert_return (invoke \"drop2\" (i32.const 7) (i32.const 9)) (i32.const 7))";
+        let n = run_wast(script).expect("select/drop conformance passes");
+        assert_eq!(n, 4);
+    }
+
+    #[test]
     fn spec_multi_value_results() {
         // A function returning two values (the multi-value proposal, now standard).
         let script = "(module \
