@@ -312,13 +312,95 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
 }
 
 /// The optimizing-JIT pass over the integer register IR: **constant folding**
-/// (with propagation) followed by **dead-code elimination**. The result is
-/// observationally identical to the input — same [`eval_reg`] for all inputs —
-/// but constant subexpressions are pre-computed and never-read computations are
-/// removed.
+/// (with propagation), then **copy propagation**, then **dead-code elimination**.
+/// The result is observationally identical to the input — same [`eval_reg`] for
+/// all inputs — but constant subexpressions are pre-computed, register copies are
+/// forwarded to their source, and never-read computations are removed.
 #[must_use]
 pub fn optimize_reg(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
-    dce_reg(&fold_constants(ops, n_regs))
+    dce_reg(&copy_propagate(&fold_constants(ops, n_regs), n_regs))
+}
+
+/// Copy propagation: after `Move dst, src`, later reads of `dst` are rewritten to
+/// read `src` directly (so the `Move` becomes dead and DCE removes it). Each
+/// `Move` target tracks the *root* register it copies, so chains collapse in one
+/// step. Sound across control flow: all copy relationships are cleared at any
+/// jump target and after a branch, and an entry is invalidated when its source
+/// register is overwritten.
+#[must_use]
+pub fn copy_propagate(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
+    let mut is_target = alloc::vec![false; ops.len()];
+    for op in ops {
+        if let RegOp::JumpIfFalse { target, .. } | RegOp::Jump { target } = op
+            && *target < is_target.len()
+        {
+            is_target[*target] = true;
+        }
+    }
+    // `copy_of[r] = Some(root)` means `r` currently equals register `root`.
+    let mut copy_of: Vec<Option<u8>> = alloc::vec![None; n_regs];
+    let resolve = |copy_of: &[Option<u8>], r: u8| copy_of[r as usize].unwrap_or(r);
+    // Invalidate any copy whose source is `w` (it is about to change), and clear
+    // `w`'s own copy status.
+    let invalidate = |copy_of: &mut [Option<u8>], w: u8| {
+        for c in copy_of.iter_mut() {
+            if *c == Some(w) {
+                *c = None;
+            }
+        }
+        copy_of[w as usize] = None;
+    };
+    let mut out = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        if is_target[i] {
+            copy_of.iter_mut().for_each(|c| *c = None);
+        }
+        // Rewrite source operands to their roots.
+        let rewritten = match *op {
+            RegOp::Bin { dst, a, b, op } => RegOp::Bin {
+                dst,
+                a: resolve(&copy_of, a),
+                b: resolve(&copy_of, b),
+                op,
+            },
+            RegOp::Lt { dst, a, b } => RegOp::Lt {
+                dst,
+                a: resolve(&copy_of, a),
+                b: resolve(&copy_of, b),
+            },
+            RegOp::Move { dst, src } => RegOp::Move {
+                dst,
+                src: resolve(&copy_of, src),
+            },
+            RegOp::JumpIfFalse { cond, target } => RegOp::JumpIfFalse {
+                cond: resolve(&copy_of, cond),
+                target,
+            },
+            RegOp::Ret { src } => RegOp::Ret {
+                src: resolve(&copy_of, src),
+            },
+            other => other,
+        };
+        // Update copy state from the (rewritten) op's destination.
+        match rewritten {
+            RegOp::Move { dst, src } => {
+                invalidate(&mut copy_of, dst);
+                if src != dst {
+                    copy_of[dst as usize] = Some(src);
+                }
+            }
+            RegOp::Const { dst, .. }
+            | RegOp::Bin { dst, .. }
+            | RegOp::Lt { dst, .. }
+            | RegOp::Arg { dst, .. } => invalidate(&mut copy_of, dst),
+            RegOp::JumpIfFalse { .. } | RegOp::Jump { .. } => {
+                copy_of.iter_mut().for_each(|c| *c = None);
+            }
+            RegOp::Ret { .. } => {}
+        }
+        out.push(rewritten);
+    }
+    out
 }
 
 /// Removes ops whose destination register is never read (anywhere), then remaps
@@ -2311,6 +2393,60 @@ mod tests {
         // Observationally identical.
         assert_eq!(eval_reg(&opt, 4, &[]), eval_reg(&ops, 4, &[]));
         assert_eq!(eval_reg(&opt, 4, &[]), 10);
+    }
+
+    #[test]
+    fn copy_propagation_forwards_moves() {
+        // r0=arg0; r1=Move r0; r2=Move r1; r3=r2+r2; ret r3.
+        // After copy-prop, r3 = r0 + r0 and the two Moves are dead → DCE drops them.
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Move { dst: 1, src: 0 },
+            RegOp::Move { dst: 2, src: 1 },
+            RegOp::Bin {
+                dst: 3,
+                a: 2,
+                b: 2,
+                op: BinOp2::Add,
+            },
+            RegOp::Ret { src: 3 },
+        ];
+        let prop = copy_propagate(&ops, 4);
+        // The Bin now reads r0 directly (the chain collapsed in one step).
+        assert!(
+            matches!(prop[3], RegOp::Bin { a: 0, b: 0, .. }),
+            "operands forwarded to the root: {prop:?}"
+        );
+        let opt = optimize_reg(&ops, 4);
+        // No Move survives (both became dead and were eliminated).
+        assert!(
+            !opt.iter().any(|o| matches!(o, RegOp::Move { .. })),
+            "moves eliminated: {opt:?}"
+        );
+        for x in [0i64, 3, -7, 1000] {
+            assert_eq!(eval_reg(&opt, 4, &[x]), eval_reg(&ops, 4, &[x]));
+            assert_eq!(eval_reg(&opt, 4, &[x]), x + x);
+        }
+    }
+
+    #[test]
+    fn copy_propagation_invalidates_on_overwrite() {
+        // r1=Move r0; r0=Const 99; ret r1  — r1 must still be the OLD r0 (arg),
+        // not 99, because r0 was overwritten after the copy.
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Move { dst: 1, src: 0 },
+            RegOp::Const { dst: 0, imm: 99 },
+            RegOp::Ret { src: 1 },
+        ];
+        let opt = optimize_reg(&ops, 2);
+        for x in [5i64, -3, 42] {
+            assert_eq!(
+                eval_reg(&opt, 2, &[x]),
+                x,
+                "r1 keeps the pre-overwrite value"
+            );
+        }
     }
 
     #[test]
