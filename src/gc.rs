@@ -149,12 +149,8 @@ pub fn compact<T: Trace + Relocate>(heap: &mut Heap<T>, roots: &mut [Handle]) ->
         heap.compact_to(&marked).into_iter().collect();
     let forward = |h: Handle| map.get(&h).copied().unwrap_or(h);
 
-    // Fix up every reference: inside each relocated object, then the roots.
-    for handle in heap.live_handles() {
-        if let Some(obj) = heap.get_mut(handle) {
-            obj.relocate(&forward);
-        }
-    }
+    // Fix up every reference inside surviving objects, then the roots.
+    relocate(heap, &forward);
     for r in roots.iter_mut() {
         *r = forward(*r);
     }
@@ -162,6 +158,21 @@ pub fn compact<T: Trace + Relocate>(heap: &mut Heap<T>, roots: &mut [Handle]) ->
     Stats {
         marked: marked.len(),
         swept: before - marked.len(),
+    }
+}
+
+/// Rewrites every outgoing reference of every live heap object via `forward` —
+/// the **pointer-relocation pass**. It is the moving collector's fix-up step,
+/// and equally the load step of a **heap snapshot** (`ROADMAP.md` §2.2 "heap
+/// snapshots"): when a serialized object graph is reloaded, the freshly-allocated
+/// objects carry the *old* (serialized) handles, and one relocation pass with a
+/// `old → new` forwarding map repairs the whole graph in place — no per-edge
+/// special-casing, exactly as the moving GC relocates after compaction.
+pub fn relocate<T: Relocate>(heap: &mut Heap<T>, forward: &dyn Fn(Handle) -> Handle) {
+    for handle in heap.live_handles() {
+        if let Some(obj) = heap.get_mut(handle) {
+            obj.relocate(forward);
+        }
     }
 }
 
@@ -513,6 +524,59 @@ mod tests {
         assert_eq!(stats.marked, 2);
         assert_eq!(stats.swept, 0);
         assert!(heap.is_live(x) && heap.is_live(y));
+    }
+
+    #[test]
+    fn snapshot_reload_relocates_pointers() {
+        use alloc::collections::BTreeMap;
+        // Build a graph in heap A: a 2-cycle n0 <-> n1, plus n1 -> n2.
+        let mut a: Heap<Node> = Heap::new();
+        let n0 = a.alloc(Node::new(10));
+        let n1 = a.alloc(Node::new(11));
+        let n2 = a.alloc(Node::new(12));
+        a.get_mut(n0).unwrap().edges.push(n1);
+        a.get_mut(n1).unwrap().edges.push(n0);
+        a.get_mut(n1).unwrap().edges.push(n2);
+
+        // "Snapshot": capture each live object's payload + its edges as the
+        // *original* handles (what a serialized graph would record).
+        let live = a.live_handles();
+        let snap: Vec<(Handle, u32, Vec<Handle>)> = live
+            .iter()
+            .map(|h| {
+                let mut edges = Vec::new();
+                a.get(*h).unwrap().trace(&mut |e| edges.push(e));
+                (*h, a.get(*h).unwrap().tag, edges)
+            })
+            .collect();
+
+        // "Reload" into a fresh heap B. Allocate a decoy first so B's handles do
+        // NOT coincide with A's — relocation must do real work. Each reloaded node
+        // keeps the OLD handles in its edges, to be repaired by the relocation pass.
+        let mut b: Heap<Node> = Heap::new();
+        let _decoy = b.alloc(Node::new(99));
+        let mut map: BTreeMap<Handle, Handle> = BTreeMap::new();
+        let mut new_handles = Vec::new();
+        for (old, tag, edges) in &snap {
+            let mut node = Node::new(*tag);
+            node.edges = edges.clone(); // still the serialized (old) handles
+            let nh = b.alloc(node);
+            map.insert(*old, nh);
+            new_handles.push(nh);
+        }
+
+        // The pointer-relocation pass: forward every old handle to its new one.
+        let forward = |h: Handle| map.get(&h).copied().unwrap_or(h);
+        relocate(&mut b, &forward);
+
+        // The graph in B is intact under the new handles: n0<->n1, n1->n2.
+        let (b0, b1, b2) = (new_handles[0], new_handles[1], new_handles[2]);
+        assert_eq!(b.get(b0).unwrap().tag, 10);
+        assert_eq!(b.get(b0).unwrap().edges, alloc::vec![b1]);
+        assert_eq!(b.get(b1).unwrap().edges, alloc::vec![b0, b2]);
+        assert_eq!(b.get(b2).unwrap().tag, 12);
+        // And the relocated handles genuinely differ from the originals.
+        assert_ne!(b0, n0);
     }
 
     #[test]
