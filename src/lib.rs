@@ -113,6 +113,11 @@ pub mod wasm;
 #[cfg(feature = "alloc")]
 pub mod wasm_rt;
 
+/// A WebAssembly spec-test harness: typed `assert_return`/`assert_trap`/
+/// `assert_invalid` commands run against the `wasm_rt` engine. Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod wasm_spec;
+
 /// A minimal register VM over the `Realm`/`NanBox` representation — the proof
 /// that the performance object model executes code. Needs `alloc`.
 #[cfg(feature = "alloc")]
