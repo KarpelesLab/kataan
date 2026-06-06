@@ -233,7 +233,8 @@ pub(crate) const VB_SHL: u8 = 4;
 pub(crate) const VB_SHR: u8 = 5;
 /// `Op::ValueBin` op code for `>>>`.
 pub(crate) const VB_USHR: u8 = 6;
-const VB_LOOSE_EQ: u8 = 7;
+/// `Op::ValueBin` op code for loose `==` (exposed for the JIT's integer lowering).
+pub(crate) const VB_LOOSE_EQ: u8 = 7;
 const VB_LOOSE_NEQ: u8 = 8;
 
 // Native built-in ids for `Op::CallNative`.
@@ -5521,6 +5522,14 @@ mod tests {
                 for (let i = 0; i < 40; i = i + 1) { c = c + nz(i); } \
                 c"),
             "39"
+        );
+        // Loose `==` between integers (lowered to `Eq`): count i == 3 over 0..40 → 1.
+        assert_eq!(
+            bc("function eq3(x){ return x == 3 ? 1 : 0; } \
+                let c = 0; \
+                for (let i = 0; i < 40; i = i + 1) { c = c + eq3(i); } \
+                c"),
+            "1"
         );
     }
 

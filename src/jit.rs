@@ -1212,6 +1212,14 @@ pub fn lower_nbvm_with(
                 written[*dst as usize] = true;
                 RegOp::Eq { dst: d, a, b }
             }
+            // Loose `==` between two integers coerces to numeric equality — the
+            // same as `===` on this all-integer path.
+            Op::ValueBin { dst, op, a, b } if *op == crate::nbvm::VB_LOOSE_EQ => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                RegOp::Eq { dst: d, a, b }
+            }
             // JS unary minus of an integer: `-x`. The native code guards i64::MIN
             // overflow and the exact-integer range, so it never diverges.
             Op::Neg { dst, a } => {
