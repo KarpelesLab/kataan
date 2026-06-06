@@ -267,10 +267,16 @@ const N_WASM_CALL: u16 = 186;
 /// The `Function` global — supports `typeof`/`instanceof` (any callable); the
 /// dynamic `Function(...)` constructor (runtime code compilation) is unsupported.
 const N_FUNCTION: u16 = 187;
+/// `new WebAssembly.Module(bytes)` — a decoded/validated module object.
+const N_WASM_MODULE: u16 = 188;
+/// `new WebAssembly.Instance(module, imports?)` — an instance with `.exports`.
+const N_WASM_INSTANCE: u16 = 189;
 // Hidden slots on a WASM export wrapper's data object.
 const WASM_BYTES: &str = "\u{0}wbytes";
 const WASM_EXPORT: &str = "\u{0}wexport";
 const WASM_IMPORTS: &str = "\u{0}wimports";
+/// Marks an object built by `new WebAssembly.Module(...)`.
+const WASM_IS_MODULE: &str = "\u{0}wmodule";
 // `Object.prototype.*` methods (the receiver arrives as `this`).
 const N_OBJ_PROTO_TOSTRING: u16 = 179;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
@@ -652,6 +658,8 @@ impl<'a> Interp<'a> {
             &[
                 ("validate", N_WASM_VALIDATE),
                 ("instantiate", N_WASM_INSTANTIATE),
+                ("Module", N_WASM_MODULE),
+                ("Instance", N_WASM_INSTANCE),
             ],
         );
         // A minimal `Object.prototype` carrying the methods commonly invoked via
@@ -1565,34 +1573,16 @@ impl<'a> Interp<'a> {
             // each export a callable wrapper. (Synchronous, unlike the spec's
             // Promise; a stateful module re-instantiates per call.)
             N_WASM_INSTANTIATE => {
-                let bytes = self
-                    .wasm_bytes(arg(0))
-                    .ok_or_else(|| self.wasm_compile_error("invalid module source"))?;
-                let module = crate::wasm_rt::Module::decode(&bytes)
-                    .map_err(|_| self.wasm_compile_error("invalid module"))?;
-                let names: Vec<String> =
-                    module.export_names().iter().map(|s| (*s).into()).collect();
-                let bytes_arr = arg(0); // the original buffer, kept for re-decode
-                let exports = self.realm.new_object();
-                let imports_obj = arg(1); // the optional importObject
-                for name in names {
-                    // The wrapper's data object carries the bytes + export name +
-                    // the import object (for modules that import host functions).
-                    let data = self.realm.new_object();
-                    self.realm.set_property(data, WASM_BYTES, bytes_arr);
-                    self.realm.set_property(data, WASM_IMPORTS, imports_obj);
-                    let name_v = self.new_str(&name);
-                    self.realm.set_property(data, WASM_EXPORT, name_v);
-                    let f = self.realm.new_bound_native(N_WASM_CALL, data);
-                    self.realm
-                        .set_property(exports, &name, NanBox::handle(f.to_raw()));
-                }
-                let instance = self.realm.new_object();
-                self.realm
-                    .set_property(instance, "exports", NanBox::handle(exports.to_raw()));
+                let instance = self.build_wasm_instance(arg(0), arg(1))?;
                 let result = self.realm.new_object();
+                self.realm.set_property(result, "instance", instance);
+                let module = self.realm.new_object();
+                self.realm.set_property(module, WASM_BYTES, arg(0));
+                self.realm.mark_hidden(module, WASM_BYTES);
                 self.realm
-                    .set_property(result, "instance", NanBox::handle(instance.to_raw()));
+                    .set_hidden_property(module, WASM_IS_MODULE, NanBox::boolean(true));
+                self.realm
+                    .set_property(result, "module", NanBox::handle(module.to_raw()));
                 NanBox::handle(result.to_raw())
             }
             // `Object.prototype.*` methods — the receiver is `self.this_val`.
@@ -2870,6 +2860,47 @@ impl<'a> Interp<'a> {
             .realm
             .native_at(handle)
             .ok_or(ExecError::Unsupported("new on this value"))?;
+        // `new WebAssembly.Module(bytes)` — decode/validate, keep the bytes so a
+        // later `new WebAssembly.Instance(module)` can instantiate it.
+        if id == N_WASM_MODULE {
+            let bytes = self
+                .wasm_bytes(args.first().copied().unwrap_or(NanBox::undefined()))
+                .ok_or_else(|| self.wasm_compile_error("invalid module source"))?;
+            crate::wasm_rt::Module::decode(&bytes)
+                .map_err(|_| self.wasm_compile_error("invalid module"))?;
+            let module = self.realm.new_object();
+            // The original buffer is retained for instantiation/`instanceof`.
+            self.realm.set_property(
+                module,
+                WASM_BYTES,
+                args.first().copied().unwrap_or(NanBox::undefined()),
+            );
+            self.realm.mark_hidden(module, WASM_BYTES);
+            self.realm
+                .set_hidden_property(module, WASM_IS_MODULE, NanBox::boolean(true));
+            return Ok(NanBox::handle(module.to_raw()));
+        }
+        // `new WebAssembly.Instance(module, importObject?)` → `{ exports: {…} }`.
+        if id == N_WASM_INSTANCE {
+            let module = args
+                .first()
+                .copied()
+                .and_then(|m| m.as_handle())
+                .map(Handle::from_raw)
+                .filter(|m| self.realm.get_property(*m, WASM_IS_MODULE).is_some())
+                .ok_or_else(|| {
+                    self.wasm_type_error(
+                        "WebAssembly.Instance argument must be a WebAssembly.Module",
+                    )
+                })?;
+            let bytes_arr = self
+                .realm
+                .get_property(module, WASM_BYTES)
+                .unwrap_or(NanBox::undefined());
+            let imports = args.get(1).copied().unwrap_or(NanBox::undefined());
+            let instance = self.build_wasm_instance(bytes_arr, imports)?;
+            return Ok(instance);
+        }
         // `new Proxy(target, handler)`.
         if id == N_PROXY {
             let target = args.first().copied().unwrap_or(NanBox::undefined());
@@ -6105,6 +6136,43 @@ impl<'a> Interp<'a> {
     fn wasm_compile_error(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);
         ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
+    }
+
+    fn wasm_type_error(&mut self, msg: &str) -> ExecError {
+        let m = self.new_str(msg);
+        ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
+    }
+
+    /// Builds an instance object (`{ exports: {…} }`) from module `bytes_arr` (the
+    /// original `BufferSource`, kept for per-call re-decode) and an optional import
+    /// object. Each export is a callable wrapper bound to `N_WASM_CALL`. Shared by
+    /// `WebAssembly.instantiate` and `new WebAssembly.Instance`.
+    fn build_wasm_instance(
+        &mut self,
+        bytes_arr: NanBox,
+        imports_obj: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let bytes = self
+            .wasm_bytes(bytes_arr)
+            .ok_or_else(|| self.wasm_compile_error("invalid module source"))?;
+        let module = crate::wasm_rt::Module::decode(&bytes)
+            .map_err(|_| self.wasm_compile_error("invalid module"))?;
+        let names: Vec<String> = module.export_names().iter().map(|s| (*s).into()).collect();
+        let exports = self.realm.new_object();
+        for name in names {
+            let data = self.realm.new_object();
+            self.realm.set_property(data, WASM_BYTES, bytes_arr);
+            self.realm.set_property(data, WASM_IMPORTS, imports_obj);
+            let name_v = self.new_str(&name);
+            self.realm.set_property(data, WASM_EXPORT, name_v);
+            let f = self.realm.new_bound_native(N_WASM_CALL, data);
+            self.realm
+                .set_property(exports, &name, NanBox::handle(f.to_raw()));
+        }
+        let instance = self.realm.new_object();
+        self.realm
+            .set_property(instance, "exports", NanBox::handle(exports.to_raw()));
+        Ok(NanBox::handle(instance.to_raw()))
     }
 
     /// Extracts a byte vector from a JS `BufferSource`-ish value for the WASM
