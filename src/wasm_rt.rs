@@ -144,6 +144,9 @@ pub struct Module {
     /// Imported globals, occupying the low global indices before module-defined
     /// globals (module name, field name, type, mutable). The host supplies values.
     global_imports: Vec<(alloc::string::String, alloc::string::String, ValType, bool)>,
+    /// `true` if the module imports its linear memory from the host (rather than
+    /// defining its own); the host supplies the backing bytes at instantiation.
+    mem_imported: bool,
 }
 
 /// A host function backing an `import` — receives the WASM call's arguments and
@@ -422,11 +425,14 @@ impl Module {
                     }
                 }
                 0x02 => {
+                    // An imported linear memory: the host supplies the bytes.
                     let flag = s.byte()?;
-                    s.u32()?;
+                    let min = s.u32()?;
                     if flag == 1 {
-                        s.u32()?;
+                        s.u32()?; // max
                     }
+                    m.mem_imported = true;
+                    m.mem_min_pages = Some(min);
                 }
                 0x03 => {
                     // A global import: it occupies the next global index, before
@@ -1199,8 +1205,25 @@ impl<'m> Instance<'m> {
         host_funcs: Vec<HostFunc>,
         import_globals: Vec<Val>,
     ) -> Result<Self, WasmRtError> {
+        Self::instantiate_full(module, host_funcs, import_globals, None)
+    }
+
+    /// Instantiates `module` binding function imports, global imports, and an
+    /// optional **imported linear memory** (`import_memory` — the host-owned
+    /// bytes the module reads/writes; required iff the module imports memory).
+    ///
+    /// # Errors
+    /// `WasmRtError("import count mismatch")` if any import list doesn't match the
+    /// module's declared imports, or a data segment is out of bounds.
+    pub fn instantiate_full(
+        module: &'m Module,
+        host_funcs: Vec<HostFunc>,
+        import_globals: Vec<Val>,
+        import_memory: Option<Vec<u8>>,
+    ) -> Result<Self, WasmRtError> {
         if host_funcs.len() != module.n_imported_funcs()
             || import_globals.len() != module.n_imported_globals()
+            || module.mem_imported != import_memory.is_some()
         {
             return Err(WasmRtError("import count mismatch"));
         }
@@ -1209,6 +1232,19 @@ impl<'m> Instance<'m> {
         // Imported globals occupy the first slots of the global space.
         for (i, v) in import_globals.into_iter().enumerate() {
             store.globals[i] = v;
+        }
+        // An imported memory replaces the store's default-allocated bytes; data
+        // segments (applied by `new_store`) carry over by re-applying them.
+        if let Some(mut mem) = import_memory {
+            for (off, bytes) in &module.data {
+                let start = *off as usize;
+                let end = start
+                    .checked_add(bytes.len())
+                    .filter(|e| *e <= mem.len())
+                    .ok_or(WasmRtError("data segment out of bounds"))?;
+                mem[start..end].copy_from_slice(bytes);
+            }
+            store.mem = mem;
         }
         Ok(Self { module, store })
     }
@@ -1941,6 +1977,42 @@ mod tests {
 
         // A missing import binding is rejected at instantiation.
         assert!(Instance::with_imports(&module, vec![]).is_err());
+    }
+
+    #[test]
+    fn imported_memory_supplied_by_host() {
+        // (import "env" "memory" (memory 1))
+        // (func (export "get") (param i32) (result i32) local.get 0 i32.load)
+        let body: Vec<u8> = vec![0x00, 0x20, 0x00, 0x28, 0x02, 0x00, 0x0b];
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]); // (i32)->i32
+        // import: "env"."memory" memory limits {min 1}
+        m.extend([
+            0x02, 0x0f, 0x01, 0x03, b'e', b'n', b'v', 0x06, b'm', b'e', b'm', b'o', b'r', b'y',
+            0x02, 0x00, 0x01,
+        ]);
+        m.extend([0x03, 0x02, 0x01, 0x00]); // func 0: type 0
+        m.extend([0x07, 0x07, 0x01, 0x03, b'g', b'e', b't', 0x00, 0x00]); // export "get"
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+
+        let module = Module::decode(&m).expect("decode imported-memory module");
+        // The host owns the memory and pre-fills it: mem[8] = 0xdead_beef_u32 LE.
+        let mut host_mem = alloc::vec![0u8; PAGE_SIZE];
+        host_mem[8..12].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        let mut inst =
+            Instance::instantiate_full(&module, alloc::vec![], alloc::vec![], Some(host_mem))
+                .expect("instantiate with imported memory");
+        // The module reads the host-supplied bytes.
+        assert_eq!(
+            inst.call_export("get", &[Val::I32(8)]).unwrap(),
+            vec![Val::I32(0x1234_5678)]
+        );
+        // A module importing memory must be given one.
+        assert!(Instance::new(&module).is_err());
     }
 
     #[test]
