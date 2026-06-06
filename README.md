@@ -44,7 +44,7 @@ tri-modal model proven out in the sibling projects
 >   insertion-order-preserving) and runs it in place.
 >
 > Kataan works as a CLI/REPL, a Rust library, and a C library (`kt_eval`). See
-> the [roadmap](ROADMAP.md) for the full design and milestone plan.
+> the [roadmap](ROADMAP.md) for the remaining road to a complete engine.
 
 ## Why
 
@@ -66,8 +66,8 @@ architecture stage rather than retrofitting them:
 
 The language core is **sans-I/O** and `no_std + alloc`; the host runtime (event
 loop, timers, `fetch`, `crypto`, modules) is a separate layer on top, so the
-engine stays embeddable. See [`ROADMAP.md`](ROADMAP.md) for the full design,
-the builtins inventory, and the milestone plan.
+engine stays embeddable. See [`ROADMAP.md`](ROADMAP.md) for the road ahead — the
+remaining work to a complete JS+WASM engine and the design invariants behind it.
 
 ## Pure Rust, no foreign code
 
@@ -110,8 +110,7 @@ $ cargo run -- repl                    # interactive session
 $ cargo run -- --help
 ```
 
-The `disasm` command shows the register bytecode the compiler emits (the
-front half of the Phase-D pipeline — see [`ROADMAP.md`](ROADMAP.md)):
+The `disasm` command shows the register bytecode the compiler emits:
 
 ```console
 $ cargo run -- disasm -e 'let s = 0; let i = 0; while (i < 3) { s += i; i += 1; } s'
