@@ -5420,6 +5420,17 @@ mod tests {
                 s"),
             "3.5"
         );
+        // A hot function with a *float loop* (fractional step + f64 comparison) —
+        // exercises the JIT's float branch path. sum of x for x in 0,0.5,..<3 = 7.5.
+        assert_eq!(
+            bc(
+                "function tri(n){ let s = 0.0; for (let x = 0.0; x < n; x = x + 0.5) { s = s + x; } return s; } \
+                let r = 0; \
+                for (let i = 0; i < 20; i = i + 1) { r = tri(3); } \
+                r"
+            ),
+            "7.5"
+        );
     }
 
     #[test]

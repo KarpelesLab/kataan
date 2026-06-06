@@ -152,23 +152,59 @@ pub enum FBinOp {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[allow(missing_docs)] // field names mirror the IR
 pub enum FloatOp {
-    Arg { dst: u8, index: u8 },
-    Const { dst: u8, imm: f64 },
-    Bin { dst: u8, a: u8, b: u8, op: FBinOp },
-    Move { dst: u8, src: u8 },
-    Ret { src: u8 },
+    Arg {
+        dst: u8,
+        index: u8,
+    },
+    Const {
+        dst: u8,
+        imm: f64,
+    },
+    Bin {
+        dst: u8,
+        a: u8,
+        b: u8,
+        op: FBinOp,
+    },
+    Move {
+        dst: u8,
+        src: u8,
+    },
+    /// `reg[dst] = (reg[a] < reg[b]) ? 1.0 : 0.0` (ordered; NaN → 0.0)
+    Lt {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
+    /// if `reg[cond] == 0.0`, jump to op index `target`
+    JumpIfFalse {
+        cond: u8,
+        target: usize,
+    },
+    /// unconditional jump to op index `target`
+    Jump {
+        target: usize,
+    },
+    Ret {
+        src: u8,
+    },
 }
 
 /// Interprets a [`FloatOp`] program — the oracle for [`JitFunction::compile_float`].
 #[must_use]
 pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
     let mut regs = alloc::vec![0.0f64; n_regs];
-    for op in ops {
-        match *op {
+    let mut pc = 0usize;
+    while pc < ops.len() {
+        match ops[pc] {
             FloatOp::Arg { dst, index } => {
                 regs[dst as usize] = args.get(index as usize).copied().unwrap_or(0.0);
+                pc += 1;
             }
-            FloatOp::Const { dst, imm } => regs[dst as usize] = imm,
+            FloatOp::Const { dst, imm } => {
+                regs[dst as usize] = imm;
+                pc += 1;
+            }
             FloatOp::Bin { dst, a, b, op } => {
                 let (x, y) = (regs[a as usize], regs[b as usize]);
                 regs[dst as usize] = match op {
@@ -177,8 +213,24 @@ pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
                     FBinOp::Mul => x * y,
                     FBinOp::Div => x / y,
                 };
+                pc += 1;
             }
-            FloatOp::Move { dst, src } => regs[dst as usize] = regs[src as usize],
+            FloatOp::Move { dst, src } => {
+                regs[dst as usize] = regs[src as usize];
+                pc += 1;
+            }
+            FloatOp::Lt { dst, a, b } => {
+                regs[dst as usize] = f64::from(u8::from(regs[a as usize] < regs[b as usize]));
+                pc += 1;
+            }
+            FloatOp::JumpIfFalse { cond, target } => {
+                if regs[cond as usize] == 0.0 {
+                    pc = target;
+                } else {
+                    pc += 1;
+                }
+            }
+            FloatOp::Jump { target } => pc = target,
             FloatOp::Ret { src } => return regs[src as usize],
         }
     }
@@ -479,17 +531,40 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                 written[*dst as usize] = true;
                 FloatOp::Move { dst: d, src: s }
             }
-            Op::Return { src } => {
-                out.push(FloatOp::Ret {
-                    src: read(&written, *src)?,
-                });
-                return Some(out);
+            Op::Lt { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                FloatOp::Lt { dst: d, a, b }
             }
+            // Targets are nbvm op indices; the lowered stream prepends one `Arg`
+            // per parameter, so each target shifts by `n_params`.
+            Op::JumpIfFalse { cond, target } => FloatOp::JumpIfFalse {
+                cond: read(&written, *cond)?,
+                target: target.checked_add(proto.n_params)?,
+            },
+            Op::Jump { target } => FloatOp::Jump {
+                target: target.checked_add(proto.n_params)?,
+            },
+            Op::Return { src } => FloatOp::Ret {
+                src: read(&written, *src)?,
+            },
             _ => return None,
         };
         out.push(lowered);
     }
-    None
+    // Eligible only if it terminates with a `Ret` and every target is in range.
+    if !matches!(out.last(), Some(FloatOp::Ret { .. })) {
+        return None;
+    }
+    for op in &out {
+        if let FloatOp::JumpIfFalse { target, .. } | FloatOp::Jump { target } = op
+            && *target >= out.len()
+        {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// A bytecode-VM function compiled to native code, callable from the VM with
@@ -873,6 +948,29 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0xf2, 0x0f, 0x11, modrm]);
         self.code.extend_from_slice(&disp.to_le_bytes());
     }
+    /// `ucomisd xmm0, [rbp+disp]` — unordered compare, set EFLAGS like `cmp`.
+    pub fn ucomisd_xmm0_mem(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x66, 0x0f, 0x2e, 0x85]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `xorpd xmm1, xmm1` — set `xmm1` to `+0.0`.
+    pub fn zero_xmm1(&mut self) {
+        self.code.extend_from_slice(&[0x66, 0x0f, 0x57, 0xc9]);
+    }
+    /// `ucomisd xmm0, xmm1`.
+    pub fn ucomisd_xmm0_xmm1(&mut self) {
+        self.code.extend_from_slice(&[0x66, 0x0f, 0x2e, 0xc1]);
+    }
+    /// `seta al; movzx rax, al` — `rax = (above: ordered and >) ? 1 : 0` after a
+    /// `ucomisd` (`above` is false for NaN, matching JS ordered comparison).
+    pub fn seta_rax(&mut self) {
+        self.code.extend_from_slice(&[0x0f, 0x97, 0xc0]); // seta al
+        self.code.extend_from_slice(&[0x48, 0x0f, 0xb6, 0xc0]); // movzx rax, al
+    }
+    /// `cvtsi2sd xmm0, rax` — convert the integer in `rax` to an `f64` in `xmm0`.
+    pub fn cvtsi2sd_xmm0_rax(&mut self) {
+        self.code.extend_from_slice(&[0xf2, 0x48, 0x0f, 0x2a, 0xc0]);
+    }
     /// `<addsd|subsd|mulsd|divsd> xmm0, [rbp+disp]`.
     pub fn fbin_xmm0_mem(&mut self, op: FBinOp, disp: i32) {
         let opcode = match op {
@@ -1254,9 +1352,12 @@ impl JitFunction {
         let disp = |r: u8| -((i32::from(r) + 1) * 8);
         let frame = ((n_regs as u32 * 8) + 15) & !15;
         let mut a = X64Assembler::new();
+        // One label per op so any op can be a branch target.
+        let labels: Vec<Label> = (0..ops.len()).map(|_| a.new_label()).collect();
         a.prologue(frame);
         let mut has_ret = false;
-        for op in ops {
+        for (i, op) in ops.iter().enumerate() {
+            a.bind(labels[i]);
             match *op {
                 FloatOp::Arg { dst, index } => {
                     if !ok(dst) || index as usize >= n_args {
@@ -1292,6 +1393,35 @@ impl JitFunction {
                     a.movsd_xmm0_mem(disp(src));
                     a.movsd_mem_xmm0(disp(dst));
                 }
+                FloatOp::Lt { dst, a: ra, b: rb } => {
+                    if !ok(dst) || !ok(ra) || !ok(rb) {
+                        return None;
+                    }
+                    // `seta` after `ucomisd b, a` is `b > a` ordered = `a < b`
+                    // (false for NaN). Convert the 0/1 to an f64 in the slot.
+                    a.movsd_xmm0_mem(disp(rb));
+                    a.ucomisd_xmm0_mem(disp(ra));
+                    a.seta_rax();
+                    a.cvtsi2sd_xmm0_rax();
+                    a.movsd_mem_xmm0(disp(dst));
+                }
+                FloatOp::JumpIfFalse { cond, target } => {
+                    if !ok(cond) || target >= ops.len() {
+                        return None;
+                    }
+                    // Jump when the cond slot is +0.0 (the only falsy value Lt
+                    // produces); compare against a zeroed xmm1.
+                    a.movsd_xmm0_mem(disp(cond));
+                    a.zero_xmm1();
+                    a.ucomisd_xmm0_xmm1();
+                    a.je(labels[target]);
+                }
+                FloatOp::Jump { target } => {
+                    if target >= ops.len() {
+                        return None;
+                    }
+                    a.jmp(labels[target]);
+                }
                 FloatOp::Ret { src } => {
                     if !ok(src) {
                         return None;
@@ -1299,7 +1429,7 @@ impl JitFunction {
                     a.movsd_xmm0_mem(disp(src)); // result in xmm0
                     a.epilogue();
                     has_ret = true;
-                    break;
+                    // Do NOT break: later ops may be branch targets.
                 }
             }
         }
@@ -1821,6 +1951,48 @@ mod tests {
                 Unpacked::Number((n * (n - 1) / 2) as f64),
                 "jit sum 0..{n}"
             );
+        }
+    }
+
+    #[test]
+    fn float_jit_compiles_a_loop() {
+        // A float loop with a fractional step and an f64 comparison:
+        // sum of x for x in 0, 0.5, 1.0, ... while x < n.
+        let ops = [
+            FloatOp::Arg { dst: 0, index: 0 },           // 0: n
+            FloatOp::Const { dst: 1, imm: 0.0 },         // 1: s = 0
+            FloatOp::Const { dst: 2, imm: 0.0 },         // 2: x = 0
+            FloatOp::Const { dst: 3, imm: 0.5 },         // 3: step = 0.5
+            FloatOp::Lt { dst: 4, a: 2, b: 0 },          // 4: cond = x < n
+            FloatOp::JumpIfFalse { cond: 4, target: 9 }, // 5: if !cond goto 9 (ret)
+            FloatOp::Bin {
+                dst: 1,
+                a: 1,
+                b: 2,
+                op: FBinOp::Add,
+            }, // 6: s += x
+            FloatOp::Bin {
+                dst: 2,
+                a: 2,
+                b: 3,
+                op: FBinOp::Add,
+            }, // 7: x += 0.5
+            FloatOp::Jump { target: 4 },                 // 8: goto 4
+            FloatOp::Ret { src: 1 },                     // 9: ret s
+        ];
+        let oracle = |n: f64| {
+            let (mut s, mut x) = (0.0, 0.0);
+            while x < n {
+                s += x;
+                x += 0.5;
+            }
+            s
+        };
+        for n in [0.0, 1.0, 3.0, 5.0, 10.0] {
+            assert_eq!(eval_float(&ops, 5, &[n]), oracle(n));
+            if let Some(f) = JitFunction::compile_float(5, 1, &ops) {
+                assert_eq!(f.call_args_f64(&[n]), oracle(n), "float loop n={n}");
+            }
         }
     }
 
