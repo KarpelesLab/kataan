@@ -45,8 +45,11 @@ pub enum SnapCell {
     Str(String),
     /// an array of values
     Array(Vec<SnapVal>),
-    /// an object: enumerable own `(key, value)` pairs
-    Object(Vec<(String, SnapVal)>),
+    /// an object: own `(key, value, hidden)` data properties — including
+    /// non-enumerable ones and the engine's internal `\0`-prefixed slots (so
+    /// typed-array kind, bound-function target/this/args, error `stack`, etc.
+    /// survive). `hidden` is true for a non-enumerable property.
+    Object(Vec<(String, SnapVal, bool)>),
     /// a `Date` (millisecond timestamp)
     Date(f64),
     /// a `BigInt` (its base-10 digit string)
@@ -236,13 +239,19 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                 .map(|v| snap_val(*v, &mut index_of, &mut order, &mut intern))
                 .collect();
             SnapCell::Array(vals)
-        } else if let Some(keys) = realm.object_keys(h) {
-            let pairs = keys
+        } else if realm.object_keys(h).is_some() {
+            // All own *data* properties, including non-enumerable + internal slots
+            // (private `#` fields and accessor properties are skipped). Each pair
+            // records whether the property is hidden (non-enumerable).
+            let pairs = realm
+                .object_all_keys(h)
                 .into_iter()
+                .filter(|k| !k.starts_with('#'))
                 .map(|k| {
                     let v = realm.get_property(h, &k).unwrap_or(NanBox::undefined());
                     let sv = snap_val(v, &mut index_of, &mut order, &mut intern);
-                    (k, sv)
+                    let hidden = !realm.property_is_enumerable(h, &k);
+                    (k, sv, hidden)
                 })
                 .collect();
             SnapCell::Object(pairs)
@@ -362,9 +371,12 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 realm.array_set_all(*h, elems);
             }
             SnapCell::Object(pairs) => {
-                for (k, v) in pairs {
+                for (k, v, hidden) in pairs {
                     let val = resolve(v, &handles);
                     realm.set_property(*h, k, val);
+                    if *hidden {
+                        realm.mark_hidden(*h, k);
+                    }
                 }
             }
             SnapCell::Function { frames, .. } => {
@@ -493,9 +505,10 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
             SnapCell::Object(pairs) => {
                 out.push(2);
                 w_u32(pairs.len() as u32, &mut out);
-                for (k, v) in pairs {
+                for (k, v, hidden) in pairs {
                     w_str(k, &mut out);
                     w_val(v, &mut out);
+                    out.push(u8::from(*hidden));
                 }
             }
             SnapCell::Date(ms) => {
@@ -633,7 +646,8 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                 for _ in 0..n {
                     let k = r.string()?;
                     let v = r.val()?;
-                    pairs.push((k, v));
+                    let hidden = r.u8()? != 0;
+                    pairs.push((k, v, hidden));
                 }
                 SnapCell::Object(pairs)
             }
@@ -1208,6 +1222,51 @@ mod tests {
         assert_eq!(
             realm2.string_value(Handle::from_raw(obj_tag.as_handle().unwrap())),
             Some(String::from("cap"))
+        );
+    }
+
+    #[test]
+    fn snapshots_preserve_non_enumerable_and_hidden_slots() {
+        let mut realm = Realm::new();
+        let obj = realm.new_object();
+        // An enumerable property, a non-enumerable one, and an engine-internal
+        // hidden slot (the `\0`-prefixed convention used for typed-array kind,
+        // bound-function targets, error stacks, …).
+        let vis = NanBox::handle(realm.new_string("v").to_raw());
+        realm.set_property(obj, "visible", vis);
+        let hid = NanBox::handle(realm.new_string("h").to_raw());
+        realm.set_property(obj, "secret", hid);
+        realm.mark_hidden(obj, "secret");
+        realm.set_hidden_property(obj, "\u{0}slot", NanBox::number(42.0));
+
+        let snap = deserialize(&serialize(&capture(&realm, &[obj]))).expect("round-trip");
+        let mut realm2 = Realm::new();
+        let o2 = restore(&mut realm2, &snap)[0];
+
+        // All three survive, with enumerability preserved.
+        assert!(
+            realm2.property_is_enumerable(o2, "visible"),
+            "enumerable kept"
+        );
+        assert!(
+            !realm2.property_is_enumerable(o2, "secret"),
+            "non-enumerable kept"
+        );
+        assert_eq!(
+            realm2
+                .get_property(o2, "\u{0}slot")
+                .and_then(|v| v.as_number()),
+            Some(42.0),
+            "internal hidden slot survives"
+        );
+        // Enumerable view shows only the visible key.
+        assert_eq!(
+            realm2.object_keys(o2).unwrap(),
+            alloc::vec![String::from("visible")]
+        );
+        assert!(
+            realm2.has_own(o2, "secret"),
+            "non-enumerable is an own prop"
         );
     }
 

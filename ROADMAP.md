@@ -145,12 +145,14 @@ Today the snapshot codec round-trips eleven cell kinds and `mmap`-reloads over t
 moving GC. "Complete" means *any* live heap snapshots, reloads zero-copy, and
 **executes** — and the bytecode code-cache it shares is production-grade.
 
-- **Hidden-state cells.** Capture the cells the current codec skips because their
-  state lives in hidden slots or engine-side tables: bound functions
-  (`bind` target/this/args), typed arrays + `ArrayBuffer`/`DataView` (element
-  kind, byte offset, backing buffer identity), generator/async suspension state
-  (depends on Track 3 lazy frames), error stacks, `Map`/`Set` ordering already
-  covered — audit every `Cell` variant for completeness.
+- **Hidden-state cells.** *Done:* object capture now records **all own data
+  properties** — non-enumerable ones and the engine's internal `\0`-prefixed slots
+  — with a per-property hidden flag, so bound-function target/this/args, typed-array
+  kind, error `stack`, and the `constructor` back-reference round-trip
+  (`snapshots_preserve_non_enumerable_and_hidden_slots`). *Remaining:* accessor
+  (getter/setter) properties and prototype links in the object cell; generator/async
+  suspension state (depends on Track 3 lazy frames); the `ArrayBuffer` backing-buffer
+  *identity* shared across typed-array views — audit each remaining `Cell` variant.
 - **End-to-end restore-and-execute.** *In place:* a restored closure now runs and
   carries its snapshotted captured state, independent of the original
   (`snapshot_restores_an_executable_closure`) — restored state is executable, not
