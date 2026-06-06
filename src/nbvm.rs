@@ -4284,11 +4284,17 @@ impl Compiler {
                     // `delete` of a non-reference is a no-op that yields `true`.
                     return self.constant(NanBox::boolean(true));
                 }
-                // `typeof x` must not throw for an undefined identifier.
+                // `typeof x` must not throw for a *genuinely* undefined identifier.
+                // A resolvable bare name — a global value (`NaN`/`Infinity`/
+                // `undefined`) or a known builtin (`Math`, `BigInt`, …) — instead
+                // goes through the normal path (the builtin bails to the
+                // tree-walker), so `typeof Math` is `"object"`, not `"undefined"`.
                 if matches!(op, UnaryOp::Typeof)
                     && let Expr::Ident(id) = &**argument
                     && self.lookup(&id.name).is_none()
                     && !self.fn_ids.contains_key(&*id.name)
+                    && !matches!(&*id.name, "undefined" | "NaN" | "Infinity")
+                    && !KNOWN_GLOBALS.contains(&&*id.name)
                 {
                     return Ok(self.constant_str("undefined"));
                 }
