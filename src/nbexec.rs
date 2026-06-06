@@ -7133,6 +7133,14 @@ impl<'a> Interp<'a> {
                         }
                         sink.extend(vals);
                     }
+                    // `yield* iterable` evaluates to the iterator's final value — a
+                    // delegated generator's `return` value (else `undefined`).
+                    let ret = v
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.get_property(h, GEN_RET))
+                        .unwrap_or(NanBox::undefined());
+                    return Ok(ret);
                 } else if let Some(sink) = self.gen_sink.as_mut() {
                     if sink.len() >= GEN_CAP {
                         return Err(ExecError::Throw(self.new_str("generator yield limit")));
