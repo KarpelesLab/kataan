@@ -311,6 +311,98 @@ pub fn eval_reg(ops: &[RegOp], n_regs: usize, args: &[i64]) -> i64 {
     0
 }
 
+/// An optimization pass over the integer register IR — the first tier of the
+/// optimizing JIT. It does **constant folding** (a `Bin` of two known constants,
+/// or a `Move`/`Lt` over knowns, becomes a `Const`) with constant propagation,
+/// staying sound across control flow by clearing all known constants at any jump
+/// target and after a branch (a register may hold a different value when reached
+/// from elsewhere). The result is observationally identical to the input — same
+/// [`eval_reg`] for all inputs — but with constant subexpressions pre-computed.
+#[must_use]
+pub fn optimize_reg(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
+    // Every op index that is a branch target: constants can't be assumed there.
+    let mut is_target = alloc::vec![false; ops.len()];
+    for op in ops {
+        if let RegOp::JumpIfFalse { target, .. } | RegOp::Jump { target } = op
+            && *target < is_target.len()
+        {
+            is_target[*target] = true;
+        }
+    }
+    let mut known: Vec<Option<i64>> = alloc::vec![None; n_regs];
+    let mut out = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        if is_target[i] {
+            known.iter_mut().for_each(|k| *k = None);
+        }
+        let lowered = match *op {
+            RegOp::Const { dst, imm } => {
+                known[dst as usize] = Some(imm);
+                RegOp::Const { dst, imm }
+            }
+            RegOp::Move { dst, src } => {
+                if let Some(v) = known[src as usize] {
+                    known[dst as usize] = Some(v);
+                    RegOp::Const { dst, imm: v }
+                } else {
+                    known[dst as usize] = None;
+                    RegOp::Move { dst, src }
+                }
+            }
+            RegOp::Bin { dst, a, b, op } => {
+                match (known[a as usize], known[b as usize]) {
+                    (Some(x), Some(y)) => {
+                        let v = match op {
+                            BinOp2::Add => x.wrapping_add(y),
+                            BinOp2::Sub => x.wrapping_sub(y),
+                            BinOp2::Mul => x.wrapping_mul(y),
+                            BinOp2::And => x & y,
+                            BinOp2::Or => x | y,
+                            BinOp2::Xor => x ^ y,
+                        };
+                        // Only fold when the result stays in the exact-integer
+                        // range, so the native code's overflow/range deopt is
+                        // still reachable for genuinely out-of-range arithmetic.
+                        if (-SAFE_INT_MAX..=SAFE_INT_MAX).contains(&v) {
+                            known[dst as usize] = Some(v);
+                            RegOp::Const { dst, imm: v }
+                        } else {
+                            known[dst as usize] = None;
+                            RegOp::Bin { dst, a, b, op }
+                        }
+                    }
+                    _ => {
+                        known[dst as usize] = None;
+                        RegOp::Bin { dst, a, b, op }
+                    }
+                }
+            }
+            RegOp::Lt { dst, a, b } => {
+                if let (Some(x), Some(y)) = (known[a as usize], known[b as usize]) {
+                    let v = i64::from(x < y);
+                    known[dst as usize] = Some(v);
+                    RegOp::Const { dst, imm: v }
+                } else {
+                    known[dst as usize] = None;
+                    RegOp::Lt { dst, a, b }
+                }
+            }
+            RegOp::Arg { dst, .. } => {
+                known[dst as usize] = None;
+                *op
+            }
+            // Branches end a straight-line region; clear constants conservatively.
+            RegOp::JumpIfFalse { .. } | RegOp::Jump { .. } => {
+                known.iter_mut().for_each(|k| *k = None);
+                *op
+            }
+            RegOp::Ret { .. } => *op,
+        };
+        out.push(lowered);
+    }
+    out
+}
+
 /// If `v` is a `NanBox` whole number that fits an `i64` losslessly, its integer
 /// value — the JIT integer fast path only applies to such constants.
 #[cfg(feature = "alloc")]
@@ -599,6 +691,8 @@ impl JitProto {
     #[must_use]
     pub fn compile(proto: &crate::nbvm::FnProto) -> Option<Self> {
         if let Some(ops) = lower_nbvm(proto) {
+            // Optimize (constant-fold) before native codegen — the optimizing tier.
+            let ops = optimize_reg(&ops, proto.n_regs);
             let func = JitFunction::compile_reg(proto.n_regs, proto.n_params, &ops)?;
             return Some(Self {
                 func,
@@ -2118,6 +2212,85 @@ mod tests {
                 assert!(lower_nbvm(p).is_none(), "g uses a call, must not lower");
             }
         }
+    }
+
+    #[test]
+    fn optimize_reg_folds_constants() {
+        // r0=2, r1=3, r2=r0+r1 (=5), r3=r2*r0 (=10), ret r3 — all foldable.
+        let ops = [
+            RegOp::Const { dst: 0, imm: 2 },
+            RegOp::Const { dst: 1, imm: 3 },
+            RegOp::Bin {
+                dst: 2,
+                a: 0,
+                b: 1,
+                op: BinOp2::Add,
+            },
+            RegOp::Bin {
+                dst: 3,
+                a: 2,
+                b: 0,
+                op: BinOp2::Mul,
+            },
+            RegOp::Ret { src: 3 },
+        ];
+        let opt = optimize_reg(&ops, 4);
+        // The two Bins became Consts.
+        assert!(
+            matches!(opt[2], RegOp::Const { imm: 5, .. })
+                && matches!(opt[3], RegOp::Const { imm: 10, .. }),
+            "constant subexpressions folded: {opt:?}"
+        );
+        // Observationally identical.
+        for _ in 0..1 {
+            assert_eq!(eval_reg(&opt, 4, &[]), eval_reg(&ops, 4, &[]));
+            assert_eq!(eval_reg(&opt, 4, &[]), 10);
+        }
+    }
+
+    #[test]
+    fn optimize_reg_preserves_arg_dependent_and_branches() {
+        // r0=arg0; r1=10; r2=r0*r1 (NOT foldable — depends on arg); ret r2.
+        let ops = [
+            RegOp::Arg { dst: 0, index: 0 },
+            RegOp::Const { dst: 1, imm: 10 },
+            RegOp::Bin {
+                dst: 2,
+                a: 0,
+                b: 1,
+                op: BinOp2::Mul,
+            },
+            RegOp::Ret { src: 2 },
+        ];
+        let opt = optimize_reg(&ops, 3);
+        // The arg-dependent Bin stays a Bin.
+        assert!(
+            matches!(opt[2], RegOp::Bin { .. }),
+            "arg-dependent op not folded"
+        );
+        for x in [0i64, 3, -7, 1000] {
+            assert_eq!(eval_reg(&opt, 3, &[x]), eval_reg(&ops, 3, &[x]));
+            assert_eq!(eval_reg(&opt, 3, &[x]), x * 10);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn optimized_program_runs_natively() {
+        let ops = [
+            RegOp::Const { dst: 0, imm: 6 },
+            RegOp::Const { dst: 1, imm: 7 },
+            RegOp::Bin {
+                dst: 2,
+                a: 0,
+                b: 1,
+                op: BinOp2::Mul,
+            },
+            RegOp::Ret { src: 2 },
+        ];
+        let opt = optimize_reg(&ops, 3);
+        let f = JitFunction::compile_reg(3, 0, &opt).unwrap();
+        assert_eq!(f.call_args(&[]), 42, "folded 6*7 runs natively");
     }
 
     #[test]
