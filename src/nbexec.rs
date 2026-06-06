@@ -4002,6 +4002,18 @@ impl<'a> Interp<'a> {
                     self.realm.set_property(res, "done", NanBox::boolean(true));
                     return Ok(Some(NanBox::handle(res.to_raw())));
                 }
+                "throw" => {
+                    // Eager-generator model: the body has already run, so the thrown
+                    // value can't be re-injected at the suspended `yield` (a
+                    // `try`/`catch` *around* that yield won't observe it). Mark the
+                    // generator done and propagate the value — correct when the
+                    // generator does not catch at the yield (the common case) and for
+                    // an already-exhausted generator.
+                    let len = self.realm.array_elements(buf).map_or(0, <[_]>::len);
+                    self.realm
+                        .set_hidden_property(handle, GEN_IDX, NanBox::number(len as f64));
+                    return Err(ExecError::Throw(arg(0)));
+                }
                 // ES2025 iterator helpers — they consume the remaining yields.
                 "map" | "filter" | "take" | "drop" | "toArray" | "forEach" | "reduce" | "some"
                 | "every" | "find" | "flatMap" => {
