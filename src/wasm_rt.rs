@@ -957,6 +957,42 @@ impl Module {
                     tc.pop_expect(I32)?;
                     tc.push(I32); // memory.grow
                 }
+                0xfc => {
+                    let sub = r.u32()?;
+                    match sub {
+                        // trunc_sat: [Fxx] → Ixx (saturating, never traps).
+                        0x00 | 0x01 => {
+                            tc.pop_expect(F32)?;
+                            tc.push(I32);
+                        }
+                        0x02 | 0x03 => {
+                            tc.pop_expect(F64)?;
+                            tc.push(I32);
+                        }
+                        0x04 | 0x05 => {
+                            tc.pop_expect(F32)?;
+                            tc.push(I64);
+                        }
+                        0x06 | 0x07 => {
+                            tc.pop_expect(F64)?;
+                            tc.push(I64);
+                        }
+                        0x0a => {
+                            r.byte()?; // memory.copy: dst, src, n
+                            r.byte()?;
+                            tc.pop_expect(I32)?;
+                            tc.pop_expect(I32)?;
+                            tc.pop_expect(I32)?;
+                        }
+                        0x0b => {
+                            r.byte()?; // memory.fill: dst, val, n
+                            tc.pop_expect(I32)?;
+                            tc.pop_expect(I32)?;
+                            tc.pop_expect(I32)?;
+                        }
+                        _ => return Ok(()), // other 0xfc ops: accept conservatively
+                    }
+                }
                 _ => {
                     if let Some((pops, push)) = simple(op) {
                         tc.pop_many(pops)?;
@@ -3494,6 +3530,18 @@ mod tests {
         assert!(
             Module::decode(&module(&[0x20, 0x00, 0x6a])).is_err(),
             "i32.add with one operand must be rejected"
+        );
+        // 0xfc trunc_sat is type-checked: i32.trunc_sat_f32_s (0xfc 0x00) wants an
+        // f32 operand, so feeding it the i32 param must be rejected.
+        assert!(
+            Module::decode(&module(&[0x20, 0x00, 0xfc, 0x00])).is_err(),
+            "i32.trunc_sat_f32_s on an i32 operand must be rejected"
+        );
+        // Well-typed trunc_sat: f32.convert then trunc_sat round-trips to i32.
+        // (local.get 0; f32.convert_i32_s (0xb2); i32.trunc_sat_f32_s (0xfc 0x00))
+        assert!(
+            Module::decode(&module(&[0x20, 0x00, 0xb2, 0xfc, 0x00])).is_ok(),
+            "f32→i32 saturating round-trip is well-typed"
         );
 
         // Control-flow aware: an `if (result i32)` whose then-branch yields i64.
