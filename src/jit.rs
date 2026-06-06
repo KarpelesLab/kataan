@@ -211,6 +211,20 @@ pub enum FloatOp {
         dst: u8,
         a: u8,
     },
+    /// `reg[dst] = Math.max(reg[a], reg[b])` — JS max: NaN if either is NaN,
+    /// `+0 > -0`.
+    Max {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
+    /// `reg[dst] = Math.min(reg[a], reg[b])` — JS min: NaN if either is NaN,
+    /// `-0 < +0`.
+    Min {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
     /// `reg[dst] = !reg[a]` — JS logical-not: `1.0` if `reg[a]` is falsy (`±0.0`
     /// or `NaN`), else `0.0`. (`ucomisd x, 0` sets ZF for both equal and NaN.)
     Eqz {
@@ -280,6 +294,36 @@ pub fn eval_float(ops: &[FloatOp], n_regs: usize, args: &[f64]) -> f64 {
             }
             FloatOp::Abs { dst, a } => {
                 regs[dst as usize] = regs[a as usize].abs();
+                pc += 1;
+            }
+            FloatOp::Max { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                regs[dst as usize] = if x.is_nan() || y.is_nan() {
+                    f64::NAN
+                } else if x > y {
+                    x
+                } else if y > x {
+                    y
+                } else if x.is_sign_positive() {
+                    x // equal: +0 wins over -0
+                } else {
+                    y
+                };
+                pc += 1;
+            }
+            FloatOp::Min { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                regs[dst as usize] = if x.is_nan() || y.is_nan() {
+                    f64::NAN
+                } else if x < y {
+                    x
+                } else if y < x {
+                    y
+                } else if x.is_sign_negative() {
+                    x // equal: -0 wins over +0
+                } else {
+                    y
+                };
                 pc += 1;
             }
             FloatOp::Eqz { dst, a } => {
@@ -1473,6 +1517,21 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                     FloatOp::Abs { dst: d, a }
                 }
             }
+            // `Math.max(a, b)` / `Math.min(a, b)` — two-argument f64 intrinsics with
+            // JS NaN/±0 semantics (handled in codegen). Also pure → JIT-safe.
+            Op::CallNative { dst, native, args }
+                if (*native == crate::nbvm::NB_MATH_MAX || *native == crate::nbvm::NB_MATH_MIN)
+                    && args.len() == 2 =>
+            {
+                let (a, b) = (read(&written, args[0])?, read(&written, args[1])?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                if *native == crate::nbvm::NB_MATH_MAX {
+                    FloatOp::Max { dst: d, a, b }
+                } else {
+                    FloatOp::Min { dst: d, a, b }
+                }
+            }
             // Targets are nbvm op indices; the lowered stream prepends one `Arg`
             // per parameter, so each target shifts by `n_params`.
             Op::JumpIfFalse { cond, target } => FloatOp::JumpIfFalse {
@@ -1991,6 +2050,41 @@ impl X64Assembler {
     /// `sqrtsd xmm0, xmm0` — `xmm0 = sqrt(xmm0)`.
     pub fn sqrtsd_xmm0(&mut self) {
         self.code.extend_from_slice(&[0xf2, 0x0f, 0x51, 0xc0]);
+    }
+    /// `movsd xmm1, [rbp+disp]`.
+    pub fn movsd_xmm1_mem(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0xf2, 0x0f, 0x10, 0x8d]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `maxsd xmm0, xmm1` — SSE max (returns xmm1 on NaN/equal; callers handle those).
+    pub fn maxsd_xmm0_xmm1(&mut self) {
+        self.code.extend_from_slice(&[0xf2, 0x0f, 0x5f, 0xc1]);
+    }
+    /// `minsd xmm0, xmm1` — SSE min (returns xmm1 on NaN/equal; callers handle those).
+    pub fn minsd_xmm0_xmm1(&mut self) {
+        self.code.extend_from_slice(&[0xf2, 0x0f, 0x5d, 0xc1]);
+    }
+    /// `andpd xmm0, xmm1`.
+    pub fn andpd_xmm0_xmm1(&mut self) {
+        self.code.extend_from_slice(&[0x66, 0x0f, 0x54, 0xc1]);
+    }
+    /// `orpd xmm0, xmm1`.
+    pub fn orpd_xmm0_xmm1(&mut self) {
+        self.code.extend_from_slice(&[0x66, 0x0f, 0x56, 0xc1]);
+    }
+    /// `addsd xmm0, xmm1` — used to coalesce a NaN operand into a NaN result.
+    pub fn addsd_xmm0_xmm1(&mut self) {
+        self.code.extend_from_slice(&[0xf2, 0x0f, 0x58, 0xc1]);
+    }
+    /// `jp label` — jump if parity (an unordered `ucomisd`, i.e. a NaN operand).
+    pub fn jp(&mut self, label: Label) {
+        self.code.extend_from_slice(&[0x0f, 0x8a]);
+        self.emit_rel32(label);
+    }
+    /// `jne label` — jump if not equal (ZF clear).
+    pub fn jne(&mut self, label: Label) {
+        self.code.extend_from_slice(&[0x0f, 0x85]);
+        self.emit_rel32(label);
     }
     /// `xmm0 = |xmm0|` — clear the f64 sign bit by `and`ing with `0x7fff…` built
     /// in `xmm1` (`pcmpeqd` → all-ones, `psrlq 1` → mask, `andpd`).
@@ -2647,6 +2741,41 @@ impl JitFunction {
                     }
                     a.movsd_xmm0_mem(disp(ra));
                     a.abs_xmm0();
+                    a.movsd_mem_xmm0(disp(dst));
+                }
+                FloatOp::Max { dst, a: ra, b: rb } | FloatOp::Min { dst, a: ra, b: rb } => {
+                    if !ok(dst) || !ok(ra) || !ok(rb) {
+                        return None;
+                    }
+                    let is_max = matches!(op, FloatOp::Max { .. });
+                    // xmm0 = a, xmm1 = b; branch on the ucomisd flags:
+                    //   NaN (parity)  → a + b  (propagates NaN)
+                    //   equal         → andpd (max → +0) / orpd (min → -0)
+                    //   otherwise     → maxsd / minsd
+                    let nan = a.new_label();
+                    let neq = a.new_label();
+                    let done = a.new_label();
+                    a.movsd_xmm0_mem(disp(ra));
+                    a.movsd_xmm1_mem(disp(rb));
+                    a.ucomisd_xmm0_xmm1();
+                    a.jp(nan);
+                    a.jne(neq);
+                    if is_max {
+                        a.andpd_xmm0_xmm1();
+                    } else {
+                        a.orpd_xmm0_xmm1();
+                    }
+                    a.jmp(done);
+                    a.bind(neq);
+                    if is_max {
+                        a.maxsd_xmm0_xmm1();
+                    } else {
+                        a.minsd_xmm0_xmm1();
+                    }
+                    a.jmp(done);
+                    a.bind(nan);
+                    a.addsd_xmm0_xmm1();
+                    a.bind(done);
                     a.movsd_mem_xmm0(disp(dst));
                 }
                 FloatOp::Eqz { dst, a: ra } => {
@@ -4048,6 +4177,68 @@ mod tests {
         ];
         let g = JitFunction::compile_float(2, 1, &neg).unwrap();
         assert!(g.call_args_f64(&[-1.0]).is_nan(), "sqrt(-1) is NaN");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn float_min_max_js_semantics() {
+        let max = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Arg { dst: 1, index: 1 },
+            FloatOp::Max { dst: 2, a: 0, b: 1 },
+            FloatOp::Ret { src: 2 },
+        ];
+        let min = [
+            FloatOp::Arg { dst: 0, index: 0 },
+            FloatOp::Arg { dst: 1, index: 1 },
+            FloatOp::Min { dst: 2, a: 0, b: 1 },
+            FloatOp::Ret { src: 2 },
+        ];
+        let fmax = JitFunction::compile_float(3, 2, &max).unwrap();
+        let fmin = JitFunction::compile_float(3, 2, &min).unwrap();
+        let cases = [
+            (3.0f64, 5.0),
+            (5.0, 3.0),
+            (-2.0, -7.0),
+            (1.5, 1.5),
+            (0.0, -0.0),
+            (-0.0, 0.0),
+            (f64::INFINITY, 1.0),
+            (f64::NAN, 1.0),
+            (1.0, f64::NAN),
+        ];
+        for (x, y) in cases {
+            // Native results match the oracle bit-for-bit (so ±0 and NaN agree).
+            assert_eq!(
+                fmax.call_args_f64(&[x, y]).to_bits(),
+                eval_float(&max, 3, &[x, y]).to_bits(),
+                "max({x}, {y})"
+            );
+            assert_eq!(
+                fmin.call_args_f64(&[x, y]).to_bits(),
+                eval_float(&min, 3, &[x, y]).to_bits(),
+                "min({x}, {y})"
+            );
+        }
+        // Spot-check the ±0 and NaN corners explicitly.
+        assert_eq!(
+            fmax.call_args_f64(&[0.0, -0.0]).to_bits(),
+            0.0f64.to_bits(),
+            "max(+0,-0)=+0"
+        );
+        assert_eq!(
+            fmin.call_args_f64(&[0.0, -0.0]).to_bits(),
+            (-0.0f64).to_bits(),
+            "min(+0,-0)=-0"
+        );
+        assert!(
+            fmax.call_args_f64(&[f64::NAN, 1.0]).is_nan(),
+            "max(NaN,1)=NaN"
+        );
+        assert!(
+            fmin.call_args_f64(&[1.0, f64::NAN]).is_nan(),
+            "min(1,NaN)=NaN"
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

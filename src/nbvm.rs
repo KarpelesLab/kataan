@@ -239,8 +239,8 @@ const VB_LOOSE_NEQ: u8 = 8;
 
 // Native built-in ids for `Op::CallNative`.
 const NB_CONSOLE_LOG: u16 = 0;
-const NB_MATH_MAX: u16 = 1;
-const NB_MATH_MIN: u16 = 2;
+pub(crate) const NB_MATH_MAX: u16 = 1;
+pub(crate) const NB_MATH_MIN: u16 = 2;
 pub(crate) const NB_MATH_ABS: u16 = 3;
 const NB_MATH_FLOOR: u16 = 4;
 const NB_MATH_CEIL: u16 = 5;
@@ -5739,6 +5739,19 @@ mod tests {
                 for (let i = 0; i < 40; i = i + 1) { r = h(-6.25); } \
                 r"),
             "2.5"
+        );
+        // A hot float function using `Math.min`/`Math.max` (the float path's `Min`
+        // and `Max`): clamp(x) to [0,10]. clamp(13.5)=10, then clamp(-2.5)=0.
+        assert_eq!(
+            bc(
+                "function clamp(x){ return Math.max(0.0, Math.min(10.0, x)); } \
+                let r = 0; \
+                for (let i = 0; i < 40; i = i + 1) { r = clamp(13.5); } \
+                let r2 = 0; \
+                for (let j = 0; j < 40; j = j + 1) { r2 = clamp(-2.5); } \
+                r + r2"
+            ),
+            "10"
         );
     }
 
