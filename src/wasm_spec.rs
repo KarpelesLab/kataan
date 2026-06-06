@@ -882,6 +882,50 @@ mod tests {
     }
 
     #[test]
+    fn spec_conformance_corpus() {
+        // A spec-format `.wast` conformance corpus (WAT text modules + assertions)
+        // exercising a broad slice of the engine through the harness, in the shape
+        // the upstream suite uses.
+        let script = "\
+;; --- i32 arithmetic & comparison (cf. i32.wast) ---
+(module (func (export \"add\") (param i32 i32) (result i32) (i32.add (local.get 0) (local.get 1)))
+        (func (export \"sub\") (param i32 i32) (result i32) (i32.sub (local.get 0) (local.get 1)))
+        (func (export \"mul\") (param i32 i32) (result i32) (i32.mul (local.get 0) (local.get 1)))
+        (func (export \"divs\") (param i32 i32) (result i32) (i32.div_s (local.get 0) (local.get 1)))
+        (func (export \"lts\") (param i32 i32) (result i32) (i32.lt_s (local.get 0) (local.get 1)))
+        (func (export \"shl\") (param i32 i32) (result i32) (i32.shl (local.get 0) (local.get 1))))
+(assert_return (invoke \"add\" (i32.const 1) (i32.const 1)) (i32.const 2))
+(assert_return (invoke \"add\" (i32.const -1) (i32.const -1)) (i32.const -2))
+(assert_return (invoke \"sub\" (i32.const 5) (i32.const 8)) (i32.const -3))
+(assert_return (invoke \"mul\" (i32.const 6) (i32.const 7)) (i32.const 42))
+(assert_return (invoke \"divs\" (i32.const 20) (i32.const 4)) (i32.const 5))
+(assert_trap   (invoke \"divs\" (i32.const 1) (i32.const 0)))
+(assert_return (invoke \"lts\" (i32.const -1) (i32.const 0)) (i32.const 1))
+(assert_return (invoke \"lts\" (i32.const 0) (i32.const -1)) (i32.const 0))
+(assert_return (invoke \"shl\" (i32.const 1) (i32.const 4)) (i32.const 16))
+;; --- f64 arithmetic (cf. f64.wast) ---
+(module (func (export \"fadd\") (param f64 f64) (result f64) (f64.add (local.get 0) (local.get 1)))
+        (func (export \"fdiv\") (param f64 f64) (result f64) (f64.div (local.get 0) (local.get 1)))
+        (func (export \"conv\") (param i32) (result f64) (f64.convert_i32_s (local.get 0))))
+(assert_return (invoke \"fadd\" (f64.const 1.5) (f64.const 2.25)) (f64.const 3.75))
+(assert_return (invoke \"fdiv\" (f64.const 7) (f64.const 2)) (f64.const 3.5))
+(assert_return (invoke \"conv\" (i32.const -8)) (f64.const -8))
+;; --- i64 + conversions (cf. i64.wast / conversions.wast) ---
+(module (func (export \"i64add\") (param i64 i64) (result i64) (i64.add (local.get 0) (local.get 1)))
+        (func (export \"ext\") (param i32) (result i64) (i64.extend_i32_s (local.get 0)))
+        (func (export \"wrap\") (param i64) (result i32) (i32.wrap_i64 (local.get 0))))
+(assert_return (invoke \"i64add\" (i64.const 100) (i64.const 23)) (i64.const 123))
+(assert_return (invoke \"ext\" (i32.const -1)) (i64.const -1))
+(assert_return (invoke \"wrap\" (i64.const 4294967297)) (i32.const 1))
+;; --- malformed modules are rejected ---
+(assert_invalid (module binary \"\\00\\00\\00\\00\") \"bad magic\")
+(assert_invalid (module binary \"\\00\\61\\73\\6d\") \"truncated\")";
+        let n = run_wast(script).expect("conformance corpus passes");
+        // 9 + 3 + 3 i32/f64/i64 returns/traps + 2 invalids = 17.
+        assert_eq!(n, 17, "all conformance assertions executed");
+    }
+
+    #[test]
     fn wast_runs_a_text_module() {
         // A .wast script whose module is WAT *text* (not binary).
         let script = "(module (func (export \"sub\") (param i32 i32) (result i32) \
