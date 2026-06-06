@@ -1959,6 +1959,18 @@ mod tests {
     }
 
     #[test]
+    fn spec_multi_value_results() {
+        // A function returning two values (the multi-value proposal, now standard).
+        let script = "(module \
+            (func (export \"pair\") (result i32 i32) (i32.const 7) (i32.const 9)) \
+            (func (export \"swap\") (param i32 i32) (result i32 i32) (local.get 1) (local.get 0))) \
+            (assert_return (invoke \"pair\") (i32.const 7) (i32.const 9)) \
+            (assert_return (invoke \"swap\" (i32.const 1) (i32.const 2)) (i32.const 2) (i32.const 1))";
+        let n = run_wast(script).expect("multi-value results conformance passes");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
     fn spec_f32_operations() {
         // f32 arithmetic at single precision, NaN-propagating min/max with ±0, the
         // ordered comparisons, and abs/neg/sqrt.
