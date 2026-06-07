@@ -2923,6 +2923,54 @@ fn bound_names(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> 
 
 /// This function's own bound names that are captured by some nested function
 /// (and so must be cells).
+/// Whether a statement list can complete abruptly via `return`/`break`/`continue`
+/// that reaches out of an enclosing `try` block — so its `finally` must run on the
+/// way out. Conservative: it descends into control flow (over-reporting a
+/// `break`/`continue` fully contained in a nested loop is safe — it only routes the
+/// program to the tree-walker), but not into nested functions/classes, whose
+/// abrupt statements exit *them*, not the try.
+fn block_can_exit_abruptly(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_can_exit_abruptly)
+}
+
+fn stmt_can_exit_abruptly(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => true,
+        Stmt::Block { body, .. } => block_can_exit_abruptly(body),
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            stmt_can_exit_abruptly(consequent)
+                || alternate.as_deref().is_some_and(stmt_can_exit_abruptly)
+        }
+        Stmt::For { body, .. }
+        | Stmt::ForIn { body, .. }
+        | Stmt::ForOf { body, .. }
+        | Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::With { body, .. } => stmt_can_exit_abruptly(body),
+        Stmt::Switch { cases, .. } => cases.iter().any(|c| block_can_exit_abruptly(&c.body)),
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            block_can_exit_abruptly(block)
+                || handler
+                    .as_ref()
+                    .is_some_and(|h| block_can_exit_abruptly(&h.body))
+                || finalizer
+                    .as_ref()
+                    .is_some_and(|f| block_can_exit_abruptly(f))
+        }
+        _ => false, // nested functions/classes exit themselves, not the try
+    }
+}
+
 fn captured_names(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
     let bound = bound_names(params, body);
     let mut direct = BTreeSet::new();
@@ -3937,6 +3985,18 @@ impl Compiler {
             } => {
                 if handler.is_none() && finalizer.is_none() {
                     return Err(CompileError::Unsupported("try without catch/finally"));
+                }
+                // A `finally` must run even when the `try`/`catch` exits via
+                // `return`/`break`/`continue`, but the emitter only runs it on the
+                // normal/throw paths. When the body can exit abruptly, defer the
+                // whole program to the tree-walker (which handles it correctly).
+                if finalizer.is_some()
+                    && (block_can_exit_abruptly(block)
+                        || handler
+                            .as_ref()
+                            .is_some_and(|h| block_can_exit_abruptly(&h.body)))
+                {
+                    return Err(CompileError::Unsupported("try/finally with abrupt exit"));
                 }
                 // The register the thrown value lands in (and the catch binding,
                 // if any, names it).
