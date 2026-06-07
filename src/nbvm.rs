@@ -348,6 +348,9 @@ pub struct FnProto {
     pub rest_from: Option<usize>,
     /// An `async` function: its completion is wrapped in a settled `Promise`.
     pub is_async: bool,
+    /// `Function.prototype.length`: parameters before the first one with a default
+    /// value or the rest parameter.
+    pub length: usize,
 }
 
 /// A queued promise reaction: run `handler(value)` then settle `result` with
@@ -1278,20 +1281,32 @@ fn run_frame(
             }
             Op::ArrayLen { dst, arr } => {
                 let handle = object_handle(regs[*arr as usize])?;
-                // `.length` on an array, or a string's character count.
-                let len = ctx
-                    .realm
-                    .array_length(handle)
-                    .or_else(|| ctx.realm.string_value(handle).map(|s| s.chars().count()));
-                regs[*dst as usize] = match len {
-                    Some(n) => NanBox::number(n as f64),
-                    // Otherwise an explicit `length` data property (e.g. a regex
-                    // match result, which is object-shaped here), else undefined.
-                    None => ctx
+                // A VM function (a tagged closure array) reports its parameter
+                // count from the proto, not the backing array's length.
+                if ctx.realm.is_vm_function(handle) {
+                    let n = ctx
                         .realm
-                        .get_property(handle, "length")
-                        .unwrap_or(NanBox::undefined()),
-                };
+                        .get_element(handle, 0)
+                        .as_number()
+                        .and_then(|f| funcs.get(f as usize))
+                        .map_or(0, |p| p.length);
+                    regs[*dst as usize] = NanBox::number(n as f64);
+                } else {
+                    // `.length` on an array, or a string's character count.
+                    let len = ctx
+                        .realm
+                        .array_length(handle)
+                        .or_else(|| ctx.realm.string_value(handle).map(|s| s.chars().count()));
+                    regs[*dst as usize] = match len {
+                        Some(n) => NanBox::number(n as f64),
+                        // Otherwise an explicit `length` data property (e.g. a regex
+                        // match result, which is object-shaped here), else undefined.
+                        None => ctx
+                            .realm
+                            .get_property(handle, "length")
+                            .unwrap_or(NanBox::undefined()),
+                    };
+                }
             }
             Op::CollectionSize { dst, recv } => {
                 let h = object_handle(regs[*recv as usize])?;
@@ -2747,6 +2762,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
         n_captures: 0,
         rest_from: None,
         is_async: false,
+        length: 0,
     };
     // Reserve slots: main (0), top-level functions (1..=N), then class members
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
@@ -3549,12 +3565,18 @@ impl Compiler {
             };
             c.ops.push(Op::Return { src });
         }
+        // `fn.length`: params before the first default value or the rest param.
+        let length = params
+            .iter()
+            .take_while(|p| !p.rest && p.default.is_none())
+            .count();
         Ok(FnProto {
             n_regs: c.next_reg as usize,
             n_params: params.len(),
             n_captures: captures.len(),
             rest_from,
             is_async,
+            length,
             ops: c.ops,
         })
     }
@@ -5200,6 +5222,7 @@ impl Compiler {
                 n_captures: 0,
                 rest_from: None,
                 is_async: false,
+                length: 0,
             });
             (p.len() - 1) as u32
         };

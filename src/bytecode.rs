@@ -19,7 +19,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 const MAGIC: &[u8; 4] = b"KTBC";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 
 /// Why a bytecode artifact failed to load.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -494,6 +494,7 @@ pub fn serialize(protos: &[FnProto]) -> Vec<u8> {
             None => w_u8(0, &mut out),
         }
         w_bool(p.is_async, &mut out);
+        w_usize(p.length, &mut out);
         w_u32(p.ops.len() as u32, &mut out);
         for op in &p.ops {
             write_op(op, &mut out);
@@ -523,6 +524,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
         let n_captures = r.usize()?;
         let rest_from = if r.u8()? == 1 { Some(r.usize()?) } else { None };
         let is_async = r.boolean()?;
+        let length = r.usize()?;
         let n_ops = r.u32()? as usize;
         let mut ops = Vec::with_capacity(n_ops);
         for _ in 0..n_ops {
@@ -535,6 +537,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
             n_captures,
             rest_from,
             is_async,
+            length,
         });
     }
     Ok(protos)
