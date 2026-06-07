@@ -5445,6 +5445,14 @@ impl Compiler {
         };
         let cobj = self.alloc();
         self.ops.push(Op::NewObject { dst: cobj });
+        // Tag the constructor object `\0vmfn` (non-enumerable: `\0` keys are
+        // filtered from enumeration) so `typeof Class === "function"`.
+        let fn_tag = self.constant(NanBox::boolean(true))?;
+        self.ops.push(Op::SetProp {
+            obj: cobj,
+            key: String::from("\u{0}vmfn"),
+            src: fn_tag,
+        });
         for (sname, sid) in &info.statics {
             let f = self.alloc();
             self.ops.push(Op::LoadFunc { dst: f, func: *sid });
