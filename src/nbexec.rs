@@ -4040,6 +4040,13 @@ impl<'a> Interp<'a> {
                     self.init_instance_fields(class_id, instance)?;
                 }
                 (None, None) => {
+                    // A constructor-less class extending a *native* superclass
+                    // (`class X extends Error {}`) performs the implicit
+                    // `super(...args)` into the native constructor, so e.g. the
+                    // error message is forwarded.
+                    if let Some(nid) = native_parent {
+                        self.apply_native_super(nid, instance, args);
+                    }
                     self.init_instance_fields(class_id, instance)?;
                 }
             }
