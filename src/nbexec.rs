@@ -365,16 +365,26 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-const ERROR_NAMES: [&str; 6] = [
+const ERROR_NAMES: [&str; 9] = [
     "Error",
     "TypeError",
     "RangeError",
     "SyntaxError",
     "ReferenceError",
     "AggregateError",
+    // The `WebAssembly.*` error subclasses (exposed under the WebAssembly
+    // namespace, not as globals — see the registration below).
+    "CompileError",
+    "LinkError",
+    "RuntimeError",
 ];
+/// Count of `Error` subclasses exposed as JS globals (the rest are namespaced).
+const N_GLOBAL_ERROR_COUNT: usize = 6;
 const N_TYPE_ERROR: u16 = N_ERROR_BASE + 1;
 const N_REFERENCE_ERROR: u16 = N_ERROR_BASE + 4;
+const N_WASM_COMPILE_ERROR: u16 = N_ERROR_BASE + 6;
+const N_WASM_LINK_ERROR: u16 = N_ERROR_BASE + 7;
+const N_WASM_RUNTIME_ERROR: u16 = N_ERROR_BASE + 8;
 /// A reserved, non-identifier key under which a `new fn()` instance records its
 /// constructor function (a hidden, GC-traced slot) so `instanceof` can match it.
 const CTOR_KEY: &str = "\u{0}ctor";
@@ -580,7 +590,9 @@ impl<'a> Interp<'a> {
         self.current
             .declare("RegExp", NanBox::handle(regexp_ctor.to_raw()));
         // The `Error` family — native constructors producing `{ name, message }`.
-        for (i, name) in ERROR_NAMES.iter().enumerate() {
+        // Only the standard errors are globals; the `WebAssembly.*` error
+        // subclasses are installed under the WebAssembly namespace below.
+        for (i, name) in ERROR_NAMES.iter().enumerate().take(N_GLOBAL_ERROR_COUNT) {
             let ctor = self.realm.new_native(N_ERROR_BASE + i as u16);
             self.current.declare(name, NanBox::handle(ctor.to_raw()));
         }
@@ -707,6 +719,9 @@ impl<'a> Interp<'a> {
                 ("Global", N_WASM_GLOBAL),
                 ("Memory", N_WASM_MEMORY),
                 ("Table", N_WASM_TABLE),
+                ("CompileError", N_WASM_COMPILE_ERROR),
+                ("LinkError", N_WASM_LINK_ERROR),
+                ("RuntimeError", N_WASM_RUNTIME_ERROR),
             ],
         );
         // A minimal `Object.prototype` carrying the methods commonly invoked via
@@ -6608,7 +6623,7 @@ impl<'a> Interp<'a> {
     /// A thrown `WebAssembly`-style `TypeError` for compile/instantiate failures.
     fn wasm_compile_error(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);
-        ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
+        ExecError::Throw(self.make_error(N_WASM_COMPILE_ERROR, Some(m)))
     }
 
     fn wasm_type_error(&mut self, msg: &str) -> ExecError {
