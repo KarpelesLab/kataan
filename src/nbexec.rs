@@ -6496,7 +6496,41 @@ impl<'a> Interp<'a> {
             })
             .collect::<Result<_, _>>()?;
 
-        let mut inst = if import_names.is_empty() {
+        // Resolve imported globals: importObject[mod][field] is a
+        // `WebAssembly.Global` (its `.value`) or a plain Number/BigInt, coerced to
+        // the imported global's declared type.
+        let global_imports: Vec<(String, String, crate::wasm_rt::ValType)> = module
+            .global_import_names()
+            .iter()
+            .map(|(m, f, t)| ((*m).into(), (*f).into(), *t))
+            .collect();
+        let mut import_global_vals = Vec::with_capacity(global_imports.len());
+        for (m, f, ty) in &global_imports {
+            let ns = imports_obj
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.get_property(h, m))
+                .unwrap_or(NanBox::undefined());
+            let entry = ns
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.get_property(h, f))
+                .unwrap_or(NanBox::undefined());
+            // A `WebAssembly.Global` carries its value in a hidden slot; otherwise
+            // the entry is itself the value (a Number/BigInt).
+            let raw_val = entry
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.get_property(h, WASM_GLOBAL_VALUE))
+                .unwrap_or(entry);
+            let v = crate::wasm_rt::Val::from_nanbox(raw_val, *ty)
+                .ok_or_else(|| self.wasm_compile_error("imported global not coercible"))?;
+            import_global_vals.push(v);
+        }
+
+        let mut inst = if !global_imports.is_empty() {
+            crate::wasm_rt::Instance::with_host_imports_and_globals(&module, import_global_vals)
+        } else if import_names.is_empty() {
             crate::wasm_rt::Instance::new(&module)
         } else {
             crate::wasm_rt::Instance::with_host_imports(&module)

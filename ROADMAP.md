@@ -129,9 +129,12 @@ WebAssembly spec test suite**.
   init?)` → prior length, out-of-bounds + `maximum` → RangeError). *Remaining:*
   making `Memory.buffer` a *live shared view* with typed arrays/DataView (blocked
   on the separate typed-array ↔ ArrayBuffer backing-buffer work — today typed-array
-  views don't share an ArrayBuffer's bytes), wiring `Memory`/`Table`/`Global` as
-  module imports/exports, `compileStreaming`/`instantiateStreaming`, and the
-  `externref` bridge. Traps already surface as JS exceptions.
+  views don't share an ArrayBuffer's bytes). **Imported globals** are wired
+  (`importObject[m][f]` from a `WebAssembly.Global` or a Number/BigInt, coerced to
+  the declared type); *remaining* imports/exports wiring: imported memories/tables
+  and exposing a module's exported `Memory`/`Table`/`Global` as the matching JS
+  objects, plus `compileStreaming`/`instantiateStreaming` and the `externref`
+  bridge. Traps already surface as JS exceptions.
 - **Post-MVP proposals (prioritized):** SIMD (`v128`), threads + `Atomics` on
   shared memory, multi-memory, tail calls, extended-const, then GC types and
   exception handling as they stabilize.

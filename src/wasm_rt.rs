@@ -1214,6 +1214,17 @@ impl Module {
             .collect()
     }
 
+    /// The `(module, field, type)` of each imported global, in declaration order —
+    /// the order a host supplies values to
+    /// [`Instance::with_host_imports_and_globals`].
+    #[must_use]
+    pub fn global_import_names(&self) -> Vec<(&str, &str, ValType)> {
+        self.global_imports
+            .iter()
+            .map(|(m, f, t, _)| (m.as_str(), f.as_str(), *t))
+            .collect()
+    }
+
     fn decode_memory(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
         let count = s.u32()?;
         if count > 0 {
@@ -2539,6 +2550,42 @@ impl<'m> Instance<'m> {
         };
         if let Some(start) = module.start {
             inst.call(start, &[])?; // start with no host imports
+        }
+        Ok(inst)
+    }
+
+    /// Like [`with_host_imports`](Self::with_host_imports), but also seeds the
+    /// module's imported **globals** with host-supplied values (in
+    /// [`global_import_names`](Module::global_import_names) order). Function imports
+    /// still dispatch through the per-call host; memory imports remain unsupported.
+    ///
+    /// # Errors
+    /// `WasmRtError` if the module imports memory, the global count doesn't match,
+    /// or a data segment is out of bounds.
+    pub fn with_host_imports_and_globals(
+        module: &'m Module,
+        import_globals: Vec<Val>,
+    ) -> Result<Self, WasmRtError> {
+        if module.mem_imported {
+            return Err(WasmRtError(
+                "unsupported import kind for host instantiation",
+            ));
+        }
+        if import_globals.len() != module.n_imported_globals() {
+            return Err(WasmRtError("import count mismatch"));
+        }
+        let mut store = module.new_store()?;
+        // Imported globals occupy the first slots of the global space.
+        for (i, v) in import_globals.into_iter().enumerate() {
+            store.globals[i] = v;
+        }
+        let mut inst = Self {
+            module,
+            store,
+            host_funcs: Vec::new(),
+        };
+        if let Some(start) = module.start {
+            inst.call(start, &[])?;
         }
         Ok(inst)
     }
