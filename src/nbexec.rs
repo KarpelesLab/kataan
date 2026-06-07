@@ -126,6 +126,10 @@ pub struct Interp<'a> {
     classes: Vec<&'a Class>,
     /// Per-class static members (`Class.foo`), parallel to `classes`.
     class_statics: Vec<alloc::collections::BTreeMap<String, NanBox>>,
+    /// Per-class static *field* names in declaration order — the enumerable own
+    /// keys of the constructor (static methods are non-enumerable), for
+    /// `Object.keys`/`values`/`entries` of a class.
+    class_static_fields: Vec<Vec<String>>,
     /// Per-class static getter functions (`static get x() {}`), called on read.
     class_static_get: Vec<alloc::collections::BTreeMap<String, NanBox>>,
     /// Per-class static setter functions (`static set x(v) {}`), called on write.
@@ -469,6 +473,7 @@ impl<'a> Interp<'a> {
             functions: Vec::new(),
             classes: Vec::new(),
             class_statics: Vec::new(),
+            class_static_fields: Vec::new(),
             class_static_get: Vec::new(),
             class_static_set: Vec::new(),
             class_envs: Vec::new(),
@@ -1076,6 +1081,11 @@ impl<'a> Interp<'a> {
                     if let Some(named) = self.realm.object_keys(h) {
                         keys.extend(named);
                     }
+                    // A class constructor's enumerable own keys are its static
+                    // fields (static methods/accessors are non-enumerable).
+                    if let Some((cid, _)) = self.realm.class_at(h) {
+                        keys.extend(self.class_static_fields[cid as usize].iter().cloned());
+                    }
                 }
                 let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_str(k)).collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
@@ -1438,6 +1448,13 @@ impl<'a> Interp<'a> {
                                 .unwrap_or(NanBox::undefined()),
                         );
                     }
+                    // A class constructor's static fields are its enumerable values.
+                    if let Some((cid, _)) = self.realm.class_at(h) {
+                        let fields = self.class_static_fields[cid as usize].clone();
+                        for k in fields {
+                            vals.push(self.read_member(h, &k)?);
+                        }
+                    }
                 }
                 NanBox::handle(self.realm.new_array(vals).to_raw())
             }
@@ -1506,6 +1523,14 @@ impl<'a> Interp<'a> {
                             .get_property(h, &k)
                             .unwrap_or(NanBox::undefined());
                         entries.push((k, v));
+                    }
+                    // A class constructor's static fields are its enumerable entries.
+                    if let Some((cid, _)) = self.realm.class_at(h) {
+                        let fields = self.class_static_fields[cid as usize].clone();
+                        for k in fields {
+                            let v = self.read_member(h, &k)?;
+                            entries.push((k, v));
+                        }
                     }
                 }
                 let pairs: Vec<NanBox> = entries
@@ -3999,6 +4024,7 @@ impl<'a> Interp<'a> {
         self.classes.push(class);
         // Build the static members (`static foo() {}` / `static x = …`).
         let mut statics = alloc::collections::BTreeMap::new();
+        let mut static_fields = Vec::new();
         let mut static_getters = alloc::collections::BTreeMap::new();
         let mut static_setters = alloc::collections::BTreeMap::new();
         for member in &class.body {
@@ -4020,6 +4046,10 @@ impl<'a> Interp<'a> {
                             Some(e) => self.eval(e).unwrap_or(NanBox::undefined()),
                             None => NanBox::undefined(),
                         };
+                        // Static fields are enumerable own keys of the constructor.
+                        if !static_fields.contains(&key) {
+                            static_fields.push(key.clone());
+                        }
                         statics.insert(key, v);
                     }
                 }
@@ -4045,6 +4075,7 @@ impl<'a> Interp<'a> {
             }
         }
         self.class_statics.push(statics);
+        self.class_static_fields.push(static_fields);
         self.class_static_get.push(static_getters);
         self.class_static_set.push(static_setters);
         // The methods' captured scope; a named class binds its own name here (so
