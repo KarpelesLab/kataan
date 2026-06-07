@@ -55,6 +55,10 @@ fn stringify_seen(
             if let Some(s) = realm.string_value(h) {
                 return Ok(Some(quote(&s)));
             }
+            // A bytecode-VM closure is a tagged array but a function — omitted.
+            if realm.is_vm_function(h) {
+                return Ok(None);
+            }
             let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
             if is_container {
                 if seen.contains(&h) {
@@ -121,6 +125,10 @@ fn stringify_at(
             let h = Handle::from_raw(raw);
             if let Some(s) = realm.string_value(h) {
                 return Ok(Some(quote(&s)));
+            }
+            // A bytecode-VM closure is a tagged array but a function — omitted.
+            if realm.is_vm_function(h) {
+                return Ok(None);
             }
             let inner = alloc::format!("{cur}{indent}");
             let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
