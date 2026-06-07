@@ -2171,6 +2171,38 @@ impl<'a> Interp<'a> {
         &self.realm
     }
 
+    /// Captures the object graph reachable from `roots` (the heap objects among
+    /// them — primitives are skipped) and serializes it to portable bytes: a D′
+    /// snapshot of live values that can later be reloaded into a fresh interpreter
+    /// holding the same code (see [`restore_snapshot`](Self::restore_snapshot)).
+    #[must_use]
+    pub fn snapshot(&self, roots: &[NanBox]) -> Vec<u8> {
+        let handles: Vec<Handle> = roots
+            .iter()
+            .filter_map(|v| v.as_handle().map(Handle::from_raw))
+            .collect();
+        crate::snapshot::serialize(&crate::snapshot::capture(&self.realm, &handles))
+    }
+
+    /// Reloads a snapshot produced by [`snapshot`](Self::snapshot) into this
+    /// interpreter, returning the restored root values in the order their (heap)
+    /// roots were captured. The restored objects are live — a restored closure runs
+    /// and carries its snapshotted captured state.
+    ///
+    /// # Errors
+    /// [`SnapError`](crate::snapshot::SnapError) if `bytes` is not a valid snapshot.
+    pub fn restore_snapshot(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Vec<NanBox>, crate::snapshot::SnapError> {
+        let snap = crate::snapshot::deserialize(bytes)?;
+        let handles = crate::snapshot::restore(&mut self.realm, &snap);
+        Ok(handles
+            .into_iter()
+            .map(|h| NanBox::handle(h.to_raw()))
+            .collect())
+    }
+
     /// Runs a whole program, returning the value of its last expression
     /// statement (or `undefined`).
     pub fn run(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
@@ -10582,6 +10614,46 @@ mod tests {
         assert_eq!(run("let inc = x => x + 1; inc(41)"), "42");
         // Hoisting: callable before its definition.
         assert_eq!(run("f(10); function f(n) { return n; } f(10)"), "10");
+    }
+
+    /// The public D′ API (`Interp::snapshot` / `restore_snapshot`): snapshot a
+    /// live closure's state in one interpreter and reload it into a *fresh* one
+    /// holding the same code, through the supported library surface alone — no
+    /// reaching into interpreter internals.
+    #[test]
+    fn public_snapshot_api_round_trips_across_runtimes() {
+        let program = Parser::parse_program(
+            "function makeCounter(start){ var n = start; return function(){ return ++n; }; } makeCounter(0)",
+        )
+        .expect("parse");
+
+        // Runtime A: advance a counter to n = 2, snapshot it to bytes.
+        let mut a = Interp::new();
+        let f = a.run(&program).expect("exec A");
+        assert_eq!(a.call(f, &[]).unwrap().as_number(), Some(1.0));
+        assert_eq!(a.call(f, &[]).unwrap().as_number(), Some(2.0));
+        let bytes = a.snapshot(&[f]);
+        drop(a);
+
+        // Runtime B: a fresh interpreter compiles the same program, then reloads
+        // A's snapshot and runs the restored closure — resuming from n = 2.
+        let mut b = Interp::new();
+        let own = b.run(&program).expect("exec B");
+        let restored = b.restore_snapshot(&bytes).expect("restore");
+        assert_eq!(restored.len(), 1, "one heap root restored");
+        assert_eq!(
+            b.call(restored[0], &[]).unwrap().as_number(),
+            Some(3.0),
+            "restored closure resumes from snapshotted state"
+        );
+        assert_eq!(
+            b.call(own, &[]).unwrap().as_number(),
+            Some(1.0),
+            "the fresh runtime's own counter is independent"
+        );
+
+        // A malformed snapshot is rejected, not panicked on.
+        assert!(b.restore_snapshot(b"not a snapshot").is_err());
     }
 
     /// Cross-runtime D′ reload: snapshot a closure in one runtime, serialize it,
