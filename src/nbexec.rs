@@ -284,6 +284,12 @@ const N_WASM_GLOBAL: u16 = 191;
 /// The `.value` getter / setter of a `WebAssembly.Global` (bound to the global).
 const N_WASM_GLOBAL_GET: u16 = 192;
 const N_WASM_GLOBAL_SET: u16 = 193;
+/// `new WebAssembly.Memory({initial, maximum?})` and its `.buffer` getter / `grow`.
+const N_WASM_MEMORY: u16 = 194;
+const N_WASM_MEM_BUFFER_GET: u16 = 195;
+const N_WASM_MEM_GROW: u16 = 196;
+/// A WASM linear-memory page is 64 KiB.
+const WASM_PAGE: usize = 65536;
 // Hidden slots on a WASM export wrapper's data object.
 const WASM_BYTES: &str = "\u{0}wbytes";
 const WASM_EXPORT: &str = "\u{0}wexport";
@@ -298,6 +304,10 @@ const WASM_INSTANCE_ID: &str = "\u{0}winst";
 const WASM_GLOBAL_VALUE: &str = "\u{0}gval";
 const WASM_GLOBAL_TYPE: &str = "\u{0}gtype";
 const WASM_GLOBAL_MUTABLE: &str = "\u{0}gmut";
+/// Hidden slots on a `WebAssembly.Memory`: its `ArrayBuffer`, page count, and max.
+const WASM_MEM_BUFFER: &str = "\u{0}mbuf";
+const WASM_MEM_PAGES: &str = "\u{0}mpages";
+const WASM_MEM_MAX: &str = "\u{0}mmax";
 // `Object.prototype.*` methods (the receiver arrives as `this`).
 const N_OBJ_PROTO_TOSTRING: u16 = 179;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
@@ -685,6 +695,7 @@ impl<'a> Interp<'a> {
                 ("Instance", N_WASM_INSTANCE),
                 ("compile", N_WASM_COMPILE),
                 ("Global", N_WASM_GLOBAL),
+                ("Memory", N_WASM_MEMORY),
             ],
         );
         // A minimal `Object.prototype` carrying the methods commonly invoked via
@@ -2725,6 +2736,68 @@ impl<'a> Interp<'a> {
                     .set_hidden_property(target, WASM_GLOBAL_VALUE, coerced);
                 return Ok(NanBox::undefined());
             }
+            // `WebAssembly.Memory.prototype.buffer` getter.
+            if id == N_WASM_MEM_BUFFER_GET {
+                return Ok(self
+                    .realm
+                    .get_property(target, WASM_MEM_BUFFER)
+                    .unwrap_or(NanBox::undefined()));
+            }
+            // `WebAssembly.Memory.prototype.grow(delta)` → old page count (a new,
+            // larger `ArrayBuffer` replaces `.buffer`, old contents copied).
+            if id == N_WASM_MEM_GROW {
+                let delta = args
+                    .first()
+                    .map_or(0.0, |v| self.realm.to_number(*v))
+                    .max(0.0) as usize;
+                let old_pages = self
+                    .realm
+                    .get_property(target, WASM_MEM_PAGES)
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+                let new_pages = old_pages + delta;
+                if let Some(max) = self
+                    .realm
+                    .get_property(target, WASM_MEM_MAX)
+                    .and_then(|v| v.as_number())
+                    && new_pages as f64 > max
+                {
+                    let m = self.new_str("memory.grow exceeds the declared maximum");
+                    return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                }
+                let new_buf = self.make_array_buffer(new_pages * WASM_PAGE);
+                // Copy the existing bytes into the new (zero-extended) buffer.
+                if let Some(old_bytes) = self
+                    .realm
+                    .get_property(target, WASM_MEM_BUFFER)
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+                    .and_then(|ob| self.realm.get_property(ob, ARRAY_BUFFER_BYTES))
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
+                    && let Some(nb) = self
+                        .realm
+                        .get_property(new_buf, ARRAY_BUFFER_BYTES)
+                        .and_then(|v| v.as_handle())
+                        .map(Handle::from_raw)
+                {
+                    for (i, b) in old_bytes.into_iter().enumerate() {
+                        self.realm.set_element(nb, i, b);
+                    }
+                }
+                self.realm.set_hidden_property(
+                    target,
+                    WASM_MEM_BUFFER,
+                    NanBox::handle(new_buf.to_raw()),
+                );
+                self.realm.set_hidden_property(
+                    target,
+                    WASM_MEM_PAGES,
+                    NanBox::number(new_pages as f64),
+                );
+                return Ok(NanBox::number(old_pages as f64));
+            }
             let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
             match id {
                 N_RESOLVE => self.resolve_with(target, arg0),
@@ -3161,11 +3234,45 @@ impl<'a> Interp<'a> {
                 .first()
                 .map_or(0.0, |v| self.realm.to_number(*v))
                 .max(0.0) as usize;
-            let obj = self.realm.new_object();
-            let bytes = self.realm.new_array(alloc::vec![NanBox::number(0.0); n]);
+            return Ok(NanBox::handle(self.make_array_buffer(n).to_raw()));
+        }
+        // `new WebAssembly.Memory({ initial, maximum? })` — linear memory backed by
+        // an `ArrayBuffer` of `initial` 64 KiB pages, exposing `.buffer` + `grow()`.
+        if id == N_WASM_MEMORY {
+            let dh = args
+                .first()
+                .copied()
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw);
+            let initial = dh
+                .and_then(|h| self.realm.get_property(h, "initial"))
+                .map_or(0.0, |v| self.realm.to_number(v))
+                .max(0.0) as usize;
+            let maximum = dh
+                .and_then(|h| self.realm.get_property(h, "maximum"))
+                .map(|v| self.realm.to_number(v).max(0.0) as usize);
+            let buf = self.make_array_buffer(initial * WASM_PAGE);
+            let mem = self.realm.new_object();
             self.realm
-                .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(bytes.to_raw()));
-            return Ok(NanBox::handle(obj.to_raw()));
+                .set_hidden_property(mem, WASM_MEM_BUFFER, NanBox::handle(buf.to_raw()));
+            self.realm
+                .set_hidden_property(mem, WASM_MEM_PAGES, NanBox::number(initial as f64));
+            self.realm.set_hidden_property(
+                mem,
+                WASM_MEM_MAX,
+                maximum.map_or(NanBox::undefined(), |m| NanBox::number(m as f64)),
+            );
+            let getter = self.realm.new_bound_native(N_WASM_MEM_BUFFER_GET, mem);
+            self.realm.define_accessor(
+                mem,
+                "buffer",
+                NanBox::handle(getter.to_raw()),
+                NanBox::undefined(),
+            );
+            let grow = self.realm.new_bound_native(N_WASM_MEM_GROW, mem);
+            self.realm
+                .set_property(mem, "grow", NanBox::handle(grow.to_raw()));
+            return Ok(NanBox::handle(mem.to_raw()));
         }
         // `new DataView(buffer, byteOffset?)` — a view onto an ArrayBuffer.
         if id == N_DATA_VIEW {
@@ -6335,6 +6442,15 @@ impl<'a> Interp<'a> {
     fn wasm_type_error(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);
         ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
+    }
+
+    /// Builds an `ArrayBuffer` object of `len` zeroed bytes.
+    fn make_array_buffer(&mut self, len: usize) -> Handle {
+        let obj = self.realm.new_object();
+        let bytes = self.realm.new_array(alloc::vec![NanBox::number(0.0); len]);
+        self.realm
+            .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(bytes.to_raw()));
+        obj
     }
 
     /// Coerces a JS value to a WASM `Global`'s value type: `i32` via ToInt32,

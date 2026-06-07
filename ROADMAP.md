@@ -123,10 +123,13 @@ WebAssembly spec test suite**.
   **stateful instances** — mutable globals and linear memory persist across export
   calls, each instance independent — and the **`WebAssembly.Global`** object (typed
   value cell with a `.value` accessor, ToInt32/`BigInt` coercion, immutability
-  enforced). *Remaining:* the `Memory`/`Table` objects (and `.buffer` ↔ typed-array
-  views), `compileStreaming`/`instantiateStreaming`, the `externref` bridge to JS
-  values, and imported memories/tables/globals. Traps already surface as JS
-  exceptions.
+  enforced), and **`WebAssembly.Memory`** (`.buffer` ArrayBuffer + `byteLength`,
+  `grow(delta)` page accounting with content copy, `maximum` → RangeError).
+  *Remaining:* making `.buffer` a *live shared view* with typed arrays/DataView
+  (blocked on the separate typed-array ↔ ArrayBuffer backing-buffer work — today
+  typed-array views don't share an ArrayBuffer's bytes), the `Table` object,
+  `compileStreaming`/`instantiateStreaming`, the `externref` bridge, and imported
+  memories/tables/globals. Traps already surface as JS exceptions.
 - **Post-MVP proposals (prioritized):** SIMD (`v128`), threads + `Atomics` on
   shared memory, multi-memory, tail calls, extended-const, then GC types and
   exception handling as they stabilize.
