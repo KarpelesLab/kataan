@@ -793,7 +793,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
     Ok(Snapshot { cells, roots })
 }
 
-pub use store::{ArtifactStore, address_hex, content_address};
+pub use store::{ArtifactStore, address_hex, content_address, host_keyed_address, host_tag};
 
 /// Content-addressed store for serialized snapshots (`ROADMAP.md` §2.3): a
 /// snapshot's bytes are keyed by a stable hash of their own content, so identical
@@ -812,6 +812,40 @@ pub mod store {
     pub fn content_address(bytes: &[u8]) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
         for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+        h
+    }
+
+    /// The current host's tag: its pointer width, byte order, and architecture
+    /// family. A host-native snapshot is only valid on a matching host (it would
+    /// need byte-swap/width conversion otherwise), so artifacts are keyed per host.
+    /// Stable for a given build target.
+    #[must_use]
+    pub fn host_tag() -> u32 {
+        let ptr_bits = (core::mem::size_of::<usize>() as u32) & 0xff; // 32 or 64
+        let little_endian = u32::from(cfg!(target_endian = "little"));
+        let arch: u32 = if cfg!(target_arch = "x86_64") {
+            1
+        } else if cfg!(target_arch = "aarch64") {
+            2
+        } else if cfg!(target_arch = "x86") {
+            3
+        } else {
+            0
+        };
+        (ptr_bits << 8) | (little_endian << 4) | arch
+    }
+
+    /// A **host-qualified** address: the content hash of `key_source` (e.g. a
+    /// program's source) mixed with `host_tag`, so the same source keyed for two
+    /// hosts that differ in byte order or pointer width resolves to *different*
+    /// addresses — a host-native artifact never aliases another host's.
+    #[must_use]
+    pub fn host_keyed_address(key_source: &[u8], host_tag: u32) -> u64 {
+        let mut h = content_address(key_source);
+        for b in host_tag.to_le_bytes() {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
         }
@@ -856,6 +890,22 @@ pub mod store {
         #[must_use]
         pub fn get(&self, addr: u64) -> Option<&[u8]> {
             self.objects.get(&addr).map(Vec::as_slice)
+        }
+
+        /// Stores `artifact` under the host-qualified address of `key_source` (e.g.
+        /// the program source) for `host_tag`, returning that address — so the same
+        /// source resolves to a different artifact per host.
+        pub fn put_for_host(&mut self, key_source: &[u8], host_tag: u32, artifact: Vec<u8>) -> u64 {
+            let addr = host_keyed_address(key_source, host_tag);
+            self.objects.entry(addr).or_insert(artifact);
+            addr
+        }
+
+        /// Fetches the artifact for `key_source` on `host_tag`, if one was stored —
+        /// a lookup that misses cleanly for a host the artifact wasn't built for.
+        #[must_use]
+        pub fn get_for_host(&self, key_source: &[u8], host_tag: u32) -> Option<&[u8]> {
+            self.get(host_keyed_address(key_source, host_tag))
         }
 
         /// Fetches the bytes at `addr`, re-verifying they still hash to it — so a
@@ -1100,6 +1150,41 @@ mod tests {
 
         // A verified fetch confirms the bytes still hash to the requested address.
         assert_eq!(store.get_verified(a1), Some(&[1, 2, 3, 4][..]));
+    }
+
+    #[test]
+    fn host_keyed_addresses_separate_hosts() {
+        use super::store::{ArtifactStore, host_keyed_address, host_tag};
+        // The host tag is stable for this build.
+        assert_eq!(host_tag(), host_tag());
+
+        // Same source, different host tag → different address; same tag → same.
+        let src = b"function f(){ return 1 }";
+        let h_native = host_tag();
+        let h_other = h_native ^ 0xff; // a hypothetical different host
+        assert_ne!(
+            host_keyed_address(src, h_native),
+            host_keyed_address(src, h_other),
+            "a host-native artifact never aliases another host's"
+        );
+        assert_eq!(
+            host_keyed_address(src, h_native),
+            host_keyed_address(src, h_native),
+            "deterministic per (source, host)"
+        );
+        // Different source, same host → different address.
+        assert_ne!(
+            host_keyed_address(src, h_native),
+            host_keyed_address(b"other source", h_native)
+        );
+
+        // The store resolves a source to a per-host artifact, and misses cleanly
+        // for a host it wasn't built for.
+        let mut store = ArtifactStore::new();
+        let addr = store.put_for_host(src, h_native, alloc::vec![1, 2, 3]);
+        assert_eq!(store.get_for_host(src, h_native), Some(&[1, 2, 3][..]));
+        assert_eq!(store.get_for_host(src, h_other), None, "wrong host misses");
+        assert_eq!(addr, host_keyed_address(src, h_native));
     }
 
     #[test]

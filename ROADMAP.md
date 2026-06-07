@@ -185,7 +185,10 @@ moving GC. "Complete" means *any* live heap snapshots, reloads zero-copy, and
   own bytes, so identical artifacts deduplicate and a fetch can re-verify the bytes
   still hash to the requested address (`snapshot::store::{ArtifactStore,
   content_address, address_hex}`; end-to-end capture → serialize → store → fetch →
-  deserialize → restore tested). *Remaining:* keying by source hash **+ host tag**,
+  deserialize → restore tested). **Source-hash + host-tag keying** is in
+  (`host_tag` encodes pointer width / byte order / arch; `host_keyed_address` and
+  `ArtifactStore::{put,get}_for_host` resolve a source to a per-host artifact, so a
+  host-native artifact never aliases another host's). *Remaining:*
   lazy per-function bodies faulted in
   on first call; **module-local atom remap** on load; IC slots load reset; the
   **on-demand byte-swap conversion** path for a mismatched host (convert once,
