@@ -5400,6 +5400,33 @@ impl<'a> Interp<'a> {
             }
         }
 
+        // A custom matcher/replacer: when the argument defines the matching
+        // well-known symbol method (`Symbol.match`/`replace`/`search`/`split`/
+        // `matchAll`), `str.method(obj)` delegates to `obj[@@method](str, …rest)`.
+        if let Some(s) = self.realm.string_value(handle)
+            && let Some(sym_name) = match method {
+                "match" => Some("match"),
+                "matchAll" => Some("matchAll"),
+                "search" => Some("search"),
+                "replace" | "replaceAll" => Some("replace"),
+                "split" => Some("split"),
+                _ => None,
+            }
+            && let Some(argh) = arg(0).as_handle().map(Handle::from_raw)
+        {
+            let sym = self.well_known_symbol(sym_name);
+            let key = self.member_key(sym);
+            let m = self.read_member(argh, &key)?;
+            if m.as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let this_str = self.new_str(&s);
+                let mut call_args = alloc::vec![this_str];
+                call_args.extend_from_slice(&args[1.min(args.len())..]);
+                return Ok(Some(self.call_with_this(m, arg(0), &call_args)?));
+            }
+        }
+
         // --- regex-backed String methods (when the argument is a RegExp) ---
         #[cfg(feature = "regex")]
         if let Some(s) = self.realm.string_value(handle)
