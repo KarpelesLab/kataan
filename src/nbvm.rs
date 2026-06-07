@@ -4998,7 +4998,13 @@ impl Compiler {
                     chain.push(name);
                 }
                 for name in chain.iter().rev() {
-                    let cls = self.classes.get(name).expect("class");
+                    // A native superclass (e.g. `extends Error`/`Array`) isn't a user
+                    // class; the bytecode VM can't model the native chain (`super(...)`
+                    // into a native constructor), so bail the whole program to the
+                    // tree-walker, which handles it.
+                    let Some(cls) = self.classes.get(name) else {
+                        return Err(CompileError::Unsupported("extends a native class"));
+                    };
                     let methods = cls.methods.clone();
                     let accessors = cls.accessors.clone();
                     for (mname, mid) in &methods {
