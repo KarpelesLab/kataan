@@ -1057,7 +1057,11 @@ impl<'a> Interp<'a> {
                 if let Some(h) = target {
                     // An array's own enumerable keys are its integer indices (in
                     // ascending order) — stored as elements, not named properties.
-                    if let Some(len) = self.realm.array_length(h) {
+                    // A VM closure backs onto an array but is a function, so its
+                    // "indices" (captured cells) are not enumerable keys.
+                    if let Some(len) = self.realm.array_length(h)
+                        && !self.realm.is_vm_function(h)
+                    {
                         for i in 0..len {
                             keys.push(alloc::format!("{i}"));
                         }
@@ -1396,8 +1400,11 @@ impl<'a> Interp<'a> {
                 let mut vals = Vec::new();
                 if let Some(raw) = arg(0).as_handle() {
                     let h = self.proxy_key_target(Handle::from_raw(raw));
-                    // Array index values come from element access (ascending) first.
-                    if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
+                    // Array index values come from element access (ascending) first
+                    // — but a VM closure's backing cells are not enumerable values.
+                    if !self.realm.is_vm_function(h)
+                        && let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec)
+                    {
                         vals.extend(elems);
                     }
                     for k in self.realm.object_keys(h).unwrap_or_default() {
@@ -1460,8 +1467,11 @@ impl<'a> Interp<'a> {
                 let mut entries: Vec<(alloc::string::String, NanBox)> = Vec::new();
                 if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
                     let h = self.proxy_key_target(h);
-                    // Array index entries (ascending) before named ones.
-                    if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
+                    // Array index entries (ascending) before named ones — but a VM
+                    // closure's backing cells are not enumerable entries.
+                    if !self.realm.is_vm_function(h)
+                        && let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec)
+                    {
                         for (i, v) in elems.into_iter().enumerate() {
                             entries.push((alloc::format!("{i}"), v));
                         }
@@ -7451,7 +7461,11 @@ impl<'a> Interp<'a> {
         // A proxy with no `ownKeys` trap (the trap case is handled by the caller)
         // enumerates its target's keys.
         let h = self.proxy_key_target(h);
-        if let Some(len) = self.realm.array_length(h) {
+        // A VM closure backs onto an array but is a function — its captured cells
+        // are not enumerable, so fall through to the named-property walk.
+        if !self.realm.is_vm_function(h)
+            && let Some(len) = self.realm.array_length(h)
+        {
             return (0..len)
                 .map(|i| self.new_str(&alloc::format!("{i}")))
                 .collect();

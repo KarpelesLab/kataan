@@ -1218,7 +1218,13 @@ fn run_frame(
             }
             Op::EnumKeys { dst, obj } => {
                 let h = object_handle(regs[*obj as usize])?;
-                let keys: Vec<NanBox> = if let Some(len) = ctx.realm.array_length(h) {
+                // A VM closure backs onto an array but is a function, so for-in
+                // walks its named properties, not the captured-cell indices.
+                let array_indices = ctx
+                    .realm
+                    .array_length(h)
+                    .filter(|_| !ctx.realm.is_vm_function(h));
+                let keys: Vec<NanBox> = if let Some(len) = array_indices {
                     (0..len)
                         .map(|i| {
                             NanBox::handle(ctx.realm.new_string(&alloc::format!("{i}")).to_raw())
@@ -2301,7 +2307,11 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             // properties — and the index values come from element access.
             let mut pairs: Vec<(String, NanBox)> = Vec::new();
             if let Some(h) = h {
-                if let Some(elems) = ctx.realm.array_elements(h).map(<[_]>::to_vec) {
+                // A VM closure backs onto an array but is a function — its captured
+                // cells are not enumerable keys/values.
+                if !ctx.realm.is_vm_function(h)
+                    && let Some(elems) = ctx.realm.array_elements(h).map(<[_]>::to_vec)
+                {
                     for (i, v) in elems.into_iter().enumerate() {
                         pairs.push((alloc::format!("{i}"), v));
                     }
