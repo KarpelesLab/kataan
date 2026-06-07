@@ -33,3 +33,12 @@ assert.sameValue(JSON.stringify(Object.entries(pv)), '[["a","A!"],["b","B!"]]', 
 // Without a get trap, values forward to the target.
 var pt = new Proxy({ x: 10, y: 20 }, { ownKeys() { return ["x", "y"]; } });
 assert.sameValue(Object.values(pt).join(","), "10,20", "values forward to target");
+
+// for-in over a proxy uses the ownKeys trap (enumerable keys), reading values
+// through the get trap; without an ownKeys trap it forwards to the target.
+var seen = [];
+for (var k in pv) seen.push(k + "=" + pv[k]);
+assert.sameValue(seen.join(" "), "a=A! b=B!", "for-in via ownKeys + get");
+var fwd = "";
+for (var k2 in new Proxy({ p: 1, q: 2 }, {})) fwd += k2;
+assert.sameValue(fwd, "pq", "for-in forwards to target when no ownKeys trap");

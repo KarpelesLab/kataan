@@ -6560,7 +6560,16 @@ impl<'a> Interp<'a> {
                 left, right, body, ..
             } => {
                 let obj = self.eval(right)?;
-                let keys = self.iterate_keys(obj);
+                // A proxy with an `ownKeys` trap enumerates through it; otherwise
+                // the normal own + inherited enumerable key walk.
+                let keys = if let Some(raw) = obj.as_handle()
+                    && let Some(trap_keys) =
+                        self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
+                {
+                    trap_keys.iter().map(|k| self.new_str(k)).collect()
+                } else {
+                    self.iterate_keys(obj)
+                };
                 self.exec_for_each(left, body, keys)
             }
             Stmt::Switch {
@@ -6900,6 +6909,9 @@ impl<'a> Interp<'a> {
         let Some(h) = v.as_handle().map(Handle::from_raw) else {
             return Vec::new();
         };
+        // A proxy with no `ownKeys` trap (the trap case is handled by the caller)
+        // enumerates its target's keys.
+        let h = self.proxy_key_target(h);
         if let Some(len) = self.realm.array_length(h) {
             return (0..len)
                 .map(|i| self.new_str(&alloc::format!("{i}")))
