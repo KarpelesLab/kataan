@@ -279,6 +279,11 @@ const N_WASM_MODULE: u16 = 188;
 const N_WASM_INSTANCE: u16 = 189;
 /// `WebAssembly.compile(bytes)` — async compile → `Promise<Module>`.
 const N_WASM_COMPILE: u16 = 190;
+/// `new WebAssembly.Global({value, mutable}, init)` — a typed value cell.
+const N_WASM_GLOBAL: u16 = 191;
+/// The `.value` getter / setter of a `WebAssembly.Global` (bound to the global).
+const N_WASM_GLOBAL_GET: u16 = 192;
+const N_WASM_GLOBAL_SET: u16 = 193;
 // Hidden slots on a WASM export wrapper's data object.
 const WASM_BYTES: &str = "\u{0}wbytes";
 const WASM_EXPORT: &str = "\u{0}wexport";
@@ -288,6 +293,11 @@ const WASM_IS_MODULE: &str = "\u{0}wmodule";
 /// The instance id on a WASM export wrapper's data object (keys `wasm_states`, so
 /// memory/globals persist across calls of the same instance).
 const WASM_INSTANCE_ID: &str = "\u{0}winst";
+/// Hidden slots on a `WebAssembly.Global`: its current value, value type, and
+/// mutability.
+const WASM_GLOBAL_VALUE: &str = "\u{0}gval";
+const WASM_GLOBAL_TYPE: &str = "\u{0}gtype";
+const WASM_GLOBAL_MUTABLE: &str = "\u{0}gmut";
 // `Object.prototype.*` methods (the receiver arrives as `this`).
 const N_OBJ_PROTO_TOSTRING: u16 = 179;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
@@ -674,6 +684,7 @@ impl<'a> Interp<'a> {
                 ("Module", N_WASM_MODULE),
                 ("Instance", N_WASM_INSTANCE),
                 ("compile", N_WASM_COMPILE),
+                ("Global", N_WASM_GLOBAL),
             ],
         );
         // A minimal `Object.prototype` carrying the methods commonly invoked via
@@ -2688,6 +2699,32 @@ impl<'a> Interp<'a> {
             if id == N_WASM_CALL {
                 return self.call_wasm_export(target, args);
             }
+            // `WebAssembly.Global` `.value` getter / setter (bound to the global).
+            if id == N_WASM_GLOBAL_GET {
+                return Ok(self
+                    .realm
+                    .get_property(target, WASM_GLOBAL_VALUE)
+                    .unwrap_or(NanBox::undefined()));
+            }
+            if id == N_WASM_GLOBAL_SET {
+                if !self
+                    .realm
+                    .get_property(target, WASM_GLOBAL_MUTABLE)
+                    .is_some_and(|v| self.realm.truthy(v))
+                {
+                    return Err(self.wasm_type_error("WebAssembly.Global is immutable"));
+                }
+                let new_val = args.first().copied().unwrap_or(NanBox::undefined());
+                let ty = self
+                    .realm
+                    .get_property(target, WASM_GLOBAL_TYPE)
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default();
+                let coerced = self.wasm_coerce_global(&ty, new_val);
+                self.realm
+                    .set_hidden_property(target, WASM_GLOBAL_VALUE, coerced);
+                return Ok(NanBox::undefined());
+            }
             let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
             match id {
                 N_RESOLVE => self.resolve_with(target, arg0),
@@ -2945,6 +2982,36 @@ impl<'a> Interp<'a> {
             let imports = args.get(1).copied().unwrap_or(NanBox::undefined());
             let instance = self.build_wasm_instance(bytes_arr, imports)?;
             return Ok(instance);
+        }
+        // `new WebAssembly.Global({ value: "i32"|…, mutable }, init)` — a typed
+        // value cell exposing a `.value` accessor (settable only if mutable).
+        if id == N_WASM_GLOBAL {
+            let desc = args.first().copied().unwrap_or(NanBox::undefined());
+            let dh = desc.as_handle().map(Handle::from_raw);
+            let ty = dh
+                .and_then(|h| self.realm.get_property(h, "value"))
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_else(|| String::from("i32"));
+            let mutable = dh
+                .and_then(|h| self.realm.get_property(h, "mutable"))
+                .is_some_and(|v| self.realm.truthy(v));
+            let init = args.get(1).copied().unwrap_or(NanBox::undefined());
+            let value = self.wasm_coerce_global(&ty, init);
+            let g = self.realm.new_object();
+            self.realm.set_hidden_property(g, WASM_GLOBAL_VALUE, value);
+            let ty_v = self.new_str(&ty);
+            self.realm.set_hidden_property(g, WASM_GLOBAL_TYPE, ty_v);
+            self.realm
+                .set_hidden_property(g, WASM_GLOBAL_MUTABLE, NanBox::boolean(mutable));
+            let getter = self.realm.new_bound_native(N_WASM_GLOBAL_GET, g);
+            let setter = self.realm.new_bound_native(N_WASM_GLOBAL_SET, g);
+            self.realm.define_accessor(
+                g,
+                "value",
+                NanBox::handle(getter.to_raw()),
+                NanBox::handle(setter.to_raw()),
+            );
+            return Ok(NanBox::handle(g.to_raw()));
         }
         // `new Proxy(target, handler)`.
         if id == N_PROXY {
@@ -6268,6 +6335,32 @@ impl<'a> Interp<'a> {
     fn wasm_type_error(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);
         ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
+    }
+
+    /// Coerces a JS value to a WASM `Global`'s value type: `i32` via ToInt32,
+    /// `f32`/`f64` via ToNumber, `i64` to a `BigInt`.
+    fn wasm_coerce_global(&mut self, ty: &str, v: NanBox) -> NanBox {
+        match ty {
+            "i32" => {
+                // ToInt32 without the std-only `trunc`: truncate toward zero (the
+                // `as i64` cast) then take the low 32 bits.
+                let n = self.realm.to_number(v);
+                let i = if n.is_finite() { n as i64 as i32 } else { 0 };
+                NanBox::number(f64::from(i))
+            }
+            "i64" => {
+                if let Some(h) = v.as_handle().map(Handle::from_raw)
+                    && self.realm.bigint_at(h).is_some()
+                {
+                    v
+                } else {
+                    let n = crate::bignum::BigInt::from_i128(self.realm.to_number(v) as i128);
+                    NanBox::handle(self.realm.new_bigint(n).to_raw())
+                }
+            }
+            // f32 (and f64) keep the JS number; f32 precision is not narrowed here.
+            _ => NanBox::number(self.realm.to_number(v)),
+        }
     }
 
     /// Decodes/validates `bytes_arr` and builds a `WebAssembly.Module` object that

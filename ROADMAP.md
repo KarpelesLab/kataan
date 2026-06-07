@@ -120,11 +120,13 @@ WebAssembly spec test suite**.
 - **The JS ↔ WASM boundary (the "non-numeric" surface):** *Done:* `validate`,
   `instantiate` (→ `{module, instance}`), the `Module`/`Instance` constructors,
   `compile` (→ `Promise<Module>`), host-function imports (JS callable from WASM),
-  and **stateful instances** — mutable globals and linear memory now persist across
-  export calls, each instance independent. *Remaining:* the `Memory`/`Table`/
-  `Global` objects (and `.buffer` ↔ typed-array views), `compileStreaming`/
-  `instantiateStreaming`, the `externref` bridge to JS values, and imported
-  memories/tables/globals. Traps already surface as JS exceptions.
+  **stateful instances** — mutable globals and linear memory persist across export
+  calls, each instance independent — and the **`WebAssembly.Global`** object (typed
+  value cell with a `.value` accessor, ToInt32/`BigInt` coercion, immutability
+  enforced). *Remaining:* the `Memory`/`Table` objects (and `.buffer` ↔ typed-array
+  views), `compileStreaming`/`instantiateStreaming`, the `externref` bridge to JS
+  values, and imported memories/tables/globals. Traps already surface as JS
+  exceptions.
 - **Post-MVP proposals (prioritized):** SIMD (`v128`), threads + `Atomics` on
   shared memory, multi-memory, tail calls, extended-const, then GC types and
   exception handling as they stabilize.
