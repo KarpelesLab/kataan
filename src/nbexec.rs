@@ -351,6 +351,10 @@ const N_REFLECT_CONSTRUCT: u16 = 120;
 const N_REFLECT_DEFINE_PROP: u16 = 135;
 const N_REFLECT_GET_OWN_DESC: u16 = 136;
 const N_REFLECT_GET_PROTO: u16 = 137;
+/// `Reflect.setPrototypeOf` / `preventExtensions` — like the `Object.*` forms but
+/// returning a boolean success flag.
+const N_REFLECT_SET_PROTO: u16 = 204;
+const N_REFLECT_PREVENT_EXT: u16 = 205;
 /// Bound native: the `revoke` function from `Proxy.revocable` (carries the proxy).
 const N_PROXY_REVOKE: u16 = 122;
 const N_SYMBOL: u16 = 38;
@@ -663,9 +667,12 @@ impl<'a> Interp<'a> {
                 ("defineProperty", N_REFLECT_DEFINE_PROP),
                 ("getOwnPropertyDescriptor", N_REFLECT_GET_OWN_DESC),
                 ("getPrototypeOf", N_REFLECT_GET_PROTO),
+                ("setPrototypeOf", N_REFLECT_SET_PROTO),
                 ("deleteProperty", N_REFLECT_DELETE),
                 ("apply", N_REFLECT_APPLY),
                 ("construct", N_REFLECT_CONSTRUCT),
+                ("isExtensible", N_OBJECT_IS_EXTENSIBLE),
+                ("preventExtensions", N_REFLECT_PREVENT_EXT),
             ],
         );
         for (name, id) in [
@@ -1308,6 +1315,23 @@ impl<'a> Interp<'a> {
                 .as_handle()
                 .and_then(|raw| self.realm.object_proto(Handle::from_raw(raw)))
                 .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())),
+            // `Reflect.setPrototypeOf(target, proto)` → boolean success.
+            N_REFLECT_SET_PROTO => {
+                let ok = arg(0).as_handle().is_some_and(|raw| {
+                    let proto = arg(1).as_handle().map(Handle::from_raw);
+                    self.realm.set_object_proto(Handle::from_raw(raw), proto);
+                    true
+                });
+                NanBox::boolean(ok)
+            }
+            // `Reflect.preventExtensions(target)` → boolean success.
+            N_REFLECT_PREVENT_EXT => {
+                let ok = arg(0).as_handle().is_some_and(|raw| {
+                    self.realm.prevent_extensions(Handle::from_raw(raw));
+                    true
+                });
+                NanBox::boolean(ok)
+            }
             N_REFLECT_APPLY => {
                 let list = match arg(2).as_handle().map(Handle::from_raw) {
                     Some(h) => self
