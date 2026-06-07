@@ -8606,6 +8606,15 @@ impl<'a> Interp<'a> {
                                 false,
                                 false,
                             );
+                            // An object-literal accessor's `[[HomeObject]]` is this
+                            // object, so `super.x` inside it resolves via the proto.
+                            if let Some(fh) = f.as_handle().map(Handle::from_raw) {
+                                self.realm.set_hidden_property(
+                                    fh,
+                                    HOME_OBJECT,
+                                    NanBox::handle(handle.to_raw()),
+                                );
+                            }
                             if *is_getter {
                                 self.realm
                                     .define_accessor(handle, &k, f, NanBox::undefined());

@@ -25,3 +25,18 @@ assert.sameValue(d2.read(), 20, "super method sees the derived this");
 class A { get prop() { return "A"; } }
 class B extends A { get prop() { return super.prop + "B"; } }
 assert.sameValue(new B().prop, "AB", "class super still works");
+
+// super also works inside object-literal accessors and generator methods.
+var p3 = { get base() { return 10; }, calc() { return 5; } };
+var o3 = {
+  __proto__: p3,
+  get derived() { return super.base + 1; },
+  set v(x) { this._v = super.calc() + x; },
+};
+assert.sameValue(o3.derived, 11, "super in a getter");
+o3.v = 3;
+assert.sameValue(o3._v, 8, "super in a setter");
+
+var p4 = { items() { return [1, 2]; } };
+var o4 = { __proto__: p4, *gen() { yield* super.items(); yield 3; } };
+assert.sameValue([...o4.gen()].join(","), "1,2,3", "super in a generator method");
