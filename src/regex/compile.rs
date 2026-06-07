@@ -7,10 +7,14 @@ use alloc::vec::Vec;
 /// Compiles `ast` to a program. The program is wrapped in `Save(0)…Save(1)` so
 /// group 0 records the whole match, and ends in `Match`. Returns the program
 /// and the number of capturing groups.
-pub(crate) fn compile(ast: &Node) -> (Vec<Inst>, usize) {
+pub(crate) fn compile(
+    ast: &Node,
+    group_names: &[(usize, alloc::string::String)],
+) -> (Vec<Inst>, usize) {
     let mut c = Compiler {
         prog: Vec::new(),
         groups: 0,
+        group_names,
     };
     c.emit(Inst::Save(0));
     c.compile(ast);
@@ -19,12 +23,14 @@ pub(crate) fn compile(ast: &Node) -> (Vec<Inst>, usize) {
     (c.prog, c.groups)
 }
 
-struct Compiler {
+struct Compiler<'a> {
     prog: Vec<Inst>,
     groups: usize,
+    /// `(index, name)` of each named group, for resolving `\k<name>`.
+    group_names: &'a [(usize, alloc::string::String)],
 }
 
-impl Compiler {
+impl Compiler<'_> {
     fn emit(&mut self, inst: Inst) -> usize {
         self.prog.push(inst);
         self.prog.len() - 1
@@ -91,6 +97,7 @@ impl Compiler {
                 let mut sub = Compiler {
                     prog: Vec::new(),
                     groups: 0,
+                    group_names: self.group_names,
                 };
                 sub.compile(inner);
                 sub.emit(Inst::Match);
@@ -104,6 +111,7 @@ impl Compiler {
                 let mut sub = Compiler {
                     prog: Vec::new(),
                     groups: 0,
+                    group_names: self.group_names,
                 };
                 sub.compile(inner);
                 sub.emit(Inst::Match);
@@ -116,6 +124,17 @@ impl Compiler {
             Node::Backref(n) => {
                 self.groups = self.groups.max(*n);
                 self.emit(Inst::Backref(*n));
+            }
+            Node::NamedBackref(name) => {
+                // Resolve the name to its group index; an unknown name back-refers
+                // group 0 (the whole match never re-binds, so it matches empty).
+                let n = self
+                    .group_names
+                    .iter()
+                    .find(|(_, gn)| gn == name)
+                    .map_or(0, |(idx, _)| *idx);
+                self.groups = self.groups.max(n);
+                self.emit(Inst::Backref(n));
             }
         }
     }

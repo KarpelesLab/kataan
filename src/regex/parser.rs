@@ -52,6 +52,9 @@ pub(crate) enum Node {
     LookBehind { neg: bool, inner: Box<Node> },
     /// A backreference `\1`…`\9`.
     Backref(usize),
+    /// A named backreference `\k<name>`, resolved to a group index at compile time
+    /// (so it may reference a group declared later in the pattern).
+    NamedBackref(alloc::string::String),
     /// A sequence of nodes.
     Concat(Vec<Node>),
     /// Alternation `a|b|…`.
@@ -423,6 +426,24 @@ impl Parser {
             'B' => Node::WordBoundary { neg: true },
             // `\1`…`\9` — a backreference to a capture group.
             d if d.is_ascii_digit() && d != '0' => Node::Backref((d as u8 - b'0') as usize),
+            // `\k<name>` — a named backreference (resolved at compile time).
+            'k' => {
+                if !self.eat('<') {
+                    return Err(RegexError::new("expected `<` after `\\k`"));
+                }
+                let mut name = alloc::string::String::new();
+                while let Some(&c) = self.chars.get(self.pos) {
+                    if c == '>' {
+                        break;
+                    }
+                    name.push(c);
+                    self.pos += 1;
+                }
+                if !self.eat('>') {
+                    return Err(RegexError::new("unterminated `\\k<` group name"));
+                }
+                Node::NamedBackref(name)
+            }
             'u' => Node::Char(self.parse_unicode_escape()?),
             'x' => Node::Char(self.parse_hex_escape(2)?),
             'p' => class_shorthand(Shorthand::Property(self.parse_property()?, false)),
