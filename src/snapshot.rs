@@ -793,6 +793,99 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
     Ok(Snapshot { cells, roots })
 }
 
+pub use store::{ArtifactStore, address_hex, content_address};
+
+/// Content-addressed store for serialized snapshots (`ROADMAP.md` §2.3): a
+/// snapshot's bytes are keyed by a stable hash of their own content, so identical
+/// snapshots deduplicate to a single entry and the key doubles as an integrity
+/// tag (a fetch can re-verify the bytes still hash to the address they were asked
+/// for). Pure, `alloc`-only Rust — the address is deterministic across runs and
+/// runtimes (no `Date`/`Random`).
+pub mod store {
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// The content address of `bytes`: an FNV-1a 64-bit hash. Deterministic, so
+    /// the same content always maps to the same address.
+    #[must_use]
+    pub fn content_address(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+        h
+    }
+
+    /// Renders a content address as 16 lowercase hex digits (e.g. for a filename
+    /// in an on-disk store).
+    #[must_use]
+    pub fn address_hex(addr: u64) -> String {
+        let mut s = String::with_capacity(16);
+        for i in (0..16).rev() {
+            let nib = (addr >> (i * 4)) & 0xf;
+            // `nib` is 0..=15, always a valid hex digit.
+            s.push(char::from_digit(nib as u32, 16).unwrap_or('0'));
+        }
+        s
+    }
+
+    /// An in-memory content-addressed store of serialized snapshot artifacts.
+    #[derive(Default)]
+    pub struct ArtifactStore {
+        objects: BTreeMap<u64, Vec<u8>>,
+    }
+
+    impl ArtifactStore {
+        /// Creates an empty store.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Stores `bytes` under their content address and returns it. Storing the
+        /// same content again is idempotent — deduplicated to one entry.
+        pub fn put(&mut self, bytes: Vec<u8>) -> u64 {
+            let addr = content_address(&bytes);
+            self.objects.entry(addr).or_insert(bytes);
+            addr
+        }
+
+        /// Fetches the bytes stored at `addr`, if present.
+        #[must_use]
+        pub fn get(&self, addr: u64) -> Option<&[u8]> {
+            self.objects.get(&addr).map(Vec::as_slice)
+        }
+
+        /// Fetches the bytes at `addr`, re-verifying they still hash to it — so a
+        /// corrupted or forged entry returns `None` instead of bad data.
+        #[must_use]
+        pub fn get_verified(&self, addr: u64) -> Option<&[u8]> {
+            let b = self.objects.get(&addr)?;
+            (content_address(b) == addr).then_some(b.as_slice())
+        }
+
+        /// Whether an artifact is stored at `addr`.
+        #[must_use]
+        pub fn contains(&self, addr: u64) -> bool {
+            self.objects.contains_key(&addr)
+        }
+
+        /// Number of distinct artifacts held.
+        #[must_use]
+        pub fn len(&self) -> usize {
+            self.objects.len()
+        }
+
+        /// Whether the store holds no artifacts.
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            self.objects.is_empty()
+        }
+    }
+}
+
 #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
 pub use mmap::restore_file;
 
@@ -964,6 +1057,78 @@ mod tests {
                 .as_handle(),
             Some(a2.to_raw())
         );
+    }
+
+    #[test]
+    fn content_address_is_stable_and_distinguishing() {
+        use super::store::{address_hex, content_address};
+        // Deterministic: equal content → equal address; different → (almost surely)
+        // different.
+        assert_eq!(content_address(b"hello"), content_address(b"hello"));
+        assert_ne!(content_address(b"hello"), content_address(b"hellp"));
+        assert_ne!(content_address(b""), content_address(b"\0"));
+        // Hex rendering is 16 lowercase digits.
+        let h = address_hex(content_address(b"abc"));
+        assert_eq!(h.len(), 16);
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn artifact_store_dedups_and_verifies() {
+        use super::store::{ArtifactStore, content_address};
+        let mut store = ArtifactStore::new();
+        assert!(store.is_empty());
+
+        // Two identical artifacts collapse to one entry under the same address.
+        let a1 = store.put(alloc::vec![1, 2, 3, 4]);
+        let a2 = store.put(alloc::vec![1, 2, 3, 4]);
+        assert_eq!(a1, a2, "identical content → same address");
+        assert_eq!(store.len(), 1, "deduplicated");
+
+        // A different artifact gets its own address.
+        let b = store.put(alloc::vec![9, 9, 9]);
+        assert_ne!(a1, b);
+        assert_eq!(store.len(), 2);
+
+        // Fetch by address round-trips the exact bytes.
+        assert_eq!(store.get(a1), Some(&[1, 2, 3, 4][..]));
+        assert!(store.contains(b));
+        assert_eq!(store.get(content_address(b"absent")), None);
+
+        // A verified fetch confirms the bytes still hash to the requested address.
+        assert_eq!(store.get_verified(a1), Some(&[1, 2, 3, 4][..]));
+    }
+
+    #[test]
+    fn artifact_store_round_trips_a_snapshot() {
+        // End-to-end: capture → serialize → store by content address → fetch →
+        // deserialize → restore. The reload reproduces the object graph.
+        use super::store::ArtifactStore;
+        let mut realm = Realm::new();
+        let obj = realm.new_object();
+        realm.set_property(obj, "x", NanBox::number(7.0));
+        let inner = realm.new_array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)]);
+        realm.set_property(obj, "list", NanBox::handle(inner.to_raw()));
+
+        let bytes = serialize(&capture(&realm, &[obj]));
+        let mut store = ArtifactStore::new();
+        let addr = store.put(bytes);
+
+        let reloaded = store.get_verified(addr).expect("stored artifact");
+        let snap = deserialize(reloaded).expect("deserialize");
+        let mut realm2 = Realm::new();
+        let roots = restore(&mut realm2, &snap);
+        let o2 = roots[0];
+        assert_eq!(realm2.get_property(o2, "x").unwrap().as_number(), Some(7.0));
+        let list = realm2
+            .get_property(o2, "list")
+            .unwrap()
+            .as_handle()
+            .unwrap();
+        assert_eq!(realm2.array_length(Handle::from_raw(list)), Some(2));
     }
 
     #[test]

@@ -175,8 +175,13 @@ moving GC. "Complete" means *any* live heap snapshots, reloads zero-copy, and
   *Remaining:* expose this as a public/C API (today it's exercised via the
   interpreter's internals in tests), and persist the bytes through the
   content-addressed artifact store below.
-- **The shared, versioned, mmap-able artifact store (code-cache, §6):**
-  content-addressed by source hash + host tag; lazy per-function bodies faulted in
+- **The shared, versioned, mmap-able artifact store (code-cache, §6):** *Started:*
+  a content-addressed store keys serialized snapshots by an FNV-1a hash of their
+  own bytes, so identical artifacts deduplicate and a fetch can re-verify the bytes
+  still hash to the requested address (`snapshot::store::{ArtifactStore,
+  content_address, address_hex}`; end-to-end capture → serialize → store → fetch →
+  deserialize → restore tested). *Remaining:* keying by source hash **+ host tag**,
+  lazy per-function bodies faulted in
   on first call; **module-local atom remap** on load; IC slots load reset; the
   **on-demand byte-swap conversion** path for a mismatched host (convert once,
   re-cache, zero-copy thereafter); **read-only pages shareable across many
