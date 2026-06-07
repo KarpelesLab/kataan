@@ -6734,6 +6734,13 @@ impl<'a> Interp<'a> {
             NanBox::handle(getter.to_raw()),
             NanBox::handle(setter.to_raw()),
         );
+        self.realm.mark_hidden(g, "value"); // a prototype accessor in spec: non-enumerable
+        // `valueOf()` returns the value (so a Global coerces numerically), reusing
+        // the same getter native; it is non-enumerable.
+        let value_of = self.realm.new_bound_native(N_WASM_GLOBAL_GET, g);
+        self.realm
+            .set_property(g, "valueOf", NanBox::handle(value_of.to_raw()));
+        self.realm.mark_hidden(g, "valueOf");
         NanBox::handle(g.to_raw())
     }
 
