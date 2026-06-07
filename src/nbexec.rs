@@ -169,6 +169,10 @@ pub struct Interp<'a> {
     pending_super_native: Option<u16>,
     /// The class of the currently-running method (for `super.method()`).
     current_home: Option<u32>,
+    /// The `[[HomeObject]]` of the currently-running object-literal method — the
+    /// object the method was defined on — so its `super.x` resolves through that
+    /// object's prototype (when there is no enclosing class home).
+    current_home_object: Option<Handle>,
     /// A label attached to the next loop (for `break`/`continue label`).
     pending_label: Option<String>,
     /// The promise-reaction microtask queue, drained after the script.
@@ -406,6 +410,9 @@ const N_EVAL_ERROR: u16 = N_ERROR_BASE + 10;
 /// A reserved, non-identifier key under which a `new fn()` instance records its
 /// constructor function (a hidden, GC-traced slot) so `instanceof` can match it.
 const CTOR_KEY: &str = "\u{0}ctor";
+/// Hidden slot on an object-literal concise method recording its `[[HomeObject]]`
+/// (the object it was defined on), for `super` resolution.
+const HOME_OBJECT: &str = "\u{0}home";
 /// Reserved hidden keys for an eager generator's result object: the buffer of
 /// yielded values and the current `next()` cursor.
 /// Sentinel description for a `Symbol()` created with no argument (so its
@@ -499,6 +506,7 @@ impl<'a> Interp<'a> {
             pending_super: None,
             pending_super_native: None,
             current_home: None,
+            current_home_object: None,
             pending_label: None,
             microtasks: Vec::new(),
             strict: false,
@@ -3072,7 +3080,17 @@ impl<'a> Interp<'a> {
             return Err(ExecError::NotCallable);
         };
         let def = self.functions[func_id as usize];
-        self.invoke(def, captured, this_val, args)
+        // An object-literal concise method carries its `[[HomeObject]]`; bind it for
+        // the duration of the call so `super.x` in the body resolves through it.
+        let home_obj = self
+            .realm
+            .get_property(handle, HOME_OBJECT)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw);
+        let saved_home_obj = core::mem::replace(&mut self.current_home_object, home_obj);
+        let r = self.invoke(def, captured, this_val, args);
+        self.current_home_object = saved_home_obj;
+        r
     }
 
     /// Runs a function body with `this` and the parameters bound in a fresh
@@ -8530,6 +8548,18 @@ impl<'a> Interp<'a> {
                             {
                                 self.set_fn_name(v, s);
                             }
+                            // A concise method (`{ m() {} }`, not an arrow) records
+                            // this object as its `[[HomeObject]]`, so `super.x`
+                            // inside it resolves through the object's prototype.
+                            if matches!(&**value, Expr::Function(_))
+                                && let Some(fv) = v.as_handle().map(Handle::from_raw)
+                            {
+                                self.realm.set_hidden_property(
+                                    fv,
+                                    HOME_OBJECT,
+                                    NanBox::handle(handle.to_raw()),
+                                );
+                            }
                             self.realm.set_property(handle, &k, v);
                         }
                         // `{ ...src }` — copy own enumerable properties.
@@ -9793,6 +9823,23 @@ impl<'a> Interp<'a> {
     /// Finds `name` as a method in the superclass chain of the currently-running
     /// method's home class, returning a callable bound to the base definition.
     fn resolve_super_method(&mut self, name: &str) -> Result<NanBox, ExecError> {
+        // An object-literal method: `super.m()` is `HomeObject.[[Prototype]].m`,
+        // called (by the caller) with the current `this`.
+        if self.current_home.is_none()
+            && let Some(home) = self.current_home_object
+        {
+            if let Some(proto) = self.realm.object_proto(home) {
+                let f = self.read_member(proto, name)?;
+                if f.as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Ok(f);
+                }
+            }
+            return Err(ExecError::Throw(
+                self.new_str(&alloc::format!("super method {name} not found")),
+            ));
+        }
         let home = self
             .current_home
             .ok_or(ExecError::Unsupported("super outside a method"))?;
@@ -9830,6 +9877,16 @@ impl<'a> Interp<'a> {
     /// `super.name` as a value read: a super getter is invoked (with the current
     /// `this`); a super method is returned as a bound function.
     fn resolve_super_member(&mut self, name: &str) -> Result<NanBox, ExecError> {
+        // An object-literal method: `super.x` reads `HomeObject.[[Prototype]].x`
+        // (a data property, or a getter — invoked through the proto here).
+        if self.current_home.is_none()
+            && let Some(home) = self.current_home_object
+        {
+            return match self.realm.object_proto(home) {
+                Some(proto) => self.read_member(proto, name),
+                None => Ok(NanBox::undefined()),
+            };
+        }
         let home = self
             .current_home
             .ok_or(ExecError::Unsupported("super outside a method"))?;
