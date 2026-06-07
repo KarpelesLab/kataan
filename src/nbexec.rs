@@ -3673,6 +3673,8 @@ impl<'a> Interp<'a> {
         self.realm.set_property(obj, "input", input);
         self.realm
             .set_property(obj, "length", NanBox::number(caps.groups.len() as f64));
+        // `length` is the array-length slot: present but non-enumerable.
+        self.realm.mark_hidden(obj, "length");
         // `.groups`: an object of named captures (or `undefined` if none).
         let groups = if group_names.is_empty() {
             NanBox::undefined()

@@ -1279,12 +1279,19 @@ fn run_frame(
             Op::ArrayLen { dst, arr } => {
                 let handle = object_handle(regs[*arr as usize])?;
                 // `.length` on an array, or a string's character count.
-                let len = ctx.realm.array_length(handle).unwrap_or_else(|| {
-                    ctx.realm
-                        .string_value(handle)
-                        .map_or(0, |s| s.chars().count())
-                });
-                regs[*dst as usize] = NanBox::number(len as f64);
+                let len = ctx
+                    .realm
+                    .array_length(handle)
+                    .or_else(|| ctx.realm.string_value(handle).map(|s| s.chars().count()));
+                regs[*dst as usize] = match len {
+                    Some(n) => NanBox::number(n as f64),
+                    // Otherwise an explicit `length` data property (e.g. a regex
+                    // match result, which is object-shaped here), else undefined.
+                    None => ctx
+                        .realm
+                        .get_property(handle, "length")
+                        .unwrap_or(NanBox::undefined()),
+                };
             }
             Op::CollectionSize { dst, recv } => {
                 let h = object_handle(regs[*recv as usize])?;
@@ -1683,9 +1690,14 @@ fn char_substr_from(s: &str, st: usize) -> String {
 }
 
 /// Builds a regex match result object `{ 0: whole, 1: g1, …, index, input,
-/// length }` (the shape `RegExp.exec` / `String.match` return).
+/// groups, length }` (the shape `RegExp.exec` / `String.match` return).
 #[cfg(feature = "regex")]
-fn regex_match_object(realm: &mut Realm, text: &str, caps: &crate::regex::Captures) -> NanBox {
+fn regex_match_object(
+    realm: &mut Realm,
+    text: &str,
+    caps: &crate::regex::Captures,
+    group_names: &[(usize, alloc::string::String)],
+) -> NanBox {
     let obj = realm.new_object();
     for (i, g) in caps.groups.iter().enumerate() {
         let v = match g {
@@ -1699,6 +1711,23 @@ fn regex_match_object(realm: &mut Realm, text: &str, caps: &crate::regex::Captur
     let input = NanBox::handle(realm.new_string(text).to_raw());
     realm.set_property(obj, "input", input);
     realm.set_property(obj, "length", NanBox::number(caps.groups.len() as f64));
+    // `length` is the array-length slot: present but non-enumerable.
+    realm.mark_hidden(obj, "length");
+    // `.groups`: an object of named captures (or `undefined` if none).
+    let groups = if group_names.is_empty() {
+        NanBox::undefined()
+    } else {
+        let g = realm.new_object();
+        for (idx, name) in group_names {
+            let v = match caps.groups.get(*idx).and_then(|x| *x) {
+                Some((s, e)) => NanBox::handle(realm.new_string(&char_substr(text, s, e)).to_raw()),
+                None => NanBox::undefined(),
+            };
+            realm.set_property(g, name, v);
+        }
+        NanBox::handle(g.to_raw())
+    };
+    realm.set_property(obj, "groups", groups);
     NanBox::handle(obj.to_raw())
 }
 
@@ -1739,7 +1768,7 @@ fn regex_method(
         }
         return Some(Ok(match (key, caps) {
             ("test", c) => NanBox::boolean(c.is_some()),
-            (_, Some(caps)) => regex_match_object(ctx.realm, &text, &caps),
+            (_, Some(caps)) => regex_match_object(ctx.realm, &text, &caps, re.group_names()),
             (_, None) => NanBox::null(),
         }));
     }
@@ -1774,7 +1803,7 @@ fn regex_method(
             NanBox::number(i)
         }
         "match" if !global => match re.captures_from(&text, 0) {
-            Some(caps) => regex_match_object(ctx.realm, &text, &caps),
+            Some(caps) => regex_match_object(ctx.realm, &text, &caps, re.group_names()),
             None => NanBox::null(),
         },
         "match" => {
