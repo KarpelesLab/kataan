@@ -1410,11 +1410,10 @@ impl<'a> Interp<'a> {
                 }
                 NanBox::handle(self.realm.new_array(vals).to_raw())
             }
-            N_ARRAY_IS_ARRAY => NanBox::boolean(
-                arg(0)
-                    .as_handle()
-                    .is_some_and(|raw| self.realm.is_array(Handle::from_raw(raw))),
-            ),
+            N_ARRAY_IS_ARRAY => NanBox::boolean(arg(0).as_handle().is_some_and(|raw| {
+                let h = Handle::from_raw(raw);
+                self.realm.is_array(h) && !self.realm.is_vm_function(h)
+            })),
             N_OBJECT_ASSIGN => {
                 let target = arg(0);
                 if let Some(t) = target.as_handle().map(Handle::from_raw) {

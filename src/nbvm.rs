@@ -2402,7 +2402,7 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                 .first()
                 .and_then(|a| a.as_handle())
                 .map(Handle::from_raw)
-                .is_some_and(|h| ctx.realm.is_array(h));
+                .is_some_and(|h| ctx.realm.is_array(h) && !ctx.realm.is_vm_function(h));
             NanBox::boolean(yes)
         }
         NB_ARRAY_FROM => {

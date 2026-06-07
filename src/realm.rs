@@ -495,6 +495,14 @@ impl Realm {
         self.heap.get(handle).and_then(Cell::as_array).is_some()
     }
 
+    /// Whether `handle` is a bytecode-VM function value — a closure represented as
+    /// an array tagged with the reserved `\0vmfn` marker. Such a value backs onto
+    /// an array cell but is a function, so `Array.isArray` must reject it.
+    #[must_use]
+    pub fn is_vm_function(&self, handle: Handle) -> bool {
+        self.get_property(handle, "\u{0}vmfn").is_some()
+    }
+
     /// The own property names of the object at `handle`, in insertion order, or
     /// `None` if it is not an object.
     #[must_use]
