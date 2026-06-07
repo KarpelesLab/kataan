@@ -1496,10 +1496,13 @@ fn run_frame(
             }
             Op::LoadFunc { dst, func } => {
                 // A function value is a one-element heap array holding the
-                // function-table index (as a number).
+                // function-table index (as a number), tagged `\0vmfn` so `typeof`
+                // and friends see a function rather than the backing array.
                 let handle = ctx
                     .realm
                     .new_array(alloc::vec![NanBox::number(*func as f64)]);
+                ctx.realm
+                    .set_hidden_property(handle, "\u{0}vmfn", NanBox::boolean(true));
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::MakeClosure {
@@ -1507,10 +1510,13 @@ fn run_frame(
                 func,
                 captures,
             } => {
-                // `[func_id, cell0, cell1, …]`.
+                // `[func_id, cell0, cell1, …]`, tagged so `typeof` and friends see
+                // a function rather than the backing array.
                 let mut elems = alloc::vec![NanBox::number(*func as f64)];
                 elems.extend(captures.iter().map(|r| regs[*r as usize]));
                 let handle = ctx.realm.new_array(elems);
+                ctx.realm
+                    .set_hidden_property(handle, "\u{0}vmfn", NanBox::boolean(true));
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::CallValue { dst, callee, args } => {
@@ -6210,6 +6216,23 @@ mod tests {
     }
 
     #[cfg(feature = "std")]
+    #[test]
+    fn typeof_of_a_user_function_is_function_on_the_vm() {
+        // These compile fully to bytecode (no tree-walker fallback), so they
+        // exercise the `\0vmfn` tag on `LoadFunc`/`MakeClosure` closures that makes
+        // `typeof` report a function rather than the backing array.
+        let (out, _) = execute(
+            "var f = function(){}; function g(){} var h = () => 1;
+             console.log(typeof f); console.log(typeof g); console.log(typeof h);
+             console.log(typeof []); console.log(typeof {});
+             console.log(Object.keys(f).indexOf('\u{0}vmfn'));",
+        )
+        .expect("ok");
+        // Functions report `function`; arrays/objects unchanged; the internal tag
+        // is non-enumerable (absent from Object.keys).
+        assert_eq!(out, "function\nfunction\nfunction\nobject\nobject\n-1\n");
+    }
+
     #[test]
     fn execute_bytecode_first_with_tree_walker_fallback() {
         // A program the bytecode VM compiles fully (closures, loops, output).

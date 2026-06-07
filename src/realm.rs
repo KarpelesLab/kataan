@@ -916,15 +916,27 @@ impl Realm {
     /// for class methods, which are callable but must stay out of `Object.keys`,
     /// spread, `for-in`, and JSON.
     pub fn set_hidden_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
-        match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
-            Some(obj) => {
-                obj.set(key, value);
-                obj.set_hidden(key);
-                self.write_barrier(handle, value);
-                true
-            }
-            None => false,
+        if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            obj.set(key, value);
+            obj.set_hidden(key);
+            self.write_barrier(handle, value);
+            return true;
         }
+        // Arrays/functions/natives carry hidden slots in their auxiliary object
+        // (e.g. a VM closure's function marker), kept non-enumerable there too.
+        let aux_eligible = self.heap.get(handle).is_some_and(|c| {
+            c.as_array().is_some() || c.as_function().is_some() || c.as_native().is_some()
+        });
+        if aux_eligible {
+            let aux = self.aux_object(handle);
+            if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                o.set(key, value);
+                o.set_hidden(key);
+            }
+            self.write_barrier(aux, value);
+            return true;
+        }
+        false
     }
 
     /// The generational write barrier: records an old→young edge (container is
@@ -1389,6 +1401,11 @@ impl Realm {
                 }
                 // A bound function (reserved `\0bnd_t` slot) is a function.
                 if self.get_property(h, "\u{0}bnd_t").is_some() {
+                    return "function";
+                }
+                // A bytecode-VM closure is represented as an array tagged with the
+                // reserved `\0vmfn` marker; `typeof` reports it as a function.
+                if self.get_property(h, "\u{0}vmfn").is_some() {
                     return "function";
                 }
                 self.heap.get(h).map_or("undefined", Cell::type_of)
