@@ -140,6 +140,11 @@ pub struct Module {
     exports: Vec<(alloc::string::String, u32)>,
     /// `name -> global_index` for exported globals.
     global_exports: Vec<(alloc::string::String, u32)>,
+    /// Every export's `(name, kind)` for introspection (kind: 0=func, 1=table,
+    /// 2=memory, 3=global) — what `WebAssembly.Module.exports` reports.
+    export_descriptors: Vec<(alloc::string::String, u8)>,
+    /// Every import's `(module, field, kind)` — `WebAssembly.Module.imports`.
+    import_descriptors: Vec<(alloc::string::String, alloc::string::String, u8)>,
     /// Linear memory minimum size, in 64 KiB pages (`None` = no memory).
     mem_min_pages: Option<u32>,
     /// Linear memory maximum size in pages, if the limits declared one. A
@@ -1127,6 +1132,8 @@ impl Module {
             let field = alloc::string::String::from_utf8(s.bytes(flen)?.to_vec())
                 .map_err(|_| WasmRtError("bad import field name"))?;
             let kind = s.byte()?;
+            m.import_descriptors
+                .push((module.clone(), field.clone(), kind));
             match kind {
                 0x00 => {
                     // A function import: its type index. It occupies the next
@@ -1354,10 +1361,11 @@ impl Module {
                 .map_err(|_| WasmRtError("bad export name"))?;
             let kind = s.byte()?;
             let index = s.u32()?;
+            m.export_descriptors.push((name.clone(), kind));
             match kind {
                 0x00 => m.exports.push((name, index)), // function export
                 0x03 => m.global_exports.push((name, index)), // global export
-                _ => {} // memory/table exports: not surfaced here yet
+                _ => {} // memory/table exports: introspectable, not yet wired
             }
         }
         Ok(())
@@ -1405,6 +1413,26 @@ impl Module {
     #[must_use]
     pub fn global_is_mutable(&self, index: u32) -> bool {
         self.global_mutable(index as usize).unwrap_or(false)
+    }
+
+    /// Every export's `(name, kind)` (kind: 0=function, 1=table, 2=memory,
+    /// 3=global) — backing `WebAssembly.Module.exports`.
+    #[must_use]
+    pub fn export_descriptors(&self) -> Vec<(&str, u8)> {
+        self.export_descriptors
+            .iter()
+            .map(|(n, k)| (n.as_str(), *k))
+            .collect()
+    }
+
+    /// Every import's `(module, field, kind)` — backing
+    /// `WebAssembly.Module.imports`.
+    #[must_use]
+    pub fn import_descriptors(&self) -> Vec<(&str, &str, u8)> {
+        self.import_descriptors
+            .iter()
+            .map(|(m, f, k)| (m.as_str(), f.as_str(), *k))
+            .collect()
     }
 
     /// The index of an exported function, or `None`.

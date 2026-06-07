@@ -297,6 +297,9 @@ const N_WASM_TABLE_LEN: u16 = 198;
 const N_WASM_TABLE_GET: u16 = 199;
 const N_WASM_TABLE_SET: u16 = 200;
 const N_WASM_TABLE_GROW: u16 = 201;
+/// Static `WebAssembly.Module.exports(module)` / `.imports(module)` introspection.
+const N_WASM_MODULE_EXPORTS: u16 = 202;
+const N_WASM_MODULE_IMPORTS: u16 = 203;
 // Hidden slots on a WASM export wrapper's data object.
 const WASM_BYTES: &str = "\u{0}wbytes";
 const WASM_EXPORT: &str = "\u{0}wexport";
@@ -724,6 +727,25 @@ impl<'a> Interp<'a> {
                 ("RuntimeError", N_WASM_RUNTIME_ERROR),
             ],
         );
+        // Static introspection methods on `WebAssembly.Module`.
+        if let Some(module_ctor) = self
+            .current
+            .get("WebAssembly")
+            .and_then(|ns| ns.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|ns| self.realm.get_property(ns, "Module"))
+            .and_then(|m| m.as_handle())
+            .map(Handle::from_raw)
+        {
+            for (name, id) in [
+                ("exports", N_WASM_MODULE_EXPORTS),
+                ("imports", N_WASM_MODULE_IMPORTS),
+            ] {
+                let f = self.realm.new_native(id);
+                self.realm
+                    .set_property(module_ctor, name, NanBox::handle(f.to_raw()));
+            }
+        }
         // A minimal `Object.prototype` carrying the methods commonly invoked via
         // `Object.prototype.<m>.call(x)`. The receiver arrives as `this`.
         let obj_proto = self.realm.new_object();
@@ -1665,6 +1687,51 @@ impl<'a> Interp<'a> {
                     .wasm_bytes(arg(0))
                     .is_some_and(|b| crate::wasm_rt::Module::decode(&b).is_ok());
                 NanBox::boolean(ok)
+            }
+            // `WebAssembly.Module.exports(module)` / `.imports(module)` — arrays of
+            // `{ name, kind }` / `{ module, name, kind }` descriptors.
+            N_WASM_MODULE_EXPORTS | N_WASM_MODULE_IMPORTS => {
+                let bytes = arg(0)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.get_property(h, WASM_BYTES))
+                    .and_then(|v| self.wasm_bytes(v))
+                    .ok_or_else(|| self.wasm_type_error("expected a WebAssembly.Module"))?;
+                let module = crate::wasm_rt::Module::decode(&bytes)
+                    .map_err(|e| self.wasm_compile_error(e.0))?;
+                let mut out = Vec::new();
+                if id == N_WASM_MODULE_EXPORTS {
+                    let descs: Vec<(String, u8)> = module
+                        .export_descriptors()
+                        .iter()
+                        .map(|(n, k)| ((*n).into(), *k))
+                        .collect();
+                    for (name, kind) in descs {
+                        let obj = self.realm.new_object();
+                        let nv = self.new_str(&name);
+                        self.realm.set_property(obj, "name", nv);
+                        let kv = self.new_str(wasm_extern_kind(kind));
+                        self.realm.set_property(obj, "kind", kv);
+                        out.push(NanBox::handle(obj.to_raw()));
+                    }
+                } else {
+                    let descs: Vec<(String, String, u8)> = module
+                        .import_descriptors()
+                        .iter()
+                        .map(|(m, f, k)| ((*m).into(), (*f).into(), *k))
+                        .collect();
+                    for (m, f, kind) in descs {
+                        let obj = self.realm.new_object();
+                        let mv = self.new_str(&m);
+                        self.realm.set_property(obj, "module", mv);
+                        let nv = self.new_str(&f);
+                        self.realm.set_property(obj, "name", nv);
+                        let kv = self.new_str(wasm_extern_kind(kind));
+                        self.realm.set_property(obj, "kind", kv);
+                        out.push(NanBox::handle(obj.to_raw()));
+                    }
+                }
+                NanBox::handle(self.realm.new_array(out).to_raw())
             }
             // `WebAssembly.instantiate(bytes)` → `{ instance: { exports: {…} } }`,
             // each export a callable wrapper. (Synchronous, unlike the spec's
@@ -10081,6 +10148,16 @@ fn dataview_method(method: &str) -> Option<(bool, usize, bool, bool)> {
         _ => return None,
     };
     Some((is_set, size, signed, is_float))
+}
+
+/// Maps a WASM export/import kind byte to its `ExternType` string.
+fn wasm_extern_kind(kind: u8) -> &'static str {
+    match kind {
+        0 => "function",
+        1 => "table",
+        2 => "memory",
+        _ => "global",
+    }
 }
 
 fn coerce_typed(kind: u16, n: f64) -> f64 {

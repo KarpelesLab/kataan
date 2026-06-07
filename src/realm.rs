@@ -834,12 +834,12 @@ impl Realm {
             self.write_barrier(handle, value);
             return true;
         }
-        // Only arrays and functions carry auxiliary named properties; other
+        // Arrays, user functions, and native functions carry auxiliary named
+        // properties (e.g. static methods on a built-in constructor); other
         // primitives (strings, numbers, …) reject property writes.
-        let aux_eligible = self
-            .heap
-            .get(handle)
-            .is_some_and(|c| c.as_array().is_some() || c.as_function().is_some());
+        let aux_eligible = self.heap.get(handle).is_some_and(|c| {
+            c.as_array().is_some() || c.as_function().is_some() || c.as_native().is_some()
+        });
         if aux_eligible {
             let aux = self.aux_object(handle);
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
