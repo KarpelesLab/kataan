@@ -21,12 +21,14 @@ tri-modal model proven out in the sibling projects
 >   `.throw()`), and `async`/`await` — falling back to the tree-walker for the
 >   handful of constructs it doesn't yet compile.
 >
-> A **dual-path Test262-style conformance corpus (510/510) passes on both
-> engines**, covering closures, classes/inheritance, optional chaining, the
-> iterator protocol, `Map`/`Set`/`WeakMap`, `Symbol`, `BigInt`, `Promise` +
-> async/await, `Proxy`/`Reflect`, typed arrays, `Date`, an in-house `RegExp`,
-> and a large standard library (Math, JSON, Object/Array/String/Number). Compiled
-> bytecode can be serialized, reloaded, and run without the source.
+> A **dual-path Test262-style conformance corpus (520/520) passes on both
+> engines**, covering closures, classes/inheritance (incl. `extends` of native
+> errors), optional chaining, the iterator protocol, `Map`/`Set`/`WeakMap`,
+> `Symbol` (incl. `Symbol.hasInstance`), `BigInt`, `Promise` + async/await,
+> `Proxy`/`Reflect` (incl. the `ownKeys` trap driving `Object.keys`/`values`/
+> `entries`/`for-in`), typed arrays, `Date`, an in-house `RegExp`, and a large
+> standard library (Math, JSON, Object/Array/String/Number). Compiled bytecode can
+> be serialized, reloaded, and run without the source.
 >
 > Three advanced tiers are real and tested, though each has named work remaining:
 >
@@ -37,11 +39,14 @@ tri-modal model proven out in the sibling projects
 >   into W^X memory via raw syscalls; object/string ops stay interpreted;
 > - a pure-Rust, `no_std` **WebAssembly engine** — full MVP plus sign-extension,
 >   saturating conversion, bulk-memory, multi-value, and typed structured
->   control — driven by a `.wast`/WAT spec harness (a spec-derived corpus, not
->   yet the full upstream suite);
+>   control — with a JS↔WASM boundary (`validate`/`compile`/`instantiate`, the
+>   `Module`/`Instance`/`Global`/`Memory` objects, host-function imports, and
+>   stateful instances), driven by a `.wast`/WAT spec harness (a spec-derived
+>   corpus, not yet the full upstream suite);
 > - a **zero-copy "D′" snapshot tier** atop the moving GC: a verified codec that
 >   `mmap`-reloads a heap (eleven reference cell kinds, cross-kind cycles,
->   insertion-order-preserving) and runs it in place.
+>   insertion-order-preserving) and runs a restored closure both in place and
+>   reloaded into a fresh runtime.
 >
 > Kataan works as a CLI/REPL, a Rust library, and a C library (`kt_eval`). See
 > the [roadmap](ROADMAP.md) for the remaining road to a complete engine.
