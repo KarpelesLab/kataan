@@ -138,6 +138,8 @@ pub struct Module {
     bodies: Vec<FuncBody>,
     /// `name -> func_index`.
     exports: Vec<(alloc::string::String, u32)>,
+    /// `name -> global_index` for exported globals.
+    global_exports: Vec<(alloc::string::String, u32)>,
     /// Linear memory minimum size, in 64 KiB pages (`None` = no memory).
     mem_min_pages: Option<u32>,
     /// Linear memory maximum size in pages, if the limits declared one. A
@@ -1352,9 +1354,10 @@ impl Module {
                 .map_err(|_| WasmRtError("bad export name"))?;
             let kind = s.byte()?;
             let index = s.u32()?;
-            if kind == 0x00 {
-                // a function export
-                m.exports.push((name, index));
+            match kind {
+                0x00 => m.exports.push((name, index)), // function export
+                0x03 => m.global_exports.push((name, index)), // global export
+                _ => {} // memory/table exports: not surfaced here yet
             }
         }
         Ok(())
@@ -1387,6 +1390,21 @@ impl Module {
     #[must_use]
     pub fn export_names(&self) -> Vec<&str> {
         self.exports.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// The `(name, global index)` of each exported global, in declaration order.
+    #[must_use]
+    pub fn global_exports(&self) -> Vec<(&str, u32)> {
+        self.global_exports
+            .iter()
+            .map(|(n, i)| (n.as_str(), *i))
+            .collect()
+    }
+
+    /// Whether global `index` (imports + defined) is declared mutable.
+    #[must_use]
+    pub fn global_is_mutable(&self, index: u32) -> bool {
+        self.global_mutable(index as usize).unwrap_or(false)
     }
 
     /// The index of an exported function, or `None`.
@@ -2636,6 +2654,13 @@ impl<'m> Instance<'m> {
             .export(name)
             .ok_or(WasmRtError("no such export"))?;
         self.call(idx, args)
+    }
+
+    /// The current value of global `index` (imports occupy the low indices), or
+    /// `None` if out of range.
+    #[must_use]
+    pub fn global_value(&self, index: u32) -> Option<Val> {
+        self.store.globals.get(index as usize).copied()
     }
 
     /// Snapshots the instance's mutable state (memory, globals, dropped segments).

@@ -3171,21 +3171,7 @@ impl<'a> Interp<'a> {
                 .is_some_and(|v| self.realm.truthy(v));
             let init = args.get(1).copied().unwrap_or(NanBox::undefined());
             let value = self.wasm_coerce_global(&ty, init);
-            let g = self.realm.new_object();
-            self.realm.set_hidden_property(g, WASM_GLOBAL_VALUE, value);
-            let ty_v = self.new_str(&ty);
-            self.realm.set_hidden_property(g, WASM_GLOBAL_TYPE, ty_v);
-            self.realm
-                .set_hidden_property(g, WASM_GLOBAL_MUTABLE, NanBox::boolean(mutable));
-            let getter = self.realm.new_bound_native(N_WASM_GLOBAL_GET, g);
-            let setter = self.realm.new_bound_native(N_WASM_GLOBAL_SET, g);
-            self.realm.define_accessor(
-                g,
-                "value",
-                NanBox::handle(getter.to_raw()),
-                NanBox::handle(setter.to_raw()),
-            );
-            return Ok(NanBox::handle(g.to_raw()));
+            return Ok(self.make_wasm_global(value, &ty, mutable));
         }
         // `new Proxy(target, handler)`.
         if id == N_PROXY {
@@ -6639,6 +6625,26 @@ impl<'a> Interp<'a> {
         obj
     }
 
+    /// Builds a `WebAssembly.Global` object wrapping the already-coerced `value`
+    /// of type `ty`, with a `.value` accessor (settable only when `mutable`).
+    fn make_wasm_global(&mut self, value: NanBox, ty: &str, mutable: bool) -> NanBox {
+        let g = self.realm.new_object();
+        self.realm.set_hidden_property(g, WASM_GLOBAL_VALUE, value);
+        let ty_v = self.new_str(ty);
+        self.realm.set_hidden_property(g, WASM_GLOBAL_TYPE, ty_v);
+        self.realm
+            .set_hidden_property(g, WASM_GLOBAL_MUTABLE, NanBox::boolean(mutable));
+        let getter = self.realm.new_bound_native(N_WASM_GLOBAL_GET, g);
+        let setter = self.realm.new_bound_native(N_WASM_GLOBAL_SET, g);
+        self.realm.define_accessor(
+            g,
+            "value",
+            NanBox::handle(getter.to_raw()),
+            NanBox::handle(setter.to_raw()),
+        );
+        NanBox::handle(g.to_raw())
+    }
+
     /// Coerces a JS value to a WASM `Global`'s value type: `i32` via ToInt32,
     /// `f32`/`f64` via ToNumber, `i64` to a `BigInt`.
     fn wasm_coerce_global(&mut self, ty: &str, v: NanBox) -> NanBox {
@@ -6713,10 +6719,46 @@ impl<'a> Interp<'a> {
             self.realm
                 .set_property(exports, &name, NanBox::handle(f.to_raw()));
         }
+        // Exported globals become `WebAssembly.Global` objects holding the
+        // instance's value, read at instantiation. Supported for modules with no
+        // imports (so a fresh `Instance::new` reflects the real initial values).
+        let global_exports: Vec<(String, u32)> = module
+            .global_exports()
+            .iter()
+            .map(|(n, i)| ((*n).into(), *i))
+            .collect();
+        if !global_exports.is_empty()
+            && module.import_names().is_empty()
+            && module.global_import_names().is_empty()
+            && let Ok(inst) = crate::wasm_rt::Instance::new(&module)
+        {
+            for (gname, gidx) in &global_exports {
+                if let Some(val) = inst.global_value(*gidx) {
+                    let (value, ty) = self.wasm_global_export_value(val);
+                    let mutable = module.global_is_mutable(*gidx);
+                    let g = self.make_wasm_global(value, ty, mutable);
+                    self.realm.set_property(exports, gname, g);
+                }
+            }
+        }
         let instance = self.realm.new_object();
         self.realm
             .set_property(instance, "exports", NanBox::handle(exports.to_raw()));
         Ok(NanBox::handle(instance.to_raw()))
+    }
+
+    /// Converts a WASM global's `Val` to a `(JS value, type string)` pair for
+    /// building a `WebAssembly.Global` (an `i64` becomes a `BigInt`).
+    fn wasm_global_export_value(&mut self, val: crate::wasm_rt::Val) -> (NanBox, &'static str) {
+        match val {
+            crate::wasm_rt::Val::I32(_) => (val.to_nanbox(), "i32"),
+            crate::wasm_rt::Val::F32(_) => (val.to_nanbox(), "f32"),
+            crate::wasm_rt::Val::F64(_) => (val.to_nanbox(), "f64"),
+            crate::wasm_rt::Val::I64(n) => {
+                let big = crate::bignum::BigInt::from_i128(i128::from(n));
+                (NanBox::handle(self.realm.new_bigint(big).to_raw()), "i64")
+            }
+        }
     }
 
     /// Extracts a byte vector from a JS `BufferSource`-ish value for the WASM
@@ -9626,6 +9668,19 @@ impl<'a> Interp<'a> {
                 .contains(&id)
                 && let Some(k) = self.realm.get_property(oh, TYPED_ARRAY_KIND)
                 && k.as_number() == Some(f64::from(id - N_TYPED_ARRAY_BASE))
+            {
+                return Ok(true);
+            }
+            // The `WebAssembly.*` boundary objects match by their marker slot.
+            let wasm_marker = match id {
+                N_WASM_GLOBAL => Some(WASM_GLOBAL_VALUE),
+                N_WASM_MEMORY => Some(WASM_MEM_BUFFER),
+                N_WASM_TABLE => Some(WASM_TABLE_ELEMS),
+                N_WASM_MODULE => Some(WASM_IS_MODULE),
+                _ => None,
+            };
+            if let Some(slot) = wasm_marker
+                && self.realm.get_property(oh, slot).is_some()
             {
                 return Ok(true);
             }
