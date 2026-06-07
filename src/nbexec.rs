@@ -3938,12 +3938,16 @@ impl<'a> Interp<'a> {
                     let digits = (self.realm.to_number(arg(0)) as usize).min(100);
                     // JS rounds half away from zero (Rust's formatter rounds half
                     // to even), so pre-round at the target scale.
-                    let s = if n.is_finite() {
+                    let s = if !n.is_finite() {
+                        alloc::format!("{n}")
+                    } else if n.abs() >= 1e21 {
+                        // Spec: a magnitude ≥ 1e21 uses the regular `ToString`
+                        // (exponential), not a full decimal expansion.
+                        self.realm.to_display_string(NanBox::number(n))
+                    } else {
                         let factor = 10f64.powi(digits as i32);
                         let rounded = (n * factor).round() / factor;
                         alloc::format!("{rounded:.digits$}")
-                    } else {
-                        alloc::format!("{n}")
                     };
                     Some(self.new_str(&s))
                 }
