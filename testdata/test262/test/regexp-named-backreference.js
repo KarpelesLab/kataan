@@ -21,3 +21,9 @@ assert.sameValue(/(?<a>x)(?<b>y)\k<a>\k<b>/.test("xyxy"), true, "two named backr
 
 // $<name> replacement keeps working.
 assert.sameValue("2024-01".replace(/(?<y>\d+)-(?<m>\d+)/, "$<m>/$<y>"), "01/2024", "named replacement");
+
+// A bare \k (not followed by `<`) is the literal character "k" (Annex B), not an
+// error and not a backreference.
+assert.sameValue(/\k/.test("k"), true, "bare \\k is literal k");
+assert.sameValue(/a\kb/.test("akb"), true, "literal \\k mid-pattern");
+assert.sameValue(/\k/.test("x"), false, "literal \\k does not match other chars");

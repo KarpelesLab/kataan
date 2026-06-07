@@ -426,11 +426,10 @@ impl Parser {
             'B' => Node::WordBoundary { neg: true },
             // `\1`…`\9` — a backreference to a capture group.
             d if d.is_ascii_digit() && d != '0' => Node::Backref((d as u8 - b'0') as usize),
-            // `\k<name>` — a named backreference (resolved at compile time).
-            'k' => {
-                if !self.eat('<') {
-                    return Err(RegexError::new("expected `<` after `\\k`"));
-                }
+            // `\k<name>` — a named backreference (resolved at compile time). A bare
+            // `\k` not followed by `<` is the literal character `k` (Annex B).
+            'k' if self.chars.get(self.pos) == Some(&'<') => {
+                self.eat('<');
                 let mut name = alloc::string::String::new();
                 while let Some(&c) = self.chars.get(self.pos) {
                     if c == '>' {
