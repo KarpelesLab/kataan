@@ -9409,6 +9409,22 @@ impl<'a> Interp<'a> {
     /// class or one of its subclasses (via the instance's class tag and the
     /// `extends` chain).
     fn instance_of(&mut self, obj: NanBox, ctor: NanBox) -> Result<bool, ExecError> {
+        // A custom `[Symbol.hasInstance]` on the right-hand side overrides the
+        // ordinary prototype/cell-kind check (and applies even to a primitive
+        // left-hand side, e.g. `4 instanceof Even`). Read via `read_member` so a
+        // `static [Symbol.hasInstance]` on a class is found.
+        if let Some(ch) = ctor.as_handle().map(Handle::from_raw) {
+            let sym = self.well_known_symbol("hasInstance");
+            let key = self.member_key(sym);
+            let method = self.read_member(ch, &key)?;
+            if method
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let result = self.call_with_this(method, ctor, &[obj])?;
+                return Ok(self.realm.truthy(result));
+            }
+        }
         let (Some(oh), Some(ch)) = (
             obj.as_handle().map(Handle::from_raw),
             ctor.as_handle().map(Handle::from_raw),
