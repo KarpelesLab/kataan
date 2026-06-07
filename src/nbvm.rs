@@ -1440,6 +1440,15 @@ fn run_frame(
                                 "sticky" => {
                                     regs[*dst as usize] = NanBox::boolean(flags.contains('y'))
                                 }
+                                "dotAll" => {
+                                    regs[*dst as usize] = NanBox::boolean(flags.contains('s'))
+                                }
+                                "unicode" => {
+                                    regs[*dst as usize] = NanBox::boolean(flags.contains('u'))
+                                }
+                                "hasIndices" => {
+                                    regs[*dst as usize] = NanBox::boolean(flags.contains('d'))
+                                }
                                 "lastIndex" => {
                                     regs[*dst as usize] =
                                         NanBox::number(ctx.realm.regex_last_index(handle) as f64);

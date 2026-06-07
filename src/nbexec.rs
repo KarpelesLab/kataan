@@ -8774,6 +8774,9 @@ impl<'a> Interp<'a> {
                 "ignoreCase" => NanBox::boolean(flags.contains('i')),
                 "multiline" => NanBox::boolean(flags.contains('m')),
                 "sticky" => NanBox::boolean(flags.contains('y')),
+                "dotAll" => NanBox::boolean(flags.contains('s')),
+                "unicode" => NanBox::boolean(flags.contains('u')),
+                "hasIndices" => NanBox::boolean(flags.contains('d')),
                 "lastIndex" => NanBox::number(self.realm.regex_last_index(handle) as f64),
                 _ => self.member_value(handle, name),
             });
