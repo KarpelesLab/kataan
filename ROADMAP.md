@@ -165,12 +165,16 @@ moving GC. "Complete" means *any* live heap snapshots, reloads zero-copy, and
   *Remaining:* generator/async suspension state (depends on Track 3 lazy frames);
   the `ArrayBuffer` backing-buffer *identity* shared across typed-array views —
   audit each remaining non-object `Cell` variant.
-- **End-to-end restore-and-execute.** *In place:* a restored closure now runs and
-  carries its snapshotted captured state, independent of the original
-  (`snapshot_restores_an_executable_closure`) — restored state is executable, not
-  just structurally equal. *Remaining:* a supported public/C API that binds a
-  restored realm + the matching function table into a **fresh runtime** and
-  invokes a value (the cross-runtime reload path, vs the same-runtime test today).
+- **End-to-end restore-and-execute.** *Done:* a restored closure runs and carries
+  its snapshotted captured state, both in place
+  (`snapshot_restores_an_executable_closure`) and **across runtimes** — snapshot in
+  one interpreter, serialize to bytes, drop it, then restore into a *fresh*
+  interpreter holding the same code and call the closure, which resumes from the
+  snapshotted state independent of the new runtime's own program instance
+  (`snapshot_reloads_into_a_fresh_runtime`) — the load → evict → reload scenario.
+  *Remaining:* expose this as a public/C API (today it's exercised via the
+  interpreter's internals in tests), and persist the bytes through the
+  content-addressed artifact store below.
 - **The shared, versioned, mmap-able artifact store (code-cache, §6):**
   content-addressed by source hash + host tag; lazy per-function bodies faulted in
   on first call; **module-local atom remap** on load; IC slots load reset; the

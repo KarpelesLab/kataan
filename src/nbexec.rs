@@ -10421,6 +10421,52 @@ mod tests {
         assert_eq!(run("f(10); function f(n) { return n; } f(10)"), "10");
     }
 
+    /// Cross-runtime D′ reload: snapshot a closure in one runtime, serialize it,
+    /// then restore and **execute** it in a *separate, fresh* runtime that holds
+    /// the same code — the load → evict → reload scenario. The restored closure
+    /// carries the snapshotted captured state and is independent of the fresh
+    /// runtime's own instance of the program.
+    #[test]
+    fn snapshot_reloads_into_a_fresh_runtime() {
+        use crate::snapshot::{capture, deserialize, restore, serialize};
+
+        // `makeCounter` (func 0) returns the inner closure (func 1); both runtimes
+        // compile the same program, so the snapshot's `func_id`s line up.
+        let program = Parser::parse_program(
+            "function makeCounter(start){ var n = start; return function(){ return ++n; }; } makeCounter(0)",
+        )
+        .expect("parse");
+
+        // Runtime A: build a counter, advance it to n = 2, snapshot it to bytes.
+        let mut a = Interp::new();
+        let f = a.run(&program).expect("exec A");
+        assert_eq!(a.call(f, &[]).unwrap().as_number(), Some(1.0));
+        assert_eq!(a.call(f, &[]).unwrap().as_number(), Some(2.0));
+        let fh = Handle::from_raw(f.as_handle().expect("closure"));
+        let bytes = serialize(&capture(&a.realm, &[fh]));
+        drop(a); // A is gone — only the bytes survive.
+
+        // Runtime B: a fresh interpreter that compiles the same program (its own
+        // counter starts at 0), then reloads A's snapshot and runs the restored
+        // closure — which resumes from the snapshotted n = 2.
+        let mut b = Interp::new();
+        let own = b.run(&program).expect("exec B");
+        let snap = deserialize(&bytes).expect("deserialize");
+        let restored = restore(&mut b.realm, &snap);
+        let f2 = NanBox::handle(restored[0].to_raw());
+
+        assert_eq!(
+            b.call(f2, &[]).unwrap().as_number(),
+            Some(3.0),
+            "restored closure resumes from the snapshotted state in the new runtime"
+        );
+        assert_eq!(
+            b.call(own, &[]).unwrap().as_number(),
+            Some(1.0),
+            "the fresh runtime's own counter is independent of the reloaded one"
+        );
+    }
+
     /// End-to-end D′: a live closure's captured state survives capture →
     /// serialize → deserialize → restore *and remains executable* — the restored
     /// closure runs, carries the snapshotted captured value, and is independent of
