@@ -290,6 +290,13 @@ const N_WASM_MEM_BUFFER_GET: u16 = 195;
 const N_WASM_MEM_GROW: u16 = 196;
 /// A WASM linear-memory page is 64 KiB.
 const WASM_PAGE: usize = 65536;
+/// `new WebAssembly.Table({element, initial, maximum?})` and its `.length` getter
+/// plus `get`/`set`/`grow` methods.
+const N_WASM_TABLE: u16 = 197;
+const N_WASM_TABLE_LEN: u16 = 198;
+const N_WASM_TABLE_GET: u16 = 199;
+const N_WASM_TABLE_SET: u16 = 200;
+const N_WASM_TABLE_GROW: u16 = 201;
 // Hidden slots on a WASM export wrapper's data object.
 const WASM_BYTES: &str = "\u{0}wbytes";
 const WASM_EXPORT: &str = "\u{0}wexport";
@@ -308,6 +315,9 @@ const WASM_GLOBAL_MUTABLE: &str = "\u{0}gmut";
 const WASM_MEM_BUFFER: &str = "\u{0}mbuf";
 const WASM_MEM_PAGES: &str = "\u{0}mpages";
 const WASM_MEM_MAX: &str = "\u{0}mmax";
+/// Hidden slots on a `WebAssembly.Table`: its element (function-ref) array and max.
+const WASM_TABLE_ELEMS: &str = "\u{0}telems";
+const WASM_TABLE_MAX: &str = "\u{0}tmax";
 // `Object.prototype.*` methods (the receiver arrives as `this`).
 const N_OBJ_PROTO_TOSTRING: u16 = 179;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
@@ -696,6 +706,7 @@ impl<'a> Interp<'a> {
                 ("compile", N_WASM_COMPILE),
                 ("Global", N_WASM_GLOBAL),
                 ("Memory", N_WASM_MEMORY),
+                ("Table", N_WASM_TABLE),
             ],
         );
         // A minimal `Object.prototype` carrying the methods commonly invoked via
@@ -2798,6 +2809,64 @@ impl<'a> Interp<'a> {
                 );
                 return Ok(NanBox::number(old_pages as f64));
             }
+            // `WebAssembly.Table` `.length` getter and `get`/`set`/`grow` methods
+            // (bound to the table `target`), over its function-ref element array.
+            if matches!(
+                id,
+                N_WASM_TABLE_LEN | N_WASM_TABLE_GET | N_WASM_TABLE_SET | N_WASM_TABLE_GROW
+            ) {
+                let Some(elems) = self
+                    .realm
+                    .get_property(target, WASM_TABLE_ELEMS)
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+                else {
+                    return Ok(NanBox::undefined());
+                };
+                let len = self.realm.array_length(elems).unwrap_or(0);
+                let idx = self
+                    .realm
+                    .to_number(args.first().copied().unwrap_or(NanBox::undefined()));
+                match id {
+                    N_WASM_TABLE_LEN => return Ok(NanBox::number(len as f64)),
+                    N_WASM_TABLE_GET | N_WASM_TABLE_SET => {
+                        if idx < 0.0 || idx as usize >= len {
+                            let m = self.new_str("WebAssembly.Table index out of bounds");
+                            return Err(ExecError::Throw(
+                                self.make_error(N_ERROR_BASE + 2, Some(m)),
+                            ));
+                        }
+                        let i = idx as usize;
+                        if id == N_WASM_TABLE_GET {
+                            return Ok(self.realm.get_element(elems, i));
+                        }
+                        let v = args.get(1).copied().unwrap_or(NanBox::null());
+                        self.realm.set_element(elems, i, v);
+                        return Ok(NanBox::undefined());
+                    }
+                    _ => {
+                        // grow(delta, init?) → prior length.
+                        let new_len = len + idx.max(0.0) as usize;
+                        if let Some(max) = self
+                            .realm
+                            .get_property(target, WASM_TABLE_MAX)
+                            .and_then(|v| v.as_number())
+                            && new_len as f64 > max
+                        {
+                            let m =
+                                self.new_str("WebAssembly.Table.grow exceeds the declared maximum");
+                            return Err(ExecError::Throw(
+                                self.make_error(N_ERROR_BASE + 2, Some(m)),
+                            ));
+                        }
+                        let init = args.get(1).copied().unwrap_or(NanBox::null());
+                        for i in len..new_len {
+                            self.realm.set_element(elems, i, init);
+                        }
+                        return Ok(NanBox::number(len as f64));
+                    }
+                }
+            }
             let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
             match id {
                 N_RESOLVE => self.resolve_with(target, arg0),
@@ -3273,6 +3342,50 @@ impl<'a> Interp<'a> {
             self.realm
                 .set_property(mem, "grow", NanBox::handle(grow.to_raw()));
             return Ok(NanBox::handle(mem.to_raw()));
+        }
+        // `new WebAssembly.Table({ element, initial, maximum? }, init?)` — a fixed
+        // table of function references, exposing `.length` + `get`/`set`/`grow`.
+        if id == N_WASM_TABLE {
+            let dh = args
+                .first()
+                .copied()
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw);
+            let initial = dh
+                .and_then(|h| self.realm.get_property(h, "initial"))
+                .map_or(0.0, |v| self.realm.to_number(v))
+                .max(0.0) as usize;
+            let maximum = dh
+                .and_then(|h| self.realm.get_property(h, "maximum"))
+                .map(|v| self.realm.to_number(v).max(0.0) as usize);
+            // Slots start at the init value (a function) or null.
+            let init = args.get(1).copied().unwrap_or(NanBox::null());
+            let elems = self.realm.new_array(alloc::vec![init; initial]);
+            let table = self.realm.new_object();
+            self.realm
+                .set_hidden_property(table, WASM_TABLE_ELEMS, NanBox::handle(elems.to_raw()));
+            self.realm.set_hidden_property(
+                table,
+                WASM_TABLE_MAX,
+                maximum.map_or(NanBox::undefined(), |m| NanBox::number(m as f64)),
+            );
+            let len_get = self.realm.new_bound_native(N_WASM_TABLE_LEN, table);
+            self.realm.define_accessor(
+                table,
+                "length",
+                NanBox::handle(len_get.to_raw()),
+                NanBox::undefined(),
+            );
+            for (name, nid) in [
+                ("get", N_WASM_TABLE_GET),
+                ("set", N_WASM_TABLE_SET),
+                ("grow", N_WASM_TABLE_GROW),
+            ] {
+                let f = self.realm.new_bound_native(nid, table);
+                self.realm
+                    .set_property(table, name, NanBox::handle(f.to_raw()));
+            }
+            return Ok(NanBox::handle(table.to_raw()));
         }
         // `new DataView(buffer, byteOffset?)` — a view onto an ArrayBuffer.
         if id == N_DATA_VIEW {

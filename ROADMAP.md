@@ -123,13 +123,15 @@ WebAssembly spec test suite**.
   **stateful instances** — mutable globals and linear memory persist across export
   calls, each instance independent — and the **`WebAssembly.Global`** object (typed
   value cell with a `.value` accessor, ToInt32/`BigInt` coercion, immutability
-  enforced), and **`WebAssembly.Memory`** (`.buffer` ArrayBuffer + `byteLength`,
-  `grow(delta)` page accounting with content copy, `maximum` → RangeError).
-  *Remaining:* making `.buffer` a *live shared view* with typed arrays/DataView
-  (blocked on the separate typed-array ↔ ArrayBuffer backing-buffer work — today
-  typed-array views don't share an ArrayBuffer's bytes), the `Table` object,
-  `compileStreaming`/`instantiateStreaming`, the `externref` bridge, and imported
-  memories/tables/globals. Traps already surface as JS exceptions.
+  enforced), **`WebAssembly.Memory`** (`.buffer` ArrayBuffer + `byteLength`,
+  `grow(delta)` page accounting with content copy, `maximum` → RangeError), and
+  **`WebAssembly.Table`** (`.length`, `get`/`set` of function refs, `grow(delta,
+  init?)` → prior length, out-of-bounds + `maximum` → RangeError). *Remaining:*
+  making `Memory.buffer` a *live shared view* with typed arrays/DataView (blocked
+  on the separate typed-array ↔ ArrayBuffer backing-buffer work — today typed-array
+  views don't share an ArrayBuffer's bytes), wiring `Memory`/`Table`/`Global` as
+  module imports/exports, `compileStreaming`/`instantiateStreaming`, and the
+  `externref` bridge. Traps already surface as JS exceptions.
 - **Post-MVP proposals (prioritized):** SIMD (`v128`), threads + `Atomics` on
   shared memory, multi-memory, tail calls, extended-const, then GC types and
   exception handling as they stabilize.
