@@ -4783,6 +4783,40 @@ impl<'a> Interp<'a> {
         if self.realm.native_at(handle) == Some(N_DATE) && method == "now" {
             return Ok(Some(NanBox::number(now_ms())));
         }
+        // `Uint8Array.of(...items)` / `Uint8Array.from(iterable|arrayLike, mapFn?)`
+        // — the typed-array statics, producing a typed array of the constructor's
+        // kind (each value coerced to the element type).
+        if let Some(id) = self.realm.native_at(handle)
+            && (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
+                .contains(&id)
+            && matches!(method, "of" | "from")
+        {
+            let kind = id - N_TYPED_ARRAY_BASE;
+            let mut items: Vec<NanBox> = if method == "of" {
+                args.to_vec()
+            } else {
+                self.iterate_values(arg(0)).unwrap_or_default()
+            };
+            // `from`'s optional map callback `(value, index)`.
+            if method == "from"
+                && let Some(mapfn) = args.get(1).copied()
+                && mapfn
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                for (i, v) in items.iter_mut().enumerate() {
+                    *v = self.call(mapfn, &[*v, NanBox::number(i as f64)])?;
+                }
+            }
+            let elems: Vec<NanBox> = items
+                .iter()
+                .map(|v| NanBox::number(coerce_typed(kind, self.realm.to_number(*v))))
+                .collect();
+            let arr = self.realm.new_array(elems);
+            self.realm
+                .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
+            return Ok(Some(NanBox::handle(arr.to_raw())));
+        }
         // `Date.parse(str)` → epoch ms (or NaN) by ISO parsing.
         if self.realm.native_at(handle) == Some(N_DATE) && method == "parse" {
             let s = self.realm.to_display_string(arg(0));
@@ -6156,6 +6190,31 @@ impl<'a> Interp<'a> {
                         }
                     }
                     return Ok(Some(NanBox::undefined()));
+                }
+                // `subarray(begin, end)` — a new typed array of the same kind over
+                // the `[begin, end)` slice. (A copy here, not a live buffer view,
+                // since typed arrays are standalone — see the ArrayBuffer-backing
+                // limitation.)
+                "subarray" if self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some() => {
+                    let len = elems.len() as i64;
+                    let norm = |v: NanBox, default: i64, this: &mut Self| -> usize {
+                        if matches!(v.unpack(), Unpacked::Undefined) {
+                            return default as usize;
+                        }
+                        let n = this.realm.to_number(v) as i64;
+                        usize::try_from(if n < 0 { (len + n).max(0) } else { n.min(len) })
+                            .unwrap_or(0)
+                    };
+                    let start = norm(arg(0), 0, self);
+                    let end = norm(arg(1), len, self);
+                    let sub: Vec<NanBox> = elems.get(start..end.max(start)).unwrap_or(&[]).to_vec();
+                    let kind = self
+                        .realm
+                        .get_property(handle, TYPED_ARRAY_KIND)
+                        .unwrap_or(NanBox::number(0.0));
+                    let arr = self.realm.new_array(sub);
+                    self.realm.set_property(arr, TYPED_ARRAY_KIND, kind);
+                    return Ok(Some(NanBox::handle(arr.to_raw())));
                 }
                 "fill" => {
                     let len = elems.len();
