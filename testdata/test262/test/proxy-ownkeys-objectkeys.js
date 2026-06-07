@@ -19,3 +19,17 @@ assert.sameValue(Object.keys(p2).join(","), "x,y", "missing target key excluded"
 
 // No ownKeys trap: the target's own enumerable keys.
 assert.sameValue(Object.keys(new Proxy({ m: 1, n: 2 }, {})).join(","), "m,n", "no trap forwards");
+
+// Object.values / Object.entries also drive off the ownKeys trap, reading each
+// value through the proxy (so a get trap is honored).
+var pv = new Proxy({}, {
+  ownKeys() { return ["a", "b"]; },
+  getOwnPropertyDescriptor() { return { enumerable: true, configurable: true, value: 1 }; },
+  get(t, k) { return k.toUpperCase() + "!"; },
+});
+assert.sameValue(Object.values(pv).join(","), "A!,B!", "values via ownKeys + get trap");
+assert.sameValue(JSON.stringify(Object.entries(pv)), '[["a","A!"],["b","B!"]]', "entries via traps");
+
+// Without a get trap, values forward to the target.
+var pt = new Proxy({ x: 10, y: 20 }, { ownKeys() { return ["x", "y"]; } });
+assert.sameValue(Object.values(pt).join(","), "10,20", "values forward to target");

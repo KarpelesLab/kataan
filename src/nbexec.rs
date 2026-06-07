@@ -1301,6 +1301,18 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_array(syms).to_raw())
             }
             N_OBJECT_VALUES => {
+                // A proxy with an `ownKeys` trap: its enumerable keys, each value
+                // read through the proxy (so a `get` trap fires).
+                if let Some(raw) = arg(0).as_handle()
+                    && let Some(keys) = self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
+                {
+                    let ph = Handle::from_raw(raw);
+                    let mut vals = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        vals.push(self.read_member(ph, &k)?);
+                    }
+                    return Ok(NanBox::handle(self.realm.new_array(vals).to_raw()));
+                }
                 let mut vals = Vec::new();
                 if let Some(raw) = arg(0).as_handle() {
                     let h = self.proxy_key_target(Handle::from_raw(raw));
@@ -1350,6 +1362,22 @@ impl<'a> Interp<'a> {
                 target
             }
             N_OBJECT_ENTRIES => {
+                // A proxy with an `ownKeys` trap drives the entry list (values read
+                // through the proxy so a `get` trap fires).
+                if let Some(raw) = arg(0).as_handle()
+                    && let Some(keys) = self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
+                {
+                    let ph = Handle::from_raw(raw);
+                    let mut pairs = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        let v = self.read_member(ph, &k)?;
+                        let key = self.new_str(&k);
+                        pairs.push(NanBox::handle(
+                            self.realm.new_array(alloc::vec![key, v]).to_raw(),
+                        ));
+                    }
+                    return Ok(NanBox::handle(self.realm.new_array(pairs).to_raw()));
+                }
                 let mut entries: Vec<(alloc::string::String, NanBox)> = Vec::new();
                 if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
                     let h = self.proxy_key_target(h);
