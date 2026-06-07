@@ -376,7 +376,7 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-const ERROR_NAMES: [&str; 9] = [
+const ERROR_NAMES: [&str; 11] = [
     "Error",
     "TypeError",
     "RangeError",
@@ -388,14 +388,21 @@ const ERROR_NAMES: [&str; 9] = [
     "CompileError",
     "LinkError",
     "RuntimeError",
+    // Standard global error subclasses (registered as globals below).
+    "URIError",
+    "EvalError",
 ];
-/// Count of `Error` subclasses exposed as JS globals (the rest are namespaced).
+/// Count of `Error` subclasses exposed as JS globals (`Error`…`AggregateError`);
+/// the `WebAssembly.*` ones are namespaced, and `URIError`/`EvalError` are
+/// registered separately as globals.
 const N_GLOBAL_ERROR_COUNT: usize = 6;
 const N_TYPE_ERROR: u16 = N_ERROR_BASE + 1;
 const N_REFERENCE_ERROR: u16 = N_ERROR_BASE + 4;
 const N_WASM_COMPILE_ERROR: u16 = N_ERROR_BASE + 6;
 const N_WASM_LINK_ERROR: u16 = N_ERROR_BASE + 7;
 const N_WASM_RUNTIME_ERROR: u16 = N_ERROR_BASE + 8;
+const N_URI_ERROR: u16 = N_ERROR_BASE + 9;
+const N_EVAL_ERROR: u16 = N_ERROR_BASE + 10;
 /// A reserved, non-identifier key under which a `new fn()` instance records its
 /// constructor function (a hidden, GC-traced slot) so `instanceof` can match it.
 const CTOR_KEY: &str = "\u{0}ctor";
@@ -705,6 +712,8 @@ impl<'a> Interp<'a> {
             ("structuredClone", N_STRUCTURED_CLONE),
             ("btoa", N_BTOA),
             ("atob", N_ATOB),
+            ("URIError", N_URI_ERROR),
+            ("EvalError", N_EVAL_ERROR),
         ] {
             let f = self.new_named_native(name, id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -1737,7 +1746,7 @@ impl<'a> Interp<'a> {
                     }
                     None => {
                         let m = self.new_str("URI malformed");
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        return Err(ExecError::Throw(self.make_error(N_URI_ERROR, Some(m))));
                     }
                 }
             }
@@ -13909,8 +13918,13 @@ mod tests {
         assert_eq!(run("decodeURIComponent('caf%C3%A9')"), "café");
         assert_eq!(run("encodeURIComponent(\"-_.!~*'()\")"), "-_.!~*'()");
         assert_eq!(run("decodeURIComponent('%2f')"), "/");
+        // Malformed percent-encoding throws a URIError (a subclass of Error).
         assert_eq!(
-            run("try{decodeURIComponent('%zz');'no'}catch(e){e instanceof TypeError}"),
+            run("try{decodeURIComponent('%zz');'no'}catch(e){e instanceof URIError}"),
+            "true"
+        );
+        assert_eq!(
+            run("try{decodeURIComponent('%zz');'no'}catch(e){e instanceof Error}"),
             "true"
         );
     }
