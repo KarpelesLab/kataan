@@ -506,6 +506,16 @@ impl<'a> Interp<'a> {
         self.realm.to_display_string(value)
     }
 
+    /// Creates a native function carrying its own (non-enumerable) `name`, per the
+    /// spec's named built-ins (`Math.max.name === "max"`).
+    fn new_named_native(&mut self, name: &str, id: u16) -> Handle {
+        let f = self.realm.new_native(id);
+        let name_v = self.new_str(name);
+        self.realm.set_property(f, "name", name_v);
+        self.realm.mark_hidden(f, "name");
+        f
+    }
+
     /// Installs a small built-in library: the `Math` object and the global
     /// coercion/parse functions. (A token stdlib to prove the native-call path;
     /// the full port is the remaining migration work.)
@@ -514,7 +524,7 @@ impl<'a> Interp<'a> {
         let install_namespace = |this: &mut Self, global_name: &str, methods: &[(&str, u16)]| {
             let obj = this.realm.new_object();
             for (name, id) in methods {
-                let f = this.realm.new_native(*id);
+                let f = this.new_named_native(name, *id);
                 this.realm
                     .set_property(obj, name, NanBox::handle(f.to_raw()));
             }
@@ -581,22 +591,22 @@ impl<'a> Interp<'a> {
         install_namespace(self, "console", &[("log", N_CONSOLE_LOG)]);
         // `Promise` is a native constructor (`new Promise(executor)`); its
         // `.resolve`/`.reject` statics are dispatched in `call_method`.
-        let promise_ctor = self.realm.new_native(N_PROMISE);
+        let promise_ctor = self.new_named_native("Promise", N_PROMISE);
         self.current
             .declare("Promise", NanBox::handle(promise_ctor.to_raw()));
         // `Date` is a native constructor; `Date.now()` is a static.
-        let date_ctor = self.realm.new_native(N_DATE);
+        let date_ctor = self.new_named_native("Date", N_DATE);
         self.current
             .declare("Date", NanBox::handle(date_ctor.to_raw()));
         // `RegExp` is a native constructor.
-        let regexp_ctor = self.realm.new_native(N_REGEXP);
+        let regexp_ctor = self.new_named_native("RegExp", N_REGEXP);
         self.current
             .declare("RegExp", NanBox::handle(regexp_ctor.to_raw()));
         // The `Error` family — native constructors producing `{ name, message }`.
         // Only the standard errors are globals; the `WebAssembly.*` error
         // subclasses are installed under the WebAssembly namespace below.
         for (i, name) in ERROR_NAMES.iter().enumerate().take(N_GLOBAL_ERROR_COUNT) {
-            let ctor = self.realm.new_native(N_ERROR_BASE + i as u16);
+            let ctor = self.new_named_native(name, N_ERROR_BASE + i as u16);
             self.current.declare(name, NanBox::handle(ctor.to_raw()));
         }
         install_namespace(
@@ -684,7 +694,7 @@ impl<'a> Interp<'a> {
             ("btoa", N_BTOA),
             ("atob", N_ATOB),
         ] {
-            let f = self.realm.new_native(id);
+            let f = self.new_named_native(name, id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
         }
         // The `Intl` namespace with its format constructors.
@@ -693,14 +703,14 @@ impl<'a> Interp<'a> {
             ("NumberFormat", N_INTL_NUMBER_FORMAT),
             ("DateTimeFormat", N_INTL_DATETIME_FORMAT),
         ] {
-            let f = self.realm.new_native(id);
+            let f = self.new_named_native(name, id);
             self.realm
                 .set_property(intl, name, NanBox::handle(f.to_raw()));
         }
         self.current.declare("Intl", NanBox::handle(intl.to_raw()));
         // The typed-array constructors.
         for (i, (name, _)) in TYPED_ARRAY_KINDS.iter().enumerate() {
-            let f = self.realm.new_native(N_TYPED_ARRAY_BASE + i as u16);
+            let f = self.new_named_native(name, N_TYPED_ARRAY_BASE + i as u16);
             self.current.declare(name, NanBox::handle(f.to_raw()));
         }
         for (name, id) in [("ArrayBuffer", N_ARRAY_BUFFER), ("DataView", N_DATA_VIEW)] {
