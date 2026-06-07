@@ -95,6 +95,25 @@ int kt_compile(const char *source, size_t source_len, char *out, size_t *out_len
  */
 int kt_load_bytecode(const char *bytecode, size_t bytecode_len, char *out, size_t *out_len);
 
+/*
+ * Run `source` and write a D' snapshot of its completion value's object graph
+ * into `out` (portable bytes) per the in/out length convention. The completion
+ * must be a heap object (object/array/string/...); a primitive completion returns
+ * KT_INVALID_INPUT with the message in `out`. The bytes pair with kt_restore and
+ * may be persisted or moved across processes on a matching host.
+ */
+int kt_snapshot(const char *source, size_t source_len, char *out, size_t *out_len);
+
+/*
+ * Restore a snapshot written by kt_snapshot into a fresh runtime and write its
+ * first root value, rendered as a string, into `out` per the in/out length
+ * convention. Returns KT_OK on success, KT_INVALID_INPUT for a malformed snapshot,
+ * or the same buffer/pointer/internal codes as kt_eval. (Data graphs restore
+ * standalone; a snapshot containing closures must be reloaded by a runtime holding
+ * the same code.)
+ */
+int kt_restore(const char *snapshot, size_t snapshot_len, char *out, size_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

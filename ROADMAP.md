@@ -177,11 +177,13 @@ moving GC. "Complete" means *any* live heap snapshots, reloads zero-copy, and
   interpreter holding the same code and call the closure, which resumes from the
   snapshotted state independent of the new runtime's own program instance
   (`snapshot_reloads_into_a_fresh_runtime`) — the load → evict → reload scenario.
-  A **public library API** now exposes this: `Interp::snapshot(&[roots]) -> bytes`
+  A **public library API** exposes this: `Interp::snapshot(&[roots]) -> bytes`
   and `Interp::restore_snapshot(&bytes) -> Vec<Value>`, tested cross-runtime through
   the supported surface alone (`public_snapshot_api_round_trips_across_runtimes`),
-  with a malformed snapshot rejected rather than panicked on. *Remaining:* a C-ABI
-  binding of the same two calls, and persisting the bytes through the
+  with a malformed snapshot rejected rather than panicked on. A **C-ABI binding** of
+  the same two calls is in — `kt_snapshot(source) -> bytes` and `kt_restore(bytes)
+  -> string` (panic-guarded, length-convention, header-documented; round-trip
+  tested through the C entry points). *Remaining:* persisting the bytes through the
   content-addressed artifact store below.
 - **The shared, versioned, mmap-able artifact store (code-cache, §6):** *Started:*
   a content-addressed store keys serialized snapshots by an FNV-1a hash of their

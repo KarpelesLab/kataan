@@ -179,6 +179,35 @@ fn run_bytecode_to_string(bytes: &[u8]) -> Result<alloc::string::String, alloc::
     }
 }
 
+/// Runs `src` and serializes the object graph of its completion value to a D′
+/// snapshot, or an error message if the completion isn't a heap object.
+#[cfg(feature = "std")]
+fn snapshot_source(src: &str) -> Result<alloc::vec::Vec<u8>, alloc::string::String> {
+    use alloc::string::ToString;
+    let program = crate::parser::Parser::parse_program(src).map_err(|e| e.to_string())?;
+    let mut interp = crate::nbexec::Interp::new();
+    let value = interp.run(&program).map_err(|e| alloc::format!("{e:?}"))?;
+    if value.as_handle().is_none() {
+        return Err("completion value is not a heap object to snapshot".to_string());
+    }
+    Ok(interp.snapshot(&[value]))
+}
+
+/// Restores a D′ snapshot into a fresh interpreter and renders its first root
+/// value to a string — the load → reload path for data graphs across the C ABI.
+#[cfg(feature = "std")]
+fn restore_to_string(bytes: &[u8]) -> Result<alloc::string::String, alloc::string::String> {
+    let mut interp = crate::nbexec::Interp::new();
+    let roots = interp
+        .restore_snapshot(bytes)
+        .map_err(|e| alloc::format!("{e:?}"))?;
+    let root = roots
+        .first()
+        .copied()
+        .unwrap_or(crate::nanbox::NanBox::undefined());
+    Ok(interp.realm().to_display_string(root))
+}
+
 /// Compiles `source` to a `.ktbc` bytecode artifact written into `out`.
 ///
 /// # Safety
@@ -243,6 +272,91 @@ pub unsafe extern "C" fn kt_load_bytecode(
         // SAFETY: caller guarantees `bytecode` covers `bytecode_len` bytes.
         let bytes = unsafe { core::slice::from_raw_parts(bytecode as *const u8, bytecode_len) };
         let (text, ok) = match run_bytecode_to_string(bytes) {
+            Ok(value) => (value, true),
+            Err(message) => (message, false),
+        };
+        // SAFETY: `out_len` is non-null; `out` honors the length convention.
+        match unsafe { copy_out(text.as_bytes(), out, out_len) } {
+            KtStatus::Ok if !ok => KtStatus::InvalidInput,
+            other => other,
+        }
+    }));
+    match outcome {
+        Ok(status) => status as c_int,
+        Err(_) => KtStatus::Internal as c_int,
+    }
+}
+
+/// Runs `source` and writes a D′ snapshot of its completion value's object graph
+/// into `out` — portable bytes that [`kt_restore`] reloads. The completion must be
+/// a heap object (object/array/string/…); a primitive completion yields
+/// [`KtStatus::InvalidInput`] with the message in `out`.
+///
+/// # Safety
+///
+/// Same contract as [`kt_eval`]: `out_len` must be valid; `source` must cover
+/// `source_len` bytes; `out` must hold `*out_len` writable bytes when the result
+/// fits.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_snapshot(
+    source: *const c_char,
+    source_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if out_len.is_null() || (source.is_null() && source_len != 0) {
+            return KtStatus::NullPointer;
+        }
+        // SAFETY: caller guarantees `source` covers `source_len` bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(source as *const u8, source_len) };
+        let Ok(src) = core::str::from_utf8(bytes) else {
+            return KtStatus::InvalidInput;
+        };
+        let (data, ok) = match snapshot_source(src) {
+            Ok(artifact) => (artifact, true),
+            Err(message) => (message.into_bytes(), false),
+        };
+        // SAFETY: `out_len` is non-null; `out` honors the length convention.
+        match unsafe { copy_out(&data, out, out_len) } {
+            KtStatus::Ok if !ok => KtStatus::InvalidInput,
+            other => other,
+        }
+    }));
+    match outcome {
+        Ok(status) => status as c_int,
+        Err(_) => KtStatus::Internal as c_int,
+    }
+}
+
+/// Restores a snapshot written by [`kt_snapshot`] into a fresh runtime and writes
+/// its first root value's string rendering into `out` (the cross-process load →
+/// reload path for data graphs). A malformed snapshot yields
+/// [`KtStatus::InvalidInput`].
+///
+/// # Safety
+///
+/// Same contract as [`kt_load_bytecode`]: `out_len` must be valid; `snapshot` must
+/// cover `snapshot_len` bytes; `out` must hold `*out_len` writable bytes when the
+/// result fits.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_restore(
+    snapshot: *const c_char,
+    snapshot_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if out_len.is_null() || (snapshot.is_null() && snapshot_len != 0) {
+            return KtStatus::NullPointer;
+        }
+        // SAFETY: caller guarantees `snapshot` covers `snapshot_len` bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(snapshot as *const u8, snapshot_len) };
+        let (text, ok) = match restore_to_string(bytes) {
             Ok(value) => (value, true),
             Err(message) => (message, false),
         };
@@ -360,6 +474,85 @@ mod tests {
         let (status, out) = eval_str("[1, 2, 3].map(x => x * x).join(',')");
         assert_eq!(status, KtStatus::Ok);
         assert_eq!(out, "1,4,9");
+    }
+
+    #[cfg(feature = "std")]
+    fn snapshot_bytes(src: &str) -> (KtStatus, alloc::vec::Vec<u8>) {
+        let mut len: usize = 0;
+        unsafe {
+            kt_snapshot(
+                src.as_ptr() as *const c_char,
+                src.len(),
+                core::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        let mut buf = alloc::vec![0i8; len];
+        let rc = unsafe {
+            kt_snapshot(
+                src.as_ptr() as *const c_char,
+                src.len(),
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        let bytes: alloc::vec::Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+        let status = if rc == KtStatus::Ok as i32 {
+            KtStatus::Ok
+        } else {
+            KtStatus::InvalidInput
+        };
+        (status, bytes)
+    }
+
+    #[cfg(feature = "std")]
+    fn restore_str(snapshot: &[u8]) -> (KtStatus, alloc::string::String) {
+        let mut len: usize = 0;
+        unsafe {
+            kt_restore(
+                snapshot.as_ptr() as *const c_char,
+                snapshot.len(),
+                core::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        let mut buf = alloc::vec![0i8; len];
+        let rc = unsafe {
+            kt_restore(
+                snapshot.as_ptr() as *const c_char,
+                snapshot.len(),
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        let bytes: alloc::vec::Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+        let status = if rc == KtStatus::Ok as i32 {
+            KtStatus::Ok
+        } else {
+            KtStatus::InvalidInput
+        };
+        (status, alloc::string::String::from_utf8(bytes).unwrap())
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn snapshot_and_restore_round_trip() {
+        // A data graph snapshotted in one runtime restores and renders in another
+        // through the C ABI alone.
+        let (s1, bytes) = snapshot_bytes("[1, 2, 3]");
+        assert_eq!(s1, KtStatus::Ok);
+        assert!(!bytes.is_empty());
+        let (s2, text) = restore_str(&bytes);
+        assert_eq!(s2, KtStatus::Ok);
+        assert_eq!(text, "1,2,3");
+
+        // A primitive completion has no object graph to snapshot.
+        let (s3, _) = snapshot_bytes("42");
+        assert_eq!(s3, KtStatus::InvalidInput);
+
+        // A malformed snapshot is rejected, not panicked on.
+        let (s4, _) = restore_str(b"not a snapshot");
+        assert_eq!(s4, KtStatus::InvalidInput);
     }
 
     #[cfg(feature = "std")]
