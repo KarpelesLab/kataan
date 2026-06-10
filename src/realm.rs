@@ -521,6 +521,24 @@ impl Realm {
         )
     }
 
+    /// Enumerable named keys held in a handle's **auxiliary** object — the named
+    /// properties an array/function/native carries alongside its elements (e.g.
+    /// `arr.custom = …`, or a regex match result's `index`/`input`). Empty if none.
+    #[must_use]
+    pub fn aux_named_keys(&self, handle: Handle) -> Vec<alloc::string::String> {
+        let Some(aux) = self.aux_props.get(&handle.to_raw()) else {
+            return alloc::vec::Vec::new();
+        };
+        let Some(obj) = self.heap.get(*aux).and_then(Cell::as_object) else {
+            return alloc::vec::Vec::new();
+        };
+        obj.enumerable_keys()
+            .iter()
+            .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+            .map(|s| alloc::string::String::from(*s))
+            .collect()
+    }
+
     /// Own enumerable keys **including** symbol keys (the `\0sym:` internal
     /// names), excluding only private (`#`) fields — for `Object.assign` and
     /// spread, which copy own enumerable string *and* symbol properties.
@@ -917,6 +935,18 @@ impl Realm {
     pub fn mark_hidden(&mut self, handle: Handle, key: &str) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.set_hidden(key);
+            return;
+        }
+        // Arrays/functions/natives keep named properties — and their non-enumerable
+        // flags — in their auxiliary object (e.g. a native's `name`/`length`).
+        let aux_eligible = self.heap.get(handle).is_some_and(|c| {
+            c.as_array().is_some() || c.as_function().is_some() || c.as_native().is_some()
+        });
+        if aux_eligible {
+            let aux = self.aux_object(handle);
+            if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                o.set_hidden(key);
+            }
         }
     }
 

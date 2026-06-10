@@ -1221,34 +1221,36 @@ fn run_frame(
             }
             Op::EnumKeys { dst, obj } => {
                 let h = object_handle(regs[*obj as usize])?;
-                // A VM closure backs onto an array but is a function, so for-in
-                // walks its named properties, not the captured-cell indices.
-                let array_indices = ctx
-                    .realm
-                    .array_length(h)
-                    .filter(|_| !ctx.realm.is_vm_function(h));
-                let keys: Vec<NanBox> = if let Some(len) = array_indices {
-                    (0..len)
-                        .map(|i| {
-                            NanBox::handle(ctx.realm.new_string(&alloc::format!("{i}")).to_raw())
-                        })
-                        .collect()
-                } else {
-                    // Own enumerable keys, then enumerable keys inherited through
-                    // the prototype chain (each name once, own first).
-                    let mut seen = alloc::collections::BTreeSet::new();
-                    let mut out = Vec::new();
-                    let mut cur = Some(h);
-                    while let Some(c) = cur {
-                        for k in ctx.realm.object_keys(c).unwrap_or_default() {
-                            if seen.insert(k.clone()) {
-                                out.push(NanBox::handle(ctx.realm.new_string(&k).to_raw()));
-                            }
+                let mut seen = alloc::collections::BTreeSet::new();
+                let mut out = Vec::new();
+                // An array leads with its integer indices (a VM closure's backing
+                // cells are not enumerable).
+                if !ctx.realm.is_vm_function(h)
+                    && let Some(len) = ctx.realm.array_length(h)
+                {
+                    for i in 0..len {
+                        let k = alloc::format!("{i}");
+                        if seen.insert(k.clone()) {
+                            out.push(NanBox::handle(ctx.realm.new_string(&k).to_raw()));
                         }
-                        cur = ctx.realm.object_proto(c);
                     }
-                    out
-                };
+                }
+                // Own enumerable keys (named props live in the cell for objects, in
+                // the auxiliary object for arrays/functions), then inherited.
+                let mut cur = Some(h);
+                while let Some(c) = cur {
+                    let named = ctx
+                        .realm
+                        .object_keys(c)
+                        .unwrap_or_else(|| ctx.realm.aux_named_keys(c));
+                    for k in named {
+                        if seen.insert(k.clone()) {
+                            out.push(NanBox::handle(ctx.realm.new_string(&k).to_raw()));
+                        }
+                    }
+                    cur = ctx.realm.object_proto(c);
+                }
+                let keys = out;
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(keys).to_raw());
             }
             Op::ObjectSpread { dst, src } => {
@@ -2360,11 +2362,15 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                         pairs.push((alloc::format!("{i}"), v));
                     }
                 }
-                if let Some(named) = ctx.realm.object_keys(h) {
-                    for k in named {
-                        let v = ctx.realm.get_property(h, &k).unwrap_or(NanBox::undefined());
-                        pairs.push((k, v));
-                    }
+                // Plain objects keep keys in the cell; arrays/functions keep named
+                // properties in their auxiliary object.
+                let named = ctx
+                    .realm
+                    .object_keys(h)
+                    .unwrap_or_else(|| ctx.realm.aux_named_keys(h));
+                for k in named {
+                    let v = ctx.realm.get_property(h, &k).unwrap_or(NanBox::undefined());
+                    pairs.push((k, v));
                 }
             }
             let mut out = Vec::with_capacity(pairs.len());

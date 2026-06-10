@@ -1097,6 +1097,11 @@ impl<'a> Interp<'a> {
                     }
                     if let Some(named) = self.realm.object_keys(h) {
                         keys.extend(named);
+                    } else {
+                        // An array/function/native keeps named properties in its
+                        // auxiliary object (e.g. `arr.custom`, a match result's
+                        // `index`/`input`).
+                        keys.extend(self.realm.aux_named_keys(h));
                     }
                     // A class constructor's enumerable own keys are its static
                     // fields (static methods/accessors are non-enumerable).
@@ -1458,7 +1463,11 @@ impl<'a> Interp<'a> {
                     {
                         vals.extend(elems);
                     }
-                    for k in self.realm.object_keys(h).unwrap_or_default() {
+                    let named = self
+                        .realm
+                        .object_keys(h)
+                        .unwrap_or_else(|| self.realm.aux_named_keys(h));
+                    for k in named {
                         vals.push(
                             self.realm
                                 .get_property(h, &k)
@@ -1534,7 +1543,11 @@ impl<'a> Interp<'a> {
                             entries.push((alloc::format!("{i}"), v));
                         }
                     }
-                    for k in self.realm.object_keys(h).unwrap_or_default() {
+                    let named = self
+                        .realm
+                        .object_keys(h)
+                        .unwrap_or_else(|| self.realm.aux_named_keys(h));
+                    for k in named {
                         let v = self
                             .realm
                             .get_property(h, &k)
@@ -7631,22 +7644,31 @@ impl<'a> Interp<'a> {
         // A proxy with no `ownKeys` trap (the trap case is handled by the caller)
         // enumerates its target's keys.
         let h = self.proxy_key_target(h);
-        // A VM closure backs onto an array but is a function — its captured cells
-        // are not enumerable, so fall through to the named-property walk.
-        if !self.realm.is_vm_function(h)
-            && let Some(len) = self.realm.array_length(h)
-        {
-            return (0..len)
-                .map(|i| self.new_str(&alloc::format!("{i}")))
-                .collect();
-        }
         // `for-in` enumerates own enumerable keys, then enumerable keys inherited
         // through the prototype chain — each name only once, own keys first.
         let mut seen = alloc::collections::BTreeSet::new();
         let mut out = Vec::new();
+        // An array's own keys lead with its integer indices (a VM closure's backing
+        // cells are not enumerable).
+        if !self.realm.is_vm_function(h)
+            && let Some(len) = self.realm.array_length(h)
+        {
+            for i in 0..len {
+                let k = alloc::format!("{i}");
+                if seen.insert(k.clone()) {
+                    out.push(self.new_str(&k));
+                }
+            }
+        }
         let mut cur = Some(h);
         while let Some(c) = cur {
-            for k in self.realm.object_keys(c).unwrap_or_default() {
+            // Plain objects keep keys in the cell; arrays/functions keep named
+            // properties in their auxiliary object.
+            let named = self
+                .realm
+                .object_keys(c)
+                .unwrap_or_else(|| self.realm.aux_named_keys(c));
+            for k in named {
                 if seen.insert(k.clone()) {
                     out.push(self.new_str(&k));
                 }
