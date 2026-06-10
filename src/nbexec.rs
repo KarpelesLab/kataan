@@ -5380,6 +5380,13 @@ impl<'a> Interp<'a> {
         if self.realm.native_at(handle) == Some(N_PROMISE) {
             match method {
                 "resolve" => {
+                    // `Promise.resolve(x)` is idempotent on a promise: if `x` is
+                    // already a promise, return it unchanged (same identity).
+                    if let Some(raw) = arg(0).as_handle()
+                        && self.realm.promise_state(Handle::from_raw(raw)).is_some()
+                    {
+                        return Ok(Some(arg(0)));
+                    }
                     let p = self.realm.new_promise();
                     self.resolve_with(p, arg(0));
                     return Ok(Some(NanBox::handle(p.to_raw())));
