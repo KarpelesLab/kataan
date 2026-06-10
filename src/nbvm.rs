@@ -694,6 +694,25 @@ fn make_error(realm: &mut Realm, name: &str, message: &str) -> NanBox {
     NanBox::handle(obj.to_raw())
 }
 
+const SYM_NUM_ERR: &str = "Cannot convert a Symbol value to a number";
+const SYM_STR_ERR: &str = "Cannot convert a Symbol value to a string";
+
+/// A `TypeError` value when `x` or `y` is a Symbol (which has no implicit numeric/
+/// string conversion), else `None`. The caller `handle_throw!`s the result so the
+/// VM's exception-handler stack (`try`/`catch`) sees it.
+fn symbol_coercion_error(realm: &mut Realm, x: NanBox, y: NanBox, msg: &str) -> Option<NanBox> {
+    let is_sym = |v: NanBox| {
+        v.as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| realm.symbol_at(h).is_some())
+    };
+    if is_sym(x) || is_sym(y) {
+        Some(make_error(realm, "TypeError", msg))
+    } else {
+        None
+    }
+}
+
 /// Settles promise `p` with `value` (fulfilled or rejected), queueing its
 /// pending reactions as microtasks. A no-op if already settled or not a promise.
 fn settle(ctx: &mut Ctx, p: Handle, value: NanBox, fulfilled: bool) {
@@ -963,21 +982,33 @@ fn run_frame(
             Op::Sub { dst, a, b } => {
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
                 let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
+                    handle_throw!(VmError::Thrown(e));
+                }
                 regs[*dst as usize] = ctx.realm.sub(x, y);
             }
             Op::Mul { dst, a, b } => {
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
                 let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
+                    handle_throw!(VmError::Thrown(e));
+                }
                 regs[*dst as usize] = ctx.realm.mul(x, y);
             }
             Op::Div { dst, a, b } => {
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
                 let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
+                    handle_throw!(VmError::Thrown(e));
+                }
                 regs[*dst as usize] = ctx.realm.div(x, y);
             }
             Op::Mod { dst, a, b } => {
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
                 let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
+                    handle_throw!(VmError::Thrown(e));
+                }
                 regs[*dst as usize] = ctx.realm.rem(x, y);
             }
             Op::HasProp { dst, key, obj } => {
@@ -1063,6 +1094,9 @@ fn run_frame(
             #[cfg(feature = "std")]
             Op::BitNot { dst, a } => {
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
+                if let Some(e) = symbol_coercion_error(ctx.realm, x, x, SYM_NUM_ERR) {
+                    handle_throw!(VmError::Thrown(e));
+                }
                 regs[*dst as usize] = ctx.realm.bit_not(x);
             }
             #[cfg(not(feature = "std"))]
@@ -1083,6 +1117,9 @@ fn run_frame(
                     _ => {
                         let xn = to_primitive(ctx, funcs, x, true);
                         let yn = to_primitive(ctx, funcs, y, true);
+                        if let Some(e) = symbol_coercion_error(ctx.realm, xn, yn, SYM_NUM_ERR) {
+                            handle_throw!(VmError::Thrown(e));
+                        }
                         match *op {
                             VB_POW => ctx.realm.pow(xn, yn),
                             VB_BIT_AND => ctx.realm.bit_and(xn, yn),
@@ -1100,6 +1137,9 @@ fn run_frame(
             }
             Op::Neg { dst, a } => {
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
+                if let Some(e) = symbol_coercion_error(ctx.realm, x, x, SYM_NUM_ERR) {
+                    handle_throw!(VmError::Thrown(e));
+                }
                 regs[*dst as usize] = ctx.realm.neg(x);
             }
             Op::Not { dst, a } => {
@@ -1111,6 +1151,9 @@ fn run_frame(
                 // (ToPrimitive) work natively instead of erroring into a fallback.
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
                 let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
+                    handle_throw!(VmError::Thrown(e));
+                }
                 regs[*dst as usize] = ctx.realm.less_than(x, y);
             }
             Op::AddValue { dst, a, b } => {
@@ -1119,6 +1162,9 @@ fn run_frame(
                 // concatenation vs numeric addition from the resulting primitives.
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
                 let y = to_primitive(ctx, funcs, regs[*b as usize], true);
+                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_STR_ERR) {
+                    handle_throw!(VmError::Thrown(e));
+                }
                 regs[*dst as usize] = ctx.realm.add(x, y);
             }
             Op::StrictEq { dst, a, b } => {
