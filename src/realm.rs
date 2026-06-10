@@ -1180,7 +1180,15 @@ impl Realm {
                     }
                 }
                 Some(Cell::RegExp { source, flags, .. }) => alloc::format!("/{source}/{flags}"),
-                Some(Cell::Symbol { description, .. }) => alloc::format!("Symbol({description})"),
+                Some(Cell::Symbol { description, .. }) => {
+                    // A no-argument `Symbol()` carries a `\0`-sentinel description
+                    // (an undefined `.description`); render it as `Symbol()`.
+                    if description.starts_with('\u{0}') {
+                        alloc::string::String::from("Symbol()")
+                    } else {
+                        alloc::format!("Symbol({description})")
+                    }
+                }
                 Some(Cell::BigInt(n)) => alloc::format!("{n}"),
                 // A proxy renders as its target would.
                 Some(Cell::Proxy { target, .. }) => {

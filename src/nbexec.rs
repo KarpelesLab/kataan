@@ -5117,7 +5117,9 @@ impl<'a> Interp<'a> {
         if let Some((desc, _)) = self.realm.symbol_at(handle)
             && method == "toString"
         {
-            return Ok(Some(self.new_str(&alloc::format!("Symbol({desc})"))));
+            // A no-argument `Symbol()` has an empty (undefined) description.
+            let shown = if desc.starts_with('\u{0}') { "" } else { &desc };
+            return Ok(Some(self.new_str(&alloc::format!("Symbol({shown})"))));
         }
         // --- BigInt instance: `toString(radix)` / `valueOf` ---
         if let Some(big) = self.realm.bigint_at(handle) {
