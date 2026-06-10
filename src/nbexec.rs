@@ -10767,6 +10767,10 @@ impl<'a> Interp<'a> {
             let m = self.new_str("Right-hand side of 'instanceof' is not an object");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         };
+        // A bound function tests `instanceof` against its target function.
+        if let Some(target) = self.realm.get_property(ch, BOUND_TARGET) {
+            return self.instance_of(obj, target);
+        }
         let is_ctor = self.realm.native_at(ch).is_some()
             || self.realm.function_at(ch).is_some()
             || self.realm.class_at(ch).is_some()
