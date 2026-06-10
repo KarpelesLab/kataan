@@ -8127,8 +8127,9 @@ impl<'a> Interp<'a> {
         match target {
             BindingTarget::Ident(Ident { name, .. }) => self.current.declare(name, value),
             BindingTarget::Array(pat) => {
-                // Any iterable destructures (strings, Sets, generators, …).
-                let elems = self.iterate_values(value).unwrap_or_default();
+                // Any iterable destructures (strings, Sets, generators, …); a
+                // non-iterable (null, a plain object, a number) is a TypeError.
+                let elems = self.iterate_values(value)?;
                 let mut i = 0;
                 for el in &pat.elements {
                     match el {
@@ -8557,7 +8558,8 @@ impl<'a> Interp<'a> {
     fn assign_destructure(&mut self, target: &'a Expr, value: NanBox) -> Result<(), ExecError> {
         match target {
             Expr::Array { elements, .. } => {
-                let items = self.iterate_values(value).unwrap_or_default();
+                // A non-iterable right-hand side (null, a plain object) is a TypeError.
+                let items = self.iterate_values(value)?;
                 let mut i = 0;
                 for el in elements {
                     match el {
