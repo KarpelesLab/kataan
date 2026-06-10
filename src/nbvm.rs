@@ -3468,6 +3468,11 @@ struct Compiler {
     /// Active statement labels → the `break_sites`/`continue_sites` stack index
     /// of the loop they label (for `break label` / `continue label`).
     labels: Vec<(String, usize)>,
+    /// In `main`: a top-level function declaration name → the register holding its
+    /// one canonical closure (materialized once at entry). Reading the function as
+    /// a *value* uses this register, so it has a stable identity (`f === f`) and
+    /// holds assigned properties; *calls* still dispatch directly via `fn_ids`.
+    fn_value_regs: alloc::collections::BTreeMap<String, Reg>,
 }
 
 impl Compiler {
@@ -3605,6 +3610,21 @@ impl Compiler {
                 key: name.clone(),
                 src: v,
             });
+        }
+        // In `main`, materialize one canonical closure per top-level function
+        // declaration so referencing it as a value has a stable identity (and can
+        // hold assigned properties). Calls still dispatch directly by id.
+        if is_main {
+            for stmt in body {
+                if let Stmt::Function(f) = stmt
+                    && let Some(id) = &f.id
+                    && let Some(&func) = c.fn_ids.get(&*id.name)
+                {
+                    let reg = c.alloc();
+                    c.ops.push(Op::LoadFunc { dst: reg, func });
+                    c.fn_value_regs.insert(String::from(&*id.name), reg);
+                }
+            }
         }
         let mut last: Option<Reg> = None;
         for stmt in body {
@@ -4385,8 +4405,14 @@ impl Compiler {
             Expr::Ident(id) => {
                 if let Some(b) = self.lookup(&id.name) {
                     Ok(self.read_var(b))
+                } else if let Some(&reg) = self.fn_value_regs.get(&*id.name) {
+                    // A top-level function used as a value: its one canonical
+                    // closure (same handle each time → stable identity, holds
+                    // assigned properties).
+                    Ok(reg)
                 } else if let Some(&func) = self.fn_ids.get(&*id.name) {
-                    // A function referenced as a value: materialize a closure.
+                    // A function referenced as a value before the canonical closure
+                    // is available (e.g. inside a nested function): materialize one.
                     let dst = self.alloc();
                     self.ops.push(Op::LoadFunc { dst, func });
                     Ok(dst)
