@@ -7381,6 +7381,20 @@ impl<'a> Interp<'a> {
                 ..
             } => {
                 let iterable = self.eval(right)?;
+                // A user iterator (not a built-in array/string/Map/Set or generator)
+                // runs lazily: one `next()` per iteration, with `IteratorClose` on an
+                // early exit — so `break` calls `return()` and an infinite iterator can
+                // be cut short. `for await` keeps the eager path (it awaits each value).
+                if !*is_await && let Some(ih) = self.for_of_get_iterator(iterable)? {
+                    // A user `[Symbol.iterator]` that is a generator is still drained
+                    // eagerly (its `next` is built-in dispatch, not a readable method) —
+                    // from this same iterator, so it is not re-created.
+                    if self.realm.get_property(ih, GEN_BUF).is_some() {
+                        let values = self.iterate_values(NanBox::handle(ih.to_raw()))?;
+                        return self.exec_for_each(left, body, values);
+                    }
+                    return self.exec_for_of_iter(left, body, ih);
+                }
                 let mut values = self.iterate_values(iterable)?;
                 // `for await (…)`: await each iterated value (a non-promise passes
                 // through unchanged).
@@ -7783,6 +7797,113 @@ impl<'a> Interp<'a> {
 
     /// Runs `body` once per `item`, binding the loop variable (a fresh scope per
     /// iteration for a declared head).
+    /// Obtains a *user* iterable's iterator object (calling `[Symbol.iterator]`
+    /// once), for the lazy `for-of` path. Returns `None` for built-in iterables
+    /// (arrays/strings/Maps/Sets) and generator values, which `iterate_values`
+    /// drains eagerly, and for non-iterables.
+    fn for_of_get_iterator(&mut self, v: NanBox) -> Result<Option<Handle>, ExecError> {
+        let Some(h) = v.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        if self.realm.array_elements(h).is_some()
+            || self.realm.string_value(h).is_some()
+            || self.realm.collection_entries(h).is_some()
+            || self.realm.get_property(h, GEN_BUF).is_some()
+        {
+            return Ok(None);
+        }
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
+        let mut iter_fn = self.realm.get_property(h, &iter_key);
+        if iter_fn.is_none() {
+            iter_fn = self.class_iterator_method(h)?;
+        }
+        let Some(f) = iter_fn else { return Ok(None) };
+        if !f
+            .as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            return Ok(None);
+        }
+        let iterator = self.call_with_this(f, v, &[])?;
+        match iterator.as_handle().map(Handle::from_raw) {
+            Some(ih) => Ok(Some(ih)),
+            None => Err(ExecError::Throw(self.new_str("iterator is not an object"))),
+        }
+    }
+
+    /// `IteratorClose`: invoke the iterator's `return()` method (if any) on an early
+    /// exit, so the iterator can release resources. Errors from `return()` propagate.
+    fn iterator_close(&mut self, ih: Handle) -> Result<(), ExecError> {
+        let ret = self.read_member(ih, "return")?;
+        if ret
+            .as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            self.call_with_this(ret, NanBox::handle(ih.to_raw()), &[])?;
+        }
+        Ok(())
+    }
+
+    /// A lazy `for-of` over a user iterator: pull one value per iteration (so an
+    /// infinite iterator can be cut short by `break`), and run `IteratorClose` on
+    /// every early exit (`break`/`return`/`throw`) — unlike the eager path.
+    fn exec_for_of_iter(
+        &mut self,
+        left: &'a crate::ast::ForLeft,
+        body: &'a Stmt,
+        ih: Handle,
+    ) -> Result<Flow, ExecError> {
+        use crate::ast::ForLeft;
+        let label = self.pending_label.take();
+        let iterator = NanBox::handle(ih.to_raw());
+        loop {
+            let next_fn = self.read_member(ih, "next")?;
+            let res = self.call_with_this(next_fn, iterator, &[])?;
+            let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                return Err(ExecError::Throw(
+                    self.new_str("iterator result is not an object"),
+                ));
+            };
+            let done = self.read_member(rh, "done")?;
+            if self.realm.truthy(done) {
+                return Ok(Flow::Normal(NanBox::undefined()));
+            }
+            let item = self.read_member(rh, "value")?;
+            let child = self.current.child();
+            let saved = core::mem::replace(&mut self.current, child);
+            let r = (|| {
+                match left {
+                    ForLeft::Decl { target, .. } => self.bind_pattern(target, item)?,
+                    ForLeft::Target(expr) => {
+                        self.assign_to(expr, item)?;
+                    }
+                }
+                self.exec(body)
+            })();
+            self.current = saved;
+            match r {
+                Ok(flow) => match loop_action(flow, &label) {
+                    LoopAction::Next => {}
+                    LoopAction::Stop => {
+                        self.iterator_close(ih)?;
+                        return Ok(Flow::Normal(NanBox::undefined()));
+                    }
+                    LoopAction::Propagate(f) => {
+                        self.iterator_close(ih)?;
+                        return Ok(f);
+                    }
+                },
+                Err(e) => {
+                    // An abrupt body completion still closes the iterator, but its
+                    // own error is suppressed in favor of the original.
+                    let _ = self.iterator_close(ih);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     fn exec_for_each(
         &mut self,
         left: &'a crate::ast::ForLeft,
