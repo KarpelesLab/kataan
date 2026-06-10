@@ -9175,9 +9175,13 @@ impl<'a> Interp<'a> {
                 let raw: Vec<NanBox> = quasi.quasis.iter().map(|q| self.new_str(&q.raw)).collect();
                 let strings_h = self.realm.new_array(strings);
                 // The strings object carries a `.raw` array (for `String.raw` and
-                // tags reading `strings.raw`).
-                let raw_arr = NanBox::handle(self.realm.new_array(raw).to_raw());
-                self.realm.set_property(strings_h, "raw", raw_arr);
+                // tags reading `strings.raw`). Both arrays are frozen, per spec —
+                // freeze `.raw` first and `strings` last so the property write lands.
+                let raw_h = self.realm.new_array(raw);
+                self.realm.freeze_object(raw_h);
+                self.realm
+                    .set_property(strings_h, "raw", NanBox::handle(raw_h.to_raw()));
+                self.realm.freeze_object(strings_h);
                 let strings_arr = NanBox::handle(strings_h.to_raw());
                 let mut args = alloc::vec![strings_arr];
                 for e in &quasi.expressions {
