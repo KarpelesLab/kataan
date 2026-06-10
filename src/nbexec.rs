@@ -1866,7 +1866,7 @@ impl<'a> Interp<'a> {
                     Unpacked::Undefined => String::from("[object Undefined]"),
                     Unpacked::Null => String::from("[object Null]"),
                     _ => match this.as_handle().map(Handle::from_raw) {
-                        Some(h) => alloc::format!("[object {}]", self.object_string_tag(h)),
+                        Some(h) => alloc::format!("[object {}]", self.object_string_tag(h)?),
                         // A boxed primitive's tag (number/boolean/string immediates).
                         None => String::from("[object Object]"),
                     },
@@ -6809,7 +6809,7 @@ impl<'a> Interp<'a> {
             if method == "valueOf" {
                 return Ok(Some(recv));
             }
-            let tag = self.object_string_tag(h);
+            let tag = self.object_string_tag(h)?;
             return Ok(Some(self.new_str(&alloc::format!("[object {tag}]"))));
         }
         Ok(None)
@@ -7170,16 +7170,19 @@ impl<'a> Interp<'a> {
         )
     }
 
-    fn object_string_tag(&mut self, h: crate::heap::Handle) -> String {
+    fn object_string_tag(&mut self, h: crate::heap::Handle) -> Result<String, ExecError> {
         let tag_sym = self.well_known_symbol("toStringTag");
         let tag_key = self.member_key(tag_sym);
-        if let Some(v) = self.realm.get_property(h, &tag_key)
-            && let Some(sh) = v.as_handle().map(Handle::from_raw)
+        // Read through the prototype chain so a `Symbol.toStringTag` accessor
+        // (e.g. `get [Symbol.toStringTag]() {…}` on a class) is invoked, not just
+        // an own data property.
+        let v = self.read_member(h, &tag_key)?;
+        if let Some(sh) = v.as_handle().map(Handle::from_raw)
             && let Some(s) = self.realm.string_value(sh)
         {
-            return s;
+            return Ok(s);
         }
-        if self.realm.is_array(h) {
+        Ok(if self.realm.is_array(h) {
             String::from("Array")
         } else if self.is_callable(h) || self.realm.class_at(h).is_some() {
             String::from("Function")
@@ -7189,7 +7192,7 @@ impl<'a> Interp<'a> {
             String::from("RegExp")
         } else {
             String::from("Object")
-        }
+        })
     }
 
     /// Allocates a heap string and returns its boxed handle.
