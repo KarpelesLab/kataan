@@ -2950,11 +2950,7 @@ impl<'a> Interp<'a> {
                 .macrotasks
                 .iter()
                 .enumerate()
-                .min_by(|(_, a), (_, b)| {
-                    a.delay
-                        .total_cmp(&b.delay)
-                        .then(a.seq.cmp(&b.seq))
-                })
+                .min_by(|(_, a), (_, b)| a.delay.total_cmp(&b.delay).then(a.seq.cmp(&b.seq)))
                 .map(|(i, _)| i)
                 .unwrap();
             let t = self.macrotasks.remove(idx);
