@@ -6194,6 +6194,8 @@ impl<'a> Interp<'a> {
                 }
                 "trimStart" => Some(self.new_str(s.trim_start())),
                 "trimEnd" => Some(self.new_str(s.trim_end())),
+                // A string's `toString`/`valueOf` is the string itself.
+                "toString" | "valueOf" => Some(recv),
                 // Strings are stored as well-formed UTF-8 (lone surrogates cannot
                 // be represented), so these are always well-formed already.
                 "isWellFormed" => Some(NanBox::boolean(true)),
@@ -9738,7 +9740,41 @@ impl<'a> Interp<'a> {
         {
             return Ok(ctor);
         }
+        // A built-in array/string/function exposes its prototype's methods as
+        // first-class values — so feature detection (`if (arr.flat)`,
+        // `typeof str.padStart`) and detached-method access resolve. (Ordinary
+        // `recv.m(args)` calls dispatch via `call_method` and never reach here.)
+        if let Some(m) = self.builtin_proto_method(handle, name) {
+            return Ok(m);
+        }
         Ok(direct)
+    }
+
+    /// For a built-in array/string/function value, the first-class method `name`
+    /// from its constructor's prototype (`Array.prototype` etc.), or `None`.
+    fn builtin_proto_method(&mut self, handle: Handle, name: &str) -> Option<NanBox> {
+        let ctor_name = if self.realm.string_value(handle).is_some() {
+            "String"
+        } else if self.realm.is_array(handle) {
+            "Array"
+        } else if self.realm.function_at(handle).is_some()
+            || self.realm.native_at(handle).is_some()
+            || self.realm.bound_native_at(handle).is_some()
+        {
+            "Function"
+        } else {
+            return None;
+        };
+        let proto = self
+            .current
+            .get(ctor_name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|ns| self.realm.get_property(ns, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)?;
+        let m = self.realm.get_property(proto, name)?;
+        (!matches!(m.unpack(), Unpacked::Undefined)).then_some(m)
     }
 
     fn member_value(&self, handle: crate::heap::Handle, key: &str) -> NanBox {
