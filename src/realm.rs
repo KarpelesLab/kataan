@@ -69,6 +69,11 @@ pub struct Realm {
     /// object part to carry the flag; same handle-keyed, non-GC-root caveat as
     /// `aux_props`.
     frozen_arrays: alloc::collections::BTreeSet<u64>,
+    /// Handles of sealed arrays (`Object.seal`/`freeze`) — same caveat.
+    sealed_arrays: alloc::collections::BTreeSet<u64>,
+    /// Handles of non-extensible arrays (`Object.preventExtensions`/`seal`/`freeze`)
+    /// — element writes past the end are rejected. Same caveat.
+    non_extensible_arrays: alloc::collections::BTreeSet<u64>,
     /// The default prototype (`Object.prototype`) installed on objects created by
     /// [`new_object`](Realm::new_object) once the global environment is set up. A
     /// `None`-proto object (`Object.create(null)`) opts out explicitly.
@@ -96,6 +101,8 @@ impl Realm {
             fn_ctor: alloc::collections::BTreeMap::new(),
             aux_props: alloc::collections::BTreeMap::new(),
             frozen_arrays: alloc::collections::BTreeSet::new(),
+            sealed_arrays: alloc::collections::BTreeSet::new(),
+            non_extensible_arrays: alloc::collections::BTreeSet::new(),
             default_object_proto: None,
         }
     }
@@ -648,9 +655,12 @@ impl Realm {
     /// Freezes the object at `handle` (`Object.freeze`); returns whether it was
     /// an object.
     pub fn freeze_object(&mut self, handle: Handle) -> bool {
-        // An array carries no inline object part — track frozen-ness aside.
+        // An array carries no inline object part — track frozen-ness aside. Frozen
+        // implies sealed and non-extensible.
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.frozen_arrays.insert(handle.to_raw());
+            self.sealed_arrays.insert(handle.to_raw());
+            self.non_extensible_arrays.insert(handle.to_raw());
             return true;
         }
         match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
@@ -694,13 +704,19 @@ impl Realm {
     /// `arr[index] = value` — grows the array with `undefined` holes if `index`
     /// is past the end (per JS). Returns `false` if the cell is not an array.
     pub fn set_element(&mut self, handle: Handle, index: usize, value: NanBox) -> bool {
-        // A frozen array rejects element writes (and any extension).
+        // A frozen array rejects all element writes; a sealed / non-extensible array
+        // rejects only writes that would grow it (a write to an existing index is
+        // still allowed when merely sealed).
         if self.frozen_arrays.contains(&handle.to_raw()) {
             return false;
         }
+        let non_ext = self.non_extensible_arrays.contains(&handle.to_raw());
         match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
                 if index >= a.len() {
+                    if non_ext {
+                        return false;
+                    }
                     a.resize(index + 1, NanBox::undefined());
                 }
                 a[index] = value;
@@ -714,7 +730,8 @@ impl Realm {
     /// `arr.push(value)` — appends, returning the new length, or `None` if the
     /// cell is not an array (or the array is frozen).
     pub fn array_push(&mut self, handle: Handle, value: NanBox) -> Option<usize> {
-        if self.frozen_arrays.contains(&handle.to_raw()) {
+        // A sealed / non-extensible (or frozen) array cannot grow.
+        if self.non_extensible_arrays.contains(&handle.to_raw()) {
             return None;
         }
         let a = self.heap.get_mut(handle).and_then(Cell::as_array_mut)?;
@@ -810,21 +827,30 @@ impl Realm {
 
     /// `Object.preventExtensions(obj)` — disallow new properties.
     pub fn prevent_extensions(&mut self, handle: Handle) {
-        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+        if self.heap.get(handle).and_then(Cell::as_array).is_some() {
+            self.non_extensible_arrays.insert(handle.to_raw());
+        } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.prevent_extensions();
         }
     }
 
     /// `Object.seal(obj)` — no new properties and no deletions.
     pub fn seal_object(&mut self, handle: Handle) {
-        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+        if self.heap.get(handle).and_then(Cell::as_array).is_some() {
+            self.sealed_arrays.insert(handle.to_raw());
+            self.non_extensible_arrays.insert(handle.to_raw());
+        } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.seal();
         }
     }
 
-    /// Whether the object at `handle` is extensible.
+    /// Whether the object at `handle` is extensible. A plain array is extensible
+    /// unless `preventExtensions`/`seal`/`freeze` marked it.
     #[must_use]
     pub fn is_extensible(&self, handle: Handle) -> bool {
+        if self.heap.get(handle).and_then(Cell::as_array).is_some() {
+            return !self.non_extensible_arrays.contains(&handle.to_raw());
+        }
         self.heap
             .get(handle)
             .and_then(Cell::as_object)
@@ -834,6 +860,9 @@ impl Realm {
     /// Whether the object at `handle` is sealed (or frozen).
     #[must_use]
     pub fn is_sealed(&self, handle: Handle) -> bool {
+        if self.heap.get(handle).and_then(Cell::as_array).is_some() {
+            return self.sealed_arrays.contains(&handle.to_raw());
+        }
         self.heap
             .get(handle)
             .and_then(Cell::as_object)
