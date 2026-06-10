@@ -481,6 +481,28 @@ const NUMBER_PROTO_METHODS: &[&str] = &[
 ];
 /// `Boolean.prototype` methods exposed as first-class values.
 const BOOLEAN_PROTO_METHODS: &[&str] = &["toString", "valueOf"];
+/// `Set.prototype` methods exposed as first-class values.
+const SET_PROTO_METHODS: &[&str] = &[
+    "add",
+    "has",
+    "delete",
+    "clear",
+    "forEach",
+    "keys",
+    "values",
+    "entries",
+    "union",
+    "intersection",
+    "difference",
+    "symmetricDifference",
+    "isSubsetOf",
+    "isSupersetOf",
+    "isDisjointFrom",
+];
+/// `Map.prototype` methods exposed as first-class values.
+const MAP_PROTO_METHODS: &[&str] = &[
+    "set", "get", "has", "delete", "clear", "forEach", "keys", "values", "entries",
+];
 /// `Function.prototype` methods exposed as first-class values.
 const FUNCTION_PROTO_METHODS: &[&str] = &["call", "apply", "bind", "toString"];
 /// Bound native: the `revoke` function from `Proxy.revocable` (carries the proxy).
@@ -987,6 +1009,8 @@ impl<'a> Interp<'a> {
         self.setup_first_class_prototype("Number", NUMBER_PROTO_METHODS);
         self.setup_first_class_prototype("Boolean", BOOLEAN_PROTO_METHODS);
         self.setup_first_class_prototype("Function", FUNCTION_PROTO_METHODS);
+        self.setup_first_class_prototype("Set", SET_PROTO_METHODS);
+        self.setup_first_class_prototype("Map", MAP_PROTO_METHODS);
         // Newly-created plain objects now inherit from `Object.prototype`.
         self.realm.set_default_object_proto(obj_proto);
         // `globalThis`: an object mirroring the global bindings, referencing
@@ -10164,6 +10188,8 @@ impl<'a> Interp<'a> {
             "String"
         } else if self.realm.is_array(handle) {
             "Array"
+        } else if let Some(is_set) = self.realm.collection_is_set(handle) {
+            if is_set { "Set" } else { "Map" }
         } else if self.realm.function_at(handle).is_some()
             || self.realm.native_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
