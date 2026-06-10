@@ -9539,12 +9539,13 @@ impl<'a> Interp<'a> {
                             shorthand,
                             ..
                         } => {
-                            // `{ __proto__: obj }` — a non-computed, non-shorthand,
-                            // non-method data property named `__proto__` sets the
-                            // prototype rather than creating a property.
+                            // `{ __proto__: obj }` — only the *unquoted identifier*
+                            // form (not `"__proto__":`, computed, shorthand, or a
+                            // method) sets the prototype; a quoted/computed key makes
+                            // an ordinary own `__proto__` data property.
                             if !shorthand
                                 && !matches!(&**value, Expr::Function(_))
-                                && let PropertyKey::Ident(s) | PropertyKey::Str(s) = key
+                                && let PropertyKey::Ident(s) = key
                                 && &**s == "__proto__"
                             {
                                 let v = self.eval(value)?;
