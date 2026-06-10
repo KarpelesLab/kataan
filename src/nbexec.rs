@@ -984,11 +984,19 @@ impl<'a> Interp<'a> {
                 let s = self.realm.to_display_string(arg(0));
                 let radix = match args.get(1) {
                     Some(r) if !matches!(r.unpack(), Unpacked::Undefined) => {
-                        self.realm.to_number(*r) as u32
+                        let n = self.realm.to_number(*r);
+                        // Keep the sign (a `… as u32` cast saturates a negative
+                        // radix to 0, which would wrongly default to base 10).
+                        if n.is_finite() { n as i64 } else { 0 }
                     }
                     _ => 0,
                 };
-                NanBox::number(parse_int(&s, radix))
+                // A nonzero radix outside [2, 36] is invalid → NaN; 0 means "infer".
+                if radix != 0 && !(2..=36).contains(&radix) {
+                    NanBox::number(f64::NAN)
+                } else {
+                    NanBox::number(parse_int(&s, radix as u32))
+                }
             }
             N_CONSOLE_LOG => {
                 let line: Vec<String> = args

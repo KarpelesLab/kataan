@@ -2323,11 +2323,19 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             let s = ctx
                 .realm
                 .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
+            // Keep the sign: a `… as u32` cast saturates a negative radix to 0,
+            // which would wrongly default to base 10. A nonzero radix outside
+            // [2, 36] is invalid → NaN.
             let radix = args
                 .get(1)
                 .and_then(|r| r.as_number())
-                .map_or(0, |n| n as u32);
-            NanBox::number(parse_int(s.trim(), radix))
+                .filter(|n| n.is_finite())
+                .map_or(0i64, |n| n as i64);
+            if radix != 0 && !(2..=36).contains(&radix) {
+                NanBox::number(f64::NAN)
+            } else {
+                NanBox::number(parse_int(s.trim(), radix as u32))
+            }
         }
         NB_PARSE_FLOAT => {
             let s = ctx
@@ -2445,11 +2453,17 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             let s = ctx
                 .realm
                 .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
+            // See NB_PARSE_INT: preserve the sign and reject an out-of-range radix.
             let radix = args
                 .get(1)
                 .and_then(|r| r.as_number())
-                .map_or(0, |n| n as u32);
-            NanBox::number(parse_int(s.trim(), radix))
+                .filter(|n| n.is_finite())
+                .map_or(0i64, |n| n as i64);
+            if radix != 0 && !(2..=36).contains(&radix) {
+                NanBox::number(f64::NAN)
+            } else {
+                NanBox::number(parse_int(s.trim(), radix as u32))
+            }
         }
         NB_STRING_FROM_CHAR_CODE => {
             let s: String = args
