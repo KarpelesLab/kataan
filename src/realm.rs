@@ -1172,7 +1172,13 @@ impl Realm {
                 }
                 Some(Cell::BoundNative { .. }) => "function () { … }".into(),
                 Some(Cell::Promise(_)) => "[object Promise]".into(),
-                Some(Cell::Date(ms)) => date_to_iso(*ms),
+                Some(Cell::Date(ms)) => {
+                    if ms.is_finite() {
+                        date_to_iso(*ms)
+                    } else {
+                        alloc::string::String::from("Invalid Date")
+                    }
+                }
                 Some(Cell::RegExp { source, flags, .. }) => alloc::format!("/{source}/{flags}"),
                 Some(Cell::Symbol { description, .. }) => alloc::format!("Symbol({description})"),
                 Some(Cell::BigInt(n)) => alloc::format!("{n}"),
@@ -1648,9 +1654,17 @@ pub fn parse_iso_date(s: &str) -> Option<f64> {
     };
     let mut dp = date.split('-');
     let y: i64 = dp.next()?.parse().ok()?;
-    let mo: u32 = dp.next()?.parse().ok()?;
-    let d: u32 = dp.next()?.parse().ok()?;
-    if !(1..=12).contains(&mo) || dp.next().is_some() {
+    // Month and day are optional: `YYYY` and `YYYY-MM` are valid ISO date forms
+    // (defaulting the omitted fields to 1), per Date Time String Format.
+    let mo: u32 = match dp.next() {
+        Some(m) => m.parse().ok()?,
+        None => 1,
+    };
+    let d: u32 = match dp.next() {
+        Some(day) => day.parse().ok()?,
+        None => 1,
+    };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || dp.next().is_some() {
         return None;
     }
     let mut ms: i64 = days_from_civil(y, mo, d) * 86_400_000;
