@@ -254,6 +254,12 @@ const N_BTOA: u16 = 164;
 const N_ATOB: u16 = 165;
 const N_INTL_NUMBER_FORMAT: u16 = 166;
 const N_INTL_DATETIME_FORMAT: u16 = 167;
+const N_INTL_COLLATOR: u16 = 207;
+const N_INTL_PLURAL_RULES: u16 = 208;
+/// `Intl.Collator.prototype.compare` (a bound function value).
+const N_INTL_COMPARE: u16 = 209;
+/// `Intl.PluralRules.prototype.select`.
+const N_INTL_PLURAL_SELECT: u16 = 210;
 /// The typed-array constructors occupy `[BASE, BASE + KINDS.len())`; the id minus
 /// the base indexes [`TYPED_ARRAY_KINDS`].
 const N_TYPED_ARRAY_BASE: u16 = 168;
@@ -855,6 +861,8 @@ impl<'a> Interp<'a> {
         for (name, id) in [
             ("NumberFormat", N_INTL_NUMBER_FORMAT),
             ("DateTimeFormat", N_INTL_DATETIME_FORMAT),
+            ("Collator", N_INTL_COLLATOR),
+            ("PluralRules", N_INTL_PLURAL_RULES),
         ] {
             let f = self.new_named_native(name, id);
             self.realm
@@ -1919,6 +1927,39 @@ impl<'a> Interp<'a> {
             // `Intl.NumberFormat(...)` / `Intl.DateTimeFormat(...)` called without
             // `new` build the same formatter object.
             N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => self.make_intl_formatter(id, args),
+            // `Intl.Collator(...)` / `Intl.PluralRules(...)` without `new`.
+            N_INTL_COLLATOR => {
+                let obj = self.realm.new_object();
+                let cmp = self.new_named_native("compare", N_INTL_COMPARE);
+                self.realm
+                    .set_property(obj, "compare", NanBox::handle(cmp.to_raw()));
+                NanBox::handle(obj.to_raw())
+            }
+            N_INTL_PLURAL_RULES => {
+                let obj = self.realm.new_object();
+                let sel = self.new_named_native("select", N_INTL_PLURAL_SELECT);
+                self.realm
+                    .set_property(obj, "select", NanBox::handle(sel.to_raw()));
+                NanBox::handle(obj.to_raw())
+            }
+            // `Intl.Collator.prototype.compare(a, b)` — code-point order (no locale
+            // tailoring), so a negative/zero/positive result orders `a` vs `b`.
+            N_INTL_COMPARE => {
+                let a = self.realm.to_display_string(arg(0));
+                let b = self.realm.to_display_string(arg(1));
+                NanBox::number(match a.cmp(&b) {
+                    core::cmp::Ordering::Less => -1.0,
+                    core::cmp::Ordering::Equal => 0.0,
+                    core::cmp::Ordering::Greater => 1.0,
+                })
+            }
+            // `Intl.PluralRules.prototype.select(n)` — the English plural category:
+            // `1` is "one", everything else "other".
+            N_INTL_PLURAL_SELECT => {
+                let n = self.realm.to_number(arg(0));
+                let cat = if n == 1.0 { "one" } else { "other" };
+                self.new_str(cat)
+            }
             // `WebAssembly.validate(bytes)` — true iff `bytes` decodes to a
             // well-formed module. Accepts an `ArrayBuffer` or a byte array.
             N_WASM_VALIDATE => {
@@ -3657,6 +3698,24 @@ impl<'a> Interp<'a> {
         // `new Intl.NumberFormat(locales, options)` / `Intl.DateTimeFormat(...)`.
         if id == N_INTL_NUMBER_FORMAT || id == N_INTL_DATETIME_FORMAT {
             return Ok(self.make_intl_formatter(id, args));
+        }
+        // `new Intl.Collator(...)` → an object whose `compare` is a bound function
+        // (so `arr.sort(new Intl.Collator().compare)` works); code-point order, no
+        // locale tailoring (matching `localeCompare`).
+        if id == N_INTL_COLLATOR {
+            let obj = self.realm.new_object();
+            let cmp = self.new_named_native("compare", N_INTL_COMPARE);
+            self.realm
+                .set_property(obj, "compare", NanBox::handle(cmp.to_raw()));
+            return Ok(NanBox::handle(obj.to_raw()));
+        }
+        // `new Intl.PluralRules(...)` → an object with a `select(n)` method.
+        if id == N_INTL_PLURAL_RULES {
+            let obj = self.realm.new_object();
+            let sel = self.new_named_native("select", N_INTL_PLURAL_SELECT);
+            self.realm
+                .set_property(obj, "select", NanBox::handle(sel.to_raw()));
+            return Ok(NanBox::handle(obj.to_raw()));
         }
         // `new Promise(executor)`: run executor(resolve, reject).
         if id == N_PROMISE {
