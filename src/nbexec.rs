@@ -3195,6 +3195,12 @@ impl<'a> Interp<'a> {
         if self.current.get("Array").and_then(|v| v.as_handle()) == callee.as_handle() {
             return self.construct(callee, args);
         }
+        // `Object(value)` (ToObject): `null`/`undefined` → a new object; an object is
+        // returned as-is; a primitive is boxed in its wrapper.
+        if self.current.get("Object").and_then(|v| v.as_handle()) == callee.as_handle() {
+            let v = args.first().copied().unwrap_or(NanBox::undefined());
+            return Ok(self.coerce_to_object(v));
+        }
         // A bound function: prepend the bound `this`/args and forward.
         if let Some(target) = self.realm.get_property(handle, BOUND_TARGET) {
             let bthis = self
@@ -4315,6 +4321,28 @@ impl<'a> Interp<'a> {
         self.realm
             .set_hidden_property(obj, PRIM_WRAP_TYPE, NanBox::number(f64::from(ctor_id)));
         NanBox::handle(obj.to_raw())
+    }
+
+    /// `ToObject(v)` for `Object(v)`: `null`/`undefined` yield a fresh object; an
+    /// existing object/array/function is returned unchanged; a primitive is boxed in
+    /// its wrapper (so `Object(42).valueOf()` is `42`).
+    fn coerce_to_object(&mut self, v: NanBox) -> NanBox {
+        match v.unpack() {
+            Unpacked::Undefined | Unpacked::Null => {
+                NanBox::handle(self.realm.new_object().to_raw())
+            }
+            Unpacked::Number(_) => self.make_primitive_wrapper(v, N_NUMBER),
+            Unpacked::Bool(_) => self.make_primitive_wrapper(v, N_BOOLEAN),
+            Unpacked::Handle(raw) => {
+                let h = Handle::from_raw(raw);
+                if self.realm.string_value(h).is_some() {
+                    self.make_primitive_wrapper(v, N_STRING)
+                } else {
+                    // An already-object value (object/array/function/symbol/bigint).
+                    v
+                }
+            }
+        }
     }
 
     /// Resolves a (trap-less) proxy to its target for key enumeration, so
