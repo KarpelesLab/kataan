@@ -4027,6 +4027,9 @@ impl<'a> Interp<'a> {
                 _ => self.new_str(""),
             };
             self.realm.set_property(instance, "message", msg);
+            // `name`/`message` are non-enumerable (out of `Object.keys`/JSON).
+            self.realm.mark_hidden(instance, "name");
+            self.realm.mark_hidden(instance, "message");
         }
     }
 
@@ -4323,6 +4326,9 @@ impl<'a> Interp<'a> {
         };
         let msg = self.new_str(&msg_str);
         self.realm.set_property(obj, "message", msg);
+        // `name`/`message` are non-enumerable (so `Object.keys(err)` is empty).
+        self.realm.mark_hidden(obj, "name");
+        self.realm.mark_hidden(obj, "message");
         // A minimal `stack` (the `name: message` header; no real frame capture),
         // non-enumerable like the real property.
         let head = if msg_str.is_empty() {
@@ -4884,7 +4890,11 @@ impl<'a> Interp<'a> {
                     .get_property(handle, "message")
                     .map(|v| self.realm.to_display_string(v))
                     .unwrap_or_default();
-                let s = if msg.is_empty() {
+                // `Error.prototype.toString`: an empty name yields just the message;
+                // an empty message yields just the name; else `"name: message"`.
+                let s = if name.is_empty() {
+                    msg
+                } else if msg.is_empty() {
                     name
                 } else {
                     alloc::format!("{name}: {msg}")
