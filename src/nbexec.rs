@@ -6143,8 +6143,12 @@ impl<'a> Interp<'a> {
                             "NFKC" => normalize::nfkc(s.chars()).collect(),
                             "NFKD" => normalize::nfkd(s.chars()).collect(),
                             _ => {
+                                // An unsupported form is a RangeError *object*.
+                                let m = self.new_str(&alloc::format!(
+                                    "The normalization form should be one of NFC, NFD, NFKC, NFKD. Got {form}."
+                                ));
                                 return Err(ExecError::Throw(
-                                    self.new_str("RangeError: invalid normalization form"),
+                                    self.make_error(N_ERROR_BASE + 2, Some(m)),
                                 ));
                             }
                         };
@@ -13239,6 +13243,15 @@ mod tests {
         // NFKC expands the ﬁ ligature.
         assert_eq!(run("'\u{fb01}'.normalize('NFKC')"), "fi");
         assert_eq!(run("'abc'.normalize()"), "abc");
+        // An unsupported form throws a RangeError *object* (not a bare string).
+        assert_eq!(
+            run("try{'x'.normalize('BAD');'no'}catch(e){e instanceof RangeError}"),
+            "true"
+        );
+        assert_eq!(
+            run("try{'x'.normalize('BAD');'no'}catch(e){e.name}"),
+            "RangeError"
+        );
     }
 
     #[test]
