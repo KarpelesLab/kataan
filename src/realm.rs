@@ -694,6 +694,10 @@ impl Realm {
     /// `arr[index] = value` — grows the array with `undefined` holes if `index`
     /// is past the end (per JS). Returns `false` if the cell is not an array.
     pub fn set_element(&mut self, handle: Handle, index: usize, value: NanBox) -> bool {
+        // A frozen array rejects element writes (and any extension).
+        if self.frozen_arrays.contains(&handle.to_raw()) {
+            return false;
+        }
         match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
                 if index >= a.len() {
@@ -708,8 +712,11 @@ impl Realm {
     }
 
     /// `arr.push(value)` — appends, returning the new length, or `None` if the
-    /// cell is not an array.
+    /// cell is not an array (or the array is frozen).
     pub fn array_push(&mut self, handle: Handle, value: NanBox) -> Option<usize> {
+        if self.frozen_arrays.contains(&handle.to_raw()) {
+            return None;
+        }
         let a = self.heap.get_mut(handle).and_then(Cell::as_array_mut)?;
         a.push(value);
         Some(a.len())
