@@ -327,6 +327,9 @@ const KNOWN_GLOBALS: &[&str] = &[
     "EvalError",
     "URIError",
     "AggregateError",
+    "Intl",
+    "WebAssembly",
+    "structuredClone",
 ];
 
 /// A compiled function: its instruction stream, register-file size, and the
