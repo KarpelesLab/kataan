@@ -2939,22 +2939,30 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Runs the earliest-due `setTimeout` macrotask (least `delay`, ties by
+    /// insertion order). A no-op when none are pending.
+    fn run_one_macrotask(&mut self) -> Result<(), ExecError> {
+        let Some(idx) = self
+            .macrotasks
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.delay.total_cmp(&b.delay).then(a.seq.cmp(&b.seq)))
+            .map(|(i, _)| i)
+        else {
+            return Ok(());
+        };
+        let t = self.macrotasks.remove(idx);
+        self.call(t.callback, &t.args)?;
+        Ok(())
+    }
+
     /// Runs the event loop to quiescence: drain all microtasks, then run the
     /// earliest-due `setTimeout` macrotask (draining microtasks after each), until
     /// both queues are empty.
     fn run_event_loop(&mut self) -> Result<(), ExecError> {
         self.drain_microtasks()?;
         while !self.macrotasks.is_empty() {
-            // The earliest timer: least `delay`, ties broken by insertion order.
-            let idx = self
-                .macrotasks
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| a.delay.total_cmp(&b.delay).then(a.seq.cmp(&b.seq)))
-                .map(|(i, _)| i)
-                .unwrap();
-            let t = self.macrotasks.remove(idx);
-            self.call(t.callback, &t.args)?;
+            self.run_one_macrotask()?;
             self.drain_microtasks()?;
         }
         Ok(())
@@ -3006,6 +3014,25 @@ impl<'a> Interp<'a> {
     /// `await value` — for a promise, drains microtasks until it settles (this
     /// model has no timers, so all promises settle via the queue), then yields
     /// its value or throws its rejection. A non-promise passes through.
+    /// The current settled state of `value`: `Some(Ok(v))` if fulfilled (a
+    /// non-promise counts as fulfilled with itself), `Some(Err(e))` if rejected,
+    /// `None` if it is a still-pending promise.
+    fn settled_state(&self, value: NanBox) -> Option<Result<NanBox, NanBox>> {
+        use crate::cell::PromiseStatus::{Fulfilled, Pending, Rejected};
+        let Some(state) = value
+            .as_handle()
+            .and_then(|raw| self.realm.promise_state(Handle::from_raw(raw)))
+        else {
+            return Some(Ok(value));
+        };
+        let s = state.borrow();
+        match s.status {
+            Fulfilled => Some(Ok(s.value)),
+            Rejected => Some(Err(s.value)),
+            Pending => None,
+        }
+    }
+
     fn await_value(&mut self, value: NanBox) -> Result<NanBox, ExecError> {
         use crate::cell::PromiseStatus::{Fulfilled, Pending, Rejected};
         let Some(state) = value
@@ -3014,14 +3041,23 @@ impl<'a> Interp<'a> {
         else {
             return Ok(value); // not a promise
         };
-        while state.borrow().status == Pending && !self.microtasks.is_empty() {
-            self.run_one_microtask()?;
+        // Make progress on the event loop until the promise settles: drain
+        // microtasks first, then run a `setTimeout` macrotask if still pending (so an
+        // `await` / `Promise.all` on a timer-backed promise observes its value).
+        while state.borrow().status == Pending
+            && (!self.microtasks.is_empty() || !self.macrotasks.is_empty())
+        {
+            if self.microtasks.is_empty() {
+                self.run_one_macrotask()?;
+            } else {
+                self.run_one_microtask()?;
+            }
         }
         let s = state.borrow();
         match s.status {
             Fulfilled => Ok(s.value),
             Rejected => Err(ExecError::Throw(s.value)),
-            Pending => Ok(NanBox::undefined()), // never settled (no timers)
+            Pending => Ok(NanBox::undefined()), // never settles
         }
     }
 
@@ -5937,16 +5973,36 @@ impl<'a> Interp<'a> {
                     self.resolve_with(p, NanBox::handle(arr.to_raw()));
                     return Ok(Some(NanBox::handle(p.to_raw())));
                 }
-                // `Promise.race(iterable)`: settle with the first input to settle
-                // (eager — the first list element).
+                // `Promise.race(iterable)`: settle with the first input to *settle*.
+                // Steps the event loop, checking the inputs after each task, so a
+                // timer-backed promise that settles first wins (ties in a single step
+                // broken by list order).
                 "race" => {
                     let items = self.iterate_values(arg(0))?;
                     let p = self.realm.new_promise();
-                    if let Some(item) = items.into_iter().next() {
-                        match self.await_value(item) {
-                            Ok(v) => self.resolve_with(p, v),
-                            Err(ExecError::Throw(e)) => self.settle(p, e, false),
-                            Err(other) => return Err(other),
+                    'race: loop {
+                        for item in &items {
+                            match self.settled_state(*item) {
+                                Some(Ok(v)) => {
+                                    self.resolve_with(p, v);
+                                    break 'race;
+                                }
+                                Some(Err(e)) => {
+                                    self.settle(p, e, false);
+                                    break 'race;
+                                }
+                                None => {}
+                            }
+                        }
+                        // None settled yet: advance the loop, or stop if it is idle
+                        // (the race promise then stays pending, as the spec requires).
+                        if self.microtasks.is_empty() && self.macrotasks.is_empty() {
+                            break;
+                        }
+                        if self.microtasks.is_empty() {
+                            self.run_one_macrotask()?;
+                        } else {
+                            self.run_one_microtask()?;
                         }
                     }
                     return Ok(Some(NanBox::handle(p.to_raw())));
