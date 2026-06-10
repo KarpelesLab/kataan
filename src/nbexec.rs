@@ -2285,14 +2285,17 @@ impl<'a> Interp<'a> {
                 && let Some(keys) = self.realm.object_keys(vh)
             {
                 let no = self.realm.new_object();
-                for k in keys {
-                    if allow.iter().any(|a| a == &k) {
+                // Keys are emitted in allowlist order (deduplicated, own keys only).
+                let mut emitted: Vec<&String> = Vec::new();
+                for k in allow {
+                    if keys.contains(k) && !emitted.contains(&k) {
+                        emitted.push(k);
                         let pv = self
                             .realm
-                            .get_property(vh, &k)
+                            .get_property(vh, k)
                             .unwrap_or(NanBox::undefined());
                         let nv = self.json_filter_keys(pv, allow);
-                        self.realm.set_property(no, &k, nv);
+                        self.realm.set_property(no, k, nv);
                     }
                 }
                 return NanBox::handle(no.to_raw());

@@ -1881,11 +1881,22 @@ fn json_normalize(
                 )));
             }
             seen.push(h);
-            let new_obj = ctx.realm.new_object();
-            for k in keys {
-                if allow.is_some_and(|a| !a.iter().any(|x| x == &k)) {
-                    continue;
+            // With an array replacer the keys come from the allowlist, in allowlist
+            // order (deduplicated, own keys only); otherwise the object's own order.
+            let key_list: Vec<alloc::string::String> = match allow {
+                Some(a) => {
+                    let mut ks: Vec<alloc::string::String> = Vec::new();
+                    for k in a {
+                        if keys.contains(k) && !ks.contains(k) {
+                            ks.push(k.clone());
+                        }
+                    }
+                    ks
                 }
+                None => keys,
+            };
+            let new_obj = ctx.realm.new_object();
+            for k in key_list {
                 let pv = json_read_prop(ctx, funcs, h, &k)?;
                 let nv = json_normalize(ctx, funcs, v, &k, pv, replacer, allow, seen)?;
                 ctx.realm.set_property(new_obj, &k, nv);
