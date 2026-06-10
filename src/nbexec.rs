@@ -9563,18 +9563,24 @@ impl<'a> Interp<'a> {
             return self.assign_member(target, property, new);
         }
         // An accessor setter — own or inherited via the prototype chain — takes
-        // precedence over creating a data property.
-        if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property {
+        // precedence over creating a data property. A private accessor
+        // (`set #x() {…}`) is stored under the `#`-prefixed key, so resolve that.
+        let setter_key: Option<alloc::string::String> = match property {
+            PropertyKey::Ident(s) | PropertyKey::Str(s) => Some(String::from(&**s)),
+            PropertyKey::Private(s) => Some(alloc::format!("#{s}")),
+            _ => None,
+        };
+        if let Some(skey) = setter_key {
             let mut cur = Some(handle);
             while let Some(c) = cur {
-                if let Some((_, setter)) = self.realm.accessor(c, s) {
+                if let Some((_, setter)) = self.realm.accessor(c, &skey) {
                     if !matches!(setter.unpack(), Unpacked::Undefined) {
                         let this = NanBox::handle(handle.to_raw());
                         self.call_with_this(setter, this, &[new])?;
                     } else if self.strict {
                         // Strict mode: writing a getter-only accessor is a TypeError.
                         let m = self.new_str(&alloc::format!(
-                            "Cannot set property {s} which has only a getter"
+                            "Cannot set property {skey} which has only a getter"
                         ));
                         return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     }
@@ -9582,7 +9588,7 @@ impl<'a> Interp<'a> {
                     return Ok(());
                 }
                 // An own data property below shadows an inherited accessor.
-                if self.realm.has_own(c, s) {
+                if self.realm.has_own(c, &skey) {
                     break;
                 }
                 cur = self.realm.object_proto(c);
