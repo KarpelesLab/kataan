@@ -4997,8 +4997,6 @@ impl<'a> Interp<'a> {
                         return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
                     }
                     let digits = f as usize;
-                    // JS rounds half away from zero (Rust's formatter rounds half
-                    // to even), so pre-round at the target scale.
                     let s = if !n.is_finite() {
                         // `Infinity`/`-Infinity`/`NaN` use the spec ToString.
                         self.realm.to_display_string(NanBox::number(n))
@@ -5007,9 +5005,45 @@ impl<'a> Interp<'a> {
                         // (exponential), not a full decimal expansion.
                         self.realm.to_display_string(NanBox::number(n))
                     } else {
-                        let factor = 10f64.powi(digits as i32);
-                        let rounded = (n * factor).round() / factor;
-                        alloc::format!("{rounded:.digits$}")
+                        // Round the *exact* f64 to `digits` places. Rust's formatter is
+                        // correctly rounded but ties-to-even; JS ties away from zero.
+                        // Only an exact half (the dropped tail is precisely "5" then
+                        // zeros) differs — detect that from the value's decimal
+                        // expansion and round its magnitude up; everything else takes
+                        // Rust's already-correct rounding (so e.g. `(2.355).toFixed(2)`
+                        // is "2.35", since the double is 2.35499…, not "2.36").
+                        let expanded = alloc::format!("{:.*}", digits + 25, n.abs());
+                        let dot = expanded.find('.').unwrap_or(expanded.len());
+                        let tail = &expanded[(dot + 1 + digits).min(expanded.len())..];
+                        let exact_half = tail.starts_with('5')
+                            && tail.as_bytes()[1..].iter().all(|&b| b == b'0');
+                        if exact_half {
+                            let kept: String = expanded[..dot]
+                                .chars()
+                                .chain(expanded[dot + 1..dot + 1 + digits].chars())
+                                .collect();
+                            let m = kept.parse::<u128>().unwrap_or(0) + 1;
+                            let mut s = alloc::format!("{m}");
+                            if digits > 0 {
+                                while s.len() <= digits {
+                                    s.insert(0, '0');
+                                }
+                                s.insert(s.len() - digits, '.');
+                            }
+                            if n < 0.0 {
+                                s.insert(0, '-');
+                            }
+                            s
+                        } else {
+                            let mut s = alloc::format!("{n:.digits$}");
+                            // A zero result never carries a sign (`(-0).toFixed(2)`).
+                            if s.starts_with('-')
+                                && s.bytes().all(|b| matches!(b, b'-' | b'0' | b'.'))
+                            {
+                                s.remove(0);
+                            }
+                            s
+                        }
                     };
                     Some(self.new_str(&s))
                 }
