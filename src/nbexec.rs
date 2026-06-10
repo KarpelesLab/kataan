@@ -177,6 +177,14 @@ pub struct Interp<'a> {
     pending_label: Option<String>,
     /// The promise-reaction microtask queue, drained after the script.
     microtasks: Vec<Job>,
+    /// Pending `setTimeout` callbacks (macrotasks), run after the microtask queue
+    /// drains — ordered by `delay`, then insertion (`seq`). No real clock: delays
+    /// only order callbacks relative to each other.
+    macrotasks: Vec<Timer>,
+    /// Monotonic id handed out by `setTimeout` (for `clearTimeout`).
+    timer_next_id: u64,
+    /// Monotonic insertion counter breaking equal-`delay` ties.
+    timer_seq: u64,
     /// Whether the currently-executing code is in strict mode (`"use strict"`),
     /// which propagates into nested functions.
     strict: bool,
@@ -198,6 +206,15 @@ struct Job {
     /// A `finally` job: run the handler for side effects, then pass the original
     /// value/rejection through to `result`.
     finally: bool,
+}
+
+/// A pending `setTimeout` callback.
+struct Timer {
+    id: u64,
+    delay: f64,
+    seq: u64,
+    callback: NanBox,
+    args: Vec<NanBox>,
 }
 
 impl Default for Interp<'_> {
@@ -254,6 +271,9 @@ const N_BTOA: u16 = 164;
 const N_ATOB: u16 = 165;
 const N_INTL_NUMBER_FORMAT: u16 = 166;
 const N_INTL_DATETIME_FORMAT: u16 = 167;
+const N_SET_TIMEOUT: u16 = 211;
+const N_CLEAR_TIMEOUT: u16 = 212;
+const N_QUEUE_MICROTASK: u16 = 213;
 const N_INTL_COLLATOR: u16 = 207;
 const N_INTL_PLURAL_RULES: u16 = 208;
 /// `Intl.Collator.prototype.compare` (a bound function value).
@@ -612,6 +632,9 @@ impl<'a> Interp<'a> {
             current_home_object: None,
             pending_label: None,
             microtasks: Vec::new(),
+            macrotasks: Vec::new(),
+            timer_next_id: 1,
+            timer_seq: 0,
             strict: false,
             global_this: NanBox::undefined(),
             output: String::new(),
@@ -848,6 +871,9 @@ impl<'a> Interp<'a> {
             ("encodeURI", N_ENCODE_URI),
             ("decodeURI", N_DECODE_URI),
             ("structuredClone", N_STRUCTURED_CLONE),
+            ("setTimeout", N_SET_TIMEOUT),
+            ("clearTimeout", N_CLEAR_TIMEOUT),
+            ("queueMicrotask", N_QUEUE_MICROTASK),
             ("btoa", N_BTOA),
             ("atob", N_ATOB),
             ("URIError", N_URI_ERROR),
@@ -1960,6 +1986,45 @@ impl<'a> Interp<'a> {
                 let cat = if n == 1.0 { "one" } else { "other" };
                 self.new_str(cat)
             }
+            // `setTimeout(cb, delay?, ...args)` — queues `cb(...args)` as a macrotask
+            // and returns a numeric timer id (usable with `clearTimeout`).
+            N_SET_TIMEOUT => {
+                let callback = arg(0);
+                let delay = self.realm.to_number(arg(1)).max(0.0);
+                let extra: Vec<NanBox> = args.iter().skip(2).copied().collect();
+                let id = self.timer_next_id;
+                self.timer_next_id += 1;
+                let seq = self.timer_seq;
+                self.timer_seq += 1;
+                self.macrotasks.push(Timer {
+                    id,
+                    delay: if delay.is_finite() { delay } else { 0.0 },
+                    seq,
+                    callback,
+                    args: extra,
+                });
+                NanBox::number(id as f64)
+            }
+            // `clearTimeout(id)` — cancels a pending `setTimeout`.
+            N_CLEAR_TIMEOUT => {
+                if let Some(id) = arg(0).as_number() {
+                    self.macrotasks.retain(|t| (t.id as f64) != id);
+                }
+                NanBox::undefined()
+            }
+            // `queueMicrotask(cb)` — schedules `cb()` on the microtask queue.
+            N_QUEUE_MICROTASK => {
+                let callback = arg(0);
+                let result = self.realm.new_promise();
+                self.microtasks.push(Job {
+                    handler: callback,
+                    value: NanBox::undefined(),
+                    result,
+                    fulfilled: true,
+                    finally: false,
+                });
+                NanBox::undefined()
+            }
             // `WebAssembly.validate(bytes)` — true iff `bytes` decodes to a
             // well-formed module. Accepts an `ArrayBuffer` or a byte array.
             N_WASM_VALIDATE => {
@@ -2618,14 +2683,14 @@ impl<'a> Interp<'a> {
             match self.exec(stmt)? {
                 Flow::Normal(v) => last = v,
                 Flow::Return(v) => {
-                    self.drain_microtasks()?;
+                    self.run_event_loop()?;
                     return Ok(v);
                 }
                 Flow::Break(_) | Flow::Continue(_) => {}
             }
         }
-        // Drain the promise microtask queue (the event loop) before returning.
-        self.drain_microtasks()?;
+        // Run the event loop (microtasks + `setTimeout`) before returning.
+        self.run_event_loop()?;
         Ok(last)
     }
 
@@ -2870,6 +2935,31 @@ impl<'a> Interp<'a> {
     fn drain_microtasks(&mut self) -> Result<(), ExecError> {
         while !self.microtasks.is_empty() {
             self.run_one_microtask()?;
+        }
+        Ok(())
+    }
+
+    /// Runs the event loop to quiescence: drain all microtasks, then run the
+    /// earliest-due `setTimeout` macrotask (draining microtasks after each), until
+    /// both queues are empty.
+    fn run_event_loop(&mut self) -> Result<(), ExecError> {
+        self.drain_microtasks()?;
+        while !self.macrotasks.is_empty() {
+            // The earliest timer: least `delay`, ties broken by insertion order.
+            let idx = self
+                .macrotasks
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    a.delay
+                        .total_cmp(&b.delay)
+                        .then(a.seq.cmp(&b.seq))
+                })
+                .map(|(i, _)| i)
+                .unwrap();
+            let t = self.macrotasks.remove(idx);
+            self.call(t.callback, &t.args)?;
+            self.drain_microtasks()?;
         }
         Ok(())
     }

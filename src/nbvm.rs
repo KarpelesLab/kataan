@@ -330,6 +330,9 @@ const KNOWN_GLOBALS: &[&str] = &[
     "Intl",
     "WebAssembly",
     "structuredClone",
+    "setTimeout",
+    "clearTimeout",
+    "queueMicrotask",
 ];
 
 /// A compiled function: its instruction stream, register-file size, and the
