@@ -4493,6 +4493,26 @@ impl<'a> Interp<'a> {
         Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
     }
 
+    /// Builds the result array for an Array method invoked on `recv`. If `recv` is a
+    /// typed array, the result is a same-kind typed array with its elements coerced
+    /// to that element type; otherwise an ordinary array.
+    fn typed_like(&mut self, recv: Handle, elems: Vec<NanBox>) -> NanBox {
+        if let Some(k) = self.realm.get_property(recv, TYPED_ARRAY_KIND) {
+            let kind = k.as_number().unwrap_or(0.0) as u16;
+            let mut coerced = Vec::with_capacity(elems.len());
+            for e in elems {
+                let n = self.realm.to_number(e);
+                coerced.push(NanBox::number(coerce_typed(kind, n)));
+            }
+            let arr = self.realm.new_array(coerced);
+            self.realm
+                .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
+            NanBox::handle(arr.to_raw())
+        } else {
+            NanBox::handle(self.realm.new_array(elems).to_raw())
+        }
+    }
+
     fn make_primitive_wrapper(&mut self, prim: NanBox, ctor_id: u16) -> NanBox {
         let obj = self.realm.new_object();
         self.realm.set_hidden_property(obj, PRIM_WRAP, prim);
@@ -6830,7 +6850,7 @@ impl<'a> Interp<'a> {
                 "toReversed" => {
                     let mut out = elems.clone();
                     out.reverse();
-                    return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
+                    return Ok(Some(self.typed_like(handle, out)));
                 }
                 "with" => {
                     let len = elems.len() as i64;
@@ -6843,12 +6863,12 @@ impl<'a> Interp<'a> {
                     }
                     let mut out = elems.clone();
                     out[idx as usize] = arg(1);
-                    return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
+                    return Ok(Some(self.typed_like(handle, out)));
                 }
                 "toSorted" => {
                     let numeric = self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some();
                     let sorted = self.sort_array(elems.clone(), arg(0), numeric)?;
-                    return Ok(Some(NanBox::handle(self.realm.new_array(sorted).to_raw())));
+                    return Ok(Some(self.typed_like(handle, sorted)));
                 }
                 "indexOf" => {
                     let target = arg(0);
@@ -6868,8 +6888,7 @@ impl<'a> Interp<'a> {
                         let cb_args = [*e, NanBox::number(i as f64), arr];
                         out.push(self.call_with_this(f, this_arg, &cb_args)?);
                     }
-                    let h = self.realm.new_array(out);
-                    return Ok(Some(NanBox::handle(h.to_raw())));
+                    return Ok(Some(self.typed_like(handle, out)));
                 }
                 "filter" => {
                     let f = arg(0);
@@ -6883,8 +6902,7 @@ impl<'a> Interp<'a> {
                             out.push(*e);
                         }
                     }
-                    let h = self.realm.new_array(out);
-                    return Ok(Some(NanBox::handle(h.to_raw())));
+                    return Ok(Some(self.typed_like(handle, out)));
                 }
                 "forEach" => {
                     let f = arg(0);
@@ -6943,8 +6961,8 @@ impl<'a> Interp<'a> {
                         &self.realm,
                         elems.len(),
                     );
-                    let h = self.realm.new_array(elems[a..b].to_vec());
-                    return Ok(Some(NanBox::handle(h.to_raw())));
+                    let sub = elems[a..b].to_vec();
+                    return Ok(Some(self.typed_like(handle, sub)));
                 }
                 // Iterators: `keys()` over indices, `values()` over elements,
                 // `entries()` over `[index, element]` pairs (eager generators).
