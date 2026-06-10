@@ -1832,21 +1832,52 @@ impl<'a> Interp<'a> {
                 }
                 NanBox::handle(self.realm.new_array(out).to_raw())
             }
-            // `WebAssembly.instantiate(bytes)` → `{ instance: { exports: {…} } }`,
-            // each export a callable wrapper. (Synchronous, unlike the spec's
-            // Promise; a stateful module re-instantiates per call.)
+            // `WebAssembly.instantiate(x)` → a `Promise`: given source bytes it
+            // resolves to `{ module, instance }`; given a `Module` it resolves to the
+            // `Instance` alone. Each export is a callable wrapper. (A stateful module
+            // re-instantiates per call.)
             N_WASM_INSTANTIATE => {
-                let instance = self.build_wasm_instance(arg(0), arg(1))?;
-                let result = self.realm.new_object();
-                self.realm.set_property(result, "instance", instance);
-                let module = self.realm.new_object();
-                self.realm.set_property(module, WASM_BYTES, arg(0));
-                self.realm.mark_hidden(module, WASM_BYTES);
-                self.realm
-                    .set_hidden_property(module, WASM_IS_MODULE, NanBox::boolean(true));
-                self.realm
-                    .set_property(result, "module", NanBox::handle(module.to_raw()));
-                NanBox::handle(result.to_raw())
+                let module_handle = arg(0)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|h| self.realm.get_property(*h, WASM_IS_MODULE).is_some());
+                let given_module = module_handle.is_some();
+                // `build_wasm_instance` consumes source bytes; a `Module` argument
+                // carries them under `WASM_BYTES`.
+                let source =
+                    match module_handle.and_then(|h| self.realm.get_property(h, WASM_BYTES)) {
+                        Some(bytes) => bytes,
+                        None => arg(0),
+                    };
+                let p = self.realm.new_promise();
+                match self.build_wasm_instance(source, arg(1)) {
+                    Ok(instance) => {
+                        let resolved = if given_module {
+                            instance
+                        } else {
+                            let result = self.realm.new_object();
+                            self.realm.set_property(result, "instance", instance);
+                            let module = self.realm.new_object();
+                            self.realm.set_property(module, WASM_BYTES, arg(0));
+                            self.realm.mark_hidden(module, WASM_BYTES);
+                            self.realm.set_hidden_property(
+                                module,
+                                WASM_IS_MODULE,
+                                NanBox::boolean(true),
+                            );
+                            self.realm.set_property(
+                                result,
+                                "module",
+                                NanBox::handle(module.to_raw()),
+                            );
+                            NanBox::handle(result.to_raw())
+                        };
+                        self.settle(p, resolved, true);
+                    }
+                    Err(ExecError::Throw(err)) => self.settle(p, err, false),
+                    Err(other) => return Err(other),
+                }
+                NanBox::handle(p.to_raw())
             }
             // `WebAssembly.compile(bytes)` → `Promise<Module>` (rejected, not thrown,
             // on a bad module).
@@ -7142,6 +7173,13 @@ impl<'a> Interp<'a> {
         let instance = self.realm.new_object();
         self.realm
             .set_property(instance, "exports", NanBox::handle(exports.to_raw()));
+        // A (non-enumerable) marker so `instance instanceof WebAssembly.Instance`
+        // matches, like the other `WebAssembly.*` boundary objects.
+        self.realm.set_hidden_property(
+            instance,
+            WASM_INSTANCE_ID,
+            NanBox::number(f64::from(inst_id)),
+        );
         Ok(NanBox::handle(instance.to_raw()))
     }
 
@@ -10266,6 +10304,7 @@ impl<'a> Interp<'a> {
                 N_WASM_MEMORY => Some(WASM_MEM_BUFFER),
                 N_WASM_TABLE => Some(WASM_TABLE_ELEMS),
                 N_WASM_MODULE => Some(WASM_IS_MODULE),
+                N_WASM_INSTANCE => Some(WASM_INSTANCE_ID),
                 _ => None,
             };
             if let Some(slot) = wasm_marker
@@ -11811,7 +11850,9 @@ mod tests {
 
     #[test]
     fn webassembly_instantiate_and_call() {
-        let setup = "var b=[0,0x61,0x73,0x6d,1,0,0,0, 1,7,1,0x60,2,0x7f,0x7f,1,0x7f, 3,2,1,0, 7,7,1,3,0x61,0x64,0x64,0,0, 0xa,9,1,7,0,0x20,0,0x20,1,0x6a,0xb]; var e=WebAssembly.instantiate(b).instance.exports; ";
+        // `WebAssembly.instantiate` now returns a Promise (per spec); use the
+        // synchronous `new Instance(new Module(...))` path to read exports directly.
+        let setup = "var b=[0,0x61,0x73,0x6d,1,0,0,0, 1,7,1,0x60,2,0x7f,0x7f,1,0x7f, 3,2,1,0, 7,7,1,3,0x61,0x64,0x64,0,0, 0xa,9,1,7,0,0x20,0,0x20,1,0x6a,0xb]; var e=new WebAssembly.Instance(new WebAssembly.Module(b)).exports; ";
         assert_eq!(run(&alloc::format!("{setup} typeof e.add")), "function");
         assert_eq!(run(&alloc::format!("{setup} e.add(20,22)")), "42");
         assert_eq!(run(&alloc::format!("{setup} e.add(-5,8)")), "3");

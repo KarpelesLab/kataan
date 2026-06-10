@@ -14,9 +14,10 @@ var bytes = [
   7, 0, 0x20, 0, 0x20, 1, 0x6c, 0x0b
 ];
 assert.sameValue(typeof WebAssembly.instantiate, "function", "instantiate is a function");
-var result = WebAssembly.instantiate(bytes);
-assert.sameValue(typeof result.instance, "object", "result.instance is an object");
-var ex = result.instance.exports;
+// instantiate() returns a Promise (per spec); read exports synchronously via the
+// Instance constructor for the assertions below.
+assert.sameValue(WebAssembly.instantiate(bytes) instanceof Promise, true, "instantiate returns a Promise");
+var ex = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports;
 assert.sameValue(typeof ex.add, "function", "exports.add is callable");
 assert.sameValue(typeof ex.mul, "function", "exports.mul is callable");
 assert.sameValue(ex.add(20, 22), 42, "add(20,22)");

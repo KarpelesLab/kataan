@@ -14,7 +14,8 @@ var bytes = [
 ];
 var calls = 0;
 var imports = { env: { triple: function (x) { calls = calls + 1; return x * 3; } } };
-var inst = WebAssembly.instantiate(bytes, imports).instance;
+// instantiate() is async (Promise); use the synchronous Instance path with imports.
+var inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports);
 assert.sameValue(inst.exports.run(10), 31, "triple(10) + 1");
 assert.sameValue(inst.exports.run(-2), -5, "triple(-2) + 1");
 assert.sameValue(calls, 2, "the JS import was actually called twice");

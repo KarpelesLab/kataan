@@ -23,10 +23,9 @@ assert.sameValue(inst.exports.add(7, 5), 12, "exported add");
 var inst2 = new WebAssembly.Instance(mod);
 assert.sameValue(inst2.exports.add(100, 1), 101, "module reuse");
 
-// The functional instantiate() now also surfaces .module and .instance.
-var r = WebAssembly.instantiate(bytes);
-assert.sameValue(r.instance.exports.add(3, 4), 7, "instantiate().instance");
-assert.sameValue(typeof r.module, "object", "instantiate().module");
+// instantiate() returns a Promise (per spec); the synchronous Instance path is used
+// elsewhere for direct export access.
+assert.sameValue(WebAssembly.instantiate(bytes) instanceof Promise, true, "instantiate returns a Promise");
 
 // new Instance() with a non-Module argument is a TypeError.
 var threw = false;
