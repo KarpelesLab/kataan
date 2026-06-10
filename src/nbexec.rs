@@ -7260,15 +7260,21 @@ impl<'a> Interp<'a> {
     /// Sorts `elems` with a JS comparator (a negative result orders `a` before
     /// `b`); without one, by the elements' string forms. Insertion sort, so the
     /// comparator can call back into the interpreter.
-    fn sort_array(
-        &mut self,
-        mut elems: Vec<NanBox>,
-        cmp: NanBox,
-    ) -> Result<Vec<NanBox>, ExecError> {
+    fn sort_array(&mut self, elems: Vec<NanBox>, cmp: NanBox) -> Result<Vec<NanBox>, ExecError> {
         let has_cmp = cmp.as_handle().is_some_and(|raw| {
             let h = Handle::from_raw(raw);
             self.realm.native_at(h).is_some() || self.realm.function_at(h).is_some()
         });
+        // `undefined` elements always sort to the end and are never passed to the
+        // comparator; only defined values are ordered against each other.
+        let undefined_count = elems
+            .iter()
+            .filter(|e| matches!(e.unpack(), Unpacked::Undefined))
+            .count();
+        let mut elems: Vec<NanBox> = elems
+            .into_iter()
+            .filter(|e| !matches!(e.unpack(), Unpacked::Undefined))
+            .collect();
         for i in 1..elems.len() {
             let mut j = i;
             while j > 0 {
@@ -7294,6 +7300,8 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // Re-append the `undefined` holes after the ordered defined values.
+        elems.extend(core::iter::repeat_n(NanBox::undefined(), undefined_count));
         Ok(elems)
     }
 
