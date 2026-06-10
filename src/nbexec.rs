@@ -2251,14 +2251,17 @@ impl<'a> Interp<'a> {
     /// Interpreter-aware `JSON.stringify` (compact): honors a `toJSON` method and
     /// invokes getters, unlike the realm-only `json_stringify`.
     fn json_to_string(&mut self, v: NanBox) -> Result<Option<String>, ExecError> {
-        self.json_to_string_seen(v, &mut Vec::new())
+        self.json_to_string_seen(v, "", &mut Vec::new())
     }
 
     /// `JSON.stringify` serialization tracking the ancestor handles in `seen`, so a
     /// circular structure throws a `TypeError` rather than overflowing the stack.
+    /// `key` is the property name under which `v` appears in its parent (`""` at the
+    /// top level), passed to a `toJSON(key)` method.
     fn json_to_string_seen(
         &mut self,
         v: NanBox,
+        key: &str,
         seen: &mut Vec<Handle>,
     ) -> Result<Option<String>, ExecError> {
         if let Some(h) = v.as_handle().map(Handle::from_raw) {
@@ -2287,8 +2290,9 @@ impl<'a> Interp<'a> {
                 .as_handle()
                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
             {
-                let r = self.call_with_this(tj, v, &[])?;
-                return self.json_to_string_seen(r, seen);
+                let key_box = self.new_str(key);
+                let r = self.call_with_this(tj, v, &[key_box])?;
+                return self.json_to_string_seen(r, key, seen);
             }
         }
         match v.unpack() {
@@ -2317,9 +2321,9 @@ impl<'a> Interp<'a> {
                 if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
                     seen.push(h);
                     let mut parts = Vec::with_capacity(elems.len());
-                    for e in elems {
+                    for (i, e) in elems.into_iter().enumerate() {
                         parts.push(
-                            self.json_to_string_seen(e, seen)?
+                            self.json_to_string_seen(e, &alloc::format!("{i}"), seen)?
                                 .unwrap_or_else(|| String::from("null")),
                         );
                     }
@@ -2334,7 +2338,7 @@ impl<'a> Interp<'a> {
                     let mut parts = Vec::new();
                     for k in keys {
                         let val = self.read_member(h, &k)?;
-                        if let Some(s) = self.json_to_string_seen(val, seen)? {
+                        if let Some(s) = self.json_to_string_seen(val, &k, seen)? {
                             parts.push(alloc::format!("{}:{}", json_quote(&k), s));
                         }
                     }
