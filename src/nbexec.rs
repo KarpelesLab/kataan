@@ -8466,6 +8466,11 @@ impl<'a> Interp<'a> {
     fn coerce_to_string(&mut self, v: NanBox) -> Result<String, ExecError> {
         if let Some(raw) = v.as_handle() {
             let h = Handle::from_raw(raw);
+            // A Symbol has no implicit string conversion (e.g. in a template).
+            if self.realm.symbol_at(h).is_some() {
+                let m = self.new_str("Cannot convert a Symbol value to a string");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
             if self.realm.string_value(h).is_none()
                 && !self.realm.is_array(h)
                 && self.realm.object_keys(h).is_some()
@@ -9898,6 +9903,15 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
+        // A Symbol cannot be converted to a number (unary `+`/`-`/`~`).
+        if matches!(op, UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot)
+            && v.as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|h| self.realm.symbol_at(h).is_some())
+        {
+            let m = self.new_str("Cannot convert a Symbol value to a number");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
         Ok(match op {
             UnaryOp::Plus => {
                 let p = self.coerce_object(v, "number")?;
@@ -10132,6 +10146,24 @@ impl<'a> Interp<'a> {
         } else {
             (a, b)
         };
+        // A Symbol cannot be implicitly converted to a number or string, so any
+        // arithmetic/relational operator on one throws a TypeError.
+        if coerces {
+            let is_sym = |this: &Self, v: NanBox| {
+                v.as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| this.realm.symbol_at(h).is_some())
+            };
+            if is_sym(self, a) || is_sym(self, b) {
+                let msg = if matches!(op, BinaryOp::Add) {
+                    "Cannot convert a Symbol value to a string"
+                } else {
+                    "Cannot convert a Symbol value to a number"
+                };
+                let m = self.new_str(msg);
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+        }
         Ok(match op {
             BinaryOp::Add => self.realm.add(a, b),
             BinaryOp::Sub => self.realm.sub(a, b),
