@@ -282,8 +282,25 @@ impl Realm {
     pub fn new_collection(&mut self, is_set: bool) -> Handle {
         self.heap.alloc(Cell::Collection {
             is_set,
+            is_weak: false,
             entries: Vec::new(),
         })
+    }
+
+    /// Marks a collection as weak (`WeakMap`/`WeakSet`), so its keys are validated.
+    pub fn set_collection_weak(&mut self, handle: Handle) {
+        if let Some(Cell::Collection { is_weak, .. }) = self.heap.get_mut(handle) {
+            *is_weak = true;
+        }
+    }
+
+    /// Whether `handle` is a weak collection (`WeakMap`/`WeakSet`).
+    #[must_use]
+    pub fn collection_is_weak(&self, handle: Handle) -> bool {
+        matches!(
+            self.heap.get(handle),
+            Some(Cell::Collection { is_weak: true, .. })
+        )
     }
 
     /// `SameValueZero(a, b)` — the key equality `Map`/`Set` use: strict equality,

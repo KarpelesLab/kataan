@@ -115,6 +115,8 @@ pub enum Cell {
     Collection {
         /// Whether this is a `Set` (vs a `Map`).
         is_set: bool,
+        /// Whether this is a `WeakMap`/`WeakSet` (keys must be objects/symbols).
+        is_weak: bool,
         /// The entries, in insertion order, compared by `SameValueZero`-ish
         /// strict equality.
         entries: Vec<(NanBox, NanBox)>,
@@ -252,7 +254,9 @@ impl Cell {
     /// The `(is_set, entries)` of a collection, mutably.
     pub fn as_collection_mut(&mut self) -> Option<(bool, &mut Vec<(NanBox, NanBox)>)> {
         match self {
-            Cell::Collection { is_set, entries } => Some((*is_set, entries)),
+            Cell::Collection {
+                is_set, entries, ..
+            } => Some((*is_set, entries)),
             _ => None,
         }
     }
@@ -261,7 +265,9 @@ impl Cell {
     #[must_use]
     pub fn as_collection(&self) -> Option<(bool, &[(NanBox, NanBox)])> {
         match self {
-            Cell::Collection { is_set, entries } => Some((*is_set, entries)),
+            Cell::Collection {
+                is_set, entries, ..
+            } => Some((*is_set, entries)),
             _ => None,
         }
     }

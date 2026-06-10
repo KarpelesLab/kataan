@@ -4154,14 +4154,19 @@ impl<'a> Interp<'a> {
             _ => return Err(ExecError::Unsupported("new on this constructor")),
         };
         let handle = self.realm.new_collection(is_set);
+        // A weak collection rejects primitive keys (its keys must be objects/symbols).
+        if matches!(id, N_WEAKMAP | N_WEAKSET) {
+            self.realm.set_collection_weak(handle);
+        }
         // Seed from an iterable: a `Set` from array elements, a `Map` from
         // `[key, value]` pairs.
         // Seed from any iterable (array, string, Set, Map, …): a `Set` from each
         // value, a `Map` from each `[key, value]` pair.
         let first = args.first().copied().unwrap_or(NanBox::undefined());
         if !matches!(first.unpack(), Unpacked::Undefined | Unpacked::Null) {
-            for item in self.iterate_values(first).unwrap_or_default() {
+            for item in self.iterate_values(first)? {
                 if is_set {
+                    self.guard_weak_key(handle, item)?;
                     self.realm.collection_set(handle, item, item);
                 } else if let Some(pr) = item
                     .as_handle()
@@ -4170,6 +4175,7 @@ impl<'a> Interp<'a> {
                 {
                     let k = pr.first().copied().unwrap_or(NanBox::undefined());
                     let v = pr.get(1).copied().unwrap_or(NanBox::undefined());
+                    self.guard_weak_key(handle, k)?;
                     self.realm.collection_set(handle, k, v);
                 }
             }
@@ -4446,6 +4452,23 @@ impl<'a> Interp<'a> {
     /// Builds a primitive wrapper object (`new Number`/`String`/`Boolean`,
     /// `Object(primitive)`): an object boxing `prim` behind a `\0prim` slot, with
     /// `\0wraptype` recording the constructor id (for `instanceof`).
+    /// For a weak collection (`WeakMap`/`WeakSet`), throws a `TypeError` when `key`
+    /// is a primitive — weak keys must be objects or symbols. A no-op for a
+    /// non-weak (`Map`/`Set`) collection.
+    fn guard_weak_key(&mut self, coll: Handle, key: NanBox) -> Result<(), ExecError> {
+        if !self.realm.collection_is_weak(coll) {
+            return Ok(());
+        }
+        let valid = key.as_handle().map(Handle::from_raw).is_some_and(|h| {
+            self.realm.string_value(h).is_none() && self.realm.bigint_at(h).is_none()
+        });
+        if valid {
+            return Ok(());
+        }
+        let m = self.new_str("Invalid value used as weak collection key");
+        Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
+    }
+
     fn make_primitive_wrapper(&mut self, prim: NanBox, ctor_id: u16) -> NanBox {
         let obj = self.realm.new_object();
         self.realm.set_hidden_property(obj, PRIM_WRAP, prim);
@@ -7244,10 +7267,12 @@ impl<'a> Interp<'a> {
         if let Some(size) = self.realm.collection_size(handle) {
             match method {
                 "set" => {
+                    self.guard_weak_key(handle, arg(0))?;
                     self.realm.collection_set(handle, arg(0), arg(1));
                     return Ok(Some(recv)); // Map.set returns the map (chainable)
                 }
                 "add" => {
+                    self.guard_weak_key(handle, arg(0))?;
                     self.realm.collection_set(handle, arg(0), arg(0));
                     return Ok(Some(recv)); // Set.add returns the set
                 }
