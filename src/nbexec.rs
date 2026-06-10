@@ -2477,6 +2477,11 @@ impl<'a> Interp<'a> {
         seen: &mut Vec<Handle>,
     ) -> Result<Option<String>, ExecError> {
         if let Some(h) = v.as_handle().map(Handle::from_raw) {
+            // A primitive-wrapper object (`new Number`/`String`/`Boolean`) serializes
+            // as its boxed primitive.
+            if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
+                return self.json_to_string_seen(prim, key, seen);
+            }
             // A `Date` serializes as its ISO string (its built-in `toJSON`).
             if let Some(ms) = self.realm.date_at(h) {
                 return Ok(Some(if ms.is_finite() {
@@ -8010,8 +8015,17 @@ impl<'a> Interp<'a> {
 
     fn iterate_values(&mut self, v: NanBox) -> Result<Vec<NanBox>, ExecError> {
         let Some(h) = v.as_handle().map(Handle::from_raw) else {
-            return Err(ExecError::Throw(self.new_str("value is not iterable")));
+            let m = self.new_str("is not iterable");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         };
+        // A `String` wrapper object iterates its characters (a `Number`/`Boolean`
+        // wrapper is not iterable — falls through to the error).
+        if let Some(prim) = self.realm.get_property(h, PRIM_WRAP)
+            && let Some(ph) = prim.as_handle().map(Handle::from_raw)
+            && self.realm.string_value(ph).is_some()
+        {
+            return self.iterate_values(prim);
+        }
         if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
             return Ok(elems);
         }
@@ -8095,7 +8109,8 @@ impl<'a> Interp<'a> {
             }
             return Ok(out);
         }
-        Err(ExecError::Throw(self.new_str("value is not iterable")))
+        let m = self.new_str("is not iterable");
+        Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
     }
 
     /// Finds a class instance's `[Symbol.iterator]` method (a method whose
