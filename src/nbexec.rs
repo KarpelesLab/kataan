@@ -8008,10 +8008,25 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal(NanBox::undefined()))
             }
             Stmt::Labeled { label, body, .. } => {
-                self.pending_label = Some(String::from(&*label.name));
+                // The label is handed to a *directly* labeled loop (via `pending_label`)
+                // so its own `break`/`continue label` see it. For any other body (a
+                // block, `if`, …) leaving `pending_label` set would let a nested loop
+                // wrongly claim the label, so it stays unset and the break-match below
+                // unwinds `break label` out of the whole labeled statement.
+                let is_loop = matches!(
+                    &**body,
+                    Stmt::For { .. }
+                        | Stmt::While { .. }
+                        | Stmt::DoWhile { .. }
+                        | Stmt::ForOf { .. }
+                        | Stmt::ForIn { .. }
+                );
+                if is_loop {
+                    self.pending_label = Some(String::from(&*label.name));
+                }
                 let flow = self.exec(body)?;
                 self.pending_label = None;
-                // A labeled non-loop block consumes a matching `break label`.
+                // A labeled statement consumes a matching `break label`.
                 Ok(match flow {
                     Flow::Break(Some(l)) if l == *label.name => Flow::Normal(NanBox::undefined()),
                     other => other,
