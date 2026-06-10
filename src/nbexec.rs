@@ -5404,7 +5404,7 @@ impl<'a> Interp<'a> {
         }
         // --- DataView get*/set* ---
         if let Some(bufv) = self.realm.get_property(handle, DATA_VIEW_BUF)
-            && let Some((is_set, size, signed, is_float)) = dataview_method(method)
+            && let Some((is_set, size, signed, is_float, is_bigint)) = dataview_method(method)
         {
             let bytes_h = bufv
                 .as_handle()
@@ -5423,16 +5423,24 @@ impl<'a> Interp<'a> {
                 .unwrap_or(0.0) as usize;
             let abs = base + self.realm.to_number(arg(0)).max(0.0) as usize;
             if is_set {
-                let value = self.realm.to_number(arg(1));
                 let le = self.realm.truthy(arg(2));
-                let bits = if is_float {
+                let bits = if is_bigint {
+                    // `setBigInt64`/`setBigUint64`: the value is a BigInt; its low
+                    // 64 bits are stored.
+                    let big = arg(1)
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.bigint_at(h));
+                    big.and_then(|b| b.to_i128()).unwrap_or(0) as u64
+                } else if is_float {
+                    let value = self.realm.to_number(arg(1));
                     if size == 4 {
                         u64::from((value as f32).to_bits())
                     } else {
                         value.to_bits()
                     }
                 } else {
-                    value as i64 as u64
+                    self.realm.to_number(arg(1)) as i64 as u64
                 };
                 for i in 0..size {
                     let shift = if le { i } else { size - 1 - i };
@@ -5454,6 +5462,16 @@ impl<'a> Interp<'a> {
                     & 0xff;
                 let shift = if le { i } else { size - 1 - i };
                 bits |= b << (8 * shift);
+            }
+            if is_bigint {
+                // `getBigInt64` reinterprets the 64 bits as a signed i64; `getBigUint64`
+                // as an unsigned u64 — both returned as a BigInt.
+                let big = if signed {
+                    crate::bignum::BigInt::from_i128(i128::from(bits as i64))
+                } else {
+                    crate::bignum::BigInt::from_i128(i128::from(bits))
+                };
+                return Ok(Some(NanBox::handle(self.realm.new_bigint(big).to_raw())));
             }
             let value = if is_float {
                 if size == 4 {
@@ -11015,7 +11033,7 @@ fn json_quote(s: &str) -> String {
 /// `Uint8Clamped`); float kinds narrow precision.
 /// Parses a `DataView` accessor name (`getInt32`, `setFloat64`, …) into
 /// `(is_set, byte_size, signed, is_float)`, or `None` if it isn't one.
-fn dataview_method(method: &str) -> Option<(bool, usize, bool, bool)> {
+fn dataview_method(method: &str) -> Option<(bool, usize, bool, bool, bool)> {
     let (is_set, t) = if let Some(t) = method.strip_prefix("get") {
         (false, t)
     } else if let Some(t) = method.strip_prefix("set") {
@@ -11023,18 +11041,21 @@ fn dataview_method(method: &str) -> Option<(bool, usize, bool, bool)> {
     } else {
         return None;
     };
-    let (size, signed, is_float) = match t {
-        "Int8" => (1, true, false),
-        "Uint8" => (1, false, false),
-        "Int16" => (2, true, false),
-        "Uint16" => (2, false, false),
-        "Int32" => (4, true, false),
-        "Uint32" => (4, false, false),
-        "Float32" => (4, false, true),
-        "Float64" => (8, false, true),
+    // (size, signed, is_float, is_bigint)
+    let (size, signed, is_float, is_bigint) = match t {
+        "Int8" => (1, true, false, false),
+        "Uint8" => (1, false, false, false),
+        "Int16" => (2, true, false, false),
+        "Uint16" => (2, false, false, false),
+        "Int32" => (4, true, false, false),
+        "Uint32" => (4, false, false, false),
+        "Float32" => (4, false, true, false),
+        "Float64" => (8, false, true, false),
+        "BigInt64" => (8, true, false, true),
+        "BigUint64" => (8, false, false, true),
         _ => return None,
     };
-    Some((is_set, size, signed, is_float))
+    Some((is_set, size, signed, is_float, is_bigint))
 }
 
 /// Maps a WASM export/import kind byte to its `ExternType` string.
