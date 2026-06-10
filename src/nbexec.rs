@@ -4584,11 +4584,20 @@ impl<'a> Interp<'a> {
                 "toLocaleString" => Some(self.new_str(&group_thousands(n))),
                 #[cfg(feature = "std")]
                 "toFixed" => {
-                    let digits = (self.realm.to_number(arg(0)) as usize).min(100);
+                    // `fractionDigits` is ToIntegerOrInfinity'd (undefined/NaN → 0)
+                    // and must be in [0, 100], else a RangeError.
+                    let d = self.realm.to_number(arg(0));
+                    let f = if d.is_nan() { 0 } else { d as i64 };
+                    if !(0..=100).contains(&f) {
+                        let m = self.new_str("toFixed() digits argument must be between 0 and 100");
+                        return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                    }
+                    let digits = f as usize;
                     // JS rounds half away from zero (Rust's formatter rounds half
                     // to even), so pre-round at the target scale.
                     let s = if !n.is_finite() {
-                        alloc::format!("{n}")
+                        // `Infinity`/`-Infinity`/`NaN` use the spec ToString.
+                        self.realm.to_display_string(NanBox::number(n))
                     } else if n.abs() >= 1e21 {
                         // Spec: a magnitude ≥ 1e21 uses the regular `ToString`
                         // (exponential), not a full decimal expansion.
@@ -4603,20 +4612,25 @@ impl<'a> Interp<'a> {
                 // `toExponential(d)` — exponential notation with `d` fractional
                 // digits and a signed exponent (`1.23e+3`).
                 "toExponential" => {
-                    let raw = if matches!(arg(0).unpack(), Unpacked::Undefined) {
-                        alloc::format!("{n:e}")
+                    if !n.is_finite() {
+                        // `Infinity`/`-Infinity`/`NaN` use the spec ToString.
+                        Some(self.new_str(&self.realm.to_display_string(NanBox::number(n))))
                     } else {
-                        let d = self.realm.to_number(arg(0)) as usize;
-                        alloc::format!("{n:.d$e}")
-                    };
-                    // Rust prints `1.23e3`; JS wants `1.23e+3`.
-                    let fixed = match raw.find('e') {
-                        Some(i) if !raw[i + 1..].starts_with('-') => {
-                            alloc::format!("{}e+{}", &raw[..i], &raw[i + 1..])
-                        }
-                        _ => raw,
-                    };
-                    Some(self.new_str(&fixed))
+                        let raw = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                            alloc::format!("{n:e}")
+                        } else {
+                            let d = self.realm.to_number(arg(0)) as usize;
+                            alloc::format!("{n:.d$e}")
+                        };
+                        // Rust prints `1.23e3`; JS wants `1.23e+3`.
+                        let fixed = match raw.find('e') {
+                            Some(i) if !raw[i + 1..].starts_with('-') => {
+                                alloc::format!("{}e+{}", &raw[..i], &raw[i + 1..])
+                            }
+                            _ => raw,
+                        };
+                        Some(self.new_str(&fixed))
+                    }
                 }
                 // `toPrecision(p)` — p significant digits (no arg → default
                 // string form).
