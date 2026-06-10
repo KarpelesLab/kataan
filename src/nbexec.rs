@@ -1135,11 +1135,13 @@ impl<'a> Interp<'a> {
                     .as_handle()
                     .is_some_and(|raw| self.realm.is_sealed(Handle::from_raw(raw))),
             ),
-            N_OBJECT_IS_EXTENSIBLE => NanBox::boolean(
-                arg(0)
-                    .as_handle()
-                    .is_some_and(|raw| self.realm.is_extensible(Handle::from_raw(raw))),
-            ),
+            N_OBJECT_IS_EXTENSIBLE => {
+                if let Some(obj) = arg(0).as_handle().map(Handle::from_raw) {
+                    self.is_extensible_of(obj)?
+                } else {
+                    NanBox::boolean(false)
+                }
+            }
             // `Object.create(proto)` — a new object with the given prototype
             // (`null` → no prototype).
             N_OBJECT_CREATE => {
@@ -1166,7 +1168,7 @@ impl<'a> Interp<'a> {
             N_OBJECT_SET_PROTO => {
                 if let Some(raw) = arg(0).as_handle() {
                     let proto = arg(1).as_handle().map(Handle::from_raw);
-                    self.realm.set_object_proto(Handle::from_raw(raw), proto);
+                    self.set_proto_of(Handle::from_raw(raw), proto)?;
                 }
                 arg(0)
             }
@@ -1337,8 +1339,7 @@ impl<'a> Interp<'a> {
             N_REFLECT_GET_OWN_DESC => match arg(0).as_handle().map(Handle::from_raw) {
                 Some(obj) => {
                     let key = self.member_key(arg(1));
-                    self.build_descriptor(obj, &key)
-                        .unwrap_or(NanBox::undefined())
+                    self.descriptor_of(obj, &key)?
                 }
                 None => NanBox::undefined(),
             },
@@ -1349,12 +1350,13 @@ impl<'a> Interp<'a> {
                 .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())),
             // `Reflect.setPrototypeOf(target, proto)` → boolean success.
             N_REFLECT_SET_PROTO => {
-                let ok = arg(0).as_handle().is_some_and(|raw| {
+                if let Some(raw) = arg(0).as_handle() {
                     let proto = arg(1).as_handle().map(Handle::from_raw);
-                    self.realm.set_object_proto(Handle::from_raw(raw), proto);
-                    true
-                });
-                NanBox::boolean(ok)
+                    self.set_proto_of(Handle::from_raw(raw), proto)?;
+                    NanBox::boolean(true)
+                } else {
+                    NanBox::boolean(false)
+                }
             }
             // `Reflect.preventExtensions(target)` → boolean success.
             N_REFLECT_PREVENT_EXT => {
@@ -1389,8 +1391,7 @@ impl<'a> Interp<'a> {
             N_OBJECT_GET_OWN_DESC => match arg(0).as_handle().map(Handle::from_raw) {
                 Some(obj) => {
                     let key = self.member_key(arg(1));
-                    self.build_descriptor(obj, &key)
-                        .unwrap_or(NanBox::undefined())
+                    self.descriptor_of(obj, &key)?
                 }
                 None => NanBox::undefined(),
             },
@@ -2756,6 +2757,75 @@ impl<'a> Interp<'a> {
         } else {
             None
         }
+    }
+
+    /// `Object/Reflect.getOwnPropertyDescriptor(obj, key)` — routing a proxy
+    /// through its `getOwnPropertyDescriptor` trap (or forwarding to the target),
+    /// else building the descriptor from the own property.
+    fn descriptor_of(&mut self, obj: Handle, key: &str) -> Result<NanBox, ExecError> {
+        if let Some((target, handler)) = self.realm.proxy_at(obj) {
+            self.guard_revoked(obj)?;
+            let trap = self
+                .realm
+                .get_property(handler, "getOwnPropertyDescriptor")
+                .unwrap_or(NanBox::undefined());
+            if trap
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let key_v = self.new_str(key);
+                return self.call(trap, &[NanBox::handle(target.to_raw()), key_v]);
+            }
+            return self.descriptor_of(target, key);
+        }
+        Ok(self
+            .build_descriptor(obj, key)
+            .unwrap_or(NanBox::undefined()))
+    }
+
+    /// `Object/Reflect.isExtensible(obj)` — routing a proxy through its
+    /// `isExtensible` trap (or forwarding to the target).
+    fn is_extensible_of(&mut self, obj: Handle) -> Result<NanBox, ExecError> {
+        if let Some((target, handler)) = self.realm.proxy_at(obj) {
+            self.guard_revoked(obj)?;
+            let trap = self
+                .realm
+                .get_property(handler, "isExtensible")
+                .unwrap_or(NanBox::undefined());
+            if trap
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let r = self.call(trap, &[NanBox::handle(target.to_raw())])?;
+                return Ok(NanBox::boolean(self.realm.truthy(r)));
+            }
+            return Ok(NanBox::boolean(self.realm.is_extensible(target)));
+        }
+        Ok(NanBox::boolean(self.realm.is_extensible(obj)))
+    }
+
+    /// `Object/Reflect.setPrototypeOf(obj, proto)` — routing a proxy through its
+    /// `setPrototypeOf` trap (or forwarding to the target).
+    fn set_proto_of(&mut self, obj: Handle, proto: Option<Handle>) -> Result<(), ExecError> {
+        if let Some((target, handler)) = self.realm.proxy_at(obj) {
+            self.guard_revoked(obj)?;
+            let trap = self
+                .realm
+                .get_property(handler, "setPrototypeOf")
+                .unwrap_or(NanBox::undefined());
+            if trap
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let proto_box = proto.map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
+                self.call(trap, &[NanBox::handle(target.to_raw()), proto_box])?;
+                return Ok(());
+            }
+            self.realm.set_object_proto(target, proto);
+            return Ok(());
+        }
+        self.realm.set_object_proto(obj, proto);
+        Ok(())
     }
 
     fn apply_descriptor(&mut self, obj: Handle, key: &str, desc: Handle) -> Result<(), ExecError> {
