@@ -2759,6 +2759,31 @@ impl<'a> Interp<'a> {
     }
 
     fn apply_descriptor(&mut self, obj: Handle, key: &str, desc: Handle) -> Result<(), ExecError> {
+        // A proxy routes `Object.defineProperty` through its `defineProperty` trap
+        // (called `trap(target, key, descriptor)`), or forwards to the target.
+        if let Some((target, handler)) = self.realm.proxy_at(obj) {
+            self.guard_revoked(obj)?;
+            let trap = self
+                .realm
+                .get_property(handler, "defineProperty")
+                .unwrap_or(NanBox::undefined());
+            if trap
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let key_v = self.new_str(key);
+                self.call(
+                    trap,
+                    &[
+                        NanBox::handle(target.to_raw()),
+                        key_v,
+                        NanBox::handle(desc.to_raw()),
+                    ],
+                )?;
+                return Ok(());
+            }
+            return self.apply_descriptor(target, key, desc);
+        }
         let is_own = self.realm.has_own(obj, key) || self.realm.accessor(obj, key).is_some();
         // Adding a *new* property to a non-extensible object is a TypeError.
         if !is_own && !self.realm.is_extensible(obj) {
