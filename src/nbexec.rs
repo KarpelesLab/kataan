@@ -363,6 +363,51 @@ const N_REFLECT_GET_PROTO: u16 = 137;
 /// returning a boolean success flag.
 const N_REFLECT_SET_PROTO: u16 = 204;
 const N_REFLECT_PREVENT_EXT: u16 = 205;
+/// A first-class `Array.prototype.<method>` value: a bound native carrying the
+/// method name; calling it (via `.call`/`.apply`) dispatches that array method on
+/// the supplied `this` (so `Array.prototype.slice.call(arguments)` works).
+const N_ARRAY_PROTO_FN: u16 = 206;
+/// The `Array.prototype` methods exposed as first-class values (each re-dispatched
+/// through `call_method`).
+const ARRAY_PROTO_METHODS: &[&str] = &[
+    "slice",
+    "splice",
+    "map",
+    "filter",
+    "forEach",
+    "reduce",
+    "reduceRight",
+    "indexOf",
+    "lastIndexOf",
+    "includes",
+    "find",
+    "findIndex",
+    "findLast",
+    "findLastIndex",
+    "some",
+    "every",
+    "join",
+    "concat",
+    "reverse",
+    "sort",
+    "fill",
+    "copyWithin",
+    "flat",
+    "flatMap",
+    "at",
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "keys",
+    "values",
+    "entries",
+    "toString",
+    "with",
+    "toReversed",
+    "toSorted",
+    "toSpliced",
+];
 /// Bound native: the `revoke` function from `Proxy.revocable` (carries the proxy).
 const N_PROXY_REVOKE: u16 = 122;
 const N_SYMBOL: u16 = 38;
@@ -820,6 +865,31 @@ impl<'a> Interp<'a> {
             );
             let name = self.new_str("Object");
             self.realm.set_hidden_property(obj_ns, "name", name);
+        }
+        // `Array.prototype`: a real object whose methods are first-class values that
+        // dispatch on their `this`, so the classic `Array.prototype.slice.call(...)`
+        // (and `.map`/`.filter`/… `.call`/`.apply`) idioms work on array-likes.
+        if let Some(arr_ns) = self
+            .current
+            .get("Array")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            let arr_proto = self.realm.new_object();
+            for &name in ARRAY_PROTO_METHODS {
+                let name_h = self.realm.new_string(name);
+                let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
+                self.realm
+                    .set_property(arr_proto, name, NanBox::handle(f.to_raw()));
+                self.realm.mark_hidden(arr_proto, name);
+            }
+            self.realm
+                .set_property(arr_ns, "prototype", NanBox::handle(arr_proto.to_raw()));
+            self.realm.set_hidden_property(
+                arr_proto,
+                "constructor",
+                NanBox::handle(arr_ns.to_raw()),
+            );
         }
         // Newly-created plain objects now inherit from `Object.prototype`.
         self.realm.set_default_object_proto(obj_proto);
@@ -3066,6 +3136,14 @@ impl<'a> Interp<'a> {
         }
         // A bound native (promise resolve/reject) carries its target.
         if let Some((id, target)) = self.realm.bound_native_at(handle) {
+            // A first-class `Array.prototype.<method>`: run that array method on the
+            // call's `this` (e.g. `Array.prototype.slice.call(arguments)`).
+            if id == N_ARRAY_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                return Ok(self
+                    .call_method(this_val, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
             // A WASM export wrapper: decode the carried module, instantiate, and
             // invoke the named export through the JS-value boundary.
             if id == N_WASM_CALL {
