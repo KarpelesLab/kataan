@@ -10761,10 +10761,24 @@ impl<'a> Interp<'a> {
                 return Ok(self.realm.truthy(result));
             }
         }
-        let (Some(oh), Some(ch)) = (
-            obj.as_handle().map(Handle::from_raw),
-            ctor.as_handle().map(Handle::from_raw),
-        ) else {
+        // The RHS must be a callable object (without a `[Symbol.hasInstance]`); a
+        // primitive or a non-constructor object is a TypeError.
+        let Some(ch) = ctor.as_handle().map(Handle::from_raw) else {
+            let m = self.new_str("Right-hand side of 'instanceof' is not an object");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        };
+        let is_ctor = self.realm.native_at(ch).is_some()
+            || self.realm.function_at(ch).is_some()
+            || self.realm.class_at(ch).is_some()
+            || self.realm.bound_native_at(ch).is_some()
+            || self.current.get("Array").and_then(|v| v.as_handle()) == ctor.as_handle()
+            || self.current.get("Object").and_then(|v| v.as_handle()) == ctor.as_handle();
+        if !is_ctor {
+            let m = self.new_str("Right-hand side of 'instanceof' is not callable");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        // A primitive left-hand side is not an instance of anything.
+        let Some(oh) = obj.as_handle().map(Handle::from_raw) else {
             return Ok(false);
         };
         // Built-in constructors: check the cell kind directly.
@@ -10857,13 +10871,19 @@ impl<'a> Interp<'a> {
                 && self.realm.symbol_at(oh).is_none()
                 && self.realm.bigint_at(oh).is_none());
         }
-        // Plain function constructors: match the instance's recorded constructor.
-        if self.realm.function_at(ch).is_some() {
-            return Ok(self
-                .realm
-                .get_property(oh, CTOR_KEY)
-                .and_then(|t| t.as_handle())
-                == ctor.as_handle());
+        // Plain function constructors: walk the instance's `[[Prototype]]` chain for
+        // the constructor's current `.prototype` (so `Object.create(C.prototype)` is an
+        // instance, and reassigning `C.prototype` is reflected).
+        if let Some((func_id, _)) = self.realm.function_at(ch) {
+            let proto = self.realm.function_prototype(func_id);
+            let mut cur = self.realm.object_proto(oh);
+            while let Some(p) = cur {
+                if p == proto {
+                    return Ok(true);
+                }
+                cur = self.realm.object_proto(p);
+            }
+            return Ok(false);
         }
         let (Some(tag), Some((target_id, _))) = (self.realm.class_tag(oh), self.realm.class_at(ch))
         else {
