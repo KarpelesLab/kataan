@@ -3723,23 +3723,24 @@ impl<'a> Interp<'a> {
         caps: &crate::regex::Captures,
         group_names: &[(usize, String)],
     ) -> NanBox {
-        let obj = self.realm.new_object();
-        for (i, g) in caps.groups.iter().enumerate() {
-            let v = match g {
+        // A match result is a real Array: element `i` is capture group `i` (the
+        // whole match at 0), so `Array.isArray`, `JSON.stringify`, `.length`, and
+        // the array methods all behave. `index`/`input`/`groups` are enumerable
+        // named own properties (kept in the array's auxiliary object).
+        let elems: Vec<NanBox> = caps
+            .groups
+            .iter()
+            .map(|g| match g {
                 Some((s, e)) => self.new_str(&char_substr(text, *s, *e)),
                 None => NanBox::undefined(),
-            };
-            self.realm.set_property(obj, &alloc::format!("{i}"), v);
-        }
+            })
+            .collect();
+        let obj = self.realm.new_array(elems);
         let index = caps.groups.first().and_then(|g| *g).map_or(0, |(s, _)| s);
         self.realm
             .set_property(obj, "index", NanBox::number(index as f64));
         let input = self.new_str(text);
         self.realm.set_property(obj, "input", input);
-        self.realm
-            .set_property(obj, "length", NanBox::number(caps.groups.len() as f64));
-        // `length` is the array-length slot: present but non-enumerable.
-        self.realm.mark_hidden(obj, "length");
         // `.groups`: an object of named captures (or `undefined` if none).
         let groups = if group_names.is_empty() {
             NanBox::undefined()

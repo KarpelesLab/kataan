@@ -1715,21 +1715,23 @@ fn regex_match_object(
     caps: &crate::regex::Captures,
     group_names: &[(usize, alloc::string::String)],
 ) -> NanBox {
-    let obj = realm.new_object();
-    for (i, g) in caps.groups.iter().enumerate() {
-        let v = match g {
+    // A match result is a real Array: element `i` is capture group `i` (the whole
+    // match at 0), so `Array.isArray`, `JSON.stringify`, `.length`, and the array
+    // methods behave; `index`/`input`/`groups` are enumerable named own properties
+    // (kept in the array's auxiliary object).
+    let elems: Vec<NanBox> = caps
+        .groups
+        .iter()
+        .map(|g| match g {
             Some((s, e)) => NanBox::handle(realm.new_string(&char_substr(text, *s, *e)).to_raw()),
             None => NanBox::undefined(),
-        };
-        realm.set_property(obj, &alloc::format!("{i}"), v);
-    }
+        })
+        .collect();
+    let obj = realm.new_array(elems);
     let index = caps.groups.first().and_then(|g| *g).map_or(0, |(s, _)| s);
     realm.set_property(obj, "index", NanBox::number(index as f64));
     let input = NanBox::handle(realm.new_string(text).to_raw());
     realm.set_property(obj, "input", input);
-    realm.set_property(obj, "length", NanBox::number(caps.groups.len() as f64));
-    // `length` is the array-length slot: present but non-enumerable.
-    realm.mark_hidden(obj, "length");
     // `.groups`: an object of named captures (or `undefined` if none).
     let groups = if group_names.is_empty() {
         NanBox::undefined()
