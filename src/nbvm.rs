@@ -1701,6 +1701,11 @@ fn run_frame(
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),
                     }
+                } else if *native == NB_JSON_PARSE {
+                    match json_parse(ctx, funcs, &argv) {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
                 } else {
                     regs[*dst as usize] = call_native(ctx, *native, &argv);
                 }
@@ -1782,6 +1787,78 @@ fn json_stringify(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<N
         Some(s) => NanBox::handle(ctx.realm.new_string(&s).to_raw()),
         None => NanBox::undefined(),
     })
+}
+
+/// Interpreter-aware `JSON.parse(text, reviver?)`: parses (throwing a `SyntaxError`
+/// on malformed input) then, with a function reviver, walks the result bottom-up
+/// transforming each value.
+fn json_parse(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<NanBox, VmError> {
+    let s = ctx
+        .realm
+        .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
+    let value = match crate::json::parse(ctx.realm, &s) {
+        Ok(v) => v,
+        Err(msg) => return Err(VmError::Thrown(make_error(ctx.realm, "SyntaxError", &msg))),
+    };
+    let reviver = args.get(1).copied().unwrap_or(NanBox::undefined());
+    if reviver
+        .as_handle()
+        .map(Handle::from_raw)
+        .is_some_and(|r| ctx.realm.is_vm_function(r))
+    {
+        let holder = ctx.realm.new_object();
+        ctx.realm.set_property(holder, "", value);
+        return json_revive(ctx, funcs, holder, "", reviver);
+    }
+    Ok(value)
+}
+
+/// `JSON.parse` reviver walk (spec `InternalizeJSONProperty`): recurse into a value's
+/// children first, then call `reviver.call(holder, key, value)`. An `undefined` result
+/// deletes the (object) property.
+fn json_revive(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    holder: Handle,
+    key: &str,
+    reviver: NanBox,
+) -> Result<NanBox, VmError> {
+    let value = if ctx.realm.is_array(holder)
+        && let Ok(i) = key.parse::<usize>()
+    {
+        ctx.realm.get_element(holder, i)
+    } else {
+        ctx.realm
+            .get_property(holder, key)
+            .unwrap_or(NanBox::undefined())
+    };
+    if let Some(vh) = value.as_handle().map(Handle::from_raw) {
+        if ctx.realm.is_array(vh) {
+            let len = ctx.realm.array_length(vh).unwrap_or(0);
+            for i in 0..len {
+                let ks = alloc::format!("{i}");
+                let nv = json_revive(ctx, funcs, vh, &ks, reviver)?;
+                ctx.realm.set_element(vh, i, nv);
+            }
+        } else if let Some(keys) = ctx.realm.object_keys(vh) {
+            for k in keys {
+                let nv = json_revive(ctx, funcs, vh, &k, reviver)?;
+                if matches!(nv.unpack(), crate::nanbox::Unpacked::Undefined) {
+                    ctx.realm.delete_property(vh, &k);
+                } else {
+                    ctx.realm.set_property(vh, &k, nv);
+                }
+            }
+        }
+    }
+    let kb = NanBox::handle(ctx.realm.new_string(key).to_raw());
+    call_closure(
+        ctx,
+        funcs,
+        reviver,
+        &[kb, value],
+        NanBox::handle(holder.to_raw()),
+    )
 }
 
 /// Reads property `key` from `h`, invoking a getter accessor (a closure) so
