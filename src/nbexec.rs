@@ -535,6 +535,9 @@ const TYPED_ARRAY_KIND: &str = "\u{0}takind";
 const ARRAY_BUFFER_BYTES: &str = "\u{0}abytes";
 const DATA_VIEW_BUF: &str = "\u{0}dvbuf";
 const DATA_VIEW_OFF: &str = "\u{0}dvoff";
+/// An explicit `DataView` byteLength (the 3rd constructor arg); absent → the rest
+/// of the buffer from the offset.
+const DATA_VIEW_LEN: &str = "\u{0}dvlen";
 const BOUND_TARGET: &str = "\u{0}bnd_t";
 const BOUND_THIS: &str = "\u{0}bnd_this";
 const BOUND_ARGS: &str = "\u{0}bnd_args";
@@ -3878,6 +3881,15 @@ impl<'a> Interp<'a> {
             self.realm.set_hidden_property(obj, DATA_VIEW_BUF, buf);
             self.realm
                 .set_hidden_property(obj, DATA_VIEW_OFF, NanBox::number(off));
+            // An explicit byteLength (3rd arg) is honored; otherwise the view spans
+            // the rest of the buffer from `byteOffset`.
+            if let Some(len) = args.get(2)
+                && !matches!(len.unpack(), Unpacked::Undefined)
+            {
+                let n = self.realm.to_number(*len);
+                self.realm
+                    .set_hidden_property(obj, DATA_VIEW_LEN, NanBox::number(n));
+            }
             return Ok(NanBox::handle(obj.to_raw()));
         }
         // `new Int8Array(n)` / `new Uint8Array([…])` / … — a typed array backed by
@@ -5362,6 +5374,33 @@ impl<'a> Interp<'a> {
                 return Ok(Some(self.new_str(&out)));
             }
             _ => {}
+        }
+        // --- ArrayBuffer.prototype.slice(begin?, end?) → a new ArrayBuffer copy ---
+        if method == "slice"
+            && let Some(bytesv) = self.realm.get_property(handle, ARRAY_BUFFER_BYTES)
+            && let Some(bh) = bytesv.as_handle().map(Handle::from_raw)
+        {
+            let elems = self
+                .realm
+                .array_elements(bh)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
+            let len = elems.len() as i64;
+            let norm = |this: &mut Self, v: NanBox, default: i64| -> usize {
+                if matches!(v.unpack(), Unpacked::Undefined) {
+                    return default as usize;
+                }
+                let n = this.realm.to_number(v) as i64;
+                usize::try_from(if n < 0 { (len + n).max(0) } else { n.min(len) }).unwrap_or(0)
+            };
+            let begin = norm(self, arg(0), 0);
+            let end = norm(self, arg(1), len);
+            let sub = elems.get(begin..end.max(begin)).unwrap_or(&[]).to_vec();
+            let nb = self.realm.new_object();
+            let arr = self.realm.new_array(sub);
+            self.realm
+                .set_hidden_property(nb, ARRAY_BUFFER_BYTES, NanBox::handle(arr.to_raw()));
+            return Ok(Some(NanBox::handle(nb.to_raw())));
         }
         // --- DataView get*/set* ---
         if let Some(bufv) = self.realm.get_property(handle, DATA_VIEW_BUF)
@@ -9670,6 +9709,14 @@ impl<'a> Interp<'a> {
                     .get_property(handle, DATA_VIEW_OFF)
                     .unwrap_or(NanBox::number(0.0)),
                 _ => {
+                    // An explicit byteLength wins; else the rest of the buffer.
+                    if let Some(len) = self
+                        .realm
+                        .get_property(handle, DATA_VIEW_LEN)
+                        .and_then(|n| n.as_number())
+                    {
+                        return Ok(NanBox::number(len));
+                    }
                     let total = buf
                         .as_handle()
                         .map(Handle::from_raw)
