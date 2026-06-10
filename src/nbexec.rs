@@ -408,6 +408,55 @@ const ARRAY_PROTO_METHODS: &[&str] = &[
     "toSorted",
     "toSpliced",
 ];
+/// `String.prototype` methods exposed as first-class values.
+const STRING_PROTO_METHODS: &[&str] = &[
+    "slice",
+    "substring",
+    "substr",
+    "charAt",
+    "charCodeAt",
+    "codePointAt",
+    "indexOf",
+    "lastIndexOf",
+    "includes",
+    "startsWith",
+    "endsWith",
+    "split",
+    "replace",
+    "replaceAll",
+    "match",
+    "matchAll",
+    "search",
+    "toUpperCase",
+    "toLowerCase",
+    "trim",
+    "trimStart",
+    "trimEnd",
+    "padStart",
+    "padEnd",
+    "repeat",
+    "concat",
+    "at",
+    "normalize",
+    "localeCompare",
+    "toString",
+    "valueOf",
+    "isWellFormed",
+    "toWellFormed",
+];
+/// `Number.prototype` methods exposed as first-class values.
+const NUMBER_PROTO_METHODS: &[&str] = &[
+    "toFixed",
+    "toPrecision",
+    "toExponential",
+    "toString",
+    "valueOf",
+    "toLocaleString",
+];
+/// `Boolean.prototype` methods exposed as first-class values.
+const BOOLEAN_PROTO_METHODS: &[&str] = &["toString", "valueOf"];
+/// `Function.prototype` methods exposed as first-class values.
+const FUNCTION_PROTO_METHODS: &[&str] = &["call", "apply", "bind", "toString"];
 /// Bound native: the `revoke` function from `Proxy.revocable` (carries the proxy).
 const N_PROXY_REVOKE: u16 = 122;
 const N_SYMBOL: u16 = 38;
@@ -583,6 +632,33 @@ impl<'a> Interp<'a> {
         self.realm.set_property(f, "name", name_v);
         self.realm.mark_hidden(f, "name");
         f
+    }
+
+    /// Builds `<ctor>.prototype` as a real object whose `methods` are first-class
+    /// values — each a bound native re-dispatching that method on the call's `this`
+    /// — so `Ctor.prototype.method.call(thisArg, …)` works. Methods are
+    /// non-enumerable; `proto.constructor` links back to the constructor.
+    fn setup_first_class_prototype(&mut self, ctor_name: &str, methods: &[&str]) {
+        let Some(ns) = self
+            .current
+            .get(ctor_name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        let proto = self.realm.new_object();
+        for &name in methods {
+            let name_h = self.realm.new_string(name);
+            let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
+            self.realm
+                .set_property(proto, name, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(proto, name);
+        }
+        self.realm
+            .set_property(ns, "prototype", NanBox::handle(proto.to_raw()));
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
     }
 
     /// Installs a small built-in library: the `Math` object and the global
@@ -866,31 +942,14 @@ impl<'a> Interp<'a> {
             let name = self.new_str("Object");
             self.realm.set_hidden_property(obj_ns, "name", name);
         }
-        // `Array.prototype`: a real object whose methods are first-class values that
-        // dispatch on their `this`, so the classic `Array.prototype.slice.call(...)`
-        // (and `.map`/`.filter`/… `.call`/`.apply`) idioms work on array-likes.
-        if let Some(arr_ns) = self
-            .current
-            .get("Array")
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-        {
-            let arr_proto = self.realm.new_object();
-            for &name in ARRAY_PROTO_METHODS {
-                let name_h = self.realm.new_string(name);
-                let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
-                self.realm
-                    .set_property(arr_proto, name, NanBox::handle(f.to_raw()));
-                self.realm.mark_hidden(arr_proto, name);
-            }
-            self.realm
-                .set_property(arr_ns, "prototype", NanBox::handle(arr_proto.to_raw()));
-            self.realm.set_hidden_property(
-                arr_proto,
-                "constructor",
-                NanBox::handle(arr_ns.to_raw()),
-            );
-        }
+        // `<Ctor>.prototype` as a real object whose methods are first-class values
+        // that dispatch on their `this`, so the classic `Array.prototype.slice.call`
+        // / `String.prototype.X.call` / `Function.prototype.bind.call` idioms work.
+        self.setup_first_class_prototype("Array", ARRAY_PROTO_METHODS);
+        self.setup_first_class_prototype("String", STRING_PROTO_METHODS);
+        self.setup_first_class_prototype("Number", NUMBER_PROTO_METHODS);
+        self.setup_first_class_prototype("Boolean", BOOLEAN_PROTO_METHODS);
+        self.setup_first_class_prototype("Function", FUNCTION_PROTO_METHODS);
         // Newly-created plain objects now inherit from `Object.prototype`.
         self.realm.set_default_object_proto(obj_proto);
         // `globalThis`: an object mirroring the global bindings, referencing
@@ -4641,6 +4700,14 @@ impl<'a> Interp<'a> {
             };
         }
 
+        // --- boolean methods (the receiver is an immediate) ---
+        if let Unpacked::Bool(b) = recv.unpack() {
+            return Ok(match method {
+                "toString" => Some(self.new_str(if b { "true" } else { "false" })),
+                "valueOf" => Some(recv),
+                _ => None,
+            });
+        }
         // --- number methods (the receiver is an immediate, not a handle) ---
         if let Some(n) = recv.as_number() {
             return Ok(match method {
