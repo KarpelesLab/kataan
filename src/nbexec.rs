@@ -3607,6 +3607,12 @@ impl<'a> Interp<'a> {
         // body, and return it — unless the function explicitly returned an object
         // (the spec's constructor return rule).
         if let Some((func_id, _)) = self.realm.function_at(handle) {
+            // Arrow, generator, and async functions are not constructors.
+            let def = self.functions[func_id as usize];
+            if def.is_arrow || def.is_generator || def.is_async {
+                let m = self.new_str("is not a constructor");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
             // The instance's `[[Prototype]]` is the constructor's `.prototype`,
             // so inherited methods/getters resolve through the chain.
             let proto = self.realm.function_prototype(func_id);
@@ -4663,8 +4669,21 @@ impl<'a> Interp<'a> {
         let result = self.run_constructor(class_id, env, instance, args);
         self.this_val = saved_this;
         self.new_target = saved_target;
-        result?;
-        Ok(this_val)
+        let ret = result?;
+        // A constructor that `return`s an *object* makes `new` yield that object
+        // instead of the freshly-built instance; a primitive return is ignored.
+        match ret {
+            Some(v)
+                if v.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    self.realm.string_value(h).is_none()
+                        && self.realm.bigint_at(h).is_none()
+                        && self.realm.symbol_at(h).is_none()
+                }) =>
+            {
+                Ok(v)
+            }
+            _ => Ok(this_val),
+        }
     }
 
     /// Runs one class's field initializers and constructor on `instance` (with
@@ -4702,7 +4721,7 @@ impl<'a> Interp<'a> {
         env: &Scope,
         instance: Handle,
         args: &[NanBox],
-    ) -> Result<(), ExecError> {
+    ) -> Result<Option<NanBox>, ExecError> {
         let class = self.classes[class_id as usize];
         let parent = self.resolve_super(class, env)?;
         let saved_super = core::mem::replace(&mut self.pending_super, parent.clone());
@@ -4721,7 +4740,7 @@ impl<'a> Interp<'a> {
                     self.init_instance_fields(class_id, instance)?;
                     let scope = self.current.child();
                     let saved = core::mem::replace(&mut self.current, scope);
-                    let r = (|| {
+                    let r: Result<Option<NanBox>, ExecError> = (|| {
                         // Bind parameters (rest/default/destructuring supported).
                         for (i, param) in ctor.value.params.iter().enumerate() {
                             let value = if param.rest {
@@ -4738,21 +4757,26 @@ impl<'a> Interp<'a> {
                             };
                             self.bind_pattern(&param.target, value)?;
                         }
+                        // The constructor's `return value` (if an object) overrides
+                        // the new instance; captured here.
+                        let mut returned = None;
                         for stmt in &ctor.value.body {
-                            if let Flow::Return(_) = self.exec(stmt)? {
+                            if let Flow::Return(v) = self.exec(stmt)? {
+                                returned = Some(v);
                                 break;
                             }
                         }
-                        Ok(())
+                        Ok(returned)
                     })();
                     self.current = saved;
-                    r?;
+                    r
                 }
                 // No own constructor but a base: implicit `super(args)`, then
                 // this class's own field initializers.
                 (None, Some((pid, penv))) => {
-                    self.run_constructor(*pid, &penv.clone(), instance, args)?;
+                    let ret = self.run_constructor(*pid, &penv.clone(), instance, args)?;
                     self.init_instance_fields(class_id, instance)?;
+                    Ok(ret)
                 }
                 (None, None) => {
                     // A constructor-less class extending a *native* superclass
@@ -4763,9 +4787,9 @@ impl<'a> Interp<'a> {
                         self.apply_native_super(nid, instance, args);
                     }
                     self.init_instance_fields(class_id, instance)?;
+                    Ok(None)
                 }
             }
-            Ok(())
         })();
         self.current = saved_scope;
         self.pending_super = saved_super;
