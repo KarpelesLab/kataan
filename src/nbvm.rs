@@ -1693,7 +1693,17 @@ fn run_frame(
             }
             Op::CallNative { dst, native, args } => {
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                regs[*dst as usize] = call_native(ctx, *native, &argv);
+                // `JSON.stringify` needs interpreter access (toJSON / getters / a
+                // function or array replacer), so it is handled here where `funcs`
+                // and the throw machinery are available rather than in `call_native`.
+                if *native == NB_JSON_STRINGIFY {
+                    match json_stringify(ctx, funcs, &argv) {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
+                } else {
+                    regs[*dst as usize] = call_native(ctx, *native, &argv);
+                }
             }
             Op::PushHandler { target, reg } => handlers.push((*target, *reg)),
             Op::PopHandler => {
@@ -1713,6 +1723,178 @@ fn run_frame(
         }
     }
     Ok(None)
+}
+
+/// Interpreter-aware `JSON.stringify(value, replacer?, space?)`: normalizes the
+/// value tree (honoring `toJSON`, getters, and the replacer) then serializes it.
+fn json_stringify(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<NanBox, VmError> {
+    let v = args.first().copied().unwrap_or(NanBox::undefined());
+    // Optional `space` (arg 2): number → spaces, string → that string (cap 10).
+    let space = args.get(2).copied().unwrap_or(NanBox::undefined());
+    let indent: alloc::string::String = if let Some(n) = space.as_number() {
+        " ".repeat((n.max(0.0) as usize).min(10))
+    } else if let Some(s) = space
+        .as_handle()
+        .and_then(|r| ctx.realm.string_value(Handle::from_raw(r)))
+    {
+        s.chars().take(10).collect()
+    } else {
+        alloc::string::String::new()
+    };
+    // Optional `replacer` (arg 1): a function transforms each value, an array
+    // allowlists object keys.
+    let replacer = args.get(1).copied().unwrap_or(NanBox::undefined());
+    let (repl_fn, allow): (Option<NanBox>, Option<Vec<alloc::string::String>>) =
+        match replacer.as_handle().map(Handle::from_raw) {
+            Some(rh) if ctx.realm.is_vm_function(rh) => (Some(replacer), None),
+            Some(rh) if ctx.realm.is_array(rh) => {
+                let a = ctx
+                    .realm
+                    .array_elements(rh)
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|e| ctx.realm.to_display_string(*e))
+                    .collect();
+                (None, Some(a))
+            }
+            _ => (None, None),
+        };
+    let holder = ctx.realm.new_object();
+    ctx.realm.set_property(holder, "", v);
+    let mut seen = Vec::new();
+    let v = json_normalize(
+        ctx,
+        funcs,
+        NanBox::handle(holder.to_raw()),
+        "",
+        v,
+        repl_fn,
+        allow.as_deref(),
+        &mut seen,
+    )?;
+    let result = if indent.is_empty() {
+        crate::json::stringify(ctx.realm, v)
+    } else {
+        crate::json::stringify_pretty(ctx.realm, v, &indent)
+    };
+    Ok(match result {
+        Some(s) => NanBox::handle(ctx.realm.new_string(&s).to_raw()),
+        None => NanBox::undefined(),
+    })
+}
+
+/// Reads property `key` from `h`, invoking a getter accessor (a closure) so
+/// `JSON.stringify` observes computed values; a data property is read directly.
+fn json_read_prop(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    h: Handle,
+    key: &str,
+) -> Result<NanBox, VmError> {
+    if let Some((getter, _)) = ctx.realm.accessor(h, key) {
+        if getter
+            .as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|r| ctx.realm.is_vm_function(r))
+        {
+            return call_closure(ctx, funcs, getter, &[], NanBox::handle(h.to_raw()));
+        }
+        return Ok(NanBox::undefined());
+    }
+    Ok(ctx
+        .realm
+        .get_property(h, key)
+        .unwrap_or(NanBox::undefined()))
+}
+
+/// Interpreter-aware `JSON.stringify` pre-pass: applies `toJSON`, invokes getters,
+/// and runs the `replacer` (a function, or `allow` key allowlist), producing a plain
+/// value tree that `crate::json::stringify` can serialize. Mirrors the tree-walker's
+/// `json_to_string_seen` + `json_apply_replacer`. A cycle throws a `TypeError`.
+#[allow(clippy::too_many_arguments)]
+fn json_normalize(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    holder: NanBox,
+    key: &str,
+    value: NanBox,
+    replacer: Option<NanBox>,
+    allow: Option<&[alloc::string::String]>,
+    seen: &mut Vec<Handle>,
+) -> Result<NanBox, VmError> {
+    let mut v = value;
+    // `toJSON(key)` replaces the value (real objects only — not strings/bigints/Dates,
+    // whose serialization the realm handles).
+    if let Some(h) = v.as_handle().map(Handle::from_raw)
+        && ctx.realm.string_value(h).is_none()
+        && ctx.realm.bigint_at(h).is_none()
+        && ctx.realm.date_at(h).is_none()
+    {
+        let tj = json_read_prop(ctx, funcs, h, "toJSON")?;
+        if tj
+            .as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|r| ctx.realm.is_vm_function(r))
+        {
+            let kb = NanBox::handle(ctx.realm.new_string(key).to_raw());
+            v = call_closure(ctx, funcs, tj, &[kb], v)?;
+        }
+    }
+    // The replacer function transforms the value.
+    if let Some(rf) = replacer {
+        let kb = NanBox::handle(ctx.realm.new_string(key).to_raw());
+        v = call_closure(ctx, funcs, rf, &[kb, v], holder)?;
+    }
+    // Recurse into plain arrays/objects, rebuilding a normalized copy. Closures,
+    // strings, and Dates pass through to the serializer unchanged.
+    if let Some(h) = v.as_handle().map(Handle::from_raw)
+        && ctx.realm.string_value(h).is_none()
+        && !ctx.realm.is_vm_function(h)
+        && ctx.realm.date_at(h).is_none()
+    {
+        if let Some(elems) = ctx.realm.array_elements(h).map(<[_]>::to_vec) {
+            if seen.contains(&h) {
+                return Err(VmError::Thrown(make_error(
+                    ctx.realm,
+                    "TypeError",
+                    "Converting circular structure to JSON",
+                )));
+            }
+            seen.push(h);
+            let mut out = Vec::with_capacity(elems.len());
+            for (i, e) in elems.into_iter().enumerate() {
+                let kk = alloc::format!("{i}");
+                out.push(json_normalize(
+                    ctx, funcs, v, &kk, e, replacer, allow, seen,
+                )?);
+            }
+            seen.pop();
+            return Ok(NanBox::handle(ctx.realm.new_array(out).to_raw()));
+        }
+        if let Some(keys) = ctx.realm.object_keys(h) {
+            if seen.contains(&h) {
+                return Err(VmError::Thrown(make_error(
+                    ctx.realm,
+                    "TypeError",
+                    "Converting circular structure to JSON",
+                )));
+            }
+            seen.push(h);
+            let new_obj = ctx.realm.new_object();
+            for k in keys {
+                if allow.is_some_and(|a| !a.iter().any(|x| x == &k)) {
+                    continue;
+                }
+                let pv = json_read_prop(ctx, funcs, h, &k)?;
+                let nv = json_normalize(ctx, funcs, v, &k, pv, replacer, allow, seen)?;
+                ctx.realm.set_property(new_obj, &k, nv);
+            }
+            seen.pop();
+            return Ok(NanBox::handle(new_obj.to_raw()));
+        }
+    }
+    Ok(v)
 }
 
 /// Invokes a closure value (`[func_id, cell…]`) with `args` and `this_val`.
@@ -2460,6 +2642,9 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             } else {
                 String::new()
             };
+            // Plain serialization (no interpreter features). The `Op::CallNative`
+            // site intercepts `JSON.stringify` and uses the interpreter-aware
+            // `json_stringify` instead; this is a pure fallback.
             let result = if indent.is_empty() {
                 crate::json::stringify(ctx.realm, v)
             } else {
