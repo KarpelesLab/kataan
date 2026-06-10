@@ -6846,7 +6846,8 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
                 }
                 "toSorted" => {
-                    let sorted = self.sort_array(elems.clone(), arg(0))?;
+                    let numeric = self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some();
+                    let sorted = self.sort_array(elems.clone(), arg(0), numeric)?;
                     return Ok(Some(NanBox::handle(self.realm.new_array(sorted).to_raw())));
                 }
                 "indexOf" => {
@@ -7260,8 +7261,10 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::boolean(true)));
                 }
                 "sort" => {
-                    // Sorts in place and returns the same array.
-                    let sorted = self.sort_array(elems, arg(0))?;
+                    // Sorts in place and returns the same array. A typed array sorts
+                    // numerically by default (a plain array lexicographically).
+                    let numeric = self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some();
+                    let sorted = self.sort_array(elems, arg(0), numeric)?;
                     self.realm.array_set_all(handle, sorted);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
@@ -7873,7 +7876,12 @@ impl<'a> Interp<'a> {
     /// Sorts `elems` with a JS comparator (a negative result orders `a` before
     /// `b`); without one, by the elements' string forms. Insertion sort, so the
     /// comparator can call back into the interpreter.
-    fn sort_array(&mut self, elems: Vec<NanBox>, cmp: NanBox) -> Result<Vec<NanBox>, ExecError> {
+    fn sort_array(
+        &mut self,
+        elems: Vec<NanBox>,
+        cmp: NanBox,
+        numeric: bool,
+    ) -> Result<Vec<NanBox>, ExecError> {
         let has_cmp = cmp.as_handle().is_some_and(|raw| {
             let h = Handle::from_raw(raw);
             self.realm.native_at(h).is_some() || self.realm.function_at(h).is_some()
@@ -7894,6 +7902,18 @@ impl<'a> Interp<'a> {
                 let order = if has_cmp {
                     let r = self.call(cmp, &[elems[j - 1], elems[j]])?;
                     self.realm.to_number(r)
+                } else if numeric {
+                    // A typed array's default comparison is numeric ascending (with
+                    // `NaN` sorting to the end).
+                    let a = self.realm.to_number(elems[j - 1]);
+                    let b = self.realm.to_number(elems[j]);
+                    if a < b || b.is_nan() {
+                        -1.0
+                    } else if a > b || a.is_nan() {
+                        1.0
+                    } else {
+                        0.0
+                    }
                 } else {
                     let a = self.realm.to_display_string(elems[j - 1]);
                     let b = self.realm.to_display_string(elems[j]);
@@ -10121,6 +10141,16 @@ impl<'a> Interp<'a> {
                     NanBox::number(total.saturating_sub(off) as f64)
                 }
             });
+        }
+        // Static `<TypedArray>.BYTES_PER_ELEMENT` (on the constructor itself).
+        if name == "BYTES_PER_ELEMENT"
+            && let Some(id) = self.realm.native_at(handle)
+            && (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
+                .contains(&id)
+        {
+            return Ok(NanBox::number(f64::from(
+                TYPED_ARRAY_KINDS[(id - N_TYPED_ARRAY_BASE) as usize].1,
+            )));
         }
         // Typed-array introspection (`byteLength`, `BYTES_PER_ELEMENT`).
         if matches!(name, "byteLength" | "BYTES_PER_ELEMENT" | "byteOffset")
