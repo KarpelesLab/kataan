@@ -2393,6 +2393,34 @@ impl<'a> Interp<'a> {
             // nan/infinity). en-US-ish; mirrors the `format` output's structure.
             N_INTL_FORMAT_TO_PARTS => {
                 let fmt = self.this_val.as_handle().map(Handle::from_raw);
+                // A DateTimeFormat breaks into typed date/time parts (weekday/month/day/year/
+                // hour/minute/second/dayPeriod/era with `literal` separators).
+                if let Some(h) = fmt
+                    && self
+                        .realm
+                        .get_property(h, "\u{0}intl")
+                        .map(|v| self.realm.to_display_string(v))
+                        .as_deref()
+                        == Some("datetime")
+                {
+                    let ms = match arg(0).as_handle().map(Handle::from_raw) {
+                        Some(dh) if self.realm.date_at(dh).is_some() => {
+                            self.realm.date_at(dh).unwrap()
+                        }
+                        _ => self.realm.to_number(arg(0)),
+                    };
+                    let parts = self.datetime_parts(h, ms);
+                    let mut arr_elems = Vec::with_capacity(parts.len());
+                    for (ty, val) in parts {
+                        let o = self.realm.new_object();
+                        let tv = self.new_str(ty);
+                        self.realm.set_property(o, "type", tv);
+                        let vv = self.new_str(&val);
+                        self.realm.set_property(o, "value", vv);
+                        arr_elems.push(NanBox::handle(o.to_raw()));
+                    }
+                    return Ok(NanBox::handle(self.realm.new_array(arr_elems).to_raw()));
+                }
                 let formatted = match fmt {
                     Some(h) if self.realm.get_property(h, "\u{0}intl").is_some() => {
                         self.intl_format_value(h, arg(0))
@@ -5275,10 +5303,12 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Formats a UTC millisecond timestamp per an `Intl.DateTimeFormat` instance's captured
-    /// component options (`weekday`/`year`/`month`/`day`/`hour`/`minute`/`second`/`hour12`/
-    /// `era`/`dateStyle`/`timeStyle`), en-US patterns. (Timezone is always UTC here.)
-    fn format_intl_datetime(&mut self, handle: Handle, ms: f64) -> String {
+    /// Breaks a UTC millisecond timestamp into typed `(type, value)` parts per an
+    /// `Intl.DateTimeFormat` instance's captured component options (`weekday`/`year`/`month`/
+    /// `day`/`hour`/`minute`/`second`/`hour12`/`era`/`dateStyle`/`timeStyle`), en-US patterns
+    /// with `literal` separators. (Timezone is always UTC here.) Used by both `format` and
+    /// `formatToParts`.
+    fn datetime_parts(&mut self, handle: Handle, ms: f64) -> Vec<(&'static str, String)> {
         let opt = |this: &mut Self, k: &str| -> Option<String> {
             this.realm
                 .get_property(handle, k)
@@ -5388,63 +5418,70 @@ impl<'a> Interp<'a> {
         };
         let named_month = matches!(month.as_deref(), Some("long" | "short" | "narrow"));
 
-        // --- Date part ---
-        let mut date = String::new();
-        if named_month {
-            if let Some(m) = &month {
-                let name = MONTHS[(mo as usize).saturating_sub(1).min(11)];
-                date.push_str(if m == "long" { name } else { &name[..3] });
-            }
-            if let Some(ds) = &day_o {
-                if !date.is_empty() {
-                    date.push(' ');
-                }
-                date.push_str(&if ds == "2-digit" { two(d) } else { bare(d) });
-            }
-            if let Some(ys) = &year {
-                date.push_str(if day_o.is_some() {
-                    ", "
-                } else if date.is_empty() {
-                    ""
-                } else {
-                    " "
-                });
-                date.push_str(&year_str(ys));
-            }
-        } else {
-            // Slash-separated numeric date (month/day/year).
-            let mut comps: Vec<String> = Vec::new();
-            if let Some(m) = &month {
-                comps.push(if m == "2-digit" { two(mo) } else { bare(mo) });
-            }
-            if let Some(ds) = &day_o {
-                comps.push(if ds == "2-digit" { two(d) } else { bare(d) });
-            }
-            if let Some(ys) = &year {
-                comps.push(year_str(ys));
-            }
-            date = comps.join("/");
-        }
+        let lit = |s: &str| ("literal", String::from(s));
+
+        // --- Date components (typed parts, en-US order) ---
+        let mut date: Vec<(&'static str, String)> = Vec::new();
         if let Some(ws) = &weekday {
             let name = WEEKDAYS[wd_idx];
-            let wd = if ws == "long" { name } else { &name[..3] };
-            date = if date.is_empty() {
-                String::from(wd)
-            } else {
-                alloc::format!("{wd}, {date}")
-            };
+            date.push((
+                "weekday",
+                String::from(if ws == "long" { name } else { &name[..3] }),
+            ));
         }
-        if let Some(es) = opt(self, "era") {
-            let era = if y > 0 { "AD" } else { "BC" };
-            let _ = es;
+        if named_month {
             if !date.is_empty() {
-                date.push(' ');
+                date.push(lit(", "));
             }
-            date.push_str(era);
+            if let Some(m) = &month {
+                let name = MONTHS[(mo as usize).saturating_sub(1).min(11)];
+                date.push((
+                    "month",
+                    String::from(if m == "long" { name } else { &name[..3] }),
+                ));
+            }
+            if let Some(ds) = &day_o {
+                date.push(lit(" "));
+                date.push(("day", if ds == "2-digit" { two(d) } else { bare(d) }));
+            }
+            if let Some(ys) = &year {
+                date.push(lit(if day_o.is_some() { ", " } else { " " }));
+                date.push(("year", year_str(ys)));
+            }
+        } else {
+            // A weekday-only request has no trailing separator; add ", " only before an
+            // actual numeric date.
+            if !date.is_empty() && (month.is_some() || day_o.is_some() || year.is_some()) {
+                date.push(lit(", "));
+            }
+            let mut first = true;
+            if let Some(m) = &month {
+                date.push(("month", if m == "2-digit" { two(mo) } else { bare(mo) }));
+                first = false;
+            }
+            if let Some(ds) = &day_o {
+                if !first {
+                    date.push(lit("/"));
+                }
+                date.push(("day", if ds == "2-digit" { two(d) } else { bare(d) }));
+                first = false;
+            }
+            if let Some(ys) = &year {
+                if !first {
+                    date.push(lit("/"));
+                }
+                date.push(("year", year_str(ys)));
+            }
+        }
+        if opt(self, "era").is_some() {
+            if !date.is_empty() {
+                date.push(lit(" "));
+            }
+            date.push(("era", String::from(if y > 0 { "AD" } else { "BC" })));
         }
 
-        // --- Time part ---
-        let mut time = String::new();
+        // --- Time components ---
+        let mut time: Vec<(&'static str, String)> = Vec::new();
         if hour.is_some() || minute_o.is_some() || second_o.is_some() {
             // en-US defaults to 12-hour unless `hour12: false`.
             let h12 = !matches!(
@@ -5457,35 +5494,48 @@ impl<'a> Interp<'a> {
             } else {
                 hour24
             };
-            time.push_str(&if hour.as_deref() == Some("2-digit") {
-                two(h)
-            } else {
-                bare(h)
-            });
+            time.push((
+                "hour",
+                if hour.as_deref() == Some("2-digit") {
+                    two(h)
+                } else {
+                    bare(h)
+                },
+            ));
             if minute_o.is_some() {
-                time.push(':');
-                time.push_str(&two(minute));
+                time.push(lit(":"));
+                time.push(("minute", two(minute)));
             }
             if second_o.is_some() {
-                time.push(':');
-                time.push_str(&two(second));
+                time.push(lit(":"));
+                time.push(("second", two(second)));
             }
             if h12 {
-                time.push(' ');
-                time.push_str(if hour24 < 12 { "AM" } else { "PM" });
+                time.push(lit(" "));
+                time.push((
+                    "dayPeriod",
+                    String::from(if hour24 < 12 { "AM" } else { "PM" }),
+                ));
             }
         }
 
         // --- Combine ---
-        match (date.is_empty(), time.is_empty()) {
-            (false, false) => {
-                let conn = if named_month { " at " } else { ", " };
-                alloc::format!("{date}{conn}{time}")
-            }
-            (false, true) => date,
-            (true, false) => time,
-            (true, true) => date,
+        let mut parts = date;
+        if !parts.is_empty() && !time.is_empty() {
+            parts.push(lit(if named_month { " at " } else { ", " }));
         }
+        parts.extend(time);
+        parts
+    }
+
+    /// The `Intl.DateTimeFormat` rendering of `ms` as a flat string (joins
+    /// [`datetime_parts`](Self::datetime_parts)).
+    fn format_intl_datetime(&mut self, handle: Handle, ms: f64) -> String {
+        let mut s = String::new();
+        for (_, v) in self.datetime_parts(handle, ms) {
+            s.push_str(&v);
+        }
+        s
     }
 
     /// Formats `n` per an `Intl.NumberFormat` instance's captured options
