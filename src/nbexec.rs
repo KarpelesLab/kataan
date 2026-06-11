@@ -1444,7 +1444,8 @@ impl<'a> Interp<'a> {
             }
             // `Object.hasOwn(obj, key)` — own-property check (incl. array index).
             N_OBJECT_HAS_OWN => {
-                let key = self.realm.to_display_string(arg(1));
+                // `member_key` resolves a symbol key to its internal slot name.
+                let key = self.member_key(arg(1));
                 let owned = arg(0).as_handle().map(Handle::from_raw).is_some_and(|h| {
                     self.realm.has_own(h, &key)
                         || self
@@ -11646,6 +11647,11 @@ impl<'a> Interp<'a> {
             | BinaryOp::BitOr
             | BinaryOp::BitXor => return Err(ExecError::Unsupported("** / bitwise need std")),
             BinaryOp::In => {
+                // The right operand must be an object (a primitive is a TypeError).
+                if !self.is_object_value(b) {
+                    let m = self.new_str("Cannot use 'in' operator to search in a non-object");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 let key = self.member_key(a);
                 let present = match b.as_handle().map(Handle::from_raw) {
                     // Proxy `has` trap, or forward to the target.
