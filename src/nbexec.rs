@@ -6993,9 +6993,28 @@ impl<'a> Interp<'a> {
                 }
                 "lastIndexOf" => {
                     let needle = self.realm.to_display_string(arg(0));
-                    let idx = s
-                        .rfind(&needle)
-                        .map_or(-1.0, |b| s[..b].chars().count() as f64);
+                    // `fromIndex` (a char index): the match may *start* at or before it;
+                    // `undefined`/`NaN` mean +Infinity (search the whole string).
+                    let n = self.realm.to_number(arg(1));
+                    let from = if n.is_nan() {
+                        usize::MAX
+                    } else {
+                        n.max(0.0).min(usize::MAX as f64) as usize
+                    };
+                    let chars: Vec<char> = s.chars().collect();
+                    let needle_chars: Vec<char> = needle.chars().collect();
+                    let (len, nlen) = (chars.len(), needle_chars.len());
+                    let idx = if nlen == 0 {
+                        from.min(len) as f64
+                    } else if nlen <= len {
+                        let upper = from.min(len - nlen);
+                        (0..=upper)
+                            .rev()
+                            .find(|&k| chars[k..k + nlen] == needle_chars[..])
+                            .map_or(-1.0, |k| k as f64)
+                    } else {
+                        -1.0
+                    };
                     Some(NanBox::number(idx))
                 }
                 // `concat` appends each argument's string form.
