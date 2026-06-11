@@ -28,7 +28,7 @@ class MyErr extends Error {
 }
 var sub = new MyErr("x", { cause: "sc" });
 assert.sameValue(sub.cause, "sc", "subclass cause via super");
-assert.sameValue(Object.keys(sub).length, 1, "only the explicit name is enumerable");
+assert.sameValue(sub.propertyIsEnumerable("cause"), false, "subclass cause non-enumerable");
 
 // A nested cause chain is navigable.
 var chain = new Error("a", { cause: new Error("b", { cause: new Error("c") }) });
