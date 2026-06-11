@@ -151,6 +151,9 @@ pub struct Interp<'a> {
     /// One-shot: a pending `new.target` set by `construct`, consumed by the next
     /// non-arrow invocation (so `new.target` is the constructor inside it).
     pending_new_target: Option<NanBox>,
+    /// One-shot `newTarget` override for the next `construct` (set by
+    /// `Reflect.construct(target, args, newTarget)`); else `new.target` is the callee.
+    reflect_new_target: Option<NanBox>,
     /// Persistent mutable state (memory/globals) of each live WASM instance, keyed
     /// by an instance id stored on the instance's export wrappers — so a
     /// `WebAssembly.Instance`'s memory and globals survive across export calls.
@@ -643,6 +646,7 @@ impl<'a> Interp<'a> {
             this_val: NanBox::undefined(),
             new_target: NanBox::undefined(),
             pending_new_target: None,
+            reflect_new_target: None,
             wasm_states: alloc::collections::BTreeMap::new(),
             wasm_next_id: 0,
             gen_sink: None,
@@ -1584,6 +1588,11 @@ impl<'a> Interp<'a> {
                         .unwrap_or_default(),
                     None => Vec::new(),
                 };
+                // An explicit `newTarget` (3rd arg) becomes `new.target` inside the
+                // constructor (else it is the target itself).
+                if args.len() > 2 && !matches!(arg(2).unpack(), Unpacked::Undefined) {
+                    self.reflect_new_target = Some(arg(2));
+                }
                 return self.construct(arg(0), &list);
             }
             N_OBJECT_GET_OWN_DESC => match arg(0).as_handle().map(Handle::from_raw) {
@@ -3812,7 +3821,7 @@ impl<'a> Interp<'a> {
         // `new UserClass(...)`.
         if let Some((class_id, env)) = self.realm.class_at(handle) {
             // `new.target` inside the class constructor is the class itself.
-            self.pending_new_target = Some(callee);
+            self.pending_new_target = Some(self.reflect_new_target.take().unwrap_or(callee));
             let inst = self.instantiate(class_id, &env, args)?;
             // `instance.constructor === TheClass` (non-enumerable back-reference).
             if let Some(ih) = inst.as_handle().map(Handle::from_raw) {
@@ -3830,15 +3839,32 @@ impl<'a> Interp<'a> {
                 let m = self.new_str("is not a constructor");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
-            // The instance's `[[Prototype]]` is the constructor's `.prototype`,
-            // so inherited methods/getters resolve through the chain.
-            let proto = self.realm.function_prototype(func_id);
+            // The instance's `[[Prototype]]` is the *newTarget*'s `.prototype`
+            // (the callee's, except under `Reflect.construct(target, args, newTarget)`
+            // with a function newTarget), so inherited methods resolve correctly.
+            let proto = match self.reflect_new_target {
+                Some(nt)
+                    if nt
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.function_at(h))
+                        .is_some() =>
+                {
+                    let nt_fid = self
+                        .realm
+                        .function_at(Handle::from_raw(nt.as_handle().unwrap()))
+                        .unwrap()
+                        .0;
+                    self.realm.function_prototype(nt_fid)
+                }
+                _ => self.realm.function_prototype(func_id),
+            };
             let instance = self.realm.new_object_with_proto(Some(proto));
             let this = NanBox::handle(instance.to_raw());
             // Record the constructor for `instanceof` (hidden, GC-traced slot).
             self.realm.set_hidden_property(instance, CTOR_KEY, callee);
             // `new.target` inside the constructor body is the constructor itself.
-            self.pending_new_target = Some(callee);
+            self.pending_new_target = Some(self.reflect_new_target.take().unwrap_or(callee));
             let ret = self.call_with_this(callee, this, args)?;
             if let Some(rh) = ret.as_handle().map(Handle::from_raw)
                 && (self.realm.is_array(rh) || self.realm.object_keys(rh).is_some())
