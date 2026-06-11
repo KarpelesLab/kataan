@@ -301,6 +301,10 @@ const N_INTL_PLURAL_RULES: u16 = 208;
 const N_INTL_COMPARE: u16 = 209;
 /// `Intl.PluralRules.prototype.select`.
 const N_INTL_PLURAL_SELECT: u16 = 210;
+/// `Intl.ListFormat` constructor.
+const N_INTL_LIST_FORMAT: u16 = 221;
+/// `Intl.ListFormat.prototype.format`.
+const N_INTL_LIST_FORMAT_FORMAT: u16 = 222;
 /// The typed-array constructors occupy `[BASE, BASE + KINDS.len())`; the id minus
 /// the base indexes [`TYPED_ARRAY_KINDS`].
 const N_TYPED_ARRAY_BASE: u16 = 168;
@@ -1013,6 +1017,7 @@ impl<'a> Interp<'a> {
             ("DateTimeFormat", N_INTL_DATETIME_FORMAT),
             ("Collator", N_INTL_COLLATOR),
             ("PluralRules", N_INTL_PLURAL_RULES),
+            ("ListFormat", N_INTL_LIST_FORMAT),
         ] {
             let f = self.new_named_native(name, id);
             // `Intl.X.supportedLocalesOf(locales)` — static on every constructor.
@@ -2275,6 +2280,64 @@ impl<'a> Interp<'a> {
                 self.realm
                     .set_property(obj, "select", NanBox::handle(sel.to_raw()));
                 NanBox::handle(obj.to_raw())
+            }
+            // `new Intl.ListFormat(locale, { type, style })` — an object with `.format`.
+            N_INTL_LIST_FORMAT => {
+                let obj = self.realm.new_object();
+                if let Some(opts) = args
+                    .get(1)
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+                {
+                    for key in ["type", "style"] {
+                        if let Some(v) = self.realm.get_property(opts, key) {
+                            self.realm.set_hidden_property(obj, key, v);
+                        }
+                    }
+                }
+                let f = self.new_named_native("format", N_INTL_LIST_FORMAT_FORMAT);
+                self.realm
+                    .set_property(obj, "format", NanBox::handle(f.to_raw()));
+                NanBox::handle(obj.to_raw())
+            }
+            // `Intl.ListFormat.prototype.format(list)` — joins with en-US conjunction /
+            // disjunction / unit patterns (Oxford comma for 3+ items).
+            N_INTL_LIST_FORMAT_FORMAT => {
+                let fmt = self.this_val.as_handle().map(Handle::from_raw);
+                let list_type = fmt
+                    .and_then(|h| self.realm.get_property(h, "type"))
+                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_else(|| String::from("conjunction"));
+                let items: Vec<String> = arg(0)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|e| self.realm.to_display_string(*e))
+                    .collect();
+                let word = match list_type.as_str() {
+                    "disjunction" => "or",
+                    "unit" => "",
+                    _ => "and",
+                };
+                let out = match items.len() {
+                    0 => String::new(),
+                    1 => items[0].clone(),
+                    2 if word.is_empty() => alloc::format!("{}, {}", items[0], items[1]),
+                    2 => alloc::format!("{} {word} {}", items[0], items[1]),
+                    n => {
+                        let init = items[..n - 1].join(", ");
+                        let last = &items[n - 1];
+                        if word.is_empty() {
+                            alloc::format!("{init}, {last}")
+                        } else {
+                            alloc::format!("{init}, {word} {last}")
+                        }
+                    }
+                };
+                self.new_str(&out)
             }
             // `Intl.Collator.prototype.compare(a, b)` — code-point order (no locale
             // tailoring), so a negative/zero/positive result orders `a` vs `b`.
@@ -4596,6 +4659,25 @@ impl<'a> Interp<'a> {
             let sel = self.new_named_native("select", N_INTL_PLURAL_SELECT);
             self.realm
                 .set_property(obj, "select", NanBox::handle(sel.to_raw()));
+            return Ok(NanBox::handle(obj.to_raw()));
+        }
+        // `new Intl.ListFormat(locale, { type, style })` → an object with a `format(list)`.
+        if id == N_INTL_LIST_FORMAT {
+            let obj = self.realm.new_object();
+            if let Some(opts) = args
+                .get(1)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+            {
+                for key in ["type", "style"] {
+                    if let Some(v) = self.realm.get_property(opts, key) {
+                        self.realm.set_hidden_property(obj, key, v);
+                    }
+                }
+            }
+            let f = self.new_named_native("format", N_INTL_LIST_FORMAT_FORMAT);
+            self.realm
+                .set_property(obj, "format", NanBox::handle(f.to_raw()));
             return Ok(NanBox::handle(obj.to_raw()));
         }
         // `new Promise(executor)`: run executor(resolve, reject).
