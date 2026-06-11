@@ -845,16 +845,25 @@ impl Realm {
     }
 
     /// Whether the object at `handle` is extensible. A plain array is extensible
-    /// unless `preventExtensions`/`seal`/`freeze` marked it.
+    /// unless `preventExtensions`/`seal`/`freeze` marked it; functions/classes/native
+    /// callables are extensible (properties may be attached to them).
     #[must_use]
     pub fn is_extensible(&self, handle: Handle) -> bool {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             return !self.non_extensible_arrays.contains(&handle.to_raw());
         }
-        self.heap
-            .get(handle)
-            .and_then(Cell::as_object)
-            .is_some_and(Object::is_extensible)
+        if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
+            return o.is_extensible();
+        }
+        matches!(
+            self.heap.get(handle),
+            Some(
+                Cell::Function { .. }
+                    | Cell::Class { .. }
+                    | Cell::Native(_)
+                    | Cell::BoundNative { .. }
+            )
+        )
     }
 
     /// Whether the object at `handle` is sealed (or frozen).

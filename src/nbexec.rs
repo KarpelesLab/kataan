@@ -10074,6 +10074,7 @@ impl<'a> Interp<'a> {
         }
         // A function's `length` (params before a default/rest) and `name`.
         if matches!(name, "length" | "name")
+            && !self.realm.has_own(handle, name)
             && let Some((func_id, _)) = self.realm.function_at(handle)
         {
             let def = self.functions[func_id as usize];
