@@ -10248,7 +10248,15 @@ impl<'a> Interp<'a> {
                 let name = self.member_key(key);
                 let key_box = self.new_str(&name);
                 let recv = NanBox::handle(handle.to_raw());
-                self.call(trap, &[NanBox::handle(target.to_raw()), key_box, new, recv])?;
+                let r = self.call(trap, &[NanBox::handle(target.to_raw()), key_box, new, recv])?;
+                // A `set` trap returning a falsy value is a failed [[Set]]: a strict-mode
+                // assignment then throws a TypeError (sloppy mode fails silently).
+                if self.strict && !self.realm.truthy(r) {
+                    let m = self.new_str(&alloc::format!(
+                        "'set' on proxy: trap returned falsish for property '{name}'"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 return Ok(());
             }
             return self.assign_member_value(target, key, new);
@@ -10950,7 +10958,15 @@ impl<'a> Interp<'a> {
                 let key = self.eval_prop_key(property)?;
                 let key_box = self.new_str(&key);
                 let recv = NanBox::handle(handle.to_raw());
-                self.call(trap, &[NanBox::handle(target.to_raw()), key_box, new, recv])?;
+                let r = self.call(trap, &[NanBox::handle(target.to_raw()), key_box, new, recv])?;
+                // A `set` trap returning a falsy value is a failed [[Set]]: a strict-mode
+                // assignment then throws a TypeError (sloppy mode fails silently).
+                if self.strict && !self.realm.truthy(r) {
+                    let m = self.new_str(&alloc::format!(
+                        "'set' on proxy: trap returned falsish for property '{key}'"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 return Ok(());
             }
             return self.assign_member(target, property, new);
