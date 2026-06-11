@@ -4270,6 +4270,21 @@ impl Compiler {
 
     /// Emits a read of `name` into a register and returns it (a cell read goes
     /// through `GetElem`).
+    /// `CreatePerIterationEnvironment` for a `let`/`const` C-style `for` head: give
+    /// each captured loop variable a *fresh* cell seeded with its current value, so a
+    /// closure made in one iteration's body captures that iteration's binding (the
+    /// classic `for (let i …) … () => i` semantics). Only cell (captured) bindings
+    /// need it; a plain register binding is invisible to closures.
+    fn refresh_loop_cells(&mut self, bindings: &[Binding]) {
+        for b in bindings {
+            if b.cell {
+                let val = self.read_var(*b);
+                self.ops.push(Op::NewArray { dst: b.reg, len: 1 });
+                self.write_var(*b, val);
+            }
+        }
+    }
+
     fn read_var(&mut self, b: Binding) -> Reg {
         if b.cell {
             let dst = self.alloc();
@@ -4741,6 +4756,20 @@ impl Compiler {
                     }
                     None => {}
                 }
+                // A `let`/`const` head gives each iteration a fresh binding for any
+                // captured loop variable (so closures capture per-iteration values).
+                let per_iter: Vec<Binding> = match init {
+                    Some(ForInit::Var(decl)) if decl.kind != crate::ast::VarDeclKind::Var => decl
+                        .declarations
+                        .iter()
+                        .filter_map(|d| match &d.target {
+                            BindingTarget::Ident(id) => self.lookup(&id.name),
+                            _ => None,
+                        })
+                        .filter(|b| b.cell)
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 let top = self.ops.len();
                 let exit = match test {
                     Some(t) => {
@@ -4751,7 +4780,9 @@ impl Compiler {
                 };
                 self.enter_loop();
                 self.stmt(body)?;
-                let cont = self.ops.len(); // `continue` runs the update
+                // `continue` runs the per-iteration copy and then the update.
+                let cont = self.ops.len();
+                self.refresh_loop_cells(&per_iter);
                 if let Some(u) = update {
                     self.expr(u)?;
                 }
