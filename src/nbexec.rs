@@ -2423,6 +2423,7 @@ impl<'a> Interp<'a> {
                 {
                     self.realm
                         .set_property(Handle::from_raw(eh), "cause", cause);
+                    self.realm.mark_hidden(Handle::from_raw(eh), "cause");
                 }
                 err
             }
@@ -4324,6 +4325,7 @@ impl<'a> Interp<'a> {
             {
                 self.realm
                     .set_property(Handle::from_raw(eh), "cause", cause);
+                self.realm.mark_hidden(Handle::from_raw(eh), "cause");
             }
             return Ok(err);
         }
@@ -4614,6 +4616,19 @@ impl<'a> Interp<'a> {
             // `name`/`message` are non-enumerable (out of `Object.keys`/JSON).
             self.realm.mark_hidden(instance, "name");
             self.realm.mark_hidden(instance, "message");
+            // ES2022 `cause`: `new Error(msg, { cause })` installs a non-enumerable
+            // `cause` when the options argument has such a property (even if undefined).
+            if let Some(opts) = args.get(1)
+                && let Some(raw) = opts.as_handle()
+                && self.realm.has_own(Handle::from_raw(raw), "cause")
+            {
+                let cause = self
+                    .realm
+                    .get_property(Handle::from_raw(raw), "cause")
+                    .unwrap_or(NanBox::undefined());
+                self.realm.set_property(instance, "cause", cause);
+                self.realm.mark_hidden(instance, "cause");
+            }
         }
     }
 
