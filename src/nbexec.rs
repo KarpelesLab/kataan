@@ -288,6 +288,7 @@ const N_CLEAR_TIMEOUT: u16 = 212;
 const N_QUEUE_MICROTASK: u16 = 213;
 const N_ARRAY_BUFFER_IS_VIEW: u16 = 214;
 const N_INTL_FORMAT: u16 = 215;
+const N_EVAL: u16 = 216;
 const N_INTL_COLLATOR: u16 = 207;
 const N_INTL_PLURAL_RULES: u16 = 208;
 /// `Intl.Collator.prototype.compare` (a bound function value).
@@ -925,6 +926,7 @@ impl<'a> Interp<'a> {
             ("atob", N_ATOB),
             ("URIError", N_URI_ERROR),
             ("EvalError", N_EVAL_ERROR),
+            ("eval", N_EVAL),
         ] {
             let f = self.new_named_native(name, id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -1086,6 +1088,7 @@ impl<'a> Interp<'a> {
             "btoa",
             "atob",
             "Intl",
+            "eval",
         ] {
             if let Some(v) = self.current.get(n) {
                 self.realm.set_property(global, n, v);
@@ -1200,6 +1203,19 @@ impl<'a> Interp<'a> {
                 // compiles a string of source at runtime — unsupported here.
                 let m = self.new_str("Function constructor (dynamic code) is not supported");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            N_EVAL => {
+                // `eval(x)` returns `x` unchanged when it isn't a string (per spec);
+                // a string would require compiling source at runtime — unsupported, so
+                // it throws a catchable EvalError rather than leaving `eval` undefined.
+                let v = arg(0);
+                if v.as_handle()
+                    .is_some_and(|raw| self.realm.string_value(Handle::from_raw(raw)).is_some())
+                {
+                    let m = self.new_str("eval (dynamic code) is not supported");
+                    return Err(ExecError::Throw(self.make_error(N_EVAL_ERROR, Some(m))));
+                }
+                return Ok(v);
             }
             N_PARSE_INT => {
                 let s = self.realm.to_display_string(arg(0));
