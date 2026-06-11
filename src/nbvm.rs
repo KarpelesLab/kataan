@@ -2791,10 +2791,22 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             }
         }
         NB_STRING_FROM_CHAR_CODE => {
-            let s: String = args
+            // Each argument is ToUint16'd into a UTF-16 code unit; decoding the
+            // sequence combines an adjacent high/low surrogate pair into one astral
+            // code point (a lone surrogate becomes U+FFFD, unrepresentable in UTF-8).
+            let units: Vec<u16> = args
                 .iter()
-                .filter_map(|a| a.as_number())
-                .filter_map(|n| char::from_u32(n as u32))
+                .map(|a| {
+                    let n = ctx.realm.to_number(*a);
+                    if n.is_finite() {
+                        (n as i64).rem_euclid(65536) as u16
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            let s: String = char::decode_utf16(units)
+                .map(|r| r.unwrap_or('\u{FFFD}'))
                 .collect();
             NanBox::handle(ctx.realm.new_string(&s).to_raw())
         }

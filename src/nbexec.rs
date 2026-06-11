@@ -5857,9 +5857,24 @@ impl<'a> Interp<'a> {
                 };
             }
             Some(N_STRING) if method == "fromCharCode" => {
-                let s: String = args
+                // Each argument is ToUint16'd into a UTF-16 code unit; the resulting
+                // sequence is then decoded, so an adjacent high/low surrogate pair
+                // combines into one astral code point (a lone surrogate, which UTF-8
+                // can't store, becomes U+FFFD).
+                let units: Vec<u16> = args
                     .iter()
-                    .filter_map(|a| char::from_u32(self.realm.to_number(*a) as u32))
+                    .map(|a| {
+                        let n = self.realm.to_number(*a);
+                        if n.is_finite() {
+                            // ToUint16: truncate toward zero, then take mod 2^16.
+                            (n as i64).rem_euclid(65536) as u16
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                let s: String = char::decode_utf16(units)
+                    .map(|r| r.unwrap_or('\u{FFFD}'))
                     .collect();
                 return Ok(Some(self.new_str(&s)));
             }
