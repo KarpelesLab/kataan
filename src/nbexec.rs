@@ -744,6 +744,28 @@ impl<'a> Interp<'a> {
             .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
     }
 
+    /// Exposes a constructor's *static* methods (dispatched in `call_method`) as readable
+    /// own properties — each a bound native that routes a read-then-call back through
+    /// `call_method` with the constructor as `this`. So `typeof Promise.allSettled ===
+    /// "function"` (feature detection) holds, not just `Promise.allSettled(...)` working.
+    fn setup_static_methods(&mut self, ctor_name: &str, methods: &[&str]) {
+        let Some(ns) = self
+            .current
+            .get(ctor_name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        for &name in methods {
+            let name_h = self.realm.new_string(name);
+            let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
+            self.realm
+                .set_property(ns, name, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(ns, name);
+        }
+    }
+
     /// Installs a small built-in library: the `Math` object and the global
     /// coercion/parse functions. (A token stdlib to prove the native-call path;
     /// the full port is the remaining migration work.)
@@ -1051,6 +1073,20 @@ impl<'a> Interp<'a> {
         self.setup_first_class_prototype("Function", FUNCTION_PROTO_METHODS);
         self.setup_first_class_prototype("Set", SET_PROTO_METHODS);
         self.setup_first_class_prototype("Map", MAP_PROTO_METHODS);
+        // Static methods that are otherwise call-only (readable for feature detection).
+        self.setup_static_methods(
+            "Promise",
+            &[
+                "resolve",
+                "reject",
+                "all",
+                "race",
+                "allSettled",
+                "any",
+                "withResolvers",
+            ],
+        );
+        self.setup_static_methods("Map", &["groupBy"]);
         // Newly-created plain objects now inherit from `Object.prototype`.
         self.realm.set_default_object_proto(obj_proto);
         // `globalThis`: an object mirroring the global bindings, referencing
