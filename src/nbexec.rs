@@ -9697,7 +9697,13 @@ impl<'a> Interp<'a> {
                 .array_elements(buf)
                 .map(<[_]>::to_vec)
                 .unwrap_or_default();
-            return Ok(elems.into_iter().skip(idx).collect());
+            let len = elems.len();
+            let result: Vec<NanBox> = elems.into_iter().skip(idx).collect();
+            // Draining the iterator (for-of/spread) consumes it: advance to the end so a
+            // later `.next()` reports `{ done: true }` rather than restarting.
+            self.realm
+                .set_property(h, GEN_IDX, NanBox::number(len as f64));
+            return Ok(result);
         }
         // A custom iterable: call `obj[Symbol.iterator]()` and drain `.next()`.
         // The method may be an own/inherited property or a class method whose
