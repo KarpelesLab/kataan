@@ -443,6 +443,7 @@ const ARRAY_PROTO_METHODS: &[&str] = &[
     "values",
     "entries",
     "toString",
+    "toLocaleString",
     "with",
     "toReversed",
     "toSorted",
@@ -6022,6 +6023,12 @@ impl<'a> Interp<'a> {
                     return Ok(Some(self.new_str(&bigint_to_radix(&big, radix))));
                 }
                 "valueOf" => return Ok(Some(NanBox::handle(self.realm.new_bigint(big).to_raw()))),
+                // Grouped base-10 form (no locale data, en-US-ish default).
+                "toLocaleString" => {
+                    return Ok(Some(
+                        self.new_str(&group_thousands_str(&bigint_to_radix(&big, 10))),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -7363,6 +7370,31 @@ impl<'a> Interp<'a> {
                         parts.push(s);
                     }
                     return Ok(Some(self.new_str(&parts.join(&sep))));
+                }
+                // Like `join(",")`, but each element renders via its locale form:
+                // numbers/BigInts get `,` thousands grouping, others go through ToString.
+                "toLocaleString" => {
+                    let mut parts: Vec<String> = Vec::with_capacity(elems.len());
+                    for e in &elems {
+                        let s = match e.unpack() {
+                            Unpacked::Null | Unpacked::Undefined => String::new(),
+                            Unpacked::Handle(raw) if raw == handle.to_raw() => String::new(),
+                            Unpacked::Number(n) => group_thousands(n),
+                            _ => {
+                                if let Some(big) = e
+                                    .as_handle()
+                                    .and_then(|r| self.realm.bigint_at(Handle::from_raw(r)))
+                                {
+                                    group_thousands_str(&bigint_to_radix(&big, 10))
+                                } else {
+                                    let p = self.coerce_object(*e, "string")?;
+                                    self.realm.to_display_string(p)
+                                }
+                            }
+                        };
+                        parts.push(s);
+                    }
+                    return Ok(Some(self.new_str(&parts.join(","))));
                 }
                 "includes" => {
                     let target = arg(0);
@@ -12430,11 +12462,27 @@ fn group_thousands(n: f64) -> String {
         return String::from(if n > 0.0 { "∞" } else { "-∞" });
     }
     let neg = n.is_sign_negative() && n != 0.0;
-    let abs = if n < 0.0 { -n } else { n };
-    let base = alloc::format!("{abs}");
-    let (int_part, frac_part) = match base.split_once('.') {
+    // `n.abs()` maps -0 to +0 so it renders as "0", not "-0".
+    let base = alloc::format!("{}", n.abs());
+    let grouped = group_thousands_str(&base);
+    if neg {
+        alloc::format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
+/// Groups the integer part of a decimal digit string (optional leading `-` and
+/// fractional `.NNN`) with `,` thousands separators — shared by `Number`/`BigInt`
+/// `toLocaleString`.
+fn group_thousands_str(s: &str) -> String {
+    let (neg, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s),
+    };
+    let (int_part, frac_part) = match rest.split_once('.') {
         Some((i, f)) => (i, Some(f)),
-        None => (base.as_str(), None),
+        None => (rest, None),
     };
     let bytes = int_part.as_bytes();
     let len = bytes.len();
