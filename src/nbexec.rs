@@ -1359,10 +1359,10 @@ impl<'a> Interp<'a> {
                 }
                 NanBox::handle(obj.to_raw())
             }
-            N_OBJECT_GET_PROTO => arg(0)
-                .as_handle()
-                .and_then(|raw| self.realm.object_proto(Handle::from_raw(raw)))
-                .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())),
+            N_OBJECT_GET_PROTO => match arg(0).as_handle() {
+                Some(raw) => self.get_proto_of(Handle::from_raw(raw))?,
+                None => NanBox::null(),
+            },
             N_OBJECT_SET_PROTO => {
                 if let Some(raw) = arg(0).as_handle() {
                     let proto = arg(1).as_handle().map(Handle::from_raw);
@@ -1541,11 +1541,11 @@ impl<'a> Interp<'a> {
                 }
                 None => NanBox::undefined(),
             },
-            // `Reflect.getPrototypeOf(obj)`.
-            N_REFLECT_GET_PROTO => arg(0)
-                .as_handle()
-                .and_then(|raw| self.realm.object_proto(Handle::from_raw(raw)))
-                .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())),
+            // `Reflect.getPrototypeOf(obj)` (honors a proxy `getPrototypeOf` trap).
+            N_REFLECT_GET_PROTO => match arg(0).as_handle() {
+                Some(raw) => self.get_proto_of(Handle::from_raw(raw))?,
+                None => NanBox::null(),
+            },
             // `Reflect.setPrototypeOf(target, proto)` → boolean success.
             N_REFLECT_SET_PROTO => {
                 if let Some(raw) = arg(0).as_handle() {
@@ -3176,6 +3176,32 @@ impl<'a> Interp<'a> {
 
     /// `Object/Reflect.setPrototypeOf(obj, proto)` — routing a proxy through its
     /// `setPrototypeOf` trap (or forwarding to the target).
+    /// `Object.getPrototypeOf` / `Reflect.getPrototypeOf`, honoring a proxy's
+    /// `getPrototypeOf` trap (else forwarding to the target / reading the link).
+    fn get_proto_of(&mut self, obj: Handle) -> Result<NanBox, ExecError> {
+        if let Some((target, handler)) = self.realm.proxy_at(obj) {
+            self.guard_revoked(obj)?;
+            let trap = self
+                .realm
+                .get_property(handler, "getPrototypeOf")
+                .unwrap_or(NanBox::undefined());
+            if trap
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                return self.call(trap, &[NanBox::handle(target.to_raw())]);
+            }
+            return Ok(self
+                .realm
+                .object_proto(target)
+                .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())));
+        }
+        Ok(self
+            .realm
+            .object_proto(obj)
+            .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())))
+    }
+
     fn set_proto_of(&mut self, obj: Handle, proto: Option<Handle>) -> Result<(), ExecError> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
