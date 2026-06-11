@@ -4567,26 +4567,7 @@ impl<'a> Interp<'a> {
                 .and_then(|h| self.realm.get_property(h, "maximum"))
                 .map(|v| self.realm.to_number(v).max(0.0) as usize);
             let buf = self.make_array_buffer(initial * WASM_PAGE);
-            let mem = self.realm.new_object();
-            self.realm
-                .set_hidden_property(mem, WASM_MEM_BUFFER, NanBox::handle(buf.to_raw()));
-            self.realm
-                .set_hidden_property(mem, WASM_MEM_PAGES, NanBox::number(initial as f64));
-            self.realm.set_hidden_property(
-                mem,
-                WASM_MEM_MAX,
-                maximum.map_or(NanBox::undefined(), |m| NanBox::number(m as f64)),
-            );
-            let getter = self.realm.new_bound_native(N_WASM_MEM_BUFFER_GET, mem);
-            self.realm.define_accessor(
-                mem,
-                "buffer",
-                NanBox::handle(getter.to_raw()),
-                NanBox::undefined(),
-            );
-            let grow = self.realm.new_bound_native(N_WASM_MEM_GROW, mem);
-            self.realm
-                .set_property(mem, "grow", NanBox::handle(grow.to_raw()));
+            let mem = self.make_wasm_memory_object(buf, initial, maximum);
             return Ok(NanBox::handle(mem.to_raw()));
         }
         // `new WebAssembly.Table({ element, initial, maximum? }, init?)` — a fixed
@@ -8753,6 +8734,37 @@ impl<'a> Interp<'a> {
         obj
     }
 
+    /// Builds a `WebAssembly.Memory` object over `buf` (an ArrayBuffer): a `.buffer`
+    /// accessor + `.grow`, with the page count and (optional) maximum recorded.
+    fn make_wasm_memory_object(
+        &mut self,
+        buf: Handle,
+        pages: usize,
+        maximum: Option<usize>,
+    ) -> Handle {
+        let mem = self.realm.new_object();
+        self.realm
+            .set_hidden_property(mem, WASM_MEM_BUFFER, NanBox::handle(buf.to_raw()));
+        self.realm
+            .set_hidden_property(mem, WASM_MEM_PAGES, NanBox::number(pages as f64));
+        self.realm.set_hidden_property(
+            mem,
+            WASM_MEM_MAX,
+            maximum.map_or(NanBox::undefined(), |m| NanBox::number(m as f64)),
+        );
+        let getter = self.realm.new_bound_native(N_WASM_MEM_BUFFER_GET, mem);
+        self.realm.define_accessor(
+            mem,
+            "buffer",
+            NanBox::handle(getter.to_raw()),
+            NanBox::undefined(),
+        );
+        let grow = self.realm.new_bound_native(N_WASM_MEM_GROW, mem);
+        self.realm
+            .set_property(mem, "grow", NanBox::handle(grow.to_raw()));
+        mem
+    }
+
     /// An `ArrayBuffer` whose byte store is `bytes`.
     fn make_array_buffer_from_bytes(&mut self, bytes: &[u8]) -> Handle {
         let obj = self.realm.new_object();
@@ -8915,6 +8927,29 @@ impl<'a> Interp<'a> {
                     let g = self.make_wasm_global(value, ty, mutable);
                     self.realm.set_property(exports, gname, g);
                 }
+            }
+        }
+        // Exported memory becomes a `WebAssembly.Memory` whose buffer is a snapshot of
+        // the instance's linear memory after instantiation (data segments + start). (For
+        // modules with no imports, like the global-export case; live JS<->WASM sharing of
+        // the bytes is the same deferred work as typed-array buffer read-backing.)
+        let memory_exports: Vec<String> = module
+            .memory_exports()
+            .iter()
+            .map(|(n, _)| (*n).into())
+            .collect();
+        if !memory_exports.is_empty()
+            && module.import_names().is_empty()
+            && module.global_import_names().is_empty()
+            && let Ok(inst) = crate::wasm_rt::Instance::new(&module)
+        {
+            let mem_bytes = inst.memory().to_vec();
+            let pages = mem_bytes.len() / WASM_PAGE;
+            for mname in &memory_exports {
+                let buf = self.make_array_buffer_from_bytes(&mem_bytes);
+                let mem = self.make_wasm_memory_object(buf, pages, None);
+                self.realm
+                    .set_property(exports, mname, NanBox::handle(mem.to_raw()));
             }
         }
         let instance = self.realm.new_object();

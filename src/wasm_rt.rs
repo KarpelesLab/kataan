@@ -140,6 +140,8 @@ pub struct Module {
     exports: Vec<(alloc::string::String, u32)>,
     /// `name -> global_index` for exported globals.
     global_exports: Vec<(alloc::string::String, u32)>,
+    /// `name -> memory_index` for exported memories.
+    memory_exports: Vec<(alloc::string::String, u32)>,
     /// Every export's `(name, kind)` for introspection (kind: 0=func, 1=table,
     /// 2=memory, 3=global) — what `WebAssembly.Module.exports` reports.
     export_descriptors: Vec<(alloc::string::String, u8)>,
@@ -1364,8 +1366,9 @@ impl Module {
             m.export_descriptors.push((name.clone(), kind));
             match kind {
                 0x00 => m.exports.push((name, index)), // function export
+                0x02 => m.memory_exports.push((name, index)), // memory export
                 0x03 => m.global_exports.push((name, index)), // global export
-                _ => {} // memory/table exports: introspectable, not yet wired
+                _ => {} // table exports: introspectable, not yet wired
             }
         }
         Ok(())
@@ -1404,6 +1407,15 @@ impl Module {
     #[must_use]
     pub fn global_exports(&self) -> Vec<(&str, u32)> {
         self.global_exports
+            .iter()
+            .map(|(n, i)| (n.as_str(), *i))
+            .collect()
+    }
+
+    /// `(name, memory_index)` of each exported memory.
+    #[must_use]
+    pub fn memory_exports(&self) -> Vec<(&str, u32)> {
+        self.memory_exports
             .iter()
             .map(|(n, i)| (n.as_str(), *i))
             .collect()
