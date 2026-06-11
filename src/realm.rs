@@ -616,8 +616,10 @@ impl Realm {
     /// methods, but not private `#` fields) — for `Object.getOwnPropertyNames`.
     pub fn own_property_names(&self, handle: Handle) -> Option<Vec<alloc::string::String>> {
         if let Some(obj) = self.heap.get(handle)?.as_object() {
+            // `[[OwnPropertyKeys]]` order: integer indices ascending, then the rest in
+            // insertion order (so `getOwnPropertyNames`/`Reflect.ownKeys` match `keys`).
             return Some(
-                obj.keys()
+                obj.ordered_keys()
                     .iter()
                     .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
                     .map(|s| alloc::string::String::from(*s))

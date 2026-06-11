@@ -205,6 +205,23 @@ impl Object {
         keys
     }
 
+    /// All own property names (data + accessor, **including** non-enumerable) in spec
+    /// `[[OwnPropertyKeys]]` order: integer-index keys ascending, then the rest in
+    /// insertion order. Used by `getOwnPropertyNames` / `Reflect.ownKeys`.
+    #[must_use]
+    pub fn ordered_keys(&self) -> Vec<&str> {
+        let keys = self.shape.keys();
+        let mut ints: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| array_index(k).is_some())
+            .collect();
+        ints.sort_by_key(|k| array_index(k).unwrap());
+        let strs = keys.iter().copied().filter(|k| array_index(k).is_none());
+        let acc = self.accessors.iter().map(|(k, _, _)| k.as_ref());
+        ints.into_iter().chain(strs).chain(acc).collect()
+    }
+
     /// The own **enumerable** property names (excludes keys marked hidden), in
     /// spec order: integer-index keys ascending, then the rest in insertion order.
     #[must_use]
