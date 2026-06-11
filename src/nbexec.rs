@@ -5159,6 +5159,7 @@ impl<'a> Interp<'a> {
                 "signDisplay",
                 "unit",
                 "unitDisplay",
+                "notation",
             ] {
                 if let Some(v) = self.realm.get_property(opts, key) {
                     self.realm.set_hidden_property(obj, key, v);
@@ -5315,21 +5316,57 @@ impl<'a> Interp<'a> {
             .unwrap_or(def_max.max(min))
             .clamp(min, 20);
         let value = if style == "percent" { n * 100.0 } else { n };
-        // Round to `max` digits, then trim trailing zeros down to `min`.
-        let mut s = alloc::format!("{:.*}", max as usize, value);
-        if max > min && s.contains('.') {
-            while s.ends_with('0') && {
-                let frac = s.split_once('.').map_or(0, |(_, f)| f.len());
-                frac > min as usize
-            } {
-                s.pop();
+        // Round `x` to `max` digits, trimming trailing zeros down to `min`.
+        let fmt_digits = |x: f64| -> String {
+            let mut s = alloc::format!("{:.*}", max as usize, x);
+            if max > min && s.contains('.') {
+                while s.ends_with('0')
+                    && s.split_once('.').map_or(0, |(_, f)| f.len()) > min as usize
+                {
+                    s.pop();
+                }
+                if s.ends_with('.') {
+                    s.pop();
+                }
             }
-            if s.ends_with('.') {
-                s.pop();
+            s
+        };
+        // `notation: "scientific" | "engineering"` renders `mantissa E exponent` (no
+        // grouping); engineering pins the exponent to a multiple of 3.
+        let notation = opt_str(self, "notation").unwrap_or_default();
+        let (s, do_group) = if matches!(notation.as_str(), "scientific" | "engineering") {
+            let neg = value < 0.0;
+            let mag = value.abs();
+            let mut exp = 0i32;
+            let mut p = 1.0f64; // 10^exp
+            if mag >= 1.0 {
+                while mag >= p * 10.0 {
+                    p *= 10.0;
+                    exp += 1;
+                }
+            } else if mag > 0.0 {
+                while mag < p {
+                    p /= 10.0;
+                    exp -= 1;
+                }
             }
-        }
-        // Group the integer part.
-        let grouped = if use_grouping {
+            if notation == "engineering" {
+                // Drop the exponent to the nearest lower multiple of 3, scaling the mantissa
+                // up to compensate (p = 10^exp must shrink as exp shrinks).
+                let shift = exp.rem_euclid(3);
+                exp -= shift;
+                for _ in 0..shift {
+                    p /= 10.0;
+                }
+            }
+            let m = if mag == 0.0 { 0.0 } else { mag / p };
+            let sign = if neg { "-" } else { "" };
+            (alloc::format!("{sign}{}E{exp}", fmt_digits(m)), false)
+        } else {
+            (fmt_digits(value), use_grouping)
+        };
+        // Group the integer part (skipped for scientific/engineering).
+        let grouped = if do_group {
             let neg = s.starts_with('-');
             let body = s.trim_start_matches('-');
             let (ip, fp) = body
