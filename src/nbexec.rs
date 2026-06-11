@@ -1800,10 +1800,7 @@ impl<'a> Interp<'a> {
                 }
                 NanBox::handle(self.realm.new_array(vals).to_raw())
             }
-            N_ARRAY_IS_ARRAY => NanBox::boolean(arg(0).as_handle().is_some_and(|raw| {
-                let h = Handle::from_raw(raw);
-                self.realm.is_array(h) && !self.realm.is_vm_function(h)
-            })),
+            N_ARRAY_IS_ARRAY => NanBox::boolean(self.is_array_unwrap_proxy(arg(0))?),
             // `ArrayBuffer.isView(x)` — true iff `x` is a typed array or a DataView
             // (anything with a `[[ViewedArrayBuffer]]`).
             N_ARRAY_BUFFER_IS_VIEW => NanBox::boolean(arg(0).as_handle().is_some_and(|raw| {
@@ -3281,6 +3278,29 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
         Ok(())
+    }
+
+    /// `Array.isArray` semantics: follow a chain of proxies to the underlying target and
+    /// report whether it is a (non-function) array. A revoked proxy in the chain throws.
+    fn is_array_unwrap_proxy(&mut self, v: NanBox) -> Result<bool, ExecError> {
+        let mut cur = v;
+        for _ in 0..1000 {
+            let Some(raw) = cur.as_handle() else {
+                return Ok(false);
+            };
+            let h = Handle::from_raw(raw);
+            self.guard_revoked(h)?;
+            if let Some((target, _)) = self.realm.proxy_at(h) {
+                cur = NanBox::handle(target.to_raw());
+                continue;
+            }
+            // A genuine Array exotic object: not a VM function and not a typed array
+            // (typed arrays are array-backed here but are not Arrays per `Array.isArray`).
+            return Ok(self.realm.is_array(h)
+                && !self.realm.is_vm_function(h)
+                && self.realm.get_property(h, TYPED_ARRAY_KIND).is_none());
+        }
+        Ok(false)
     }
 
     /// Applies a property descriptor object (`{ value }` or `{ get, set }`) to
