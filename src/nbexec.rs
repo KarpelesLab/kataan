@@ -11671,6 +11671,19 @@ impl<'a> Interp<'a> {
                 _ => self.member_value(handle, name),
             });
         }
+        // `ArrayBuffer.prototype.slice` as a readable method (so `typeof ab.slice ===
+        // "function"` and a detached `ab.slice.call(ab, …)` work; it is dispatched in
+        // `call_method`).
+        if name == "slice"
+            && self
+                .realm
+                .get_property(handle, ARRAY_BUFFER_BYTES)
+                .is_some()
+        {
+            let name_h = self.realm.new_string("slice");
+            let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
+            return Ok(NanBox::handle(f.to_raw()));
+        }
         // `ArrayBuffer.byteLength` (the byte store's length).
         if name == "byteLength"
             && let Some(b) = self.realm.get_property(handle, ARRAY_BUFFER_BYTES)
