@@ -1848,11 +1848,7 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Unsupported("Math float ops need std"));
             }
             #[cfg(feature = "std")]
-            N_MATH_POW => NanBox::number(
-                self.realm
-                    .to_number(arg(0))
-                    .powf(self.realm.to_number(arg(1))),
-            ),
+            N_MATH_POW => self.realm.pow(arg(0), arg(1)),
             #[cfg(not(feature = "std"))]
             N_MATH_POW => return Err(ExecError::Unsupported("Math.pow needs std")),
             N_MATH_SIGN => {
@@ -1873,8 +1869,28 @@ impl<'a> Interp<'a> {
             N_MATH_TRUNC => return Err(ExecError::Unsupported("Math.trunc needs std")),
             #[cfg(feature = "std")]
             N_MATH_HYPOT => {
-                let sum: f64 = args.iter().map(|a| self.realm.to_number(*a).powi(2)).sum();
-                NanBox::number(sum.sqrt())
+                // If any argument is ±Infinity the result is +Infinity, even when
+                // another argument is NaN (NaN only wins if no argument is infinite).
+                let mut any_inf = false;
+                let mut any_nan = false;
+                let mut sum = 0.0;
+                for a in args {
+                    let n = self.realm.to_number(*a);
+                    if n.is_infinite() {
+                        any_inf = true;
+                    } else if n.is_nan() {
+                        any_nan = true;
+                    } else {
+                        sum += n * n;
+                    }
+                }
+                NanBox::number(if any_inf {
+                    f64::INFINITY
+                } else if any_nan {
+                    f64::NAN
+                } else {
+                    sum.sqrt()
+                })
             }
             #[cfg(feature = "std")]
             N_MATH_CBRT => NanBox::number(self.realm.to_number(arg(0)).cbrt()),

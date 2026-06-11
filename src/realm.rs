@@ -1467,7 +1467,19 @@ impl Realm {
     #[cfg(feature = "std")]
     #[must_use]
     pub fn pow(&self, a: NanBox, b: NanBox) -> NanBox {
-        NanBox::number(self.to_number(a).powf(self.to_number(b)))
+        let base = self.to_number(a);
+        let exp = self.to_number(b);
+        // ECMAScript `Number::exponentiate` differs from IEEE `powf`: a NaN exponent is
+        // always NaN (so `1 ** NaN` is NaN, not 1), and `(±1) ** ±Infinity` is NaN —
+        // but `x ** ±0` is 1 for every `x` (including NaN).
+        let r = if exp == 0.0 {
+            1.0
+        } else if exp.is_nan() || base.is_nan() || (base.abs() == 1.0 && exp.is_infinite()) {
+            f64::NAN
+        } else {
+            base.powf(exp)
+        };
+        NanBox::number(r)
     }
 
     /// Unary `-a` (numeric negation).
