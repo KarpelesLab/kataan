@@ -5019,6 +5019,28 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Re-encodes a typed array's whole element store into its backing buffer — used after
+    /// a wholesale reorder (`sort`/`reverse`) that bypasses `set_element_coerced`. A no-op
+    /// for an ordinary or unbacked array.
+    fn typed_array_resync(&mut self, handle: crate::heap::Handle) {
+        let Some(kind) = self
+            .realm
+            .get_property(handle, TYPED_ARRAY_KIND)
+            .and_then(|k| k.as_number())
+        else {
+            return;
+        };
+        let kind = kind as u16;
+        let elems = self
+            .realm
+            .array_elements(handle)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        for (i, e) in elems.iter().enumerate() {
+            self.typed_array_write_through(handle, i, kind, *e);
+        }
+    }
+
     /// Builds a primitive wrapper object (`new Number`/`String`/`Boolean`,
     /// `Object(primitive)`): an object boxing `prim` behind a `\0prim` slot, with
     /// `\0wraptype` recording the constructor id (for `instanceof`).
@@ -7779,6 +7801,7 @@ impl<'a> Interp<'a> {
                     let mut out = elems.clone();
                     out.reverse();
                     self.realm.array_set_all(handle, out);
+                    self.typed_array_resync(handle);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 // `fill(value, start?, end?)` — mutate in place, return the array.
@@ -7857,7 +7880,9 @@ impl<'a> Interp<'a> {
                         }
                     };
                     for i in start..end {
-                        self.realm.set_element(handle, i, value);
+                        // `set_element_coerced` applies typed-array coercion + buffer
+                        // write-through (a plain `set_element` for an ordinary array).
+                        self.set_element_coerced(handle, i, value);
                     }
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
@@ -7894,7 +7919,7 @@ impl<'a> Interp<'a> {
                         if dst >= elems.len() {
                             break;
                         }
-                        self.realm.set_element(handle, dst, v);
+                        self.set_element_coerced(handle, dst, v);
                     }
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
@@ -8058,6 +8083,7 @@ impl<'a> Interp<'a> {
                     let numeric = self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some();
                     let sorted = self.sort_array(elems, arg(0), numeric)?;
                     self.realm.array_set_all(handle, sorted);
+                    self.typed_array_resync(handle);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 // `toSpliced(start, deleteCount, ...items)` — a spliced copy
