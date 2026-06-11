@@ -4492,6 +4492,12 @@ impl<'a> Interp<'a> {
             };
             return Ok(self.make_primitive_wrapper(prim, id));
         }
+        // `new Function(...)` — dynamic code generation is unsupported, but it fails
+        // with a catchable TypeError (matching `Function(...)`), not an engine abort.
+        if id == N_FUNCTION {
+            let m = self.new_str("Function constructor (dynamic code) is not supported");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
         // `WeakMap`/`WeakSet` reuse the collection cell (no true weak refs here).
         let is_set = match id {
             N_SET | N_WEAKSET => true,
