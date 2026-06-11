@@ -41,3 +41,12 @@ assert.sameValue(Object.getOwnPropertyNames(Math).indexOf("PI") >= 0, true, "Mat
 assert.sameValue(typeof Array.isArray, "function", "Array.isArray readable");
 assert.sameValue(Math.abs(-5), 5, "Math.abs callable");
 assert.sameValue(typeof Object.prototype, "object", "Object.prototype readable");
+
+// A detached static call routes to its constructor regardless of `this`.
+var isInt = Number.isInteger;
+assert.sameValue(isInt(7), true, "detached Number.isInteger(7)");
+assert.sameValue(isInt(7.5), false, "detached Number.isInteger(7.5)");
+var fcc = String.fromCharCode;
+assert.sameValue(fcc(72, 73), "HI", "detached String.fromCharCode");
+var groupBy = Map.groupBy;
+assert.sameValue(groupBy([1, 2, 3], function (x) { return x % 2 ? "o" : "e"; }).get("o").join(","), "1,3", "detached Map.groupBy");

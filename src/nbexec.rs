@@ -292,6 +292,9 @@ const N_EVAL: u16 = 216;
 const N_INTL_RESOLVED_OPTIONS: u16 = 217;
 const N_INTL_SUPPORTED_LOCALES: u16 = 218;
 const N_INTL_FORMAT_TO_PARTS: u16 = 219;
+/// A readable static method bound to a `[constructor, name]` pair (so a detached call
+/// still routes to the constructor's `call_method` static dispatch).
+const N_STATIC_METHOD: u16 = 220;
 const N_INTL_COLLATOR: u16 = 207;
 const N_INTL_PLURAL_RULES: u16 = 208;
 /// `Intl.Collator.prototype.compare` (a bound function value).
@@ -761,7 +764,11 @@ impl<'a> Interp<'a> {
         };
         for &name in methods {
             let name_h = self.realm.new_string(name);
-            let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
+            let pair = self.realm.new_array(alloc::vec![
+                NanBox::handle(ns.to_raw()),
+                NanBox::handle(name_h.to_raw()),
+            ]);
+            let f = self.realm.new_bound_native(N_STATIC_METHOD, pair);
             self.realm
                 .set_property(ns, name, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(ns, name);
@@ -3978,6 +3985,25 @@ impl<'a> Interp<'a> {
                 return Ok(self
                     .call_method(this_val, &name, args)?
                     .unwrap_or(NanBox::undefined()));
+            }
+            // A readable static method: `target` is `[constructor, name]`. Route to the
+            // constructor's static dispatch regardless of the call's `this` (so a detached
+            // `var f = Number.isInteger; f(x)` works like `Number.isInteger(x)`).
+            if id == N_STATIC_METHOD {
+                let pair = self.realm.array_elements(target).map(<[_]>::to_vec);
+                if let Some(pair) = pair
+                    && let Some(ctor) = pair.first().copied()
+                    && let Some(name_v) = pair.get(1).copied()
+                    && let Some(name) = name_v
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.string_value(h))
+                {
+                    return Ok(self
+                        .call_method(ctor, &name, args)?
+                        .unwrap_or(NanBox::undefined()));
+                }
+                return Ok(NanBox::undefined());
             }
             // A WASM export wrapper: decode the carried module, instantiate, and
             // invoke the named export through the JS-value boundary.
