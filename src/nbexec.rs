@@ -2291,24 +2291,7 @@ impl<'a> Interp<'a> {
             }
             N_INTL_PLURAL_RULES => self.make_plural_rules(args),
             // `new Intl.ListFormat(locale, { type, style })` — an object with `.format`.
-            N_INTL_LIST_FORMAT => {
-                let obj = self.realm.new_object();
-                if let Some(opts) = args
-                    .get(1)
-                    .and_then(|v| v.as_handle())
-                    .map(Handle::from_raw)
-                {
-                    for key in ["type", "style"] {
-                        if let Some(v) = self.realm.get_property(opts, key) {
-                            self.realm.set_hidden_property(obj, key, v);
-                        }
-                    }
-                }
-                let f = self.new_named_native("format", N_INTL_LIST_FORMAT_FORMAT);
-                self.realm
-                    .set_property(obj, "format", NanBox::handle(f.to_raw()));
-                NanBox::handle(obj.to_raw())
-            }
+            N_INTL_LIST_FORMAT => self.make_list_format(args),
             // `Intl.ListFormat.prototype.format(list)` — joins with en-US conjunction /
             // disjunction / unit patterns (Oxford comma for 3+ items).
             N_INTL_LIST_FORMAT_FORMAT => {
@@ -2326,6 +2309,24 @@ impl<'a> Interp<'a> {
                     .iter()
                     .map(|e| self.realm.to_display_string(*e))
                     .collect();
+                // The crate handles conjunction/disjunction with locale-aware connectors;
+                // `type:"unit"` (no crate `ListStyle`) falls through to the hand-rolled join.
+                #[cfg(feature = "intl")]
+                {
+                    let style = match list_type.as_str() {
+                        "disjunction" => Some(intl::list::ListStyle::Or),
+                        "conjunction" => Some(intl::list::ListStyle::And),
+                        _ => None,
+                    };
+                    if let Some(style) = style {
+                        let locale = fmt
+                            .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
+                            .map(|v| self.realm.to_display_string(v))
+                            .unwrap_or_else(|| String::from("en"));
+                        let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+                        return Ok(self.new_str(&intl::list::format_list(&locale, &refs, style)));
+                    }
+                }
                 let word = match list_type.as_str() {
                     "disjunction" => "or",
                     "unit" => "",
@@ -2374,8 +2375,33 @@ impl<'a> Interp<'a> {
                     .map(|v| self.realm.to_display_string(v))
                     .unwrap_or_default();
                 let code = self.realm.to_display_string(arg(0));
-                let s = display_name(&ty, &code);
-                self.new_str(&s)
+                #[cfg(feature = "intl")]
+                {
+                    let locale = fmt
+                        .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
+                        .map(|v| self.realm.to_display_string(v))
+                        .unwrap_or_else(|| String::from("en"));
+                    // The crate has CLDR language/region names; currency/script use the
+                    // hand-rolled table (and any code the crate doesn't know falls back).
+                    let primary = code.split(['-', '_']).next().unwrap_or(&code);
+                    let crate_name = match ty.as_str() {
+                        "language" => intl::display::language_name(&locale, primary),
+                        "region" => intl::display::region_name(&locale, &code),
+                        _ => None,
+                    };
+                    match crate_name {
+                        Some(n) => self.new_str(n),
+                        None => {
+                            let s = display_name(&ty, &code);
+                            self.new_str(&s)
+                        }
+                    }
+                }
+                #[cfg(not(feature = "intl"))]
+                {
+                    let s = display_name(&ty, &code);
+                    self.new_str(&s)
+                }
             }
             // `Intl.Segmenter(...)` without `new`.
             N_INTL_SEGMENTER => self.make_segmenter(args),
@@ -4763,22 +4789,7 @@ impl<'a> Interp<'a> {
         }
         // `new Intl.ListFormat(locale, { type, style })` → an object with a `format(list)`.
         if id == N_INTL_LIST_FORMAT {
-            let obj = self.realm.new_object();
-            if let Some(opts) = args
-                .get(1)
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw)
-            {
-                for key in ["type", "style"] {
-                    if let Some(v) = self.realm.get_property(opts, key) {
-                        self.realm.set_hidden_property(obj, key, v);
-                    }
-                }
-            }
-            let f = self.new_named_native("format", N_INTL_LIST_FORMAT_FORMAT);
-            self.realm
-                .set_property(obj, "format", NanBox::handle(f.to_raw()));
-            return Ok(NanBox::handle(obj.to_raw()));
+            return Ok(self.make_list_format(args));
         }
         // `new Intl.RelativeTimeFormat(locale, { numeric, style })` → an object with `format`.
         if id == N_INTL_REL_TIME {
@@ -5522,6 +5533,14 @@ impl<'a> Interp<'a> {
     /// `of(code)` method.
     fn make_display_names(&mut self, args: &[NanBox]) -> NanBox {
         let obj = self.realm.new_object();
+        let locale = args
+            .first()
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .unwrap_or_else(|| String::from("en"));
+        let locv = self.new_str(&locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
         if let Some(opts) = args
             .get(1)
             .and_then(|v| v.as_handle())
@@ -5536,6 +5555,35 @@ impl<'a> Interp<'a> {
         let f = self.new_named_native("of", N_INTL_DISPLAY_NAMES_OF);
         self.realm
             .set_property(obj, "of", NanBox::handle(f.to_raw()));
+        NanBox::handle(obj.to_raw())
+    }
+
+    /// Builds an `Intl.ListFormat` instance: an object capturing the locale, `type`, and
+    /// `style` with a readable `format(list)` method.
+    fn make_list_format(&mut self, args: &[NanBox]) -> NanBox {
+        let obj = self.realm.new_object();
+        let locale = args
+            .first()
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .unwrap_or_else(|| String::from("en"));
+        let locv = self.new_str(&locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
+        if let Some(opts) = args
+            .get(1)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            for key in ["type", "style"] {
+                if let Some(v) = self.realm.get_property(opts, key) {
+                    self.realm.set_hidden_property(obj, key, v);
+                }
+            }
+        }
+        let f = self.new_named_native("format", N_INTL_LIST_FORMAT_FORMAT);
+        self.realm
+            .set_property(obj, "format", NanBox::handle(f.to_raw()));
         NanBox::handle(obj.to_raw())
     }
 
@@ -15044,6 +15092,21 @@ mod tests {
                 r#"var p=new Intl.PluralRules("pl");console.log([1,2,5,22].map(n=>p.select(n)).join(","))"#
             ),
             "one,few,many,few\n"
+        );
+    }
+
+    /// With the `intl` crate, `Intl.DisplayNames` / `Intl.ListFormat` are locale-aware (the
+    /// en-only fallback ignores the locale argument).
+    #[cfg(feature = "intl")]
+    #[test]
+    fn intl_display_and_list_are_locale_aware() {
+        assert_eq!(
+            out(r#"console.log(new Intl.DisplayNames("de",{type:"region"}).of("US"))"#),
+            "Vereinigte Staaten\n"
+        );
+        assert_eq!(
+            out(r#"console.log(new Intl.ListFormat("es").format(["a","b","c"]))"#),
+            "a, b y c\n"
         );
     }
 
