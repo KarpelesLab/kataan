@@ -529,6 +529,30 @@ const MAP_PROTO_METHODS: &[&str] = &[
 ];
 /// `Function.prototype` methods exposed as first-class values.
 const FUNCTION_PROTO_METHODS: &[&str] = &["call", "apply", "bind", "toString"];
+/// `DataView.prototype` accessor methods — dispatched in `call_method`, exposed here as
+/// readable bound natives (for `typeof dv.getUint8` and detached `dv.getUint8.call(dv, …)`).
+const DATA_VIEW_METHODS: &[&str] = &[
+    "getInt8",
+    "getUint8",
+    "getInt16",
+    "getUint16",
+    "getInt32",
+    "getUint32",
+    "getFloat32",
+    "getFloat64",
+    "getBigInt64",
+    "getBigUint64",
+    "setInt8",
+    "setUint8",
+    "setInt16",
+    "setUint16",
+    "setInt32",
+    "setUint32",
+    "setFloat32",
+    "setFloat64",
+    "setBigInt64",
+    "setBigUint64",
+];
 /// Bound native: the `revoke` function from `Proxy.revocable` (carries the proxy).
 const N_PROXY_REVOKE: u16 = 122;
 const N_SYMBOL: u16 = 38;
@@ -747,6 +771,14 @@ impl<'a> Interp<'a> {
         self.realm.mark_hidden(ns, "prototype");
         self.realm
             .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
+    }
+
+    /// A readable bound native for a call-only method `name` (dispatched in `call_method`),
+    /// so `typeof obj.method === "function"` and a detached `obj.method.call(obj, …)` work.
+    fn readable_native_method(&mut self, name: &str) -> NanBox {
+        let name_h = self.realm.new_string(name);
+        let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
+        NanBox::handle(f.to_raw())
     }
 
     /// Exposes a constructor's *static* methods (dispatched in `call_method`) as readable
@@ -11680,9 +11712,7 @@ impl<'a> Interp<'a> {
                 .get_property(handle, ARRAY_BUFFER_BYTES)
                 .is_some()
         {
-            let name_h = self.realm.new_string("slice");
-            let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
-            return Ok(NanBox::handle(f.to_raw()));
+            return Ok(self.readable_native_method("slice"));
         }
         // `ArrayBuffer.byteLength` (the byte store's length).
         if name == "byteLength"
@@ -11692,6 +11722,12 @@ impl<'a> Interp<'a> {
             return Ok(NanBox::number(
                 self.realm.array_length(bh).unwrap_or(0) as f64
             ));
+        }
+        // `DataView.prototype` get*/set* accessors, exposed as readable methods.
+        if DATA_VIEW_METHODS.contains(&name)
+            && self.realm.get_property(handle, DATA_VIEW_BUF).is_some()
+        {
+            return Ok(self.readable_native_method(name));
         }
         // `DataView.byteLength` / `.buffer` / `.byteOffset`.
         if matches!(name, "byteLength" | "buffer" | "byteOffset")
@@ -11743,6 +11779,13 @@ impl<'a> Interp<'a> {
         if name == "buffer" && self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some() {
             let buf = self.typed_array_buffer_handle(handle);
             return Ok(NanBox::handle(buf.to_raw()));
+        }
+        // Typed-array-specific methods that aren't shared with `Array.prototype`
+        // (`set`/`subarray`), exposed as readable methods.
+        if matches!(name, "set" | "subarray")
+            && self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some()
+        {
+            return Ok(self.readable_native_method(name));
         }
         // Typed-array introspection (`byteLength`, `BYTES_PER_ELEMENT`).
         if matches!(name, "byteLength" | "BYTES_PER_ELEMENT" | "byteOffset")
