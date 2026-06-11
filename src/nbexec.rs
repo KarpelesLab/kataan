@@ -3365,6 +3365,89 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Whether redefining own property `key` with descriptor `desc` would change
+    /// nothing — every field the descriptor *specifies* already matches the current
+    /// property. Such a no-op redefine is permitted even on a non-configurable property.
+    fn redefine_is_noop(
+        &mut self,
+        obj: Handle,
+        key: &str,
+        desc: Handle,
+        is_accessor: bool,
+        writable: bool,
+    ) -> Result<bool, ExecError> {
+        let truthy_field = |this: &mut Self, name: &str| {
+            this.realm
+                .get_property(desc, name)
+                .is_some_and(|v| this.realm.truthy(v))
+        };
+        // Switching kind (data <-> accessor) is a change.
+        let wants_accessor = self.realm.has_own(desc, "get") || self.realm.has_own(desc, "set");
+        if wants_accessor != is_accessor {
+            return Ok(false);
+        }
+        // Making a non-configurable property configurable is a change.
+        if self.realm.has_own(desc, "configurable") && truthy_field(self, "configurable") {
+            return Ok(false);
+        }
+        if self.realm.has_own(desc, "enumerable")
+            && truthy_field(self, "enumerable") != self.realm.property_is_enumerable(obj, key)
+        {
+            return Ok(false);
+        }
+        if is_accessor {
+            let (cur_get, cur_set) = self
+                .realm
+                .accessor(obj, key)
+                .unwrap_or((NanBox::undefined(), NanBox::undefined()));
+            if self.realm.has_own(desc, "get") {
+                let g = self
+                    .realm
+                    .get_property(desc, "get")
+                    .unwrap_or(NanBox::undefined());
+                if !self.realm.strict_equals(g, cur_get) {
+                    return Ok(false);
+                }
+            }
+            if self.realm.has_own(desc, "set") {
+                let s = self
+                    .realm
+                    .get_property(desc, "set")
+                    .unwrap_or(NanBox::undefined());
+                if !self.realm.strict_equals(s, cur_set) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        // A data property: a writable flip, or (for a non-writable one) a value change.
+        if self.realm.has_own(desc, "writable") && truthy_field(self, "writable") != writable {
+            return Ok(false);
+        }
+        if !writable && self.realm.has_own(desc, "value") {
+            let new_val = self
+                .realm
+                .get_property(desc, "value")
+                .unwrap_or(NanBox::undefined());
+            let cur_val = self
+                .realm
+                .get_property(obj, key)
+                .unwrap_or(NanBox::undefined());
+            // SameValue (distinguishes NaN and ±0 from `===`).
+            let same = match (new_val.as_number(), cur_val.as_number()) {
+                (Some(x), Some(y)) => {
+                    (x == y && (x != 0.0 || x.is_sign_positive() == y.is_sign_positive()))
+                        || (x.is_nan() && y.is_nan())
+                }
+                _ => self.realm.strict_equals(new_val, cur_val),
+            };
+            if !same {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn apply_descriptor(&mut self, obj: Handle, key: &str, desc: Handle) -> Result<(), ExecError> {
         // A proxy routes `Object.defineProperty` through its `defineProperty` trap
         // (called `trap(target, key, descriptor)`), or forwards to the target.
@@ -3391,6 +3474,17 @@ impl<'a> Interp<'a> {
             }
             return self.apply_descriptor(target, key, desc);
         }
+        // A descriptor may not mix accessor fields (`get`/`set`) with data fields
+        // (`value`/`writable`) — that is an invalid descriptor (ToPropertyDescriptor).
+        let has_accessor_field = self.realm.has_own(desc, "get") || self.realm.has_own(desc, "set");
+        let has_data_field =
+            self.realm.has_own(desc, "value") || self.realm.has_own(desc, "writable");
+        if has_accessor_field && has_data_field {
+            let m = self.new_str(
+                "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
+            );
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
         let is_own = self.realm.has_own(obj, key) || self.realm.accessor(obj, key).is_some();
         // Adding a *new* property to a non-extensible object is a TypeError.
         if !is_own && !self.realm.is_extensible(obj) {
@@ -3402,7 +3496,9 @@ impl<'a> Interp<'a> {
         if is_own && self.realm.property_is_non_configurable(obj, key) {
             let is_accessor = self.realm.accessor(obj, key).is_some();
             let writable = !self.realm.property_is_readonly(obj, key);
-            if is_accessor || !writable {
+            if (is_accessor || !writable)
+                && !self.redefine_is_noop(obj, key, desc, is_accessor, writable)?
+            {
                 let m = self.new_str("Cannot redefine non-configurable property");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
