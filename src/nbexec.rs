@@ -172,6 +172,11 @@ pub struct Interp<'a> {
     /// The frozen template-strings object for each tagged-template site (keyed by the
     /// AST node's address), so the same array is passed to the tag on every evaluation.
     tagged_template_cache: alloc::collections::BTreeMap<usize, NanBox>,
+    /// Leak-once cache interning `Intl.NumberFormat` currency/unit codes to `&'static str`
+    /// (the `intl` crate's options take `'static`); bounded by the distinct codes a program
+    /// uses.
+    #[cfg(feature = "intl")]
+    intl_intern: alloc::collections::BTreeMap<String, &'static str>,
     /// The superclass to invoke for `super(...)` inside the running constructor.
     pending_super: Option<(u32, Scope)>,
     /// The native-constructor superclass for `super(...)` (e.g. extending Error).
@@ -725,6 +730,8 @@ impl<'a> Interp<'a> {
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
             tagged_template_cache: alloc::collections::BTreeMap::new(),
+            #[cfg(feature = "intl")]
+            intl_intern: alloc::collections::BTreeMap::new(),
             pending_super: None,
             pending_super_native: None,
             current_home: None,
@@ -2614,6 +2621,36 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(NanBox::handle(self.realm.new_array(arr_elems).to_raw()));
                 }
+                // Number formatters use the `intl` crate's typed parts (CLDR, locale-aware).
+                #[cfg(feature = "intl")]
+                if let Some(h) = fmt
+                    && self
+                        .realm
+                        .get_property(h, "\u{0}intl")
+                        .map(|v| self.realm.to_display_string(v))
+                        .as_deref()
+                        == Some("number")
+                    && !self.number_uses_handrolled(h)
+                {
+                    let n = self.realm.to_number(arg(0));
+                    let locale = self
+                        .realm
+                        .get_property(h, "\u{0}locale")
+                        .map(|v| self.realm.to_display_string(v))
+                        .unwrap_or_else(|| String::from("en"));
+                    let opts = self.number_format_options(h);
+                    let parts = intl::number::format_to_parts(&locale, n, &opts);
+                    let mut arr_elems = Vec::with_capacity(parts.len());
+                    for p in parts {
+                        let o = self.realm.new_object();
+                        let tv = self.new_str(p.kind.as_str());
+                        self.realm.set_property(o, "type", tv);
+                        let vv = self.new_str(&p.value);
+                        self.realm.set_property(o, "value", vv);
+                        arr_elems.push(NanBox::handle(o.to_raw()));
+                    }
+                    return Ok(NanBox::handle(self.realm.new_array(arr_elems).to_raw()));
+                }
                 let formatted = match fmt {
                     Some(h) if self.realm.get_property(h, "\u{0}intl").is_some() => {
                         self.intl_format_value(h, arg(0))
@@ -2672,7 +2709,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 if percent {
-                    entries.push(("percent", String::from("%")));
+                    entries.push(("percentSign", String::from("%")));
                 }
                 let mut arr_elems = Vec::with_capacity(entries.len());
                 for (ty, val) in entries {
@@ -5994,9 +6031,135 @@ impl<'a> Interp<'a> {
         s
     }
 
-    /// Formats `n` per an `Intl.NumberFormat` instance's captured options
-    /// (`style`, `currency`, min/max `FractionDigits`, `useGrouping`).
+    /// Interns `s` to a `&'static str` (leak-once, deduped), for the `intl` number options
+    /// whose `currency`/`unit` fields are `'static`.
+    #[cfg(feature = "intl")]
+    fn intern_static(&mut self, s: &str) -> &'static str {
+        if let Some(&v) = self.intl_intern.get(s) {
+            return v;
+        }
+        let leaked: &'static str = alloc::boxed::Box::leak(String::from(s).into_boxed_str());
+        self.intl_intern.insert(String::from(s), leaked);
+        leaked
+    }
+
+    /// Builds the `intl` crate's `NumberFormatOptions` from an `Intl.NumberFormat` instance's
+    /// stored JS options.
+    #[cfg(feature = "intl")]
+    fn number_format_options(&mut self, handle: Handle) -> intl::number::NumberFormatOptions {
+        use intl::number::{
+            CompactDisplay, CurrencyDisplay, Notation, NumberFormatOptions, NumberStyle,
+            RoundingMode, SignDisplay, UnitDisplay, UseGrouping,
+        };
+        let opt_str = |this: &mut Self, k: &str| -> Option<String> {
+            this.realm
+                .get_property(handle, k)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_display_string(v))
+        };
+        let opt_num = |this: &mut Self, k: &str| -> Option<u8> {
+            this.realm
+                .get_property(handle, k)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_number(v) as u8)
+        };
+        let mut o = NumberFormatOptions {
+            style: match opt_str(self, "style").as_deref() {
+                Some("percent") => NumberStyle::Percent,
+                Some("currency") => NumberStyle::Currency,
+                Some("unit") => NumberStyle::Unit,
+                _ => NumberStyle::Decimal,
+            },
+            notation: match opt_str(self, "notation").as_deref() {
+                Some("scientific") => Notation::Scientific,
+                Some("engineering") => Notation::Engineering,
+                Some("compact") => Notation::Compact,
+                _ => Notation::Standard,
+            },
+            compact_display: match opt_str(self, "compactDisplay").as_deref() {
+                Some("long") => CompactDisplay::Long,
+                _ => CompactDisplay::Short,
+            },
+            sign_display: match opt_str(self, "signDisplay").as_deref() {
+                Some("always") => SignDisplay::Always,
+                Some("exceptZero") => SignDisplay::ExceptZero,
+                Some("negative") => SignDisplay::Negative,
+                Some("never") => SignDisplay::Never,
+                _ => SignDisplay::Auto,
+            },
+            currency_display: match opt_str(self, "currencyDisplay").as_deref() {
+                Some("code") => CurrencyDisplay::Code,
+                Some("name") => CurrencyDisplay::Name,
+                Some("narrowSymbol") => CurrencyDisplay::NarrowSymbol,
+                _ => CurrencyDisplay::Symbol,
+            },
+            unit_display: match opt_str(self, "unitDisplay").as_deref() {
+                Some("long") => UnitDisplay::Long,
+                Some("narrow") => UnitDisplay::Narrow,
+                _ => UnitDisplay::Short,
+            },
+            // ECMA-402's default rounding is half-expand (1.25 → 1.3), not banker's rounding.
+            rounding_mode: RoundingMode::HalfExpand,
+            ..Default::default()
+        };
+        if matches!(
+            self.realm
+                .get_property(handle, "useGrouping")
+                .map(|v| v.unpack()),
+            Some(Unpacked::Bool(false))
+        ) {
+            o.use_grouping = UseGrouping::Never;
+        }
+        o.minimum_fraction_digits = opt_num(self, "minimumFractionDigits");
+        o.maximum_fraction_digits = opt_num(self, "maximumFractionDigits");
+        o.minimum_significant_digits = opt_num(self, "minimumSignificantDigits");
+        o.maximum_significant_digits = opt_num(self, "maximumSignificantDigits");
+        // Scientific/engineering cap the mantissa at 3 fraction digits by default (1.235E5).
+        if o.maximum_fraction_digits.is_none()
+            && o.maximum_significant_digits.is_none()
+            && matches!(o.notation, Notation::Scientific | Notation::Engineering)
+        {
+            o.maximum_fraction_digits = Some(3);
+        }
+        if let Some(c) = opt_str(self, "currency") {
+            o.currency = Some(self.intern_static(&c));
+        }
+        if let Some(u) = opt_str(self, "unit") {
+            o.unit = Some(self.intern_static(&u));
+        }
+        o
+    }
+
+    /// Whether an `Intl.NumberFormat` instance must use the hand-rolled path rather than the
+    /// `intl` crate: `style: "unit"` and `notation: "compact"` aren't yet faithfully rendered
+    /// by `intl::number::format` (units are dropped; compact rounds differently from V8).
+    #[cfg(feature = "intl")]
+    fn number_uses_handrolled(&mut self, handle: Handle) -> bool {
+        let get = |this: &mut Self, k: &str| -> Option<String> {
+            this.realm
+                .get_property(handle, k)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_display_string(v))
+        };
+        get(self, "style").as_deref() == Some("unit")
+            || get(self, "notation").as_deref() == Some("compact")
+    }
+
+    /// Formats `n` per an `Intl.NumberFormat` instance. With the `intl` crate, all styles
+    /// except those in [`number_uses_handrolled`](Self::number_uses_handrolled) go through
+    /// `intl::number::format` (CLDR, locale-aware, full ECMA-402 options); the rest, and the
+    /// no-`intl` build, use the hand-rolled en-US path below.
     fn intl_format_number(&mut self, handle: Handle, n: f64) -> String {
+        #[cfg(feature = "intl")]
+        if !self.number_uses_handrolled(handle) {
+            let locale = self
+                .realm
+                .get_property(handle, "\u{0}locale")
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_else(|| String::from("en"));
+            let opts = self.number_format_options(handle);
+            return intl::number::format(&locale, n, &opts);
+        }
         let opt_str = |this: &mut Self, k: &str| -> Option<String> {
             this.realm
                 .get_property(handle, k)
@@ -14552,7 +14715,8 @@ fn display_name(ty: &str, code: &str) -> alloc::string::String {
 }
 
 /// The CLDR "short" symbol for an `Intl.NumberFormat` `style: "unit"` measurement unit
-/// (a common subset). An unrecognized unit renders by its own name.
+/// (a common subset). An unrecognized unit renders by its own name. (Used for `style: "unit"`
+/// in both builds — the `intl` crate's `number::format` doesn't render units yet.)
 fn unit_symbol(unit: &str) -> &str {
     match unit {
         "kilometer" => "km",
@@ -15220,6 +15384,19 @@ mod tests {
                 r#"var p=new Intl.PluralRules("pl");console.log([1,2,5,22].map(n=>p.select(n)).join(","))"#
             ),
             "one,few,many,few\n"
+        );
+    }
+
+    /// With the `intl` crate, `Intl.NumberFormat` is locale-aware — German currency uses the
+    /// `1.234,50 €` pattern (comma decimal, trailing symbol), unlike the en-only fallback.
+    #[cfg(feature = "intl")]
+    #[test]
+    fn intl_numberformat_is_locale_aware() {
+        assert_eq!(
+            out(
+                r#"console.log(new Intl.NumberFormat("de-DE",{style:"currency",currency:"EUR"}).format(1234.5))"#
+            ),
+            "1.234,50\u{a0}€\n"
         );
     }
 
