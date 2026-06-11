@@ -1351,11 +1351,14 @@ impl<'a> Interp<'a> {
                 }
                 arg(0)
             }
-            N_OBJECT_IS_SEALED => NanBox::boolean(
-                arg(0)
-                    .as_handle()
-                    .is_some_and(|raw| self.realm.is_sealed(Handle::from_raw(raw))),
-            ),
+            N_OBJECT_IS_SEALED => {
+                // A non-object argument (a primitive) is reported as sealed.
+                let v = arg(0);
+                let sealed = !self.is_object_value(v)
+                    || v.as_handle()
+                        .is_some_and(|raw| self.realm.is_sealed(Handle::from_raw(raw)));
+                NanBox::boolean(sealed)
+            }
             N_OBJECT_IS_EXTENSIBLE => {
                 if let Some(obj) = arg(0).as_handle().map(Handle::from_raw) {
                     self.is_extensible_of(obj)?
@@ -1684,11 +1687,14 @@ impl<'a> Interp<'a> {
                 }
                 NanBox::handle(out.to_raw())
             }
-            N_OBJECT_IS_FROZEN => NanBox::boolean(
-                arg(0)
-                    .as_handle()
-                    .is_some_and(|raw| self.realm.is_frozen(Handle::from_raw(raw))),
-            ),
+            N_OBJECT_IS_FROZEN => {
+                // A non-object argument (a primitive) is reported as frozen.
+                let v = arg(0);
+                let frozen = !self.is_object_value(v)
+                    || v.as_handle()
+                        .is_some_and(|raw| self.realm.is_frozen(Handle::from_raw(raw)));
+                NanBox::boolean(frozen)
+            }
             N_OBJECT_GET_OWN_NAMES => {
                 let names = arg(0)
                     .as_handle()
