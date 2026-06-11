@@ -3613,6 +3613,7 @@ mod tests {
             rest_from: None,
             is_async: false,
             length: 0,
+            name: alloc::string::String::new(),
         };
         assert!(
             lower_nbvm(&proto).is_none(),
@@ -3635,6 +3636,7 @@ mod tests {
             rest_from: None,
             is_async: false,
             length: 0,
+            name: alloc::string::String::new(),
         };
         assert!(lower_nbvm(&ok).is_some(), "written-then-read should lower");
     }
@@ -3659,6 +3661,7 @@ mod tests {
             rest_from: None,
             is_async: false,
             length: 0,
+            name: alloc::string::String::new(),
         };
         let bjit = JitProto::compile(&b).expect("compile B");
         let b_ptr = bjit.code_ptr();
@@ -3683,6 +3686,7 @@ mod tests {
             rest_from: None,
             is_async: false,
             length: 0,
+            name: alloc::string::String::new(),
         };
         // Without the registry the call can't lower; with it, it does.
         assert!(lower_nbvm(&a).is_none(), "unregistered call must bail");

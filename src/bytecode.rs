@@ -538,6 +538,8 @@ pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
             rest_from,
             is_async,
             length,
+            // The serialized bytecode format does not yet carry function names.
+            name: alloc::string::String::new(),
         });
     }
     Ok(protos)

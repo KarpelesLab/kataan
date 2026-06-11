@@ -357,6 +357,9 @@ pub struct FnProto {
     /// `Function.prototype.length`: parameters before the first one with a default
     /// value or the rest parameter.
     pub length: usize,
+    /// `Function.prototype.name`: the function's own name, or a name inferred from
+    /// the binding/property it was assigned to (empty for a truly anonymous one).
+    pub name: alloc::string::String,
 }
 
 /// A queued promise reaction: run `handler(value)` then settle `result` with
@@ -1498,6 +1501,22 @@ fn run_frame(
                         }
                     }
                     Some(handle) => {
+                        // A VM function's `.name` comes from its proto (the closure is a
+                        // tagged array whose element 0 is the function id).
+                        if key.as_str() == "name"
+                            && ctx.realm.is_vm_function(handle)
+                            && !ctx.realm.has_own(handle, "name")
+                        {
+                            let nm = ctx
+                                .realm
+                                .get_element(handle, 0)
+                                .as_number()
+                                .and_then(|f| funcs.get(f as usize))
+                                .map_or("", |p| p.name.as_str());
+                            let s = ctx.realm.new_string(nm);
+                            regs[*dst as usize] = NanBox::handle(s.to_raw());
+                            continue;
+                        }
                         // RegExp introspection properties.
                         let mut done = true;
                         if let Some((src, flags)) = ctx.realm.regexp_at(handle) {
@@ -3122,6 +3141,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
         rest_from: None,
         is_async: false,
         length: 0,
+        name: alloc::string::String::new(),
     };
     // Reserve slots: main (0), top-level functions (1..=N), then class members
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
@@ -3132,7 +3152,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
     let main = Compiler::compile_fn(&fn_ids, &classes, &protos, &[], &[], &program.body, true)?;
     protos.borrow_mut()[0] = main;
     for (i, f) in decls.iter().enumerate() {
-        let proto = Compiler::compile_fn_inner(
+        let mut proto = Compiler::compile_fn_inner(
             &fn_ids,
             &classes,
             &protos,
@@ -3145,6 +3165,10 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
             None,
             f.is_async,
         )?;
+        // A function declaration's `name` is its declared identifier.
+        if let Some(id) = &f.id {
+            proto.name = alloc::string::String::from(id.name.as_ref());
+        }
         protos.borrow_mut()[i + 1] = proto;
     }
     for job in &class_jobs {
@@ -4005,6 +4029,7 @@ impl Compiler {
             is_async,
             length,
             ops: c.ops,
+            name: alloc::string::String::new(),
         })
     }
 }
@@ -4452,7 +4477,7 @@ impl Compiler {
                         continue;
                     }
                     let value = match &d.init {
-                        Some(e) => self.expr(e)?,
+                        Some(e) => self.expr_named(e, &d.target)?,
                         None => self.constant(NanBox::undefined())?,
                     };
                     self.bind_pattern(&d.target, value)?;
@@ -5050,7 +5075,7 @@ impl Compiler {
                             ..
                         } => {
                             let key = static_key(key)?;
-                            let f = self.make_closure(&value.params, &value.body, false)?;
+                            let f = self.make_closure(&value.params, &value.body, false, "")?;
                             let undef = self.constant(NanBox::undefined())?;
                             let (getter, setter) = if *is_getter { (f, undef) } else { (undef, f) };
                             self.ops.push(Op::DefineAccessor {
@@ -5603,7 +5628,10 @@ impl Compiler {
             }
             // A function expression / arrow → a closure capturing its free
             // variables (as shared cells).
-            Expr::Function(f) => self.make_closure(&f.params, &f.body, f.is_async),
+            Expr::Function(f) => {
+                let nm = f.id.as_ref().map_or("", |i| i.name.as_ref());
+                self.make_closure(&f.params, &f.body, f.is_async, nm)
+            }
             Expr::Arrow(a) => {
                 let body: Vec<Stmt> = match &a.body {
                     crate::ast::ArrowBody::Block(b) => b.clone(),
@@ -5612,7 +5640,7 @@ impl Compiler {
                         span: crate::common::Span::point(0),
                     }],
                 };
-                self.make_closure(&a.params, &body, a.is_async)
+                self.make_closure(&a.params, &body, a.is_async, "")
             }
             // The optional-chain boundary. Allocate the result (defaulting to
             // `undefined`), then compile the inner chain: each `?.` link with a
@@ -5644,11 +5672,37 @@ impl Compiler {
 
     /// Compiles a nested function into the shared table and emits the code to
     /// build a closure over its captured cells.
+    /// Like `expr`, but when `e` is an *anonymous* function/arrow bound to a simple
+    /// identifier, the binding name is inferred as the function's `.name`
+    /// (NamedEvaluation: `const f = () => {}` ⇒ `f.name === "f"`).
+    fn expr_named(&mut self, e: &Expr, target: &BindingTarget) -> Result<Reg, CompileError> {
+        if let BindingTarget::Ident(id) = target {
+            match e {
+                Expr::Function(f) if f.id.is_none() => {
+                    return self.make_closure(&f.params, &f.body, f.is_async, id.name.as_ref());
+                }
+                Expr::Arrow(a) => {
+                    let body: Vec<Stmt> = match &a.body {
+                        crate::ast::ArrowBody::Block(b) => b.clone(),
+                        crate::ast::ArrowBody::Expr(ex) => alloc::vec![Stmt::Return {
+                            argument: Some(Box::new((**ex).clone())),
+                            span: crate::common::Span::point(0),
+                        }],
+                    };
+                    return self.make_closure(&a.params, &body, a.is_async, id.name.as_ref());
+                }
+                _ => {}
+            }
+        }
+        self.expr(e)
+    }
+
     fn make_closure(
         &mut self,
         params: &[crate::ast::Param],
         body: &[Stmt],
         is_async: bool,
+        name: &str,
     ) -> Result<Reg, CompileError> {
         // Captures = free variables that resolve to an enclosing binding (others
         // are top-level functions / globals, reached directly).
@@ -5668,6 +5722,7 @@ impl Compiler {
                 rest_from: None,
                 is_async: false,
                 length: 0,
+                name: alloc::string::String::new(),
             });
             (p.len() - 1) as u32
         };
@@ -5684,6 +5739,8 @@ impl Compiler {
             None,
             is_async,
         )?;
+        let mut proto = proto;
+        proto.name = alloc::string::String::from(name);
         self.protos.borrow_mut()[id as usize] = proto;
         // Capture the cell registers for each free variable (in the same sorted
         // order the callee binds them).
