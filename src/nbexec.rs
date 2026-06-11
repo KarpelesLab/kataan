@@ -309,6 +309,10 @@ const N_INTL_LIST_FORMAT_FORMAT: u16 = 222;
 const N_INTL_REL_TIME: u16 = 223;
 /// `Intl.RelativeTimeFormat.prototype.format`.
 const N_INTL_REL_TIME_FORMAT: u16 = 224;
+/// `Intl.DisplayNames` constructor.
+const N_INTL_DISPLAY_NAMES: u16 = 225;
+/// `Intl.DisplayNames.prototype.of`.
+const N_INTL_DISPLAY_NAMES_OF: u16 = 226;
 /// The typed-array constructors occupy `[BASE, BASE + KINDS.len())`; the id minus
 /// the base indexes [`TYPED_ARRAY_KINDS`].
 const N_TYPED_ARRAY_BASE: u16 = 168;
@@ -1023,6 +1027,7 @@ impl<'a> Interp<'a> {
             ("PluralRules", N_INTL_PLURAL_RULES),
             ("ListFormat", N_INTL_LIST_FORMAT),
             ("RelativeTimeFormat", N_INTL_REL_TIME),
+            ("DisplayNames", N_INTL_DISPLAY_NAMES),
         ] {
             let f = self.new_named_native(name, id);
             // `Intl.X.supportedLocalesOf(locales)` — static on every constructor.
@@ -2357,6 +2362,20 @@ impl<'a> Interp<'a> {
                 let value = self.realm.to_number(arg(0));
                 let unit = self.realm.to_display_string(arg(1));
                 let s = relative_time_string(value, &unit, &numeric);
+                self.new_str(&s)
+            }
+            // `Intl.DisplayNames(...)` without `new`.
+            N_INTL_DISPLAY_NAMES => self.make_display_names(args),
+            // `Intl.DisplayNames.prototype.of(code)`.
+            N_INTL_DISPLAY_NAMES_OF => {
+                let fmt = self.this_val.as_handle().map(Handle::from_raw);
+                let ty = fmt
+                    .and_then(|h| self.realm.get_property(h, "type"))
+                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default();
+                let code = self.realm.to_display_string(arg(0));
+                let s = display_name(&ty, &code);
                 self.new_str(&s)
             }
             // `Intl.Collator.prototype.compare(a, b)` — code-point order (no locale
@@ -4704,6 +4723,10 @@ impl<'a> Interp<'a> {
         if id == N_INTL_REL_TIME {
             return Ok(self.make_relative_time_format(args));
         }
+        // `new Intl.DisplayNames(locale, { type })` → an object with an `of(code)` method.
+        if id == N_INTL_DISPLAY_NAMES {
+            return Ok(self.make_display_names(args));
+        }
         // `new Promise(executor)`: run executor(resolve, reject).
         if id == N_PROMISE {
             let promise = self.realm.new_promise();
@@ -5427,6 +5450,27 @@ impl<'a> Interp<'a> {
         let f = self.new_named_native("format", N_INTL_REL_TIME_FORMAT);
         self.realm
             .set_property(obj, "format", NanBox::handle(f.to_raw()));
+        NanBox::handle(obj.to_raw())
+    }
+
+    /// Builds an `Intl.DisplayNames` instance: an object capturing `type` with a readable
+    /// `of(code)` method.
+    fn make_display_names(&mut self, args: &[NanBox]) -> NanBox {
+        let obj = self.realm.new_object();
+        if let Some(opts) = args
+            .get(1)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            for key in ["type", "style", "fallback"] {
+                if let Some(v) = self.realm.get_property(opts, key) {
+                    self.realm.set_hidden_property(obj, key, v);
+                }
+            }
+        }
+        let f = self.new_named_native("of", N_INTL_DISPLAY_NAMES_OF);
+        self.realm
+            .set_property(obj, "of", NanBox::handle(f.to_raw()));
         NanBox::handle(obj.to_raw())
     }
 
@@ -14035,6 +14079,89 @@ fn relative_time_string(value: f64, unit: &str, numeric: &str) -> alloc::string:
     } else {
         alloc::format!("in {n} {unit_disp}")
     }
+}
+
+/// `Intl.DisplayNames.prototype.of(code)` for the `language`/`region`/`currency`/`script`
+/// types (a common en subset). An unrecognized code falls back to itself.
+fn display_name(ty: &str, code: &str) -> alloc::string::String {
+    let owned;
+    let name: &str = match ty {
+        "language" => {
+            // The primary language subtag, lowercased.
+            let primary = code.split(['-', '_']).next().unwrap_or(code);
+            owned = primary.to_ascii_lowercase();
+            match owned.as_str() {
+                "en" => "English",
+                "fr" => "French",
+                "de" => "German",
+                "es" => "Spanish",
+                "it" => "Italian",
+                "pt" => "Portuguese",
+                "nl" => "Dutch",
+                "ru" => "Russian",
+                "ja" => "Japanese",
+                "zh" => "Chinese",
+                "ko" => "Korean",
+                "ar" => "Arabic",
+                "hi" => "Hindi",
+                "tr" => "Turkish",
+                "pl" => "Polish",
+                "sv" => "Swedish",
+                "el" => "Greek",
+                "he" => "Hebrew",
+                "th" => "Thai",
+                "vi" => "Vietnamese",
+                _ => code,
+            }
+        }
+        "region" => {
+            owned = code.to_ascii_uppercase();
+            match owned.as_str() {
+                "US" => "United States",
+                "GB" => "United Kingdom",
+                "FR" => "France",
+                "DE" => "Germany",
+                "ES" => "Spain",
+                "IT" => "Italy",
+                "PT" => "Portugal",
+                "NL" => "Netherlands",
+                "RU" => "Russia",
+                "JP" => "Japan",
+                "CN" => "China",
+                "KR" => "South Korea",
+                "IN" => "India",
+                "BR" => "Brazil",
+                "CA" => "Canada",
+                "AU" => "Australia",
+                "MX" => "Mexico",
+                "CH" => "Switzerland",
+                "SE" => "Sweden",
+                "GR" => "Greece",
+                _ => code,
+            }
+        }
+        "currency" => {
+            owned = code.to_ascii_uppercase();
+            match owned.as_str() {
+                "USD" => "US Dollar",
+                "EUR" => "Euro",
+                "GBP" => "British Pound",
+                "JPY" => "Japanese Yen",
+                "CNY" => "Chinese Yuan",
+                "CHF" => "Swiss Franc",
+                "CAD" => "Canadian Dollar",
+                "AUD" => "Australian Dollar",
+                "INR" => "Indian Rupee",
+                "BRL" => "Brazilian Real",
+                "RUB" => "Russian Ruble",
+                "KRW" => "South Korean Won",
+                "MXN" => "Mexican Peso",
+                _ => code,
+            }
+        }
+        _ => code,
+    };
+    alloc::string::String::from(name)
 }
 
 /// The CLDR "short" symbol for an `Intl.NumberFormat` `style: "unit"` measurement unit
