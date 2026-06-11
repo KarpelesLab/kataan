@@ -12,11 +12,11 @@ assert.sameValue(g.map(function (x) { return x.segment; }).join(","), "a,b,c", "
 assert.sameValue(g.map(function (x) { return x.index; }).join(","), "0,1,2", "grapheme indices");
 assert.sameValue(seg(undefined, "ab").map(function (x) { return x.segment; }).join(","), "a,b", "default granularity is grapheme");
 
-// Word: alternating word-like and separator runs, with isWordLike + index.
+// Word (UAX-29): word-like runs, with punctuation and whitespace as distinct segments.
 var w = seg("word", "Hello, world!");
-assert.sameValue(w.map(function (x) { return x.segment; }).join("|"), "Hello|, |world|!", "word segments");
-assert.sameValue(w.map(function (x) { return x.isWordLike; }).join(","), "true,false,true,false", "isWordLike");
-assert.sameValue(w.map(function (x) { return x.index; }).join(","), "0,5,7,12", "word indices");
+assert.sameValue(w.map(function (x) { return x.segment; }).join("|"), "Hello|,| |world|!", "word segments");
+assert.sameValue(w.map(function (x) { return x.isWordLike; }).join(","), "true,false,false,true,false", "isWordLike");
+assert.sameValue(w.map(function (x) { return x.index; }).join(","), "0,5,6,7,12", "word indices");
 
 // Sentence: split after terminating punctuation + spaces.
 var s = seg("sentence", "Hi there. How are you? Good!");

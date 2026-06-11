@@ -14141,22 +14141,73 @@ fn relative_time_string(value: f64, unit: &str, numeric: &str) -> alloc::string:
 /// isWordLike)` triples (`index` is a code-point offset). `grapheme` is per code point;
 /// `word` alternates alphanumeric "word-like" runs with separators; `sentence` splits after
 /// terminating punctuation followed by a space.
+#[cfg(feature = "intl")]
+fn segment_text(
+    input: &str,
+    granularity: &str,
+) -> Vec<(usize, alloc::string::String, Option<bool>)> {
+    use intl::unicode::segment;
+    // `index` is a code-point offset (kataan strings index by code point, e.g.
+    // `"\u{1F600}".length === 1`), so accumulate `chars().count()` per segment.
+    let mut out: Vec<(usize, alloc::string::String, Option<bool>)> = Vec::new();
+    let mut index = 0usize;
+    let push = |seg: &str, is_word_like: Option<bool>, out: &mut Vec<_>, index: &mut usize| {
+        out.push((*index, alloc::string::String::from(seg), is_word_like));
+        *index += seg.chars().count();
+    };
+    match granularity {
+        "word" => {
+            for w in segment::words(input) {
+                let wl = Some(w.chars().any(char::is_alphanumeric));
+                push(w, wl, &mut out, &mut index);
+            }
+        }
+        "sentence" => {
+            for s in segment::sentences(input) {
+                push(s, None, &mut out, &mut index);
+            }
+        }
+        // "grapheme" (default): UAX-29 extended grapheme clusters.
+        _ => {
+            for g in segment::graphemes(input) {
+                push(g, None, &mut out, &mut index);
+            }
+        }
+    }
+    out
+}
+
+/// Hand-rolled en-US fallback used when the `intl` crate is unavailable: per-code-point
+/// graphemes, alphanumeric word runs, and `.`/`!`/`?`-plus-space sentence splits.
+#[cfg(not(feature = "intl"))]
 fn segment_text(
     input: &str,
     granularity: &str,
 ) -> Vec<(usize, alloc::string::String, Option<bool>)> {
     let chars: Vec<char> = input.chars().collect();
     let mut out: Vec<(usize, alloc::string::String, Option<bool>)> = Vec::new();
+    // Approximate UAX-29 word boundaries: group runs of one class — alphanumeric (word-like),
+    // whitespace, or other — so punctuation and spaces become distinct segments (matching the
+    // `intl` crate, e.g. `","` and `" "` split apart).
+    let class = |c: char| -> u8 {
+        if c.is_alphanumeric() {
+            0
+        } else if c.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
     match granularity {
         "word" => {
             let mut i = 0;
             while i < chars.len() {
-                let word = chars[i].is_alphanumeric();
+                let cls = class(chars[i]);
                 let start = i;
-                while i < chars.len() && chars[i].is_alphanumeric() == word {
+                while i < chars.len() && class(chars[i]) == cls {
                     i += 1;
                 }
-                out.push((start, chars[start..i].iter().collect(), Some(word)));
+                out.push((start, chars[start..i].iter().collect(), Some(cls == 0)));
             }
         }
         "sentence" => {
@@ -14915,6 +14966,19 @@ mod tests {
         let mut interp = Interp::new();
         interp.run(&program).expect("exec");
         String::from(interp.output())
+    }
+
+    /// With the `intl` crate, `Intl.Segmenter` uses real UAX-29 grapheme clusters — an emoji
+    /// stays a single segment (the no-`intl` fallback splits per code point).
+    #[cfg(feature = "intl")]
+    #[test]
+    fn intl_segmenter_real_grapheme_clusters() {
+        assert_eq!(
+            out(
+                r#"console.log([...new Intl.Segmenter("en").segment("a😀b")].map(s=>s.segment).join("|"))"#
+            ),
+            "a|😀|b\n"
+        );
     }
 
     #[test]
