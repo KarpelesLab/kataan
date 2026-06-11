@@ -8534,14 +8534,24 @@ impl<'a> Interp<'a> {
                 }
             }
             BindingTarget::Object(pat) => {
+                // Object destructuring requires a coercible value: null/undefined throw
+                // a TypeError (RequireObjectCoercible).
+                if matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    let m = self.new_str("Cannot destructure 'null' or 'undefined' as an object");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 let src = value.as_handle().map(Handle::from_raw);
                 let mut used: Vec<String> = Vec::new();
                 for prop in &pat.properties {
                     // A computed key (`{ [expr]: t }`) is evaluated here.
                     let key = self.eval_prop_key(&prop.key)?;
-                    let mut v = src
-                        .and_then(|h| self.realm.get_property(h, &key))
-                        .unwrap_or(NanBox::undefined());
+                    // Read through `read_member` so accessors fire and inherited /
+                    // string-length / array-length properties resolve (not just own
+                    // data slots).
+                    let mut v = match src {
+                        Some(h) => self.read_member(h, &key)?,
+                        None => NanBox::undefined(),
+                    };
                     if matches!(v.unpack(), Unpacked::Undefined)
                         && let Some(d) = &prop.default
                     {
