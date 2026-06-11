@@ -11206,12 +11206,18 @@ impl<'a> Interp<'a> {
         // instance, and reassigning `C.prototype` is reflected).
         if let Some((func_id, _)) = self.realm.function_at(ch) {
             let proto = self.realm.function_prototype(func_id);
-            let mut cur = self.realm.object_proto(oh);
-            while let Some(p) = cur {
+            // Walk via `get_proto_of` so a proxy's `getPrototypeOf` trap is honored at
+            // each step (bounded to guard against a trap returning a cycle).
+            let mut cur = oh;
+            for _ in 0..100_000 {
+                let next = self.get_proto_of(cur)?;
+                let Some(p) = next.as_handle().map(Handle::from_raw) else {
+                    return Ok(false);
+                };
                 if p == proto {
                     return Ok(true);
                 }
-                cur = self.realm.object_proto(p);
+                cur = p;
             }
             return Ok(false);
         }

@@ -26,3 +26,13 @@ assert.throws(TypeError, function () { return Object.getPrototypeOf(rev.proxy); 
 // Ordinary objects are unaffected.
 assert.sameValue(Object.getPrototypeOf({}), Object.prototype, "plain object");
 assert.sameValue(Object.getPrototypeOf(Object.create(null)), null, "null-proto object");
+
+// instanceof walks the prototype chain through the getPrototypeOf trap.
+function Ctor() {}
+var inst = new Proxy({}, { getPrototypeOf: function () { return Ctor.prototype; } });
+assert.sameValue(inst instanceof Ctor, true, "instanceof uses the trap");
+var mid = Object.create(Ctor.prototype);
+var chained = new Proxy({}, { getPrototypeOf: function () { return mid; } });
+assert.sameValue(chained instanceof Ctor, true, "instanceof walks through the trap result");
+var unrelated = new Proxy({}, { getPrototypeOf: function () { return {}; } });
+assert.sameValue(unrelated instanceof Ctor, false, "non-instance via trap");
