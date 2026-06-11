@@ -4458,6 +4458,48 @@ impl<'a> Interp<'a> {
         // a plain array whose element writes coerce to the element kind.
         if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id) {
             let kind = id - N_TYPED_ARRAY_BASE;
+            // `new T(buffer, byteOffset?, length?)` — a view over an ArrayBuffer. The
+            // element store is decoded from the buffer's bytes (a snapshot: writes don't
+            // yet flow back to the buffer — the live-backing D′ work is separate), and the
+            // byte offset is recorded so `.byteOffset` reports it.
+            if let Some(v) = args.first()
+                && let Some(bh) = v.as_handle().map(Handle::from_raw)
+                && let Some(bytesv) = self.realm.get_property(bh, ARRAY_BUFFER_BYTES)
+            {
+                let bytes: Vec<u8> = bytesv
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|e| self.realm.to_number(*e) as i64 as u8)
+                    .collect();
+                let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+                let byte_off = args
+                    .get(1)
+                    .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
+                    .map_or(0, |a| self.realm.to_number(*a).max(0.0) as usize);
+                let avail = bytes.len().saturating_sub(byte_off);
+                let length = args
+                    .get(2)
+                    .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
+                    .map_or(avail / elem_size, |a| {
+                        self.realm.to_number(*a).max(0.0) as usize
+                    });
+                let decoded: Vec<NanBox> = (0..length)
+                    .map(|i| {
+                        let start = byte_off + i * elem_size;
+                        let slice = bytes.get(start..start + elem_size).unwrap_or(&[]);
+                        NanBox::number(decode_typed_element(kind as u8, slice))
+                    })
+                    .collect();
+                let arr = self.realm.new_array(decoded);
+                self.realm
+                    .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
+                self.realm
+                    .set_hidden_property(arr, DATA_VIEW_OFF, NanBox::number(byte_off as f64));
+                return Ok(NanBox::handle(arr.to_raw()));
+            }
             let elems: Vec<NanBox> = match args.first().copied() {
                 // `new T(arrayLike)` copies and coerces the source's elements.
                 Some(v)
@@ -11065,7 +11107,12 @@ impl<'a> Interp<'a> {
             let bpe = f64::from(TYPED_ARRAY_KINDS[k.as_number().unwrap_or(0.0) as usize].1);
             return Ok(NanBox::number(match name {
                 "BYTES_PER_ELEMENT" => bpe,
-                "byteOffset" => 0.0,
+                // A buffer-backed view records its start offset under `DATA_VIEW_OFF`.
+                "byteOffset" => self
+                    .realm
+                    .get_property(handle, DATA_VIEW_OFF)
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0),
                 _ => self.realm.array_length(handle).unwrap_or(0) as f64 * bpe,
             }));
         }
@@ -12542,6 +12589,23 @@ fn coerce_typed(kind: u16, n: f64) -> f64 {
             }
             u as f64
         }
+    }
+}
+
+/// Little-endian decode of one typed-array element of `kind` (index into
+/// [`TYPED_ARRAY_KINDS`]) from `bytes` (short/empty slices read as zero).
+fn decode_typed_element(kind: u8, bytes: &[u8]) -> f64 {
+    let b = |i: usize| bytes.get(i).copied().unwrap_or(0);
+    match kind {
+        0 => f64::from(b(0) as i8),                                   // Int8
+        1 | 2 => f64::from(b(0)),                                     // Uint8 / Clamped
+        3 => f64::from(i16::from_le_bytes([b(0), b(1)])),             // Int16
+        4 => f64::from(u16::from_le_bytes([b(0), b(1)])),             // Uint16
+        5 => f64::from(i32::from_le_bytes([b(0), b(1), b(2), b(3)])), // Int32
+        6 => f64::from(u32::from_le_bytes([b(0), b(1), b(2), b(3)])), // Uint32
+        7 => f64::from(f32::from_le_bytes([b(0), b(1), b(2), b(3)])), // Float32
+        8 => f64::from_le_bytes([b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7)]), // Float64
+        _ => 0.0,
     }
 }
 
