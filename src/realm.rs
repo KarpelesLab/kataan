@@ -138,6 +138,52 @@ impl Realm {
         emptied
     }
 
+    /// Resizes the byte store at `bytes_handle` to `new_byte_len` (zero-filling on growth)
+    /// and re-lengths every typed-array view over it to span the resized buffer, decoding
+    /// the elements from the (possibly grown) bytes. Used by `ArrayBuffer.prototype.resize`.
+    pub fn resize_buffer(&mut self, bytes_handle: Handle, new_byte_len: usize) {
+        let old_len = self.array_length(bytes_handle).unwrap_or(0);
+        self.set_array_length(bytes_handle, new_byte_len);
+        for i in old_len..new_byte_len {
+            self.set_element(bytes_handle, i, NanBox::number(0.0));
+        }
+        let bytes: alloc::vec::Vec<u8> = self
+            .heap
+            .get(bytes_handle)
+            .and_then(Cell::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|n| n.as_number().unwrap_or(0.0) as u8)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let views = self
+            .typed_views
+            .get(&bytes_handle.to_raw())
+            .cloned()
+            .unwrap_or_default();
+        for (vraw, off, kind, size) in views {
+            let v = Handle::from_raw(vraw);
+            if !self.heap.is_live(v) {
+                continue;
+            }
+            let view_len = new_byte_len.saturating_sub(off) / size;
+            let mut elems = alloc::vec::Vec::with_capacity(view_len);
+            let mut raw = [0u8; 8];
+            for i in 0..view_len {
+                let start = off + i * size;
+                for (j, b) in raw.iter_mut().take(size).enumerate() {
+                    *b = bytes.get(start + j).copied().unwrap_or(0);
+                }
+                elems.push(NanBox::number(decode_typed_element(
+                    kind as u8,
+                    &raw[..size],
+                )));
+            }
+            self.array_set_all(v, elems);
+        }
+    }
+
     /// Registers a typed-array view over the buffer whose bytes live at `bytes_handle`, so
     /// later writes to that buffer propagate into this view's element store.
     pub fn register_typed_view(

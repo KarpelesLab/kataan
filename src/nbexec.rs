@@ -637,6 +637,9 @@ const ARRAY_BUFFER_BYTES: &str = "\u{0}abytes";
 /// Marks an `ArrayBuffer` as detached (after `transfer()`): its `byteLength` reads 0 and its
 /// views have been emptied.
 const ARRAY_BUFFER_DETACHED: &str = "\u{0}abdetached";
+/// An `ArrayBuffer`'s `maxByteLength` — present iff it was constructed resizable (via
+/// `new ArrayBuffer(n, { maxByteLength })`), bounding `resize`.
+const ARRAY_BUFFER_MAXLEN: &str = "\u{0}abmaxlen";
 const DATA_VIEW_BUF: &str = "\u{0}dvbuf";
 const DATA_VIEW_OFF: &str = "\u{0}dvoff";
 /// An explicit `DataView` byteLength (the 3rd constructor arg); absent → the rest
@@ -4694,7 +4697,26 @@ impl<'a> Interp<'a> {
                 .first()
                 .map_or(0.0, |v| self.realm.to_number(*v))
                 .max(0.0) as usize;
-            return Ok(NanBox::handle(self.make_array_buffer(n).to_raw()));
+            let buf = self.make_array_buffer(n);
+            // `new ArrayBuffer(n, { maxByteLength })` makes the buffer resizable up to `max`.
+            if let Some(opts) = args
+                .get(1)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                && let Some(maxv) = self.realm.get_property(opts, "maxByteLength")
+            {
+                let max = self.realm.to_number(maxv).max(0.0) as usize;
+                if max < n {
+                    let m = self.new_str("ArrayBuffer maxByteLength is smaller than its length");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                self.realm.set_hidden_property(
+                    buf,
+                    ARRAY_BUFFER_MAXLEN,
+                    NanBox::number(max as f64),
+                );
+            }
+            return Ok(NanBox::handle(buf.to_raw()));
         }
         // `new WebAssembly.Memory({ initial, maximum? })` — linear memory backed by
         // an `ArrayBuffer` of `initial` 64 KiB pages, exposing `.buffer` + `grow()`.
@@ -6818,6 +6840,28 @@ impl<'a> Interp<'a> {
             self.realm
                 .set_hidden_property(handle, ARRAY_BUFFER_DETACHED, NanBox::boolean(true));
             return Ok(Some(NanBox::handle(nb.to_raw())));
+        }
+        // --- ArrayBuffer.prototype.resize(newByteLength) (resizable buffers) ---
+        if method == "resize"
+            && let Some(bytesv) = self.realm.get_property(handle, ARRAY_BUFFER_BYTES)
+            && let Some(bh) = bytesv.as_handle().map(Handle::from_raw)
+        {
+            self.guard_detached_buffer(handle)?;
+            let Some(max) = self
+                .realm
+                .get_property(handle, ARRAY_BUFFER_MAXLEN)
+                .map(|m| self.realm.to_number(m) as usize)
+            else {
+                let m = self.new_str("ArrayBuffer.prototype.resize: buffer is not resizable");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            };
+            let new_len = self.realm.to_number(arg(0)).max(0.0) as usize;
+            if new_len > max {
+                let m = self.new_str("ArrayBuffer.prototype.resize: length exceeds maxByteLength");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            self.realm.resize_buffer(bh, new_len);
+            return Ok(Some(NanBox::undefined()));
         }
         // --- DataView get*/set* ---
         if let Some(bufv) = self.realm.get_property(handle, DATA_VIEW_BUF)
@@ -11768,13 +11812,31 @@ impl<'a> Interp<'a> {
         // `ArrayBuffer.prototype.slice` as a readable method (so `typeof ab.slice ===
         // "function"` and a detached `ab.slice.call(ab, …)` work; it is dispatched in
         // `call_method`).
-        if matches!(name, "slice" | "transfer")
+        if matches!(name, "slice" | "transfer" | "resize")
             && self
                 .realm
                 .get_property(handle, ARRAY_BUFFER_BYTES)
                 .is_some()
         {
             return Ok(self.readable_native_method(name));
+        }
+        // `ArrayBuffer.prototype.resizable` / `.maxByteLength` (ES2024 resizable buffers).
+        if matches!(name, "resizable" | "maxByteLength")
+            && self
+                .realm
+                .get_property(handle, ARRAY_BUFFER_BYTES)
+                .is_some()
+        {
+            let max = self.realm.get_property(handle, ARRAY_BUFFER_MAXLEN);
+            if name == "resizable" {
+                return Ok(NanBox::boolean(max.is_some()));
+            }
+            // `maxByteLength` is the recorded max, or — for a non-resizable buffer — its
+            // current `byteLength`.
+            return Ok(match max {
+                Some(m) => m,
+                None => self.read_member(handle, "byteLength")?,
+            });
         }
         // `ArrayBuffer.prototype.detached` — true once `transfer()` has emptied it.
         if name == "detached"
