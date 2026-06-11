@@ -1224,18 +1224,37 @@ impl Realm {
         self.heap.is_live(handle)
     }
 
+    /// Handles held only by the realm's value-reachable-only side-tables — auxiliary
+    /// property objects (`aux_props`), lazily-created function prototypes/constructors
+    /// (`fn_protos`/`fn_ctor`), and interned symbol objects (`symbols_by_id`). These are not
+    /// reachable through the object graph, so the collector must treat them as extra roots,
+    /// else a collection would free state the tables still point at (leaving dangling
+    /// handles). Compaction additionally relocates the tables (see [`compact`](Self::compact)).
+    fn gc_extra_roots(&self) -> alloc::vec::Vec<Handle> {
+        let mut r = alloc::vec::Vec::new();
+        r.extend(self.aux_props.values().copied());
+        r.extend(self.fn_protos.values().copied());
+        r.extend(self.fn_ctor.values().copied());
+        r.extend(self.symbols_by_id.values().copied());
+        r
+    }
+
     /// Runs a full (**major**) garbage collection, keeping everything reachable
     /// from `roots` and freeing the rest (including cycles). Survivors are
     /// promoted toward the old generation. Returns the collection statistics.
     pub fn collect(&mut self, roots: &[Handle]) -> Stats {
-        gc::collect(&mut self.heap, roots)
+        let mut all = roots.to_vec();
+        all.extend(self.gc_extra_roots());
+        gc::collect(&mut self.heap, &all)
     }
 
     /// Runs a **minor** (generational) collection — reclaims only short-lived
     /// objects in the young generation, treating the old generation as roots.
     /// Cheap when most allocation is short-lived. Returns the statistics.
     pub fn collect_minor(&mut self, roots: &[Handle]) -> Stats {
-        gc::collect_minor(&mut self.heap, roots)
+        let mut all = roots.to_vec();
+        all.extend(self.gc_extra_roots());
+        gc::collect_minor(&mut self.heap, &all)
     }
 
     /// Runs a **moving (compacting)** collection: keeps everything reachable from
@@ -1243,18 +1262,28 @@ impl Realm {
     /// the slot table), and rewrites every reference — including the caller's
     /// `roots`, updated in place — to the new locations. Returns the statistics.
     pub fn compact(&mut self, roots: &mut [Handle]) -> Stats {
+        // The value-reachable-only side-tables must be marked (else their objects are swept)
+        // *and* relocated. Append them as extra roots for the marking/relocation, then copy
+        // the caller's portion back afterwards.
+        let extra = self.gc_extra_roots();
+        let n = roots.len();
+        let mut all: alloc::vec::Vec<Handle> = roots.iter().copied().chain(extra).collect();
+
         // Split the borrow so the moving collector (which takes `&mut heap`) can hand the
-        // forwarding function to a closure that repairs the out-of-heap `typed_views`
-        // registry — keeping shared-buffer view backing sound across a compaction.
+        // forwarding function to a closure that repairs the realm's out-of-heap handle tables.
         let Self {
             heap,
             typed_views,
             frozen_arrays,
             sealed_arrays,
             non_extensible_arrays,
+            aux_props,
+            fn_protos,
+            fn_ctor,
+            symbols_by_id,
             ..
         } = self;
-        gc::compact_with(heap, roots, &mut |forward| {
+        let stats = gc::compact_with(heap, &mut all, &mut |forward| {
             // The shared-buffer view registry: forward the bytes-handle keys and the
             // per-view handle entries.
             let old = core::mem::take(typed_views);
@@ -1268,10 +1297,7 @@ impl Realm {
                     .collect();
                 typed_views.insert(new_bytes, new_views);
             }
-            // The array integrity flag sets are keyed by the array's handle. (The arrays
-            // themselves are ordinary reachable objects, so the GC relocates them and these
-            // keys must follow — unlike `aux_props`, whose values are only reachable through
-            // the table itself and so need GC-rooting before they can be relocated soundly.)
+            // The array integrity flag sets are keyed by the array's (relocated) handle.
             for set in [
                 &mut *frozen_arrays,
                 &mut *sealed_arrays,
@@ -1282,7 +1308,25 @@ impl Realm {
                     set.insert(forward(Handle::from_raw(raw)).to_raw());
                 }
             }
-        })
+            // `aux_props` is handle→handle (owning cell → aux object); forward both.
+            let old_aux = core::mem::take(aux_props);
+            for (cell_raw, obj) in old_aux {
+                aux_props.insert(forward(Handle::from_raw(cell_raw)).to_raw(), forward(obj));
+            }
+            // `fn_protos`/`fn_ctor`/`symbols_by_id` are id→handle: keys are stable ids, only
+            // the (relocated) value handles need forwarding.
+            for v in fn_protos.values_mut() {
+                *v = forward(*v);
+            }
+            for v in fn_ctor.values_mut() {
+                *v = forward(*v);
+            }
+            for v in symbols_by_id.values_mut() {
+                *v = forward(*v);
+            }
+        });
+        roots.copy_from_slice(&all[..n]);
+        stats
     }
 
     /// Runs an **incremental** collection: marks in step-bounded slices of at
@@ -2421,6 +2465,33 @@ mod tests {
         assert!(
             !realm.is_frozen(arr),
             "the stale handle is no longer flagged"
+        );
+    }
+
+    #[test]
+    fn compaction_roots_and_relocates_aux_properties() {
+        let mut realm = Realm::new();
+        // A named property on an *array* cell is stored in the handle-keyed `aux_props` table,
+        // whose value object is reachable only through that table — so the collector must root
+        // it and compaction must forward both the cell key and the aux-object value.
+        let _g = realm.new_string("garbage");
+        let arr = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        let tag = realm.new_string("tag");
+        realm.set_property(arr, "label", NanBox::handle(tag.to_raw()));
+
+        let mut roots = [arr, tag];
+        realm.compact(&mut roots);
+        let arr2 = roots[0];
+        assert_ne!(arr2.to_raw(), arr.to_raw(), "slot relocated");
+
+        let label = realm
+            .get_property(arr2, "label")
+            .expect("aux property survived compaction (rooted + relocated)");
+        assert_eq!(
+            realm
+                .string_value(Handle::from_raw(label.as_handle().unwrap()))
+                .as_deref(),
+            Some("tag"),
         );
     }
 
