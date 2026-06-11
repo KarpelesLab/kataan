@@ -885,6 +885,19 @@ impl Realm {
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
             return o.contains(key) || o.accessor(key).is_some();
         }
+        // An array's own properties are its in-range indices and `length` (plus any
+        // aux-stored named property, checked below).
+        if let Some(a) = self.heap.get(handle).and_then(Cell::as_array) {
+            if key == "length" {
+                return true;
+            }
+            if let Ok(i) = key.parse::<usize>()
+                && i < a.len()
+                && alloc::format!("{i}") == key
+            {
+                return true;
+            }
+        }
         // A non-object cell: check its auxiliary props.
         self.aux_props
             .get(&handle.to_raw())
@@ -987,10 +1000,28 @@ impl Realm {
     /// Whether own property `key` is enumerable (not marked hidden).
     #[must_use]
     pub fn property_is_enumerable(&self, handle: Handle, key: &str) -> bool {
-        self.heap
-            .get(handle)
+        if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
+            return !o.is_hidden(key);
+        }
+        // An array's in-range indices are enumerable; `length` is not.
+        if let Some(a) = self.heap.get(handle).and_then(Cell::as_array) {
+            if key == "length" {
+                return false;
+            }
+            if let Ok(i) = key.parse::<usize>()
+                && i < a.len()
+                && alloc::format!("{i}") == key
+            {
+                return true;
+            }
+        }
+        // A named aux property (e.g. a custom property on an array/function) follows
+        // its stored hidden flag.
+        self.aux_props
+            .get(&handle.to_raw())
+            .and_then(|aux| self.heap.get(*aux))
             .and_then(Cell::as_object)
-            .is_some_and(|o| !o.is_hidden(key))
+            .is_some_and(|o| o.contains(key) && !o.is_hidden(key))
     }
 
     /// Marks own property `key` non-enumerable (without changing its value).

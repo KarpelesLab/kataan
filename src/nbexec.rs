@@ -3117,6 +3117,32 @@ impl<'a> Interp<'a> {
     /// (accessor or data), or `None` if `key` is not an own property.
     fn build_descriptor(&mut self, obj: Handle, key: &str) -> Option<NanBox> {
         let t = NanBox::boolean(true);
+        // An array index / `length` is a data property (not stored as a named slot):
+        // an in-range index is writable, enumerable, configurable; `length` is
+        // writable but non-enumerable and non-configurable.
+        if let Some(len) = self.realm.array_length(obj) {
+            let (value, enumerable, configurable) = if key == "length" {
+                (Some(NanBox::number(len as f64)), false, false)
+            } else if let Ok(i) = key.parse::<usize>() {
+                if i < len && alloc::format!("{i}") == key {
+                    (Some(self.realm.get_element(obj, i)), true, true)
+                } else {
+                    (None, false, false)
+                }
+            } else {
+                (None, false, false)
+            };
+            if let Some(v) = value {
+                let d = self.realm.new_object();
+                self.realm.set_property(d, "value", v);
+                self.realm.set_property(d, "writable", t);
+                self.realm
+                    .set_property(d, "enumerable", NanBox::boolean(enumerable));
+                self.realm
+                    .set_property(d, "configurable", NanBox::boolean(configurable));
+                return Some(NanBox::handle(d.to_raw()));
+            }
+        }
         let configurable = NanBox::boolean(!self.realm.property_is_non_configurable(obj, key));
         if let Some((g, s)) = self.realm.accessor(obj, key) {
             let d = self.realm.new_object();
@@ -5231,8 +5257,12 @@ impl<'a> Interp<'a> {
                 return Ok(Some(NanBox::boolean(false)));
             }
             "propertyIsEnumerable" => {
+                // True only for an *own* *enumerable* property (a non-enumerable one,
+                // or an inherited one, is false).
                 let key = self.realm.to_display_string(arg(0));
-                return Ok(Some(NanBox::boolean(self.realm.has_own(handle, &key))));
+                let r = self.realm.has_own(handle, &key)
+                    && self.realm.property_is_enumerable(handle, &key);
+                return Ok(Some(NanBox::boolean(r)));
             }
             // Legacy (Annex B) accessor helpers on Object.prototype.
             "__defineGetter__" => {
