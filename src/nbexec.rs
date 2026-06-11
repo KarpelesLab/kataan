@@ -12040,8 +12040,22 @@ impl<'a> Interp<'a> {
                 self.realm.set_property(handle, &alloc::format!("{n}"), new);
             }
             PropertyKey::Private(s) => {
-                self.realm
-                    .set_property(handle, &alloc::format!("#{s}"), new);
+                // Writing `obj.#x` where obj's class did not declare `#x` is a TypeError.
+                // (Field initialization writes via `set_property` directly, not this path,
+                // so the initial creation of a field is exempt; a class receiver, for
+                // static privates, is resolved via separate per-class storage.)
+                let key = alloc::format!("#{s}");
+                if !self.is_callable(handle)
+                    && self.realm.class_at(handle).is_none()
+                    && !self.realm.has_own(handle, &key)
+                    && self.realm.accessor(handle, &key).is_none()
+                {
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot write private member #{s} to an object whose class did not declare it"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                self.realm.set_property(handle, &key, new);
             }
         }
         Ok(())

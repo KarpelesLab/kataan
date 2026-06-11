@@ -38,3 +38,23 @@ assert.sameValue(Counter.bump(), 1, "static private");
 assert.sameValue(Counter.bump(), 2, "static private again");
 class M { #g() { return 7; } static run(o) { var f = o.#g; return f.call(o); } }
 assert.sameValue(M.run(new M()), 7, "read-then-call private method");
+
+// Writing a private member to a non-holder is also a TypeError (field initialization,
+// which creates the field, is exempt).
+class W { #w = 1; static set(o) { o.#w = 5; return o.#w; } }
+assert.sameValue(W.set(new W()), 5, "valid private write");
+assert.sameValue(throwsType(function () { return W.set({}); }), true, "write to plain object -> TypeError");
+class P2 { #p = 1; }
+class Q2 { #q = 2; static w(o) { o.#q = 9; } }
+assert.sameValue(throwsType(function () { return Q2.w(new P2()); }), true, "cross-class write -> TypeError");
+
+// Private setters, static writes, constructor writes, and inherited-field writes still work.
+class Acc { #v = 10; set #d(x) { this.#v = x; } get #d() { return this.#v; } test() { this.#d = 99; return this.#v; } }
+assert.sameValue(new Acc().test(), 99, "private setter");
+class Stat { static #s = 0; static bump() { Stat.#s = 7; return Stat.#s; } }
+assert.sameValue(Stat.bump(), 7, "static private write");
+class Ctor { #g; constructor() { this.#g = 100; } get() { return this.#g; } }
+assert.sameValue(new Ctor().get(), 100, "constructor write");
+class Base2 { #h = 1; set() { this.#h = 2; return this.#h; } }
+class Sub2 extends Base2 {}
+assert.sameValue(new Sub2().set(), 2, "inherited-field write");
