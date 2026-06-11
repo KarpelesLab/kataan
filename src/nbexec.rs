@@ -8870,7 +8870,11 @@ impl<'a> Interp<'a> {
                 .map(|c| self.new_str(&String::from(*c)))
                 .collect());
         }
-        if let Some(entries) = self.realm.collection_entries(h) {
+        // `Map`/`Set` iterate their entries; `WeakMap`/`WeakSet` are not iterable
+        // (they fall through to the not-iterable TypeError below).
+        if !self.realm.collection_is_weak(h)
+            && let Some(entries) = self.realm.collection_entries(h)
+        {
             if self.realm.collection_is_set(h) == Some(true) {
                 return Ok(entries.iter().map(|(k, _)| *k).collect());
             }
@@ -10867,7 +10871,9 @@ impl<'a> Interp<'a> {
             }
         }
         // `Map`/`Set` expose `size`.
+        // `Map`/`Set` expose `.size`; the weak variants do not (no enumeration).
         if key == "size"
+            && !self.realm.collection_is_weak(handle)
             && let Some(n) = self.realm.collection_size(handle)
         {
             return NanBox::number(n as f64);
