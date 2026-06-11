@@ -634,6 +634,9 @@ const TYPED_ARRAY_KIND: &str = "\u{0}takind";
 const TYPED_ARRAY_BUF: &str = "\u{0}tabuf";
 /// `ArrayBuffer` byte store (an array of 0–255 numbers) and `DataView` linkage.
 const ARRAY_BUFFER_BYTES: &str = "\u{0}abytes";
+/// Marks an `ArrayBuffer` as detached (after `transfer()`): its `byteLength` reads 0 and its
+/// views have been emptied.
+const ARRAY_BUFFER_DETACHED: &str = "\u{0}abdetached";
 const DATA_VIEW_BUF: &str = "\u{0}dvbuf";
 const DATA_VIEW_OFF: &str = "\u{0}dvoff";
 /// An explicit `DataView` byteLength (the 3rd constructor arg); absent → the rest
@@ -4760,6 +4763,9 @@ impl<'a> Interp<'a> {
         if id == N_DATA_VIEW {
             let obj = self.realm.new_object();
             let buf = args.first().copied().unwrap_or(NanBox::undefined());
+            if let Some(bh) = buf.as_handle().map(Handle::from_raw) {
+                self.guard_detached_buffer(bh)?;
+            }
             let off = args.get(1).map_or(0.0, |v| self.realm.to_number(*v));
             self.realm.set_hidden_property(obj, DATA_VIEW_BUF, buf);
             self.realm
@@ -4787,6 +4793,7 @@ impl<'a> Interp<'a> {
                 && let Some(bh) = v.as_handle().map(Handle::from_raw)
                 && let Some(bytesv) = self.realm.get_property(bh, ARRAY_BUFFER_BYTES)
             {
+                self.guard_detached_buffer(bh)?;
                 let bytes: Vec<u8> = bytesv
                     .as_handle()
                     .map(Handle::from_raw)
@@ -5459,6 +5466,20 @@ impl<'a> Interp<'a> {
     /// For a weak collection (`WeakMap`/`WeakSet`), throws a `TypeError` when `key`
     /// is a primitive — weak keys must be objects or symbols. A no-op for a
     /// non-weak (`Map`/`Set`) collection.
+    /// Throws a `TypeError` if `buf` is a detached `ArrayBuffer` (one whose data has been
+    /// moved out by `transfer()`) — every operation on a detached buffer is an error.
+    fn guard_detached_buffer(&mut self, buf: Handle) -> Result<(), ExecError> {
+        if self
+            .realm
+            .get_property(buf, ARRAY_BUFFER_DETACHED)
+            .is_some()
+        {
+            let m = self.new_str("Cannot perform operation on a detached ArrayBuffer");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        Ok(())
+    }
+
     fn guard_weak_key(&mut self, coll: Handle, key: NanBox) -> Result<(), ExecError> {
         if !self.realm.collection_is_weak(coll) {
             return Ok(());
@@ -6739,6 +6760,7 @@ impl<'a> Interp<'a> {
             && let Some(bytesv) = self.realm.get_property(handle, ARRAY_BUFFER_BYTES)
             && let Some(bh) = bytesv.as_handle().map(Handle::from_raw)
         {
+            self.guard_detached_buffer(handle)?;
             let elems = self
                 .realm
                 .array_elements(bh)
@@ -6761,10 +6783,50 @@ impl<'a> Interp<'a> {
                 .set_hidden_property(nb, ARRAY_BUFFER_BYTES, NanBox::handle(arr.to_raw()));
             return Ok(Some(NanBox::handle(nb.to_raw())));
         }
+        // --- ArrayBuffer.prototype.transfer(newLength?) → a new ArrayBuffer; detaches the
+        // original (its byteLength becomes 0 and its views are emptied) ---
+        if method == "transfer"
+            && let Some(bytesv) = self.realm.get_property(handle, ARRAY_BUFFER_BYTES)
+            && let Some(bh) = bytesv.as_handle().map(Handle::from_raw)
+        {
+            if self
+                .realm
+                .get_property(handle, ARRAY_BUFFER_DETACHED)
+                .is_some()
+            {
+                let m = self.new_str("Cannot transfer an already-detached ArrayBuffer");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            let mut elems = self
+                .realm
+                .array_elements(bh)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
+            // `transfer()` keeps the size; `transfer(n)` resizes (truncating or zero-padding).
+            let new_len = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                elems.len()
+            } else {
+                self.realm.to_number(arg(0)).max(0.0) as usize
+            };
+            elems.resize(new_len, NanBox::number(0.0));
+            let nb = self.realm.new_object();
+            let arr = self.realm.new_array(elems);
+            self.realm
+                .set_hidden_property(nb, ARRAY_BUFFER_BYTES, NanBox::handle(arr.to_raw()));
+            // Detach the original: empty every view over it, then flag it.
+            self.realm.detach_buffer_views(bh);
+            self.realm
+                .set_hidden_property(handle, ARRAY_BUFFER_DETACHED, NanBox::boolean(true));
+            return Ok(Some(NanBox::handle(nb.to_raw())));
+        }
         // --- DataView get*/set* ---
         if let Some(bufv) = self.realm.get_property(handle, DATA_VIEW_BUF)
             && let Some((is_set, size, signed, is_float, is_bigint)) = dataview_method(method)
         {
+            // Accessing through a DataView whose buffer was detached is a TypeError.
+            if let Some(buf_h) = bufv.as_handle().map(Handle::from_raw) {
+                self.guard_detached_buffer(buf_h)?;
+            }
             let bytes_h = bufv
                 .as_handle()
                 .map(Handle::from_raw)
@@ -11706,19 +11768,39 @@ impl<'a> Interp<'a> {
         // `ArrayBuffer.prototype.slice` as a readable method (so `typeof ab.slice ===
         // "function"` and a detached `ab.slice.call(ab, …)` work; it is dispatched in
         // `call_method`).
-        if name == "slice"
+        if matches!(name, "slice" | "transfer")
             && self
                 .realm
                 .get_property(handle, ARRAY_BUFFER_BYTES)
                 .is_some()
         {
-            return Ok(self.readable_native_method("slice"));
+            return Ok(self.readable_native_method(name));
         }
-        // `ArrayBuffer.byteLength` (the byte store's length).
+        // `ArrayBuffer.prototype.detached` — true once `transfer()` has emptied it.
+        if name == "detached"
+            && self
+                .realm
+                .get_property(handle, ARRAY_BUFFER_BYTES)
+                .is_some()
+        {
+            let detached = self
+                .realm
+                .get_property(handle, ARRAY_BUFFER_DETACHED)
+                .is_some();
+            return Ok(NanBox::boolean(detached));
+        }
+        // `ArrayBuffer.byteLength` (the byte store's length; 0 once detached).
         if name == "byteLength"
             && let Some(b) = self.realm.get_property(handle, ARRAY_BUFFER_BYTES)
             && let Some(bh) = b.as_handle().map(Handle::from_raw)
         {
+            if self
+                .realm
+                .get_property(handle, ARRAY_BUFFER_DETACHED)
+                .is_some()
+            {
+                return Ok(NanBox::number(0.0));
+            }
             return Ok(NanBox::number(
                 self.realm.array_length(bh).unwrap_or(0) as f64
             ));

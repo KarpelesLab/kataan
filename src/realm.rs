@@ -119,6 +119,25 @@ impl Realm {
         }
     }
 
+    /// Empties every typed-array view registered over the buffer at `bytes_handle` (setting
+    /// each view's length to 0) and forgets them — used when the buffer is detached by
+    /// `ArrayBuffer.prototype.transfer`. Returns the handles that were emptied.
+    pub fn detach_buffer_views(&mut self, bytes_handle: Handle) -> alloc::vec::Vec<Handle> {
+        let views = self
+            .typed_views
+            .remove(&bytes_handle.to_raw())
+            .unwrap_or_default();
+        let mut emptied = alloc::vec::Vec::new();
+        for (vraw, ..) in views {
+            let v = Handle::from_raw(vraw);
+            if self.heap.is_live(v) {
+                self.set_array_length(v, 0);
+                emptied.push(v);
+            }
+        }
+        emptied
+    }
+
     /// Registers a typed-array view over the buffer whose bytes live at `bytes_handle`, so
     /// later writes to that buffer propagate into this view's element store.
     pub fn register_typed_view(
