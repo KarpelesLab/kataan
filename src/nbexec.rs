@@ -1474,7 +1474,7 @@ impl<'a> Interp<'a> {
                             .get_property(descs, &key)
                             .and_then(NanBox::as_handle)
                         {
-                            self.apply_descriptor(obj, &key, Handle::from_raw(d))?;
+                            self.apply_descriptor(obj, &key, Handle::from_raw(d), false)?;
                         }
                     }
                 }
@@ -1500,7 +1500,7 @@ impl<'a> Interp<'a> {
                 {
                     let obj = Handle::from_raw(oraw);
                     let key = self.member_key(arg(1));
-                    self.apply_descriptor(obj, &key, Handle::from_raw(draw))?;
+                    self.apply_descriptor(obj, &key, Handle::from_raw(draw), false)?;
                 }
                 arg(0)
             }
@@ -1517,7 +1517,7 @@ impl<'a> Interp<'a> {
                             .get_property(descs, &key)
                             .and_then(NanBox::as_handle)
                         {
-                            self.apply_descriptor(obj, &key, Handle::from_raw(d))?;
+                            self.apply_descriptor(obj, &key, Handle::from_raw(d), false)?;
                         }
                     }
                 }
@@ -1634,10 +1634,15 @@ impl<'a> Interp<'a> {
                     }
                     // No setter: write the data property on the receiver (via
                     // `assign_member_value`, so array indices/`length` behave right).
+                    // A disallowed write (read-only / non-extensible) returns false.
                     let Some(rh) = receiver.as_handle() else {
                         return Ok(NanBox::boolean(false));
                     };
-                    self.assign_member_value(Handle::from_raw(rh), arg(1), value)?;
+                    let rh = Handle::from_raw(rh);
+                    if !self.can_write_property(rh, &key) {
+                        return Ok(NanBox::boolean(false));
+                    }
+                    self.assign_member_value(rh, arg(1), value)?;
                 }
                 NanBox::boolean(true)
             }
@@ -1664,11 +1669,14 @@ impl<'a> Interp<'a> {
                 NanBox::boolean(present)
             }
             N_REFLECT_DELETE => {
-                if let Some(raw) = arg(0).as_handle() {
+                // Returns the [[Delete]] result: false for a non-configurable property.
+                let ok = if let Some(raw) = arg(0).as_handle() {
                     let key = self.member_key(arg(1));
-                    self.realm.delete_property(Handle::from_raw(raw), &key);
-                }
-                NanBox::boolean(true)
+                    self.realm.delete_property(Handle::from_raw(raw), &key)
+                } else {
+                    false
+                };
+                NanBox::boolean(ok)
             }
             N_REFLECT_OWN_KEYS => {
                 // String keys (integer-indexed then insertion order), then own
@@ -1698,8 +1706,9 @@ impl<'a> Interp<'a> {
                     arg(2).as_handle().map(Handle::from_raw),
                 ) {
                     let key = self.member_key(arg(1));
-                    self.apply_descriptor(obj, &key, desc)?;
-                    true
+                    // Reflect.defineProperty returns the boolean result (false on a failed
+                    // definition) rather than throwing.
+                    self.apply_descriptor(obj, &key, desc, true)?
                 } else {
                     false
                 };
@@ -3764,7 +3773,19 @@ impl<'a> Interp<'a> {
         Ok(true)
     }
 
-    fn apply_descriptor(&mut self, obj: Handle, key: &str, desc: Handle) -> Result<(), ExecError> {
+    /// Applies a property descriptor (the shared `Object.defineProperty` / `Reflect
+    /// .defineProperty` logic). Returns whether `[[DefineOwnProperty]]` succeeded. An
+    /// *invalid* descriptor always throws; a *failed* definition (new property on a
+    /// non-extensible object, or a disallowed redefine of a non-configurable one) throws
+    /// when `reflect` is false (Object.defineProperty) but returns `Ok(false)` when it is
+    /// true (Reflect.defineProperty, which yields a boolean rather than throwing).
+    fn apply_descriptor(
+        &mut self,
+        obj: Handle,
+        key: &str,
+        desc: Handle,
+        reflect: bool,
+    ) -> Result<bool, ExecError> {
         // A proxy routes `Object.defineProperty` through its `defineProperty` trap
         // (called `trap(target, key, descriptor)`), or forwards to the target.
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
@@ -3786,9 +3807,9 @@ impl<'a> Interp<'a> {
                         NanBox::handle(desc.to_raw()),
                     ],
                 )?;
-                return Ok(());
+                return Ok(true);
             }
-            return self.apply_descriptor(target, key, desc);
+            return self.apply_descriptor(target, key, desc, reflect);
         }
         // A descriptor may not mix accessor fields (`get`/`set`) with data fields
         // (`value`/`writable`) — that is an invalid descriptor (ToPropertyDescriptor).
@@ -3802,8 +3823,11 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
         let is_own = self.realm.has_own(obj, key) || self.realm.accessor(obj, key).is_some();
-        // Adding a *new* property to a non-extensible object is a TypeError.
+        // Adding a *new* property to a non-extensible object fails.
         if !is_own && !self.realm.is_extensible(obj) {
+            if reflect {
+                return Ok(false);
+            }
             let m = self.new_str("Cannot define property: object is not extensible");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
@@ -3815,6 +3839,9 @@ impl<'a> Interp<'a> {
             if (is_accessor || !writable)
                 && !self.redefine_is_noop(obj, key, desc, is_accessor, writable)?
             {
+                if reflect {
+                    return Ok(false);
+                }
                 let m = self.new_str("Cannot redefine non-configurable property");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
@@ -3873,7 +3900,7 @@ impl<'a> Interp<'a> {
         if !configurable {
             self.realm.set_non_configurable_property(obj, key);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn is_callable(&self, handle: Handle) -> bool {
@@ -11893,19 +11920,27 @@ impl<'a> Interp<'a> {
     /// non-writable property (its own `writable: false`, or any property of a
     /// frozen object) is a `TypeError` in strict mode and silently ignored
     /// otherwise. Returns `true` when the caller should perform the write.
+    /// Whether `handle[key] = …` is permitted (non-throwing): the property is not
+    /// read-only/frozen, and either already own or the object is extensible. The shared
+    /// predicate behind `allow_property_write` (which adds the strict-mode throw) and
+    /// `Reflect.set` (which returns the boolean).
+    fn can_write_property(&self, handle: crate::heap::Handle, key: &str) -> bool {
+        let add_to_non_extensible =
+            !self.realm.has_own(handle, key) && !self.realm.is_extensible(handle);
+        let readonly = self.realm.property_is_readonly(handle, key)
+            || (self.realm.is_frozen(handle) && self.realm.get_property(handle, key).is_some());
+        !readonly && !add_to_non_extensible
+    }
+
     fn allow_property_write(
         &mut self,
         handle: crate::heap::Handle,
         key: &str,
     ) -> Result<bool, ExecError> {
-        // Adding a *new* property to a non-extensible (sealed/frozen/preventExtensions)
-        // object fails — like writing a read-only property.
-        let add_to_non_extensible =
-            !self.realm.has_own(handle, key) && !self.realm.is_extensible(handle);
-        let readonly = self.realm.property_is_readonly(handle, key)
-            || (self.realm.is_frozen(handle) && self.realm.get_property(handle, key).is_some());
-        if readonly || add_to_non_extensible {
+        if !self.can_write_property(handle, key) {
             if self.strict {
+                let add_to_non_extensible =
+                    !self.realm.has_own(handle, key) && !self.realm.is_extensible(handle);
                 let m = if add_to_non_extensible {
                     self.new_str(&alloc::format!(
                         "Cannot add property '{key}', object is not extensible"
