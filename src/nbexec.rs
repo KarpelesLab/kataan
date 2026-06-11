@@ -5160,6 +5160,19 @@ impl<'a> Interp<'a> {
                 "unit",
                 "unitDisplay",
                 "notation",
+                // DateTimeFormat component options.
+                "weekday",
+                "era",
+                "year",
+                "month",
+                "day",
+                "hour",
+                "minute",
+                "second",
+                "hour12",
+                "dateStyle",
+                "timeStyle",
+                "timeZone",
             ] {
                 if let Some(v) = self.realm.get_property(opts, key) {
                     self.realm.set_hidden_property(obj, key, v);
@@ -5255,12 +5268,223 @@ impl<'a> Interp<'a> {
                 Some(h) if self.realm.date_at(h).is_some() => self.realm.date_at(h).unwrap(),
                 _ => self.realm.to_number(value),
             };
-            let day = (ms as i64).div_euclid(86_400_000);
-            let (y, mo, d) = crate::realm::civil_from_days(day);
-            alloc::format!("{mo}/{d}/{y}")
+            self.format_intl_datetime(handle, ms)
         } else {
             let n = self.realm.to_number(value);
             self.intl_format_number(handle, n)
+        }
+    }
+
+    /// Formats a UTC millisecond timestamp per an `Intl.DateTimeFormat` instance's captured
+    /// component options (`weekday`/`year`/`month`/`day`/`hour`/`minute`/`second`/`hour12`/
+    /// `era`/`dateStyle`/`timeStyle`), en-US patterns. (Timezone is always UTC here.)
+    fn format_intl_datetime(&mut self, handle: Handle, ms: f64) -> String {
+        let opt = |this: &mut Self, k: &str| -> Option<String> {
+            this.realm
+                .get_property(handle, k)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_display_string(v))
+        };
+        let msi = ms as i64;
+        let day = msi.div_euclid(86_400_000);
+        let tod = msi.rem_euclid(86_400_000);
+        let (y, mo, d) = crate::realm::civil_from_days(day);
+        let (mo, d) = (i64::from(mo), i64::from(d));
+        let wd_idx = (day + 4).rem_euclid(7) as usize; // 0 = Sunday
+        let hour24 = tod / 3_600_000;
+        let minute = (tod / 60_000) % 60;
+        let second = (tod / 1_000) % 60;
+
+        const MONTHS: [&str; 12] = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ];
+        const WEEKDAYS: [&str; 7] = [
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+        ];
+        let two = |v: i64| alloc::format!("{v:02}");
+        let bare = |v: i64| alloc::format!("{v}");
+
+        // Effective component options (after expanding dateStyle/timeStyle presets).
+        let mut weekday = opt(self, "weekday");
+        let mut year = opt(self, "year");
+        let mut month = opt(self, "month");
+        let mut day_o = opt(self, "day");
+        let mut hour = opt(self, "hour");
+        let mut minute_o = opt(self, "minute");
+        let mut second_o = opt(self, "second");
+        match opt(self, "dateStyle").as_deref() {
+            Some("full") => {
+                weekday = Some(String::from("long"));
+                year = Some(String::from("numeric"));
+                month = Some(String::from("long"));
+                day_o = Some(String::from("numeric"));
+            }
+            Some("long") => {
+                year = Some(String::from("numeric"));
+                month = Some(String::from("long"));
+                day_o = Some(String::from("numeric"));
+            }
+            Some("medium") => {
+                year = Some(String::from("numeric"));
+                month = Some(String::from("short"));
+                day_o = Some(String::from("numeric"));
+            }
+            Some("short") => {
+                year = Some(String::from("2-digit"));
+                month = Some(String::from("numeric"));
+                day_o = Some(String::from("numeric"));
+            }
+            _ => {}
+        }
+        match opt(self, "timeStyle").as_deref() {
+            Some("full" | "long" | "medium") => {
+                hour = Some(String::from("numeric"));
+                minute_o = Some(String::from("2-digit"));
+                second_o = Some(String::from("2-digit"));
+            }
+            Some("short") => {
+                hour = Some(String::from("numeric"));
+                minute_o = Some(String::from("2-digit"));
+            }
+            _ => {}
+        }
+        // With no options at all, the default is a numeric date.
+        if weekday.is_none()
+            && year.is_none()
+            && month.is_none()
+            && day_o.is_none()
+            && hour.is_none()
+            && minute_o.is_none()
+            && second_o.is_none()
+        {
+            year = Some(String::from("numeric"));
+            month = Some(String::from("numeric"));
+            day_o = Some(String::from("numeric"));
+        }
+
+        let year_str = |style: &str| -> String {
+            if style == "2-digit" {
+                two(y.rem_euclid(100))
+            } else {
+                bare(y)
+            }
+        };
+        let named_month = matches!(month.as_deref(), Some("long" | "short" | "narrow"));
+
+        // --- Date part ---
+        let mut date = String::new();
+        if named_month {
+            if let Some(m) = &month {
+                let name = MONTHS[(mo as usize).saturating_sub(1).min(11)];
+                date.push_str(if m == "long" { name } else { &name[..3] });
+            }
+            if let Some(ds) = &day_o {
+                if !date.is_empty() {
+                    date.push(' ');
+                }
+                date.push_str(&if ds == "2-digit" { two(d) } else { bare(d) });
+            }
+            if let Some(ys) = &year {
+                date.push_str(if day_o.is_some() {
+                    ", "
+                } else if date.is_empty() {
+                    ""
+                } else {
+                    " "
+                });
+                date.push_str(&year_str(ys));
+            }
+        } else {
+            // Slash-separated numeric date (month/day/year).
+            let mut comps: Vec<String> = Vec::new();
+            if let Some(m) = &month {
+                comps.push(if m == "2-digit" { two(mo) } else { bare(mo) });
+            }
+            if let Some(ds) = &day_o {
+                comps.push(if ds == "2-digit" { two(d) } else { bare(d) });
+            }
+            if let Some(ys) = &year {
+                comps.push(year_str(ys));
+            }
+            date = comps.join("/");
+        }
+        if let Some(ws) = &weekday {
+            let name = WEEKDAYS[wd_idx];
+            let wd = if ws == "long" { name } else { &name[..3] };
+            date = if date.is_empty() {
+                String::from(wd)
+            } else {
+                alloc::format!("{wd}, {date}")
+            };
+        }
+        if let Some(es) = opt(self, "era") {
+            let era = if y > 0 { "AD" } else { "BC" };
+            let _ = es;
+            if !date.is_empty() {
+                date.push(' ');
+            }
+            date.push_str(era);
+        }
+
+        // --- Time part ---
+        let mut time = String::new();
+        if hour.is_some() || minute_o.is_some() || second_o.is_some() {
+            // en-US defaults to 12-hour unless `hour12: false`.
+            let h12 = !matches!(
+                self.realm.get_property(handle, "hour12"),
+                Some(v) if matches!(v.unpack(), Unpacked::Bool(false))
+            );
+            let h = if h12 {
+                let m = hour24 % 12;
+                if m == 0 { 12 } else { m }
+            } else {
+                hour24
+            };
+            time.push_str(&if hour.as_deref() == Some("2-digit") {
+                two(h)
+            } else {
+                bare(h)
+            });
+            if minute_o.is_some() {
+                time.push(':');
+                time.push_str(&two(minute));
+            }
+            if second_o.is_some() {
+                time.push(':');
+                time.push_str(&two(second));
+            }
+            if h12 {
+                time.push(' ');
+                time.push_str(if hour24 < 12 { "AM" } else { "PM" });
+            }
+        }
+
+        // --- Combine ---
+        match (date.is_empty(), time.is_empty()) {
+            (false, false) => {
+                let conn = if named_month { " at " } else { ", " };
+                alloc::format!("{date}{conn}{time}")
+            }
+            (false, true) => date,
+            (true, false) => time,
+            (true, true) => date,
         }
     }
 
