@@ -1,5 +1,5 @@
 /*---
-description: DataView get*/set* and TypedArray set/subarray are readable methods (feature detection + detached calls)
+description: DataView get/set accessors and TypedArray set/subarray are readable methods (feature detection + detached calls)
 features: [DataView, TypedArray]
 ---*/
 var dv = new DataView(new ArrayBuffer(16));
