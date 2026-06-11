@@ -4566,7 +4566,12 @@ impl<'a> Interp<'a> {
         let is_set = match id {
             N_SET | N_WEAKSET => true,
             N_MAP | N_WEAKMAP => false,
-            _ => return Err(ExecError::Unsupported("new on this constructor")),
+            // `new Symbol()` / `new BigInt()` and other non-constructor natives throw a
+            // catchable TypeError rather than aborting the engine.
+            _ => {
+                let m = self.new_str("is not a constructor");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
         };
         let handle = self.realm.new_collection(is_set);
         // A weak collection rejects primitive keys (its keys must be objects/symbols).
