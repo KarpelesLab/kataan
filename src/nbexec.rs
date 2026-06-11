@@ -6632,6 +6632,29 @@ impl<'a> Interp<'a> {
             }
         }
 
+        // A plain (non-RegExp, non-`Symbol.match`) string/number argument to
+        // `match`/`matchAll`/`search` is coerced to a RegExp pattern (`matchAll` needs
+        // the global flag). `split`/`replace` keep treating a string argument literally.
+        #[cfg(feature = "regex")]
+        let string_pat: Option<(String, String)> =
+            if matches!(method, "match" | "matchAll" | "search")
+                && self.realm.string_value(handle).is_some()
+                && arg(0)
+                    .as_handle()
+                    .and_then(|raw| self.realm.regexp_at(Handle::from_raw(raw)))
+                    .is_none()
+                && !matches!(arg(0).unpack(), Unpacked::Undefined | Unpacked::Null)
+            {
+                let flags = if method == "matchAll" {
+                    String::from("g")
+                } else {
+                    String::new()
+                };
+                Some((self.realm.to_display_string(arg(0)), flags))
+            } else {
+                None
+            };
+
         // --- regex-backed String methods (when the argument is a RegExp) ---
         #[cfg(feature = "regex")]
         if let Some(s) = self.realm.string_value(handle)
@@ -6642,6 +6665,7 @@ impl<'a> Interp<'a> {
             && let Some((src, flags)) = arg(0)
                 .as_handle()
                 .and_then(|raw| self.realm.regexp_at(Handle::from_raw(raw)))
+                .or(string_pat)
             && let Ok(re) = crate::regex::Regex::new(&src, &flags)
         {
             let global = flags.contains('g');
