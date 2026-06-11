@@ -9454,6 +9454,9 @@ impl<'a> Interp<'a> {
                                         } else {
                                             self.realm.delete_property(target, &name);
                                         }
+                                    } else if self.realm.is_array(h) && name == "length" {
+                                        // An array's `length` is non-configurable.
+                                        result = false;
                                     } else if let (true, Ok(i)) =
                                         (self.realm.is_array(h), name.parse::<usize>())
                                     {
@@ -9465,6 +9468,12 @@ impl<'a> Interp<'a> {
                                     }
                                 }
                             }
+                        } else if let Expr::Ident(id) = &**argument
+                            && self.current.get(&id.name).is_some()
+                        {
+                            // Deleting a resolvable binding (a declared variable) is a
+                            // no-op that returns `false`; an unresolvable name is `true`.
+                            result = false;
                         }
                         return Ok(NanBox::boolean(result));
                     }
