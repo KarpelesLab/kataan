@@ -7152,6 +7152,56 @@ impl<'a> Interp<'a> {
         }
 
         // --- array methods ---
+        // `Array.prototype.<m>.call(arrayLike)`: a plain object with a numeric `length`
+        // is treated as array-like for the common read-only methods — materialize a
+        // temporary array of its indexed elements and run the method against that.
+        const ARRAY_LIKE_METHODS: &[&str] = &[
+            "slice",
+            "map",
+            "filter",
+            "forEach",
+            "indexOf",
+            "lastIndexOf",
+            "includes",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "some",
+            "every",
+            "reduce",
+            "reduceRight",
+            "join",
+            "at",
+            "flat",
+            "flatMap",
+        ];
+        let mut array_like = None;
+        if self.realm.array_elements(handle).is_none()
+            && self.realm.object_keys(handle).is_some()
+            && ARRAY_LIKE_METHODS.contains(&method)
+        {
+            // A missing/NaN `length` is ToLength'd to 0 (an empty array-like).
+            let n = self
+                .realm
+                .get_property(handle, "length")
+                .map(|v| self.realm.to_number(v))
+                .filter(|n| !n.is_nan())
+                .unwrap_or(0.0);
+            if (0.0..=(1u64 << 24) as f64).contains(&n) {
+                let len = n as usize;
+                let mut tmp = Vec::with_capacity(len);
+                for i in 0..len {
+                    tmp.push(
+                        self.realm
+                            .get_property(handle, &alloc::format!("{i}"))
+                            .unwrap_or(NanBox::undefined()),
+                    );
+                }
+                array_like = Some(self.realm.new_array(tmp));
+            }
+        }
+        let handle = array_like.unwrap_or(handle);
         if let Some(elems) = self.realm.array_elements(handle).map(<[_]>::to_vec) {
             match method {
                 "push" => {
