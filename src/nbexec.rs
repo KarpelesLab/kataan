@@ -10037,13 +10037,32 @@ impl<'a> Interp<'a> {
             self.realm.set_regex_last_index(handle, n);
             return Ok(());
         }
-        // An accessor setter takes precedence.
+        // An own accessor setter takes precedence.
         if let Some((_, setter)) = self.realm.accessor(handle, &name) {
             if !matches!(setter.unpack(), Unpacked::Undefined) {
                 let this = NanBox::handle(handle.to_raw());
                 self.call_with_this(setter, this, &[new])?;
             }
             return Ok(());
+        }
+        // No own property: an *inherited* accessor on the prototype chain handles the
+        // write (its setter runs with `this` = the receiver). An inherited data
+        // property, or none, falls through to creating an own data property.
+        if !self.realm.has_own(handle, &name) {
+            let mut cur = self.realm.object_proto(handle);
+            while let Some(p) = cur {
+                if let Some((_, setter)) = self.realm.accessor(p, &name) {
+                    if !matches!(setter.unpack(), Unpacked::Undefined) {
+                        let this = NanBox::handle(handle.to_raw());
+                        self.call_with_this(setter, this, &[new])?;
+                    }
+                    return Ok(());
+                }
+                if self.realm.has_own(p, &name) {
+                    break;
+                }
+                cur = self.realm.object_proto(p);
+            }
         }
         // `arr.length = n` resizes the array.
         if name == "length" && self.realm.is_array(handle) {
