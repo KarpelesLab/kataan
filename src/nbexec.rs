@@ -113,6 +113,9 @@ struct FnDef<'a> {
     name: &'a str,
     /// The class this is a method of (for `super.method()`), if any.
     home_class: Option<u32>,
+    /// Whether the home is entered as a *static* method, so `super.x` resolves
+    /// against the superclass's static members rather than its prototype's.
+    home_static: bool,
 }
 
 /// A tree-walking interpreter over the performance object model.
@@ -176,6 +179,9 @@ pub struct Interp<'a> {
     /// object the method was defined on — so its `super.x` resolves through that
     /// object's prototype (when there is no enclosing class home).
     current_home_object: Option<Handle>,
+    /// Whether the currently-running method was entered as a static method, so
+    /// `super.x` resolves against the superclass's static members.
+    current_home_static: bool,
     /// A label attached to the next loop (for `break`/`continue label`).
     pending_label: Option<String>,
     /// The promise-reaction microtask queue, drained after the script.
@@ -656,6 +662,7 @@ impl<'a> Interp<'a> {
             pending_super_native: None,
             current_home: None,
             current_home_object: None,
+            current_home_static: false,
             pending_label: None,
             microtasks: Vec::new(),
             macrotasks: Vec::new(),
@@ -2886,7 +2893,7 @@ impl<'a> Interp<'a> {
         is_async: bool,
         is_generator: bool,
     ) -> NanBox {
-        self.make_method(params, body, is_async, is_generator, None)
+        self.make_method(params, body, is_async, is_generator, None, false)
     }
 
     fn make_method(
@@ -2896,6 +2903,7 @@ impl<'a> Interp<'a> {
         is_async: bool,
         is_generator: bool,
         home_class: Option<u32>,
+        home_static: bool,
     ) -> NanBox {
         // Strict mode is lexical: inherited from the defining context, or set by
         // the function body's own `"use strict"` directive prologue.
@@ -2910,6 +2918,7 @@ impl<'a> Interp<'a> {
             is_strict,
             name: "",
             home_class,
+            home_static,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
         NanBox::handle(handle.to_raw())
@@ -3791,6 +3800,7 @@ impl<'a> Interp<'a> {
             core::mem::replace(&mut self.this_val, bound)
         };
         let saved_home = core::mem::replace(&mut self.current_home, def.home_class);
+        let saved_home_static = core::mem::replace(&mut self.current_home_static, def.home_static);
         // A non-arrow invocation establishes its own `new.target`: the constructor
         // when reached via `new` (passed through the one-shot `pending_new_target`),
         // else `undefined`. An arrow inherits the enclosing `new.target`.
@@ -3837,6 +3847,7 @@ impl<'a> Interp<'a> {
         self.current = saved;
         self.this_val = saved_this;
         self.current_home = saved_home;
+        self.current_home_static = saved_home_static;
         self.new_target = saved_target;
         // A generator call returns an iterator over the values it yielded.
         if def.is_generator {
@@ -4829,11 +4840,15 @@ impl<'a> Interp<'a> {
             match member {
                 ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
                     if let Ok(key) = self.eval_prop_key(&m.key) {
-                        let f = self.make_function(
+                        // A static method's home is this class, entered statically, so
+                        // `super.x` resolves against the superclass's static members.
+                        let f = self.make_method(
                             &m.value.params,
                             Body::Block(&m.value.body),
                             false,
                             m.value.is_generator,
+                            Some(class_id),
+                            true,
                         );
                         statics.insert(key, f);
                     }
@@ -4856,11 +4871,13 @@ impl<'a> Interp<'a> {
                     if m.is_static && matches!(m.kind, MethodKind::Get | MethodKind::Set) =>
                 {
                     if let Ok(key) = self.eval_prop_key(&m.key) {
-                        let f = self.make_function(
+                        let f = self.make_method(
                             &m.value.params,
                             Body::Block(&m.value.body),
                             false,
                             false,
+                            Some(class_id),
+                            true,
                         );
                         if m.kind == MethodKind::Get {
                             static_getters.insert(key, f);
@@ -4999,6 +5016,7 @@ impl<'a> Interp<'a> {
                     false,
                     m.value.is_generator,
                     Some(*cid),
+                    false,
                 );
                 self.current = saved;
                 match m.kind {
@@ -8704,6 +8722,7 @@ impl<'a> Interp<'a> {
                             false,
                             m.value.is_generator,
                             Some(cid),
+                            false,
                         );
                         self.current = saved;
                         return Ok(Some(f));
@@ -11245,7 +11264,7 @@ impl<'a> Interp<'a> {
             let class = self.classes[pid as usize];
             for member in &class.body {
                 if let ClassMember::Method(m) = member
-                    && !m.is_static
+                    && m.is_static == self.current_home_static
                     && m.kind == MethodKind::Method
                     && static_key(&m.key).ok().as_deref() == Some(name)
                 {
@@ -11256,6 +11275,7 @@ impl<'a> Interp<'a> {
                         false,
                         m.value.is_generator,
                         Some(pid),
+                        self.current_home_static,
                     );
                     self.current = saved;
                     return Ok(f);
@@ -11292,7 +11312,7 @@ impl<'a> Interp<'a> {
             let class = self.classes[pid as usize];
             for member in &class.body {
                 if let ClassMember::Method(m) = member
-                    && !m.is_static
+                    && m.is_static == self.current_home_static
                     && matches!(m.kind, MethodKind::Method | MethodKind::Get)
                     && static_key(&m.key).ok().as_deref() == Some(name)
                 {
@@ -11303,6 +11323,7 @@ impl<'a> Interp<'a> {
                         false,
                         m.value.is_generator,
                         Some(pid),
+                        self.current_home_static,
                     );
                     self.current = saved;
                     return if m.kind == MethodKind::Get {
