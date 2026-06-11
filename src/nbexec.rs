@@ -4790,6 +4790,17 @@ impl<'a> Interp<'a> {
                 // Record the backing buffer so `.buffer` returns the original.
                 self.realm
                     .set_hidden_property(arr, TYPED_ARRAY_BUF, NanBox::handle(bh.to_raw()));
+                // Register the view so writes through a sibling view / DataView propagate
+                // into this view's element store (the BUFFER→VIEW read direction).
+                if let Some(bytes_h) = self
+                    .realm
+                    .get_property(bh, ARRAY_BUFFER_BYTES)
+                    .and_then(|b| b.as_handle())
+                    .map(Handle::from_raw)
+                {
+                    self.realm
+                        .register_typed_view(bytes_h, arr, byte_off, kind, elem_size);
+                }
                 return Ok(NanBox::handle(arr.to_raw()));
             }
             let elems: Vec<NanBox> = match args.first().copied() {
@@ -5341,6 +5352,9 @@ impl<'a> Interp<'a> {
                 NanBox::number(f64::from(byte)),
             );
         }
+        // Push the change into any sibling views over the same buffer.
+        self.realm
+            .propagate_buffer_write(byteh, byte_off + i * elem_size, elem_size, handle);
     }
 
     /// Re-encodes a typed array's whole element store into its backing buffer — used after
@@ -6734,6 +6748,8 @@ impl<'a> Interp<'a> {
                     self.realm
                         .set_element(bh, abs + i, NanBox::number(byte as f64));
                 }
+                // Push the DataView write into any typed-array views over the same buffer.
+                self.realm.propagate_buffer_write(bh, abs, size, handle);
                 return Ok(Some(NanBox::undefined()));
             }
             let le = self.realm.truthy(arg(1));
@@ -11657,6 +11673,18 @@ impl<'a> Interp<'a> {
             let buf = self.make_array_buffer_from_bytes(&bytes);
             self.realm
                 .set_hidden_property(handle, TYPED_ARRAY_BUF, NanBox::handle(buf.to_raw()));
+            // Register so a later sibling view's / DataView's write into this freshly
+            // materialized buffer propagates back into this array's store.
+            if let Some(bytes_h) = self
+                .realm
+                .get_property(buf, ARRAY_BUFFER_BYTES)
+                .and_then(|b| b.as_handle())
+                .map(Handle::from_raw)
+            {
+                let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+                self.realm
+                    .register_typed_view(bytes_h, handle, 0, u16::from(kind), elem_size);
+            }
             return Ok(NanBox::handle(buf.to_raw()));
         }
         // Typed-array introspection (`byteLength`, `BYTES_PER_ELEMENT`).
@@ -13216,7 +13244,7 @@ fn encode_typed_element(kind: u8, v: f64) -> alloc::vec::Vec<u8> {
 
 /// Little-endian decode of one typed-array element of `kind` (index into
 /// [`TYPED_ARRAY_KINDS`]) from `bytes` (short/empty slices read as zero).
-fn decode_typed_element(kind: u8, bytes: &[u8]) -> f64 {
+pub(crate) fn decode_typed_element(kind: u8, bytes: &[u8]) -> f64 {
     let b = |i: usize| bytes.get(i).copied().unwrap_or(0);
     match kind {
         0 => f64::from(b(0) as i8),                                   // Int8

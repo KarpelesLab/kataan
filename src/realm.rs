@@ -28,6 +28,7 @@ use crate::cell::Cell;
 use crate::gc::{self, Stats};
 use crate::heap::{Handle, Heap};
 use crate::nanbox::NanBox;
+use crate::nbexec::decode_typed_element;
 use crate::object::Object;
 use crate::rope::Rope;
 use crate::shape::Shape;
@@ -74,6 +75,12 @@ pub struct Realm {
     /// Handles of non-extensible arrays (`Object.preventExtensions`/`seal`/`freeze`)
     /// — element writes past the end are rejected. Same caveat.
     non_extensible_arrays: alloc::collections::BTreeSet<u64>,
+    /// Typed-array views grouped by their backing `ArrayBuffer`'s bytes handle, so a write
+    /// to the buffer (through any view or a `DataView`) can push the change into every
+    /// sibling view's element store — making the BUFFER→VIEW read direction live without
+    /// touching the (hot) read path. Each entry is `(view, byte_offset, kind, elem_size)`.
+    /// Same handle-keyed, non-GC-root caveat as `aux_props`.
+    typed_views: alloc::collections::BTreeMap<u64, alloc::vec::Vec<(u64, usize, u16, usize)>>,
     /// The default prototype (`Object.prototype`) installed on objects created by
     /// [`new_object`](Realm::new_object) once the global environment is set up. A
     /// `None`-proto object (`Object.create(null)`) opts out explicitly.
@@ -103,7 +110,75 @@ impl Realm {
             frozen_arrays: alloc::collections::BTreeSet::new(),
             sealed_arrays: alloc::collections::BTreeSet::new(),
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
+            typed_views: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
+        }
+    }
+
+    /// Registers a typed-array view over the buffer whose bytes live at `bytes_handle`, so
+    /// later writes to that buffer propagate into this view's element store.
+    pub fn register_typed_view(
+        &mut self,
+        bytes_handle: Handle,
+        view: Handle,
+        byte_offset: usize,
+        kind: u16,
+        elem_size: usize,
+    ) {
+        let entry = self.typed_views.entry(bytes_handle.to_raw()).or_default();
+        let v = view.to_raw();
+        if !entry.iter().any(|e| e.0 == v) {
+            entry.push((v, byte_offset, kind, elem_size));
+        }
+    }
+
+    /// After bytes `[byte_start, byte_start + byte_len)` of the buffer at `bytes_handle` were
+    /// written (by `writer`, a view or DataView), re-decodes the affected elements of every
+    /// *other* registered view over that buffer from the new bytes. This is the read-side of
+    /// shared buffer backing; it keeps the hot read path (`get_element`) untouched.
+    pub fn propagate_buffer_write(
+        &mut self,
+        bytes_handle: Handle,
+        byte_start: usize,
+        byte_len: usize,
+        writer: Handle,
+    ) {
+        let Some(views) = self.typed_views.get(&bytes_handle.to_raw()).cloned() else {
+            return;
+        };
+        if views.len() < 2 && views.iter().all(|e| e.0 == writer.to_raw()) {
+            return; // only the writer (or nobody) backs this buffer — nothing to push to
+        }
+        let bytes: alloc::vec::Vec<u8> = self
+            .heap
+            .get(bytes_handle)
+            .and_then(Cell::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|n| n.as_number().unwrap_or(0.0) as u8)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let byte_end = byte_start + byte_len;
+        for (vraw, off, kind, size) in views {
+            if vraw == writer.to_raw() {
+                continue;
+            }
+            if byte_end <= off {
+                continue; // the write is entirely before this view
+            }
+            let vlen = self.array_length(Handle::from_raw(vraw)).unwrap_or(0);
+            let i_lo = byte_start.saturating_sub(off) / size;
+            let i_hi = (byte_end - 1 - off) / size;
+            let mut raw = [0u8; 8];
+            for i in i_lo..=i_hi.min(vlen.saturating_sub(1)) {
+                let start = off + i * size;
+                for (j, b) in raw.iter_mut().take(size).enumerate() {
+                    *b = bytes.get(start + j).copied().unwrap_or(0);
+                }
+                let val = decode_typed_element(kind as u8, &raw[..size]);
+                self.set_element(Handle::from_raw(vraw), i, NanBox::number(val));
+            }
         }
     }
 
