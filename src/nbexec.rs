@@ -8579,6 +8579,16 @@ impl<'a> Interp<'a> {
                 .map(Handle::from_raw)
                 .and_then(|h| self.realm.get_property(h, f))
                 .unwrap_or(NanBox::undefined());
+            // A required function import that is absent or not callable is a LinkError.
+            if !func
+                .as_handle()
+                .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
+            {
+                let msg = self.new_str(&alloc::format!("import {m}.{f} is not a function"));
+                return Err(ExecError::Throw(
+                    self.make_error(N_WASM_LINK_ERROR, Some(msg)),
+                ));
+            }
             import_fns.push(func);
         }
         // The result type of each import (to marshal the JS return back to a Val).
@@ -8840,6 +8850,33 @@ impl<'a> Interp<'a> {
             .ok_or_else(|| self.wasm_compile_error("invalid module source"))?;
         let module = crate::wasm_rt::Module::decode(&bytes)
             .map_err(|_| self.wasm_compile_error("invalid module"))?;
+        // Validate function imports eagerly: a required import that is absent or not
+        // callable makes `new WebAssembly.Instance` fail with a LinkError (rather than the
+        // failure surfacing only when an export is first called).
+        let import_names: Vec<(String, String)> = module
+            .import_names()
+            .iter()
+            .map(|(m, f)| ((*m).into(), (*f).into()))
+            .collect();
+        for (m, f) in &import_names {
+            let func = imports_obj
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.get_property(h, m))
+                .and_then(|ns| ns.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.get_property(h, f))
+                .unwrap_or(NanBox::undefined());
+            if !func
+                .as_handle()
+                .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
+            {
+                let msg = self.new_str(&alloc::format!("import {m}.{f} is not a function"));
+                return Err(ExecError::Throw(
+                    self.make_error(N_WASM_LINK_ERROR, Some(msg)),
+                ));
+            }
+        }
         let names: Vec<String> = module.export_names().iter().map(|s| (*s).into()).collect();
         // A fresh instance id ties every export wrapper to one persistent state
         // entry, so the instance's memory/globals survive across export calls.
