@@ -50,3 +50,27 @@ assert.sameValue(ra.join(","), "1,99,3", "ordinary array");
 var lone = new Int16Array(3);
 lone[0] = 1000;
 assert.sameValue(lone.join(","), "1000,0,0", "standalone typed array");
+
+// subarray returns a VIEW sharing the parent's buffer (not a copy).
+var pbuf = new ArrayBuffer(8);
+var base = new Uint8Array(pbuf);
+base[1] = 10; base[2] = 20; base[3] = 30;
+var sub = base.subarray(1, 4);
+assert.sameValue(sub.join(","), "10,20,30", "subarray initial elements");
+assert.sameValue(sub.length, 3, "subarray length");
+assert.sameValue(sub.buffer, base.buffer, "subarray shares the parent's buffer");
+base[1] = 99;
+assert.sameValue(sub[0], 99, "parent write -> subarray (offset-aligned)");
+sub[2] = 77;
+assert.sameValue(base[3], 77, "subarray write -> parent");
+// subarray of a standalone typed array materializes and shares a buffer.
+var lone = new Uint8Array(4);
+lone[0] = 1; lone[1] = 2;
+var s2 = lone.subarray(1, 3);
+lone[1] = 88;
+assert.sameValue(s2[0], 88, "standalone parent write -> subarray");
+s2[1] = 66;
+assert.sameValue(lone[2], 66, "subarray write -> standalone parent");
+// A DataView write is seen by a subarray at the right offset.
+new DataView(pbuf).setUint8(1, 123);
+assert.sameValue(sub[0], 123, "DataView write -> subarray");

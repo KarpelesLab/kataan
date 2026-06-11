@@ -5379,6 +5379,48 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The backing `ArrayBuffer` of a typed array — the recorded one, or a fresh snapshot
+    /// materialized from the current elements (and the view registered against it) on first
+    /// access. Shared by the `.buffer` accessor and `subarray` (which views the same buffer).
+    fn typed_array_buffer_handle(&mut self, handle: Handle) -> Handle {
+        if let Some(buf) = self
+            .realm
+            .get_property(handle, TYPED_ARRAY_BUF)
+            .and_then(|b| b.as_handle())
+            .map(Handle::from_raw)
+        {
+            return buf;
+        }
+        let kind = self
+            .realm
+            .get_property(handle, TYPED_ARRAY_KIND)
+            .and_then(|k| k.as_number())
+            .unwrap_or(0.0) as u8;
+        let elems = self
+            .realm
+            .array_elements(handle)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        let mut bytes = alloc::vec::Vec::new();
+        for e in &elems {
+            bytes.extend_from_slice(&encode_typed_element(kind, self.realm.to_number(*e)));
+        }
+        let buf = self.make_array_buffer_from_bytes(&bytes);
+        self.realm
+            .set_hidden_property(handle, TYPED_ARRAY_BUF, NanBox::handle(buf.to_raw()));
+        if let Some(bytes_h) = self
+            .realm
+            .get_property(buf, ARRAY_BUFFER_BYTES)
+            .and_then(|b| b.as_handle())
+            .map(Handle::from_raw)
+        {
+            let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+            self.realm
+                .register_typed_view(bytes_h, handle, 0, u16::from(kind), elem_size);
+        }
+        buf
+    }
+
     /// Builds a primitive wrapper object (`new Number`/`String`/`Boolean`,
     /// `Object(primitive)`): an object boxing `prim` behind a `\0prim` slot, with
     /// `\0wraptype` recording the constructor id (for `instanceof`).
@@ -8186,14 +8228,45 @@ impl<'a> Interp<'a> {
                             .unwrap_or(0)
                     };
                     let start = norm(arg(0), 0, self);
-                    let end = norm(arg(1), len, self);
-                    let sub: Vec<NanBox> = elems.get(start..end.max(start)).unwrap_or(&[]).to_vec();
+                    let end = norm(arg(1), len, self).max(start);
+                    let sub: Vec<NanBox> = elems.get(start..end).unwrap_or(&[]).to_vec();
                     let kind = self
                         .realm
                         .get_property(handle, TYPED_ARRAY_KIND)
-                        .unwrap_or(NanBox::number(0.0));
+                        .and_then(|k| k.as_number())
+                        .unwrap_or(0.0) as u16;
+                    let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+                    // `subarray` returns a *view* sharing the parent's buffer (materializing
+                    // one if the parent had none), at the parent's offset plus `start`.
+                    let parent_buf = self.typed_array_buffer_handle(handle);
+                    let parent_off = self
+                        .realm
+                        .get_property(handle, DATA_VIEW_OFF)
+                        .and_then(|o| o.as_number())
+                        .unwrap_or(0.0) as usize;
+                    let sub_off = parent_off + start * elem_size;
                     let arr = self.realm.new_array(sub);
-                    self.realm.set_property(arr, TYPED_ARRAY_KIND, kind);
+                    self.realm
+                        .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
+                    self.realm.set_hidden_property(
+                        arr,
+                        DATA_VIEW_OFF,
+                        NanBox::number(sub_off as f64),
+                    );
+                    self.realm.set_hidden_property(
+                        arr,
+                        TYPED_ARRAY_BUF,
+                        NanBox::handle(parent_buf.to_raw()),
+                    );
+                    if let Some(bytes_h) = self
+                        .realm
+                        .get_property(parent_buf, ARRAY_BUFFER_BYTES)
+                        .and_then(|b| b.as_handle())
+                        .map(Handle::from_raw)
+                    {
+                        self.realm
+                            .register_typed_view(bytes_h, arr, sub_off, kind, elem_size);
+                    }
                     return Ok(Some(NanBox::handle(arr.to_raw())));
                 }
                 "fill" => {
@@ -11654,37 +11727,8 @@ impl<'a> Interp<'a> {
         }
         // A typed array's `.buffer` — the recorded backing buffer, or one materialized
         // (a snapshot) from the current elements on first access.
-        if name == "buffer"
-            && let Some(k) = self.realm.get_property(handle, TYPED_ARRAY_KIND)
-        {
-            if let Some(buf) = self.realm.get_property(handle, TYPED_ARRAY_BUF) {
-                return Ok(buf);
-            }
-            let kind = k.as_number().unwrap_or(0.0) as u8;
-            let elems = self
-                .realm
-                .array_elements(handle)
-                .map(<[_]>::to_vec)
-                .unwrap_or_default();
-            let mut bytes = alloc::vec::Vec::new();
-            for e in &elems {
-                bytes.extend_from_slice(&encode_typed_element(kind, self.realm.to_number(*e)));
-            }
-            let buf = self.make_array_buffer_from_bytes(&bytes);
-            self.realm
-                .set_hidden_property(handle, TYPED_ARRAY_BUF, NanBox::handle(buf.to_raw()));
-            // Register so a later sibling view's / DataView's write into this freshly
-            // materialized buffer propagates back into this array's store.
-            if let Some(bytes_h) = self
-                .realm
-                .get_property(buf, ARRAY_BUFFER_BYTES)
-                .and_then(|b| b.as_handle())
-                .map(Handle::from_raw)
-            {
-                let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
-                self.realm
-                    .register_typed_view(bytes_h, handle, 0, u16::from(kind), elem_size);
-            }
+        if name == "buffer" && self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some() {
+            let buf = self.typed_array_buffer_handle(handle);
             return Ok(NanBox::handle(buf.to_raw()));
         }
         // Typed-array introspection (`byteLength`, `BYTES_PER_ELEMENT`).
