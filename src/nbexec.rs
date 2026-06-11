@@ -305,6 +305,10 @@ const N_INTL_PLURAL_SELECT: u16 = 210;
 const N_INTL_LIST_FORMAT: u16 = 221;
 /// `Intl.ListFormat.prototype.format`.
 const N_INTL_LIST_FORMAT_FORMAT: u16 = 222;
+/// `Intl.RelativeTimeFormat` constructor.
+const N_INTL_REL_TIME: u16 = 223;
+/// `Intl.RelativeTimeFormat.prototype.format`.
+const N_INTL_REL_TIME_FORMAT: u16 = 224;
 /// The typed-array constructors occupy `[BASE, BASE + KINDS.len())`; the id minus
 /// the base indexes [`TYPED_ARRAY_KINDS`].
 const N_TYPED_ARRAY_BASE: u16 = 168;
@@ -1018,6 +1022,7 @@ impl<'a> Interp<'a> {
             ("Collator", N_INTL_COLLATOR),
             ("PluralRules", N_INTL_PLURAL_RULES),
             ("ListFormat", N_INTL_LIST_FORMAT),
+            ("RelativeTimeFormat", N_INTL_REL_TIME),
         ] {
             let f = self.new_named_native(name, id);
             // `Intl.X.supportedLocalesOf(locales)` — static on every constructor.
@@ -2338,6 +2343,21 @@ impl<'a> Interp<'a> {
                     }
                 };
                 self.new_str(&out)
+            }
+            // `Intl.RelativeTimeFormat(...)` without `new`.
+            N_INTL_REL_TIME => self.make_relative_time_format(args),
+            // `Intl.RelativeTimeFormat.prototype.format(value, unit)`.
+            N_INTL_REL_TIME_FORMAT => {
+                let fmt = self.this_val.as_handle().map(Handle::from_raw);
+                let numeric = fmt
+                    .and_then(|h| self.realm.get_property(h, "numeric"))
+                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_else(|| String::from("always"));
+                let value = self.realm.to_number(arg(0));
+                let unit = self.realm.to_display_string(arg(1));
+                let s = relative_time_string(value, &unit, &numeric);
+                self.new_str(&s)
             }
             // `Intl.Collator.prototype.compare(a, b)` — code-point order (no locale
             // tailoring), so a negative/zero/positive result orders `a` vs `b`.
@@ -4680,6 +4700,10 @@ impl<'a> Interp<'a> {
                 .set_property(obj, "format", NanBox::handle(f.to_raw()));
             return Ok(NanBox::handle(obj.to_raw()));
         }
+        // `new Intl.RelativeTimeFormat(locale, { numeric, style })` → an object with `format`.
+        if id == N_INTL_REL_TIME {
+            return Ok(self.make_relative_time_format(args));
+        }
         // `new Promise(executor)`: run executor(resolve, reject).
         if id == N_PROMISE {
             let promise = self.realm.new_promise();
@@ -5383,6 +5407,27 @@ impl<'a> Interp<'a> {
             let n = self.realm.to_number(value);
             self.intl_format_number(handle, n)
         }
+    }
+
+    /// Builds an `Intl.RelativeTimeFormat` instance: an object capturing `numeric`/`style`
+    /// with a readable `format(value, unit)` method.
+    fn make_relative_time_format(&mut self, args: &[NanBox]) -> NanBox {
+        let obj = self.realm.new_object();
+        if let Some(opts) = args
+            .get(1)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            for key in ["numeric", "style"] {
+                if let Some(v) = self.realm.get_property(opts, key) {
+                    self.realm.set_hidden_property(obj, key, v);
+                }
+            }
+        }
+        let f = self.new_named_native("format", N_INTL_REL_TIME_FORMAT);
+        self.realm
+            .set_property(obj, "format", NanBox::handle(f.to_raw()));
+        NanBox::handle(obj.to_raw())
     }
 
     /// Breaks a UTC millisecond timestamp into typed `(type, value)` parts per an
@@ -13955,6 +14000,40 @@ fn coerce_typed(kind: u16, n: f64) -> f64 {
             }
             u as f64
         }
+    }
+}
+
+/// Renders `Intl.RelativeTimeFormat.prototype.format(value, unit)` in en-US. `numeric:
+/// "auto"` yields idiomatic phrases for the adjacent units ("yesterday", "next week",
+/// "now"); otherwise (and as a fallback) it is the explicit "in N units" / "N units ago".
+fn relative_time_string(value: f64, unit: &str, numeric: &str) -> alloc::string::String {
+    let u = unit.strip_suffix('s').unwrap_or(unit); // singular stem
+    // Integer test without std-only float methods (for the `alloc` build).
+    if numeric == "auto" && value == (value as i64) as f64 {
+        let v = value as i64;
+        match (u, v) {
+            ("day", -1) => return String::from("yesterday"),
+            ("day", 0) => return String::from("today"),
+            ("day", 1) => return String::from("tomorrow"),
+            ("second", 0) => return String::from("now"),
+            ("week" | "month" | "quarter" | "year", -1) => return alloc::format!("last {u}"),
+            ("week" | "month" | "quarter" | "year", 1) => return alloc::format!("next {u}"),
+            ("minute" | "hour" | "week" | "month" | "quarter" | "year", 0) => {
+                return alloc::format!("this {u}");
+            }
+            _ => {}
+        }
+    }
+    let n = value.abs();
+    let unit_disp = if n == 1.0 {
+        String::from(u)
+    } else {
+        alloc::format!("{u}s")
+    };
+    if value < 0.0 {
+        alloc::format!("{n} {unit_disp} ago")
+    } else {
+        alloc::format!("in {n} {unit_disp}")
     }
 }
 
