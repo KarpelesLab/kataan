@@ -5362,6 +5362,36 @@ impl<'a> Interp<'a> {
             let m = if mag == 0.0 { 0.0 } else { mag / p };
             let sign = if neg { "-" } else { "" };
             (alloc::format!("{sign}{}E{exp}", fmt_digits(m)), false)
+        } else if notation == "compact" {
+            // `notation: "compact"` (short): divide by the largest 10^(3k) scale and append
+            // its suffix (K/M/B/T), showing one fraction digit only for a single-digit
+            // mantissa (`1.2M`, but `123K` and `12K`).
+            let neg = value < 0.0;
+            let mag = value.abs();
+            let (div, suffix) = if mag >= 1e12 {
+                (1e12, "T")
+            } else if mag >= 1e9 {
+                (1e9, "B")
+            } else if mag >= 1e6 {
+                (1e6, "M")
+            } else if mag >= 1e3 {
+                (1e3, "K")
+            } else {
+                (1.0, "")
+            };
+            let m = mag / div;
+            let cmax = if m < 10.0 { 1 } else { 0 };
+            let mut ms = alloc::format!("{m:.*}", cmax as usize);
+            if ms.contains('.') {
+                while ms.ends_with('0') {
+                    ms.pop();
+                }
+                if ms.ends_with('.') {
+                    ms.pop();
+                }
+            }
+            let sign = if neg { "-" } else { "" };
+            (alloc::format!("{sign}{ms}{suffix}"), suffix.is_empty())
         } else {
             (fmt_digits(value), use_grouping)
         };
