@@ -313,6 +313,10 @@ const N_INTL_REL_TIME_FORMAT: u16 = 224;
 const N_INTL_DISPLAY_NAMES: u16 = 225;
 /// `Intl.DisplayNames.prototype.of`.
 const N_INTL_DISPLAY_NAMES_OF: u16 = 226;
+/// `Intl.Segmenter` constructor.
+const N_INTL_SEGMENTER: u16 = 227;
+/// `Intl.Segmenter.prototype.segment`.
+const N_INTL_SEGMENTER_SEGMENT: u16 = 228;
 /// The typed-array constructors occupy `[BASE, BASE + KINDS.len())`; the id minus
 /// the base indexes [`TYPED_ARRAY_KINDS`].
 const N_TYPED_ARRAY_BASE: u16 = 168;
@@ -1028,6 +1032,7 @@ impl<'a> Interp<'a> {
             ("ListFormat", N_INTL_LIST_FORMAT),
             ("RelativeTimeFormat", N_INTL_REL_TIME),
             ("DisplayNames", N_INTL_DISPLAY_NAMES),
+            ("Segmenter", N_INTL_SEGMENTER),
         ] {
             let f = self.new_named_native(name, id);
             // `Intl.X.supportedLocalesOf(locales)` — static on every constructor.
@@ -2377,6 +2382,35 @@ impl<'a> Interp<'a> {
                 let code = self.realm.to_display_string(arg(0));
                 let s = display_name(&ty, &code);
                 self.new_str(&s)
+            }
+            // `Intl.Segmenter(...)` without `new`.
+            N_INTL_SEGMENTER => self.make_segmenter(args),
+            // `Intl.Segmenter.prototype.segment(input)` → an (iterable) array of segment
+            // data objects `{ segment, index, input, isWordLike? }`.
+            N_INTL_SEGMENTER_SEGMENT => {
+                let fmt = self.this_val.as_handle().map(Handle::from_raw);
+                let gran = fmt
+                    .and_then(|h| self.realm.get_property(h, "granularity"))
+                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_else(|| String::from("grapheme"));
+                let input = self.realm.to_display_string(arg(0));
+                let segs = segment_text(&input, &gran);
+                let mut elems = Vec::with_capacity(segs.len());
+                for (index, seg, is_word_like) in segs {
+                    let o = self.realm.new_object();
+                    let sv = self.new_str(&seg);
+                    self.realm.set_property(o, "segment", sv);
+                    self.realm
+                        .set_property(o, "index", NanBox::number(index as f64));
+                    let iv = self.new_str(&input);
+                    self.realm.set_property(o, "input", iv);
+                    if let Some(w) = is_word_like {
+                        self.realm.set_property(o, "isWordLike", NanBox::boolean(w));
+                    }
+                    elems.push(NanBox::handle(o.to_raw()));
+                }
+                NanBox::handle(self.realm.new_array(elems).to_raw())
             }
             // `Intl.Collator.prototype.compare(a, b)` — code-point order (no locale
             // tailoring), so a negative/zero/positive result orders `a` vs `b`.
@@ -4727,6 +4761,10 @@ impl<'a> Interp<'a> {
         if id == N_INTL_DISPLAY_NAMES {
             return Ok(self.make_display_names(args));
         }
+        // `new Intl.Segmenter(locale, { granularity })` → an object with a `segment(s)` method.
+        if id == N_INTL_SEGMENTER {
+            return Ok(self.make_segmenter(args));
+        }
         // `new Promise(executor)`: run executor(resolve, reject).
         if id == N_PROMISE {
             let promise = self.realm.new_promise();
@@ -5471,6 +5509,24 @@ impl<'a> Interp<'a> {
         let f = self.new_named_native("of", N_INTL_DISPLAY_NAMES_OF);
         self.realm
             .set_property(obj, "of", NanBox::handle(f.to_raw()));
+        NanBox::handle(obj.to_raw())
+    }
+
+    /// Builds an `Intl.Segmenter` instance: an object capturing `granularity` with a readable
+    /// `segment(input)` method.
+    fn make_segmenter(&mut self, args: &[NanBox]) -> NanBox {
+        let obj = self.realm.new_object();
+        if let Some(opts) = args
+            .get(1)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            && let Some(v) = self.realm.get_property(opts, "granularity")
+        {
+            self.realm.set_hidden_property(obj, "granularity", v);
+        }
+        let f = self.new_named_native("segment", N_INTL_SEGMENTER_SEGMENT);
+        self.realm
+            .set_property(obj, "segment", NanBox::handle(f.to_raw()));
         NanBox::handle(obj.to_raw())
     }
 
@@ -14079,6 +14135,57 @@ fn relative_time_string(value: f64, unit: &str, numeric: &str) -> alloc::string:
     } else {
         alloc::format!("in {n} {unit_disp}")
     }
+}
+
+/// Segments `input` per an `Intl.Segmenter` granularity, returning `(index, segment,
+/// isWordLike)` triples (`index` is a code-point offset). `grapheme` is per code point;
+/// `word` alternates alphanumeric "word-like" runs with separators; `sentence` splits after
+/// terminating punctuation followed by a space.
+fn segment_text(
+    input: &str,
+    granularity: &str,
+) -> Vec<(usize, alloc::string::String, Option<bool>)> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out: Vec<(usize, alloc::string::String, Option<bool>)> = Vec::new();
+    match granularity {
+        "word" => {
+            let mut i = 0;
+            while i < chars.len() {
+                let word = chars[i].is_alphanumeric();
+                let start = i;
+                while i < chars.len() && chars[i].is_alphanumeric() == word {
+                    i += 1;
+                }
+                out.push((start, chars[start..i].iter().collect(), Some(word)));
+            }
+        }
+        "sentence" => {
+            let mut start = 0;
+            let mut i = 0;
+            while i < chars.len() {
+                let c = chars[i];
+                i += 1;
+                // End a sentence after `.`/`!`/`?` followed by whitespace (or end).
+                if matches!(c, '.' | '!' | '?') {
+                    while i < chars.len() && chars[i].is_whitespace() {
+                        i += 1;
+                    }
+                    out.push((start, chars[start..i].iter().collect(), None));
+                    start = i;
+                }
+            }
+            if start < chars.len() {
+                out.push((start, chars[start..].iter().collect(), None));
+            }
+        }
+        // "grapheme" (default): one code point per segment.
+        _ => {
+            for (i, c) in chars.iter().enumerate() {
+                out.push((i, alloc::string::String::from(*c), None));
+            }
+        }
+    }
+    out
 }
 
 /// `Intl.DisplayNames.prototype.of(code)` for the `language`/`region`/`currency`/`script`
