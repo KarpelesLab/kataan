@@ -8048,14 +8048,29 @@ impl<'a> Interp<'a> {
         if args.len() != params.len() {
             return Err(self.wasm_compile_error("argument count mismatch"));
         }
-        let val_args: Vec<crate::wasm_rt::Val> = params
-            .iter()
-            .zip(args)
-            .map(|(t, v)| {
-                crate::wasm_rt::Val::from_nanbox(*v, *t)
-                    .ok_or_else(|| self.wasm_compile_error("argument not coercible to wasm value"))
-            })
-            .collect::<Result<_, _>>()?;
+        let mut val_args: Vec<crate::wasm_rt::Val> = Vec::with_capacity(params.len());
+        for (t, v) in params.iter().zip(args) {
+            // An `i64` parameter takes a BigInt (its low 64 bits); other types take a
+            // Number/Bool via `from_nanbox`.
+            let val = if *t == crate::wasm_rt::ValType::I64 {
+                match v
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.bigint_at(h))
+                    .and_then(|b| b.to_i128())
+                {
+                    Some(n) => crate::wasm_rt::Val::I64(n as i64),
+                    None => {
+                        return Err(self.wasm_compile_error("argument not coercible to wasm value"));
+                    }
+                }
+            } else {
+                crate::wasm_rt::Val::from_nanbox(*v, *t).ok_or_else(|| {
+                    self.wasm_compile_error("argument not coercible to wasm value")
+                })?
+            };
+            val_args.push(val);
+        }
 
         // Resolve imported globals: importObject[mod][field] is a
         // `WebAssembly.Global` (its `.value`) or a plain Number/BigInt, coerced to
@@ -8143,9 +8158,15 @@ impl<'a> Interp<'a> {
         if let Some(id) = inst_id {
             self.wasm_states.insert(id, inst.export_state());
         }
-        Ok(results
-            .first()
-            .map_or(NanBox::undefined(), |v| v.to_nanbox()))
+        // An `i64` result becomes a BigInt (other types map directly to a Number).
+        Ok(match results.first() {
+            Some(crate::wasm_rt::Val::I64(n)) => {
+                let big = crate::bignum::BigInt::from_i128(i128::from(*n));
+                NanBox::handle(self.realm.new_bigint(big).to_raw())
+            }
+            Some(v) => v.to_nanbox(),
+            None => NanBox::undefined(),
+        })
     }
 
     /// A thrown `WebAssembly`-style `TypeError` for compile/instantiate failures.
