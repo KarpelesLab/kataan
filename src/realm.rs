@@ -615,14 +615,38 @@ impl Realm {
     /// All own string property names (including non-enumerable ones such as
     /// methods, but not private `#` fields) — for `Object.getOwnPropertyNames`.
     pub fn own_property_names(&self, handle: Handle) -> Option<Vec<alloc::string::String>> {
-        let obj = self.heap.get(handle)?.as_object()?;
-        Some(
-            obj.keys()
-                .iter()
-                .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
-                .map(|s| alloc::string::String::from(*s))
-                .collect(),
-        )
+        if let Some(obj) = self.heap.get(handle)?.as_object() {
+            return Some(
+                obj.keys()
+                    .iter()
+                    .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                    .map(|s| alloc::string::String::from(*s))
+                    .collect(),
+            );
+        }
+        // An array's own keys: its indices (ascending), then `length`, then any
+        // aux-stored named properties — matching `[[OwnPropertyKeys]]` for an Array.
+        if let Some(a) = self.heap.get(handle).and_then(Cell::as_array) {
+            let mut names: Vec<alloc::string::String> =
+                (0..a.len()).map(|i| alloc::format!("{i}")).collect();
+            names.push(alloc::string::String::from("length"));
+            if let Some(aux) = self
+                .aux_props
+                .get(&handle.to_raw())
+                .and_then(|h| self.heap.get(*h))
+                .and_then(Cell::as_object)
+            {
+                for k in aux
+                    .keys()
+                    .iter()
+                    .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                {
+                    names.push(alloc::string::String::from(*k));
+                }
+            }
+            return Some(names);
+        }
+        None
     }
 
     /// The `[[Prototype]]` handle of the object at `handle`, if any.
