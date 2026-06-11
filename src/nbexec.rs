@@ -9840,11 +9840,28 @@ impl<'a> Interp<'a> {
                         // `delete` returns `false` when the property is
                         // non-configurable (sealed/frozen); `true` otherwise.
                         let mut result = true;
+                        // `delete a?.b` unwraps the optional-chain target; a nullish base
+                        // short-circuits the whole `delete` to a no-op returning `true`.
+                        let argument: &Expr = match &**argument {
+                            Expr::OptChain { expr, .. } => expr,
+                            other => other,
+                        };
                         if let Expr::Member {
                             object, property, ..
-                        } = &**argument
+                        } = argument
                         {
-                            let obj = self.eval(object)?;
+                            // A nullish link in the base (`delete a?.b.c` with nullish `a`)
+                            // short-circuits the whole `delete` to a no-op returning `true`.
+                            let obj = match self.eval(object) {
+                                Ok(v) => v,
+                                Err(ExecError::OptShortCircuit) => {
+                                    return Ok(NanBox::boolean(true));
+                                }
+                                Err(e) => return Err(e),
+                            };
+                            if matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                                return Ok(NanBox::boolean(true));
+                            }
                             if let Some(raw) = obj.as_handle() {
                                 let h = Handle::from_raw(raw);
                                 let name = match property {
@@ -9891,7 +9908,7 @@ impl<'a> Interp<'a> {
                                     }
                                 }
                             }
-                        } else if let Expr::Ident(id) = &**argument
+                        } else if let Expr::Ident(id) = argument
                             && self.current.get(&id.name).is_some()
                         {
                             // Deleting a resolvable binding (a declared variable) is a
