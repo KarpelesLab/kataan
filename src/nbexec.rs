@@ -10601,6 +10601,7 @@ impl<'a> Interp<'a> {
                         // `delete` returns `false` when the property is
                         // non-configurable (sealed/frozen); `true` otherwise.
                         let mut result = true;
+                        let mut is_property_delete = false;
                         // `delete a?.b` unwraps the optional-chain target; a nullish base
                         // short-circuits the whole `delete` to a no-op returning `true`.
                         let argument: &Expr = match &**argument {
@@ -10611,6 +10612,7 @@ impl<'a> Interp<'a> {
                             object, property, ..
                         } = argument
                         {
+                            is_property_delete = true;
                             // A nullish link in the base (`delete a?.b.c` with nullish `a`)
                             // short-circuits the whole `delete` to a no-op returning `true`.
                             let obj = match self.eval(object) {
@@ -10675,6 +10677,13 @@ impl<'a> Interp<'a> {
                             // Deleting a resolvable binding (a declared variable) is a
                             // no-op that returns `false`; an unresolvable name is `true`.
                             result = false;
+                        }
+                        // A failed delete of a non-configurable property throws in strict
+                        // mode (rather than silently returning `false`).
+                        if self.strict && is_property_delete && !result {
+                            let m =
+                                self.new_str("Cannot delete property of a non-configurable object");
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                         }
                         return Ok(NanBox::boolean(result));
                     }
