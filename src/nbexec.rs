@@ -1749,22 +1749,46 @@ impl<'a> Interp<'a> {
                 let target = arg(0);
                 if let Some(t) = target.as_handle().map(Handle::from_raw) {
                     for src in &args[1.min(args.len())..] {
+                        // A primitive string source contributes its character indices.
+                        if let Some(s) = src
+                            .as_handle()
+                            .and_then(|r| self.realm.string_value(Handle::from_raw(r)))
+                            && !self
+                                .realm
+                                .is_array(Handle::from_raw(src.as_handle().unwrap()))
+                        {
+                            for (i, ch) in s.chars().enumerate() {
+                                let cv = self.new_str(&alloc::format!("{ch}"));
+                                let kb = self.new_str(&alloc::format!("{i}"));
+                                self.assign_member_value(t, kb, cv)?;
+                            }
+                            continue;
+                        }
                         if let Some(sh) = src.as_handle().map(Handle::from_raw) {
                             // An array source contributes its indexed elements.
                             if let Some(elems) = self.realm.array_elements(sh).map(<[_]>::to_vec) {
                                 for (i, e) in elems.iter().enumerate() {
-                                    self.realm.set_property(t, &alloc::format!("{i}"), *e);
+                                    let kb = self.new_str(&alloc::format!("{i}"));
+                                    self.assign_member_value(t, kb, *e)?;
                                 }
                                 continue;
                             }
-                            // Own enumerable string *and* symbol keys (plus
-                            // accessor getters), read via `read_member` so getters
-                            // are invoked; the raw key string preserves symbol
-                            // identity.
+                            // Own enumerable string *and* symbol keys; values read via
+                            // `read_member` (so getters fire) and written via
+                            // `assign_member_value` ([[Set]], so the target's setters
+                            // run and a frozen/read-only property is honored).
                             let keys = self.realm.object_keys_with_symbols(sh);
                             for k in keys {
                                 let v = self.read_member(sh, &k)?;
-                                self.realm.set_property(t, &k, v);
+                                let kb = if let Some(idstr) = k.strip_prefix("\u{0}sym:")
+                                    && let Ok(id) = idstr.parse::<u64>()
+                                    && let Some(sym) = self.realm.symbol_for_id(id)
+                                {
+                                    NanBox::handle(sym.to_raw())
+                                } else {
+                                    self.new_str(&k)
+                                };
+                                self.assign_member_value(t, kb, v)?;
                             }
                         }
                     }
@@ -5318,7 +5342,9 @@ impl<'a> Interp<'a> {
         // --- universal `Object.prototype` methods (own/inherited reflection) ---
         match method {
             "hasOwnProperty" => {
-                let key = self.realm.to_display_string(arg(0));
+                // `member_key` maps a symbol to its internal slot name (a string key
+                // passes through), so a symbol-keyed property is found.
+                let key = self.member_key(arg(0));
                 return Ok(Some(NanBox::boolean(self.realm.has_own(handle, &key))));
             }
             "isPrototypeOf" => {
@@ -5333,8 +5359,8 @@ impl<'a> Interp<'a> {
             }
             "propertyIsEnumerable" => {
                 // True only for an *own* *enumerable* property (a non-enumerable one,
-                // or an inherited one, is false).
-                let key = self.realm.to_display_string(arg(0));
+                // or an inherited one, is false). `member_key` resolves symbol keys.
+                let key = self.member_key(arg(0));
                 let r = self.realm.has_own(handle, &key)
                     && self.realm.property_is_enumerable(handle, &key);
                 return Ok(Some(NanBox::boolean(r)));
