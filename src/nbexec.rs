@@ -11898,13 +11898,23 @@ impl<'a> Interp<'a> {
         handle: crate::heap::Handle,
         key: &str,
     ) -> Result<bool, ExecError> {
+        // Adding a *new* property to a non-extensible (sealed/frozen/preventExtensions)
+        // object fails — like writing a read-only property.
+        let add_to_non_extensible =
+            !self.realm.has_own(handle, key) && !self.realm.is_extensible(handle);
         let readonly = self.realm.property_is_readonly(handle, key)
             || (self.realm.is_frozen(handle) && self.realm.get_property(handle, key).is_some());
-        if readonly {
+        if readonly || add_to_non_extensible {
             if self.strict {
-                let m = self.new_str(&alloc::format!(
-                    "Cannot assign to read only property '{key}'"
-                ));
+                let m = if add_to_non_extensible {
+                    self.new_str(&alloc::format!(
+                        "Cannot add property '{key}', object is not extensible"
+                    ))
+                } else {
+                    self.new_str(&alloc::format!(
+                        "Cannot assign to read only property '{key}'"
+                    ))
+                };
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
             return Ok(false); // sloppy mode: the write is silently dropped
