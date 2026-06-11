@@ -556,6 +556,7 @@ const ERROR_NAMES: [&str; 11] = [
 /// registered separately as globals.
 const N_GLOBAL_ERROR_COUNT: usize = 6;
 const N_TYPE_ERROR: u16 = N_ERROR_BASE + 1;
+const N_RANGE_ERROR: u16 = N_ERROR_BASE + 2;
 const N_REFERENCE_ERROR: u16 = N_ERROR_BASE + 4;
 const N_WASM_COMPILE_ERROR: u16 = N_ERROR_BASE + 6;
 const N_WASM_LINK_ERROR: u16 = N_ERROR_BASE + 7;
@@ -6091,7 +6092,22 @@ impl<'a> Interp<'a> {
                 .get_property(handle, DATA_VIEW_OFF)
                 .and_then(|n| n.as_number())
                 .unwrap_or(0.0) as usize;
-            let abs = base + self.realm.to_number(arg(0)).max(0.0) as usize;
+            // Bounds-check the access against the view's byte length (an explicit
+            // `DATA_VIEW_LEN`, else the rest of the buffer). A negative/too-large offset
+            // or an access running past the end is a RangeError — never an out-of-bounds
+            // read (returning 0) or a write that silently grows the buffer.
+            let total = self.realm.array_length(bh).unwrap_or(0);
+            let view_len = self
+                .realm
+                .get_property(handle, DATA_VIEW_LEN)
+                .and_then(|n| n.as_number())
+                .map_or(total.saturating_sub(base), |n| n as usize);
+            let requested = self.realm.to_number(arg(0)) as i64; // ToIndex: truncates; NaN -> 0
+            if requested < 0 || requested as usize + size > view_len {
+                let m = self.new_str("Offset is outside the bounds of the DataView");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            let abs = base + requested as usize;
             if is_set {
                 let le = self.realm.truthy(arg(2));
                 let bits = if is_bigint {
