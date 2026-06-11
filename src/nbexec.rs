@@ -2354,6 +2354,11 @@ impl<'a> Interp<'a> {
                         .set_property(out, "maximumFractionDigits", NanBox::number(max));
                     let ug = getp(self, "useGrouping").unwrap_or(NanBox::boolean(true));
                     self.realm.set_property(out, "useGrouping", ug);
+                    // `signDisplay` ("auto" | "always" | "never" | "exceptZero").
+                    let sd = getp(self, "signDisplay")
+                        .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                        .unwrap_or_else(|| self.new_str("auto"));
+                    self.realm.set_property(out, "signDisplay", sd);
                 } else {
                     let cal = self.new_str("gregory");
                     self.realm.set_property(out, "calendar", cal);
@@ -5151,6 +5156,7 @@ impl<'a> Interp<'a> {
                 "minimumFractionDigits",
                 "maximumFractionDigits",
                 "useGrouping",
+                "signDisplay",
             ] {
                 if let Some(v) = self.realm.get_property(opts, key) {
                     self.realm.set_hidden_property(obj, key, v);
@@ -5343,21 +5349,53 @@ impl<'a> Interp<'a> {
         } else {
             s
         };
-        match style.as_str() {
-            "percent" => alloc::format!("{grouped}%"),
+        // Separate the sign from the magnitude so `signDisplay` and the style affixes
+        // compose with the sign outermost (e.g. `-$5.00`, `+5%`).
+        let neg = grouped.starts_with('-');
+        let magnitude = grouped.trim_start_matches('-');
+        let styled = match style.as_str() {
+            "percent" => alloc::format!("{magnitude}%"),
             "currency" => {
                 let sym = match currency.as_deref() {
                     Some("USD") => "$",
                     Some("EUR") => "€",
                     Some("GBP") => "£",
                     Some("JPY" | "CNY") => "¥",
-                    Some(other) => return alloc::format!("{other}\u{a0}{grouped}"),
+                    Some(other) => {
+                        let other = String::from(other);
+                        return alloc::format!(
+                            "{}{other}\u{a0}{magnitude}",
+                            if neg { "-" } else { "" }
+                        );
+                    }
                     None => "$",
                 };
-                alloc::format!("{sym}{grouped}")
+                alloc::format!("{sym}{magnitude}")
             }
-            _ => grouped,
-        }
+            _ => String::from(magnitude),
+        };
+        let is_zero = magnitude.bytes().all(|b| matches!(b, b'0' | b'.' | b','));
+        let sign = match opt_str(self, "signDisplay").as_deref() {
+            Some("never") => "",
+            Some("always") => {
+                if neg {
+                    "-"
+                } else {
+                    "+"
+                }
+            }
+            Some("exceptZero") if !is_zero => {
+                if neg {
+                    "-"
+                } else {
+                    "+"
+                }
+            }
+            // "auto" (default) and "exceptZero" on a zero: a sign only for negatives.
+            _ if neg => "-",
+            _ => "",
+        };
+        alloc::format!("{sign}{styled}")
     }
 
     /// Writes `value` to array index `i`, coercing it to the element kind first
