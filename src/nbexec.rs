@@ -1884,9 +1884,14 @@ impl<'a> Interp<'a> {
                     items
                 } else {
                     let f = arg(1);
+                    let this_arg = arg(2); // `Array.from(items, mapFn, thisArg)`
                     let mut out = Vec::with_capacity(items.len());
                     for (i, e) in items.iter().enumerate() {
-                        out.push(self.call(f, &[*e, NanBox::number(i as f64)])?);
+                        out.push(self.call_with_this(
+                            f,
+                            this_arg,
+                            &[*e, NanBox::number(i as f64)],
+                        )?);
                     }
                     out
                 };
