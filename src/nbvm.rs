@@ -5434,7 +5434,12 @@ impl Compiler {
                     len: 0,
                 });
                 for q in &quasi.quasis {
-                    let s = self.constant_str(q.cooked.as_deref().unwrap_or(""));
+                    // An invalid escape yields no cooked value (`undefined`); `.raw`
+                    // still preserves it (ES2018 tagged-template revision).
+                    let s = match q.cooked.as_deref() {
+                        Some(c) => self.constant_str(c),
+                        None => self.constant(NanBox::undefined())?,
+                    };
                     self.ops.push(Op::ArrayPush {
                         arr: strings,
                         src: s,
@@ -5627,6 +5632,14 @@ impl Compiler {
             // A template literal: interleave cooked quasis with interpolations,
             // concatenating via the realm's `+` (ToString on each value).
             Expr::Template(t) => {
+                // An invalid escape is allowed only in a *tagged* template; in a plain
+                // template literal it is a SyntaxError — defer to the tree-walker, which
+                // raises it at evaluation.
+                if t.quasis.iter().any(|q| q.cooked.is_none()) {
+                    return Err(CompileError::Unsupported(
+                        "invalid escape in template literal",
+                    ));
+                }
                 let cooked = |q: &crate::ast::TemplateElement| -> String {
                     q.cooked.as_deref().map(String::from).unwrap_or_default()
                 };

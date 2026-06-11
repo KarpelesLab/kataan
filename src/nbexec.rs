@@ -558,6 +558,7 @@ const ERROR_NAMES: [&str; 11] = [
 const N_GLOBAL_ERROR_COUNT: usize = 6;
 const N_TYPE_ERROR: u16 = N_ERROR_BASE + 1;
 const N_RANGE_ERROR: u16 = N_ERROR_BASE + 2;
+const N_SYNTAX_ERROR: u16 = N_ERROR_BASE + 3;
 const N_REFERENCE_ERROR: u16 = N_ERROR_BASE + 4;
 const N_WASM_COMPILE_ERROR: u16 = N_ERROR_BASE + 6;
 const N_WASM_LINK_ERROR: u16 = N_ERROR_BASE + 7;
@@ -9815,8 +9816,14 @@ impl<'a> Interp<'a> {
             Expr::Template(t) => {
                 let mut out = String::new();
                 for (i, quasi) in t.quasis.iter().enumerate() {
-                    if let Some(cooked) = &quasi.cooked {
-                        out.push_str(cooked);
+                    match &quasi.cooked {
+                        Some(cooked) => out.push_str(cooked),
+                        // An invalid escape is allowed only in a *tagged* template; in a
+                        // plain template literal it is a SyntaxError.
+                        None => {
+                            let m = self.new_str("Invalid escape sequence in template literal");
+                            return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
+                        }
                     }
                     if let Some(e) = t.expressions.get(i) {
                         let v = self.eval(e)?;
@@ -9842,10 +9849,15 @@ impl<'a> Interp<'a> {
                 let strings_arr = if let Some(cached) = self.tagged_template_cache.get(&cache_key) {
                     *cached
                 } else {
+                    // A quasi with an invalid escape sequence has no cooked value
+                    // (`undefined`), while its `.raw` is still preserved (ES2018).
                     let strings: Vec<NanBox> = quasi
                         .quasis
                         .iter()
-                        .map(|q| self.new_str(q.cooked.as_deref().unwrap_or("")))
+                        .map(|q| match q.cooked.as_deref() {
+                            Some(s) => self.new_str(s),
+                            None => NanBox::undefined(),
+                        })
                         .collect();
                     let raw: Vec<NanBox> =
                         quasi.quasis.iter().map(|q| self.new_str(&q.raw)).collect();

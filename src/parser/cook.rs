@@ -159,6 +159,10 @@ fn decode_unicode_escape(
                 .saturating_add(u32::from(hex_digit(chars.next(), span)?));
         }
         chars.next(); // `}`
+        // A code point above U+10FFFF is an invalid escape (no cooked value).
+        if value > 0x10_FFFF {
+            return Err(Error::syntax("invalid escape sequence", span));
+        }
         out.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
         return Ok(());
     }
