@@ -11298,6 +11298,12 @@ impl<'a> Interp<'a> {
         // accessor (the receiver stays `handle`).
         let mut cur = self.realm.object_proto(handle);
         while let Some(p) = cur {
+            // A proxy in the prototype chain handles the read via its own `[[Get]]`
+            // (a `get` trap, or forwarding to the target and its prototype chain),
+            // which is terminal for the lookup.
+            if self.realm.proxy_at(p).is_some() {
+                return self.read_member(p, name);
+            }
             if let Some((getter, _)) = self.realm.accessor(p, name) {
                 if matches!(getter.unpack(), Unpacked::Undefined) {
                     return Ok(NanBox::undefined());
