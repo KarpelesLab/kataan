@@ -291,6 +291,7 @@ const N_INTL_FORMAT: u16 = 215;
 const N_EVAL: u16 = 216;
 const N_INTL_RESOLVED_OPTIONS: u16 = 217;
 const N_INTL_SUPPORTED_LOCALES: u16 = 218;
+const N_INTL_FORMAT_TO_PARTS: u16 = 219;
 const N_INTL_COLLATOR: u16 = 207;
 const N_INTL_PLURAL_RULES: u16 = 208;
 /// `Intl.Collator.prototype.compare` (a bound function value).
@@ -2270,6 +2271,82 @@ impl<'a> Interp<'a> {
                     }
                 }
                 NanBox::handle(self.realm.new_array(out).to_raw())
+            }
+            // `nf.formatToParts(x)` — the formatted number split into `{type, value}`
+            // parts (minusSign/currency/integer/group/decimal/fraction/percent, plus
+            // nan/infinity). en-US-ish; mirrors the `format` output's structure.
+            N_INTL_FORMAT_TO_PARTS => {
+                let fmt = self.this_val.as_handle().map(Handle::from_raw);
+                let formatted = match fmt {
+                    Some(h) if self.realm.get_property(h, "\u{0}intl").is_some() => {
+                        self.intl_format_value(h, arg(0))
+                    }
+                    _ => self.realm.to_display_string(arg(0)),
+                };
+                let style = fmt
+                    .and_then(|h| self.realm.get_property(h, "style"))
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_else(|| String::from("decimal"));
+                let currency_sym = if style == "currency" {
+                    let code = fmt
+                        .and_then(|h| self.realm.get_property(h, "currency"))
+                        .map(|v| self.realm.to_display_string(v))
+                        .unwrap_or_default();
+                    currency_symbol(&code)
+                } else {
+                    String::new()
+                };
+                // Build (type, value) entries from the formatted string's structure.
+                let mut entries: Vec<(&'static str, String)> = Vec::new();
+                let mut s = formatted.as_str();
+                if let Some(rest) = s.strip_prefix('-') {
+                    entries.push(("minusSign", String::from("-")));
+                    s = rest;
+                }
+                if !currency_sym.is_empty() && s.starts_with(currency_sym.as_str()) {
+                    entries.push(("currency", currency_sym.clone()));
+                    s = &s[currency_sym.len()..];
+                }
+                // A trailing percent sign is stripped first, so the core (∞/NaN/digits)
+                // is classified correctly; the percent part is appended at the end.
+                let mut percent = false;
+                if style == "percent" && s.ends_with('%') {
+                    percent = true;
+                    s = &s[..s.len() - '%'.len_utf8()];
+                }
+                if s == "NaN" {
+                    entries.push(("nan", String::from("NaN")));
+                } else if s == "∞" {
+                    entries.push(("infinity", String::from("∞")));
+                } else {
+                    let (int_part, frac_part) = match s.split_once('.') {
+                        Some((i, f)) => (i, Some(f)),
+                        None => (s, None),
+                    };
+                    for (gi, grp) in int_part.split(',').enumerate() {
+                        if gi > 0 {
+                            entries.push(("group", String::from(",")));
+                        }
+                        entries.push(("integer", String::from(grp)));
+                    }
+                    if let Some(f) = frac_part {
+                        entries.push(("decimal", String::from(".")));
+                        entries.push(("fraction", String::from(f)));
+                    }
+                }
+                if percent {
+                    entries.push(("percent", String::from("%")));
+                }
+                let mut arr_elems = Vec::with_capacity(entries.len());
+                for (ty, val) in entries {
+                    let o = self.realm.new_object();
+                    let tv = self.new_str(ty);
+                    self.realm.set_property(o, "type", tv);
+                    let vv = self.new_str(&val);
+                    self.realm.set_property(o, "value", vv);
+                    arr_elems.push(NanBox::handle(o.to_raw()));
+                }
+                NanBox::handle(self.realm.new_array(arr_elems).to_raw())
             }
             // `setTimeout(cb, delay?, ...args)` — queues `cb(...args)` as a macrotask
             // and returns a numeric timer id (usable with `clearTimeout`).
@@ -4887,6 +4964,10 @@ impl<'a> Interp<'a> {
         let ro = self.new_named_native("resolvedOptions", N_INTL_RESOLVED_OPTIONS);
         self.realm
             .set_property(obj, "resolvedOptions", NanBox::handle(ro.to_raw()));
+        // `formatToParts(x)` returns the formatted output broken into typed parts.
+        let ftp = self.new_named_native("formatToParts", N_INTL_FORMAT_TO_PARTS);
+        self.realm
+            .set_property(obj, "formatToParts", NanBox::handle(ftp.to_raw()));
         // The requested locale (a string first argument), defaulting to en-US.
         let locale = args
             .first()
@@ -5028,6 +5109,22 @@ impl<'a> Interp<'a> {
         };
         let style = opt_str(self, "style").unwrap_or_else(|| String::from("decimal"));
         let currency = opt_str(self, "currency");
+        // Non-finite values render as the core glyph (∞ / NaN) with the sign and
+        // currency/percent affixes, but no grouping or fraction digits.
+        if !n.is_finite() {
+            let mut out = String::new();
+            if n.is_sign_negative() && !n.is_nan() {
+                out.push('-');
+            }
+            if style == "currency" {
+                out.push_str(&currency_symbol(currency.as_deref().unwrap_or("")));
+            }
+            out.push_str(if n.is_nan() { "NaN" } else { "∞" });
+            if style == "percent" {
+                out.push('%');
+            }
+            return out;
+        }
         let use_grouping = !matches!(
             self.realm.get_property(handle, "useGrouping"),
             Some(v) if matches!(v.unpack(), Unpacked::Bool(false))
