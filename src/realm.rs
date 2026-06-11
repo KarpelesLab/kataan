@@ -1808,7 +1808,24 @@ pub fn parse_iso_date(s: &str) -> Option<f64> {
     }
     let mut ms: i64 = days_from_civil(y, mo, d) * 86_400_000;
     if let Some(t) = time {
-        let t = t.trim_end_matches('Z');
+        // A trailing timezone designator: `Z` (UTC), or a numeric `+HH:MM` / `-HH:MM`
+        // offset. The offset is subtracted to convert the wall-clock time to UTC. With no
+        // designator the time is taken as UTC (this engine has no local timezone).
+        let (t, offset_min): (&str, i64) = if let Some(rest) = t.strip_suffix('Z') {
+            (rest, 0)
+        } else if let Some(pos) = t[1..].find(['+', '-']).map(|i| i + 1) {
+            let off = &t[pos..];
+            let sign: i64 = if off.starts_with('-') { -1 } else { 1 };
+            let body = &off[1..];
+            let (oh, om): (i64, i64) = match body.split_once(':') {
+                Some((a, b)) => (a.parse().ok()?, b.parse().ok()?),
+                None if body.len() == 4 => (body[..2].parse().ok()?, body[2..].parse().ok()?),
+                None => (body.parse().ok()?, 0),
+            };
+            (&t[..pos], sign * (oh * 60 + om))
+        } else {
+            (t, 0)
+        };
         let (hms, frac) = match t.split_once('.') {
             Some((a, b)) => (a, Some(b)),
             None => (t, None),
@@ -1824,6 +1841,7 @@ pub fn parse_iso_date(s: &str) -> Option<f64> {
             let padded = alloc::format!("{digits:0<3}");
             ms += padded.parse::<i64>().ok()?;
         }
+        ms -= offset_min * 60_000;
     }
     Some(ms as f64)
 }
