@@ -1488,9 +1488,38 @@ impl<'a> Interp<'a> {
             }
             N_REFLECT_SET => {
                 if let Some(raw) = arg(0).as_handle() {
-                    // Via `assign_member_value` so array indices, setters, and
-                    // `length` resize behave like an ordinary assignment.
-                    self.assign_member_value(Handle::from_raw(raw), arg(1), arg(2))?;
+                    let h = Handle::from_raw(raw);
+                    let key = self.member_key(arg(1));
+                    let value = arg(2);
+                    // The receiver defaults to the target; an explicit one (4th arg)
+                    // receives the write / is the setter's `this`.
+                    let receiver = if args.len() > 3 {
+                        arg(3)
+                    } else {
+                        NanBox::handle(h.to_raw())
+                    };
+                    // A setter accessor found on the chain runs with `receiver` as
+                    // `this` (an accessor with no setter fails).
+                    let mut cur = Some(h);
+                    while let Some(c) = cur {
+                        if let Some((_, setter)) = self.realm.accessor(c, &key) {
+                            if matches!(setter.unpack(), Unpacked::Undefined) {
+                                return Ok(NanBox::boolean(false));
+                            }
+                            self.call_with_this(setter, receiver, &[value])?;
+                            return Ok(NanBox::boolean(true));
+                        }
+                        if self.realm.has_own(c, &key) {
+                            break;
+                        }
+                        cur = self.realm.object_proto(c);
+                    }
+                    // No setter: write the data property on the receiver (via
+                    // `assign_member_value`, so array indices/`length` behave right).
+                    let Some(rh) = receiver.as_handle() else {
+                        return Ok(NanBox::boolean(false));
+                    };
+                    self.assign_member_value(Handle::from_raw(rh), arg(1), value)?;
                 }
                 NanBox::boolean(true)
             }
@@ -9948,12 +9977,23 @@ impl<'a> Interp<'a> {
             }
             return self.assign_member_value(target, key, new);
         }
-        // A numeric index addresses array storage directly.
-        if let Some(i) = key.as_number().and_then(as_index)
-            && self.realm.is_array(handle)
-        {
-            self.set_element_coerced(handle, i, new);
-            return Ok(());
+        // A numeric index — a number, or a canonical numeric string ("1", not "01"
+        // or "1.0") as produced by `Reflect.set`/`arr["1"]=` — addresses array storage.
+        if self.realm.is_array(handle) {
+            let idx = key.as_number().and_then(as_index).or_else(|| {
+                key.as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.string_value(h))
+                    .and_then(|s| {
+                        s.parse::<usize>()
+                            .ok()
+                            .filter(|i| alloc::format!("{i}") == s)
+                    })
+            });
+            if let Some(i) = idx {
+                self.set_element_coerced(handle, i, new);
+                return Ok(());
+            }
         }
         let name = self.coerce_property_key(key)?;
         // `regex.lastIndex = n` updates the RegExp's stateful search position.
