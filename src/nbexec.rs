@@ -2276,9 +2276,12 @@ impl<'a> Interp<'a> {
                 let s = match this.unpack() {
                     Unpacked::Undefined => String::from("[object Undefined]"),
                     Unpacked::Null => String::from("[object Null]"),
+                    // A primitive number/boolean (an immediate) reports its class
+                    // (ToObject would box it to a Number/Boolean wrapper).
+                    Unpacked::Number(_) => String::from("[object Number]"),
+                    Unpacked::Bool(_) => String::from("[object Boolean]"),
                     _ => match this.as_handle().map(Handle::from_raw) {
                         Some(h) => alloc::format!("[object {}]", self.object_string_tag(h)?),
-                        // A boxed primitive's tag (number/boolean/string immediates).
                         None => String::from("[object Object]"),
                     },
                 };
@@ -8116,10 +8119,24 @@ impl<'a> Interp<'a> {
         {
             return Ok(s);
         }
+        // A boxed primitive wrapper (`new Number(…)`/`String`/`Boolean`, or the
+        // object form `ToObject` produces) reports its primitive's class.
+        if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
+            return Ok(String::from(match prim.unpack() {
+                Unpacked::Number(_) => "Number",
+                Unpacked::Bool(_) => "Boolean",
+                _ => "String",
+            }));
+        }
         Ok(if self.realm.is_array(h) {
             String::from("Array")
         } else if self.is_callable(h) || self.realm.class_at(h).is_some() {
             String::from("Function")
+        } else if self.realm.string_value(h).is_some() {
+            // A primitive string boxes to a `String` exotic object.
+            String::from("String")
+        } else if let Some(is_set) = self.realm.collection_is_set(h) {
+            String::from(if is_set { "Set" } else { "Map" })
         } else if self.realm.date_at(h).is_some() {
             String::from("Date")
         } else if self.realm.regexp_at(h).is_some() {
