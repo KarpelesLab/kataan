@@ -9038,9 +9038,25 @@ impl<'a> Interp<'a> {
                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
         {
             let hint_box = self.new_str(hint);
-            return Ok(Some(self.call_with_this(f, v, &[hint_box])?));
+            let r = self.call_with_this(f, v, &[hint_box])?;
+            // `[Symbol.toPrimitive]` must return a primitive, else a TypeError.
+            if self.is_object_value(r) {
+                let m = self.new_str("Cannot convert object to primitive value");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            return Ok(Some(r));
         }
         Ok(None)
+    }
+
+    /// Whether `v` is an object (a non-primitive heap value: object/array/function/…)
+    /// rather than a string/symbol/bigint primitive or an immediate.
+    fn is_object_value(&self, v: NanBox) -> bool {
+        v.as_handle().map(Handle::from_raw).is_some_and(|h| {
+            self.realm.string_value(h).is_none()
+                && self.realm.symbol_at(h).is_none()
+                && self.realm.bigint_at(h).is_none()
+        })
     }
 
     /// ToPrimitive of an object/array for loose equality: an array becomes its
@@ -9087,13 +9103,6 @@ impl<'a> Interp<'a> {
         if let Some(r) = self.symbol_to_primitive(v, hint)? {
             return Ok(r);
         }
-        let is_object = |this: &Self, r: NanBox| {
-            r.as_handle().is_some_and(|rr| {
-                let rh = Handle::from_raw(rr);
-                this.realm.string_value(rh).is_none()
-                    && (this.realm.object_keys(rh).is_some() || this.realm.is_array(rh))
-            })
-        };
         // String hint tries `toString` first; number/default try `valueOf` first.
         let order = if hint == "string" {
             ["toString", "valueOf"]
@@ -9106,12 +9115,14 @@ impl<'a> Interp<'a> {
                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
             {
                 let r = self.call_with_this(m, v, &[])?;
-                if !is_object(self, r) {
+                if !self.is_object_value(r) {
                     return Ok(r);
                 }
             }
         }
-        Ok(v)
+        // Neither `valueOf` nor `toString` produced a primitive — a TypeError.
+        let m = self.new_str("Cannot convert object to primitive value");
+        Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
     }
 
     /// Coerces `v` to a string, invoking `[Symbol.toPrimitive]("string")` or a
