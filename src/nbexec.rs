@@ -2289,13 +2289,7 @@ impl<'a> Interp<'a> {
             // `new` build the same formatter object.
             N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => self.make_intl_formatter(id, args),
             // `Intl.Collator(...)` / `Intl.PluralRules(...)` without `new`.
-            N_INTL_COLLATOR => {
-                let obj = self.realm.new_object();
-                let cmp = self.new_named_native("compare", N_INTL_COMPARE);
-                self.realm
-                    .set_property(obj, "compare", NanBox::handle(cmp.to_raw()));
-                NanBox::handle(obj.to_raw())
-            }
+            N_INTL_COLLATOR => self.make_collator(args),
             N_INTL_PLURAL_RULES => self.make_plural_rules(args),
             // `new Intl.ListFormat(locale, { type, style })` — an object with `.format`.
             N_INTL_LIST_FORMAT => self.make_list_format(args),
@@ -2444,7 +2438,34 @@ impl<'a> Interp<'a> {
             N_INTL_COMPARE => {
                 let a = self.realm.to_display_string(arg(0));
                 let b = self.realm.to_display_string(arg(1));
-                NanBox::number(match a.cmp(&b) {
+                // With the `intl` crate, real UCA collation honoring `sensitivity`
+                // (→ strength) and `numeric`; otherwise code-point order.
+                #[cfg(feature = "intl")]
+                let ord = {
+                    use intl::unicode::collate::{AlternateHandling, Collator, Strength};
+                    let fmt = self.this_val.as_handle().map(Handle::from_raw);
+                    let strength = match fmt
+                        .and_then(|h| self.realm.get_property(h, "sensitivity"))
+                        .map(|v| self.realm.to_display_string(v))
+                        .as_deref()
+                    {
+                        Some("base") => Strength::Primary,
+                        Some("accent") => Strength::Secondary,
+                        _ => Strength::Tertiary,
+                    };
+                    let numeric = matches!(
+                        fmt.and_then(|h| self.realm.get_property(h, "numeric"))
+                            .map(|v| v.unpack()),
+                        Some(Unpacked::Bool(true))
+                    );
+                    Collator::new(AlternateHandling::Shifted)
+                        .with_strength(strength)
+                        .with_numeric(numeric)
+                        .compare(&a, &b)
+                };
+                #[cfg(not(feature = "intl"))]
+                let ord = a.cmp(&b);
+                NanBox::number(match ord {
                     core::cmp::Ordering::Less => -1.0,
                     core::cmp::Ordering::Equal => 0.0,
                     core::cmp::Ordering::Greater => 1.0,
@@ -4814,11 +4835,7 @@ impl<'a> Interp<'a> {
         // (so `arr.sort(new Intl.Collator().compare)` works); code-point order, no
         // locale tailoring (matching `localeCompare`).
         if id == N_INTL_COLLATOR {
-            let obj = self.realm.new_object();
-            let cmp = self.new_named_native("compare", N_INTL_COMPARE);
-            self.realm
-                .set_property(obj, "compare", NanBox::handle(cmp.to_raw()));
-            return Ok(NanBox::handle(obj.to_raw()));
+            return Ok(self.make_collator(args));
         }
         // `new Intl.PluralRules(...)` → an object with a `select(n)` method.
         if id == N_INTL_PLURAL_RULES {
@@ -5596,6 +5613,36 @@ impl<'a> Interp<'a> {
         let f = self.new_named_native("of", N_INTL_DISPLAY_NAMES_OF);
         self.realm
             .set_property(obj, "of", NanBox::handle(f.to_raw()));
+        NanBox::handle(obj.to_raw())
+    }
+
+    /// Builds an `Intl.Collator` instance: an object capturing the locale and
+    /// `sensitivity`/`numeric` options with a readable `compare` function (usable directly and
+    /// as `arr.sort(collator.compare)`).
+    fn make_collator(&mut self, args: &[NanBox]) -> NanBox {
+        let obj = self.realm.new_object();
+        let locale = args
+            .first()
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .unwrap_or_else(|| String::from("en"));
+        let locv = self.new_str(&locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
+        if let Some(opts) = args
+            .get(1)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            for key in ["sensitivity", "numeric", "caseFirst"] {
+                if let Some(v) = self.realm.get_property(opts, key) {
+                    self.realm.set_hidden_property(obj, key, v);
+                }
+            }
+        }
+        let cmp = self.new_named_native("compare", N_INTL_COMPARE);
+        self.realm
+            .set_property(obj, "compare", NanBox::handle(cmp.to_raw()));
         NanBox::handle(obj.to_raw())
     }
 
@@ -15384,6 +15431,24 @@ mod tests {
                 r#"var p=new Intl.PluralRules("pl");console.log([1,2,5,22].map(n=>p.select(n)).join(","))"#
             ),
             "one,few,many,few\n"
+        );
+    }
+
+    /// With the `intl` crate, `Intl.Collator` does real UCA collation: `numeric` order sorts
+    /// "a2" before "a10", and accents sort after their base letter (the fallback is code-point
+    /// order, where "a10" < "a2" and accents sort far from their base).
+    #[cfg(feature = "intl")]
+    #[test]
+    fn intl_collator_real_uca() {
+        assert_eq!(
+            out(r#"console.log(new Intl.Collator("en",{numeric:true}).compare("a2","a10"))"#),
+            "-1\n"
+        );
+        assert_eq!(
+            out(
+                r#"console.log(["é","a","z","b"].sort(new Intl.Collator("en").compare).join(","))"#
+            ),
+            "a,b,é,z\n"
         );
     }
 
