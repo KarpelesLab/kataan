@@ -143,9 +143,25 @@ impl Realm {
         byte_len: usize,
         writer: Handle,
     ) {
-        let Some(views) = self.typed_views.get(&bytes_handle.to_raw()).cloned() else {
+        let key = bytes_handle.to_raw();
+        let Some(raw) = self.typed_views.get(&key).cloned() else {
             return;
         };
+        // Drop views whose handle is no longer live (GC reclaimed them) — so the registry
+        // self-prunes and we never write through a dead/reused slot. Generation-tagged
+        // handles make `is_live` reject a recycled slot, keeping this sound under collection.
+        let views: alloc::vec::Vec<(u64, usize, u16, usize)> = raw
+            .iter()
+            .copied()
+            .filter(|e| self.heap.is_live(Handle::from_raw(e.0)))
+            .collect();
+        if views.len() != raw.len() {
+            if views.is_empty() {
+                self.typed_views.remove(&key);
+            } else {
+                self.typed_views.insert(key, views.clone());
+            }
+        }
         if views.len() < 2 && views.iter().all(|e| e.0 == writer.to_raw()) {
             return; // only the writer (or nobody) backs this buffer — nothing to push to
         }

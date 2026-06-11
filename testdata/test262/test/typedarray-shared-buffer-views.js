@@ -74,3 +74,13 @@ assert.sameValue(lone[2], 66, "subarray write -> standalone parent");
 // A DataView write is seen by a subarray at the right offset.
 new DataView(pbuf).setUint8(1, 123);
 assert.sameValue(sub[0], 123, "DataView write -> subarray");
+
+// The view registry stays correct under churn: many transient views created over one buffer,
+// then a write still reaches the live siblings.
+var cbuf = new ArrayBuffer(4);
+var keepA = new Uint8Array(cbuf);
+var keepB = new Uint8Array(cbuf);
+for (var i = 0; i < 64; i++) { var transient = new Uint8Array(cbuf); transient[0] = i; }
+keepA[1] = 200;
+assert.sameValue(keepB[1], 200, "sibling write still propagates after view churn");
+assert.sameValue(keepA[0], 63, "last transient write is visible to live siblings");
