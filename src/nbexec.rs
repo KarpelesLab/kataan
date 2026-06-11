@@ -9035,7 +9035,10 @@ impl<'a> Interp<'a> {
         if let Some(e) = thrown {
             return Err(e); // propagate a JS exception thrown by an import
         }
-        let results = results.map_err(|e| self.wasm_compile_error(e.0))?;
+        // An error *executing* an export is a runtime trap (`unreachable`, div-by-zero,
+        // out-of-bounds, an indirect-call type mismatch, …) → `WebAssembly.RuntimeError`,
+        // not a compile error (which is reserved for decode/validation at `Module`).
+        let results = results.map_err(|e| self.wasm_runtime_error(e.0))?;
         // Persist the post-call memory/globals so the next call sees them.
         if let Some(id) = inst_id {
             self.wasm_states.insert(id, inst.export_state());
@@ -9055,6 +9058,12 @@ impl<'a> Interp<'a> {
     fn wasm_compile_error(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);
         ExecError::Throw(self.make_error(N_WASM_COMPILE_ERROR, Some(m)))
+    }
+
+    /// A thrown `WebAssembly.RuntimeError` for a trap raised while executing a module.
+    fn wasm_runtime_error(&mut self, msg: &str) -> ExecError {
+        let m = self.new_str(msg);
+        ExecError::Throw(self.make_error(N_WASM_RUNTIME_ERROR, Some(m)))
     }
 
     fn wasm_type_error(&mut self, msg: &str) -> ExecError {
