@@ -7164,15 +7164,47 @@ impl<'a> Interp<'a> {
                 }
                 "concat" => {
                     let mut out = elems.clone();
+                    // An argument is spread iff it is concat-spreadable: its
+                    // `[Symbol.isConcatSpreadable]` (if defined) decides, else it is
+                    // spread exactly when it is an array.
+                    let sym = self.well_known_symbol("isConcatSpreadable");
+                    let spread_key = self.member_key(sym);
                     for a in args {
-                        if let Some(other) = a
-                            .as_handle()
-                            .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
-                            .map(<[_]>::to_vec)
-                        {
-                            out.extend(other);
-                        } else {
-                            out.push(*a);
+                        let ah = a.as_handle().map(Handle::from_raw);
+                        let spread = match ah {
+                            Some(h) => match self.realm.get_property(h, &spread_key) {
+                                Some(v) if !matches!(v.unpack(), Unpacked::Undefined) => {
+                                    self.realm.truthy(v)
+                                }
+                                _ => self.realm.is_array(h),
+                            },
+                            None => false,
+                        };
+                        match (spread, ah) {
+                            (true, Some(h)) => {
+                                if let Some(other) = self.realm.array_elements(h).map(<[_]>::to_vec)
+                                {
+                                    out.extend(other);
+                                } else {
+                                    // A spreadable array-like: read length + indices.
+                                    let len = self
+                                        .realm
+                                        .get_property(h, "length")
+                                        .map(|v| self.realm.to_number(v))
+                                        .unwrap_or(0.0)
+                                        .max(0.0)
+                                        as usize;
+                                    for i in 0..len {
+                                        let k = alloc::format!("{i}");
+                                        out.push(
+                                            self.realm
+                                                .get_property(h, &k)
+                                                .unwrap_or(NanBox::undefined()),
+                                        );
+                                    }
+                                }
+                            }
+                            _ => out.push(*a),
                         }
                     }
                     let h = self.realm.new_array(out);
