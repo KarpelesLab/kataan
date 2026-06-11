@@ -35,6 +35,10 @@ use crate::shape::Shape;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
+/// One registered typed-array view over a shared buffer, as stored in
+/// [`Realm::typed_views`]: `(view_handle, byte_offset, element_kind, element_size)`.
+type TypedView = (u64, usize, u16, usize);
+
 /// An object-model context: the heap, the shared root shape, and the atom table.
 pub struct Realm {
     heap: Heap<Cell>,
@@ -78,9 +82,9 @@ pub struct Realm {
     /// Typed-array views grouped by their backing `ArrayBuffer`'s bytes handle, so a write
     /// to the buffer (through any view or a `DataView`) can push the change into every
     /// sibling view's element store — making the BUFFER→VIEW read direction live without
-    /// touching the (hot) read path. Each entry is `(view, byte_offset, kind, elem_size)`.
-    /// Same handle-keyed, non-GC-root caveat as `aux_props`.
-    typed_views: alloc::collections::BTreeMap<u64, alloc::vec::Vec<(u64, usize, u16, usize)>>,
+    /// touching the (hot) read path. Relocated across compaction (see `compact`).
+    /// Same handle-keyed caveat as `aux_props`.
+    typed_views: alloc::collections::BTreeMap<u64, alloc::vec::Vec<TypedView>>,
     /// The default prototype (`Object.prototype`) installed on objects created by
     /// [`new_object`](Realm::new_object) once the global environment is set up. A
     /// `None`-proto object (`Object.create(null)`) opts out explicitly.
@@ -150,7 +154,7 @@ impl Realm {
         // Drop views whose handle is no longer live (GC reclaimed them) — so the registry
         // self-prunes and we never write through a dead/reused slot. Generation-tagged
         // handles make `is_live` reject a recycled slot, keeping this sound under collection.
-        let views: alloc::vec::Vec<(u64, usize, u16, usize)> = raw
+        let views: alloc::vec::Vec<TypedView> = raw
             .iter()
             .copied()
             .filter(|e| self.heap.is_live(Handle::from_raw(e.0)))
@@ -1239,7 +1243,25 @@ impl Realm {
     /// the slot table), and rewrites every reference — including the caller's
     /// `roots`, updated in place — to the new locations. Returns the statistics.
     pub fn compact(&mut self, roots: &mut [Handle]) -> Stats {
-        gc::compact(&mut self.heap, roots)
+        // Split the borrow so the moving collector (which takes `&mut heap`) can hand the
+        // forwarding function to a closure that repairs the out-of-heap `typed_views`
+        // registry — keeping shared-buffer view backing sound across a compaction.
+        let Self {
+            heap, typed_views, ..
+        } = self;
+        gc::compact_with(heap, roots, &mut |forward| {
+            let old = core::mem::take(typed_views);
+            for (bytes_raw, views) in old {
+                let new_bytes = forward(Handle::from_raw(bytes_raw)).to_raw();
+                let new_views = views
+                    .into_iter()
+                    .map(|(v, off, kind, size)| {
+                        (forward(Handle::from_raw(v)).to_raw(), off, kind, size)
+                    })
+                    .collect();
+                typed_views.insert(new_bytes, new_views);
+            }
+        })
     }
 
     /// Runs an **incremental** collection: marks in step-bounded slices of at
@@ -2319,6 +2341,41 @@ mod tests {
         let arr = Handle::from_raw(items2.as_handle().unwrap());
         // array[0] still points back at the (relocated) object — the cycle held.
         assert_eq!(realm.get_element(arr, 0).as_handle(), Some(obj2.to_raw()));
+    }
+
+    #[test]
+    fn compaction_relocates_the_shared_buffer_view_registry() {
+        let mut realm = Realm::new();
+        // A "buffer" bytes array and a "view" element store, with garbage interleaved before
+        // them so compaction actually relocates their slots.
+        let _g0 = realm.new_string("garbage0");
+        let bytes = realm.new_array(alloc::vec![NanBox::number(0.0); 4]);
+        let _g1 = realm.new_object();
+        let view = realm.new_array(alloc::vec![NanBox::number(0.0); 4]);
+        realm.register_typed_view(bytes, view, 0, 1, 1); // kind 1 = Uint8, elem_size 1
+
+        let mut roots = [bytes, view];
+        realm.compact(&mut roots);
+        let (bytes2, view2) = (roots[0], roots[1]);
+        // The slots moved (garbage created gaps), so the raw handles changed.
+        assert_ne!(bytes2.to_raw(), bytes.to_raw());
+
+        // The registry was rewritten to the relocated handles…
+        let entry = realm
+            .typed_views
+            .get(&bytes2.to_raw())
+            .expect("registry re-keyed by the relocated bytes handle");
+        assert_eq!(entry.len(), 1);
+        assert_eq!(entry[0].0, view2.to_raw(), "view handle was forwarded");
+        assert!(
+            !realm.typed_views.contains_key(&bytes.to_raw()),
+            "the stale (pre-compaction) key was removed"
+        );
+
+        // …and propagation through the relocated handles still reaches the view.
+        realm.set_element(bytes2, 1, NanBox::number(200.0));
+        realm.propagate_buffer_write(bytes2, 1, 1, bytes2);
+        assert_eq!(realm.get_element(view2, 1).as_number(), Some(200.0));
     }
 
     #[test]

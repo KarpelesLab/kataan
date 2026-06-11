@@ -141,6 +141,19 @@ pub fn collect_minor<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
 /// Compaction restores allocation locality and lets the slot table shrink, at
 /// the cost of rewriting pointers; it pairs with the tracing collector above.
 pub fn compact<T: Trace + Relocate>(heap: &mut Heap<T>, roots: &mut [Handle]) -> Stats {
+    compact_with(heap, roots, &mut |_| {})
+}
+
+/// Like [`compact`], but also calls `fixup` with the old→new forwarding function after the
+/// heap and roots have been relocated, so the caller can repair handles it holds *outside*
+/// the heap graph — e.g. a realm's handle-keyed side-tables — keeping them sound across a
+/// moving collection.
+#[allow(clippy::type_complexity)] // the `fixup` callback receives the forwarding function
+pub fn compact_with<T: Trace + Relocate>(
+    heap: &mut Heap<T>,
+    roots: &mut [Handle],
+    fixup: &mut dyn FnMut(&dyn Fn(Handle) -> Handle),
+) -> Stats {
     let before = heap.len();
     let marked = mark(heap, roots.iter().copied());
 
@@ -149,11 +162,13 @@ pub fn compact<T: Trace + Relocate>(heap: &mut Heap<T>, roots: &mut [Handle]) ->
         heap.compact_to(&marked).into_iter().collect();
     let forward = |h: Handle| map.get(&h).copied().unwrap_or(h);
 
-    // Fix up every reference inside surviving objects, then the roots.
+    // Fix up every reference inside surviving objects, then the roots, then the caller's
+    // external (out-of-heap) tables.
     relocate(heap, &forward);
     for r in roots.iter_mut() {
         *r = forward(*r);
     }
+    fixup(&forward);
 
     Stats {
         marked: marked.len(),
