@@ -286,6 +286,7 @@ const N_INTL_DATETIME_FORMAT: u16 = 167;
 const N_SET_TIMEOUT: u16 = 211;
 const N_CLEAR_TIMEOUT: u16 = 212;
 const N_QUEUE_MICROTASK: u16 = 213;
+const N_ARRAY_BUFFER_IS_VIEW: u16 = 214;
 const N_INTL_COLLATOR: u16 = 207;
 const N_INTL_PLURAL_RULES: u16 = 208;
 /// `Intl.Collator.prototype.compare` (a bound function value).
@@ -939,6 +940,12 @@ impl<'a> Interp<'a> {
         }
         for (name, id) in [("ArrayBuffer", N_ARRAY_BUFFER), ("DataView", N_DATA_VIEW)] {
             let f = self.realm.new_native(id);
+            // `ArrayBuffer.isView(x)` — true for a typed array or a DataView.
+            if id == N_ARRAY_BUFFER {
+                let isview = self.realm.new_native(N_ARRAY_BUFFER_IS_VIEW);
+                self.realm
+                    .set_hidden_property(f, "isView", NanBox::handle(isview.to_raw()));
+            }
             self.current.declare(name, NanBox::handle(f.to_raw()));
         }
         // The `WebAssembly` namespace, backed by the in-house WASM engine
@@ -1755,6 +1762,13 @@ impl<'a> Interp<'a> {
             N_ARRAY_IS_ARRAY => NanBox::boolean(arg(0).as_handle().is_some_and(|raw| {
                 let h = Handle::from_raw(raw);
                 self.realm.is_array(h) && !self.realm.is_vm_function(h)
+            })),
+            // `ArrayBuffer.isView(x)` — true iff `x` is a typed array or a DataView
+            // (anything with a `[[ViewedArrayBuffer]]`).
+            N_ARRAY_BUFFER_IS_VIEW => NanBox::boolean(arg(0).as_handle().is_some_and(|raw| {
+                let h = Handle::from_raw(raw);
+                self.realm.get_property(h, TYPED_ARRAY_KIND).is_some()
+                    || self.realm.get_property(h, DATA_VIEW_BUF).is_some()
             })),
             N_OBJECT_ASSIGN => {
                 let target = arg(0);
