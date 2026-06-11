@@ -169,6 +169,9 @@ pub struct Interp<'a> {
     symbol_registry: alloc::collections::BTreeMap<String, NanBox>,
     /// Cached well-known symbols (e.g. `Symbol.iterator`), created on first use.
     well_known_symbols: alloc::collections::BTreeMap<&'static str, NanBox>,
+    /// The frozen template-strings object for each tagged-template site (keyed by the
+    /// AST node's address), so the same array is passed to the tag on every evaluation.
+    tagged_template_cache: alloc::collections::BTreeMap<usize, NanBox>,
     /// The superclass to invoke for `super(...)` inside the running constructor.
     pending_super: Option<(u32, Scope)>,
     /// The native-constructor superclass for `super(...)` (e.g. extending Error).
@@ -658,6 +661,7 @@ impl<'a> Interp<'a> {
             gen_sink: None,
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
+            tagged_template_cache: alloc::collections::BTreeMap::new(),
             pending_super: None,
             pending_super_native: None,
             current_home: None,
@@ -9597,22 +9601,32 @@ impl<'a> Interp<'a> {
             }
             // A tagged template: `tag(stringsArray, ...interpolatedValues)`.
             Expr::TaggedTemplate { tag, quasi, .. } => {
-                let strings: Vec<NanBox> = quasi
-                    .quasis
-                    .iter()
-                    .map(|q| self.new_str(q.cooked.as_deref().unwrap_or("")))
-                    .collect();
-                let raw: Vec<NanBox> = quasi.quasis.iter().map(|q| self.new_str(&q.raw)).collect();
-                let strings_h = self.realm.new_array(strings);
-                // The strings object carries a `.raw` array (for `String.raw` and
-                // tags reading `strings.raw`). Both arrays are frozen, per spec —
-                // freeze `.raw` first and `strings` last so the property write lands.
-                let raw_h = self.realm.new_array(raw);
-                self.realm.freeze_object(raw_h);
-                self.realm
-                    .set_property(strings_h, "raw", NanBox::handle(raw_h.to_raw()));
-                self.realm.freeze_object(strings_h);
-                let strings_arr = NanBox::handle(strings_h.to_raw());
+                // The frozen strings object is created once per template-literal site
+                // and reused on every evaluation (its identity is observable to the tag).
+                let cache_key = core::ptr::from_ref(quasi) as usize;
+                let strings_arr = if let Some(cached) = self.tagged_template_cache.get(&cache_key) {
+                    *cached
+                } else {
+                    let strings: Vec<NanBox> = quasi
+                        .quasis
+                        .iter()
+                        .map(|q| self.new_str(q.cooked.as_deref().unwrap_or("")))
+                        .collect();
+                    let raw: Vec<NanBox> =
+                        quasi.quasis.iter().map(|q| self.new_str(&q.raw)).collect();
+                    let strings_h = self.realm.new_array(strings);
+                    // The strings object carries a `.raw` array (for `String.raw` and
+                    // tags reading `strings.raw`). Both arrays are frozen, per spec —
+                    // freeze `.raw` first and `strings` last so the property write lands.
+                    let raw_h = self.realm.new_array(raw);
+                    self.realm.freeze_object(raw_h);
+                    self.realm
+                        .set_property(strings_h, "raw", NanBox::handle(raw_h.to_raw()));
+                    self.realm.freeze_object(strings_h);
+                    let arr = NanBox::handle(strings_h.to_raw());
+                    self.tagged_template_cache.insert(cache_key, arr);
+                    arr
+                };
                 let mut args = alloc::vec![strings_arr];
                 for e in &quasi.expressions {
                     args.push(self.eval(e)?);
