@@ -6313,13 +6313,56 @@ impl<'a> Interp<'a> {
                     let mut ss = tod / 1000 % 60;
                     let mut mss = tod % 1000;
                     let n = self.realm.to_number(arg(0)) as i64;
+                    let argc = args.len();
+                    // The higher-order setters also accept the *following* components as
+                    // optional args (`setFullYear(y, month, date)`, `setHours(h, m, s, ms)`).
+                    let a1 = self.realm.to_number(arg(1)) as i64;
+                    let a2 = self.realm.to_number(arg(2)) as i64;
+                    let a3 = self.realm.to_number(arg(3)) as i64;
                     match method {
-                        "setFullYear" | "setUTCFullYear" => yy = n,
-                        "setMonth" | "setUTCMonth" => mo0 = n,
+                        "setFullYear" | "setUTCFullYear" => {
+                            yy = n;
+                            if argc > 1 {
+                                mo0 = a1;
+                            }
+                            if argc > 2 {
+                                dd = a2;
+                            }
+                        }
+                        "setMonth" | "setUTCMonth" => {
+                            mo0 = n;
+                            if argc > 1 {
+                                dd = a1;
+                            }
+                        }
                         "setDate" | "setUTCDate" => dd = n,
-                        "setHours" | "setUTCHours" => hh = n,
-                        "setMinutes" | "setUTCMinutes" => mi = n,
-                        "setSeconds" | "setUTCSeconds" => ss = n,
+                        "setHours" | "setUTCHours" => {
+                            hh = n;
+                            if argc > 1 {
+                                mi = a1;
+                            }
+                            if argc > 2 {
+                                ss = a2;
+                            }
+                            if argc > 3 {
+                                mss = a3;
+                            }
+                        }
+                        "setMinutes" | "setUTCMinutes" => {
+                            mi = n;
+                            if argc > 1 {
+                                ss = a1;
+                            }
+                            if argc > 2 {
+                                mss = a2;
+                            }
+                        }
+                        "setSeconds" | "setUTCSeconds" => {
+                            ss = n;
+                            if argc > 1 {
+                                mss = a1;
+                            }
+                        }
                         _ => mss = n, // setMilliseconds
                     }
                     // Normalize a possibly out-of-range month into the year, then
