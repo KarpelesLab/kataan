@@ -1585,7 +1585,8 @@ impl<'a> Interp<'a> {
                     for k in self.realm.own_property_names(h).unwrap_or_default() {
                         boxed.push(self.new_str(&k));
                     }
-                    for k in self.realm.object_keys_with_symbols(h) {
+                    // All own symbol keys (including non-enumerable ones) come last.
+                    for k in self.realm.object_all_keys(h) {
                         if let Some(idstr) = k.strip_prefix("\u{0}sym:")
                             && let Ok(id) = idstr.parse::<u64>()
                             && let Some(sh) = self.realm.symbol_for_id(id)
@@ -1681,6 +1682,14 @@ impl<'a> Interp<'a> {
                 if let Some(obj) = arg(0).as_handle().map(Handle::from_raw) {
                     let mut keys = self.realm.own_property_names(obj).unwrap_or_default();
                     keys.extend(self.realm.object_accessor_keys(obj));
+                    // Symbol-keyed properties (stored under their `\0sym:` internal name)
+                    // get a descriptor too, set under the symbol key on the result.
+                    keys.extend(
+                        self.realm
+                            .object_all_keys(obj)
+                            .into_iter()
+                            .filter(|k| k.starts_with("\u{0}sym:")),
+                    );
                     for k in keys {
                         if let Some(d) = self.build_descriptor(obj, &k) {
                             self.realm.set_property(out, &k, d);
