@@ -4734,6 +4734,79 @@ impl<'a> Interp<'a> {
 
     /// Formats `value` per the `Intl.NumberFormat`/`DateTimeFormat` instance `handle`
     /// (a `\0intl`-marked object). Shared by `nf.format(x)` and the bound `nf.format`.
+    /// `Number.prototype.toLocaleString(locale, options)` — with no options this is the
+    /// grouped default; with an options object it honors `style` (decimal/percent/
+    /// currency), `currency`, and `minimum`/`maximumFractionDigits` (en-US-ish, no real
+    /// locale data; the rounding mode follows Rust's formatter, ~halfExpand).
+    fn number_to_locale_string(&self, n: f64, opts: Option<NanBox>) -> String {
+        let oh = match opts {
+            Some(v) if !matches!(v.unpack(), Unpacked::Undefined | Unpacked::Null) => {
+                match v.as_handle() {
+                    Some(raw) => Handle::from_raw(raw),
+                    None => return group_thousands(n),
+                }
+            }
+            _ => return group_thousands(n),
+        };
+        // Non-finite values ignore the options (NaN/∞/-∞).
+        if !n.is_finite() {
+            return group_thousands(n);
+        }
+        let str_opt = |key: &str| -> Option<String> {
+            self.realm
+                .get_property(oh, key)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| self.realm.to_display_string(v))
+        };
+        let num_opt = |key: &str| -> Option<i32> {
+            self.realm
+                .get_property(oh, key)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| self.realm.to_number(v) as i32)
+        };
+        let style = str_opt("style").unwrap_or_else(|| String::from("decimal"));
+        let (value, prefix, suffix, def_min, def_max) = match style.as_str() {
+            "percent" => (n * 100.0, String::new(), String::from("%"), 0, 0),
+            "currency" => {
+                let sym = currency_symbol(&str_opt("currency").unwrap_or_default());
+                (n, sym, String::new(), 2, 2)
+            }
+            _ => (n, String::new(), String::new(), 0, 3),
+        };
+        let min_frac = num_opt("minimumFractionDigits")
+            .unwrap_or(def_min)
+            .clamp(0, 100);
+        let max_frac = num_opt("maximumFractionDigits")
+            .unwrap_or(def_max.max(min_frac))
+            .clamp(min_frac, 100);
+        let neg = value.is_sign_negative() && value != 0.0;
+        // Round to `max_frac` places, then trim trailing zeros down to `min_frac`.
+        let formatted = alloc::format!("{:.*}", max_frac as usize, value.abs());
+        let trimmed = if max_frac > min_frac && formatted.contains('.') {
+            let dot = formatted.find('.').unwrap();
+            let keep_min = dot + 1 + min_frac as usize;
+            let mut end = formatted.len();
+            while end > keep_min && formatted.as_bytes()[end - 1] == b'0' {
+                end -= 1;
+            }
+            if end == dot + 1 {
+                end = dot; // no fractional digits left → drop the '.'
+            }
+            String::from(&formatted[..end])
+        } else {
+            formatted
+        };
+        let grouped = group_thousands_str(&trimmed);
+        let mut out = String::new();
+        if neg {
+            out.push('-');
+        }
+        out.push_str(&prefix);
+        out.push_str(&grouped);
+        out.push_str(&suffix);
+        out
+    }
+
     fn intl_format_value(&mut self, handle: Handle, value: NanBox) -> String {
         let kind = self
             .realm
@@ -5442,7 +5515,10 @@ impl<'a> Interp<'a> {
                 "valueOf" => Some(recv),
                 // `toLocaleString()` — a minimal grouping format (thousands
                 // separators with `,`), since no locale data is available.
-                "toLocaleString" => Some(self.new_str(&group_thousands(n))),
+                "toLocaleString" => {
+                    let s = self.number_to_locale_string(n, args.get(1).copied());
+                    Some(self.new_str(&s))
+                }
                 #[cfg(feature = "std")]
                 "toFixed" => {
                     // `fractionDigits` is ToIntegerOrInfinity'd (undefined/NaN → 0)
@@ -12467,6 +12543,25 @@ fn coerce_typed(kind: u16, n: f64) -> f64 {
             u as f64
         }
     }
+}
+
+/// Maps an ISO-4217 currency code to its symbol for `style: "currency"` (a small
+/// common set; an unknown code is rendered as `CODE\u{00a0}`, like Intl's fallback).
+fn currency_symbol(code: &str) -> String {
+    let sym = match code {
+        "USD" | "AUD" | "CAD" | "NZD" | "HKD" | "SGD" | "MXN" => "$",
+        "EUR" => "€",
+        "GBP" => "£",
+        "JPY" | "CNY" => "¥",
+        "INR" => "₹",
+        "KRW" => "₩",
+        "RUB" => "₽",
+        "BRL" => "R$",
+        "CHF" => "CHF\u{00a0}",
+        "" => "",
+        other => return alloc::format!("{other}\u{00a0}"),
+    };
+    String::from(sym)
 }
 
 fn group_thousands(n: f64) -> String {
