@@ -2289,13 +2289,7 @@ impl<'a> Interp<'a> {
                     .set_property(obj, "compare", NanBox::handle(cmp.to_raw()));
                 NanBox::handle(obj.to_raw())
             }
-            N_INTL_PLURAL_RULES => {
-                let obj = self.realm.new_object();
-                let sel = self.new_named_native("select", N_INTL_PLURAL_SELECT);
-                self.realm
-                    .set_property(obj, "select", NanBox::handle(sel.to_raw()));
-                NanBox::handle(obj.to_raw())
-            }
+            N_INTL_PLURAL_RULES => self.make_plural_rules(args),
             // `new Intl.ListFormat(locale, { type, style })` — an object with `.format`.
             N_INTL_LIST_FORMAT => {
                 let obj = self.realm.new_object();
@@ -2427,8 +2421,45 @@ impl<'a> Interp<'a> {
             // `1` is "one", everything else "other".
             N_INTL_PLURAL_SELECT => {
                 let n = self.realm.to_number(arg(0));
-                let cat = if n == 1.0 { "one" } else { "other" };
-                self.new_str(cat)
+                #[cfg(feature = "intl")]
+                {
+                    let fmt = self.this_val.as_handle().map(Handle::from_raw);
+                    let locale = fmt
+                        .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
+                        .map(|v| self.realm.to_display_string(v))
+                        .unwrap_or_else(|| String::from("en"));
+                    let ordinal = fmt
+                        .and_then(|h| self.realm.get_property(h, "type"))
+                        .map(|v| self.realm.to_display_string(v))
+                        .as_deref()
+                        == Some("ordinal");
+                    let ops = if n == (n as i64) as f64 {
+                        intl::plural::PluralOperands::from_int(n as i64)
+                    } else {
+                        intl::plural::PluralOperands::parse(&alloc::format!("{n}"))
+                            .unwrap_or_else(|| intl::plural::PluralOperands::from_int(n as i64))
+                    };
+                    let cat = if ordinal {
+                        intl::plural::ordinal_category(&locale, &ops)
+                    } else {
+                        intl::plural::plural_category(&locale, &ops)
+                    };
+                    use intl::plural::PluralCategory::*;
+                    let s = match cat {
+                        Zero => "zero",
+                        One => "one",
+                        Two => "two",
+                        Few => "few",
+                        Many => "many",
+                        Other => "other",
+                    };
+                    self.new_str(s)
+                }
+                #[cfg(not(feature = "intl"))]
+                {
+                    let cat = if n == 1.0 { "one" } else { "other" };
+                    self.new_str(cat)
+                }
             }
             // `nf.format(x)` read as a value then called: format against the `this`
             // formatter (a detached call with no formatter falls back to ToString).
@@ -4728,11 +4759,7 @@ impl<'a> Interp<'a> {
         }
         // `new Intl.PluralRules(...)` → an object with a `select(n)` method.
         if id == N_INTL_PLURAL_RULES {
-            let obj = self.realm.new_object();
-            let sel = self.new_named_native("select", N_INTL_PLURAL_SELECT);
-            self.realm
-                .set_property(obj, "select", NanBox::handle(sel.to_raw()));
-            return Ok(NanBox::handle(obj.to_raw()));
+            return Ok(self.make_plural_rules(args));
         }
         // `new Intl.ListFormat(locale, { type, style })` → an object with a `format(list)`.
         if id == N_INTL_LIST_FORMAT {
@@ -5509,6 +5536,32 @@ impl<'a> Interp<'a> {
         let f = self.new_named_native("of", N_INTL_DISPLAY_NAMES_OF);
         self.realm
             .set_property(obj, "of", NanBox::handle(f.to_raw()));
+        NanBox::handle(obj.to_raw())
+    }
+
+    /// Builds an `Intl.PluralRules` instance: an object capturing the locale and `type`
+    /// (cardinal/ordinal) with a readable `select(n)` method.
+    fn make_plural_rules(&mut self, args: &[NanBox]) -> NanBox {
+        let obj = self.realm.new_object();
+        let locale = args
+            .first()
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .unwrap_or_else(|| String::from("en"));
+        let locv = self.new_str(&locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
+        if let Some(opts) = args
+            .get(1)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            && let Some(v) = self.realm.get_property(opts, "type")
+        {
+            self.realm.set_hidden_property(obj, "type", v);
+        }
+        let sel = self.new_named_native("select", N_INTL_PLURAL_SELECT);
+        self.realm
+            .set_property(obj, "select", NanBox::handle(sel.to_raw()));
         NanBox::handle(obj.to_raw())
     }
 
@@ -14978,6 +15031,19 @@ mod tests {
                 r#"console.log([...new Intl.Segmenter("en").segment("a😀b")].map(s=>s.segment).join("|"))"#
             ),
             "a|😀|b\n"
+        );
+    }
+
+    /// With the `intl` crate, `Intl.PluralRules` applies real CLDR rules — Polish has the
+    /// `few`/`many` categories the en-only fallback can't express.
+    #[cfg(feature = "intl")]
+    #[test]
+    fn intl_plural_rules_real_cldr_categories() {
+        assert_eq!(
+            out(
+                r#"var p=new Intl.PluralRules("pl");console.log([1,2,5,22].map(n=>p.select(n)).join(","))"#
+            ),
+            "one,few,many,few\n"
         );
     }
 
