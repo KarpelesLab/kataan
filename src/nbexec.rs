@@ -289,6 +289,8 @@ const N_QUEUE_MICROTASK: u16 = 213;
 const N_ARRAY_BUFFER_IS_VIEW: u16 = 214;
 const N_INTL_FORMAT: u16 = 215;
 const N_EVAL: u16 = 216;
+const N_INTL_RESOLVED_OPTIONS: u16 = 217;
+const N_INTL_SUPPORTED_LOCALES: u16 = 218;
 const N_INTL_COLLATOR: u16 = 207;
 const N_INTL_PLURAL_RULES: u16 = 208;
 /// `Intl.Collator.prototype.compare` (a bound function value).
@@ -940,6 +942,10 @@ impl<'a> Interp<'a> {
             ("PluralRules", N_INTL_PLURAL_RULES),
         ] {
             let f = self.new_named_native(name, id);
+            // `Intl.X.supportedLocalesOf(locales)` — static on every constructor.
+            let sl = self.new_named_native("supportedLocalesOf", N_INTL_SUPPORTED_LOCALES);
+            self.realm
+                .set_hidden_property(f, "supportedLocalesOf", NanBox::handle(sl.to_raw()));
             self.realm
                 .set_property(intl, name, NanBox::handle(f.to_raw()));
         }
@@ -2188,6 +2194,82 @@ impl<'a> Interp<'a> {
                     let s = self.realm.to_display_string(arg(0));
                     self.new_str(&s)
                 }
+            }
+            // `nf.resolvedOptions()` — the resolved configuration of the formatter.
+            N_INTL_RESOLVED_OPTIONS => {
+                let out = self.realm.new_object();
+                let fmt = self.this_val.as_handle().map(Handle::from_raw);
+                let kind = fmt
+                    .and_then(|h| self.realm.get_property(h, "\u{0}intl"))
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_else(|| String::from("number"));
+                let getp = |this: &Self, key: &str| -> Option<NanBox> {
+                    fmt.and_then(|h| this.realm.get_property(h, key))
+                        .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                };
+                let locale = getp(self, "\u{0}locale")
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_else(|| String::from("en-US"));
+                let lv = self.new_str(&locale);
+                self.realm.set_property(out, "locale", lv);
+                let ns = self.new_str("latn");
+                self.realm.set_property(out, "numberingSystem", ns);
+                if kind == "number" {
+                    let style = getp(self, "style")
+                        .map(|v| self.realm.to_display_string(v))
+                        .unwrap_or_else(|| String::from("decimal"));
+                    let sv = self.new_str(&style);
+                    self.realm.set_property(out, "style", sv);
+                    if style == "currency"
+                        && let Some(c) = getp(self, "currency")
+                    {
+                        self.realm.set_property(out, "currency", c);
+                    }
+                    let (def_min, def_max): (f64, f64) = match style.as_str() {
+                        "currency" => (2.0, 2.0),
+                        "percent" => (0.0, 0.0),
+                        _ => (0.0, 3.0),
+                    };
+                    let min = getp(self, "minimumFractionDigits")
+                        .map_or(def_min, |v| self.realm.to_number(v));
+                    let max = getp(self, "maximumFractionDigits")
+                        .map_or(def_max.max(min), |v| self.realm.to_number(v));
+                    self.realm
+                        .set_property(out, "minimumIntegerDigits", NanBox::number(1.0));
+                    self.realm
+                        .set_property(out, "minimumFractionDigits", NanBox::number(min));
+                    self.realm
+                        .set_property(out, "maximumFractionDigits", NanBox::number(max));
+                    let ug = getp(self, "useGrouping").unwrap_or(NanBox::boolean(true));
+                    self.realm.set_property(out, "useGrouping", ug);
+                } else {
+                    let cal = self.new_str("gregory");
+                    self.realm.set_property(out, "calendar", cal);
+                    let tz = self.new_str("UTC");
+                    self.realm.set_property(out, "timeZone", tz);
+                }
+                NanBox::handle(out.to_raw())
+            }
+            // `Intl.X.supportedLocalesOf(locales)` — the requested locales this engine
+            // can serve. With no real locale data, every requested locale is accepted;
+            // the result is a fresh array of the (string) requests.
+            N_INTL_SUPPORTED_LOCALES => {
+                let mut out = Vec::new();
+                let req = arg(0);
+                if let Some(rh) = req.as_handle().map(Handle::from_raw) {
+                    if let Some(elems) = self.realm.array_elements(rh).map(<[_]>::to_vec) {
+                        for e in elems {
+                            if e.as_handle().is_some_and(|r| {
+                                self.realm.string_value(Handle::from_raw(r)).is_some()
+                            }) {
+                                out.push(e);
+                            }
+                        }
+                    } else if self.realm.string_value(rh).is_some() {
+                        out.push(req); // a single locale string
+                    }
+                }
+                NanBox::handle(self.realm.new_array(out).to_raw())
             }
             // `setTimeout(cb, delay?, ...args)` — queues `cb(...args)` as a macrotask
             // and returns a numeric timer id (usable with `clearTimeout`).
@@ -4801,6 +4883,19 @@ impl<'a> Interp<'a> {
         let fmt = self.new_named_native("format", N_INTL_FORMAT);
         self.realm
             .set_property(obj, "format", NanBox::handle(fmt.to_raw()));
+        // `resolvedOptions()` reports the (resolved) configuration.
+        let ro = self.new_named_native("resolvedOptions", N_INTL_RESOLVED_OPTIONS);
+        self.realm
+            .set_property(obj, "resolvedOptions", NanBox::handle(ro.to_raw()));
+        // The requested locale (a string first argument), defaulting to en-US.
+        let locale = args
+            .first()
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .unwrap_or_else(|| String::from("en-US"));
+        let locv = self.new_str(&locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
         if let Some(opts) = args
             .get(1)
             .and_then(|v| v.as_handle())
