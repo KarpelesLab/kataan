@@ -469,6 +469,8 @@ const STRING_PROTO_METHODS: &[&str] = &[
     "search",
     "toUpperCase",
     "toLowerCase",
+    "toLocaleUpperCase",
+    "toLocaleLowerCase",
     "trim",
     "trimStart",
     "trimEnd",
@@ -6860,8 +6862,10 @@ impl<'a> Interp<'a> {
         // --- string methods ---
         if let Some(s) = self.realm.string_value(handle) {
             let out = match method {
-                "toUpperCase" => Some(self.new_str(&s.to_uppercase())),
-                "toLowerCase" => Some(self.new_str(&s.to_lowercase())),
+                // The locale variants behave like the locale-independent ones here
+                // (no locale-specific case tailoring).
+                "toUpperCase" | "toLocaleUpperCase" => Some(self.new_str(&s.to_uppercase())),
+                "toLowerCase" | "toLocaleLowerCase" => Some(self.new_str(&s.to_lowercase())),
                 "trim" => Some(self.new_str(s.trim())),
                 "charAt" => {
                     // UTF-16-indexed: the unit at `i` as a one-unit string (a
