@@ -1247,9 +1247,16 @@ impl Realm {
         // forwarding function to a closure that repairs the out-of-heap `typed_views`
         // registry — keeping shared-buffer view backing sound across a compaction.
         let Self {
-            heap, typed_views, ..
+            heap,
+            typed_views,
+            frozen_arrays,
+            sealed_arrays,
+            non_extensible_arrays,
+            ..
         } = self;
         gc::compact_with(heap, roots, &mut |forward| {
+            // The shared-buffer view registry: forward the bytes-handle keys and the
+            // per-view handle entries.
             let old = core::mem::take(typed_views);
             for (bytes_raw, views) in old {
                 let new_bytes = forward(Handle::from_raw(bytes_raw)).to_raw();
@@ -1260,6 +1267,20 @@ impl Realm {
                     })
                     .collect();
                 typed_views.insert(new_bytes, new_views);
+            }
+            // The array integrity flag sets are keyed by the array's handle. (The arrays
+            // themselves are ordinary reachable objects, so the GC relocates them and these
+            // keys must follow — unlike `aux_props`, whose values are only reachable through
+            // the table itself and so need GC-rooting before they can be relocated soundly.)
+            for set in [
+                &mut *frozen_arrays,
+                &mut *sealed_arrays,
+                &mut *non_extensible_arrays,
+            ] {
+                let old_set = core::mem::take(set);
+                for raw in old_set {
+                    set.insert(forward(Handle::from_raw(raw)).to_raw());
+                }
             }
         })
     }
@@ -2376,6 +2397,31 @@ mod tests {
         realm.set_element(bytes2, 1, NanBox::number(200.0));
         realm.propagate_buffer_write(bytes2, 1, 1, bytes2);
         assert_eq!(realm.get_element(view2, 1).as_number(), Some(200.0));
+    }
+
+    #[test]
+    fn compaction_relocates_array_flag_tables() {
+        let mut realm = Realm::new();
+        // A frozen array (recorded in the handle-keyed `frozen_arrays` set), with garbage
+        // before it to force slot relocation.
+        let _g = realm.new_string("garbage");
+        let arr = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        realm.freeze_object(arr);
+
+        let mut roots = [arr];
+        realm.compact(&mut roots);
+        let arr2 = roots[0];
+        assert_ne!(arr2.to_raw(), arr.to_raw(), "slot relocated");
+
+        // The frozen flag followed the array to its new handle.
+        assert!(
+            realm.is_frozen(arr2),
+            "frozen flag survived compaction via relocation"
+        );
+        assert!(
+            !realm.is_frozen(arr),
+            "the stale handle is no longer flagged"
+        );
     }
 
     #[test]
