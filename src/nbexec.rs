@@ -4967,14 +4967,56 @@ impl<'a> Interp<'a> {
     /// Writes `value` to array index `i`, coercing it to the element kind first
     /// if `handle` is a typed array (`Uint8Array`, …).
     fn set_element_coerced(&mut self, handle: crate::heap::Handle, i: usize, value: NanBox) {
-        let v = match self.realm.get_property(handle, TYPED_ARRAY_KIND) {
+        let (v, kind) = match self.realm.get_property(handle, TYPED_ARRAY_KIND) {
             Some(k) => {
+                let kind = k.as_number().unwrap_or(0.0) as u16;
                 let n = self.realm.to_number(value);
-                NanBox::number(coerce_typed(k.as_number().unwrap_or(0.0) as u16, n))
+                (NanBox::number(coerce_typed(kind, n)), Some(kind))
             }
-            None => value,
+            None => (value, None),
         };
         self.realm.set_element(handle, i, v);
+        // Write-through: a typed array with a backing ArrayBuffer encodes the element
+        // into the buffer's bytes, so a DataView (or anything reading `.buffer`) sees it.
+        if let Some(kind) = kind {
+            self.typed_array_write_through(handle, i, kind, v);
+        }
+    }
+
+    /// Encodes element `i` (already coerced to `value`) of a typed array into its backing
+    /// `ArrayBuffer` bytes, if one is attached. A no-op for an unbacked typed array.
+    fn typed_array_write_through(
+        &mut self,
+        handle: crate::heap::Handle,
+        i: usize,
+        kind: u16,
+        value: NanBox,
+    ) {
+        let Some(byteh) = self
+            .realm
+            .get_property(handle, TYPED_ARRAY_BUF)
+            .and_then(|b| b.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|bh| self.realm.get_property(bh, ARRAY_BUFFER_BYTES))
+            .and_then(|b| b.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+        let byte_off = self
+            .realm
+            .get_property(handle, DATA_VIEW_OFF)
+            .and_then(|o| o.as_number())
+            .unwrap_or(0.0) as usize;
+        let enc = encode_typed_element(kind as u8, value.as_number().unwrap_or(0.0));
+        for (j, &byte) in enc.iter().enumerate() {
+            self.realm.set_element(
+                byteh,
+                byte_off + i * elem_size + j,
+                NanBox::number(f64::from(byte)),
+            );
+        }
     }
 
     /// Builds a primitive wrapper object (`new Number`/`String`/`Boolean`,
