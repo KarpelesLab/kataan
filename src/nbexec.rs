@@ -287,6 +287,7 @@ const N_SET_TIMEOUT: u16 = 211;
 const N_CLEAR_TIMEOUT: u16 = 212;
 const N_QUEUE_MICROTASK: u16 = 213;
 const N_ARRAY_BUFFER_IS_VIEW: u16 = 214;
+const N_INTL_FORMAT: u16 = 215;
 const N_INTL_COLLATOR: u16 = 207;
 const N_INTL_PLURAL_RULES: u16 = 208;
 /// `Intl.Collator.prototype.compare` (a bound function value).
@@ -2144,6 +2145,19 @@ impl<'a> Interp<'a> {
                 let n = self.realm.to_number(arg(0));
                 let cat = if n == 1.0 { "one" } else { "other" };
                 self.new_str(cat)
+            }
+            // `nf.format(x)` read as a value then called: format against the `this`
+            // formatter (a detached call with no formatter falls back to ToString).
+            N_INTL_FORMAT => {
+                if let Some(h) = self.this_val.as_handle().map(Handle::from_raw)
+                    && self.realm.get_property(h, "\u{0}intl").is_some()
+                {
+                    let s = self.intl_format_value(h, arg(0));
+                    self.new_str(&s)
+                } else {
+                    let s = self.realm.to_display_string(arg(0));
+                    self.new_str(&s)
+                }
             }
             // `setTimeout(cb, delay?, ...args)` — queues `cb(...args)` as a macrotask
             // and returns a numeric timer id (usable with `clearTimeout`).
@@ -4658,6 +4672,11 @@ impl<'a> Interp<'a> {
         };
         let marker = self.new_str(kind);
         self.realm.set_hidden_property(obj, "\u{0}intl", marker);
+        // `.format` is a readable function (so `typeof nf.format === "function"` and a
+        // member call `nf.format(x)` works); it formats against its `this` formatter.
+        let fmt = self.new_named_native("format", N_INTL_FORMAT);
+        self.realm
+            .set_property(obj, "format", NanBox::handle(fmt.to_raw()));
         if let Some(opts) = args
             .get(1)
             .and_then(|v| v.as_handle())
@@ -4676,6 +4695,28 @@ impl<'a> Interp<'a> {
             }
         }
         NanBox::handle(obj.to_raw())
+    }
+
+    /// Formats `value` per the `Intl.NumberFormat`/`DateTimeFormat` instance `handle`
+    /// (a `\0intl`-marked object). Shared by `nf.format(x)` and the bound `nf.format`.
+    fn intl_format_value(&mut self, handle: Handle, value: NanBox) -> String {
+        let kind = self
+            .realm
+            .get_property(handle, "\u{0}intl")
+            .map(|k| self.realm.to_display_string(k))
+            .unwrap_or_default();
+        if kind == "datetime" {
+            let ms = match value.as_handle().map(Handle::from_raw) {
+                Some(h) if self.realm.date_at(h).is_some() => self.realm.date_at(h).unwrap(),
+                _ => self.realm.to_number(value),
+            };
+            let day = (ms as i64).div_euclid(86_400_000);
+            let (y, mo, d) = crate::realm::civil_from_days(day);
+            alloc::format!("{mo}/{d}/{y}")
+        } else {
+            let n = self.realm.to_number(value);
+            self.intl_format_number(handle, n)
+        }
     }
 
     /// Formats `n` per an `Intl.NumberFormat` instance's captured options
@@ -6180,28 +6221,9 @@ impl<'a> Interp<'a> {
         }
 
         // --- Intl.NumberFormat / Intl.DateTimeFormat instance methods ---
-        if let Some(kind) = self.realm.get_property(handle, "\u{0}intl") {
-            let kind = self.realm.to_display_string(kind);
-            match method {
-                "format" if kind == "number" => {
-                    let n = self.realm.to_number(arg(0));
-                    let s = self.intl_format_number(handle, n);
-                    return Ok(Some(self.new_str(&s)));
-                }
-                "format" if kind == "datetime" => {
-                    // Format a Date (or epoch ms) as a locale date string.
-                    let ms = match arg(0).as_handle().map(Handle::from_raw) {
-                        Some(h) if self.realm.date_at(h).is_some() => {
-                            self.realm.date_at(h).unwrap()
-                        }
-                        _ => self.realm.to_number(arg(0)),
-                    };
-                    let day = (ms as i64).div_euclid(86_400_000);
-                    let (y, mo, d) = crate::realm::civil_from_days(day);
-                    return Ok(Some(self.new_str(&alloc::format!("{mo}/{d}/{y}"))));
-                }
-                _ => {}
-            }
+        if self.realm.get_property(handle, "\u{0}intl").is_some() && method == "format" {
+            let s = self.intl_format_value(handle, arg(0));
+            return Ok(Some(self.new_str(&s)));
         }
         // --- Date instance methods ---
         if let Some(ms) = self.realm.date_at(handle) {
