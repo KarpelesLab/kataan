@@ -5157,6 +5157,8 @@ impl<'a> Interp<'a> {
                 "maximumFractionDigits",
                 "useGrouping",
                 "signDisplay",
+                "unit",
+                "unitDisplay",
             ] {
                 if let Some(v) = self.realm.get_property(opts, key) {
                     self.realm.set_hidden_property(obj, key, v);
@@ -5371,6 +5373,23 @@ impl<'a> Interp<'a> {
                     None => "$",
                 };
                 alloc::format!("{sym}{magnitude}")
+            }
+            "unit" => {
+                // `style: "unit"` appends the unit's short symbol (`5 km`); a
+                // `unit-per-unit` compound joins the two with `/` (`5 km/h`).
+                let unit = opt_str(self, "unit").unwrap_or_default();
+                let sym = unit.split_once("-per-").map_or_else(
+                    || String::from(unit_symbol(&unit)),
+                    |(a, b)| alloc::format!("{}/{}", unit_symbol(a), unit_symbol(b)),
+                );
+                // Temperature/angle units attach with no space (`20°C`); others use a
+                // (non-breaking) space (`5 km`).
+                let sep = if matches!(unit.as_str(), "celsius" | "fahrenheit" | "degree") {
+                    ""
+                } else {
+                    "\u{a0}"
+                };
+                alloc::format!("{magnitude}{sep}{sym}")
             }
             _ => String::from(magnitude),
         };
@@ -13513,6 +13532,49 @@ fn coerce_typed(kind: u16, n: f64) -> f64 {
             }
             u as f64
         }
+    }
+}
+
+/// The CLDR "short" symbol for an `Intl.NumberFormat` `style: "unit"` measurement unit
+/// (a common subset). An unrecognized unit renders by its own name.
+fn unit_symbol(unit: &str) -> &str {
+    match unit {
+        "kilometer" => "km",
+        "meter" => "m",
+        "centimeter" => "cm",
+        "millimeter" => "mm",
+        "mile" => "mi",
+        "foot" => "ft",
+        "inch" => "in",
+        "yard" => "yd",
+        "kilogram" => "kg",
+        "gram" => "g",
+        "milligram" => "mg",
+        "pound" => "lb",
+        "ounce" => "oz",
+        "liter" => "L",
+        "milliliter" => "mL",
+        "gallon" => "gal",
+        "second" => "s",
+        "millisecond" => "ms",
+        "minute" => "min",
+        "hour" => "h",
+        "day" => "d",
+        "week" => "wk",
+        "month" => "mth",
+        "year" => "yr",
+        "celsius" => "°C",
+        "fahrenheit" => "°F",
+        "byte" => "byte",
+        "kilobyte" => "kB",
+        "megabyte" => "MB",
+        "gigabyte" => "GB",
+        "terabyte" => "TB",
+        "bit" => "bit",
+        "percent" => "%",
+        "degree" => "deg",
+        "liter-per-100-kilometer" => "L/100km",
+        other => other,
     }
 }
 
