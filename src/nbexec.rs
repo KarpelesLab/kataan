@@ -598,6 +598,9 @@ const PRIM_WRAP: &str = "\u{0}prim";
 const PRIM_WRAP_TYPE: &str = "\u{0}primtype";
 /// Hidden slot on a typed array recording its element-kind index.
 const TYPED_ARRAY_KIND: &str = "\u{0}takind";
+/// A typed array's backing `ArrayBuffer` (for `.buffer`) — set when constructed over a
+/// buffer, otherwise materialized lazily from the element store on first access.
+const TYPED_ARRAY_BUF: &str = "\u{0}tabuf";
 /// `ArrayBuffer` byte store (an array of 0–255 numbers) and `DataView` linkage.
 const ARRAY_BUFFER_BYTES: &str = "\u{0}abytes";
 const DATA_VIEW_BUF: &str = "\u{0}dvbuf";
@@ -4498,6 +4501,9 @@ impl<'a> Interp<'a> {
                     .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
                 self.realm
                     .set_hidden_property(arr, DATA_VIEW_OFF, NanBox::number(byte_off as f64));
+                // Record the backing buffer so `.buffer` returns the original.
+                self.realm
+                    .set_hidden_property(arr, TYPED_ARRAY_BUF, NanBox::handle(bh.to_raw()));
                 return Ok(NanBox::handle(arr.to_raw()));
             }
             let elems: Vec<NanBox> = match args.first().copied() {
@@ -8436,6 +8442,20 @@ impl<'a> Interp<'a> {
         obj
     }
 
+    /// An `ArrayBuffer` whose byte store is `bytes`.
+    fn make_array_buffer_from_bytes(&mut self, bytes: &[u8]) -> Handle {
+        let obj = self.realm.new_object();
+        let arr = self.realm.new_array(
+            bytes
+                .iter()
+                .map(|&b| NanBox::number(f64::from(b)))
+                .collect(),
+        );
+        self.realm
+            .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(arr.to_raw()));
+        obj
+    }
+
     /// Builds a `WebAssembly.Global` object wrapping the already-coerced `value`
     /// of type `ty`, with a `.value` accessor (settable only when `mutable`).
     fn make_wasm_global(&mut self, value: NanBox, ty: &str, mutable: bool) -> NanBox {
@@ -11100,6 +11120,29 @@ impl<'a> Interp<'a> {
                 TYPED_ARRAY_KINDS[(id - N_TYPED_ARRAY_BASE) as usize].1,
             )));
         }
+        // A typed array's `.buffer` — the recorded backing buffer, or one materialized
+        // (a snapshot) from the current elements on first access.
+        if name == "buffer"
+            && let Some(k) = self.realm.get_property(handle, TYPED_ARRAY_KIND)
+        {
+            if let Some(buf) = self.realm.get_property(handle, TYPED_ARRAY_BUF) {
+                return Ok(buf);
+            }
+            let kind = k.as_number().unwrap_or(0.0) as u8;
+            let elems = self
+                .realm
+                .array_elements(handle)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
+            let mut bytes = alloc::vec::Vec::new();
+            for e in &elems {
+                bytes.extend_from_slice(&encode_typed_element(kind, self.realm.to_number(*e)));
+            }
+            let buf = self.make_array_buffer_from_bytes(&bytes);
+            self.realm
+                .set_hidden_property(handle, TYPED_ARRAY_BUF, NanBox::handle(buf.to_raw()));
+            return Ok(NanBox::handle(buf.to_raw()));
+        }
         // Typed-array introspection (`byteLength`, `BYTES_PER_ELEMENT`).
         if matches!(name, "byteLength" | "BYTES_PER_ELEMENT" | "byteOffset")
             && let Some(k) = self.realm.get_property(handle, TYPED_ARRAY_KIND)
@@ -12135,6 +12178,14 @@ impl<'a> Interp<'a> {
             {
                 return Ok(true);
             }
+            // `ArrayBuffer` / `DataView` match by their marker slot. (A typed array holds
+            // TYPED_ARRAY_BUF but not ARRAY_BUFFER_BYTES, so it is not an ArrayBuffer.)
+            if id == N_ARRAY_BUFFER && self.realm.get_property(oh, ARRAY_BUFFER_BYTES).is_some() {
+                return Ok(true);
+            }
+            if id == N_DATA_VIEW && self.realm.get_property(oh, DATA_VIEW_BUF).is_some() {
+                return Ok(true);
+            }
             // The `Error` family: match by the object's `name` against the
             // constructor (the base `Error` matches any error object).
             if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
@@ -12589,6 +12640,23 @@ fn coerce_typed(kind: u16, n: f64) -> f64 {
             }
             u as f64
         }
+    }
+}
+
+/// Little-endian encode of one already-coerced typed-array element value of `kind`
+/// (index into [`TYPED_ARRAY_KINDS`]) — the inverse of [`decode_typed_element`].
+fn encode_typed_element(kind: u8, v: f64) -> alloc::vec::Vec<u8> {
+    match kind {
+        0 => alloc::vec![(v as i64 as i8) as u8],      // Int8
+        1 => alloc::vec![v as i64 as u8],              // Uint8
+        2 => alloc::vec![v.clamp(0.0, 255.0) as u8],   // Uint8Clamped (already integral)
+        3 => (v as i64 as i16).to_le_bytes().to_vec(), // Int16
+        4 => (v as i64 as u16).to_le_bytes().to_vec(), // Uint16
+        5 => (v as i64 as i32).to_le_bytes().to_vec(), // Int32
+        6 => (v as i64 as u32).to_le_bytes().to_vec(), // Uint32
+        7 => (v as f32).to_le_bytes().to_vec(),        // Float32
+        8 => v.to_le_bytes().to_vec(),                 // Float64
+        _ => alloc::vec::Vec::new(),
     }
 }
 
