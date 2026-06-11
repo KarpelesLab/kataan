@@ -8525,7 +8525,54 @@ impl<'a> Interp<'a> {
             BindingTarget::Array(pat) => {
                 // Any iterable destructures (strings, Sets, generators, …); a
                 // non-iterable (null, a plain object, a number) is a TypeError.
-                let elems = self.iterate_values(value)?;
+                let has_rest = pat
+                    .elements
+                    .iter()
+                    .any(|e| matches!(e, ArrayPatternElement::Rest { .. }));
+                let needed = pat
+                    .elements
+                    .iter()
+                    .filter(|e| !matches!(e, ArrayPatternElement::Rest { .. }))
+                    .count();
+                // Without a rest target, a *user* iterator is pulled lazily for only
+                // the values the pattern needs, then closed (`IteratorClose`) — so
+                // `[a, b] = infiniteIterator` terminates and `return()` runs. Arrays,
+                // strings, Sets, and generators take the eager path (no user `next`).
+                let elems = if !has_rest && let Some(ih) = self.for_of_get_iterator(value)? {
+                    if self.realm.get_property(ih, GEN_BUF).is_some() {
+                        // An (eager) generator iterator has no callable `next` property;
+                        // its values are already buffered — drain the obtained iterator
+                        // (don't re-invoke `Symbol.iterator`, which would re-run it).
+                        self.iterate_values(NanBox::handle(ih.to_raw()))?
+                    } else {
+                        // A plain user iterator: pull only the values the pattern needs,
+                        // then close it (so `[a, b] = infiniteIterator` terminates).
+                        let iterator = NanBox::handle(ih.to_raw());
+                        let mut out = Vec::with_capacity(needed);
+                        let mut exhausted = false;
+                        for _ in 0..needed {
+                            let next_fn = self.read_member(ih, "next")?;
+                            let res = self.call_with_this(next_fn, iterator, &[])?;
+                            let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                                return Err(ExecError::Throw(
+                                    self.new_str("iterator result is not an object"),
+                                ));
+                            };
+                            let done = self.read_member(rh, "done")?;
+                            if self.realm.truthy(done) {
+                                exhausted = true;
+                                break;
+                            }
+                            out.push(self.read_member(rh, "value")?);
+                        }
+                        if !exhausted {
+                            self.iterator_close(ih)?;
+                        }
+                        out
+                    }
+                } else {
+                    self.iterate_values(value)?
+                };
                 let mut i = 0;
                 for el in &pat.elements {
                     match el {
