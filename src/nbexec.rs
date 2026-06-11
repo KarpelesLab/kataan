@@ -11133,7 +11133,25 @@ impl<'a> Interp<'a> {
             PropertyKey::Ident(s) | PropertyKey::Str(s) => self.read_member(handle, s),
             PropertyKey::Number(n) => self.read_member(handle, &alloc::format!("{n}")),
             // Private names (`this.#x`) are stored under a `#`-prefixed key.
-            PropertyKey::Private(s) => self.read_member(handle, &alloc::format!("#{s}")),
+            PropertyKey::Private(s) => {
+                // `obj.#x` where obj's class did not declare `#x` is a TypeError, not
+                // `undefined`. An instance holder carries the brand as an own private
+                // element (field or method) or a private accessor. A *class* receiver
+                // (`Class.#static`) is resolved by read_member's separate per-class storage,
+                // so it is not brand-checked here.
+                let key = alloc::format!("#{s}");
+                if !self.is_callable(handle)
+                    && self.realm.class_at(handle).is_none()
+                    && !self.realm.has_own(handle, &key)
+                    && self.realm.accessor(handle, &key).is_none()
+                {
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot read private member #{s} from an object whose class did not declare it"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                self.read_member(handle, &key)
+            }
         }
     }
 
