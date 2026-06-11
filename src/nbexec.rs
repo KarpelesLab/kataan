@@ -5403,6 +5403,10 @@ impl<'a> Interp<'a> {
                 "minute",
                 "second",
                 "hour12",
+                "hourCycle",
+                "dayPeriod",
+                "fractionalSecondDigits",
+                "timeZoneName",
                 "dateStyle",
                 "timeStyle",
                 "timeZone",
@@ -5632,10 +5636,131 @@ impl<'a> Interp<'a> {
     }
 
     /// Breaks a UTC millisecond timestamp into typed `(type, value)` parts per an
-    /// `Intl.DateTimeFormat` instance's captured component options (`weekday`/`year`/`month`/
-    /// `day`/`hour`/`minute`/`second`/`hour12`/`era`/`dateStyle`/`timeStyle`), en-US patterns
-    /// with `literal` separators. (Timezone is always UTC here.) Used by both `format` and
-    /// `formatToParts`.
+    /// `Intl.DateTimeFormat` instance's options, via the `intl` crate (CLDR, locale-aware).
+    /// Used by both `format` and `formatToParts`.
+    #[cfg(feature = "intl")]
+    fn datetime_parts(&mut self, handle: Handle, ms: f64) -> Vec<(&'static str, String)> {
+        use intl::datetime::{
+            self, DateStyle, DateTime, DateTimeFormatOptions, HourCycle, MonthStyle, NameStyle,
+            Numeric2Digit, TimeZoneNameStyle,
+        };
+        let opt = |this: &mut Self, k: &str| -> Option<String> {
+            this.realm
+                .get_property(handle, k)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_display_string(v))
+        };
+        let locale = opt(self, "\u{0}locale").unwrap_or_else(|| String::from("en"));
+        let msi = ms as i64;
+        let day = msi.div_euclid(86_400_000);
+        let tod = msi.rem_euclid(86_400_000);
+        let (y, mo, d) = crate::realm::civil_from_days(day);
+        let dt = DateTime {
+            year: y as i32,
+            month: mo as u8,
+            day: d as u8,
+            hour: (tod / 3_600_000) as u8,
+            minute: ((tod / 60_000) % 60) as u8,
+            second: ((tod / 1_000) % 60) as u8,
+            millisecond: (tod % 1_000) as u16,
+        };
+        let name = |s: &str| match s {
+            "long" => Some(NameStyle::Long),
+            "short" => Some(NameStyle::Short),
+            "narrow" => Some(NameStyle::Narrow),
+            _ => None,
+        };
+        let n2 = |s: &str| match s {
+            "numeric" => Some(Numeric2Digit::Numeric),
+            "2-digit" => Some(Numeric2Digit::TwoDigit),
+            _ => None,
+        };
+        let dstyle = |s: &str| match s {
+            "full" => Some(DateStyle::Full),
+            "long" => Some(DateStyle::Long),
+            "medium" => Some(DateStyle::Medium),
+            "short" => Some(DateStyle::Short),
+            _ => None,
+        };
+        let mut o = DateTimeFormatOptions::default();
+        // `dateStyle`/`timeStyle` are mutually exclusive with component fields (the crate
+        // errors if both are set), matching ECMA-402.
+        if opt(self, "dateStyle").is_some() || opt(self, "timeStyle").is_some() {
+            o.date_style = opt(self, "dateStyle").as_deref().and_then(dstyle);
+            o.time_style = opt(self, "timeStyle").as_deref().and_then(dstyle);
+        } else {
+            o.weekday = opt(self, "weekday").as_deref().and_then(name);
+            o.era = opt(self, "era").as_deref().and_then(name);
+            o.year = opt(self, "year").as_deref().and_then(n2);
+            o.month = opt(self, "month").as_deref().and_then(|s| match s {
+                "numeric" => Some(MonthStyle::Numeric),
+                "2-digit" => Some(MonthStyle::TwoDigit),
+                "long" => Some(MonthStyle::Long),
+                "short" => Some(MonthStyle::Short),
+                "narrow" => Some(MonthStyle::Narrow),
+                _ => None,
+            });
+            o.day = opt(self, "day").as_deref().and_then(n2);
+            o.hour = opt(self, "hour").as_deref().and_then(n2);
+            o.minute = opt(self, "minute").as_deref().and_then(n2);
+            o.second = opt(self, "second").as_deref().and_then(n2);
+            o.day_period = opt(self, "dayPeriod").as_deref().and_then(name);
+            o.fractional_second_digits =
+                opt(self, "fractionalSecondDigits").and_then(|s| s.parse().ok());
+            // ECMA-402 default when no component is requested: a numeric date.
+            if o.weekday.is_none()
+                && o.era.is_none()
+                && o.year.is_none()
+                && o.month.is_none()
+                && o.day.is_none()
+                && o.hour.is_none()
+                && o.minute.is_none()
+                && o.second.is_none()
+            {
+                o.year = Some(Numeric2Digit::Numeric);
+                o.month = Some(MonthStyle::Numeric);
+                o.day = Some(Numeric2Digit::Numeric);
+            }
+        }
+        o.hour12 = self
+            .realm
+            .get_property(handle, "hour12")
+            .and_then(|v| match v.unpack() {
+                Unpacked::Bool(b) => Some(b),
+                _ => None,
+            });
+        o.hour_cycle = opt(self, "hourCycle").as_deref().and_then(|s| match s {
+            "h11" => Some(HourCycle::H11),
+            "h12" => Some(HourCycle::H12),
+            "h23" => Some(HourCycle::H23),
+            "h24" => Some(HourCycle::H24),
+            _ => None,
+        });
+        if let Some(tzn) = opt(self, "timeZoneName") {
+            o.time_zone_name = match tzn.as_str() {
+                "long" => Some(TimeZoneNameStyle::Long),
+                "short" => Some(TimeZoneNameStyle::Short),
+                "shortOffset" => Some(TimeZoneNameStyle::ShortOffset),
+                "longOffset" => Some(TimeZoneNameStyle::LongOffset),
+                "shortGeneric" => Some(TimeZoneNameStyle::ShortGeneric),
+                "longGeneric" => Some(TimeZoneNameStyle::LongGeneric),
+                _ => None,
+            };
+            o.tz_offset_minutes = Some(0); // engine is UTC-only
+        }
+        match datetime::format_to_parts(&locale, &dt, &o) {
+            Ok(parts) => parts
+                .into_iter()
+                .map(|p| (p.kind.as_str(), p.value))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Hand-rolled en-US fallback for [`datetime_parts`](Self::datetime_parts) when the `intl`
+    /// crate is unavailable: component options (`weekday`/`year`/`month`/`day`/`hour`/`minute`/
+    /// `second`/`hour12`/`era`/`dateStyle`/`timeStyle`) with `literal` separators, UTC.
+    #[cfg(not(feature = "intl"))]
     fn datetime_parts(&mut self, handle: Handle, ms: f64) -> Vec<(&'static str, String)> {
         let opt = |this: &mut Self, k: &str| -> Option<String> {
             this.realm
@@ -5839,7 +5964,8 @@ impl<'a> Interp<'a> {
                 time.push(("second", two(second)));
             }
             if h12 {
-                time.push(lit(" "));
+                // CLDR separates the time from AM/PM with U+202F (narrow no-break space).
+                time.push(lit("\u{202f}"));
                 time.push((
                     "dayPeriod",
                     String::from(if hour24 < 12 { "AM" } else { "PM" }),
@@ -5850,7 +5976,9 @@ impl<'a> Interp<'a> {
         // --- Combine ---
         let mut parts = date;
         if !parts.is_empty() && !time.is_empty() {
-            parts.push(lit(if named_month { " at " } else { ", " }));
+            // CLDR's standard date-time connector is ", " (the crate uses it too).
+            let _ = named_month;
+            parts.push(lit(", "));
         }
         parts.extend(time);
         parts
@@ -15092,6 +15220,19 @@ mod tests {
                 r#"var p=new Intl.PluralRules("pl");console.log([1,2,5,22].map(n=>p.select(n)).join(","))"#
             ),
             "one,few,many,few\n"
+        );
+    }
+
+    /// With the `intl` crate, `Intl.DateTimeFormat` is locale-aware (German month name +
+    /// day-month-year order), which the en-only fallback can't produce.
+    #[cfg(feature = "intl")]
+    #[test]
+    fn intl_datetime_is_locale_aware() {
+        assert_eq!(
+            out(
+                r#"console.log(new Intl.DateTimeFormat("de",{timeZone:"UTC",dateStyle:"long"}).format(new Date(Date.UTC(2024,0,15))))"#
+            ),
+            "15. Januar 2024\n"
         );
     }
 
