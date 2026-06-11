@@ -1461,8 +1461,28 @@ impl<'a> Interp<'a> {
             // --- Reflect.* ---
             N_REFLECT_GET => {
                 if let Some(raw) = arg(0).as_handle() {
+                    let h = Handle::from_raw(raw);
                     let key = self.member_key(arg(1));
-                    return self.read_member(Handle::from_raw(raw), &key);
+                    // With an explicit `receiver` (3rd arg), a getter found on the
+                    // prototype chain runs with `receiver` as its `this` (a data
+                    // property ignores the receiver — handled by `read_member`).
+                    if args.len() > 2 {
+                        let receiver = arg(2);
+                        let mut cur = Some(h);
+                        while let Some(c) = cur {
+                            if let Some((getter, _)) = self.realm.accessor(c, &key) {
+                                if matches!(getter.unpack(), Unpacked::Undefined) {
+                                    return Ok(NanBox::undefined());
+                                }
+                                return self.call_with_this(getter, receiver, &[]);
+                            }
+                            if self.realm.has_own(c, &key) {
+                                break;
+                            }
+                            cur = self.realm.object_proto(c);
+                        }
+                    }
+                    return self.read_member(h, &key);
                 }
                 NanBox::undefined()
             }
