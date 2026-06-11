@@ -29,3 +29,15 @@ var g = Map.groupBy([1, 2, 3, 4], function (x) { return x % 2 ? "odd" : "even"; 
 assert.sameValue(g instanceof Map, true, "Map.groupBy returns a Map");
 assert.sameValue(g.get("odd").join(","), "1,3", "odd group");
 assert.sameValue(g.get("even").join(","), "2,4", "even group");
+
+// Built-in constructor/namespace statics, constants, and `.prototype` are non-enumerable.
+assert.sameValue(Object.keys(Math).length, 0, "Math has no enumerable keys");
+assert.sameValue(Object.keys(Array).length, 0, "Array statics non-enumerable");
+assert.sameValue(Object.keys(Object).length, 0, "Object statics + prototype non-enumerable");
+assert.sameValue(Object.keys(Number).length, 0, "Number statics + prototype non-enumerable");
+assert.sameValue(Object.keys(Reflect).length, 0, "Reflect statics non-enumerable");
+// ...but still present as own properties and callable/readable.
+assert.sameValue(Object.getOwnPropertyNames(Math).indexOf("PI") >= 0, true, "Math.PI is an own property");
+assert.sameValue(typeof Array.isArray, "function", "Array.isArray readable");
+assert.sameValue(Math.abs(-5), 5, "Math.abs callable");
+assert.sameValue(typeof Object.prototype, "object", "Object.prototype readable");

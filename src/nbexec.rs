@@ -740,6 +740,8 @@ impl<'a> Interp<'a> {
         }
         self.realm
             .set_property(ns, "prototype", NanBox::handle(proto.to_raw()));
+        // A constructor's `prototype` is non-enumerable (out of `Object.keys`).
+        self.realm.mark_hidden(ns, "prototype");
         self.realm
             .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
     }
@@ -777,6 +779,8 @@ impl<'a> Interp<'a> {
                 let f = this.new_named_native(name, *id);
                 this.realm
                     .set_property(obj, name, NanBox::handle(f.to_raw()));
+                // Built-in static/namespace methods are non-enumerable.
+                this.realm.mark_hidden(obj, name);
             }
             this.current
                 .declare(global_name, NanBox::handle(obj.to_raw()));
@@ -836,6 +840,7 @@ impl<'a> Interp<'a> {
                 ("SQRT1_2", core::f64::consts::FRAC_1_SQRT_2),
             ] {
                 self.realm.set_property(math, name, NanBox::number(value));
+                self.realm.mark_hidden(math, name); // Math constants are non-enumerable
             }
         }
         install_namespace(self, "console", &[("log", N_CONSOLE_LOG)]);
@@ -1053,6 +1058,7 @@ impl<'a> Interp<'a> {
         {
             self.realm
                 .set_property(obj_ns, "prototype", NanBox::handle(obj_proto.to_raw()));
+            self.realm.mark_hidden(obj_ns, "prototype"); // non-enumerable
             // `({}).constructor === Object` (non-enumerable, inherited via the
             // default object prototype), and `Object.name === "Object"`.
             self.realm.set_hidden_property(
@@ -1087,6 +1093,21 @@ impl<'a> Interp<'a> {
             ],
         );
         self.setup_static_methods("Map", &["groupBy"]);
+        self.setup_static_methods(
+            "Number",
+            &[
+                "isInteger",
+                "isFinite",
+                "isNaN",
+                "isSafeInteger",
+                "parseFloat",
+                "parseInt",
+            ],
+        );
+        self.setup_static_methods("String", &["fromCharCode", "fromCodePoint", "raw"]);
+        self.setup_static_methods("Symbol", &["for", "keyFor"]);
+        self.setup_static_methods("Date", &["now", "parse", "UTC"]);
+        self.setup_static_methods("BigInt", &["asIntN", "asUintN"]);
         // Newly-created plain objects now inherit from `Object.prototype`.
         self.realm.set_default_object_proto(obj_proto);
         // `globalThis`: an object mirroring the global bindings, referencing
