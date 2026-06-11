@@ -9207,6 +9207,11 @@ impl<'a> Interp<'a> {
             Expr::Member {
                 object, property, ..
             } => {
+                // `super.x = v` invokes the inherited setter with the current `this`.
+                if matches!(&**object, Expr::Super(_)) {
+                    let name = self.eval_prop_key(property)?;
+                    return self.assign_super_member(&name, value);
+                }
                 let obj = self.eval(object)?;
                 if let Some(raw) = obj.as_handle() {
                     self.assign_member(Handle::from_raw(raw), property, value)?;
@@ -10858,6 +10863,21 @@ impl<'a> Interp<'a> {
             }
             Expr::Member {
                 object, property, ..
+            } if matches!(&**object, Expr::Super(_)) => {
+                // `super.x = v` (and `super.x op= v`) invokes the inherited setter with
+                // the current `this`; a compound op reads through `super.x` first.
+                let name = self.eval_prop_key(property)?;
+                let new = if op == AssignOp::Assign {
+                    rhs
+                } else {
+                    let current = self.resolve_super_member(&name)?;
+                    self.binary(compound_op(op)?, current, rhs)?
+                };
+                self.assign_super_member(&name, new)?;
+                Ok(new)
+            }
+            Expr::Member {
+                object, property, ..
             } => {
                 let obj = self.eval(object)?;
                 let Some(raw) = obj.as_handle() else {
@@ -11476,6 +11496,64 @@ impl<'a> Interp<'a> {
 
     /// `super.name` as a value read: a super getter is invoked (with the current
     /// `this`); a super method is returned as a bound function.
+    /// `super.name = value`: invoke an inherited setter (found on the home's parent
+    /// chain) with `this` = the current receiver; if there is none, assign the property
+    /// directly on the receiver.
+    fn assign_super_member(&mut self, name: &str, value: NanBox) -> Result<(), ExecError> {
+        // An object-literal method: `super.x = v` uses `HomeObject.[[Prototype]]`.
+        if self.current_home.is_none()
+            && let Some(home) = self.current_home_object
+        {
+            if let Some(proto) = self.realm.object_proto(home)
+                && let Some((_, setter)) = self.realm.accessor(proto, name)
+                && !matches!(setter.unpack(), Unpacked::Undefined)
+            {
+                self.call_with_this(setter, self.this_val, &[value])?;
+                return Ok(());
+            }
+            if let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {
+                self.realm.set_property(th, name, value);
+            }
+            return Ok(());
+        }
+        let home = self
+            .current_home
+            .ok_or(ExecError::Unsupported("super outside a method"))?;
+        let mut cur = self.resolve_super(
+            self.classes[home as usize],
+            &self.class_envs[home as usize].clone(),
+        )?;
+        while let Some((pid, penv)) = cur {
+            let class = self.classes[pid as usize];
+            for member in &class.body {
+                if let ClassMember::Method(m) = member
+                    && m.is_static == self.current_home_static
+                    && m.kind == MethodKind::Set
+                    && static_key(&m.key).ok().as_deref() == Some(name)
+                {
+                    let saved = core::mem::replace(&mut self.current, penv.clone());
+                    let f = self.make_method(
+                        &m.value.params,
+                        Body::Block(&m.value.body),
+                        false,
+                        m.value.is_generator,
+                        Some(pid),
+                        self.current_home_static,
+                    );
+                    self.current = saved;
+                    self.call_with_this(f, self.this_val, &[value])?;
+                    return Ok(());
+                }
+            }
+            cur = self.resolve_super(class, &penv)?;
+        }
+        // No inherited setter — the write lands on the receiver (`this`).
+        if let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {
+            self.realm.set_property(th, name, value);
+        }
+        Ok(())
+    }
+
     fn resolve_super_member(&mut self, name: &str) -> Result<NanBox, ExecError> {
         // An object-literal method: `super.x` reads `HomeObject.[[Prototype]].x`
         // (a data property, or a getter — invoked through the proto here).
