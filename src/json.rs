@@ -17,6 +17,11 @@ use alloc::vec::Vec;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Circular;
 
+/// Maximum structural nesting `JSON.stringify` will walk before reporting it as a
+/// cycle (the caller throws), rather than overflowing the host stack on a deep
+/// acyclic structure.
+const MAX_STRINGIFY_DEPTH: usize = 1000;
+
 /// Serializes `v` to a JSON string, or `None` when it has no JSON form
 /// (`undefined` or a function — which `JSON.stringify` omits).
 #[must_use]
@@ -61,8 +66,11 @@ fn stringify_seen(
             }
             let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
             if is_container {
-                if seen.contains(&h) {
-                    return Err(Circular); // circular structure
+                // A repeated handle is a cycle; depth past the cap is treated the
+                // same (the caller throws) so a deep acyclic structure cannot
+                // overflow the native stack.
+                if seen.contains(&h) || seen.len() >= MAX_STRINGIFY_DEPTH {
+                    return Err(Circular); // circular or too-deeply-nested structure
                 }
                 seen.push(h);
             }
@@ -133,8 +141,8 @@ fn stringify_at(
             let inner = alloc::format!("{cur}{indent}");
             let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
             if is_container {
-                if seen.contains(&h) {
-                    return Err(Circular); // circular structure
+                if seen.contains(&h) || seen.len() >= MAX_STRINGIFY_DEPTH {
+                    return Err(Circular); // circular or too-deeply-nested structure
                 }
                 seen.push(h);
             }
@@ -203,7 +211,7 @@ pub fn quote(s: &str) -> String {
 pub fn parse(realm: &mut Realm, src: &str) -> Result<NanBox, String> {
     let chars: Vec<char> = src.chars().collect();
     let mut pos = 0;
-    let v = parse_value(realm, &chars, &mut pos)?;
+    let v = parse_value(realm, &chars, &mut pos, 0)?;
     skip_ws(&chars, &mut pos);
     if pos != chars.len() {
         return Err(String::from("Unexpected trailing characters in JSON"));
@@ -211,11 +219,23 @@ pub fn parse(realm: &mut Realm, src: &str) -> Result<NanBox, String> {
     Ok(v)
 }
 
-fn parse_value(realm: &mut Realm, c: &[char], pos: &mut usize) -> Result<NanBox, String> {
+/// Maximum array/object nesting depth before `JSON.parse` reports an error
+/// rather than recursing into a stack overflow.
+const MAX_JSON_DEPTH: usize = 1000;
+
+fn parse_value(
+    realm: &mut Realm,
+    c: &[char],
+    pos: &mut usize,
+    depth: usize,
+) -> Result<NanBox, String> {
     skip_ws(c, pos);
     let Some(&ch) = c.get(*pos) else {
         return Err(String::from("Unexpected end of JSON input"));
     };
+    if matches!(ch, '[' | '{') && depth >= MAX_JSON_DEPTH {
+        return Err(String::from("Maximum JSON nesting depth exceeded"));
+    }
     match ch {
         'n' => lit(c, pos, "null", NanBox::null()),
         't' => lit(c, pos, "true", NanBox::boolean(true)),
@@ -233,7 +253,7 @@ fn parse_value(realm: &mut Realm, c: &[char], pos: &mut usize) -> Result<NanBox,
                 return Ok(NanBox::handle(realm.new_array(elems).to_raw()));
             }
             loop {
-                let v = parse_value(realm, c, pos)?;
+                let v = parse_value(realm, c, pos, depth + 1)?;
                 elems.push(v);
                 skip_ws(c, pos);
                 match c.get(*pos) {
@@ -266,7 +286,7 @@ fn parse_value(realm: &mut Realm, c: &[char], pos: &mut usize) -> Result<NanBox,
                     return Err(String::from("Expected ':' in JSON"));
                 }
                 *pos += 1;
-                let v = parse_value(realm, c, pos)?;
+                let v = parse_value(realm, c, pos, depth + 1)?;
                 realm.set_property(obj, &key, v);
                 skip_ws(c, pos);
                 match c.get(*pos) {
