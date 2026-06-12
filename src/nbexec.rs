@@ -118,6 +118,25 @@ struct FnDef<'a> {
     home_static: bool,
 }
 
+/// One SplitMix64 step: scrambles a seed word into a well-distributed output.
+/// Used only to derive `Math.random`'s initial `xorshift128+` state — SplitMix64
+/// is the standard seeding procedure for xorshift generators (it spreads a
+/// single seed across the state and avoids the all-zero fixed point).
+const fn splitmix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Initial `Math.random` state: the golden-ratio constant expanded through
+/// SplitMix64 into two non-zero words for `xorshift128+`. Deterministic across
+/// runs (matching the engine's snapshot-friendly, reproducible posture) but it
+/// advances per call. Both words are non-zero, so the generator never degrades.
+const MATH_RANDOM_SEED: [u64; 2] = [
+    splitmix64(0x9E37_79B9_7F4A_7C15),
+    splitmix64(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(2)),
+];
+
 /// A tree-walking interpreter over the performance object model.
 pub struct Interp<'a> {
     realm: Realm,
@@ -144,8 +163,9 @@ pub struct Interp<'a> {
     class_native_super: Vec<Option<u16>>,
     /// Current function-call nesting depth (recursion guard).
     call_depth: usize,
-    /// xorshift PRNG state backing `Math.random` (pure Rust, no foreign code).
-    rng_state: u64,
+    /// `xorshift128+` PRNG state backing `Math.random` (pure Rust, no foreign
+    /// code). Two 64-bit words give a 2^128-1 period; see [`MATH_RANDOM_SEED`].
+    rng_state: [u64; 2],
     /// The current `this` binding (method/constructor receiver).
     this_val: NanBox,
     /// `new.target` for the current invocation (the constructor when reached via
@@ -738,8 +758,7 @@ impl<'a> Interp<'a> {
             class_envs: Vec::new(),
             class_native_super: Vec::new(),
             call_depth: 0,
-            // A fixed non-zero seed (deterministic, but advances per call).
-            rng_state: 0x9E37_79B9_7F4A_7C15,
+            rng_state: MATH_RANDOM_SEED,
             this_val: NanBox::undefined(),
             new_target: NanBox::undefined(),
             pending_new_target: None,
@@ -2225,15 +2244,18 @@ impl<'a> Interp<'a> {
             N_MATH_EXP => NanBox::number(self.realm.to_number(arg(0)).exp()),
             #[cfg(feature = "std")]
             N_MATH_LOG => NanBox::number(self.realm.to_number(arg(0)).ln()),
-            // `Math.random()` ∈ [0, 1) — a pure-Rust xorshift64 generator; the
-            // top 53 bits form the mantissa.
+            // `Math.random()` ∈ [0, 1) — Vigna's xorshift128+ (period 2^128-1),
+            // the generator family used by V8/SpiderMonkey: a strict upgrade over
+            // xorshift64 in period and statistical quality. The output is the sum
+            // of the two state words (the "+"); its top 53 bits form the mantissa.
             N_MATH_RANDOM => {
-                let mut x = self.rng_state;
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                self.rng_state = x;
-                NanBox::number((x >> 11) as f64 / (1u64 << 53) as f64)
+                let mut s1 = self.rng_state[0];
+                let s0 = self.rng_state[1];
+                let result = s0.wrapping_add(s1);
+                self.rng_state[0] = s0;
+                s1 ^= s1 << 23;
+                self.rng_state[1] = s1 ^ s0 ^ (s1 >> 18) ^ (s0 >> 5);
+                NanBox::number((result >> 11) as f64 / (1u64 << 53) as f64)
             }
             // Trig / hyperbolic / inverse — single-argument f64 functions.
             #[cfg(feature = "std")]
