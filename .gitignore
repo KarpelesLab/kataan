@@ -4,3 +4,6 @@
 .*.swp
 # Cargo.lock intentionally not committed for this library crate.
 /Cargo.lock
+
+# Local Claude Code agent state (worktrees, memory, settings)
+.claude/
