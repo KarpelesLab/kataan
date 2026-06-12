@@ -634,6 +634,26 @@ const HOME_OBJECT: &str = "\u{0}home";
 /// to fire before the large stack the engine entry points run on overflows (the
 /// tree-walker uses several tens of KB of host stack per JS call).
 const MAX_CALL_DEPTH: usize = 3500;
+/// Maximum element/byte count for a single allocation driven by an untrusted
+/// length (typed arrays, `ArrayBuffer`, WASM memory/table, the `Array`
+/// constructor). The dense NanBox-backed model amplifies this 8×, so a generous
+/// cap still bounds the allocation while admitting every legitimate test.
+const MAX_ALLOC_LEN: usize = 100_000_000;
+/// Maximum length (in `char`s/bytes) of a string produced by a single builtin
+/// (`repeat`, `padStart`/`padEnd`, `+` concatenation). `RangeError("Invalid
+/// string length")` past this — matches the spec's "invalid string length"
+/// guard while keeping the bound far below an OOM.
+const MAX_STRING_LEN: usize = 1 << 30;
+/// Maximum recursion depth for the native structural walkers (`JSON.stringify`,
+/// `structuredClone`, `Array.prototype.flat`, display stringification). Deep
+/// acyclic nesting past this throws rather than overflowing the host stack.
+const MAX_NATIVE_DEPTH: usize = 1000;
+/// Maximum bit-length of a `BigInt` grown by an attacker-controlled exponent
+/// (`**`, `<<`). `RangeError("Maximum BigInt size exceeded")` past this.
+const MAX_BIGINT_BITS: u64 = 1 << 30;
+/// Maximum array/object nesting depth before `JSON.parse` reports an error
+/// rather than recursing into a stack overflow.
+const MAX_JSON_DEPTH: usize = 1000;
 const SYMBOL_NO_DESC: &str = "\u{0}nodesc";
 /// Hidden key holding a `WeakRef`'s target (returned by `deref`).
 const WEAKREF_TARGET: &str = "\u{0}wrtarget";
@@ -1318,6 +1338,14 @@ impl<'a> Interp<'a> {
                 let n = if let Some(raw) = v.as_handle() {
                     let h = Handle::from_raw(raw);
                     if let Some(s) = self.realm.string_value(h) {
+                        // `from_str_radix` is O(n²); a huge digit string is a CPU
+                        // sink (`BigInt("9".repeat(1e7))`). Cap the input length to
+                        // the same size budget as `**`/`<<` (MAX_BIGINT_BITS bits ≈
+                        // that many binary digits — a generous decimal bound).
+                        if s.trim().len() as u64 > MAX_BIGINT_BITS {
+                            let m = self.new_str("Maximum BigInt size exceeded");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
                         parse_bigint(s.trim())
                     } else {
                         self.realm.bigint_at(h).unwrap_or_default()
@@ -1435,7 +1463,7 @@ impl<'a> Interp<'a> {
                 let text = self.realm.to_display_string(arg(0));
                 let chars: Vec<char> = text.chars().collect();
                 let mut pos = 0;
-                let value = self.json_parse(&chars, &mut pos)?;
+                let value = self.json_parse(&chars, &mut pos, 0)?;
                 skip_ws(&chars, &mut pos);
                 if pos != chars.len() {
                     return Err(self.json_error("Unexpected token in JSON"));
@@ -3137,12 +3165,20 @@ impl<'a> Interp<'a> {
         ExecError::Throw(self.make_error(N_ERROR_BASE + 3, Some(m)))
     }
 
-    fn json_parse(&mut self, c: &[char], pos: &mut usize) -> Result<NanBox, ExecError> {
+    fn json_parse(
+        &mut self,
+        c: &[char],
+        pos: &mut usize,
+        depth: usize,
+    ) -> Result<NanBox, ExecError> {
         skip_ws(c, pos);
         let err = |s: &mut Self| s.json_error("Unexpected end of JSON input");
         let Some(&ch) = c.get(*pos) else {
             return Err(err(self));
         };
+        if matches!(ch, '[' | '{') && depth >= MAX_JSON_DEPTH {
+            return Err(self.json_error("Maximum JSON nesting depth exceeded"));
+        }
         match ch {
             'n' => self.json_lit(c, pos, "null", NanBox::null()),
             't' => self.json_lit(c, pos, "true", NanBox::boolean(true)),
@@ -3160,7 +3196,7 @@ impl<'a> Interp<'a> {
                     return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
                 }
                 loop {
-                    let v = self.json_parse(c, pos)?;
+                    let v = self.json_parse(c, pos, depth + 1)?;
                     elems.push(v);
                     skip_ws(c, pos);
                     match c.get(*pos) {
@@ -3193,7 +3229,7 @@ impl<'a> Interp<'a> {
                         return Err(self.json_error("Expected ':'"));
                     }
                     *pos += 1;
-                    let v = self.json_parse(c, pos)?;
+                    let v = self.json_parse(c, pos, depth + 1)?;
                     self.realm.set_property(obj, &key, v);
                     skip_ws(c, pos);
                     match c.get(*pos) {
@@ -4985,10 +5021,8 @@ impl<'a> Interp<'a> {
         }
         // `new ArrayBuffer(n)` — a zeroed byte store of length `n`.
         if id == N_ARRAY_BUFFER {
-            let n = args
-                .first()
-                .map_or(0.0, |v| self.realm.to_number(*v))
-                .max(0.0) as usize;
+            let raw = args.first().map_or(0.0, |v| self.realm.to_number(*v));
+            let n = self.validate_alloc_len(raw, "Invalid ArrayBuffer length")?;
             let buf = self.make_array_buffer(n);
             // `new ArrayBuffer(n, { maxByteLength })` makes the buffer resizable up to `max`.
             if let Some(opts) = args
@@ -5018,14 +5052,17 @@ impl<'a> Interp<'a> {
                 .copied()
                 .and_then(|v| v.as_handle())
                 .map(Handle::from_raw);
-            let initial = dh
+            let initial_raw = dh
                 .and_then(|h| self.realm.get_property(h, "initial"))
-                .map_or(0.0, |v| self.realm.to_number(v))
-                .max(0.0) as usize;
+                .map_or(0.0, |v| self.realm.to_number(v));
             let maximum = dh
                 .and_then(|h| self.realm.get_property(h, "maximum"))
                 .map(|v| self.realm.to_number(v).max(0.0) as usize);
-            let buf = self.make_array_buffer(initial * WASM_PAGE);
+            // Validate the *byte* size (initial pages × page size) before allocating.
+            let byte_len =
+                self.validate_alloc_len(initial_raw * WASM_PAGE as f64, "Invalid memory size")?;
+            let initial = (initial_raw.max(0.0)) as usize;
+            let buf = self.make_array_buffer(byte_len);
             let mem = self.make_wasm_memory_object(buf, initial, maximum);
             return Ok(NanBox::handle(mem.to_raw()));
         }
@@ -5037,10 +5074,10 @@ impl<'a> Interp<'a> {
                 .copied()
                 .and_then(|v| v.as_handle())
                 .map(Handle::from_raw);
-            let initial = dh
+            let initial_raw = dh
                 .and_then(|h| self.realm.get_property(h, "initial"))
-                .map_or(0.0, |v| self.realm.to_number(v))
-                .max(0.0) as usize;
+                .map_or(0.0, |v| self.realm.to_number(v));
+            let initial = self.validate_alloc_len(initial_raw, "Invalid table length")?;
             let maximum = dh
                 .and_then(|h| self.realm.get_property(h, "maximum"))
                 .map(|v| self.realm.to_number(v).max(0.0) as usize);
@@ -5122,12 +5159,16 @@ impl<'a> Interp<'a> {
                     .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
                     .map_or(0, |a| self.realm.to_number(*a).max(0.0) as usize);
                 let avail = bytes.len().saturating_sub(byte_off);
-                let length = args
+                let length = match args
                     .get(2)
                     .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
-                    .map_or(avail / elem_size, |a| {
-                        self.realm.to_number(*a).max(0.0) as usize
-                    });
+                {
+                    Some(a) => {
+                        let raw = self.realm.to_number(*a);
+                        self.validate_alloc_len(raw, "Invalid typed array length")?
+                    }
+                    None => avail / elem_size,
+                };
                 let decoded: Vec<NanBox> = (0..length)
                     .map(|i| {
                         let start = byte_off + i * elem_size;
@@ -5175,7 +5216,8 @@ impl<'a> Interp<'a> {
                 }
                 // `new T(length)` allocates a zeroed array.
                 Some(v) => {
-                    let n = self.realm.to_number(v).max(0.0) as usize;
+                    let raw = self.realm.to_number(v);
+                    let n = self.validate_alloc_len(raw, "Invalid typed array length")?;
                     alloc::vec![NanBox::number(0.0); n]
                 }
                 None => Vec::new(),
@@ -5360,6 +5402,12 @@ impl<'a> Interp<'a> {
         // A previously-cloned handle (cycle or shared reference).
         if let Some((_, c)) = seen.iter().find(|(r, _)| *r == raw) {
             return Ok(*c);
+        }
+        // Bound the recursion so a deep acyclic structure throws rather than
+        // overflowing the host stack.
+        if seen.len() >= MAX_NATIVE_DEPTH {
+            let m = self.new_str("Maximum call stack size exceeded");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
         if let Some(ms) = self.realm.date_at(h) {
             return Ok(NanBox::handle(self.realm.new_date(ms).to_raw()));
@@ -7221,7 +7269,20 @@ impl<'a> Interp<'a> {
                         let raw = if matches!(arg(0).unpack(), Unpacked::Undefined) {
                             alloc::format!("{n:e}")
                         } else {
-                            let d = self.realm.to_number(arg(0)) as usize;
+                            // `fractionDigits` is ToIntegerOrInfinity'd and must be
+                            // in [0, 100], else a RangeError (an unvalidated value
+                            // would panic Rust's formatter at large widths).
+                            let dn = self.realm.to_number(arg(0));
+                            let di = if dn.is_nan() { 0 } else { dn as i64 };
+                            if !(0..=100).contains(&di) {
+                                let m = self.new_str(
+                                    "toExponential() argument must be between 0 and 100",
+                                );
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_RANGE_ERROR, Some(m)),
+                                ));
+                            }
+                            let d = di as usize;
                             alloc::format!("{n:.d$e}")
                         };
                         // Rust prints `1.23e3`; JS wants `1.23e+3`.
@@ -7240,7 +7301,16 @@ impl<'a> Interp<'a> {
                     if matches!(arg(0).unpack(), Unpacked::Undefined) {
                         Some(self.new_str(&self.realm.to_display_string(recv)))
                     } else {
-                        let p = (self.realm.to_number(arg(0)) as usize).max(1);
+                        // `precision` must be in [1, 100], else a RangeError (an
+                        // unvalidated width would panic Rust's formatter).
+                        let pn = self.realm.to_number(arg(0));
+                        let pi = if pn.is_nan() { 0 } else { pn as i64 };
+                        if !(1..=100).contains(&pi) {
+                            let m =
+                                self.new_str("toPrecision() argument must be between 1 and 100");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
+                        let p = pi as usize;
                         Some(self.new_str(&format_precision(n, p)))
                     }
                 }
@@ -8551,15 +8621,17 @@ impl<'a> Interp<'a> {
                             break;
                         };
                         // A zero-width match at the segment start: not a split;
-                        // step the search past one character and retry.
+                        // step the search past one *character* and retry. `search`
+                        // and `st` are char indices (regex positions are char
+                        // indices), so advance by 1 char — never byte-slice `s`,
+                        // which panics on a non-ASCII subject
+                        // (`"€a".split(/(?=a)/)`).
                         if en == seg_start {
-                            match s[search..].chars().next() {
-                                Some(c) => {
-                                    search = search.max(st) + c.len_utf8();
-                                    continue;
-                                }
-                                None => break,
+                            if search.max(st) < s.chars().count() {
+                                search = search.max(st) + 1;
+                                continue;
                             }
+                            break;
                         }
                         parts.push(self.new_str(&char_substr(&s, seg_start, st)));
                         // The separator's capture groups are spliced into the
@@ -8634,11 +8706,15 @@ impl<'a> Interp<'a> {
                         if en > st {
                             at = en;
                         } else {
-                            // Empty match: keep the char at `st` and step past it.
-                            match s[en..].chars().next() {
+                            // Empty match: keep the char at char-index `en` and step
+                            // one *character* past it. `en` is a char index (regex
+                            // positions are char indices), so index `s.chars()` —
+                            // never byte-slice `s`, which panics on a non-ASCII
+                            // subject (`"€a".replace(/(?=a)/g,"-")`).
+                            match s.chars().nth(en) {
                                 Some(c) => {
                                     out.push(c);
-                                    at = en + c.len_utf8();
+                                    at = en + 1;
                                 }
                                 None => break,
                             }
@@ -8707,9 +8783,15 @@ impl<'a> Interp<'a> {
                     // it is a `RangeError` too (an unrepresentable string length).
                     let nf = self.realm.to_number(arg(0));
                     let n = nf as usize;
-                    if nf < 0.0 || nf.is_infinite() || n.checked_mul(s.len()).is_none() {
-                        let m = self.new_str("Invalid count value");
-                        return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                    // A product that fits `usize` can still be enormous
+                    // (`"x".repeat(2**40)` ≈ 1 TB); cap the result length too.
+                    let total = n.checked_mul(s.len());
+                    if nf < 0.0
+                        || nf.is_infinite()
+                        || total.is_none_or(|t| t > MAX_STRING_LEN)
+                    {
+                        let m = self.new_str("Invalid string length");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
                     Some(self.new_str(&s.repeat(n)))
                 }
@@ -8914,7 +8996,7 @@ impl<'a> Interp<'a> {
                     })
                 }
                 "padStart" => {
-                    let target = self.realm.to_number(arg(0)) as usize;
+                    let target = self.pad_target(self.realm.to_number(arg(0)))?;
                     let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         String::from(" ")
                     } else {
@@ -8923,7 +9005,7 @@ impl<'a> Interp<'a> {
                     Some(self.new_str(&pad_start(&s, target, &pad)))
                 }
                 "padEnd" => {
-                    let target = self.realm.to_number(arg(0)) as usize;
+                    let target = self.pad_target(self.realm.to_number(arg(0)))?;
                     let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         String::from(" ")
                     } else {
@@ -9508,7 +9590,7 @@ impl<'a> Interp<'a> {
                     } else {
                         self.realm.to_number(arg(0)) as i32
                     };
-                    let out = self.flatten(&elems, depth);
+                    let out = self.flatten(&elems, depth, 0)?;
                     let h = self.realm.new_array(out);
                     return Ok(Some(NanBox::handle(h.to_raw())));
                 }
@@ -10133,6 +10215,30 @@ impl<'a> Interp<'a> {
     fn wasm_type_error(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);
         ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
+    }
+
+    /// Validates a `padStart`/`padEnd` target length: a result longer than
+    /// `MAX_STRING_LEN` is an unrepresentable string, a `RangeError`. A negative,
+    /// `NaN`, or zero target is clamped to 0 (the source is returned unchanged).
+    fn pad_target(&mut self, n: f64) -> Result<usize, ExecError> {
+        if n > MAX_STRING_LEN as f64 {
+            let m = self.new_str("Invalid string length");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok(if n.is_nan() || n < 0.0 { 0 } else { n as usize })
+    }
+
+    /// Validates an untrusted length/byte count `n` (from a typed-array,
+    /// `ArrayBuffer`, or WASM constructor) before it drives an allocation:
+    /// rejects negative, non-integer, and over-cap values with a `RangeError`,
+    /// returning the value as a `usize`. The dense NanBox-backed model amplifies
+    /// each slot 8×, so an uncapped length would alloc-abort the process.
+    fn validate_alloc_len(&mut self, n: f64, what: &str) -> Result<usize, ExecError> {
+        if !n.is_finite() || n < 0.0 || n.floor() != n || n > MAX_ALLOC_LEN as f64 {
+            let m = self.new_str(what);
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok(n as usize)
     }
 
     /// Builds an `ArrayBuffer` object of `len` zeroed bytes.
@@ -10951,7 +11057,14 @@ impl<'a> Interp<'a> {
     /// The values iterated by `for-of`: array elements, string chars, `Set`
     /// values, or `Map` `[key, value]` pairs.
     /// Recursively flattens nested arrays up to `depth` levels (for `flat`).
-    fn flatten(&self, elems: &[NanBox], depth: i32) -> Vec<NanBox> {
+    /// `rec` is the current recursion depth; nesting past [`MAX_NATIVE_DEPTH`]
+    /// throws rather than overflowing the host stack (`flat(Infinity)` on a
+    /// pathologically deep array).
+    fn flatten(&mut self, elems: &[NanBox], depth: i32, rec: usize) -> Result<Vec<NanBox>, ExecError> {
+        if rec >= MAX_NATIVE_DEPTH {
+            let m = self.new_str("Maximum call stack size exceeded");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
         let mut out = Vec::new();
         for e in elems {
             if depth > 0
@@ -10960,12 +11073,12 @@ impl<'a> Interp<'a> {
                     .map(Handle::from_raw)
                     .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
             {
-                out.extend(self.flatten(&inner, depth - 1));
+                out.extend(self.flatten(&inner, depth - 1, rec + 1)?);
             } else {
                 out.push(*e);
             }
         }
-        out
+        Ok(out)
     }
 
     fn iterate_values(&mut self, v: NanBox) -> Result<Vec<NanBox>, ExecError> {
@@ -13568,6 +13681,12 @@ impl<'a> Interp<'a> {
                         return Err(throw(self, "Exponent must be non-negative"));
                     }
                     let e = y.to_i128().and_then(|v| u64::try_from(v).ok()).unwrap_or(0);
+                    // Projected result size ≈ bit_len(x) × e. Reject before the
+                    // (possibly multi-GB) allocation, else `2n ** 1e10n` OOMs.
+                    if x.bit_len().saturating_mul(e) > MAX_BIGINT_BITS {
+                        let m = self.new_str("Maximum BigInt size exceeded");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
                     val(self, x.pow(e))
                 }
                 // Two's-complement bitwise ops at arbitrary precision.
@@ -13582,6 +13701,19 @@ impl<'a> Interp<'a> {
                     // `>>` is `<<` by the negated count, and vice versa.
                     let left = (op == BinaryOp::Shl) == (count >= 0);
                     let mag = u64::try_from(count.unsigned_abs()).unwrap_or(0);
+                    // A left shift grows the result to ≈ bit_len(x) + mag bits;
+                    // reject an attacker count before building `2^mag`. (A right
+                    // shift only shrinks, so it needs no bound — but `2^mag` is
+                    // still built, so cap the exponent itself.)
+                    let projected = if left {
+                        x.bit_len().saturating_add(mag)
+                    } else {
+                        mag
+                    };
+                    if projected > MAX_BIGINT_BITS {
+                        let m = self.new_str("Maximum BigInt size exceeded");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
                     let pow2 = two.pow(mag);
                     if left {
                         val(self, x.mul(&pow2))
@@ -13748,7 +13880,13 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(match op {
-            BinaryOp::Add => self.realm.add(a, b),
+            BinaryOp::Add => match self.realm.add_checked(a, b) {
+                Ok(v) => v,
+                Err(()) => {
+                    let m = self.new_str("Invalid string length");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+            },
             BinaryOp::Sub => self.realm.sub(a, b),
             BinaryOp::Mul => self.realm.mul(a, b),
             BinaryOp::Div => self.realm.div(a, b),
@@ -14371,12 +14509,25 @@ fn pad_start(s: &str, target: usize, pad: &str) -> String {
         return String::from(s);
     }
     let need = target - len;
-    let mut filler = String::new();
-    while filler.chars().count() < need {
-        filler.push_str(pad);
-    }
-    let filler: String = filler.chars().take(need).collect();
+    let filler = build_filler(need, pad);
     filler + s
+}
+
+/// Builds a string of exactly `need` characters by repeating `pad`, tracking the
+/// running char count with a counter (not recounting the whole buffer each
+/// iteration — that is O(n²)). `pad` must be non-empty.
+fn build_filler(need: usize, pad: &str) -> String {
+    let pad_len = pad.chars().count();
+    let mut filler = String::with_capacity(need.saturating_mul(pad.len() / pad_len.max(1)));
+    let mut have = 0usize;
+    while have < need {
+        filler.push_str(pad);
+        have += pad_len;
+    }
+    if have > need {
+        filler = filler.chars().take(need).collect();
+    }
+    filler
 }
 
 /// `Number.prototype.toPrecision(p)`: render `n` with `p` significant digits,
@@ -14423,11 +14574,7 @@ fn pad_end(s: &str, target: usize, pad: &str) -> String {
         return String::from(s);
     }
     let need = target - len;
-    let mut filler = String::new();
-    while filler.chars().count() < need {
-        filler.push_str(pad);
-    }
-    let filler: String = filler.chars().take(need).collect();
+    let filler = build_filler(need, pad);
     String::from(s) + &filler
 }
 
