@@ -5,6 +5,21 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+/// The largest accepted explicit quantifier bound (`a{N}` / `a{N,M}`). Bounds
+/// above this are rejected at parse time so a pattern like `a{99999999999}` can
+/// never reach the compiler and blow up instruction count / memory (RE-3). The
+/// compiler enforces a stricter *expanded-size* budget on top of this.
+const MAX_QUANT: usize = 1_000_000;
+
+/// Maximum nesting depth the parser will descend (groups / lookaround). Past this
+/// the parser errors instead of recursing, so a pathological pattern such as
+/// `"(".repeat(100_000)` cannot overflow the stack during parsing (RE-4). Each
+/// nesting level costs several recursive frames (`parse_group` →
+/// `parse_alt`/`concat`/`quantified`/`atom` → `parse_group`), so this is kept
+/// well below the point that would exhaust a small (2 MiB) embedding stack while
+/// remaining far above any realistic legitimate nesting.
+const MAX_PARSE_DEPTH: u32 = 300;
+
 /// A regex compilation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegexError {
@@ -170,6 +185,7 @@ pub(crate) fn parse(pattern: &str) -> Result<(Node, usize, GroupNames), RegexErr
         pos: 0,
         group_count: 0,
         group_names: Vec::new(),
+        depth: 0,
     };
     let node = p.parse_alt()?;
     if p.pos != p.chars.len() {
@@ -186,6 +202,8 @@ struct Parser {
     pos: usize,
     group_count: usize,
     group_names: Vec<(usize, alloc::string::String)>,
+    /// Current group/lookaround nesting depth, bounded by `MAX_PARSE_DEPTH`.
+    depth: u32,
 }
 
 impl Parser {
@@ -253,7 +271,7 @@ impl Parser {
                 self.pos += 1;
                 (0, Some(1))
             }
-            Some('{') => match self.try_parse_brace() {
+            Some('{') => match self.try_parse_brace()? {
                 Some(bounds) => bounds,
                 None => return Ok(atom), // a literal `{` not forming a quantifier
             },
@@ -269,25 +287,27 @@ impl Parser {
         })
     }
 
-    /// Parses a `{n}` / `{n,}` / `{n,m}` quantifier, returning `None` (without
-    /// consuming) if it is not a well-formed bound (then `{` is a literal).
-    fn try_parse_brace(&mut self) -> Option<(usize, Option<usize>)> {
+    /// Parses a `{n}` / `{n,}` / `{n,m}` quantifier, returning `Ok(None)` (without
+    /// consuming) if it is not a well-formed bound (then `{` is a literal). An
+    /// out-of-range bound (`parse_int` overflow) or an inverted range (`{5,2}`)
+    /// is a hard `Err` rather than a silent fallback.
+    fn try_parse_brace(&mut self) -> Result<Option<(usize, Option<usize>)>, RegexError> {
         let save = self.pos;
         self.pos += 1; // `{`
-        let min = self.parse_int();
+        let min = self.parse_int()?;
         let Some(min) = min else {
             self.pos = save;
-            return None;
+            return Ok(None);
         };
         let max = if self.eat(',') {
             if self.peek() == Some('}') {
                 None
             } else {
-                match self.parse_int() {
+                match self.parse_int()? {
                     Some(m) => Some(m),
                     None => {
                         self.pos = save;
-                        return None;
+                        return Ok(None);
                     }
                 }
             }
@@ -296,23 +316,47 @@ impl Parser {
         };
         if !self.eat('}') {
             self.pos = save;
-            return None;
+            return Ok(None);
         }
-        Some((min, max))
+        // Reject an inverted range like `a{5,2}`.
+        if let Some(m) = max
+            && min > m
+        {
+            return Err(RegexError::new(
+                "quantifier range out of order (min greater than max)",
+            ));
+        }
+        Ok(Some((min, max)))
     }
 
-    fn parse_int(&mut self) -> Option<usize> {
+    /// Parses a run of decimal digits as a quantifier bound. `Ok(None)` means no
+    /// digits were present (so `{` is a literal); `Ok(Some(v))` is the value;
+    /// `Err` is returned when the value exceeds `MAX_QUANT` — quantifier bounds
+    /// must NOT silently saturate (a saturated giant bound would blow up the
+    /// compiler / allocate enormously, RE-3), so an out-of-range bound is a hard
+    /// compile error.
+    fn parse_int(&mut self) -> Result<Option<usize>, RegexError> {
         let start = self.pos;
         let mut value: usize = 0;
+        let mut overflow = false;
         while let Some(c) = self.peek() {
             if let Some(d) = c.to_digit(10) {
                 value = value.saturating_mul(10).saturating_add(d as usize);
+                if value > MAX_QUANT {
+                    overflow = true;
+                }
                 self.pos += 1;
             } else {
                 break;
             }
         }
-        if self.pos == start { None } else { Some(value) }
+        if self.pos == start {
+            Ok(None)
+        } else if overflow {
+            Err(RegexError::new("quantifier bound too large"))
+        } else {
+            Ok(Some(value))
+        }
     }
 
     fn parse_atom(&mut self) -> Result<Node, RegexError> {
@@ -343,7 +387,21 @@ impl Parser {
         }
     }
 
+    /// Depth-guarded entry to group parsing: bounds nesting so deeply nested
+    /// patterns (`"(".repeat(100_000)`) error out instead of overflowing the
+    /// parser's own recursion (RE-4).
     fn parse_group(&mut self) -> Result<Node, RegexError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(RegexError::new("pattern nested too deeply"));
+        }
+        let result = self.parse_group_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_group_inner(&mut self) -> Result<Node, RegexError> {
         self.pos += 1; // `(`
         let index = if self.peek() == Some('?') {
             // `(?: … )` non-capturing; `(?<name> … )` named capturing.

@@ -108,7 +108,7 @@ impl Regex {
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, RegexError> {
         let flags = Flags::parse(flags)?;
         let (ast, _, group_names) = parser::parse(pattern)?;
-        let (prog, group_count) = compile::compile(&ast, &group_names);
+        let (prog, group_count) = compile::compile(&ast, &group_names)?;
         Ok(Regex {
             prog,
             group_count,
