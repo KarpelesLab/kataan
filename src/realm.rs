@@ -39,6 +39,11 @@ use alloc::vec::Vec;
 /// [`Realm::typed_views`]: `(view_handle, byte_offset, element_kind, element_size)`.
 type TypedView = (u64, usize, u16, usize);
 
+/// Maximum nesting depth `to_display_string` walks before rendering a level as
+/// empty (matching the cycle rule), so a deep acyclic array/proxy chain cannot
+/// overflow the host stack during stringification.
+const MAX_DISPLAY_DEPTH: usize = 1000;
+
 /// An object-model context: the heap, the shared root shape, and the atom table.
 pub struct Realm {
     heap: Heap<Cell>,
@@ -1501,8 +1506,10 @@ impl Realm {
                 Some(Cell::Str(r)) => r.materialize(),
                 Some(Cell::Array(elems)) => {
                     let h = Handle::from_raw(raw);
-                    // A circular reference back to this array renders empty.
-                    if seen.contains(&h) {
+                    // A circular reference back to this array renders empty; so
+                    // does nesting past the depth cap, so a deep acyclic array
+                    // cannot overflow the host stack here.
+                    if seen.contains(&h) || seen.len() >= MAX_DISPLAY_DEPTH {
                         return alloc::string::String::new();
                     }
                     seen.push(h);
@@ -1555,7 +1562,7 @@ impl Realm {
                 // A proxy renders as its target would.
                 Some(Cell::Proxy { target, .. }) => {
                     let h = Handle::from_raw(raw);
-                    if seen.contains(&h) {
+                    if seen.contains(&h) || seen.len() >= MAX_DISPLAY_DEPTH {
                         return alloc::string::String::new();
                     }
                     seen.push(h);
@@ -1574,26 +1581,48 @@ impl Realm {
     /// loop of `+` stays O(1) per step). Other combinations coerce to string for
     /// now (full `ToPrimitive` arrives with the boxed primitives).
     pub fn add(&mut self, a: NanBox, b: NanBox) -> NanBox {
+        // The non-throwing wrapper (used by callers without an error channel):
+        // an over-length string concatenation degrades to the spec error value's
+        // text rather than corrupting a length or OOM-ing. Callers that can throw
+        // use [`Realm::add_checked`] to surface the proper `RangeError`.
+        self.add_checked(a, b).unwrap_or_else(|()| {
+            let handle = self.heap.alloc(Cell::Str(Rope::from("Invalid string length")));
+            NanBox::handle(handle.to_raw())
+        })
+    }
+
+    /// ECMAScript `+`, returning `Err(())` when a string concatenation would
+    /// exceed the maximum representable string length (so the caller throws a
+    /// `RangeError`) instead of overflowing the cached length / OOM-ing.
+    ///
+    /// # Errors
+    /// `Err(())` when the concatenated string would exceed [`rope::MAX_STRING_LEN`].
+    pub fn add_checked(&mut self, a: NanBox, b: NanBox) -> Result<NanBox, ()> {
         if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
-            return NanBox::number(x + y);
+            return Ok(NanBox::number(x + y));
         }
         // A string operand keeps the O(1) rope concatenation path.
         if self.is_string(a) || self.is_string(b) {
-            let combined = self.rope_of(a).concat(&self.rope_of(b));
+            let combined = self.rope_of(a).try_concat(&self.rope_of(b)).ok_or(())?;
             let handle = self.heap.alloc(Cell::Str(combined));
-            return NanBox::handle(handle.to_raw());
+            return Ok(NanBox::handle(handle.to_raw()));
         }
         // Any other heap value (array, object): `+` is string concatenation
         // after `ToPrimitive` — our arrays/objects stringify (`[1,2] + [3,4]`
         // → "1,23,4", `{} + "!"` → "[object Object]!").
         if a.as_handle().is_some() || b.as_handle().is_some() {
-            let mut combined = self.to_display_string(a);
-            combined.push_str(&self.to_display_string(b));
+            let left = self.to_display_string(a);
+            let right = self.to_display_string(b);
+            if left.len().checked_add(right.len()).is_none_or(|n| n > crate::rope::MAX_STRING_LEN) {
+                return Err(());
+            }
+            let mut combined = left;
+            combined.push_str(&right);
             let handle = self.heap.alloc(Cell::Str(Rope::from(combined.as_str())));
-            return NanBox::handle(handle.to_raw());
+            return Ok(NanBox::handle(handle.to_raw()));
         }
         // Primitives only (bool/null/undefined): numeric.
-        NanBox::number(self.to_number(a) + self.to_number(b))
+        Ok(NanBox::number(self.to_number(a) + self.to_number(b)))
     }
 
     /// ECMAScript `ToNumber` (the cases this model covers): numbers pass
