@@ -127,8 +127,13 @@ pub unsafe extern "C" fn kt_eval(
         if out_len.is_null() || (source.is_null() && source_len != 0) {
             return KtStatus::NullPointer;
         }
-        // SAFETY: caller guarantees `source` covers `source_len` bytes.
-        let bytes = unsafe { core::slice::from_raw_parts(source as *const u8, source_len) };
+        // SAFETY: caller guarantees `source` covers `source_len` bytes; a null
+        // pointer with zero length is the empty input (never dereferenced).
+        let bytes: &[u8] = if source.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+        };
         let Ok(src) = core::str::from_utf8(bytes) else {
             return KtStatus::InvalidInput;
         };
@@ -228,8 +233,13 @@ pub unsafe extern "C" fn kt_compile(
         if out_len.is_null() || (source.is_null() && source_len != 0) {
             return KtStatus::NullPointer;
         }
-        // SAFETY: caller guarantees `source` covers `source_len` bytes.
-        let bytes = unsafe { core::slice::from_raw_parts(source as *const u8, source_len) };
+        // SAFETY: caller guarantees `source` covers `source_len` bytes; a null
+        // pointer with zero length is the empty input (never dereferenced).
+        let bytes: &[u8] = if source.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+        };
         let Ok(src) = core::str::from_utf8(bytes) else {
             return KtStatus::InvalidInput;
         };
@@ -269,8 +279,13 @@ pub unsafe extern "C" fn kt_load_bytecode(
         if out_len.is_null() || (bytecode.is_null() && bytecode_len != 0) {
             return KtStatus::NullPointer;
         }
-        // SAFETY: caller guarantees `bytecode` covers `bytecode_len` bytes.
-        let bytes = unsafe { core::slice::from_raw_parts(bytecode as *const u8, bytecode_len) };
+        // SAFETY: caller guarantees `bytecode` covers `bytecode_len` bytes; a
+        // null pointer with zero length is the empty input (never dereferenced).
+        let bytes: &[u8] = if bytecode.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(bytecode as *const u8, bytecode_len) }
+        };
         let (text, ok) = match run_bytecode_to_string(bytes) {
             Ok(value) => (value, true),
             Err(message) => (message, false),
@@ -310,8 +325,13 @@ pub unsafe extern "C" fn kt_snapshot(
         if out_len.is_null() || (source.is_null() && source_len != 0) {
             return KtStatus::NullPointer;
         }
-        // SAFETY: caller guarantees `source` covers `source_len` bytes.
-        let bytes = unsafe { core::slice::from_raw_parts(source as *const u8, source_len) };
+        // SAFETY: caller guarantees `source` covers `source_len` bytes; a null
+        // pointer with zero length is the empty input (never dereferenced).
+        let bytes: &[u8] = if source.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+        };
         let Ok(src) = core::str::from_utf8(bytes) else {
             return KtStatus::InvalidInput;
         };
@@ -354,8 +374,13 @@ pub unsafe extern "C" fn kt_restore(
         if out_len.is_null() || (snapshot.is_null() && snapshot_len != 0) {
             return KtStatus::NullPointer;
         }
-        // SAFETY: caller guarantees `snapshot` covers `snapshot_len` bytes.
-        let bytes = unsafe { core::slice::from_raw_parts(snapshot as *const u8, snapshot_len) };
+        // SAFETY: caller guarantees `snapshot` covers `snapshot_len` bytes; a
+        // null pointer with zero length is the empty input (never dereferenced).
+        let bytes: &[u8] = if snapshot.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(snapshot as *const u8, snapshot_len) }
+        };
         let (text, ok) = match restore_to_string(bytes) {
             Ok(value) => (value, true),
             Err(message) => (message, false),

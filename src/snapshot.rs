@@ -366,6 +366,13 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                     .last()
                     .cloned()
                     .unwrap_or_else(crate::env::Scope::root);
+                // SNAP-2: `func_id` is taken from the snapshot verbatim and is
+                // NOT validated against any loaded function table here — it is a
+                // raw index into whatever program is later run. A restored
+                // closure must therefore only be invoked when the matching
+                // compiled program is loaded; invoking one against a different
+                // (or absent) program is undefined. The FFI restore path never
+                // calls restored closures, so this is currently unreachable.
                 (realm.new_function(*func_id, innermost), Some(chain))
             }
             SnapCell::Collection { is_set, .. } => (realm.new_collection(*is_set), None),
@@ -644,6 +651,15 @@ struct R<'a> {
     p: usize,
 }
 impl R<'_> {
+    /// Bytes left unread in the buffer. Used to cap untrusted count fields: each
+    /// serialized element costs at least one byte, so a reservation can never
+    /// legitimately exceed what remains. Clamping a hostile `0xFFFFFFFF` count
+    /// to this bound turns an allocation bomb (capacity-overflow panic or an
+    /// uncatchable alloc abort) into a small reservation that the per-element
+    /// read loop then rejects with `Truncated`.
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.p)
+    }
     fn take(&mut self, n: usize) -> Result<&[u8], SnapError> {
         let end = self.p.checked_add(n).ok_or(SnapError::Truncated)?;
         let s = self.b.get(self.p..end).ok_or(SnapError::Truncated)?;
@@ -691,18 +707,18 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
         return Err(SnapError::BadHeader);
     }
     let n_roots = r.u32()? as usize;
-    let mut roots = Vec::with_capacity(n_roots);
+    let mut roots = Vec::with_capacity(n_roots.min(r.remaining()));
     for _ in 0..n_roots {
         roots.push(r.u32()? as usize);
     }
     let n_cells = r.u32()? as usize;
-    let mut cells = Vec::with_capacity(n_cells);
+    let mut cells = Vec::with_capacity(n_cells.min(r.remaining()));
     for _ in 0..n_cells {
         let cell = match r.u8()? {
             0 => SnapCell::Str(r.string()?),
             1 => {
                 let n = r.u32()? as usize;
-                let mut vals = Vec::with_capacity(n);
+                let mut vals = Vec::with_capacity(n.min(r.remaining()));
                 for _ in 0..n {
                     vals.push(r.val()?);
                 }
@@ -710,7 +726,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
             }
             2 => {
                 let n = r.u32()? as usize;
-                let mut props = Vec::with_capacity(n);
+                let mut props = Vec::with_capacity(n.min(r.remaining()));
                 for _ in 0..n {
                     let k = r.string()?;
                     let v = r.val()?;
@@ -718,7 +734,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                     props.push((k, v, hidden));
                 }
                 let na = r.u32()? as usize;
-                let mut accessors = Vec::with_capacity(na);
+                let mut accessors = Vec::with_capacity(na.min(r.remaining()));
                 for _ in 0..na {
                     let k = r.string()?;
                     let g = r.val()?;
@@ -738,10 +754,10 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
             5 => {
                 let func_id = r.u32()?;
                 let nf = r.u32()? as usize;
-                let mut frames = Vec::with_capacity(nf);
+                let mut frames = Vec::with_capacity(nf.min(r.remaining()));
                 for _ in 0..nf {
                     let nv = r.u32()? as usize;
-                    let mut vars = Vec::with_capacity(nv);
+                    let mut vars = Vec::with_capacity(nv.min(r.remaining()));
                     for _ in 0..nv {
                         let name = r.string()?;
                         let v = r.val()?;
@@ -755,7 +771,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
             6 => {
                 let is_set = r.u8()? != 0;
                 let n = r.u32()? as usize;
-                let mut entries = Vec::with_capacity(n);
+                let mut entries = Vec::with_capacity(n.min(r.remaining()));
                 for _ in 0..n {
                     let k = r.val()?;
                     let v = r.val()?;
