@@ -20,6 +20,11 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// Maximum length, in bytes, of a string the engine will build by
+/// concatenation. A `+` whose result would exceed this is a `RangeError`
+/// ("Invalid string length") rather than a `usize` overflow / OOM bomb.
+pub const MAX_STRING_LEN: usize = 1 << 30;
+
 /// A string value represented as a tree of concatenated segments. Cloning is a
 /// reference-count bump; concatenation and length are O(1).
 #[derive(Clone)]
@@ -60,22 +65,38 @@ impl Rope {
         self.len() == 0
     }
 
-    /// Concatenates `self` and `other` in O(1), sharing both sides.
+    /// Concatenates `self` and `other` in O(1) when the combined length is
+    /// representable (≤ [`MAX_STRING_LEN`]), sharing both sides. Returns `None`
+    /// when the result would overflow `usize` or exceed the cap — the caller
+    /// turns that into a `RangeError("Invalid string length")` rather than
+    /// corrupting the cached length or OOM-ing on materialization.
     #[must_use]
-    pub fn concat(&self, other: &Rope) -> Rope {
+    pub fn try_concat(&self, other: &Rope) -> Option<Rope> {
         // Concatenating with empty just shares the non-empty side.
         if self.is_empty() {
-            return other.clone();
+            return Some(other.clone());
         }
         if other.is_empty() {
-            return self.clone();
+            return Some(self.clone());
         }
-        let len = self.len() + other.len();
-        Rope(Rc::new(Node::Concat {
+        let len = self.len().checked_add(other.len())?;
+        if len > MAX_STRING_LEN {
+            return None;
+        }
+        Some(Rope(Rc::new(Node::Concat {
             left: self.clone(),
             right: other.clone(),
             len,
-        }))
+        })))
+    }
+
+    /// Concatenates `self` and `other` in O(1), sharing both sides. A result
+    /// past [`MAX_STRING_LEN`] (or `usize` overflow) is clamped to sharing only
+    /// the left side — a bounded, panic-free degradation. Callers that need to
+    /// surface the spec's `RangeError` use [`Rope::try_concat`] instead.
+    #[must_use]
+    pub fn concat(&self, other: &Rope) -> Rope {
+        self.try_concat(other).unwrap_or_else(|| self.clone())
     }
 
     /// Appends `s` to the rope (O(1)), returning the new rope.
