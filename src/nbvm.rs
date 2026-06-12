@@ -392,6 +392,17 @@ struct Ctx<'a> {
 /// to fire before the large stack the engine entry points run on overflows.
 const MAX_VM_CALL_DEPTH: usize = 3500;
 
+/// Maximum live exception-handler entries in a single frame. A verified artifact
+/// can route a back-edge around a `PushHandler`; this caps the handler stack so it
+/// can't grow unboundedly (OOM). Generous relative to any real `try` nesting.
+const MAX_HANDLER_DEPTH: usize = 100_000;
+
+/// Maximum nesting the interpreter-aware JSON walkers (`json_revive`,
+/// `json_normalize`) descend before throwing a catchable `RangeError`. These
+/// recurse on the native stack with cycle detection only, so deep non-cyclic
+/// nesting would otherwise overflow the stack independent of `call_depth`.
+const MAX_JSON_DEPTH: usize = 2000;
+
 /// Tier state for one function: its activation count and, once hot, its
 /// optimized bytecode body.
 type TierState = (u32, Option<alloc::rc::Rc<Vec<Op>>>);
@@ -481,7 +492,13 @@ fn call_with_inner(
     captures: &[NanBox],
     this_val: NanBox,
 ) -> Result<NanBox, VmError> {
-    let proto = &funcs[id];
+    // `id` can originate from a runtime value (an indirect call reads it out of a
+    // callee array's slot 0), so a hostile script can make it point past the
+    // function table. Surface a catchable TypeError instead of indexing OOB.
+    let Some(proto) = funcs.get(id) else {
+        let e = make_error(ctx.realm, "TypeError", "not a function");
+        return Err(VmError::Thrown(e));
+    };
     let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
     match proto.rest_from {
         // A rest parameter: fixed args fill `0..fixed`, the remainder becomes an
@@ -1193,6 +1210,12 @@ fn run_frame(
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::NewArray { dst, len } => {
+                // Defence in depth: the verifier rejects oversized lengths, but the
+                // call-free `run` entrypoint runs unverified ops, so cap here too.
+                if *len > 100_000_000 {
+                    let e = make_error(ctx.realm, "RangeError", "Array length too large");
+                    return Err(VmError::Thrown(e));
+                }
                 let handle = ctx.realm.new_array(vec![NanBox::undefined(); *len]);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
@@ -1732,7 +1755,17 @@ fn run_frame(
                     regs[*dst as usize] = call_native(ctx, *native, &argv);
                 }
             }
-            Op::PushHandler { target, reg } => handlers.push((*target, *reg)),
+            Op::PushHandler { target, reg } => {
+                // A crafted artifact can loop a back-edge around this push; bound the
+                // handler stack so it can't grow without limit (OOM). Surface a
+                // catchable RangeError rather than aborting.
+                if handlers.len() >= MAX_HANDLER_DEPTH {
+                    let e = make_error(ctx.realm, "RangeError", "Handler stack overflow");
+                    handle_throw!(VmError::Thrown(e));
+                } else {
+                    handlers.push((*target, *reg));
+                }
+            }
             Op::PopHandler => {
                 handlers.pop();
             }
@@ -1799,6 +1832,7 @@ fn json_stringify(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<N
         repl_fn,
         allow.as_deref(),
         &mut seen,
+        0,
     )?;
     let result = if indent.is_empty() {
         crate::json::stringify(ctx.realm, v)
@@ -1830,7 +1864,7 @@ fn json_parse(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<NanBo
     {
         let holder = ctx.realm.new_object();
         ctx.realm.set_property(holder, "", value);
-        return json_revive(ctx, funcs, holder, "", reviver);
+        return json_revive(ctx, funcs, holder, "", reviver, 0);
     }
     Ok(value)
 }
@@ -1844,7 +1878,15 @@ fn json_revive(
     holder: Handle,
     key: &str,
     reviver: NanBox,
+    depth: usize,
 ) -> Result<NanBox, VmError> {
+    if depth >= MAX_JSON_DEPTH {
+        return Err(VmError::Thrown(make_error(
+            ctx.realm,
+            "RangeError",
+            "Maximum JSON nesting depth exceeded",
+        )));
+    }
     let value = if ctx.realm.is_array(holder)
         && let Ok(i) = key.parse::<usize>()
     {
@@ -1859,12 +1901,12 @@ fn json_revive(
             let len = ctx.realm.array_length(vh).unwrap_or(0);
             for i in 0..len {
                 let ks = alloc::format!("{i}");
-                let nv = json_revive(ctx, funcs, vh, &ks, reviver)?;
+                let nv = json_revive(ctx, funcs, vh, &ks, reviver, depth + 1)?;
                 ctx.realm.set_element(vh, i, nv);
             }
         } else if let Some(keys) = ctx.realm.object_keys(vh) {
             for k in keys {
-                let nv = json_revive(ctx, funcs, vh, &k, reviver)?;
+                let nv = json_revive(ctx, funcs, vh, &k, reviver, depth + 1)?;
                 if matches!(nv.unpack(), crate::nanbox::Unpacked::Undefined) {
                     ctx.realm.delete_property(vh, &k);
                 } else {
@@ -1921,7 +1963,15 @@ fn json_normalize(
     replacer: Option<NanBox>,
     allow: Option<&[alloc::string::String]>,
     seen: &mut Vec<Handle>,
+    depth: usize,
 ) -> Result<NanBox, VmError> {
+    if depth >= MAX_JSON_DEPTH {
+        return Err(VmError::Thrown(make_error(
+            ctx.realm,
+            "RangeError",
+            "Maximum JSON nesting depth exceeded",
+        )));
+    }
     let mut v = value;
     // `toJSON(key)` replaces the value (real objects only — not strings/bigints/Dates,
     // whose serialization the realm handles).
@@ -1965,7 +2015,7 @@ fn json_normalize(
             for (i, e) in elems.into_iter().enumerate() {
                 let kk = alloc::format!("{i}");
                 out.push(json_normalize(
-                    ctx, funcs, v, &kk, e, replacer, allow, seen,
+                    ctx, funcs, v, &kk, e, replacer, allow, seen, depth + 1,
                 )?);
             }
             seen.pop();
@@ -1997,7 +2047,7 @@ fn json_normalize(
             let new_obj = ctx.realm.new_object();
             for k in key_list {
                 let pv = json_read_prop(ctx, funcs, h, &k)?;
-                let nv = json_normalize(ctx, funcs, v, &k, pv, replacer, allow, seen)?;
+                let nv = json_normalize(ctx, funcs, v, &k, pv, replacer, allow, seen, depth + 1)?;
                 ctx.realm.set_property(new_obj, &k, nv);
             }
             seen.pop();

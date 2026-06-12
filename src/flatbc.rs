@@ -122,7 +122,15 @@ pub fn run(bytes: &[u8], args: &[i64]) -> Result<i64, FlatError> {
     let n_regs = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
     let _n_params = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
     let n_ops = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-    if bytes.len() < HEADER + n_ops * RECORD {
+    // On 32-bit, `n_ops * RECORD` (u32 × 16) can overflow `usize`, sliding the
+    // length check past a buffer that is actually too short and panicking on the
+    // record slice below. Compute the required length with checked arithmetic and
+    // reject (rather than wrap) on overflow.
+    let needed = n_ops
+        .checked_mul(RECORD)
+        .and_then(|n| n.checked_add(HEADER))
+        .ok_or(FlatError::Malformed)?;
+    if bytes.len() < needed {
         return Err(FlatError::Malformed);
     }
     // The one runtime allocation: the mutable register file over immutable code.

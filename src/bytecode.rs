@@ -176,7 +176,14 @@ pub enum VerifyError {
     Function(u32),
     /// A jump/handler target outside `0..=ops.len()`.
     Target(usize),
+    /// A `NewArray` length above the allocation cap (a hostile snapshot).
+    ArrayLen(usize),
 }
+
+/// Maximum eager `NewArray` length accepted by the verifier — mirrors the
+/// `NewArrayCtor` / `Array(n)` cap so a crafted snapshot can't request an
+/// `usize::MAX`-element allocation that aborts at run time.
+pub const MAX_ARRAY_LEN: usize = 100_000_000;
 
 /// Verifies a decoded program is **safe to run**: every register reference is in
 /// `0..n_regs`, every function index addresses a real function, and every jump /
@@ -296,9 +303,15 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*getter)?;
             reg(*setter)
         }
+        Op::NewArray { dst, len } => {
+            reg(*dst)?;
+            if *len > MAX_ARRAY_LEN {
+                return Err(VerifyError::ArrayLen(*len));
+            }
+            Ok(())
+        }
         Op::LoadConst { dst, .. }
         | Op::NewString { dst, .. }
-        | Op::NewArray { dst, .. }
         | Op::NewRegExp { dst, .. }
         | Op::NewObject { dst } => reg(*dst),
         Op::IsBuiltin { dst, obj, .. }
