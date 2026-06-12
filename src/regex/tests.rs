@@ -168,3 +168,44 @@ fn errors() {
     assert!(Regex::new("a", "z").is_err()); // unknown flag
     assert!(Regex::new("*abc", "").is_err()); // nothing to repeat
 }
+
+#[test]
+fn redos_catastrophic_terminates() {
+    let subject: alloc::string::String = "a".repeat(40) + "!";
+    assert!(!re("(a+)+$", "").is_match(&subject));
+}
+
+#[test]
+fn redos_linear_depth_terminates() {
+    let subject: alloc::string::String = "a".repeat(200_000);
+    assert!(re("a*", "").is_match(&subject));
+    assert_eq!(
+        re("a+", "").captures_from(&subject, 0).unwrap().whole().1,
+        200_000
+    );
+}
+
+#[test]
+fn redos_zero_width_terminates() {
+    assert!(re("()*", "").is_match("abc"));
+    assert!(re("(a*)*", "").is_match("aaa"));
+    assert!(re("(a*)*", "").is_match(""));
+    assert!(re("(|a)*", "").is_match("aa"));
+}
+
+#[test]
+fn compile_blowup_rejected() {
+    assert!(Regex::new("a{99999999999}", "").is_err());
+    assert!(Regex::new("a{5,2}", "").is_err());
+    assert!(Regex::new("(a{1000}){1000}", "").is_err());
+    assert!(Regex::new("a{100}", "").is_ok());
+    assert!(Regex::new("a{2,4}", "").is_ok());
+}
+
+#[test]
+fn parser_deep_nesting_rejected() {
+    let pat: alloc::string::String = "(".repeat(100_000) + "a" + &")".repeat(100_000);
+    assert!(Regex::new(&pat, "").is_err());
+    let ok: alloc::string::String = "(".repeat(50) + "a" + &")".repeat(50);
+    assert!(Regex::new(&ok, "").is_ok());
+}
