@@ -1,0 +1,176 @@
+name: Release binaries
+
+# Fires whenever a GitHub Release is published. release-plz creates the
+# release on its own (see release-plz.yml); this workflow attaches the
+# cross-built CLI binary, the C library (static + shared), and the C header.
+#
+# Also exposed via workflow_dispatch so a failed asset upload can be
+# retried against an existing release without re-tagging.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload to (e.g. v0.0.3)"
+        required: true
+        type: string
+
+permissions:
+  # gh release upload needs to attach assets.
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Resolve the target tag once — `release` and `workflow_dispatch` use
+  # different paths in the event payload.
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            asset_suffix: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            asset_suffix: linux-aarch64
+            apt_packages: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            asset_suffix: windows-x86_64
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            asset_suffix: windows-aarch64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cross compiler (Linux aarch64)
+        if: matrix.apt_packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build CLI and C library
+        shell: bash
+        env:
+          # Only set the linker env var when the matrix entry asks for one.
+          # GitHub Actions silently drops empty `env:` values, so this is
+          # a no-op for the native targets.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: |
+          cargo build --release --bin kataan --target ${{ matrix.target }}
+          cargo rustc --lib --release --features ffi --crate-type staticlib --target ${{ matrix.target }}
+          cargo rustc --lib --release --features ffi --crate-type cdylib --target ${{ matrix.target }}
+
+      - name: Stage archive contents
+        shell: bash
+        run: |
+          mkdir -p staging/bin staging/lib staging/include
+          cp include/kataan.h staging/include/
+          cp README.md LICENSE staging/
+          td="target/${{ matrix.target }}/release"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "$td/kataan.exe" staging/bin/
+            cp "$td/kataan.lib" staging/lib/ 2>/dev/null || true      # static library
+            cp "$td/kataan.dll" staging/lib/ 2>/dev/null || true      # shared library
+            cp "$td/kataan.dll.lib" staging/lib/ 2>/dev/null || true  # import library for the DLL
+          else
+            cp "$td/kataan" staging/bin/
+            cp "$td/libkataan.a" staging/lib/
+            cp "$td"/libkataan.so staging/lib/ 2>/dev/null || true    # Linux
+            cp "$td"/libkataan.dylib staging/lib/ 2>/dev/null || true # macOS
+          fi
+          ls -R staging
+
+      - name: Pack archive
+        id: pack
+        shell: bash
+        run: |
+          name="kataan-${TAG}-${{ matrix.asset_suffix }}"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            asset="${name}.zip"
+            (cd staging && 7z a "../${asset}" *)
+          else
+            asset="${name}.tar.gz"
+            tar -C staging -czf "${asset}" .
+          fi
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
+
+  build-macos-universal:
+    name: build macos universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+
+      - name: Build both Apple slices (CLI + C library)
+        run: |
+          for t in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --release --bin kataan --target "$t"
+            cargo rustc --lib --release --features ffi --crate-type staticlib --target "$t"
+            cargo rustc --lib --release --features ffi --crate-type cdylib --target "$t"
+          done
+
+      - name: Lipo into universal artifacts
+        run: |
+          mkdir -p staging/bin staging/lib staging/include
+          lipo -create -output staging/bin/kataan \
+            target/x86_64-apple-darwin/release/kataan \
+            target/aarch64-apple-darwin/release/kataan
+          lipo -create -output staging/lib/libkataan.a \
+            target/x86_64-apple-darwin/release/libkataan.a \
+            target/aarch64-apple-darwin/release/libkataan.a
+          lipo -create -output staging/lib/libkataan.dylib \
+            target/x86_64-apple-darwin/release/libkataan.dylib \
+            target/aarch64-apple-darwin/release/libkataan.dylib
+          cp include/kataan.h staging/include/
+          cp README.md LICENSE staging/
+          file staging/bin/kataan staging/lib/libkataan.*
+
+      - name: Pack archive
+        id: pack
+        run: |
+          asset="kataan-${TAG}-macos-universal.tar.gz"
+          tar -C staging -czf "${asset}" .
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
