@@ -356,6 +356,20 @@ impl BigInt {
         self.bit_op(other, |a, b| a ^ b)
     }
 
+    /// The number of bits in the magnitude (0 for zero) — i.e. `floor(log2(|n|))
+    /// + 1`. Used to bound the projected size of a `pow`/shift result before
+    /// growing it, so an attacker exponent cannot drive an OOM.
+    #[must_use]
+    pub fn bit_len(&self) -> u64 {
+        match self.mag.last() {
+            None => 0,
+            Some(&top) => {
+                let full = (self.mag.len() as u64 - 1) * 32;
+                full + (32 - u64::from(top.leading_zeros()))
+            }
+        }
+    }
+
     /// Returns `self ** exp` (non-negative exponent) by binary exponentiation.
     #[must_use]
     pub fn pow(&self, mut exp: u64) -> Self {
