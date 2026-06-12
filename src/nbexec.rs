@@ -10234,7 +10234,9 @@ impl<'a> Interp<'a> {
     /// returning the value as a `usize`. The dense NanBox-backed model amplifies
     /// each slot 8×, so an uncapped length would alloc-abort the process.
     fn validate_alloc_len(&mut self, n: f64, what: &str) -> Result<usize, ExecError> {
-        if !n.is_finite() || n < 0.0 || n.floor() != n || n > MAX_ALLOC_LEN as f64 {
+        // `floor()` is std-only; once `n` is finite, non-negative, and within the
+        // cap, the `usize` round-trip is a core-friendly integrality check.
+        if !n.is_finite() || n < 0.0 || n > MAX_ALLOC_LEN as f64 || (n as usize as f64) != n {
             let m = self.new_str(what);
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
