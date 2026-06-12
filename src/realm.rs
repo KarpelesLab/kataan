@@ -1585,27 +1585,29 @@ impl Realm {
         // an over-length string concatenation degrades to the spec error value's
         // text rather than corrupting a length or OOM-ing. Callers that can throw
         // use [`Realm::add_checked`] to surface the proper `RangeError`.
-        self.add_checked(a, b).unwrap_or_else(|()| {
-            let handle = self.heap.alloc(Cell::Str(Rope::from("Invalid string length")));
+        self.add_checked(a, b).unwrap_or_else(|| {
+            let handle = self
+                .heap
+                .alloc(Cell::Str(Rope::from("Invalid string length")));
             NanBox::handle(handle.to_raw())
         })
     }
 
-    /// ECMAScript `+`, returning `Err(())` when a string concatenation would
+    /// ECMAScript `+`, returning `None` when a string concatenation would
     /// exceed the maximum representable string length (so the caller throws a
     /// `RangeError`) instead of overflowing the cached length / OOM-ing.
     ///
-    /// # Errors
-    /// `Err(())` when the concatenated string would exceed [`rope::MAX_STRING_LEN`].
-    pub fn add_checked(&mut self, a: NanBox, b: NanBox) -> Result<NanBox, ()> {
+    /// `None` is returned when the concatenated string would exceed
+    /// [`crate::rope::MAX_STRING_LEN`].
+    pub fn add_checked(&mut self, a: NanBox, b: NanBox) -> Option<NanBox> {
         if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
-            return Ok(NanBox::number(x + y));
+            return Some(NanBox::number(x + y));
         }
         // A string operand keeps the O(1) rope concatenation path.
         if self.is_string(a) || self.is_string(b) {
-            let combined = self.rope_of(a).try_concat(&self.rope_of(b)).ok_or(())?;
+            let combined = self.rope_of(a).try_concat(&self.rope_of(b))?;
             let handle = self.heap.alloc(Cell::Str(combined));
-            return Ok(NanBox::handle(handle.to_raw()));
+            return Some(NanBox::handle(handle.to_raw()));
         }
         // Any other heap value (array, object): `+` is string concatenation
         // after `ToPrimitive` — our arrays/objects stringify (`[1,2] + [3,4]`
@@ -1613,16 +1615,20 @@ impl Realm {
         if a.as_handle().is_some() || b.as_handle().is_some() {
             let left = self.to_display_string(a);
             let right = self.to_display_string(b);
-            if left.len().checked_add(right.len()).is_none_or(|n| n > crate::rope::MAX_STRING_LEN) {
-                return Err(());
+            if left
+                .len()
+                .checked_add(right.len())
+                .is_none_or(|n| n > crate::rope::MAX_STRING_LEN)
+            {
+                return None;
             }
             let mut combined = left;
             combined.push_str(&right);
             let handle = self.heap.alloc(Cell::Str(Rope::from(combined.as_str())));
-            return Ok(NanBox::handle(handle.to_raw()));
+            return Some(NanBox::handle(handle.to_raw()));
         }
         // Primitives only (bool/null/undefined): numeric.
-        Ok(NanBox::number(self.to_number(a) + self.to_number(b)))
+        Some(NanBox::number(self.to_number(a) + self.to_number(b)))
     }
 
     /// ECMAScript `ToNumber` (the cases this model covers): numbers pass

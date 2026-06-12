@@ -2015,7 +2015,15 @@ fn json_normalize(
             for (i, e) in elems.into_iter().enumerate() {
                 let kk = alloc::format!("{i}");
                 out.push(json_normalize(
-                    ctx, funcs, v, &kk, e, replacer, allow, seen, depth + 1,
+                    ctx,
+                    funcs,
+                    v,
+                    &kk,
+                    e,
+                    replacer,
+                    allow,
+                    seen,
+                    depth + 1,
                 )?);
             }
             seen.pop();

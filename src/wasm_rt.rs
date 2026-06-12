@@ -2332,8 +2332,15 @@ impl Module {
                 0x02 | 0x03 => {
                     let _blocktype = r.byte()?; // 0x40 (empty) or a value type
                     let is_loop = op == 0x03;
-                    let (consumed, flow) =
-                        self.exec_block(&code[r.pos..], locals, stack, store, host, is_loop, depth)?;
+                    let (consumed, flow) = self.exec_block(
+                        &code[r.pos..],
+                        locals,
+                        stack,
+                        store,
+                        host,
+                        is_loop,
+                        depth,
+                    )?;
                     r.pos += consumed;
                     match flow {
                         Flow::Return => return Ok(Flow::Return),
@@ -2497,6 +2504,10 @@ impl Module {
     /// Executes a structured block, returning `(bytes consumed up to and
     /// including its matching `end`, resulting flow)`. A `loop` re-enters on
     /// `br 0`; a `block` exits on `br 0`.
+    // The interpreter threads execution state (code, locals, stack, store, host)
+    // plus the `is_loop`/`depth` controls explicitly; bundling them into a struct
+    // would not improve clarity here.
+    #[allow(clippy::too_many_arguments)]
     fn exec_block(
         &self,
         code: &[u8],

@@ -7275,9 +7275,8 @@ impl<'a> Interp<'a> {
                             let dn = self.realm.to_number(arg(0));
                             let di = if dn.is_nan() { 0 } else { dn as i64 };
                             if !(0..=100).contains(&di) {
-                                let m = self.new_str(
-                                    "toExponential() argument must be between 0 and 100",
-                                );
+                                let m = self
+                                    .new_str("toExponential() argument must be between 0 and 100");
                                 return Err(ExecError::Throw(
                                     self.make_error(N_RANGE_ERROR, Some(m)),
                                 ));
@@ -8786,10 +8785,7 @@ impl<'a> Interp<'a> {
                     // A product that fits `usize` can still be enormous
                     // (`"x".repeat(2**40)` ≈ 1 TB); cap the result length too.
                     let total = n.checked_mul(s.len());
-                    if nf < 0.0
-                        || nf.is_infinite()
-                        || total.is_none_or(|t| t > MAX_STRING_LEN)
-                    {
+                    if nf < 0.0 || nf.is_infinite() || total.is_none_or(|t| t > MAX_STRING_LEN) {
                         let m = self.new_str("Invalid string length");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
@@ -11062,7 +11058,12 @@ impl<'a> Interp<'a> {
     /// `rec` is the current recursion depth; nesting past [`MAX_NATIVE_DEPTH`]
     /// throws rather than overflowing the host stack (`flat(Infinity)` on a
     /// pathologically deep array).
-    fn flatten(&mut self, elems: &[NanBox], depth: i32, rec: usize) -> Result<Vec<NanBox>, ExecError> {
+    fn flatten(
+        &mut self,
+        elems: &[NanBox],
+        depth: i32,
+        rec: usize,
+    ) -> Result<Vec<NanBox>, ExecError> {
         if rec >= MAX_NATIVE_DEPTH {
             let m = self.new_str("Maximum call stack size exceeded");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
@@ -13883,8 +13884,8 @@ impl<'a> Interp<'a> {
         }
         Ok(match op {
             BinaryOp::Add => match self.realm.add_checked(a, b) {
-                Ok(v) => v,
-                Err(()) => {
+                Some(v) => v,
+                None => {
                     let m = self.new_str("Invalid string length");
                     return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                 }
