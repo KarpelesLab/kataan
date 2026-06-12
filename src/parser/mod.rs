@@ -31,6 +31,24 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 
+/// Maximum recursive-descent nesting depth. Deeply nested source (e.g. a long
+/// run of unary operators, brackets, parens, or destructuring patterns) drives
+/// the parser into unbounded native recursion; without a cap this overflows the
+/// stack and `abort()`s — uncatchable by a library embedder linking the
+/// `alloc`-only core on a default ~8 MiB stack. The guard turns that into a
+/// recoverable syntax [`Error`].
+///
+/// This counts *logical* nesting levels at the recursion hubs, but a single
+/// level can span the whole expression ladder (`parse_assignment` →
+/// `parse_conditional` → … → `parse_unary` → `parse_primary` → `parse_paren` →
+/// back to `parse_assignment`), so each level costs a fair chunk of native
+/// stack. Measured against a release build, the deepest paths (`(((…`, `[[[…`)
+/// use roughly one level per ~3 KiB of stack; 300 levels therefore stays inside
+/// a 1 MiB stack with margin and leaves ~8x headroom on the stated 8 MiB target,
+/// while sitting comfortably in the few-hundred-to-~1000 range engines use and
+/// far above any realistic program's nesting.
+const MAX_PARSE_DEPTH: u32 = 300;
+
 /// A recursive-descent parser over a borrowed source string.
 pub struct Parser<'src> {
     source: &'src str,
@@ -45,6 +63,22 @@ pub struct Parser<'src> {
     in_generator: bool,
     /// Whether the cursor is inside an async body (enables `await`).
     in_async: bool,
+    /// Current recursive-descent nesting depth, bounded by [`MAX_PARSE_DEPTH`].
+    depth: u32,
+}
+
+/// RAII guard that decrements [`Parser::depth`] when dropped, keeping the count
+/// correct across the parser's many `?` early-returns. It owns the `&mut Parser`
+/// borrow, so the guarded body runs against `guard.parser` and the level is
+/// released on every exit path (success, error, or early return).
+struct DepthGuard<'a, 'src> {
+    parser: &'a mut Parser<'src>,
+}
+
+impl Drop for DepthGuard<'_, '_> {
+    fn drop(&mut self) {
+        self.parser.depth -= 1;
+    }
 }
 
 impl<'src> Parser<'src> {
@@ -59,6 +93,7 @@ impl<'src> Parser<'src> {
             no_in: false,
             in_generator: false,
             in_async: false,
+            depth: 0,
         })
     }
 
@@ -157,6 +192,20 @@ impl<'src> Parser<'src> {
         Error::syntax(message, self.cur_span())
     }
 
+    /// Enters one recursive-descent nesting level, returning a [`DepthGuard`]
+    /// that holds the parser and releases the level when dropped. Returns a
+    /// syntax [`Error`] (never a panic) when [`MAX_PARSE_DEPTH`] is exceeded.
+    /// Called at the top of the parser's true recursion hubs so deeply nested
+    /// input cannot overflow the native stack and `abort()`. The guarded body
+    /// runs against the returned guard's `parser` field.
+    fn enter_recursion(&mut self) -> Result<DepthGuard<'_, 'src>> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(self.err("maximum parser nesting depth exceeded"));
+        }
+        self.depth += 1;
+        Ok(DepthGuard { parser: self })
+    }
+
     fn err_at(&self, span: Span, message: impl Into<alloc::string::String>) -> Error {
         Error::syntax(message, span)
     }
@@ -181,6 +230,12 @@ impl<'src> Parser<'src> {
     /// `AssignmentExpression` — handles arrow functions (via cover-grammar
     /// lookahead), `=`, and the compound assignments (right-associative).
     fn parse_assignment(&mut self) -> Result<Expr> {
+        let guard = self.enter_recursion()?;
+        guard.parser.parse_assignment_inner()
+    }
+
+    /// The body of [`Self::parse_assignment`], run inside the recursion guard.
+    fn parse_assignment_inner(&mut self) -> Result<Expr> {
         if self.in_generator && self.at(TokenKind::Keyword(Kw::Yield)) {
             return self.parse_yield();
         }
@@ -437,6 +492,17 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
+        // Prefix unary/update/`await` operators (`!~+-`, `typeof`/`void`/`delete`,
+        // `++`/`--`, `await`) recurse straight back into `parse_unary` — and
+        // `**` recurses through `parse_exponent` → `parse_unary` — *without*
+        // re-entering `parse_assignment`, so this is an independent recursion hub
+        // that must carry its own depth guard.
+        let guard = self.enter_recursion()?;
+        guard.parser.parse_unary_inner()
+    }
+
+    /// The body of [`Self::parse_unary`], run inside the recursion guard.
+    fn parse_unary_inner(&mut self) -> Result<Expr> {
         let tok = self.peek_tok();
         if self.in_async && tok.kind == TokenKind::Keyword(Kw::Await) {
             self.bump();

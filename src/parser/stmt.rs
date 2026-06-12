@@ -61,6 +61,12 @@ impl<'src> Parser<'src> {
 
     /// Parses a single statement, dispatching on the leading token.
     pub(crate) fn parse_statement(&mut self) -> Result<Stmt> {
+        let guard = self.enter_recursion()?;
+        guard.parser.parse_statement_inner()
+    }
+
+    /// The body of [`Self::parse_statement`], run inside the recursion guard.
+    fn parse_statement_inner(&mut self) -> Result<Stmt> {
         match self.peek() {
             TokenKind::LBrace => self.parse_block(),
             TokenKind::Semicolon => {
@@ -214,6 +220,13 @@ impl<'src> Parser<'src> {
     /// A binding target: an identifier or an array/object destructuring
     /// pattern.
     pub(super) fn parse_binding_target(&mut self) -> Result<BindingTarget> {
+        let guard = self.enter_recursion()?;
+        guard.parser.parse_binding_target_inner()
+    }
+
+    /// The body of [`Self::parse_binding_target`], run inside the recursion
+    /// guard.
+    fn parse_binding_target_inner(&mut self) -> Result<BindingTarget> {
         let tok = self.peek_tok();
         match tok.kind {
             TokenKind::Identifier => {
