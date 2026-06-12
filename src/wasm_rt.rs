@@ -613,6 +613,30 @@ fn read_const_i32_expr(s: &mut Reader) -> Result<i32, WasmRtError> {
     Ok(v)
 }
 
+/// Resource ceilings on attacker-supplied declared counts/sizes. The decoder is
+/// reached directly from untrusted JS (`new WebAssembly.Module(bytes)`,
+/// `WebAssembly.instantiate/compile/validate`) with no input size cap, so every
+/// declared element/page/local count must be bounded *before* it drives an
+/// allocation or an iteration — otherwise a tiny binary can request a multi-GiB
+/// allocation (abort) or billions of loop iterations (CPU exhaustion). These
+/// limits are far larger than any legitimate module needs.
+///
+/// Maximum table elements (`Option<u32>` slots = 8 bytes each → ≤ 80 MiB).
+const MAX_TABLE_ELEMS: u32 = 10_000_000;
+/// Maximum linear-memory pages in a declared minimum/maximum — matches the
+/// `memory.grow` ceiling of 2^16 pages (4 GiB).
+const MAX_MEM_PAGES: u32 = 0x1_0000;
+/// Maximum locals per function (the common engine limit; V8 uses 50_000).
+const MAX_LOCALS: u32 = 50_000;
+/// A reasonable cap on speculative `Vec::with_capacity` reserves driven by a
+/// declared count, so an attacker count can't pre-reserve a huge buffer before
+/// any element is read.
+const MAX_RESERVE: usize = 1024;
+/// Maximum combined call-frame + block-nesting depth before a "call stack
+/// exhausted" trap, guarding the native (Rust) stack against unbounded
+/// recursion through `call`/`call_indirect` and nested `block`/`loop`/`if`.
+const MAX_CALL_DEPTH: u32 = 1024;
+
 impl Module {
     /// Decodes a WebAssembly binary module.
     ///
@@ -842,7 +866,7 @@ impl Module {
                 0x0e => {
                     // br_table: all labels must share the default's arity.
                     let count = r.u32()?;
-                    let mut labels = Vec::with_capacity(count as usize + 1);
+                    let mut labels = Vec::with_capacity((count as usize).min(MAX_RESERVE));
                     for _ in 0..=count {
                         labels.push(r.u32()? as usize);
                     }
@@ -1110,12 +1134,15 @@ impl Module {
                 return Err(WasmRtError("expected functype"));
             }
             let np = s.u32()?;
-            let mut params = Vec::with_capacity(np as usize);
+            // Clamp the speculative reserve: an attacker `np`/`nr` must not
+            // pre-allocate a huge buffer before any element is read (the loops
+            // are bounded by the reader running out of input).
+            let mut params = Vec::with_capacity((np as usize).min(MAX_RESERVE));
             for _ in 0..np {
                 params.push(val_type(s.byte()?)?);
             }
             let nr = s.u32()?;
-            let mut results = Vec::with_capacity(nr as usize);
+            let mut results = Vec::with_capacity((nr as usize).min(MAX_RESERVE));
             for _ in 0..nr {
                 results.push(val_type(s.byte()?)?);
             }
@@ -1160,11 +1187,20 @@ impl Module {
                     // An imported linear memory: the host supplies the bytes.
                     let flag = s.byte()?;
                     let min = s.u32()?;
-                    if flag == 1 {
-                        s.u32()?; // max
+                    let max = if flag == 1 { Some(s.u32()?) } else { None };
+                    // Bound the declared minimum (the host allocates `min` pages),
+                    // matching the `memory.grow` ceiling, and require min <= max.
+                    if min > MAX_MEM_PAGES {
+                        return Err(WasmRtError("memory minimum exceeds limit"));
+                    }
+                    if let Some(max) = max
+                        && min > max
+                    {
+                        return Err(WasmRtError("memory minimum exceeds maximum"));
                     }
                     m.mem_imported = true;
                     m.mem_min_pages = Some(min);
+                    m.mem_max_pages = max;
                 }
                 0x03 => {
                     // A global import: it occupies the next global index, before
@@ -1245,6 +1281,16 @@ impl Module {
             if flag == 1 {
                 m.mem_max_pages = Some(s.u32()?);
             }
+            // Bound the declared minimum (it sizes the `new_store` allocation),
+            // matching the `memory.grow` ceiling, and require min <= max.
+            if min > MAX_MEM_PAGES {
+                return Err(WasmRtError("memory minimum exceeds limit"));
+            }
+            if let Some(max) = m.mem_max_pages
+                && min > max
+            {
+                return Err(WasmRtError("memory minimum exceeds maximum"));
+            }
             m.mem_min_pages = Some(min);
         }
         Ok(())
@@ -1258,6 +1304,11 @@ impl Module {
             let min = s.u32()?;
             if flag == 1 {
                 let _max = s.u32()?;
+            }
+            // Reject an oversized declared minimum before allocating: an unchecked
+            // `min` (e.g. 0xFFFF_FFFF) would request ~34 GiB and abort.
+            if min > MAX_TABLE_ELEMS {
+                return Err(WasmRtError("table minimum exceeds limit"));
             }
             // One table per module (multi-table is post-MVP); size to `min`.
             m.table = alloc::vec![None; min as usize];
@@ -1382,9 +1433,17 @@ impl Module {
             let mut b = Reader::new(body);
             let nlocal_runs = b.u32()?;
             let mut locals = Vec::new();
+            // Accumulate a running total across runs, bounded *before* pushing:
+            // each run reads no per-element input, so an unchecked `n` (or many
+            // runs) would push billions of entries from a few bytes.
+            let mut total: u32 = 0;
             for _ in 0..nlocal_runs {
                 let n = b.u32()?;
                 let t = val_type(b.byte()?)?;
+                total = total
+                    .checked_add(n)
+                    .filter(|t| *t <= MAX_LOCALS)
+                    .ok_or(WasmRtError("too many locals"))?;
                 for _ in 0..n {
                     locals.push(t);
                 }
@@ -1460,7 +1519,12 @@ impl Module {
     /// data segments applied, and the initial global values).
     fn new_store(&self) -> Result<Store, WasmRtError> {
         let pages = self.mem_min_pages.unwrap_or(0) as usize;
-        let mut mem = alloc::vec![0u8; pages * PAGE_SIZE];
+        // Checked, to avoid a usize overflow on 32-bit targets (pages is already
+        // bounded to MAX_MEM_PAGES at decode, but compute defensively).
+        let bytes = pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(WasmRtError("memory size overflow"))?;
+        let mut mem = alloc::vec![0u8; bytes];
         for (off, bytes) in &self.data {
             // Only active segments are applied here; passive ones wait for
             // `memory.init`.
@@ -1501,18 +1565,27 @@ impl Module {
         let mut store = self.new_store()?;
         // No host: an imported call (which an import-free module has none of) errors.
         let mut none = |_i: usize, _a: &[Val]| Err(WasmRtError("missing host function for import"));
-        self.call_with_store(index, args, &mut store, &mut none)
+        self.call_with_store(index, args, &mut store, &mut none, 0)
     }
 
     /// Like [`call`](Self::call) but over a caller-provided instance store and
-    /// import dispatcher (both shared across nested `call`s).
+    /// import dispatcher (both shared across nested `call`s). `depth` is the
+    /// combined call-frame + block-nesting depth, threaded to bound native
+    /// recursion (see [`MAX_CALL_DEPTH`]).
     fn call_with_store(
         &self,
         index: u32,
         args: &[Val],
         store: &mut Store,
         host: ImportHost,
+        depth: u32,
     ) -> Result<Vec<Val>, WasmRtError> {
+        // Each entered call frame counts toward the shared depth budget; reject
+        // before recursing so a self-recursive wasm fn traps instead of
+        // overflowing the Rust stack.
+        if depth >= MAX_CALL_DEPTH {
+            return Err(WasmRtError("call stack exhausted"));
+        }
         let ty = self
             .func_types
             .get(index as usize)
@@ -1536,7 +1609,7 @@ impl Module {
             locals.push(zero_val(*lt));
         }
         let mut stack: Vec<Val> = Vec::new();
-        self.exec(&body.code, &mut locals, &mut stack, store, host)?;
+        self.exec(&body.code, &mut locals, &mut stack, store, host, depth + 1)?;
         // Take the result count off the top of the stack.
         let n = ty.results.len();
         if stack.len() < n {
@@ -1555,7 +1628,14 @@ impl Module {
         stack: &mut Vec<Val>,
         store: &mut Store,
         host: ImportHost,
+        depth: u32,
     ) -> Result<Flow, WasmRtError> {
+        // Guard the native stack: `exec` recurses (block/loop/if → exec_block →
+        // exec, call → call_with_store → exec). One shared budget covers both
+        // call frames and block nesting.
+        if depth >= MAX_CALL_DEPTH {
+            return Err(WasmRtError("call stack exhausted"));
+        }
         let mut r = Reader::new(code);
         macro_rules! pop {
             () => {
@@ -1681,7 +1761,7 @@ impl Module {
                         return Err(WasmRtError("call argument underflow"));
                     }
                     let cargs = stack.split_off(stack.len() - n);
-                    let res = self.call_with_store(callee, &cargs, store, host)?;
+                    let res = self.call_with_store(callee, &cargs, store, host, depth)?;
                     stack.extend(res);
                 }
                 // call_indirect: typeidx, tableidx; pop the table index, look up
@@ -1710,7 +1790,7 @@ impl Module {
                         return Err(WasmRtError("call argument underflow"));
                     }
                     let cargs = stack.split_off(stack.len() - n);
-                    let res = self.call_with_store(func, &cargs, store, host)?;
+                    let res = self.call_with_store(func, &cargs, store, host, depth)?;
                     stack.extend(res);
                 }
                 // --- linear memory ---
@@ -2253,7 +2333,7 @@ impl Module {
                     let _blocktype = r.byte()?; // 0x40 (empty) or a value type
                     let is_loop = op == 0x03;
                     let (consumed, flow) =
-                        self.exec_block(&code[r.pos..], locals, stack, store, host, is_loop)?;
+                        self.exec_block(&code[r.pos..], locals, stack, store, host, is_loop, depth)?;
                     r.pos += consumed;
                     match flow {
                         Flow::Return => return Ok(Flow::Return),
@@ -2282,7 +2362,7 @@ impl Module {
                         }
                     };
                     r.pos += inner_len;
-                    match self.exec(arm, locals, stack, store, host)? {
+                    match self.exec(arm, locals, stack, store, host, depth + 1)? {
                         Flow::Return => return Ok(Flow::Return),
                         Flow::Branch(n) => return Ok(Flow::Branch(n.saturating_sub(1))),
                         Flow::Normal => {}
@@ -2298,7 +2378,7 @@ impl Module {
                 // br_table: a computed branch — pick labels[index], else default.
                 0x0e => {
                     let count = r.u32()? as usize;
-                    let mut labels = Vec::with_capacity(count);
+                    let mut labels = Vec::with_capacity(count.min(MAX_RESERVE));
                     for _ in 0..count {
                         labels.push(r.u32()?);
                     }
@@ -2425,11 +2505,13 @@ impl Module {
         store: &mut Store,
         host: ImportHost,
         is_loop: bool,
+        depth: u32,
     ) -> Result<(usize, Flow), WasmRtError> {
         let inner_len = block_len(code)?;
         let inner = &code[..inner_len - 1]; // exclude the matching `end`
         loop {
-            match self.exec(inner, locals, stack, store, host)? {
+            // Entering the block body consumes one unit of the depth budget.
+            match self.exec(inner, locals, stack, store, host, depth + 1)? {
                 Flow::Branch(0) => {
                     if is_loop {
                         continue; // re-run the loop body
@@ -2583,7 +2665,7 @@ impl<'m> Instance<'m> {
                 .get(i)
                 .ok_or(WasmRtError("missing host function for import"))?(a)
         };
-        module.call_with_store(index, args, store, &mut host)
+        module.call_with_store(index, args, store, &mut host, 0)
     }
 
     /// Instantiates `module` whose function imports are dispatched through an
@@ -2661,7 +2743,7 @@ impl<'m> Instance<'m> {
         host: ImportHost,
     ) -> Result<Vec<Val>, WasmRtError> {
         self.module
-            .call_with_store(index, args, &mut self.store, host)
+            .call_with_store(index, args, &mut self.store, host, 0)
     }
 
     /// Resolves an exported function by name and calls it, dispatching imports
