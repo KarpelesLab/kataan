@@ -2219,14 +2219,16 @@ fn regex_method(
             "replaceAll must be called with a global RegExp",
         ))));
     }
+    // Collect the subject once; the per-match loops below index this slice via
+    // the engine's `*_in` API instead of re-collecting the chars on every call
+    // (which made dense global matches O(n²)). Match positions are char offsets.
+    let chars: Vec<char> = text.chars().collect();
     let result = match key {
         "search" => {
-            let i = re
-                .find_from(&text, 0)
-                .map_or(-1.0, |(s, _)| text[..s].chars().count() as f64);
+            let i = re.find_in(&chars, 0).map_or(-1.0, |(s, _)| s as f64);
             NanBox::number(i)
         }
-        "match" if !global => match re.captures_from(&text, 0) {
+        "match" if !global => match re.captures_in(&chars, 0) {
             Some(caps) => regex_match_object(ctx.realm, &text, &caps, re.group_names()),
             None => NanBox::null(),
         },
@@ -2234,9 +2236,11 @@ fn regex_method(
             // Global match → an array of the whole matches.
             let mut out = Vec::new();
             let mut pos = 0;
-            while let Some((s, e)) = re.find_from(&text, pos) {
+            while let Some((s, e)) = re.find_in(&chars, pos) {
                 out.push(NanBox::handle(
-                    ctx.realm.new_string(&char_substr(&text, s, e)).to_raw(),
+                    ctx.realm
+                        .new_string(&chars[s..e].iter().collect::<String>())
+                        .to_raw(),
                 ));
                 pos = if e > s { e } else { e + 1 };
             }
@@ -2275,15 +2279,15 @@ fn regex_method(
             let mut seg_start = 0;
             let mut search = 0;
             // Match positions are `< len` (spec `q < size`); the tail is appended once.
-            while search < text.len() && limit.is_none_or(|l| out.len() < l) {
-                let Some(caps) = re.captures_from(&text, search) else {
+            while search < chars.len() && limit.is_none_or(|l| out.len() < l) {
+                let Some(caps) = re.captures_in(&chars, search) else {
                     break;
                 };
                 let Some((st, en)) = caps.groups[0] else {
                     break;
                 };
                 if en == seg_start {
-                    if text.chars().nth(search).is_some() {
+                    if chars.get(search).is_some() {
                         search = search.max(st) + 1;
                         continue;
                     }
@@ -2291,13 +2295,15 @@ fn regex_method(
                 }
                 out.push(NanBox::handle(
                     ctx.realm
-                        .new_string(&char_substr(&text, seg_start, st))
+                        .new_string(&chars[seg_start..st].iter().collect::<String>())
                         .to_raw(),
                 ));
                 for g in &caps.groups[1..] {
                     out.push(match g {
                         Some((gs, ge)) => NanBox::handle(
-                            ctx.realm.new_string(&char_substr(&text, *gs, *ge)).to_raw(),
+                            ctx.realm
+                                .new_string(&chars[*gs..*ge].iter().collect::<String>())
+                                .to_raw(),
                         ),
                         None => NanBox::undefined(),
                     });
