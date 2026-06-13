@@ -143,6 +143,11 @@ impl Regex {
     }
 
     /// The first match at or after `char` index `start`, with captures.
+    ///
+    /// Collects `text` into a `Vec<char>` on every call. Callers that scan a
+    /// subject repeatedly (match/matchAll/replace/split loops) must instead
+    /// collect once and use [`captures_in`](Self::captures_in), or the
+    /// per-match re-collection makes the whole loop O(n²) (RE-7).
     #[must_use]
     pub fn captures_from(&self, text: &str, start: usize) -> Option<Captures> {
         let chars: Vec<char> = text.chars().collect();
@@ -155,6 +160,21 @@ impl Regex {
         self.captures_from(text, start).map(|c| c.whole())
     }
 
+    /// Like [`captures_from`](Self::captures_from), but over a pre-collected
+    /// `&[char]` so repeated scans of one subject don't re-collect it each call
+    /// (RE-7). `start` is a char offset, as are the returned capture indices.
+    #[must_use]
+    pub fn captures_in(&self, chars: &[char], start: usize) -> Option<Captures> {
+        self.captures_at(chars, start)
+    }
+
+    /// Like [`find_from`](Self::find_from), but over a pre-collected `&[char]`
+    /// (RE-7). `start` and the returned span are char offsets.
+    #[must_use]
+    pub fn find_in(&self, chars: &[char], start: usize) -> Option<(usize, usize)> {
+        self.captures_at(chars, start).map(|c| c.whole())
+    }
+
     fn captures_at(&self, chars: &[char], start: usize) -> Option<Captures> {
         // A sticky (`y`) match must begin exactly at `start`; otherwise the
         // engine scans forward for the first match at or after `start`.
@@ -163,8 +183,21 @@ impl Regex {
         } else {
             chars.len()
         };
+        // One step counter + budget for the *whole* scan: each start position
+        // draws from the same budget, so a catastrophic-backtracking pattern
+        // can't multiply its cost by trying every start independently (RE-8).
+        let steps = core::cell::Cell::new(0u64);
+        let budget = vm::budget_for(chars.len());
         for s in start..=last {
-            if let Some(groups) = vm::run(&self.prog, chars, s, self.group_count, self.flags) {
+            if let Some(groups) = vm::run_shared(
+                &self.prog,
+                chars,
+                s,
+                self.group_count,
+                self.flags,
+                &steps,
+                budget,
+            ) {
                 return Some(Captures { groups });
             }
         }

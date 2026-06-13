@@ -5,13 +5,20 @@ use super::parser::{PropKind, Shorthand};
 use alloc::vec::Vec;
 use core::cell::Cell;
 
-/// Backstop step budget for a single `run`. The recursive backtracker has no
-/// inherent bound, so a pathological pattern (e.g. `/(a+)+$/`) can explore
+/// Backstop step budget for a whole find operation. The recursive backtracker
+/// has no inherent bound, so a pathological pattern (e.g. `/(a+)+$/`) can explore
 /// exponentially many paths. Once this many backtrack steps are taken the match
 /// aborts cleanly (treated as "no match") rather than hanging the process. The
 /// budget is scaled by input length so legitimate long-subject matches are not
 /// starved, while keeping a fixed ceiling.
-const STEP_BASE: u64 = 10_000_000;
+///
+/// `STEP_BASE` was 10M, which is ~60-76 s of wall time on an adversarial
+/// pattern; lowered ~33× to keep catastrophic backtracking well under a second
+/// while still covering legitimate patterns (the regex suite passes). The
+/// counter is created once per *find* (in `captures_at`) and shared across all
+/// start positions via `run_shared`, so the bound covers the whole operation,
+/// not each start independently (RE-8).
+const STEP_BASE: u64 = 300_000;
 const STEP_PER_CHAR: u64 = 1_000;
 
 /// Maximum `backtrack` recursion depth before the match aborts cleanly. The VM
@@ -70,24 +77,34 @@ pub(crate) enum Assert {
     NotWordBoundary,
 }
 
+/// The step budget for a subject of `input_len` chars: a fixed base plus a
+/// per-char allowance so a legitimate long-subject match is not starved.
+pub(crate) fn budget_for(input_len: usize) -> u64 {
+    STEP_BASE.saturating_add(STEP_PER_CHAR.saturating_mul(input_len as u64))
+}
+
 /// Runs `prog` against `input` starting at `start`, returning the capture slots
 /// (`2 * (group_count + 1)` of them, as `(start, end)` pairs) on success.
-pub(crate) fn run(
+///
+/// Threads a caller-owned step counter and budget so a multi-start find
+/// ([`super::Regex::captures_at`]) shares one budget across all start positions
+/// instead of resetting it per start (RE-8).
+pub(crate) fn run_shared(
     prog: &[Inst],
     input: &[char],
     start: usize,
     group_count: usize,
     flags: Flags,
+    steps: &Cell<u64>,
+    budget: u64,
 ) -> Option<Vec<Option<(usize, usize)>>> {
     let mut saves = alloc::vec![None; 2 * (group_count + 1)];
-    let budget = STEP_BASE.saturating_add(STEP_PER_CHAR.saturating_mul(input.len() as u64));
-    let steps = Cell::new(0u64);
     let ctx = Ctx {
         prog,
         input,
         flags,
         match_end: None,
-        steps: &steps,
+        steps,
         budget,
     };
     let mut loops: Vec<(usize, usize)> = Vec::new();
