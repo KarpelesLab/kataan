@@ -5409,6 +5409,7 @@ impl<'a> Interp<'a> {
     #[cfg(feature = "regex")]
     fn regex_match_object(
         &mut self,
+        chars: &[char],
         text: &str,
         caps: &crate::regex::Captures,
         group_names: &[(usize, String)],
@@ -5417,11 +5418,14 @@ impl<'a> Interp<'a> {
         // whole match at 0), so `Array.isArray`, `JSON.stringify`, `.length`, and
         // the array methods all behave. `index`/`input`/`groups` are enumerable
         // named own properties (kept in the array's auxiliary object).
+        // Slices come from the pre-collected `chars` so a matchAll loop stays
+        // linear rather than re-scanning the subject per group (RE-7); `text`
+        // backs only the `.input` property.
         let elems: Vec<NanBox> = caps
             .groups
             .iter()
             .map(|g| match g {
-                Some((s, e)) => self.new_str(&char_substr(text, *s, *e)),
+                Some((s, e)) => self.new_str(&char_slice(chars, *s, *e)),
                 None => NanBox::undefined(),
             })
             .collect();
@@ -5438,7 +5442,7 @@ impl<'a> Interp<'a> {
             let g = self.realm.new_object();
             for (idx, name) in group_names {
                 let v = match caps.groups.get(*idx).and_then(|x| *x) {
-                    Some((s, e)) => self.new_str(&char_substr(text, s, e)),
+                    Some((s, e)) => self.new_str(&char_slice(chars, s, e)),
                     None => NanBox::undefined(),
                 };
                 self.realm.set_property(g, name, v);
@@ -8396,14 +8400,17 @@ impl<'a> Interp<'a> {
                     } else {
                         0
                     };
-                    let caps = re.captures_from(&text, start);
+                    let text_chars: Vec<char> = text.chars().collect();
+                    let caps = re.captures_in(&text_chars, start);
                     if stateful {
                         let next = caps.as_ref().map_or(0, |c| c.whole().1);
                         self.realm.set_regex_last_index(handle, next);
                     }
                     return Ok(Some(match (method, caps) {
                         ("test", c) => NanBox::boolean(c.is_some()),
-                        (_, Some(c)) => self.regex_match_object(&text, &c, re.group_names()),
+                        (_, Some(c)) => {
+                            self.regex_match_object(&text_chars, &text, &c, re.group_names())
+                        }
                         (_, None) => NanBox::null(),
                     }));
                 }
@@ -8674,14 +8681,19 @@ impl<'a> Interp<'a> {
                 ));
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
+            // Collect the subject into chars ONCE; every per-match scan below
+            // reuses this slice via the `*_in` API and `char_slice*` helpers, so
+            // a dense global match/replace/split stays O(n) instead of the O(n²)
+            // that re-collecting per match would cost (RE-7).
+            let chars: Vec<char> = s.chars().collect();
             match method {
                 "search" => {
-                    let idx = re.find_from(&s, 0).map_or(-1.0, |(st, _)| st as f64);
+                    let idx = re.find_in(&chars, 0).map_or(-1.0, |(st, _)| st as f64);
                     return Ok(Some(NanBox::number(idx)));
                 }
                 "match" if !global => {
-                    return Ok(Some(match re.captures_from(&s, 0) {
-                        Some(caps) => self.regex_match_object(&s, &caps, re.group_names()),
+                    return Ok(Some(match re.captures_in(&chars, 0) {
+                        Some(caps) => self.regex_match_object(&chars, &s, &caps, re.group_names()),
                         None => NanBox::null(),
                     }));
                 }
@@ -8689,8 +8701,8 @@ impl<'a> Interp<'a> {
                     // Global: an array of all whole matches (or null).
                     let mut out = Vec::new();
                     let mut at = 0;
-                    while let Some((st, en)) = re.find_from(&s, at) {
-                        out.push(self.new_str(&char_substr(&s, st, en)));
+                    while let Some((st, en)) = re.find_in(&chars, at) {
+                        out.push(self.new_str(&char_slice(&chars, st, en)));
                         at = if en > st { en } else { en + 1 };
                     }
                     return Ok(Some(if out.is_empty() {
@@ -8703,15 +8715,15 @@ impl<'a> Interp<'a> {
                 "matchAll" => {
                     let mut out = Vec::new();
                     let mut at = 0;
-                    while let Some(caps) = re.captures_from(&s, at) {
+                    while let Some(caps) = re.captures_in(&chars, at) {
                         let Some((st, en)) = caps.groups[0] else {
                             break;
                         };
                         // A full match-result object (indexed groups + `.groups`
                         // named captures + `.index`/`.input`).
-                        out.push(self.regex_match_object(&s, &caps, re.group_names()));
+                        out.push(self.regex_match_object(&chars, &s, &caps, re.group_names()));
                         at = if en > st { en } else { en + 1 };
-                        if at > s.len() {
+                        if at > chars.len() {
                             break;
                         }
                     }
@@ -8733,9 +8745,10 @@ impl<'a> Interp<'a> {
                     let mut seg_start = 0;
                     let mut search = 0;
                     // Match positions are `< len` (the spec's `q < size`); the tail
-                    // after the last split is appended once, below.
-                    while search < s.len() && limit.is_none_or(|l| parts.len() < l) {
-                        let Some(caps) = re.captures_from(&s, search) else {
+                    // after the last split is appended once, below. `chars.len()`
+                    // is the char count (regex positions are char indices).
+                    while search < chars.len() && limit.is_none_or(|l| parts.len() < l) {
+                        let Some(caps) = re.captures_in(&chars, search) else {
                             break;
                         };
                         let Some((st, en)) = caps.groups[0] else {
@@ -8748,19 +8761,19 @@ impl<'a> Interp<'a> {
                         // which panics on a non-ASCII subject
                         // (`"€a".split(/(?=a)/)`).
                         if en == seg_start {
-                            if search.max(st) < s.chars().count() {
+                            if search.max(st) < chars.len() {
                                 search = search.max(st) + 1;
                                 continue;
                             }
                             break;
                         }
-                        parts.push(self.new_str(&char_substr(&s, seg_start, st)));
+                        parts.push(self.new_str(&char_slice(&chars, seg_start, st)));
                         // The separator's capture groups are spliced into the
                         // result (`"a1b".split(/(\d)/)` → `["a","1","b"]`).
                         for g in &caps.groups[1..] {
                             match g {
                                 Some((gs, ge)) => {
-                                    parts.push(self.new_str(&char_substr(&s, *gs, *ge)))
+                                    parts.push(self.new_str(&char_slice(&chars, *gs, *ge)))
                                 }
                                 None => parts.push(NanBox::undefined()),
                             }
@@ -8769,7 +8782,7 @@ impl<'a> Interp<'a> {
                         search = if en > st { en } else { en + 1 };
                     }
                     if limit.is_none_or(|l| parts.len() < l) {
-                        parts.push(self.new_str(&char_substr_from(&s, seg_start)));
+                        parts.push(self.new_str(&char_slice_from(&chars, seg_start)));
                     }
                     if let Some(l) = limit {
                         parts.truncate(l);
@@ -8791,14 +8804,15 @@ impl<'a> Interp<'a> {
                     };
                     let mut out = String::new();
                     let mut at = 0;
-                    while let Some(caps) = re.captures_from(&s, at) {
+                    while let Some(caps) = re.captures_in(&chars, at) {
                         let (st, en) = caps.groups[0].unwrap_or((at, at));
-                        out.push_str(&char_substr(&s, at, st));
+                        out.push_str(&char_slice(&chars, at, st));
                         if is_fn {
-                            let mut call_args = alloc::vec![self.new_str(&char_substr(&s, st, en))];
+                            let mut call_args =
+                                alloc::vec![self.new_str(&char_slice(&chars, st, en))];
                             for g in caps.groups.iter().skip(1) {
                                 call_args.push(match g {
-                                    Some((gs, ge)) => self.new_str(&char_substr(&s, *gs, *ge)),
+                                    Some((gs, ge)) => self.new_str(&char_slice(&chars, *gs, *ge)),
                                     None => NanBox::undefined(),
                                 });
                             }
@@ -8811,7 +8825,7 @@ impl<'a> Interp<'a> {
                                 let go = self.realm.new_object();
                                 for (idx, name) in group_names {
                                     let v = match caps.groups.get(*idx).copied().flatten() {
-                                        Some((gs, ge)) => self.new_str(&char_substr(&s, gs, ge)),
+                                        Some((gs, ge)) => self.new_str(&char_slice(&chars, gs, ge)),
                                         None => NanBox::undefined(),
                                     };
                                     self.realm.set_property(go, name, v);
@@ -8822,17 +8836,22 @@ impl<'a> Interp<'a> {
                             let rep = self.realm.to_display_string(r);
                             out.push_str(&rep);
                         } else {
-                            out.push_str(&expand_replacement(&templ, &s, &caps, re.group_names()));
+                            out.push_str(&expand_replacement(
+                                &templ,
+                                &chars,
+                                &caps,
+                                re.group_names(),
+                            ));
                         }
                         if en > st {
                             at = en;
                         } else {
                             // Empty match: keep the char at char-index `en` and step
                             // one *character* past it. `en` is a char index (regex
-                            // positions are char indices), so index `s.chars()` —
-                            // never byte-slice `s`, which panics on a non-ASCII
+                            // positions are char indices), so index `chars` directly
+                            // — never byte-slice `s`, which panics on a non-ASCII
                             // subject (`"€a".replace(/(?=a)/g,"-")`).
-                            match s.chars().nth(en) {
+                            match chars.get(en).copied() {
                                 Some(c) => {
                                     out.push(c);
                                     at = en + 1;
@@ -8844,7 +8863,7 @@ impl<'a> Interp<'a> {
                             break;
                         }
                     }
-                    out.push_str(&char_substr_from(&s, at));
+                    out.push_str(&char_slice_from(&chars, at));
                     return Ok(Some(self.new_str(&out)));
                 }
             }
@@ -15181,18 +15200,22 @@ fn group_thousands_str(s: &str) -> String {
     out
 }
 
-/// Slices `s` by *character* (Unicode scalar) indices `[st, en)` — the index
-/// space the regex engine works in — so multi-byte characters never split a byte
-/// boundary (which would panic on `&s[st..en]`).
+/// Slices a pre-collected `&[char]` by *character* (Unicode scalar) indices
+/// `[st, en)` — the index space the regex engine works in — in O(en - st)
+/// rather than the O(start) re-scan a `&str` skip would cost, so a per-match
+/// loop over one subject stays linear overall (RE-7). Out-of-range indices
+/// clamp.
 #[cfg(feature = "regex")]
-fn char_substr(s: &str, st: usize, en: usize) -> String {
-    s.chars().skip(st).take(en.saturating_sub(st)).collect()
+fn char_slice(chars: &[char], st: usize, en: usize) -> String {
+    let st = st.min(chars.len());
+    let en = en.min(chars.len()).max(st);
+    chars[st..en].iter().collect()
 }
 
-/// Slices `s` from character index `st` to the end.
+/// Slices a pre-collected `&[char]` from char index `st` to the end (RE-7).
 #[cfg(feature = "regex")]
-fn char_substr_from(s: &str, st: usize) -> String {
-    s.chars().skip(st).collect()
+fn char_slice_from(chars: &[char], st: usize) -> String {
+    chars[st.min(chars.len())..].iter().collect()
 }
 
 fn int_to_radix(n: f64, radix: u32) -> String {
@@ -15388,33 +15411,38 @@ fn parse_float_prefix(s: &str) -> f64 {
 #[cfg(feature = "regex")]
 fn expand_replacement(
     templ: &str,
-    text: &str,
+    subj: &[char],
     caps: &crate::regex::Captures,
     group_names: &[(usize, String)],
 ) -> String {
-    let group = |i: usize| {
+    // Groups/segments are sliced from the pre-collected subject `&[char]` by
+    // *char* index. Earlier this byte-indexed a `&str` with char offsets, which
+    // panics on a non-ASCII subject; slicing chars is correct and also keeps the
+    // per-match cost from re-scanning the whole subject (RE-7).
+    let group = |i: usize| -> String {
         caps.groups
             .get(i)
             .and_then(|g| *g)
-            .map(|(s, e)| &text[s..e])
+            .map(|(s, e)| char_slice(subj, s, e))
+            .unwrap_or_default()
     };
     let (m_start, m_end) = caps.groups.first().and_then(|g| *g).unwrap_or((0, 0));
     let mut out = String::new();
-    let mut chars = templ.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut tc = templ.chars().peekable();
+    while let Some(c) = tc.next() {
         // `$<name>` — a named-group backreference.
-        if c == '$' && chars.peek() == Some(&'<') {
-            chars.next(); // `<`
+        if c == '$' && tc.peek() == Some(&'<') {
+            tc.next(); // `<`
             let mut name = String::new();
-            while let Some(&ch) = chars.peek() {
-                chars.next();
+            while let Some(&ch) = tc.peek() {
+                tc.next();
                 if ch == '>' {
                     break;
                 }
                 name.push(ch);
             }
             if let Some((idx, _)) = group_names.iter().find(|(_, n)| *n == name) {
-                out.push_str(group(*idx).unwrap_or(""));
+                out.push_str(&group(*idx));
             }
             continue;
         }
@@ -15422,23 +15450,23 @@ fn expand_replacement(
             out.push(c);
             continue;
         }
-        match chars.peek() {
+        match tc.peek() {
             Some('$') => {
                 out.push('$');
-                chars.next();
+                tc.next();
             }
             Some('&') => {
-                out.push_str(group(0).unwrap_or(""));
-                chars.next();
+                out.push_str(&group(0));
+                tc.next();
             }
             // `` $` `` is the portion before the match; `$'` the portion after.
             Some('`') => {
-                out.push_str(&text[..m_start]);
-                chars.next();
+                out.push_str(&char_slice(subj, 0, m_start));
+                tc.next();
             }
             Some('\'') => {
-                out.push_str(&text[m_end..]);
-                chars.next();
+                out.push_str(&char_slice_from(subj, m_end));
+                tc.next();
             }
             // `$n` for an in-range group → the capture (empty if unmatched);
             // out-of-range `$n` is left literal.
@@ -15449,8 +15477,8 @@ fn expand_replacement(
                 } =>
             {
                 let n = (*d as u8 - b'0') as usize;
-                chars.next();
-                out.push_str(group(n).unwrap_or(""));
+                tc.next();
+                out.push_str(&group(n));
             }
             _ => out.push('$'),
         }
@@ -17747,6 +17775,13 @@ mod tests {
         assert_eq!(run("'über 123'.match(/\\d+/)[0]"), "123");
         assert_eq!(run("'café'.match(/(?<r>.+)/).groups.r"), "café");
         assert_eq!(run("[...'café déjà'.matchAll(/é/g)].length"), "2");
+        // Regex-template `$&`/`` $` ``/`$'` over a multibyte subject previously
+        // byte-indexed char offsets and panicked; the template now slices chars
+        // (RE-7 refactor).
+        assert_eq!(run("'café'.replace(/f/, '[$&]')"), "ca[f]é");
+        assert_eq!(run("'café'.replace(/f/, '$`')"), "cacaé");
+        assert_eq!(run("'café'.replace(/f/, \"$'\")"), "caéé");
+        assert_eq!(run("'aéb'.replace(/(é)/, '<$1>')"), "a<é>b");
     }
 
     #[test]
