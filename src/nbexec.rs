@@ -174,11 +174,27 @@ fn math_random_seed() -> [u64; 2] {
     #[cfg(feature = "crypto")]
     {
         use purecrypto::rng::{OsRng, RngCore};
-        let mut rng = OsRng;
-        let s = [rng.next_u64(), rng.next_u64()];
+        // `OsRng::next_u64` can `panic!` on a getrandom failure (seccomp without
+        // the syscall allowed, no `/dev/urandom`, …). A sandboxed embedder must
+        // not be aborted by that during `Interp::new`; catch the unwind (when
+        // `std` is available) and fall through to the best-effort entropy mix
+        // below (RNG-1). Untrusted JS cannot reach this path — it is robustness
+        // for the host.
+        #[cfg(feature = "std")]
+        let drawn: Result<[u64; 2], _> = std::panic::catch_unwind(|| {
+            let mut rng = OsRng;
+            [rng.next_u64(), rng.next_u64()]
+        });
+        #[cfg(not(feature = "std"))]
+        let drawn: Result<[u64; 2], ()> = {
+            let mut rng = OsRng;
+            Ok([rng.next_u64(), rng.next_u64()])
+        };
         // An all-zero draw (probability 2^-128) would be the generator's fixed
         // point; fall through to the entropy mix rather than accept it.
-        if s[0] | s[1] != 0 {
+        if let Ok(s) = drawn
+            && s[0] | s[1] != 0
+        {
             return s;
         }
     }
