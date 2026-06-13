@@ -1328,7 +1328,12 @@ impl Module {
             let n = s.u32()? as usize;
             for i in 0..n {
                 let func = s.u32()?;
-                let slot = off + i;
+                // Checked, to avoid a usize overflow on 32-bit targets (mirrors
+                // the data-segment path); `off` comes from a const expr and may
+                // be a large sign-extended value.
+                let slot = off
+                    .checked_add(i)
+                    .ok_or(WasmRtError("element segment out of bounds"))?;
                 if slot >= m.table.len() {
                     return Err(WasmRtError("element segment out of bounds"));
                 }
