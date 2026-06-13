@@ -32,6 +32,17 @@ pub enum DecodeError {
     Truncated,
     /// An unknown opcode/value tag (a corrupt or incompatible artifact).
     BadTag(u8),
+    /// The artifact decoded cleanly but failed verification (a reference
+    /// outside its declared bounds). Returned by load paths that must hand back
+    /// a *runnable* function table from untrusted bytes, so verification is not
+    /// optional — see [`VerifyError`].
+    Unverified(VerifyError),
+}
+
+impl From<VerifyError> for DecodeError {
+    fn from(e: VerifyError) -> Self {
+        DecodeError::Unverified(e)
+    }
 }
 
 // --- writers ---
@@ -106,6 +117,12 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    /// Bytes left to read. Used to bound any pre-allocation against the input
+    /// size so an attacker-controlled count can't request a huge reservation
+    /// before the bytes that would fill it are even read (mirrors SNAP-1).
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated)?;
         let slice = self
@@ -140,15 +157,32 @@ impl<'a> Reader<'a> {
     }
     fn regs(&mut self) -> Result<Vec<Reg>, DecodeError> {
         let n = self.u32()? as usize;
-        (0..n).map(|_| self.reg()).collect()
+        // Each `Reg` is a u16 (2 bytes); clamp the reservation to what the
+        // remaining input could possibly hold so a hostile count can't trigger
+        // a giant allocation before the bytes are read.
+        let mut v = Vec::with_capacity(n.min(self.remaining() / 2));
+        for _ in 0..n {
+            v.push(self.reg()?);
+        }
+        Ok(v)
     }
     fn u32s(&mut self) -> Result<Vec<u32>, DecodeError> {
         let n = self.u32()? as usize;
-        (0..n).map(|_| self.u32()).collect()
+        // Each element is 4 bytes.
+        let mut v = Vec::with_capacity(n.min(self.remaining() / 4));
+        for _ in 0..n {
+            v.push(self.u32()?);
+        }
+        Ok(v)
     }
     fn strings(&mut self) -> Result<Vec<String>, DecodeError> {
         let n = self.u32()? as usize;
-        (0..n).map(|_| self.string()).collect()
+        // Each string is at least its 4-byte length prefix.
+        let mut v = Vec::with_capacity(n.min(self.remaining() / 4));
+        for _ in 0..n {
+            v.push(self.string()?);
+        }
+        Ok(v)
     }
     fn value(&mut self) -> Result<NanBox, DecodeError> {
         match self.u8()? {
@@ -456,12 +490,20 @@ impl ContentStore {
         self.entries.get(&key).cloned()
     }
 
-    /// Loads and decodes the artifact at `key` to a runnable function table.
+    /// Loads, decodes, **and verifies** the artifact at `key` to a runnable
+    /// function table. Verification is mandatory: the returned protos are fed
+    /// directly to the direct-indexing VM, which trusts that every register /
+    /// function / jump reference is in bounds.
     ///
     /// # Errors
-    /// Returns [`DecodeError`] if the stored bytes are corrupt; `None` if absent.
+    /// Returns [`DecodeError`] if the stored bytes are corrupt or fail
+    /// verification ([`DecodeError::Unverified`]); `None` if absent.
     pub fn load(&self, key: u64) -> Option<Result<Vec<FnProto>, DecodeError>> {
-        self.entries.get(&key).map(|bytes| deserialize(bytes))
+        self.entries.get(&key).map(|bytes| {
+            let protos = deserialize(bytes)?;
+            verify(&protos)?;
+            Ok(protos)
+        })
     }
 
     /// Whether an artifact with `key` is present.
@@ -531,7 +573,13 @@ pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
         return Err(DecodeError::BadVersion(version));
     }
     let n = r.u32()? as usize;
-    let mut protos = Vec::with_capacity(n);
+    // Do not pre-reserve on the untrusted count: a 12-byte header claiming
+    // `n = 0xFFFF_FFFF` would otherwise request a multi-hundred-GB reservation
+    // that aborts the allocator before any proto bytes are read. Clamp to what
+    // the remaining input could possibly hold — the smallest proto record is a
+    // fixed header (n_regs..n_ops, each a u32/u8) of at least this many bytes.
+    const MIN_PROTO_BYTES: usize = 26;
+    let mut protos = Vec::with_capacity(n.min(r.remaining() / MIN_PROTO_BYTES));
     for _ in 0..n {
         let n_regs = r.usize()?;
         let n_params = r.usize()?;
@@ -541,7 +589,10 @@ pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
         let length = r.usize()?;
         let name = r.string()?;
         let n_ops = r.u32()? as usize;
-        let mut ops = Vec::with_capacity(n_ops);
+        // Clamp the op-vector reservation to the remaining input: the smallest
+        // op record is a single tag byte, so `remaining()` bounds the count of
+        // ops the buffer could actually contain.
+        let mut ops = Vec::with_capacity(n_ops.min(r.remaining()));
         for _ in 0..n_ops {
             ops.push(read_op(&mut r)?);
         }
@@ -1033,84 +1084,41 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
     })
 }
 
-/// Zero-copy reload of a `KTBC` artifact from a memory-mapped file (`ROADMAP.md`
-/// §2.2, "mmap reload"). Re-exported when available.
-#[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-pub use mmap::load_file;
+/// Loads, decodes, and verifies a `KTBC` artifact from a file. Available when
+/// the standard library is present.
+#[cfg(feature = "std")]
+pub use file_load::load_file;
 
-/// `mmap`-based file loading via direct Linux syscalls — no libc, honoring the
-/// "no foreign code" charter (the same audited carve-out as the JIT). The
-/// mapped, read-only file bytes are decoded in place, then unmapped.
-#[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-mod mmap {
-    use super::{FnProto, deserialize};
+/// File loading for the `KTBC` container. The bytes are read into an owned
+/// buffer with [`std::fs::read`] and then decoded + verified — the input is
+/// untrusted, so this path must not (a) hand the direct-indexing VM unverified
+/// protos (VM-7), nor (b) `mmap` the file and risk a SIGBUS if it is truncated
+/// concurrently (VM-9). The file contents are copied into owned `FnProto`s
+/// regardless, so a zero-copy mapping bought nothing here.
+#[cfg(feature = "std")]
+mod file_load {
+    use super::{FnProto, deserialize_verified};
     use alloc::vec::Vec;
-    use std::os::unix::io::AsRawFd;
 
-    const PROT_READ: usize = 0x1;
-    const MAP_PRIVATE: usize = 0x02;
-    const SYS_MMAP: usize = 9;
-    const SYS_MUNMAP: usize = 11;
-
-    /// SAFETY: executes the `syscall` instruction with the System V syscall ABI
-    /// registers; caller supplies a valid number/arguments.
-    #[allow(unsafe_code)]
-    unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
-        let ret: isize;
-        // SAFETY: a single syscall with documented inputs/clobbers.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inlateout("rax") n as isize => ret,
-                in("rdi") a1, in("rsi") a2, in("rdx") a3,
-                in("r10") a4, in("r8") a5, in("r9") 0usize,
-                out("rcx") _, out("r11") _,
-                options(nostack, preserves_flags),
-            );
-        }
-        ret
-    }
-
-    /// Loads and decodes a compiled program from `path` by memory-mapping the
-    /// file read-only and decoding directly over the mapped bytes — no
-    /// intermediate copy of the file contents into a buffer.
+    /// Loads, decodes, and **verifies** a compiled program from `path`.
+    ///
+    /// The file is read into an owned buffer (no memory mapping), so a
+    /// concurrent truncation cannot raise SIGBUS, and the decoded protos are
+    /// verified before being returned — they are handed to the direct-indexing
+    /// VM, which assumes every reference is in bounds.
     ///
     /// # Errors
-    /// Returns an `io::Error` on a failed open/`mmap`, or `InvalidData` if the
-    /// mapped bytes are not a valid `KTBC` artifact.
+    /// Returns an `io::Error` on a failed open/read, or `InvalidData` if the
+    /// bytes are not a valid, verifiable `KTBC` artifact.
     pub fn load_file(path: &str) -> std::io::Result<Vec<FnProto>> {
-        let file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len() as usize;
-        if len == 0 {
+        let bytes = std::fs::read(path)?;
+        if bytes.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "empty artifact",
             ));
         }
-        let fd = file.as_raw_fd() as usize;
-        // mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0)
-        // SAFETY: a standard read-only file mapping; the kernel returns the
-        // mapping address or a small negative errno.
-        #[allow(unsafe_code)]
-        let raw = unsafe { syscall6(SYS_MMAP, 0, len, PROT_READ, MAP_PRIVATE, fd) };
-        if (-4095..0).contains(&raw) {
-            return Err(std::io::Error::last_os_error());
-        }
-        let ptr = raw as *const u8;
-        // SAFETY: `ptr..ptr+len` is a valid, initialized, read-only mapping of
-        // the whole file, alive until the `munmap` below. `deserialize` only
-        // reads it and copies what it needs into owned `FnProto`s.
-        #[allow(unsafe_code)]
-        let result = {
-            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-            deserialize(bytes)
-        };
-        // SAFETY: unmapping exactly the region we mapped.
-        #[allow(unsafe_code)]
-        unsafe {
-            syscall6(SYS_MUNMAP, ptr as usize, len, 0, 0, 0);
-        }
-        result.map_err(|e| {
+        deserialize_verified(&bytes).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, alloc::format!("{e:?}"))
         })
     }
@@ -1122,9 +1130,9 @@ mod tests {
     use crate::parser::Parser;
     use crate::realm::Realm;
 
-    /// Compiling a program, serializing it, and reloading it via the `mmap` file
+    /// Compiling a program, serializing it, and reloading it via the file load
     /// path reproduces the same bytecode and runs identically.
-    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(feature = "std")]
     #[test]
     fn mmap_reload_runs_identically() {
         let src = "function f(n){ let s=0; for(let i=1;i<=n;i++) s+=i; return s; } f(10) + 1";
@@ -1158,7 +1166,7 @@ mod tests {
     }
 
     /// `load_file` rejects a non-artifact (bad magic) without UB.
-    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(feature = "std")]
     #[test]
     fn mmap_reload_rejects_garbage() {
         let path = std::env::temp_dir().join(alloc::format!(
@@ -1302,6 +1310,103 @@ mod tests {
         let (value, _) =
             crate::nbvm::run_program_capturing(&mut realm, &protos, 0, &[]).expect("run");
         assert_eq!(realm.to_display_string(value), "55");
+    }
+
+    /// VM-7: a crafted artifact with an out-of-range register index must be
+    /// *rejected at load* by every public load path that returns runnable
+    /// protos — not handed to the direct-indexing VM (which would panic).
+    #[test]
+    fn load_paths_reject_unverifiable_bytecode() {
+        // One proto: n_regs = 1, a single `Return { src: 9 }` — register 9 is
+        // out of range, so the VM would index past its register file.
+        let proto = FnProto {
+            ops: alloc::vec![Op::Return { src: 9 }],
+            n_regs: 1,
+            n_params: 0,
+            n_captures: 0,
+            rest_from: None,
+            is_async: false,
+            length: 0,
+            name: String::new(),
+        };
+        let bytes = serialize(&[proto]);
+
+        // Bare decode still succeeds (it doesn't verify)...
+        assert!(deserialize(&bytes).is_ok());
+        // ...but the verifying entry point rejects it.
+        assert_eq!(
+            deserialize_verified(&bytes).map(|_| ()),
+            Err(Ok(VerifyError::Register(9)))
+        );
+
+        // ContentStore::load must verify before returning a runnable table.
+        let mut store = ContentStore::new();
+        let key = store.put(&bytes);
+        // Discard the protos so the result is comparable (FnProto isn't Eq).
+        let loaded = store.load(key).map(|r| r.map(|_| ()));
+        assert_eq!(
+            loaded,
+            Some(Err(DecodeError::Unverified(VerifyError::Register(9)))),
+            "ContentStore::load must reject unverifiable bytecode"
+        );
+
+        // load_file (the file path) must also reject it cleanly — no panic.
+        #[cfg(feature = "std")]
+        {
+            let path = std::env::temp_dir().join(alloc::format!(
+                "kataan_hostile_reg_{}.ktbc",
+                std::process::id() as u64
+            ));
+            std::fs::write(&path, &bytes).unwrap();
+            let r = load_file(path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert!(r.is_err(), "load_file must reject unverifiable bytecode");
+        }
+    }
+
+    /// VM-8: a tiny header claiming an astronomically large count must produce a
+    /// clean `Truncated` error, not a multi-hundred-GB pre-reservation that
+    /// aborts the allocator. We exercise the proto count, the op count, and the
+    /// inline list counts (`regs`/`u32s`/`strings`).
+    #[test]
+    fn huge_counts_do_not_abort_allocator() {
+        // 12-byte file: magic + version + proto count = 0xFFFF_FFFF.
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(deserialize(&bytes).unwrap_err(), DecodeError::Truncated);
+
+        // A single proto whose op count is huge but with no op bytes following.
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 proto
+        for _ in 0..3 {
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // n_regs, n_params, n_captures
+        }
+        bytes.push(0); // rest_from = None
+        bytes.push(0); // is_async = false
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // length
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // name len = 0
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // n_ops = huge
+        assert_eq!(deserialize(&bytes).unwrap_err(), DecodeError::Truncated);
+
+        // An inline arg list (a `Call`) claiming a huge length with no bytes.
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 proto
+        for _ in 0..3 {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+        }
+        bytes.push(0);
+        bytes.push(0);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // n_ops = 1
+        bytes.push(42); // tag for Op::Call
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // dst
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // func
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // args len = huge
+        assert_eq!(deserialize(&bytes).unwrap_err(), DecodeError::Truncated);
     }
 
     #[test]
