@@ -2091,13 +2091,27 @@ pub fn parse_iso_date(s: &str) -> Option<f64> {
         // designator the time is taken as UTC (this engine has no local timezone).
         let (t, offset_min): (&str, i64) = if let Some(rest) = t.strip_suffix('Z') {
             (rest, 0)
-        } else if let Some(pos) = t[1..].find(['+', '-']).map(|i| i + 1) {
+        } else if let Some(pos) = t
+            .char_indices()
+            // The sign must not be the first character of the time component (a
+            // leading `+`/`-` there is malformed, not an offset). `char_indices`
+            // yields valid char-boundary byte indices, so the slices below never
+            // split a multi-byte sequence on untrusted input.
+            .find(|&(i, c)| i > 0 && (c == '+' || c == '-'))
+            .map(|(i, _)| i)
+        {
             let off = &t[pos..];
             let sign: i64 = if off.starts_with('-') { -1 } else { 1 };
+            // The sign is a single ASCII byte, so `off[1..]` is a valid boundary.
             let body = &off[1..];
             let (oh, om): (i64, i64) = match body.split_once(':') {
                 Some((a, b)) => (a.parse().ok()?, b.parse().ok()?),
-                None if body.len() == 4 => (body[..2].parse().ok()?, body[2..].parse().ok()?),
+                // `HHMM` with no separator: split after two ASCII digits. A
+                // non-ASCII body fails the digit check and yields `None` (NaN)
+                // rather than panicking on a char-boundary slice.
+                None if body.len() == 4 && body.is_char_boundary(2) => {
+                    (body[..2].parse().ok()?, body[2..].parse().ok()?)
+                }
                 None => (body.parse().ok()?, 0),
             };
             (&t[..pos], sign * (oh * 60 + om))
