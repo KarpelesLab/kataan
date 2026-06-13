@@ -403,6 +403,12 @@ const MAX_HANDLER_DEPTH: usize = 100_000;
 /// nesting would otherwise overflow the stack independent of `call_depth`.
 const MAX_JSON_DEPTH: usize = 2000;
 
+/// Maximum length (in bytes) of a string produced by a single builtin
+/// (`repeat`, …). Mirrors the tree-walker's cap: past this the result is an
+/// unrepresentable string and a `RangeError("Invalid string length")` is thrown
+/// rather than alloc-aborting the process.
+const MAX_STRING_LEN: usize = 1 << 30;
+
 /// Tier state for one function: its activation count and, once hot, its
 /// optimized bytecode body.
 type TierState = (u32, Option<alloc::rc::Rc<Vec<Op>>>);
@@ -2549,20 +2555,18 @@ fn builtin_method(
                 NanBox::number(i.map_or(-1.0, |i| i as f64))
             }
             "repeat" => {
-                // Negative / non-finite / overflowing counts would panic on
-                // `str::repeat`; clamp to an empty string instead (the spec's
-                // `RangeError` can't be raised from this native return path).
+                // A negative or non-finite count is a `RangeError`; a finite count
+                // whose product with the length overflows `usize` or exceeds the
+                // max string length would alloc-abort, so it is a `RangeError` too
+                // (an unrepresentable string length).
                 let nf = ctx.realm.to_number(arg0());
-                let n = if nf.is_finite() && nf >= 0.0 {
-                    nf as usize
-                } else {
-                    0
-                };
-                let repeated = match n.checked_mul(s.len()) {
-                    Some(_) => s.repeat(n),
-                    None => String::new(),
-                };
-                NanBox::handle(ctx.realm.new_string(&repeated).to_raw())
+                let n = nf as usize;
+                let total = n.checked_mul(s.len());
+                if nf < 0.0 || !nf.is_finite() || total.is_none_or(|t| t > MAX_STRING_LEN) {
+                    let e = make_error(ctx.realm, "RangeError", "Invalid string length");
+                    return Some(Err(VmError::Thrown(e)));
+                }
+                NanBox::handle(ctx.realm.new_string(&s.repeat(n)).to_raw())
             }
             "charAt" => {
                 // ToInteger: `NaN`/no-arg → 0; a negative index is out of range → "".
@@ -3908,6 +3912,13 @@ struct Compiler {
     /// a *value* uses this register, so it has a stable identity (`f === f`) and
     /// holds assigned properties; *calls* still dispatch directly via `fn_ids`.
     fn_value_regs: alloc::collections::BTreeMap<String, Reg>,
+    /// Sticky flag set when register allocation would overflow the `Reg` (`u16`)
+    /// width. A pathological-but-valid program (e.g. a flat literal sequence of
+    /// more than 65535 elements) would otherwise integer-overflow-panic in
+    /// `alloc`; instead `alloc` saturates and sets this, and `compile_fn_inner`
+    /// turns it into a
+    /// clean `CompileError` instead of emitting a corrupt proto.
+    reg_overflow: bool,
 }
 
 impl Compiler {
@@ -4074,6 +4085,11 @@ impl Compiler {
             };
             c.ops.push(Op::Return { src });
         }
+        // Reject a program that exhausted the `Reg` width during allocation
+        // rather than returning a proto with wrapped/aliased register indices.
+        if c.reg_overflow {
+            return Err(CompileError::Unsupported("too many registers"));
+        }
         // `fn.length`: params before the first default value or the rest param.
         let length = params
             .iter()
@@ -4095,7 +4111,14 @@ impl Compiler {
 impl Compiler {
     fn alloc(&mut self) -> Reg {
         let r = self.next_reg;
-        self.next_reg += 1;
+        // A program that needs more than `Reg::MAX` registers (e.g. an enormous
+        // flat literal sequence) must not integer-overflow-panic here. Saturate
+        // and record the overflow; `compile_fn_inner` rejects the program with a
+        // `CompileError` before the corrupt proto is ever run.
+        match self.next_reg.checked_add(1) {
+            Some(n) => self.next_reg = n,
+            None => self.reg_overflow = true,
+        }
         r
     }
 
@@ -7803,6 +7826,45 @@ mod tests {
         assert_eq!(bc("'abcabc'.indexOf('c')"), "2");
         assert_eq!(bc("'ab'.repeat(3)"), "ababab");
         assert_eq!(bc("'hello world'.includes('world')"), "true");
+    }
+
+    /// NBVM-1: `String.prototype.repeat` with an attacker-controlled count must
+    /// throw a catchable `RangeError` rather than alloc-aborting the process.
+    #[test]
+    fn repeat_allocation_bomb_throws_range_error() {
+        // A huge product (or non-finite/negative count) is an unrepresentable
+        // string length — caught here to confirm it throws, not aborts.
+        assert_eq!(
+            bc("let r; try { 'x'.repeat(1e12); r = 'no throw'; } catch (e) { r = e.name; } r"),
+            "RangeError"
+        );
+        assert_eq!(
+            bc("let r; try { 'x'.repeat(-1); r = 'no throw'; } catch (e) { r = e.name; } r"),
+            "RangeError"
+        );
+        assert_eq!(
+            bc("let r; try { 'x'.repeat(Infinity); r = 'no throw'; } catch (e) { r = e.name; } r"),
+            "RangeError"
+        );
+        // Legitimate small repeats still work.
+        assert_eq!(bc("'ab'.repeat(3)"), "ababab");
+        assert_eq!(bc("'x'.repeat(0)"), "");
+    }
+
+    /// NBVM-2: a program whose register count exceeds the `Reg` (`u16`) width must
+    /// surface as a clean `CompileError`, not an integer-overflow panic in
+    /// `Compiler::alloc`.
+    #[test]
+    fn excessive_register_count_is_compile_error_not_panic() {
+        // 70_000 distinct local bindings exhaust the u16 register space.
+        let mut src = String::new();
+        for i in 0..70_000 {
+            src.push_str(&alloc::format!("let v{i}=0;"));
+        }
+        let program = crate::parser::Parser::parse_program(&src).expect("parse");
+        let mut realm = Realm::new();
+        // Must return Err (routed to the tree-walker by `execute`), never panic.
+        assert!(compile_and_run(&mut realm, &program).is_err());
     }
 
     #[test]
