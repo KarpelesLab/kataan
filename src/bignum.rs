@@ -370,6 +370,20 @@ impl BigInt {
         }
     }
 
+    /// Like [`pow`](Self::pow), but refuses to build a result larger than
+    /// `max_bits` bits, returning `None` instead. The result of `self ** exp`
+    /// has roughly `bit_len(self) * exp` bits, so this rejects the allocation
+    /// up front — a defense-in-depth guard so no caller can trigger a
+    /// multi-gigabyte allocation bomb (MEM-6). Computes `pow(exp)` when within
+    /// bounds.
+    #[must_use]
+    pub fn try_pow(&self, exp: u64, max_bits: u64) -> Option<Self> {
+        if self.bit_len().saturating_mul(exp) > max_bits {
+            return None;
+        }
+        Some(self.pow(exp))
+    }
+
     /// Returns `self ** exp` (non-negative exponent) by binary exponentiation.
     #[must_use]
     pub fn pow(&self, mut exp: u64) -> Self {

@@ -7762,12 +7762,25 @@ impl<'a> Interp<'a> {
         {
             use crate::bignum::BigInt;
             let bits = self.realm.to_number(arg(0)).max(0.0) as u64;
+            // `2^bits` is the modulus; an attacker-supplied `bits` (e.g.
+            // `BigInt.asUintN(1e18, 0n)`) would otherwise build a ~10^17-byte
+            // BigInt and OOM/abort. Cap `bits` to the same size budget as the
+            // `**`/`<<` operators before building any power-of-two (MEM-6).
+            if bits > MAX_BIGINT_BITS {
+                let m = self.new_str("Maximum BigInt size exceeded");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
             let x = arg(1)
                 .as_handle()
                 .map(Handle::from_raw)
                 .and_then(|h| self.realm.bigint_at(h))
                 .unwrap_or_else(BigInt::zero);
-            let modulus = BigInt::from_i128(2).pow(bits);
+            // `try_pow` re-checks the projected size as defense in depth: even if
+            // the cap above were ever loosened, no oversized allocation occurs.
+            let Some(modulus) = BigInt::from_i128(2).try_pow(bits, MAX_BIGINT_BITS) else {
+                let m = self.new_str("Maximum BigInt size exceeded");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            };
             // Non-negative remainder modulo 2^bits.
             let mut u = x.divmod(&modulus).map_or_else(BigInt::zero, |(_, r)| r);
             if u.is_negative() {
@@ -13777,13 +13790,15 @@ impl<'a> Interp<'a> {
                         return Err(throw(self, "Exponent must be non-negative"));
                     }
                     let e = y.to_i128().and_then(|v| u64::try_from(v).ok()).unwrap_or(0);
-                    // Projected result size ≈ bit_len(x) × e. Reject before the
-                    // (possibly multi-GB) allocation, else `2n ** 1e10n` OOMs.
-                    if x.bit_len().saturating_mul(e) > MAX_BIGINT_BITS {
+                    // Projected result size ≈ bit_len(x) × e. `try_pow` rejects
+                    // before the (possibly multi-GB) allocation, else `2n ** 1e10n`
+                    // OOMs. Belt and suspenders: the same cap is enforced here so
+                    // the error path is unmistakable.
+                    let Some(p) = x.try_pow(e, MAX_BIGINT_BITS) else {
                         let m = self.new_str("Maximum BigInt size exceeded");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
-                    }
-                    val(self, x.pow(e))
+                    };
+                    val(self, p)
                 }
                 // Two's-complement bitwise ops at arbitrary precision.
                 BinaryOp::BitAnd => val(self, x.bitand(&y)),
