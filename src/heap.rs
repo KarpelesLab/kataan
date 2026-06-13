@@ -328,8 +328,16 @@ impl<T> Heap<T> {
         let slot = self.slots.get_mut(handle.index as usize)?;
         match slot {
             Slot::Occupied { generation, .. } if *generation == handle.generation => {
-                // Bump the generation (wrapping) and take the value out.
-                let next_gen = generation.wrapping_add(1);
+                // Bump the generation and take the value out. Clamp the bump to
+                // stay strictly below the compaction-reserved range so free/reuse
+                // generations remain disjoint from those `compact_to` hands out
+                // (>= COMPACT_GEN_BASE). Wrapping to 0 is sound: 0 is the initial
+                // low-range generation used by fresh allocations.
+                let next_gen = if generation.wrapping_add(1) >= COMPACT_GEN_BASE {
+                    0
+                } else {
+                    *generation + 1
+                };
                 let Slot::Occupied { value, .. } = core::mem::replace(
                     slot,
                     Slot::Free {
