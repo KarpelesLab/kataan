@@ -454,6 +454,17 @@ impl<'src> Parser<'src> {
     /// expression on the left (e.g. `-2 ** 2`) is a syntax error and must be
     /// parenthesized; an update expression (`++x ** 2`) is allowed.
     fn parse_exponent(&mut self) -> Result<Expr> {
+        // `**` is right-recursive: `parse_exponent` calls itself for the
+        // exponent (`2**2**…`). The inner `parse_unary` enters *and exits* its
+        // own guard per call, so the `**` recursion itself is uncounted and can
+        // overflow the native stack. Guard `parse_exponent` directly so each
+        // `**` level counts toward `MAX_PARSE_DEPTH`.
+        let guard = self.enter_recursion()?;
+        guard.parser.parse_exponent_inner()
+    }
+
+    /// The body of [`Self::parse_exponent`], run inside the recursion guard.
+    fn parse_exponent_inner(&mut self) -> Result<Expr> {
         let unary_lead = self.at_unary_operator();
         let base = self.parse_unary()?;
         if self.at(TokenKind::StarStar) {
@@ -583,6 +594,17 @@ impl<'src> Parser<'src> {
     /// `new Callee` / `new Callee(args)` — the callee is a member expression
     /// (no call), and the optional argument list binds to this `new`.
     fn parse_new(&mut self) -> Result<Expr> {
+        // A `new` callee may itself be `new` (`new new new … Object`), and
+        // `parse_new` recurses straight back into itself for each level without
+        // passing through a guarded hub. Guard it so each `new` counts toward
+        // `MAX_PARSE_DEPTH` and a deep chain returns a syntax error instead of
+        // overflowing the native stack.
+        let guard = self.enter_recursion()?;
+        guard.parser.parse_new_inner()
+    }
+
+    /// The body of [`Self::parse_new`], run inside the recursion guard.
+    fn parse_new_inner(&mut self) -> Result<Expr> {
         let start = self.cur_span();
         self.bump(); // `new`
         if self.at(TokenKind::Dot) {

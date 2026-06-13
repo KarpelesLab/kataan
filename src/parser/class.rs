@@ -34,6 +34,18 @@ impl<'src> Parser<'src> {
     /// Shared class parser. `require_name` distinguishes declarations from
     /// expressions.
     fn parse_class(&mut self, require_name: bool) -> Result<Class> {
+        // `class extends class extends … Object {}` recurses through the cycle
+        // parse_lhs → parse_primary → parse_class_expr → parse_class → extends
+        // → parse_lhs with no guarded hub. Guard `parse_class` (covering both
+        // declaration and expression entry, plus the `extends` recursion) so
+        // each level counts toward `MAX_PARSE_DEPTH` and a deep chain returns a
+        // syntax error instead of overflowing the native stack.
+        let guard = self.enter_recursion()?;
+        guard.parser.parse_class_inner(require_name)
+    }
+
+    /// The body of [`Self::parse_class`], run inside the recursion guard.
+    fn parse_class_inner(&mut self, require_name: bool) -> Result<Class> {
         let start = self.expect(TokenKind::Keyword(Kw::Class))?.span;
 
         // An optional name: present unless `extends` or `{` follows.
