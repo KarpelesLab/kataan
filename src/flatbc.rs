@@ -212,74 +212,34 @@ pub fn run(bytes: &[u8], args: &[i64]) -> Result<i64, FlatError> {
     Err(FlatError::NoReturn)
 }
 
-/// Maps `path` read-only and runs the flat program **over the mapped bytes**
-/// (zero-copy: the file is the program). Linux/x86-64 only.
-#[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-pub use mmap::run_file;
+/// Reads the flat program at `path` and runs it. Available when the standard
+/// library is present.
+#[cfg(feature = "std")]
+pub use file_run::run_file;
 
-#[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-mod mmap {
-    use super::{FlatError, run};
-    use std::os::unix::io::AsRawFd;
+#[cfg(feature = "std")]
+mod file_run {
+    use super::run;
 
-    const PROT_READ: usize = 0x1;
-    const MAP_PRIVATE: usize = 0x02;
-    const SYS_MMAP: usize = 9;
-    const SYS_MUNMAP: usize = 11;
-
-    /// SAFETY: issues the `syscall` instruction with the System V syscall ABI.
-    #[allow(unsafe_code)]
-    unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
-        let ret: isize;
-        // SAFETY: a single syscall with documented inputs/clobbers.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inlateout("rax") n as isize => ret,
-                in("rdi") a1, in("rsi") a2, in("rdx") a3,
-                in("r10") a4, in("r8") a5, in("r9") 0usize,
-                out("rcx") _, out("r11") _,
-                options(nostack, preserves_flags),
-            );
-        }
-        ret
-    }
-
-    /// Runs the flat program at `path` directly from a memory mapping.
+    /// Runs the flat program at `path`. The file is read into an owned buffer
+    /// with [`std::fs::read`] rather than memory-mapped: the bytes are an
+    /// untrusted input, and an `mmap`'d file truncated concurrently by another
+    /// process would raise an uncatchable SIGBUS when a page past the new EOF is
+    /// touched (VM-9). `run` already bounds-checks every access over the slice,
+    /// so reading into owned memory removes the hazard at no correctness cost.
     ///
     /// # Errors
-    /// `io::Error` on a failed open/`mmap`, or `InvalidData` wrapping the
-    /// [`FlatError`] if the mapped bytes don't run.
+    /// `io::Error` on a failed open/read, or `InvalidData` wrapping the
+    /// [`FlatError`](super::FlatError) if the bytes don't run.
     pub fn run_file(path: &str, args: &[i64]) -> std::io::Result<i64> {
-        let file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len() as usize;
-        if len == 0 {
+        let bytes = std::fs::read(path)?;
+        if bytes.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "empty program",
             ));
         }
-        let fd = file.as_raw_fd() as usize;
-        // SAFETY: a standard read-only file mapping.
-        #[allow(unsafe_code)]
-        let raw = unsafe { syscall6(SYS_MMAP, 0, len, PROT_READ, MAP_PRIVATE, fd) };
-        if (-4095..0).contains(&raw) {
-            return Err(std::io::Error::last_os_error());
-        }
-        let ptr = raw as *const u8;
-        // SAFETY: `ptr..ptr+len` is a valid read-only mapping of the whole file,
-        // alive until the `munmap` below; `run` only reads it.
-        #[allow(unsafe_code)]
-        let result: Result<i64, FlatError> = {
-            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-            run(bytes, args)
-        };
-        // SAFETY: unmapping exactly the region we mapped.
-        #[allow(unsafe_code)]
-        unsafe {
-            syscall6(SYS_MUNMAP, ptr as usize, len, 0, 0, 0);
-        }
-        result.map_err(|e| {
+        run(&bytes, args).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, alloc::format!("{e:?}"))
         })
     }
@@ -344,7 +304,7 @@ mod tests {
         assert_eq!(run(&bad, &[]), Err(FlatError::BadTarget));
     }
 
-    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(feature = "std")]
     #[test]
     fn mmap_zero_copy_execution() {
         // Write a flat program to a file, then execute it directly from an mmap
