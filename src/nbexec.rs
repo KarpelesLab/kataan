@@ -118,48 +118,93 @@ struct FnDef<'a> {
     home_static: bool,
 }
 
-/// One SplitMix64 step: scrambles a seed word into a well-distributed output.
-/// Used only to derive `Math.random`'s initial `xorshift128+` state — SplitMix64
-/// is the standard seeding procedure for xorshift generators (it spreads a
-/// single seed across the state and avoids the all-zero fixed point).
+/// One SplitMix64 step: scrambles an input word into a well-distributed output.
+/// Used to derive `Math.random`'s initial `xorshift128+` state — SplitMix64 is
+/// the standard finalizer for xorshift seeding (it spreads the mixed entropy
+/// across the state and avoids the all-zero fixed point).
 const fn splitmix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
 }
 
-/// Fixed fallback `Math.random` state: the golden-ratio constant expanded
-/// through SplitMix64 into two non-zero words for `xorshift128+`. Used when no
-/// entropy source is available (the `no_std` / no-`crypto` core), giving
-/// deterministic, snapshot-friendly output. Both words are non-zero, so the
-/// generator never degrades to its all-zero fixed point.
-const MATH_RANDOM_SEED: [u64; 2] = [
-    splitmix64(0x9E37_79B9_7F4A_7C15),
-    splitmix64(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(2)),
-];
-
-/// Produces the initial `xorshift128+` state for a new interpreter's
-/// `Math.random`. With the `crypto` feature it draws 128 bits from purecrypto's
-/// OS CSPRNG ([`purecrypto::rng::OsRng`], i.e. `getrandom(2)` on Linux) so the
-/// stream is unpredictable across runs; without it, it falls back to the fixed
-/// [`MATH_RANDOM_SEED`]. Either way `Math.random` is *not* a security RNG —
-/// WebCrypto (`crypto.getRandomValues`) is the path for that.
-#[cfg(feature = "crypto")]
-fn math_random_seed() -> [u64; 2] {
-    use purecrypto::rng::{OsRng, RngCore};
-    let mut rng = OsRng;
-    let s = [rng.next_u64(), rng.next_u64()];
-    // Guard the all-zero fixed point (probability 2^-128).
-    if s[0] | s[1] == 0 {
-        MATH_RANDOM_SEED
-    } else {
-        s
+/// A high-resolution monotonic cycle counter (the CPU timestamp counter), read
+/// for entropy. Roughly tracks machine uptime in cycles and changes on every
+/// call. Returns 0 on architectures without a cheap unprivileged counter, where
+/// the caller leans on its other entropy sources.
+// One of the small, audited VM primitives the crate's `unsafe_code = "deny"`
+// policy permits to opt back in: both reads are unprivileged, have no
+// preconditions, and no memory effects.
+#[allow(unsafe_code)]
+fn cycle_counter() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: `rdtsc` is unconditionally available on x86_64 and has no
+        // preconditions or memory effects.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        // SAFETY: reading the virtual count register is an unprivileged,
+        // side-effect-free instruction on aarch64.
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
     }
 }
 
-#[cfg(not(feature = "crypto"))]
+/// Produces the initial `xorshift128+` state for a new interpreter's
+/// `Math.random`.
+///
+/// With the `crypto` feature it draws 128 bits from purecrypto's OS CSPRNG
+/// ([`purecrypto::rng::OsRng`], i.e. `getrandom(2)` on Linux). Otherwise (the
+/// `no_std` / no-`crypto` core) it builds a best-effort, non-deterministic seed
+/// by mixing every cheap entropy source available — a high-resolution cycle
+/// counter, the wall clock (with `std`), the process id, and an ASLR-derived
+/// stack address — through SplitMix64. There is no fixed compile-time seed.
+///
+/// Either way `Math.random` is *not* a security RNG; WebCrypto
+/// (`crypto.getRandomValues`) is the path for that. The fallback may be weak on
+/// a target that exposes none of the above, but it is never constant.
 fn math_random_seed() -> [u64; 2] {
-    MATH_RANDOM_SEED
+    #[cfg(feature = "crypto")]
+    {
+        use purecrypto::rng::{OsRng, RngCore};
+        let mut rng = OsRng;
+        let s = [rng.next_u64(), rng.next_u64()];
+        // An all-zero draw (probability 2^-128) would be the generator's fixed
+        // point; fall through to the entropy mix rather than accept it.
+        if s[0] | s[1] != 0 {
+            return s;
+        }
+    }
+
+    // The golden-ratio value is the SplitMix64 avalanche basis (not a seed): the
+    // output varies because the entropy sources below are XOR-mixed into `acc`.
+    let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+    acc ^= cycle_counter();
+    #[cfg(feature = "std")]
+    {
+        if let Ok(d) =
+            std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH)
+        {
+            acc ^= (d.as_nanos() as u64).rotate_left(32);
+        }
+        acc ^= u64::from(std::process::id()).wrapping_mul(0x2545_F491_4F6C_DD1D);
+    }
+    // ASLR / stack-layout entropy: the address of a local variable.
+    let here = 0u8;
+    acc ^= (&here as *const u8 as u64).rotate_left(17);
+
+    // Avalanche `acc` into two independent state words; forcing a low bit keeps
+    // the pair off the all-zero fixed point without reintroducing a constant.
+    let s0 = splitmix64(acc) | 1;
+    let s1 = splitmix64(acc.wrapping_add(0x9E37_79B9_7F4A_7C15));
+    [s0, s1]
 }
 
 /// A tree-walking interpreter over the performance object model.
@@ -189,7 +234,8 @@ pub struct Interp<'a> {
     /// Current function-call nesting depth (recursion guard).
     call_depth: usize,
     /// `xorshift128+` PRNG state backing `Math.random` (pure Rust, no foreign
-    /// code). Two 64-bit words give a 2^128-1 period; see [`MATH_RANDOM_SEED`].
+    /// code). Two 64-bit words give a 2^128-1 period; seeded by
+    /// [`math_random_seed`].
     rng_state: [u64; 2],
     /// The current `this` binding (method/constructor receiver).
     this_val: NanBox,

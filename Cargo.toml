@@ -36,8 +36,8 @@ required-features = ["cli"]
 # (`--no-default-features --features alloc`); `host`, `fetch`, `crypto`, `intl`,
 # and the CLI need `std`.
 # `crypto` is in the default set so `Math.random` is seeded from real OS entropy
-# (purecrypto's CSPRNG) rather than a fixed seed; the no_std core drops it and
-# falls back to a deterministic seed.
+# (purecrypto's CSPRNG); the no_std core drops it and falls back to a best-effort
+# entropy mix (cycle counter + clock + ASLR), never a fixed seed.
 default = ["std", "regex", "intl", "module", "host", "cli", "crypto"]
 std = ["alloc"]
 alloc = []
