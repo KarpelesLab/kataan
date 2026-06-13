@@ -128,14 +128,39 @@ const fn splitmix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Initial `Math.random` state: the golden-ratio constant expanded through
-/// SplitMix64 into two non-zero words for `xorshift128+`. Deterministic across
-/// runs (matching the engine's snapshot-friendly, reproducible posture) but it
-/// advances per call. Both words are non-zero, so the generator never degrades.
+/// Fixed fallback `Math.random` state: the golden-ratio constant expanded
+/// through SplitMix64 into two non-zero words for `xorshift128+`. Used when no
+/// entropy source is available (the `no_std` / no-`crypto` core), giving
+/// deterministic, snapshot-friendly output. Both words are non-zero, so the
+/// generator never degrades to its all-zero fixed point.
 const MATH_RANDOM_SEED: [u64; 2] = [
     splitmix64(0x9E37_79B9_7F4A_7C15),
     splitmix64(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(2)),
 ];
+
+/// Produces the initial `xorshift128+` state for a new interpreter's
+/// `Math.random`. With the `crypto` feature it draws 128 bits from purecrypto's
+/// OS CSPRNG ([`purecrypto::rng::OsRng`], i.e. `getrandom(2)` on Linux) so the
+/// stream is unpredictable across runs; without it, it falls back to the fixed
+/// [`MATH_RANDOM_SEED`]. Either way `Math.random` is *not* a security RNG —
+/// WebCrypto (`crypto.getRandomValues`) is the path for that.
+#[cfg(feature = "crypto")]
+fn math_random_seed() -> [u64; 2] {
+    use purecrypto::rng::{OsRng, RngCore};
+    let mut rng = OsRng;
+    let s = [rng.next_u64(), rng.next_u64()];
+    // Guard the all-zero fixed point (probability 2^-128).
+    if s[0] | s[1] == 0 {
+        MATH_RANDOM_SEED
+    } else {
+        s
+    }
+}
+
+#[cfg(not(feature = "crypto"))]
+fn math_random_seed() -> [u64; 2] {
+    MATH_RANDOM_SEED
+}
 
 /// A tree-walking interpreter over the performance object model.
 pub struct Interp<'a> {
@@ -758,7 +783,7 @@ impl<'a> Interp<'a> {
             class_envs: Vec::new(),
             class_native_super: Vec::new(),
             call_depth: 0,
-            rng_state: MATH_RANDOM_SEED,
+            rng_state: math_random_seed(),
             this_val: NanBox::undefined(),
             new_target: NanBox::undefined(),
             pending_new_target: None,
