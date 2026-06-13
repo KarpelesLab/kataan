@@ -186,40 +186,52 @@ impl Compiler<'_> {
         max: Option<usize>,
         greedy: bool,
     ) -> Result<(), RegexError> {
-        // Project the expanded size *before* emitting any copies, so a bound like
-        // `a{1000000}` (or `(a{K}){K}`) is rejected up front rather than after it
-        // has already allocated a huge program (RE-3). One copy of `inner` is
-        // first compiled into a scratch program to learn its instruction count.
-        let mut probe = Compiler {
-            prog: Vec::new(),
-            groups: 0,
-            group_names: self.group_names,
-        };
-        probe.compile(inner)?;
-        let inner_size = probe.prog.len().max(1);
-        // Each mandatory copy is `inner_size`; each optional copy adds ~1 split
-        // around `inner_size`. The unbounded tail adds a constant.
-        let copies = match max {
-            None => min,
-            Some(max) => max,
-        };
-        let projected = self
-            .prog
-            .len()
-            .saturating_add(copies.saturating_mul(inner_size.saturating_add(1)));
-        if projected > MAX_PROG_SIZE {
-            return Err(RegexError::new("compiled pattern too large"));
-        }
-
-        // `min` mandatory copies.
-        for _ in 0..min {
-            self.compile(inner)?;
-        }
         match max {
-            // Unbounded tail: `(inner)*` after the mandatory copies.
-            None => self.compile_star(inner, greedy)?,
-            // `{min,max}`: (max - min) optional copies.
+            // Unbounded tail (`*`, `+`, `{n,}`): the optional/star part adds only
+            // a small constant (a `Split`/`Jmp` around one real copy of `inner`),
+            // so there is nothing to project — and crucially we must NOT run a
+            // throwaway `probe.compile(inner)` here. Probing recompiles `inner`,
+            // and for a nested unbounded quantifier (`(?:…*)*`) the probe at each
+            // level recursively re-probes its own inner, doubling the compile work
+            // per nesting level → 2^depth blowup at *compile* time (RE-9). RE-3's
+            // size cap never fires because the final program stays tiny (min=0 ⇒
+            // no mandatory copies). `compile`'s per-emit `check_size` already
+            // bounds any real growth, so a single real compile is all we need.
+            None => {
+                // `min` mandatory copies, then the `(inner)*` tail. Each real
+                // `compile` self-checks `MAX_PROG_SIZE`, so a large `min` (e.g.
+                // `a{1000000,}`) is still rejected promptly as it emits.
+                for _ in 0..min {
+                    self.compile(inner)?;
+                }
+                self.compile_star(inner, greedy)?;
+            }
+            // Bounded `{min,max}`: project the expanded size *before* emitting any
+            // copies, so a bound like `a{1000000}` (or `(a{K}){K}`) is rejected up
+            // front rather than after it has already allocated a huge program
+            // (RE-3). One copy of `inner` is compiled into a scratch program to
+            // learn its instruction count.
             Some(max) => {
+                let mut probe = Compiler {
+                    prog: Vec::new(),
+                    groups: 0,
+                    group_names: self.group_names,
+                };
+                probe.compile(inner)?;
+                let inner_size = probe.prog.len().max(1);
+                // Each mandatory copy is `inner_size`; each optional copy adds ~1
+                // split around `inner_size`.
+                let projected = self
+                    .prog
+                    .len()
+                    .saturating_add(max.saturating_mul(inner_size.saturating_add(1)));
+                if projected > MAX_PROG_SIZE {
+                    return Err(RegexError::new("compiled pattern too large"));
+                }
+                // `min` mandatory copies, then `(max - min)` optional copies.
+                for _ in 0..min {
+                    self.compile(inner)?;
+                }
                 for _ in min..max {
                     self.compile_optional(inner, greedy)?;
                 }
