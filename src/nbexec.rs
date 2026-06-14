@@ -8901,14 +8901,24 @@ impl<'a> Interp<'a> {
         // --- string methods ---
         if let Some(s) = self.realm.string_value(handle) {
             // The lossless WTF-8 bytes — used by the UTF-16-unit-correct ops
-            // (length/index/slice/search/pad/for-of); `s` (lossy `String`) is
-            // still used by case-mapping / normalize (the B5 milestone).
+            // (length/index/slice/search/pad/for-of) and the surrogate-aware
+            // case/normalize ops; `s` (lossy `String`) backs the ops that take an
+            // `&str` and are not required to preserve a lone surrogate verbatim
+            // (`trim`, the linguistic `localeCompare`, etc.).
             let bytes = self.realm.string_bytes(handle).unwrap_or_default();
             let out = match method {
                 // The locale variants behave like the locale-independent ones here
-                // (no locale-specific case tailoring).
-                "toUpperCase" | "toLocaleUpperCase" => Some(self.new_str(&s.to_uppercase())),
-                "toLowerCase" | "toLocaleLowerCase" => Some(self.new_str(&s.to_lowercase())),
+                // (no locale-specific case tailoring). A surrogate-free string
+                // takes the `&str` fast path (byte-identical to before); a
+                // surrogate-bearing string maps case over the code-point view,
+                // passing lone surrogates through unchanged (a surrogate has no
+                // case) so they survive the round-trip.
+                "toUpperCase" | "toLocaleUpperCase" => {
+                    Some(self.new_str_bytes(case_map_wtf8(&bytes, true)))
+                }
+                "toLowerCase" | "toLocaleLowerCase" => {
+                    Some(self.new_str_bytes(case_map_wtf8(&bytes, false)))
+                }
                 "trim" => Some(self.new_str(s.trim())),
                 "charAt" => {
                     // UTF-16-indexed: the unit at `i` as a one-unit string,
@@ -9223,8 +9233,12 @@ impl<'a> Interp<'a> {
                         .map_or(-1.0, |b| s[..b].encode_utf16().count() as f64);
                     Some(NanBox::number(idx))
                 }
-                // `normalize()` — Unicode normalization; a no-op here (the engine
-                // stores strings as-is), sufficient for already-normal input.
+                // `normalize()` — Unicode normalization via the `intl` crate.
+                // Normalization is the identity on a lone surrogate (it is its own
+                // canonical/compatibility form and combines with nothing), so a
+                // surrogate-bearing string normalizes its scalar runs and passes
+                // each lone surrogate through in place; a surrogate-free string
+                // takes the `&str` fast path unchanged.
                 "normalize" => {
                     let form = if matches!(arg(0).unpack(), Unpacked::Undefined) {
                         String::from("NFC")
@@ -9233,28 +9247,24 @@ impl<'a> Interp<'a> {
                     };
                     #[cfg(feature = "intl")]
                     {
-                        use intl::unicode::normalize;
-                        let out: String = match form.as_str() {
-                            "NFC" => normalize::nfc(s.chars()).collect(),
-                            "NFD" => normalize::nfd(s.chars()).collect(),
-                            "NFKC" => normalize::nfkc(s.chars()).collect(),
-                            "NFKD" => normalize::nfkd(s.chars()).collect(),
-                            _ => {
-                                // An unsupported form is a RangeError *object*.
-                                let m = self.new_str(&alloc::format!(
-                                    "The normalization form should be one of NFC, NFD, NFKC, NFKD. Got {form}."
-                                ));
-                                return Err(ExecError::Throw(
-                                    self.make_error(N_ERROR_BASE + 2, Some(m)),
-                                ));
-                            }
-                        };
-                        Some(self.new_str(&out))
+                        // Validate the form first (a bad form is a RangeError even
+                        // for the empty string), then normalize per run.
+                        if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+                            let m = self.new_str(&alloc::format!(
+                                "The normalization form should be one of NFC, NFD, NFKC, NFKD. Got {form}."
+                            ));
+                            return Err(ExecError::Throw(
+                                self.make_error(N_ERROR_BASE + 2, Some(m)),
+                            ));
+                        }
+                        Some(self.new_str_bytes(normalize_wtf8(&bytes, &form)))
                     }
                     #[cfg(not(feature = "intl"))]
                     {
                         let _ = &form;
-                        Some(self.new_str(&s))
+                        // No `intl`: normalization is a no-op, but still preserve
+                        // surrogates by round-tripping the lossless bytes.
+                        Some(self.new_str_bytes(bytes.clone()))
                     }
                 }
                 // `localeCompare(other)` — ordering sign (code-point order; no
@@ -15441,6 +15451,89 @@ fn group_thousands_str(s: &str) -> String {
     out
 }
 
+/// Case-maps a WTF-8 string, preserving lone surrogates verbatim (a surrogate
+/// code point has no case). A surrogate-free string takes the `&str` fast path
+/// — byte-identical to `str::to_uppercase`/`to_lowercase`, including full
+/// (multi-`char`) mappings like `ß`→`SS`. A surrogate-bearing string maps each
+/// scalar code point with `char::to_uppercase`/`to_lowercase` and re-emits any
+/// surrogate code point unchanged, building the result as WTF-8.
+fn case_map_wtf8(bytes: &[u8], upper: bool) -> alloc::vec::Vec<u8> {
+    // Fast path: no surrogates → valid UTF-8 → the standard `&str` mapping.
+    if let Some(s) = crate::wtf8::as_str(bytes) {
+        let mapped = if upper {
+            s.to_uppercase()
+        } else {
+            s.to_lowercase()
+        };
+        return mapped.into_bytes();
+    }
+    let mut out = alloc::vec::Vec::with_capacity(bytes.len());
+    for cp in crate::wtf8::code_points(bytes) {
+        match char::from_u32(cp) {
+            // A scalar value: apply the Unicode case mapping (a one-to-many
+            // mapping such as `ß`→`SS` expands here too).
+            Some(c) => {
+                if upper {
+                    for u in c.to_uppercase() {
+                        crate::wtf8::encode_code_point(u32::from(u), &mut out);
+                    }
+                } else {
+                    for u in c.to_lowercase() {
+                        crate::wtf8::encode_code_point(u32::from(u), &mut out);
+                    }
+                }
+            }
+            // A lone surrogate code point: no case — pass it through unchanged.
+            None => crate::wtf8::encode_code_point(cp, &mut out),
+        }
+    }
+    out
+}
+
+/// Unicode-normalizes a WTF-8 string (`form` is one of `NFC`/`NFD`/`NFKC`/
+/// `NFKD`, validated by the caller), preserving lone surrogates in place.
+/// Normalization is the identity on a surrogate code point, so a surrogate-free
+/// string takes the `&str` fast path (byte-identical to the scalar normalizer),
+/// while a surrogate-bearing string normalizes each maximal run of scalars and
+/// re-emits each lone surrogate unchanged. The result is WTF-8.
+#[cfg(feature = "intl")]
+fn normalize_wtf8(bytes: &[u8], form: &str) -> alloc::vec::Vec<u8> {
+    use intl::unicode::normalize;
+    let norm = |chars: core::str::Chars<'_>| -> String {
+        match form {
+            "NFC" => normalize::nfc(chars).collect(),
+            "NFD" => normalize::nfd(chars).collect(),
+            "NFKC" => normalize::nfkc(chars).collect(),
+            // The caller validated `form`, so the remaining case is `NFKD`.
+            _ => normalize::nfkd(chars).collect(),
+        }
+    };
+    // Fast path: no surrogates → one scalar run.
+    if let Some(s) = crate::wtf8::as_str(bytes) {
+        return norm(s.chars()).into_bytes();
+    }
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(bytes.len());
+    // A buffer of consecutive scalar code points, flushed (normalized) whenever a
+    // lone surrogate interrupts the run.
+    let mut run = String::new();
+    for cp in crate::wtf8::code_points(bytes) {
+        match char::from_u32(cp) {
+            Some(c) => run.push(c),
+            None => {
+                if !run.is_empty() {
+                    out.extend_from_slice(norm(run.chars()).as_bytes());
+                    run.clear();
+                }
+                crate::wtf8::encode_code_point(cp, &mut out);
+            }
+        }
+    }
+    if !run.is_empty() {
+        out.extend_from_slice(norm(run.chars()).as_bytes());
+    }
+    out
+}
+
 /// Slices a pre-collected `&[u16]` subject over the **code-unit** range
 /// `[st, en)` and re-encodes it to WTF-8 bytes (lone surrogates preserved). The
 /// native regex subject model is UTF-16 code units, so match/capture spans index
@@ -16080,6 +16173,36 @@ mod tests {
             run(r#""a\uD800b".replace(/\uD800/u, "X") === "aXb""#),
             "true"
         );
+    }
+
+    #[test]
+    fn case_and_normalize_preserve_surrogates() {
+        // A lone surrogate has no case and survives toUpperCase/toLowerCase.
+        assert_eq!(
+            run(r#""\uD800".toUpperCase().charCodeAt(0) === 0xD800"#),
+            "true"
+        );
+        assert_eq!(
+            run(r#""\uDC00".toLowerCase().charCodeAt(0) === 0xDC00"#),
+            "true"
+        );
+        // Surrounding scalars still case-map; the surrogate stays put.
+        assert_eq!(run(r#""a\uD800b".toUpperCase() === "A\uD800B""#), "true");
+        // The surrogate-free fast path is unchanged, including `ß`→`SS`.
+        assert_eq!(run(r#""abc".toUpperCase() === "ABC""#), "true");
+        assert_eq!(run(r#""ß".toUpperCase() === "SS""#), "true");
+        assert_eq!(run(r#""ABC".toLowerCase() === "abc""#), "true");
+        // normalize is the identity on a lone surrogate (it round-trips).
+        assert_eq!(
+            run(r#""\uD800".normalize().charCodeAt(0) === 0xD800"#),
+            "true"
+        );
+        assert_eq!(
+            run(r#""a\uD800é".normalize("NFC").charCodeAt(1) === 0xD800"#),
+            "true"
+        );
+        // A surrogate-free string still normalizes (NFC composes here).
+        assert_eq!(run(r#""é".normalize("NFC") === "é""#), "true");
     }
 
     #[test]
