@@ -2047,8 +2047,12 @@ impl Realm {
     pub fn truthy(&self, v: NanBox) -> bool {
         if let Some(raw) = v.as_handle() {
             let h = Handle::from_raw(raw);
-            if let Some(s) = self.string_value(h) {
-                return !s.is_empty();
+            // Emptiness is O(1) on the rope (cached length) — never materialize the
+            // whole string just to test it. `Cell::as_str` + `Rope::is_empty` are
+            // both allocation-free, so this runs on every `if`/`while`/`&&`/`||`/
+            // `??`/ternary without copying the string.
+            if let Some(r) = self.heap.get(h).and_then(Cell::as_str) {
+                return !r.is_empty();
             }
             if let Some(n) = self.bigint_at(h) {
                 return !n.is_zero(); // `0n` is falsy
