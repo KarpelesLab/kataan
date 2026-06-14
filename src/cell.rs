@@ -170,8 +170,12 @@ pub enum Cell {
     /// elements, reading/writing the shared bytes directly so sibling views and
     /// `DataView`s alias the same storage.
     TypedArray {
-        /// The backing `ArrayBuffer`'s bytes cell.
+        /// The backing `ArrayBuffer`'s bytes cell (element reads/writes go here).
         buffer: Handle,
+        /// The `[[ViewedArrayBuffer]]` — the `ArrayBuffer` *object* this view was
+        /// created over. `.buffer` returns this handle directly (SameValue stable),
+        /// and sibling views (`subarray`) propagate it so they share one object.
+        array_buffer: Handle,
         /// Byte offset of the view's first element within the buffer.
         byte_offset: usize,
         /// Element count.
@@ -316,6 +320,8 @@ impl Cell {
     }
 
     /// The typed-array view `(buffer, byte_offset, length, kind)`, if this is one.
+    /// `buffer` is the backing *bytes* cell (for element access); use
+    /// [`Cell::typed_array_object`] for the `[[ViewedArrayBuffer]]` object.
     #[must_use]
     pub fn as_typed_array(&self) -> Option<(Handle, usize, usize, u8)> {
         match self {
@@ -324,7 +330,17 @@ impl Cell {
                 byte_offset,
                 length,
                 kind,
+                ..
             } => Some((*buffer, *byte_offset, *length, *kind)),
+            _ => None,
+        }
+    }
+
+    /// The `[[ViewedArrayBuffer]]` object handle of this view, if it is one.
+    #[must_use]
+    pub fn typed_array_object(&self) -> Option<Handle> {
+        match self {
+            Cell::TypedArray { array_buffer, .. } => Some(*array_buffer),
             _ => None,
         }
     }
@@ -525,8 +541,16 @@ impl Trace for Cell {
                     visit(r.result);
                 }
             }
-            // A typed-array view keeps its backing buffer reachable.
-            Cell::TypedArray { buffer, .. } => visit(*buffer),
+            // A typed-array view keeps its backing bytes and its viewed
+            // ArrayBuffer object reachable.
+            Cell::TypedArray {
+                buffer,
+                array_buffer,
+                ..
+            } => {
+                visit(*buffer);
+                visit(*array_buffer);
+            }
             // A bound native keeps its target reachable.
             Cell::BoundNative { target, .. } => visit(*target),
             // A proxy keeps its target and handler reachable.
@@ -576,7 +600,14 @@ impl crate::gc::Relocate for Cell {
                     r.result = forward(r.result);
                 }
             }
-            Cell::TypedArray { buffer, .. } => *buffer = forward(*buffer),
+            Cell::TypedArray {
+                buffer,
+                array_buffer,
+                ..
+            } => {
+                *buffer = forward(*buffer);
+                *array_buffer = forward(*array_buffer);
+            }
             Cell::BoundNative { target, .. } => *target = forward(*target),
             Cell::Proxy {
                 target, handler, ..

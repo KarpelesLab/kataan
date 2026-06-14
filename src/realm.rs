@@ -295,19 +295,30 @@ impl Realm {
     /// Allocates a typed-array *view* — a [`Cell::TypedArray`] over the bytes at
     /// `buffer` starting at `byte_offset`, spanning `length` elements of `kind`.
     /// The view owns no element storage; reads/writes go through the shared bytes.
+    /// `array_buffer` is the `[[ViewedArrayBuffer]]` object the view was created
+    /// over — `.buffer` returns it directly (so it is stable and shared).
     pub fn new_typed_array(
         &mut self,
         buffer: Handle,
+        array_buffer: Handle,
         byte_offset: usize,
         length: usize,
         kind: u8,
     ) -> Handle {
         self.heap.alloc(Cell::TypedArray {
             buffer,
+            array_buffer,
             byte_offset,
             length,
             kind,
         })
+    }
+
+    /// The `[[ViewedArrayBuffer]]` object handle of the typed-array view at
+    /// `handle`, if it is one. This is the `ArrayBuffer` object `.buffer` returns.
+    #[must_use]
+    pub fn typed_array_object(&self, handle: Handle) -> Option<Handle> {
+        self.heap.get(handle)?.typed_array_object()
     }
 
     /// The element count of the typed-array view at `handle`, if it is one.
@@ -350,6 +361,14 @@ impl Realm {
     pub fn set_typed_buffer(&mut self, handle: Handle, new_buffer: Handle) {
         if let Some(Cell::TypedArray { buffer, .. }) = self.heap.get_mut(handle) {
             *buffer = new_buffer;
+        }
+    }
+
+    /// Rebinds the `[[ViewedArrayBuffer]]` object handle of the view at `handle`
+    /// (used by snapshot restore's second pass). No-op for a non-view.
+    pub fn set_typed_array_object(&mut self, handle: Handle, new_obj: Handle) {
+        if let Some(Cell::TypedArray { array_buffer, .. }) = self.heap.get_mut(handle) {
+            *array_buffer = new_obj;
         }
     }
 
@@ -2657,12 +2676,12 @@ mod tests {
         // them so compaction actually relocates their slots.
         let _g0 = realm.new_string("garbage0");
         let bytes = realm.new_bytes(alloc::vec![0u8; 4]);
-        let _g1 = realm.new_object();
-        let view = realm.new_typed_array(bytes, 0, 4, 1); // kind 1 = Uint8
+        let abuf = realm.new_object();
+        let view = realm.new_typed_array(bytes, abuf, 0, 4, 1); // kind 1 = Uint8
 
-        let mut roots = [bytes, view];
+        let mut roots = [bytes, view, abuf];
         realm.compact(&mut roots);
-        let (bytes2, view2) = (roots[0], roots[1]);
+        let (bytes2, view2, abuf2) = (roots[0], roots[1], roots[2]);
         // The slots moved (garbage created gaps), so the raw handles changed.
         assert_ne!(bytes2.to_raw(), bytes.to_raw());
 
@@ -2671,14 +2690,17 @@ mod tests {
         realm.bytes_at_mut(bytes2).unwrap()[1] = 200;
         assert_eq!(realm.get_element(view2, 1).as_number(), Some(200.0));
         assert_eq!(realm.typed_buffer(view2), Some(bytes2));
+        // The `[[ViewedArrayBuffer]]` object link was forwarded too.
+        assert_eq!(realm.typed_array_object(view2), Some(abuf2));
     }
 
     #[test]
     fn typed_array_view_aliases_shared_bytes() {
         let mut realm = Realm::new();
         let buf = realm.new_bytes(alloc::vec![0u8; 8]);
-        let u8v = realm.new_typed_array(buf, 0, 8, 1); // Uint8
-        let f64v = realm.new_typed_array(buf, 0, 1, 8); // Float64
+        let abuf = realm.new_object();
+        let u8v = realm.new_typed_array(buf, abuf, 0, 8, 1); // Uint8
+        let f64v = realm.new_typed_array(buf, abuf, 0, 1, 8); // Float64
         // A write through one view is decoded by the sibling (intrinsic aliasing).
         realm.typed_set(u8v, 0, NanBox::number(255.0));
         assert_eq!(realm.get_element(u8v, 0).as_number(), Some(255.0));
