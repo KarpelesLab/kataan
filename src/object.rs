@@ -10,6 +10,14 @@
 //! same structure share a shape, so the per-object cost is just the value
 //! vector — and a handle into a [`Heap`] is how other values point at it.
 //!
+//! An object that accumulates more own properties than the realm's
+//! `object_dictionary_threshold` switches, behind this same method API, from the
+//! shaped representation to a **dictionary** ([`ObjectData::Dict`]): an
+//! insertion-ordered map that creates no further shape transitions. This bounds
+//! the shape transition-tree's growth for programs that pile up unbounded unique
+//! keys (MEM-3), at the cost of the per-shape inline-cache fast path for those
+//! (now-atypical) objects.
+//!
 //! [`Shape`]: crate::shape::Shape
 //! [`NanBox`]: crate::nanbox::NanBox
 //! [`Heap`]: crate::heap::Heap
@@ -19,6 +27,8 @@
 
 use crate::nanbox::NanBox;
 use crate::shape::Shape;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -31,11 +41,43 @@ fn array_index(k: &str) -> Option<u32> {
         .filter(|n| *n < u32::MAX && n.to_string() == k)
 }
 
-/// A property-bearing object: a hidden-class shape plus its value slots, with an
-/// optional side list of accessor (getter/setter) properties.
+/// The internal storage representation of an [`Object`]'s data properties.
+///
+/// Objects start in [`Shaped`](ObjectData::Shaped) mode — a shared hidden-class
+/// [`Shape`] plus a dense slot vector — which is the zero-overhead representation
+/// for normal objects whose structure is shared across many instances. An object
+/// that accumulates more own properties than the realm's
+/// `object_dictionary_threshold` converts in place to
+/// [`Dict`](ObjectData::Dict) mode, an insertion-ordered map that adds **no**
+/// shape transitions: this bounds the shape transition-tree's growth for
+/// programs that pile up unbounded unique keys (MEM-3).
+enum ObjectData {
+    /// Default representation: a hidden-class shape and a dense value vector
+    /// indexed by the shape's slot numbers.
+    Shaped {
+        shape: Rc<Shape>,
+        slots: Vec<NanBox>,
+    },
+    /// Dictionary representation: values keyed by name, with a parallel list
+    /// preserving insertion order. Carries no live `Rc<Shape>`, so it creates no
+    /// transitions; `order` and `map` are kept in sync (every key in `order` is
+    /// a key in `map` and vice versa).
+    Dict {
+        order: Vec<Box<str>>,
+        map: BTreeMap<Box<str>, NanBox>,
+    },
+}
+
+/// A property-bearing object: a hidden-class shape plus its value slots (or a
+/// dictionary once it grows past the threshold), with an optional side list of
+/// accessor (getter/setter) properties.
 pub struct Object {
-    shape: Rc<Shape>,
-    slots: Vec<NanBox>,
+    /// The data-property storage: shaped (default) or dictionary mode.
+    data: ObjectData,
+    /// An empty sentinel shape returned by [`shape`](Object::shape) while in
+    /// dictionary mode, so inline caches keyed on the shape pointer always miss
+    /// (an empty shape resolves no key) and never bind a dictionary object.
+    dict_shape: Option<Rc<Shape>>,
     /// Accessor properties: `(name, getter, setter)`, both held as value
     /// handles (`undefined` when absent). Kept out of the shape's slot layout.
     accessors: Vec<(alloc::boxed::Box<str>, NanBox, NanBox)>,
@@ -70,8 +112,11 @@ impl Object {
     #[must_use]
     pub fn new(root: Rc<Shape>) -> Self {
         Self {
-            shape: root,
-            slots: Vec::new(),
+            data: ObjectData::Shaped {
+                shape: root,
+                slots: Vec::new(),
+            },
+            dict_shape: None,
             accessors: Vec::new(),
             hidden: Vec::new(),
             readonly: Vec::new(),
@@ -141,58 +186,141 @@ impl Object {
             .map(|(_, g, s)| (*g, *s))
     }
 
-    /// The object's current shape (its hidden class).
+    /// The object's current shape (its hidden class). In dictionary mode this is
+    /// an empty sentinel shape, so any inline cache keyed on the returned pointer
+    /// resolves no key and misses — a dictionary object never binds an IC.
     #[must_use]
     pub fn shape(&self) -> &Rc<Shape> {
-        &self.shape
+        match &self.data {
+            ObjectData::Shaped { shape, .. } => shape,
+            ObjectData::Dict { .. } => self
+                .dict_shape
+                .as_ref()
+                .expect("dictionary objects carry a sentinel shape"),
+        }
     }
 
-    /// The number of own properties.
+    /// The number of own data properties (excludes side-list accessors).
     #[must_use]
     pub fn len(&self) -> u32 {
-        self.shape.len()
+        match &self.data {
+            ObjectData::Shaped { shape, .. } => shape.len(),
+            ObjectData::Dict { order, .. } => order.len() as u32,
+        }
     }
 
-    /// Whether the object has no own properties.
+    /// Whether the object has no own data properties.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.shape.is_empty()
+        match &self.data {
+            ObjectData::Shaped { shape, .. } => shape.is_empty(),
+            ObjectData::Dict { order, .. } => order.is_empty(),
+        }
     }
 
     /// The value of own property `key`, or `None` if absent.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<NanBox> {
-        let slot = self.shape.lookup(key)?;
-        self.slots.get(slot as usize).copied()
+        match &self.data {
+            ObjectData::Shaped { shape, slots } => {
+                let slot = shape.lookup(key)?;
+                slots.get(slot as usize).copied()
+            }
+            ObjectData::Dict { map, .. } => map.get(key).copied(),
+        }
     }
 
     /// Whether the object has own property `key`.
     #[must_use]
     pub fn contains(&self, key: &str) -> bool {
-        self.shape.contains(key)
+        match &self.data {
+            ObjectData::Shaped { shape, .. } => shape.contains(key),
+            ObjectData::Dict { map, .. } => map.contains_key(key),
+        }
     }
 
-    /// Sets own property `key` to `value`: updates the slot in place if the
-    /// property exists, otherwise transitions the shape and appends a slot. A
-    /// no-op on a frozen object (matching `Object.freeze` semantics in
-    /// non-strict code).
+    /// Sets own property `key` to `value`: updates the value in place if the
+    /// property exists, otherwise adds it. Works transparently in either storage
+    /// mode (shaped or dictionary). A no-op on a frozen object (matching
+    /// `Object.freeze` semantics in non-strict code).
+    ///
+    /// Conversion to dictionary mode is driven by the realm via
+    /// [`maybe_convert_to_dict`](Object::maybe_convert_to_dict), called just
+    /// before adding a new property; once converted, this method appends into the
+    /// dictionary and creates no shape transitions.
     pub fn set(&mut self, key: &str, value: NanBox) {
         if self.frozen || self.is_readonly(key) {
             return;
         }
-        if let Some(slot) = self.shape.lookup(key) {
-            self.slots[slot as usize] = value;
-        } else if self.extensible {
-            self.shape = self.shape.transition(key);
-            self.slots.push(value);
+        match &mut self.data {
+            ObjectData::Shaped { shape, slots } => {
+                if let Some(slot) = shape.lookup(key) {
+                    slots[slot as usize] = value;
+                } else if self.extensible {
+                    *shape = shape.transition(key);
+                    slots.push(value);
+                }
+                // A non-extensible object silently ignores new keys.
+            }
+            ObjectData::Dict { order, map } => {
+                if let Some(v) = map.get_mut(key) {
+                    *v = value;
+                } else if self.extensible {
+                    order.push(Box::from(key));
+                    map.insert(Box::from(key), value);
+                }
+            }
         }
-        // A non-extensible object silently ignores new keys.
     }
 
-    /// The own property names, in insertion (slot) order.
+    /// If adding `key` would be a *new* own property that pushes the own-data
+    /// count past `threshold`, converts the object to dictionary mode in place so
+    /// the subsequent [`set`](Object::set) — and every later add — creates no
+    /// shape transitions. A no-op if `key` already exists, the object is already a
+    /// dictionary, the object is non-extensible/frozen, or the count is still
+    /// within the threshold. The realm calls this immediately before
+    /// [`set`](Object::set) on a property add (MEM-3: bounds shape-tree growth).
+    pub fn maybe_convert_to_dict(&mut self, key: &str, threshold: usize) {
+        if let ObjectData::Shaped { shape, .. } = &self.data
+            && self.extensible
+            && !self.frozen
+            && !self.is_readonly(key)
+            && shape.lookup(key).is_none()
+            && shape.len() as usize >= threshold
+        {
+            self.convert_to_dict();
+        }
+    }
+
+    /// Converts a shaped object to dictionary mode in place, preserving the
+    /// current properties in insertion order and dropping the live `Rc<Shape>`
+    /// so no further transitions are created. A no-op if already a dictionary.
+    fn convert_to_dict(&mut self) {
+        let ObjectData::Shaped { shape, slots } = &self.data else {
+            return;
+        };
+        let keys = shape.keys();
+        let mut order: Vec<Box<str>> = Vec::with_capacity(keys.len());
+        let mut map: BTreeMap<Box<str>, NanBox> = BTreeMap::new();
+        for k in keys {
+            let slot = shape.lookup(k).expect("shape key resolves");
+            let v = slots[slot as usize];
+            order.push(Box::from(k));
+            map.insert(Box::from(k), v);
+        }
+        // A fresh empty shape so `shape()` returns a pointer that resolves no
+        // key (inline caches keyed on it always miss for this object).
+        self.dict_shape = Some(Shape::root());
+        self.data = ObjectData::Dict { order, map };
+    }
+
+    /// The own property names, in insertion order.
     #[must_use]
     pub fn keys(&self) -> Vec<&str> {
-        self.shape.keys()
+        match &self.data {
+            ObjectData::Shaped { shape, .. } => shape.keys(),
+            ObjectData::Dict { order, .. } => order.iter().map(Box::as_ref).collect(),
+        }
     }
 
     /// All own property names — data and accessor, including non-enumerable — in
@@ -200,7 +328,7 @@ impl Object {
     /// `Object.getOwnPropertySymbols`).
     #[must_use]
     pub fn all_keys(&self) -> Vec<&str> {
-        let mut keys = self.shape.keys();
+        let mut keys = self.keys();
         keys.extend(self.accessors.iter().map(|(k, _, _)| k.as_ref()));
         keys
     }
@@ -210,7 +338,7 @@ impl Object {
     /// insertion order. Used by `getOwnPropertyNames` / `Reflect.ownKeys`.
     #[must_use]
     pub fn ordered_keys(&self) -> Vec<&str> {
-        let keys = self.shape.keys();
+        let keys = self.keys();
         let mut ints: Vec<&str> = keys
             .iter()
             .copied()
@@ -227,7 +355,6 @@ impl Object {
     #[must_use]
     pub fn enumerable_keys(&self) -> Vec<&str> {
         let keys: Vec<&str> = self
-            .shape
             .keys()
             .into_iter()
             .filter(|k| !self.is_hidden(k))
@@ -297,7 +424,7 @@ impl Object {
     /// Whether `key` is an own property (data slot or accessor).
     #[must_use]
     pub fn has_own_key(&self, key: &str) -> bool {
-        self.shape.contains(key) || self.accessors.iter().any(|(k, _, _)| k.as_ref() == key)
+        self.contains(key) || self.accessors.iter().any(|(k, _, _)| k.as_ref() == key)
     }
 
     /// Marks the object frozen (`Object.freeze`) — implies sealed + non-extensible.
@@ -348,22 +475,38 @@ impl Object {
     pub fn delete(&mut self, root: Rc<Shape>, key: &str) -> bool {
         let had_accessor = self.accessors.iter().any(|(k, _, _)| k.as_ref() == key);
         self.accessors.retain(|(k, _, _)| k.as_ref() != key);
-        if !self.shape.contains(key) {
-            return had_accessor;
+        match &mut self.data {
+            ObjectData::Shaped { shape, slots } => {
+                if !shape.contains(key) {
+                    return had_accessor;
+                }
+                let kept: Vec<(alloc::string::String, NanBox)> = shape
+                    .keys()
+                    .into_iter()
+                    .filter(|k| *k != key)
+                    .map(|k| {
+                        let slot = shape.lookup(k).expect("shape key resolves");
+                        (alloc::string::String::from(k), slots[slot as usize])
+                    })
+                    .collect();
+                let mut new_shape = root;
+                let mut new_slots = Vec::with_capacity(kept.len());
+                for (k, v) in kept {
+                    new_shape = new_shape.transition(&k);
+                    new_slots.push(v);
+                }
+                *shape = new_shape;
+                *slots = new_slots;
+                true
+            }
+            ObjectData::Dict { order, map } => {
+                if map.remove(key).is_none() {
+                    return had_accessor;
+                }
+                order.retain(|k| k.as_ref() != key);
+                true
+            }
         }
-        let kept: Vec<(alloc::string::String, NanBox)> = self
-            .shape
-            .keys()
-            .into_iter()
-            .filter(|k| *k != key)
-            .map(|k| (alloc::string::String::from(k), self.get(k).unwrap()))
-            .collect();
-        self.shape = root;
-        self.slots.clear();
-        for (k, v) in kept {
-            self.set(&k, v);
-        }
-        true
     }
 
     /// Rewrites every outgoing handle through `forward` — the mutating mirror of
@@ -378,8 +521,17 @@ impl Object {
                 *v = NanBox::handle(forward(crate::heap::Handle::from_raw(raw)).to_raw());
             }
         };
-        for slot in &mut self.slots {
-            fwd(slot);
+        match &mut self.data {
+            ObjectData::Shaped { slots, .. } => {
+                for slot in slots {
+                    fwd(slot);
+                }
+            }
+            ObjectData::Dict { map, .. } => {
+                for v in map.values_mut() {
+                    fwd(v);
+                }
+            }
         }
         for (_, g, s) in &mut self.accessors {
             fwd(g);
@@ -394,9 +546,21 @@ impl Object {
     /// references through a slot — the outgoing edges a tracing collector
     /// follows.
     pub fn trace_handles(&self, mut visit: impl FnMut(crate::heap::Handle)) {
-        for slot in &self.slots {
-            if let Some(raw) = slot.as_handle() {
+        let trace_value = |v: &NanBox, visit: &mut dyn FnMut(crate::heap::Handle)| {
+            if let Some(raw) = v.as_handle() {
                 visit(crate::heap::Handle::from_raw(raw));
+            }
+        };
+        match &self.data {
+            ObjectData::Shaped { slots, .. } => {
+                for slot in slots {
+                    trace_value(slot, &mut visit);
+                }
+            }
+            ObjectData::Dict { map, .. } => {
+                for v in map.values() {
+                    trace_value(v, &mut visit);
+                }
             }
         }
         for (_, g, s) in &self.accessors {
@@ -499,5 +663,99 @@ mod tests {
             child_ref.get("value").unwrap().unpack(),
             Unpacked::Number(7.0)
         );
+    }
+
+    /// Adds `key=value` the way the realm does: convert-if-needed, then set.
+    fn add(o: &mut Object, key: &str, value: NanBox, threshold: usize) {
+        o.maybe_convert_to_dict(key, threshold);
+        o.set(key, value);
+    }
+
+    #[test]
+    fn converts_to_dictionary_past_threshold_and_preserves_semantics() {
+        // Threshold 4: the 5th distinct key triggers conversion.
+        let mut o = Object::new(Shape::root());
+        let threshold = 4;
+        for i in 0..4 {
+            add(&mut o, &alloc::format!("k{i}"), n(f64::from(i)), threshold);
+        }
+        // Still shaped: the shape resolves a real key.
+        assert_eq!(o.shape().lookup("k0"), Some(0));
+        assert_eq!(o.len(), 4);
+
+        // The 5th add converts to dictionary mode.
+        add(&mut o, "k4", n(4.0), threshold);
+        assert_eq!(o.len(), 5);
+        // In dictionary mode the sentinel shape resolves nothing (ICs miss).
+        assert_eq!(o.shape().lookup("k0"), None);
+        assert_eq!(o.shape().lookup("k4"), None);
+
+        // Keep adding well past the threshold.
+        for i in 5..300 {
+            add(&mut o, &alloc::format!("k{i}"), n(f64::from(i)), threshold);
+        }
+        assert_eq!(o.len(), 300);
+
+        // get across the conversion boundary.
+        assert_eq!(o.get("k0").unwrap().unpack(), Unpacked::Number(0.0));
+        assert_eq!(o.get("k3").unwrap().unpack(), Unpacked::Number(3.0));
+        assert_eq!(o.get("k150").unwrap().unpack(), Unpacked::Number(150.0));
+        assert_eq!(o.get("k299").unwrap().unpack(), Unpacked::Number(299.0));
+        assert_eq!(o.get("nope"), None);
+
+        // Insertion order is preserved across the boundary.
+        let keys = o.keys();
+        assert_eq!(keys.len(), 300);
+        assert_eq!(keys[0], "k0");
+        assert_eq!(keys[299], "k299");
+        assert!(o.contains("k200"));
+        assert!(o.has_own_key("k200"));
+
+        // Update-in-place in dictionary mode.
+        add(&mut o, "k150", n(-1.0), threshold);
+        assert_eq!(o.len(), 300, "updating an existing key does not grow");
+        assert_eq!(o.get("k150").unwrap().unpack(), Unpacked::Number(-1.0));
+
+        // Delete in dictionary mode.
+        assert!(o.delete(Shape::root(), "k0"));
+        assert_eq!(o.get("k0"), None);
+        assert_eq!(o.len(), 299);
+        assert_eq!(o.keys()[0], "k1");
+        // Deleting an absent key is a no-op (returns false).
+        assert!(!o.delete(Shape::root(), "k0"));
+    }
+
+    #[test]
+    fn dictionary_ordered_keys_put_integer_indices_first() {
+        // Mirror the `{b, 2, 1, a}` example but force dictionary mode with a low
+        // threshold so the integer-index ordering is exercised in the dict path.
+        let mut o = Object::new(Shape::root());
+        let threshold = 0; // convert on the very first add
+        add(&mut o, "b", n(1.0), threshold);
+        add(&mut o, "2", n(1.0), threshold);
+        add(&mut o, "1", n(1.0), threshold);
+        add(&mut o, "a", n(1.0), threshold);
+        // Confirm we are in dictionary mode.
+        assert_eq!(o.shape().lookup("b"), None);
+        // [[OwnPropertyKeys]] order: ascending integer indices, then strings in
+        // insertion order.
+        assert_eq!(o.ordered_keys(), ["1", "2", "b", "a"]);
+        assert_eq!(o.enumerable_keys(), ["1", "2", "b", "a"]);
+        // Raw insertion order is unchanged.
+        assert_eq!(o.keys(), ["b", "2", "1", "a"]);
+    }
+
+    #[test]
+    fn dictionary_traces_handle_values() {
+        // GC must trace handle values stored in a dictionary-mode object.
+        let mut o = Object::new(Shape::root());
+        let threshold = 0;
+        add(&mut o, "h1", NanBox::handle(7), threshold);
+        add(&mut o, "n", n(1.0), threshold);
+        add(&mut o, "h2", NanBox::handle(9), threshold);
+        let mut seen: Vec<u64> = Vec::new();
+        o.trace_handles(|h| seen.push(h.to_raw()));
+        seen.sort_unstable();
+        assert_eq!(seen, [7, 9]);
     }
 }

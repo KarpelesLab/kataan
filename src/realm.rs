@@ -1126,7 +1126,9 @@ impl Realm {
     /// Sets own property `key` to `value` on the object at `handle`. Returns
     /// `false` if the handle is stale or the cell is not an object.
     pub fn set_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
+        let dict_threshold = self.limits.object_dictionary_threshold;
         if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            obj.maybe_convert_to_dict(key, dict_threshold);
             obj.set(key, value);
             self.write_barrier(handle, value);
             return true;
@@ -1140,6 +1142,7 @@ impl Realm {
         if aux_eligible {
             let aux = self.aux_object(handle);
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                o.maybe_convert_to_dict(key, dict_threshold);
                 o.set(key, value);
             }
             self.write_barrier(aux, value);
@@ -1243,7 +1246,9 @@ impl Realm {
     /// for class methods, which are callable but must stay out of `Object.keys`,
     /// spread, `for-in`, and JSON.
     pub fn set_hidden_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
+        let dict_threshold = self.limits.object_dictionary_threshold;
         if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            obj.maybe_convert_to_dict(key, dict_threshold);
             obj.set(key, value);
             obj.set_hidden(key);
             self.write_barrier(handle, value);
@@ -1257,6 +1262,7 @@ impl Realm {
         if aux_eligible {
             let aux = self.aux_object(handle);
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                o.maybe_convert_to_dict(key, dict_threshold);
                 o.set(key, value);
                 o.set_hidden(key);
             }
