@@ -754,10 +754,8 @@ const GEN_RET: &str = "\u{0}gret";
 /// constructor id (for `instanceof`).
 const PRIM_WRAP: &str = "\u{0}prim";
 const PRIM_WRAP_TYPE: &str = "\u{0}primtype";
-/// Hidden slot on a typed array recording its element-kind index.
-const TYPED_ARRAY_KIND: &str = "\u{0}takind";
-/// A typed array's backing `ArrayBuffer` (for `.buffer`) — set when constructed over a
-/// buffer, otherwise materialized lazily from the element store on first access.
+/// A typed array's backing `ArrayBuffer` *object* (for `.buffer`) — materialized
+/// once over the view's shared bytes cell, then cached under this hidden slot.
 const TYPED_ARRAY_BUF: &str = "\u{0}tabuf";
 /// `ArrayBuffer` byte store (an array of 0–255 numbers) and `DataView` linkage.
 const ARRAY_BUFFER_BYTES: &str = "\u{0}abytes";
@@ -2070,7 +2068,7 @@ impl<'a> Interp<'a> {
             // (anything with a `[[ViewedArrayBuffer]]`).
             N_ARRAY_BUFFER_IS_VIEW => NanBox::boolean(arg(0).as_handle().is_some_and(|raw| {
                 let h = Handle::from_raw(raw);
-                self.realm.get_property(h, TYPED_ARRAY_KIND).is_some()
+                self.realm.typed_kind(h).is_some()
                     || self.realm.get_property(h, DATA_VIEW_BUF).is_some()
             })),
             N_OBJECT_ASSIGN => {
@@ -2093,8 +2091,9 @@ impl<'a> Interp<'a> {
                             continue;
                         }
                         if let Some(sh) = src.as_handle().map(Handle::from_raw) {
-                            // An array source contributes its indexed elements.
-                            if let Some(elems) = self.realm.array_elements(sh).map(<[_]>::to_vec) {
+                            // An array (or typed-array view) source contributes its
+                            // indexed elements.
+                            if let Some(elems) = self.realm.elements_vec(sh) {
                                 for (i, e) in elems.iter().enumerate() {
                                     let kb = self.new_str(&alloc::format!("{i}"));
                                     self.assign_member_value(t, kb, *e)?;
@@ -3497,6 +3496,23 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("Converting circular structure to JSON");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
+                // A typed array serializes as an object keyed by its indices
+                // (`{"0":1,…}`), per ES `JSON.stringify` (it is not an Array exotic).
+                if let Some(elems) = self.realm.typed_elements(h) {
+                    let mut parts = Vec::with_capacity(elems.len());
+                    for (i, e) in elems.into_iter().enumerate() {
+                        if let Some(s) =
+                            self.json_to_string_seen(e, &alloc::format!("{i}"), seen)?
+                        {
+                            parts.push(alloc::format!(
+                                "{}:{}",
+                                json_quote(&alloc::format!("{i}")),
+                                s
+                            ));
+                        }
+                    }
+                    return Ok(Some(alloc::format!("{{{}}}", parts.join(","))));
+                }
                 if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
                     seen.push(h);
                     let mut parts = Vec::with_capacity(elems.len());
@@ -3981,11 +3997,10 @@ impl<'a> Interp<'a> {
                 cur = NanBox::handle(target.to_raw());
                 continue;
             }
-            // A genuine Array exotic object: not a VM function and not a typed array
-            // (typed arrays are array-backed here but are not Arrays per `Array.isArray`).
-            return Ok(self.realm.is_array(h)
-                && !self.realm.is_vm_function(h)
-                && self.realm.get_property(h, TYPED_ARRAY_KIND).is_none());
+            // A genuine Array exotic object: not a VM function. A typed array is a
+            // distinct `Cell::TypedArray`, so `is_array` already rejects it (per
+            // `Array.isArray`).
+            return Ok(self.realm.is_array(h) && !self.realm.is_vm_function(h));
         }
         Ok(false)
     }
@@ -4554,19 +4569,13 @@ impl<'a> Interp<'a> {
                     .get_property(target, WASM_MEM_BUFFER)
                     .and_then(|v| v.as_handle())
                     .map(Handle::from_raw)
-                    .and_then(|ob| self.realm.get_property(ob, ARRAY_BUFFER_BYTES))
-                    .and_then(|v| v.as_handle())
-                    .map(Handle::from_raw)
-                    .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
-                    && let Some(nb) = self
-                        .realm
-                        .get_property(new_buf, ARRAY_BUFFER_BYTES)
-                        .and_then(|v| v.as_handle())
-                        .map(Handle::from_raw)
+                    .and_then(|ob| self.array_buffer_bytes(ob))
+                    .and_then(|h| self.realm.bytes_at(h).map(<[u8]>::to_vec))
+                    && let Some(nb) = self.array_buffer_bytes(new_buf)
+                    && let Some(dst) = self.realm.bytes_at_mut(nb)
                 {
-                    for (i, b) in old_bytes.into_iter().enumerate() {
-                        self.realm.set_element(nb, i, b);
-                    }
+                    let n = old_bytes.len().min(dst.len());
+                    dst[..n].copy_from_slice(&old_bytes[..n]);
                 }
                 self.realm.set_hidden_property(
                     target,
@@ -5229,33 +5238,26 @@ impl<'a> Interp<'a> {
             }
             return Ok(NanBox::handle(obj.to_raw()));
         }
-        // `new Int8Array(n)` / `new Uint8Array([…])` / … — a typed array backed by
-        // a plain array whose element writes coerce to the element kind.
+        // `new Int8Array(n)` / `new Uint8Array([…])` / `new T(buffer, off?, len?)` — a
+        // typed array is a `Cell::TypedArray` *view* over a contiguous `ArrayBuffer`
+        // byte store. Element reads/writes go straight through the shared bytes, so
+        // sibling views and `DataView`s alias the same storage intrinsically.
         if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id) {
-            let kind = id - N_TYPED_ARRAY_BASE;
-            // `new T(buffer, byteOffset?, length?)` — a view over an ArrayBuffer. The
-            // element store is decoded from the buffer's bytes (a snapshot: writes don't
-            // yet flow back to the buffer — the live-backing D′ work is separate), and the
-            // byte offset is recorded so `.byteOffset` reports it.
+            let kind = (id - N_TYPED_ARRAY_BASE) as u8;
+            let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+            // `new T(buffer, byteOffset?, length?)` — a view over an existing ArrayBuffer.
             if let Some(v) = args.first()
                 && let Some(bh) = v.as_handle().map(Handle::from_raw)
-                && let Some(bytesv) = self.realm.get_property(bh, ARRAY_BUFFER_BYTES)
+                && self.realm.get_property(bh, ARRAY_BUFFER_BYTES).is_some()
             {
                 self.guard_detached_buffer(bh)?;
-                let bytes: Vec<u8> = bytesv
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|e| self.realm.to_number(*e) as i64 as u8)
-                    .collect();
-                let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+                let bytes_h = self.array_buffer_bytes(bh).unwrap();
+                let total = self.realm.bytes_len(bytes_h).unwrap_or(0);
                 let byte_off = args
                     .get(1)
                     .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
                     .map_or(0, |a| self.realm.to_number(*a).max(0.0) as usize);
-                let avail = bytes.len().saturating_sub(byte_off);
+                let avail = total.saturating_sub(byte_off);
                 let length = match args
                     .get(2)
                     .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
@@ -5266,63 +5268,34 @@ impl<'a> Interp<'a> {
                     }
                     None => avail / elem_size,
                 };
-                let decoded: Vec<NanBox> = (0..length)
-                    .map(|i| {
-                        let start = byte_off + i * elem_size;
-                        let slice = bytes.get(start..start + elem_size).unwrap_or(&[]);
-                        NanBox::number(decode_typed_element(kind as u8, slice))
-                    })
-                    .collect();
-                let arr = self.realm.new_array(decoded);
-                self.realm
-                    .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
-                self.realm
-                    .set_hidden_property(arr, DATA_VIEW_OFF, NanBox::number(byte_off as f64));
-                // Record the backing buffer so `.buffer` returns the original.
-                self.realm
-                    .set_hidden_property(arr, TYPED_ARRAY_BUF, NanBox::handle(bh.to_raw()));
-                // Register the view so writes through a sibling view / DataView propagate
-                // into this view's element store (the BUFFER→VIEW read direction).
-                if let Some(bytes_h) = self
-                    .realm
-                    .get_property(bh, ARRAY_BUFFER_BYTES)
-                    .and_then(|b| b.as_handle())
-                    .map(Handle::from_raw)
-                {
-                    self.realm
-                        .register_typed_view(bytes_h, arr, byte_off, kind, elem_size);
-                }
-                return Ok(NanBox::handle(arr.to_raw()));
+                let view = self.realm.new_typed_array(bytes_h, byte_off, length, kind);
+                return Ok(NanBox::handle(view.to_raw()));
             }
-            let elems: Vec<NanBox> = match args.first().copied() {
-                // `new T(arrayLike)` copies and coerces the source's elements.
-                Some(v)
-                    if v.as_handle()
-                        .map(Handle::from_raw)
-                        .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
-                        .is_some() =>
-                {
-                    let src = v
-                        .as_handle()
-                        .map(Handle::from_raw)
-                        .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
-                        .unwrap();
-                    src.iter()
-                        .map(|e| NanBox::number(coerce_typed(kind, self.realm.to_number(*e))))
-                        .collect()
-                }
-                // `new T(length)` allocates a zeroed array.
-                Some(v) => {
+            // Otherwise allocate a fresh backing buffer and view it from offset 0.
+            // `new T(arrayLike)` copies+coerces the source's elements into the buffer;
+            // `new T(length)` / `new T()` zero-fill.
+            let src: Option<Vec<NanBox>> = args
+                .first()
+                .copied()
+                .and_then(|v| v.as_handle().map(Handle::from_raw))
+                .and_then(|h| self.realm.elements_vec(h));
+            let length = match (&src, args.first().copied()) {
+                (Some(s), _) => s.len(),
+                (None, Some(v)) => {
                     let raw = self.realm.to_number(v);
-                    let n = self.validate_alloc_len(raw, "Invalid typed array length")?;
-                    alloc::vec![NanBox::number(0.0); n]
+                    self.validate_alloc_len(raw, "Invalid typed array length")?
                 }
-                None => Vec::new(),
+                (None, None) => 0,
             };
-            let arr = self.realm.new_array(elems);
-            self.realm
-                .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
-            return Ok(NanBox::handle(arr.to_raw()));
+            let buf = self.make_array_buffer(length * elem_size);
+            let bytes_h = self.array_buffer_bytes(buf).unwrap();
+            let view = self.realm.new_typed_array(bytes_h, 0, length, kind);
+            if let Some(s) = src {
+                for (i, e) in s.into_iter().enumerate() {
+                    self.realm.typed_set(view, i, e);
+                }
+            }
+            return Ok(NanBox::handle(view.to_raw()));
         }
         // `new Number(x)` / `new String(x)` / `new Boolean(x)`: a primitive
         // wrapper object boxing the coerced primitive (`valueOf` recovers it).
@@ -6573,89 +6546,18 @@ impl<'a> Interp<'a> {
         alloc::format!("{sign}{styled}")
     }
 
-    /// Writes `value` to array index `i`, coercing it to the element kind first
-    /// if `handle` is a typed array (`Uint8Array`, …).
+    /// Writes `value` to element `i` of `handle`. For a typed-array view this
+    /// coerces to the element kind and writes through to the shared bytes (handled
+    /// intrinsically by [`Realm::set_element`]); for a plain array it is an ordinary
+    /// element store.
     fn set_element_coerced(&mut self, handle: crate::heap::Handle, i: usize, value: NanBox) {
-        let (v, kind) = match self.realm.get_property(handle, TYPED_ARRAY_KIND) {
-            Some(k) => {
-                let kind = k.as_number().unwrap_or(0.0) as u16;
-                let n = self.realm.to_number(value);
-                (NanBox::number(coerce_typed(kind, n)), Some(kind))
-            }
-            None => (value, None),
-        };
-        self.realm.set_element(handle, i, v);
-        // Write-through: a typed array with a backing ArrayBuffer encodes the element
-        // into the buffer's bytes, so a DataView (or anything reading `.buffer`) sees it.
-        if let Some(kind) = kind {
-            self.typed_array_write_through(handle, i, kind, v);
-        }
+        self.realm.set_element(handle, i, value);
     }
 
-    /// Encodes element `i` (already coerced to `value`) of a typed array into its backing
-    /// `ArrayBuffer` bytes, if one is attached. A no-op for an unbacked typed array.
-    fn typed_array_write_through(
-        &mut self,
-        handle: crate::heap::Handle,
-        i: usize,
-        kind: u16,
-        value: NanBox,
-    ) {
-        let Some(byteh) = self
-            .realm
-            .get_property(handle, TYPED_ARRAY_BUF)
-            .and_then(|b| b.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|bh| self.realm.get_property(bh, ARRAY_BUFFER_BYTES))
-            .and_then(|b| b.as_handle())
-            .map(Handle::from_raw)
-        else {
-            return;
-        };
-        let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
-        let byte_off = self
-            .realm
-            .get_property(handle, DATA_VIEW_OFF)
-            .and_then(|o| o.as_number())
-            .unwrap_or(0.0) as usize;
-        let enc = encode_typed_element(kind as u8, value.as_number().unwrap_or(0.0));
-        for (j, &byte) in enc.iter().enumerate() {
-            self.realm.set_element(
-                byteh,
-                byte_off + i * elem_size + j,
-                NanBox::number(f64::from(byte)),
-            );
-        }
-        // Push the change into any sibling views over the same buffer.
-        self.realm
-            .propagate_buffer_write(byteh, byte_off + i * elem_size, elem_size, handle);
-    }
-
-    /// Re-encodes a typed array's whole element store into its backing buffer — used after
-    /// a wholesale reorder (`sort`/`reverse`) that bypasses `set_element_coerced`. A no-op
-    /// for an ordinary or unbacked array.
-    fn typed_array_resync(&mut self, handle: crate::heap::Handle) {
-        let Some(kind) = self
-            .realm
-            .get_property(handle, TYPED_ARRAY_KIND)
-            .and_then(|k| k.as_number())
-        else {
-            return;
-        };
-        let kind = kind as u16;
-        let elems = self
-            .realm
-            .array_elements(handle)
-            .map(<[_]>::to_vec)
-            .unwrap_or_default();
-        for (i, e) in elems.iter().enumerate() {
-            self.typed_array_write_through(handle, i, kind, *e);
-        }
-    }
-
-    /// The backing `ArrayBuffer` of a typed array — the recorded one, or a fresh snapshot
-    /// materialized from the current elements (and the view registered against it) on first
-    /// access. Shared by the `.buffer` accessor and `subarray` (which views the same buffer).
+    /// The backing `ArrayBuffer` object of a typed-array view, materialized as an
+    /// object wrapper around the view's shared bytes cell (with `.byteLength` etc.
+    /// reading the live bytes). Cached under the view's hidden `TYPED_ARRAY_BUF`
+    /// slot so repeated `.buffer` reads return the same object.
     fn typed_array_buffer_handle(&mut self, handle: Handle) -> Handle {
         if let Some(buf) = self
             .realm
@@ -6665,34 +6567,16 @@ impl<'a> Interp<'a> {
         {
             return buf;
         }
-        let kind = self
+        let bytes_h = self
             .realm
-            .get_property(handle, TYPED_ARRAY_KIND)
-            .and_then(|k| k.as_number())
-            .unwrap_or(0.0) as u8;
-        let elems = self
-            .realm
-            .array_elements(handle)
-            .map(<[_]>::to_vec)
-            .unwrap_or_default();
-        let mut bytes = alloc::vec::Vec::new();
-        for e in &elems {
-            bytes.extend_from_slice(&encode_typed_element(kind, self.realm.to_number(*e)));
-        }
-        let buf = self.make_array_buffer_from_bytes(&bytes);
+            .typed_buffer(handle)
+            .unwrap_or_else(|| self.realm.new_bytes(Vec::new()));
+        let obj = self.realm.new_object();
         self.realm
-            .set_hidden_property(handle, TYPED_ARRAY_BUF, NanBox::handle(buf.to_raw()));
-        if let Some(bytes_h) = self
-            .realm
-            .get_property(buf, ARRAY_BUFFER_BYTES)
-            .and_then(|b| b.as_handle())
-            .map(Handle::from_raw)
-        {
-            let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
-            self.realm
-                .register_typed_view(bytes_h, handle, 0, u16::from(kind), elem_size);
-        }
-        buf
+            .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(bytes_h.to_raw()));
+        self.realm
+            .set_hidden_property(handle, TYPED_ARRAY_BUF, NanBox::handle(obj.to_raw()));
+        obj
     }
 
     /// Builds a primitive wrapper object (`new Number`/`String`/`Boolean`,
@@ -6732,18 +6616,30 @@ impl<'a> Interp<'a> {
     /// Builds the result array for an Array method invoked on `recv`. If `recv` is a
     /// typed array, the result is a same-kind typed array with its elements coerced
     /// to that element type; otherwise an ordinary array.
-    fn typed_like(&mut self, recv: Handle, elems: Vec<NanBox>) -> NanBox {
-        if let Some(k) = self.realm.get_property(recv, TYPED_ARRAY_KIND) {
-            let kind = k.as_number().unwrap_or(0.0) as u16;
-            let mut coerced = Vec::with_capacity(elems.len());
-            for e in elems {
-                let n = self.realm.to_number(e);
-                coerced.push(NanBox::number(coerce_typed(kind, n)));
+    /// Writes `elems` back into `handle` in place: per-element for a typed-array
+    /// view (writing through the shared bytes, coercing each), or wholesale for a
+    /// plain array. Used by in-place reorders (`sort`/`reverse`).
+    fn write_back_elements(&mut self, handle: Handle, elems: Vec<NanBox>) {
+        if self.realm.typed_kind(handle).is_some() {
+            for (i, e) in elems.into_iter().enumerate() {
+                self.realm.set_element(handle, i, e);
             }
-            let arr = self.realm.new_array(coerced);
-            self.realm
-                .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
-            NanBox::handle(arr.to_raw())
+        } else {
+            self.realm.array_set_all(handle, elems);
+        }
+    }
+
+    fn typed_like(&mut self, recv: Handle, elems: Vec<NanBox>) -> NanBox {
+        if let Some(kind) = self.realm.typed_kind(recv) {
+            // A fresh typed array of the same kind over its own backing buffer.
+            let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+            let buf = self.make_array_buffer(elems.len() * elem_size);
+            let bytes_h = self.array_buffer_bytes(buf).unwrap();
+            let view = self.realm.new_typed_array(bytes_h, 0, elems.len(), kind);
+            for (i, e) in elems.into_iter().enumerate() {
+                self.realm.typed_set(view, i, e);
+            }
+            NanBox::handle(view.to_raw())
         } else {
             NanBox::handle(self.realm.new_array(elems).to_raw())
         }
@@ -7815,7 +7711,7 @@ impl<'a> Interp<'a> {
                 .contains(&id)
             && matches!(method, "of" | "from")
         {
-            let kind = id - N_TYPED_ARRAY_BASE;
+            let kind = (id - N_TYPED_ARRAY_BASE) as u8;
             let mut items: Vec<NanBox> = if method == "of" {
                 args.to_vec()
             } else {
@@ -7832,14 +7728,15 @@ impl<'a> Interp<'a> {
                     *v = self.call(mapfn, &[*v, NanBox::number(i as f64)])?;
                 }
             }
-            let elems: Vec<NanBox> = items
-                .iter()
-                .map(|v| NanBox::number(coerce_typed(kind, self.realm.to_number(*v))))
-                .collect();
-            let arr = self.realm.new_array(elems);
-            self.realm
-                .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
-            return Ok(Some(NanBox::handle(arr.to_raw())));
+            // Allocate a backing buffer and view it; each item is coerced on write.
+            let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+            let buf = self.make_array_buffer(items.len() * elem_size);
+            let bytes_h = self.array_buffer_bytes(buf).unwrap();
+            let view = self.realm.new_typed_array(bytes_h, 0, items.len(), kind);
+            for (i, v) in items.into_iter().enumerate() {
+                self.realm.typed_set(view, i, v);
+            }
+            return Ok(Some(NanBox::handle(view.to_raw())));
         }
         // `Date.parse(str)` → epoch ms (or NaN) by ISO parsing.
         if self.realm.native_at(handle) == Some(N_DATE) && method == "parse" {
@@ -8027,16 +7924,15 @@ impl<'a> Interp<'a> {
         }
         // --- ArrayBuffer.prototype.slice(begin?, end?) → a new ArrayBuffer copy ---
         if method == "slice"
-            && let Some(bytesv) = self.realm.get_property(handle, ARRAY_BUFFER_BYTES)
-            && let Some(bh) = bytesv.as_handle().map(Handle::from_raw)
+            && let Some(bh) = self.array_buffer_bytes(handle)
         {
             self.guard_detached_buffer(handle)?;
-            let elems = self
+            let bytes = self
                 .realm
-                .array_elements(bh)
-                .map(<[_]>::to_vec)
+                .bytes_at(bh)
+                .map(<[u8]>::to_vec)
                 .unwrap_or_default();
-            let len = elems.len() as i64;
+            let len = bytes.len() as i64;
             let norm = |this: &mut Self, v: NanBox, default: i64| -> usize {
                 if matches!(v.unpack(), Unpacked::Undefined) {
                     return default as usize;
@@ -8046,18 +7942,14 @@ impl<'a> Interp<'a> {
             };
             let begin = norm(self, arg(0), 0);
             let end = norm(self, arg(1), len);
-            let sub = elems.get(begin..end.max(begin)).unwrap_or(&[]).to_vec();
-            let nb = self.realm.new_object();
-            let arr = self.realm.new_array(sub);
-            self.realm
-                .set_hidden_property(nb, ARRAY_BUFFER_BYTES, NanBox::handle(arr.to_raw()));
+            let sub = bytes.get(begin..end.max(begin)).unwrap_or(&[]);
+            let nb = self.make_array_buffer_from_bytes(sub);
             return Ok(Some(NanBox::handle(nb.to_raw())));
         }
         // --- ArrayBuffer.prototype.transfer(newLength?) → a new ArrayBuffer; detaches the
         // original (its byteLength becomes 0 and its views are emptied) ---
         if method == "transfer"
-            && let Some(bytesv) = self.realm.get_property(handle, ARRAY_BUFFER_BYTES)
-            && let Some(bh) = bytesv.as_handle().map(Handle::from_raw)
+            && let Some(bh) = self.array_buffer_bytes(handle)
         {
             if self
                 .realm
@@ -8067,22 +7959,19 @@ impl<'a> Interp<'a> {
                 let m = self.new_str("Cannot transfer an already-detached ArrayBuffer");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
-            let mut elems = self
+            let mut bytes = self
                 .realm
-                .array_elements(bh)
-                .map(<[_]>::to_vec)
+                .bytes_at(bh)
+                .map(<[u8]>::to_vec)
                 .unwrap_or_default();
             // `transfer()` keeps the size; `transfer(n)` resizes (truncating or zero-padding).
             let new_len = if matches!(arg(0).unpack(), Unpacked::Undefined) {
-                elems.len()
+                bytes.len()
             } else {
                 self.realm.to_number(arg(0)).max(0.0) as usize
             };
-            elems.resize(new_len, NanBox::number(0.0));
-            let nb = self.realm.new_object();
-            let arr = self.realm.new_array(elems);
-            self.realm
-                .set_hidden_property(nb, ARRAY_BUFFER_BYTES, NanBox::handle(arr.to_raw()));
+            bytes.resize(new_len, 0);
+            let nb = self.make_array_buffer_from_bytes(&bytes);
             // Detach the original: empty every view over it, then flag it.
             self.realm.detach_buffer_views(bh);
             self.realm
@@ -8122,9 +8011,7 @@ impl<'a> Interp<'a> {
             let bytes_h = bufv
                 .as_handle()
                 .map(Handle::from_raw)
-                .and_then(|h| self.realm.get_property(h, ARRAY_BUFFER_BYTES))
-                .and_then(|b| b.as_handle())
-                .map(Handle::from_raw);
+                .and_then(|h| self.array_buffer_bytes(h));
             let Some(bh) = bytes_h else {
                 let m = self.new_str("DataView has no buffer");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
@@ -8138,7 +8025,7 @@ impl<'a> Interp<'a> {
             // `DATA_VIEW_LEN`, else the rest of the buffer). A negative/too-large offset
             // or an access running past the end is a RangeError — never an out-of-bounds
             // read (returning 0) or a write that silently grows the buffer.
-            let total = self.realm.array_length(bh).unwrap_or(0);
+            let total = self.realm.bytes_len(bh).unwrap_or(0);
             let view_len = self
                 .realm
                 .get_property(handle, DATA_VIEW_LEN)
@@ -8170,14 +8057,17 @@ impl<'a> Interp<'a> {
                 } else {
                     self.realm.to_number(arg(1)) as i64 as u64
                 };
-                for i in 0..size {
-                    let shift = if le { i } else { size - 1 - i };
-                    let byte = (bits >> (8 * shift)) & 0xff;
-                    self.realm
-                        .set_element(bh, abs + i, NanBox::number(byte as f64));
+                if let Some(bytes) = self.realm.bytes_at_mut(bh) {
+                    for i in 0..size {
+                        let shift = if le { i } else { size - 1 - i };
+                        let byte = ((bits >> (8 * shift)) & 0xff) as u8;
+                        if let Some(slot) = bytes.get_mut(abs + i) {
+                            *slot = byte;
+                        }
+                    }
                 }
-                // Push the DataView write into any typed-array views over the same buffer.
-                self.realm.propagate_buffer_write(bh, abs, size, handle);
+                // Aliasing is intrinsic: typed-array views over the same bytes see the
+                // write with no propagation step.
                 return Ok(Some(NanBox::undefined()));
             }
             let le = self.realm.truthy(arg(1));
@@ -8185,10 +8075,9 @@ impl<'a> Interp<'a> {
             for i in 0..size {
                 let b = self
                     .realm
-                    .array_elements(bh)
+                    .bytes_at(bh)
                     .and_then(|e| e.get(abs + i).copied())
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(0.0) as u64
+                    .unwrap_or(0) as u64
                     & 0xff;
                 let shift = if le { i } else { size - 1 - i };
                 bits |= b << (8 * shift);
@@ -9287,7 +9176,7 @@ impl<'a> Interp<'a> {
             }
         }
         let handle = array_like.unwrap_or(handle);
-        if let Some(elems) = self.realm.array_elements(handle).map(<[_]>::to_vec) {
+        if let Some(elems) = self.realm.elements_vec(handle) {
             match method {
                 "push" => {
                     let mut len = elems.len();
@@ -9423,7 +9312,7 @@ impl<'a> Interp<'a> {
                     return Ok(Some(self.typed_like(handle, out)));
                 }
                 "toSorted" => {
-                    let numeric = self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some();
+                    let numeric = self.realm.typed_kind(handle).is_some();
                     let sorted = self.sort_array(elems.clone(), arg(0), numeric)?;
                     return Ok(Some(self.typed_like(handle, sorted)));
                 }
@@ -9590,11 +9479,10 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::handle(h.to_raw())));
                 }
                 "reverse" => {
-                    // Reverses in place and returns the same array.
+                    // Reverses in place and returns the same array (or typed-array view).
                     let mut out = elems.clone();
                     out.reverse();
-                    self.realm.array_set_all(handle, out);
-                    self.typed_array_resync(handle);
+                    self.write_back_elements(handle, out);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 // `fill(value, start?, end?)` — mutate in place, return the array.
@@ -9602,14 +9490,14 @@ impl<'a> Interp<'a> {
                 // `TypedArray.prototype.set(source, offset?)`: copy a source array's
                 // elements into this typed array starting at `offset`, coercing each
                 // to the element type. (Only typed arrays have `set`.)
-                "set" if self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some() => {
+                "set" if self.realm.typed_kind(handle).is_some() => {
                     let offset = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
                         self.realm.to_number(arg(1)).max(0.0) as usize
                     };
                     if let Some(src) = arg(0).as_handle().map(Handle::from_raw)
-                        && let Some(src_elems) = self.realm.array_elements(src).map(<[_]>::to_vec)
+                        && let Some(src_elems) = self.realm.elements_vec(src)
                     {
                         // Out-of-range writes are a RangeError, per spec.
                         if offset + src_elems.len() > elems.len() {
@@ -9624,11 +9512,10 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(Some(NanBox::undefined()));
                 }
-                // `subarray(begin, end)` — a new typed array of the same kind over
-                // the `[begin, end)` slice. (A copy here, not a live buffer view,
-                // since typed arrays are standalone — see the ArrayBuffer-backing
-                // limitation.)
-                "subarray" if self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some() => {
+                // `subarray(begin, end)` — a new typed array of the same kind that is
+                // a live *view* sharing the parent's backing bytes, at the parent's
+                // byte offset plus `begin * BYTES_PER_ELEMENT`.
+                "subarray" if self.realm.typed_kind(handle).is_some() => {
                     let len = elems.len() as i64;
                     let norm = |v: NanBox, default: i64, this: &mut Self| -> usize {
                         if matches!(v.unpack(), Unpacked::Undefined) {
@@ -9640,45 +9527,15 @@ impl<'a> Interp<'a> {
                     };
                     let start = norm(arg(0), 0, self);
                     let end = norm(arg(1), len, self).max(start);
-                    let sub: Vec<NanBox> = elems.get(start..end).unwrap_or(&[]).to_vec();
-                    let kind = self
-                        .realm
-                        .get_property(handle, TYPED_ARRAY_KIND)
-                        .and_then(|k| k.as_number())
-                        .unwrap_or(0.0) as u16;
+                    let kind = self.realm.typed_kind(handle).unwrap_or(0);
                     let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
-                    // `subarray` returns a *view* sharing the parent's buffer (materializing
-                    // one if the parent had none), at the parent's offset plus `start`.
-                    let parent_buf = self.typed_array_buffer_handle(handle);
-                    let parent_off = self
-                        .realm
-                        .get_property(handle, DATA_VIEW_OFF)
-                        .and_then(|o| o.as_number())
-                        .unwrap_or(0.0) as usize;
+                    let bytes_h = self.realm.typed_buffer(handle).unwrap();
+                    let parent_off = self.realm.typed_byte_offset(handle).unwrap_or(0);
                     let sub_off = parent_off + start * elem_size;
-                    let arr = self.realm.new_array(sub);
-                    self.realm
-                        .set_property(arr, TYPED_ARRAY_KIND, NanBox::number(f64::from(kind)));
-                    self.realm.set_hidden_property(
-                        arr,
-                        DATA_VIEW_OFF,
-                        NanBox::number(sub_off as f64),
-                    );
-                    self.realm.set_hidden_property(
-                        arr,
-                        TYPED_ARRAY_BUF,
-                        NanBox::handle(parent_buf.to_raw()),
-                    );
-                    if let Some(bytes_h) = self
+                    let view = self
                         .realm
-                        .get_property(parent_buf, ARRAY_BUFFER_BYTES)
-                        .and_then(|b| b.as_handle())
-                        .map(Handle::from_raw)
-                    {
-                        self.realm
-                            .register_typed_view(bytes_h, arr, sub_off, kind, elem_size);
-                    }
-                    return Ok(Some(NanBox::handle(arr.to_raw())));
+                        .new_typed_array(bytes_h, sub_off, end - start, kind);
+                    return Ok(Some(NanBox::handle(view.to_raw())));
                 }
                 "fill" => {
                     let len = elems.len();
@@ -9904,10 +9761,9 @@ impl<'a> Interp<'a> {
                 "sort" => {
                     // Sorts in place and returns the same array. A typed array sorts
                     // numerically by default (a plain array lexicographically).
-                    let numeric = self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some();
+                    let numeric = self.realm.typed_kind(handle).is_some();
                     let sorted = self.sort_array(elems, arg(0), numeric)?;
-                    self.realm.array_set_all(handle, sorted);
-                    self.typed_array_resync(handle);
+                    self.write_back_elements(handle, sorted);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 // `toSpliced(start, deleteCount, ...items)` — a spliced copy
@@ -10374,10 +10230,11 @@ impl<'a> Interp<'a> {
         Ok(n as usize)
     }
 
-    /// Builds an `ArrayBuffer` object of `len` zeroed bytes.
+    /// Builds an `ArrayBuffer` object of `len` zeroed bytes — a contiguous
+    /// [`Cell::Bytes`] store under the hidden `ARRAY_BUFFER_BYTES` slot.
     fn make_array_buffer(&mut self, len: usize) -> Handle {
         let obj = self.realm.new_object();
-        let bytes = self.realm.new_array(alloc::vec![NanBox::number(0.0); len]);
+        let bytes = self.realm.new_bytes(alloc::vec![0u8; len]);
         self.realm
             .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(bytes.to_raw()));
         obj
@@ -10414,18 +10271,21 @@ impl<'a> Interp<'a> {
         mem
     }
 
-    /// An `ArrayBuffer` whose byte store is `bytes`.
+    /// An `ArrayBuffer` whose contiguous [`Cell::Bytes`] store is a copy of `bytes`.
     fn make_array_buffer_from_bytes(&mut self, bytes: &[u8]) -> Handle {
         let obj = self.realm.new_object();
-        let arr = self.realm.new_array(
-            bytes
-                .iter()
-                .map(|&b| NanBox::number(f64::from(b)))
-                .collect(),
-        );
+        let store = self.realm.new_bytes(bytes.to_vec());
         self.realm
-            .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(arr.to_raw()));
+            .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(store.to_raw()));
         obj
+    }
+
+    /// The contiguous byte store handle of the `ArrayBuffer` object `buf`, if it has one.
+    fn array_buffer_bytes(&self, buf: Handle) -> Option<Handle> {
+        self.realm
+            .get_property(buf, ARRAY_BUFFER_BYTES)
+            .and_then(|b| b.as_handle())
+            .map(Handle::from_raw)
     }
 
     /// Builds a `WebAssembly.Global` object wrapping the already-coerced `value`
@@ -10673,6 +10533,8 @@ impl<'a> Interp<'a> {
         }
         Ok(if self.realm.is_array(h) {
             String::from("Array")
+        } else if let Some(kind) = self.realm.typed_kind(h) {
+            String::from(TYPED_ARRAY_KINDS[kind as usize].0)
         } else if self.is_callable(h) || self.realm.class_at(h).is_some() {
             String::from("Function")
         } else if self.realm.string_value(h).is_some() {
@@ -11232,7 +11094,7 @@ impl<'a> Interp<'a> {
         {
             return self.iterate_values(prim);
         }
-        if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
+        if let Some(elems) = self.realm.elements_vec(h) {
             return Ok(elems);
         }
         if let Some(s) = self.realm.string_value(h) {
@@ -12710,13 +12572,15 @@ impl<'a> Interp<'a> {
         key: &'a PropertyKey,
     ) -> Result<NanBox, ExecError> {
         match key {
-            PropertyKey::Number(n) if as_index(*n).is_some() && self.realm.is_array(handle) => {
+            PropertyKey::Number(n)
+                if as_index(*n).is_some() && self.realm.is_array_like(handle) =>
+            {
                 Ok(self.realm.get_element(handle, as_index(*n).unwrap()))
             }
             PropertyKey::Computed(e) => {
                 let k = self.eval(e)?;
                 if let Some(i) = k.as_number().and_then(as_index)
-                    && self.realm.is_array(handle)
+                    && self.realm.is_array_like(handle)
                 {
                     return Ok(self.realm.get_element(handle, i));
                 }
@@ -12756,7 +12620,7 @@ impl<'a> Interp<'a> {
         key: NanBox,
     ) -> Result<NanBox, ExecError> {
         if let Some(i) = key.as_number().and_then(as_index)
-            && self.realm.is_array(handle)
+            && self.realm.is_array_like(handle)
         {
             return Ok(self.realm.get_element(handle, i));
         }
@@ -12801,8 +12665,9 @@ impl<'a> Interp<'a> {
             return self.assign_member_value(target, key, new);
         }
         // A numeric index — a number, or a canonical numeric string ("1", not "01"
-        // or "1.0") as produced by `Reflect.set`/`arr["1"]=` — addresses array storage.
-        if self.realm.is_array(handle) {
+        // or "1.0") as produced by `Reflect.set`/`arr["1"]=` — addresses array (or
+        // typed-array view) element storage.
+        if self.realm.is_array_like(handle) {
             let idx = key.as_number().and_then(as_index).or_else(|| {
                 key.as_handle()
                     .map(Handle::from_raw)
@@ -12819,6 +12684,10 @@ impl<'a> Interp<'a> {
             }
         }
         let name = self.coerce_property_key(key)?;
+        // A typed array's `length` is fixed (non-writable): ignore the assignment.
+        if name == "length" && self.realm.typed_len(handle).is_some() {
+            return Ok(());
+        }
         // `regex.lastIndex = n` updates the RegExp's stateful search position.
         if name == "lastIndex" && self.realm.regexp_at(handle).is_some() {
             let n = self.realm.to_number(new).max(0.0) as usize;
@@ -13187,9 +13056,7 @@ impl<'a> Interp<'a> {
             {
                 return Ok(NanBox::number(0.0));
             }
-            return Ok(NanBox::number(
-                self.realm.array_length(bh).unwrap_or(0) as f64
-            ));
+            return Ok(NanBox::number(self.realm.bytes_len(bh).unwrap_or(0) as f64));
         }
         // `DataView.prototype` get*/set* accessors, exposed as readable methods.
         if DATA_VIEW_METHODS.contains(&name)
@@ -13219,9 +13086,8 @@ impl<'a> Interp<'a> {
                     let total = buf
                         .as_handle()
                         .map(Handle::from_raw)
-                        .and_then(|h| self.realm.get_property(h, ARRAY_BUFFER_BYTES))
-                        .and_then(|b| b.as_handle().map(Handle::from_raw))
-                        .and_then(|bh| self.realm.array_length(bh))
+                        .and_then(|h| self.array_buffer_bytes(h))
+                        .and_then(|bh| self.realm.bytes_len(bh))
                         .unwrap_or(0);
                     let off = self
                         .realm
@@ -13242,33 +13108,26 @@ impl<'a> Interp<'a> {
                 TYPED_ARRAY_KINDS[(id - N_TYPED_ARRAY_BASE) as usize].1,
             )));
         }
-        // A typed array's `.buffer` — the recorded backing buffer, or one materialized
-        // (a snapshot) from the current elements on first access.
-        if name == "buffer" && self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some() {
+        // A typed array's `.buffer` — the `ArrayBuffer` object wrapping its shared
+        // bytes (materialized once, then cached).
+        if name == "buffer" && self.realm.typed_kind(handle).is_some() {
             let buf = self.typed_array_buffer_handle(handle);
             return Ok(NanBox::handle(buf.to_raw()));
         }
         // Typed-array-specific methods that aren't shared with `Array.prototype`
         // (`set`/`subarray`), exposed as readable methods.
-        if matches!(name, "set" | "subarray")
-            && self.realm.get_property(handle, TYPED_ARRAY_KIND).is_some()
-        {
+        if matches!(name, "set" | "subarray") && self.realm.typed_kind(handle).is_some() {
             return Ok(self.readable_native_method(name));
         }
-        // Typed-array introspection (`byteLength`, `BYTES_PER_ELEMENT`).
+        // Typed-array introspection (`byteLength`, `BYTES_PER_ELEMENT`, `byteOffset`).
         if matches!(name, "byteLength" | "BYTES_PER_ELEMENT" | "byteOffset")
-            && let Some(k) = self.realm.get_property(handle, TYPED_ARRAY_KIND)
+            && let Some(kind) = self.realm.typed_kind(handle)
         {
-            let bpe = f64::from(TYPED_ARRAY_KINDS[k.as_number().unwrap_or(0.0) as usize].1);
+            let bpe = f64::from(TYPED_ARRAY_KINDS[kind as usize].1);
             return Ok(NanBox::number(match name {
                 "BYTES_PER_ELEMENT" => bpe,
-                // A buffer-backed view records its start offset under `DATA_VIEW_OFF`.
-                "byteOffset" => self
-                    .realm
-                    .get_property(handle, DATA_VIEW_OFF)
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(0.0),
-                _ => self.realm.array_length(handle).unwrap_or(0) as f64 * bpe,
+                "byteOffset" => self.realm.typed_byte_offset(handle).unwrap_or(0) as f64,
+                _ => self.realm.typed_len(handle).unwrap_or(0) as f64 * bpe,
             }));
         }
         // A String wrapper delegates `length` and indexed reads to its boxed
@@ -13345,7 +13204,7 @@ impl<'a> Interp<'a> {
     fn builtin_proto_method(&mut self, handle: Handle, name: &str) -> Option<NanBox> {
         let ctor_name = if self.realm.string_value(handle).is_some() {
             "String"
-        } else if self.realm.is_array(handle) {
+        } else if self.realm.is_array_like(handle) {
             "Array"
         } else if let Some(is_set) = self.realm.collection_is_set(handle) {
             if is_set { "Set" } else { "Map" }
@@ -14333,11 +14192,10 @@ impl<'a> Interp<'a> {
             {
                 return Ok(true);
             }
-            // A typed array matches its constructor.
+            // A typed array matches its constructor (kind index == id − base).
             if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
                 .contains(&id)
-                && let Some(k) = self.realm.get_property(oh, TYPED_ARRAY_KIND)
-                && k.as_number() == Some(f64::from(id - N_TYPED_ARRAY_BASE))
+                && self.realm.typed_kind(oh) == Some((id - N_TYPED_ARRAY_BASE) as u8)
             {
                 return Ok(true);
             }
@@ -14781,7 +14639,7 @@ fn wasm_extern_kind(kind: u8) -> &'static str {
     }
 }
 
-fn coerce_typed(kind: u16, n: f64) -> f64 {
+pub(crate) fn coerce_typed(kind: u16, n: f64) -> f64 {
     match kind {
         7 => f64::from(n as f32), // Float32
         8 => n,                   // Float64
@@ -15094,7 +14952,7 @@ fn unit_symbol(unit: &str) -> &str {
 
 /// Little-endian encode of one already-coerced typed-array element value of `kind`
 /// (index into [`TYPED_ARRAY_KINDS`]) — the inverse of [`decode_typed_element`].
-fn encode_typed_element(kind: u8, v: f64) -> alloc::vec::Vec<u8> {
+pub(crate) fn encode_typed_element(kind: u8, v: f64) -> alloc::vec::Vec<u8> {
     match kind {
         0 => alloc::vec![(v as i64 as i8) as u8],      // Int8
         1 => alloc::vec![v as i64 as u8],              // Uint8
@@ -18577,6 +18435,62 @@ mod tests {
             "2,4,6"
         );
         assert_eq!(run("[...new Uint8Array([8,9])].join(',')"), "8,9");
+    }
+
+    #[test]
+    fn typed_array_view_aliasing() {
+        // Sibling views over one ArrayBuffer share bytes intrinsically.
+        assert_eq!(
+            run(
+                "let b=new ArrayBuffer(8); let u=new Uint8Array(b); let f=new Float64Array(b); u[0]=255; f[0]>0"
+            ),
+            "true"
+        );
+        // A DataView write is seen by a typed-array view over the same buffer.
+        assert_eq!(
+            run(
+                "let b=new ArrayBuffer(8); let u=new Uint8Array(b); let dv=new DataView(b); dv.setUint8(1,9); u[1]===9"
+            ),
+            "true"
+        );
+        // An offset/length view aliases the right window of the buffer.
+        assert_eq!(
+            run(
+                "let b=new ArrayBuffer(8); let u=new Uint8Array(b,2,4); u[0]=42; new Uint8Array(b)[2]"
+            ),
+            "42"
+        );
+        // `subarray` shares the parent's buffer (not a copy).
+        assert_eq!(
+            run("let u=new Uint8Array([1,2,3,4]); let s=u.subarray(1,3); s[0]=99; u[1]"),
+            "99"
+        );
+        // `.set`, `.fill`, `.copyWithin`, `.byteOffset`, and object-form JSON.
+        assert_eq!(
+            run("let u=new Uint8Array(4); u.set([5,6],1); u.join(',')"),
+            "0,5,6,0"
+        );
+        assert_eq!(run("new Uint8Array([1,2,3]).fill(7).join(',')"), "7,7,7");
+        assert_eq!(
+            run("new Uint8Array([1,2,3,4]).copyWithin(0,2).join(',')"),
+            "3,4,3,4"
+        );
+        assert_eq!(
+            run("new Uint8Array(b=new ArrayBuffer(4),2).byteOffset"),
+            "2"
+        );
+        assert_eq!(run("Array.isArray(new Uint8Array([1]))"), "false");
+        assert_eq!(
+            run("JSON.stringify(new Uint8Array([1,2,3]))"),
+            "{\"0\":1,\"1\":2,\"2\":3}"
+        );
+        // BigInt64 round-trips through a DataView.
+        assert_eq!(
+            run(
+                "let dv=new DataView(new ArrayBuffer(8)); dv.setBigInt64(0,-1n); dv.getBigInt64(0).toString()"
+            ),
+            "-1"
+        );
     }
 
     #[test]

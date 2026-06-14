@@ -114,6 +114,20 @@ pub enum SnapCell {
     /// the contiguous byte backing of an `ArrayBuffer` (an external store is
     /// captured as an owned copy).
     Bytes(Vec<u8>),
+    /// a typed-array *view* over a `Bytes` cell: a reference to the backing bytes
+    /// plus the view's byte offset, element count, and element-kind index. The view
+    /// owns no element storage — on restore it is re-bound to the restored buffer so
+    /// sibling views keep aliasing the same bytes.
+    TypedArray {
+        /// reference to the backing `Bytes` cell
+        buffer: SnapVal,
+        /// byte offset of the first element within the buffer
+        byte_offset: u32,
+        /// element count
+        length: u32,
+        /// element-kind index (0..=8)
+        kind: u8,
+    },
 }
 
 /// One captured scope frame: its `(name, value, is_const)` bindings.
@@ -168,6 +182,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             || realm.symbol_at(*r).is_some()
             || realm.array_elements(*r).is_some()
             || realm.bytes_at(*r).is_some()
+            || realm.typed_kind(*r).is_some()
             || realm.object_keys(*r).is_some();
         if serializable {
             root_indices.push(intern(&mut index_of, &mut order, *r));
@@ -247,6 +262,23 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             }
         } else if let Some((description, _id)) = realm.symbol_at(h) {
             SnapCell::Symbol { description }
+        } else if let Some(kind) = realm.typed_kind(h) {
+            // A typed-array view: capture a reference to its backing bytes cell plus
+            // its geometry. The bytes cell is interned (and captured) as a child.
+            let buffer = realm.typed_buffer(h).map_or(SnapVal::Null, |b| {
+                snap_val(
+                    NanBox::handle(b.to_raw()),
+                    &mut index_of,
+                    &mut order,
+                    &mut intern,
+                )
+            });
+            SnapCell::TypedArray {
+                buffer,
+                byte_offset: realm.typed_byte_offset(h).unwrap_or(0) as u32,
+                length: realm.typed_len(h).unwrap_or(0) as u32,
+                kind,
+            }
         } else if let Some(bytes) = realm.bytes_at(h) {
             SnapCell::Bytes(bytes.to_vec())
         } else if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
@@ -404,6 +436,25 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
             }
             SnapCell::Symbol { description } => (realm.new_symbol(description), None),
             SnapCell::Bytes(data) => (realm.new_bytes(data.clone()), None),
+            SnapCell::TypedArray {
+                byte_offset,
+                length,
+                kind,
+                ..
+            } => {
+                // A placeholder over a temporary empty bytes cell; pass 2 rebinds the
+                // real backing buffer once every cell's handle exists.
+                let placeholder = realm.new_bytes(Vec::new());
+                (
+                    realm.new_typed_array(
+                        placeholder,
+                        *byte_offset as usize,
+                        *length as usize,
+                        *kind,
+                    ),
+                    None,
+                )
+            }
         };
         handles.push(h);
         fn_chains.push(chain);
@@ -425,6 +476,13 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
         match cell {
             // Reference-free cells were built fully in pass 1.
             SnapCell::Str(_) | SnapCell::Date(_) | SnapCell::BigInt(_) | SnapCell::Bytes(_) => {}
+            SnapCell::TypedArray { buffer, .. } => {
+                // Rebind the view to the restored backing bytes cell so it (and its
+                // siblings) alias the same storage again.
+                if let Some(b) = resolve(buffer, &handles).as_handle() {
+                    realm.set_typed_buffer(*h, Handle::from_raw(b));
+                }
+            }
             SnapCell::Array(vals) => {
                 let elems: Vec<NanBox> = vals.iter().map(|v| resolve(v, &handles)).collect();
                 realm.array_set_all(*h, elems);
@@ -683,6 +741,18 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                 w_u32(data.len() as u32, &mut out);
                 out.extend_from_slice(data);
             }
+            SnapCell::TypedArray {
+                buffer,
+                byte_offset,
+                length,
+                kind,
+            } => {
+                out.push(12);
+                w_val(buffer, &mut out);
+                w_u32(*byte_offset, &mut out);
+                w_u32(*length, &mut out);
+                out.push(*kind);
+            }
         }
     }
     out
@@ -858,6 +928,18 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
             11 => {
                 let n = r.u32()? as usize;
                 SnapCell::Bytes(r.take(n)?.to_vec())
+            }
+            12 => {
+                let buffer = r.val()?;
+                let byte_offset = r.u32()?;
+                let length = r.u32()?;
+                let kind = r.u8()?;
+                SnapCell::TypedArray {
+                    buffer,
+                    byte_offset,
+                    length,
+                    kind,
+                }
             }
             t => return Err(SnapError::BadTag(t)),
         };
@@ -1868,6 +1950,36 @@ mod tests {
             Some(String::from("tag")),
             "description round-trips"
         );
+    }
+
+    #[test]
+    fn snapshots_typed_array_views_preserving_aliasing() {
+        let mut realm = Realm::new();
+        // A buffer with two sibling views (Uint8 + Float64) over the same bytes.
+        let buf = realm.new_bytes(alloc::vec![0u8; 8]);
+        let u8v = realm.new_typed_array(buf, 0, 8, 1); // Uint8
+        let f64v = realm.new_typed_array(buf, 0, 1, 8); // Float64
+        realm.typed_set(u8v, 0, NanBox::number(255.0));
+
+        let snap = capture(&realm, &[u8v, f64v]);
+        let bytes = serialize(&snap);
+        let reloaded = deserialize(&bytes).expect("deserialize");
+        assert_eq!(reloaded, snap);
+        let mut realm2 = Realm::new();
+        let roots = restore(&mut realm2, &reloaded);
+        let (u2, f2) = (roots[0], roots[1]);
+
+        // Geometry round-trips.
+        assert_eq!(realm2.typed_len(u2), Some(8));
+        assert_eq!(realm2.typed_kind(u2), Some(1));
+        assert_eq!(realm2.typed_kind(f2), Some(8));
+        // Both restored views point at the *same* restored bytes cell (aliasing held).
+        assert_eq!(realm2.typed_buffer(u2), realm2.typed_buffer(f2));
+        // The written byte survived, and the sibling sees it.
+        assert_eq!(realm2.get_element(u2, 0).as_number(), Some(255.0));
+        // A fresh write through one view is visible through the other.
+        realm2.typed_set(u2, 1, NanBox::number(255.0));
+        assert_ne!(realm2.get_element(f2, 0).as_number(), Some(0.0));
     }
 
     #[test]

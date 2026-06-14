@@ -28,16 +28,23 @@ use crate::cell::Cell;
 use crate::gc::{self, Stats};
 use crate::heap::{Handle, Heap};
 use crate::nanbox::NanBox;
-use crate::nbexec::decode_typed_element;
+use crate::nbexec::{coerce_typed, decode_typed_element, encode_typed_element};
 use crate::object::Object;
 use crate::rope::Rope;
 use crate::shape::Shape;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
-/// One registered typed-array view over a shared buffer, as stored in
-/// [`Realm::typed_views`]: `(view_handle, byte_offset, element_kind, element_size)`.
-type TypedView = (u64, usize, u16, usize);
+/// Bytes-per-element for each typed-array `kind` (index into the engine's
+/// `TYPED_ARRAY_KINDS` table: Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32,
+/// Uint32, Float32, Float64). A `kind` outside `0..9` reads as size 1.
+const TYPED_ELEM_SIZE: [usize; 9] = [1, 1, 1, 2, 2, 4, 4, 4, 8];
+
+/// The byte size of one element of typed-array `kind`.
+#[must_use]
+pub fn typed_elem_size(kind: u8) -> usize {
+    TYPED_ELEM_SIZE.get(kind as usize).copied().unwrap_or(1)
+}
 
 /// An object-model context: the heap, the shared root shape, and the atom table.
 pub struct Realm {
@@ -79,12 +86,6 @@ pub struct Realm {
     /// Handles of non-extensible arrays (`Object.preventExtensions`/`seal`/`freeze`)
     /// — element writes past the end are rejected. Same caveat.
     non_extensible_arrays: alloc::collections::BTreeSet<u64>,
-    /// Typed-array views grouped by their backing `ArrayBuffer`'s bytes handle, so a write
-    /// to the buffer (through any view or a `DataView`) can push the change into every
-    /// sibling view's element store — making the BUFFER→VIEW read direction live without
-    /// touching the (hot) read path. Relocated across compaction (see `compact`).
-    /// Same handle-keyed caveat as `aux_props`.
-    typed_views: alloc::collections::BTreeMap<u64, alloc::vec::Vec<TypedView>>,
     /// The default prototype (`Object.prototype`) installed on objects created by
     /// [`new_object`](Realm::new_object) once the global environment is set up. A
     /// `None`-proto object (`Object.create(null)`) opts out explicitly.
@@ -123,157 +124,59 @@ impl Realm {
             frozen_arrays: alloc::collections::BTreeSet::new(),
             sealed_arrays: alloc::collections::BTreeSet::new(),
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
-            typed_views: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
             limits,
         }
     }
 
-    /// Empties every typed-array view registered over the buffer at `bytes_handle` (setting
-    /// each view's length to 0) and forgets them — used when the buffer is detached by
-    /// `ArrayBuffer.prototype.transfer`. Returns the handles that were emptied.
+    /// Every live typed-array view whose backing bytes cell is `bytes_handle`.
+    /// With the byte-backed view model, views alias their buffer intrinsically, so
+    /// the set is recovered by scanning the heap rather than a registry.
+    fn views_over(&self, bytes_handle: Handle) -> alloc::vec::Vec<Handle> {
+        self.heap
+            .live_handles()
+            .into_iter()
+            .filter(|h| {
+                matches!(
+                    self.heap.get(*h),
+                    Some(Cell::TypedArray { buffer, .. }) if *buffer == bytes_handle
+                )
+            })
+            .collect()
+    }
+
+    /// Sets the intrinsic `length` of the typed-array view at `handle` (used when a
+    /// resizable buffer grows/shrinks, or on detach). No-op for a non-view.
+    fn set_typed_length(&mut self, handle: Handle, new_len: usize) {
+        if let Some(Cell::TypedArray { length, .. }) = self.heap.get_mut(handle) {
+            *length = new_len;
+        }
+    }
+
+    /// Empties every typed-array view over the buffer at `bytes_handle` (length 0)
+    /// — used when the buffer is detached by `ArrayBuffer.prototype.transfer`.
+    /// Returns the view handles that were emptied.
     pub fn detach_buffer_views(&mut self, bytes_handle: Handle) -> alloc::vec::Vec<Handle> {
-        let views = self
-            .typed_views
-            .remove(&bytes_handle.to_raw())
-            .unwrap_or_default();
-        let mut emptied = alloc::vec::Vec::new();
-        for (vraw, ..) in views {
-            let v = Handle::from_raw(vraw);
-            if self.heap.is_live(v) {
-                self.set_array_length(v, 0);
-                emptied.push(v);
-            }
+        let views = self.views_over(bytes_handle);
+        for v in &views {
+            self.set_typed_length(*v, 0);
         }
-        emptied
+        views
     }
 
-    /// Resizes the byte store at `bytes_handle` to `new_byte_len` (zero-filling on growth)
-    /// and re-lengths every typed-array view over it to span the resized buffer, decoding
-    /// the elements from the (possibly grown) bytes. Used by `ArrayBuffer.prototype.resize`.
+    /// Resizes the owned byte store at `bytes_handle` to `new_byte_len` (zero-filling
+    /// on growth) and re-lengths every typed-array view over it to span the resized
+    /// buffer. Element reads/writes already go through the shared bytes, so only each
+    /// view's intrinsic `length` needs updating. Used by `ArrayBuffer.prototype.resize`.
     pub fn resize_buffer(&mut self, bytes_handle: Handle, new_byte_len: usize) {
-        let old_len = self.array_length(bytes_handle).unwrap_or(0);
-        self.set_array_length(bytes_handle, new_byte_len);
-        for i in old_len..new_byte_len {
-            self.set_element(bytes_handle, i, NanBox::number(0.0));
-        }
-        let bytes: alloc::vec::Vec<u8> = self
-            .heap
-            .get(bytes_handle)
-            .and_then(Cell::as_array)
-            .map(|a| {
-                a.iter()
-                    .map(|n| n.as_number().unwrap_or(0.0) as u8)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let views = self
-            .typed_views
-            .get(&bytes_handle.to_raw())
-            .cloned()
-            .unwrap_or_default();
-        for (vraw, off, kind, size) in views {
-            let v = Handle::from_raw(vraw);
-            if !self.heap.is_live(v) {
+        self.bytes_resize(bytes_handle, new_byte_len);
+        for v in self.views_over(bytes_handle) {
+            let Some((_, off, _, kind)) = self.heap.get(v).and_then(Cell::as_typed_array) else {
                 continue;
-            }
+            };
+            let size = typed_elem_size(kind);
             let view_len = new_byte_len.saturating_sub(off) / size;
-            let mut elems = alloc::vec::Vec::with_capacity(view_len);
-            let mut raw = [0u8; 8];
-            for i in 0..view_len {
-                let start = off + i * size;
-                for (j, b) in raw.iter_mut().take(size).enumerate() {
-                    *b = bytes.get(start + j).copied().unwrap_or(0);
-                }
-                elems.push(NanBox::number(decode_typed_element(
-                    kind as u8,
-                    &raw[..size],
-                )));
-            }
-            self.array_set_all(v, elems);
-        }
-    }
-
-    /// Registers a typed-array view over the buffer whose bytes live at `bytes_handle`, so
-    /// later writes to that buffer propagate into this view's element store.
-    pub fn register_typed_view(
-        &mut self,
-        bytes_handle: Handle,
-        view: Handle,
-        byte_offset: usize,
-        kind: u16,
-        elem_size: usize,
-    ) {
-        let entry = self.typed_views.entry(bytes_handle.to_raw()).or_default();
-        let v = view.to_raw();
-        if !entry.iter().any(|e| e.0 == v) {
-            entry.push((v, byte_offset, kind, elem_size));
-        }
-    }
-
-    /// After bytes `[byte_start, byte_start + byte_len)` of the buffer at `bytes_handle` were
-    /// written (by `writer`, a view or DataView), re-decodes the affected elements of every
-    /// *other* registered view over that buffer from the new bytes. This is the read-side of
-    /// shared buffer backing; it keeps the hot read path (`get_element`) untouched.
-    pub fn propagate_buffer_write(
-        &mut self,
-        bytes_handle: Handle,
-        byte_start: usize,
-        byte_len: usize,
-        writer: Handle,
-    ) {
-        let key = bytes_handle.to_raw();
-        let Some(raw) = self.typed_views.get(&key).cloned() else {
-            return;
-        };
-        // Drop views whose handle is no longer live (GC reclaimed them) — so the registry
-        // self-prunes and we never write through a dead/reused slot. Generation-tagged
-        // handles make `is_live` reject a recycled slot, keeping this sound under collection.
-        let views: alloc::vec::Vec<TypedView> = raw
-            .iter()
-            .copied()
-            .filter(|e| self.heap.is_live(Handle::from_raw(e.0)))
-            .collect();
-        if views.len() != raw.len() {
-            if views.is_empty() {
-                self.typed_views.remove(&key);
-            } else {
-                self.typed_views.insert(key, views.clone());
-            }
-        }
-        if views.len() < 2 && views.iter().all(|e| e.0 == writer.to_raw()) {
-            return; // only the writer (or nobody) backs this buffer — nothing to push to
-        }
-        let bytes: alloc::vec::Vec<u8> = self
-            .heap
-            .get(bytes_handle)
-            .and_then(Cell::as_array)
-            .map(|a| {
-                a.iter()
-                    .map(|n| n.as_number().unwrap_or(0.0) as u8)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let byte_end = byte_start + byte_len;
-        for (vraw, off, kind, size) in views {
-            if vraw == writer.to_raw() {
-                continue;
-            }
-            if byte_end <= off {
-                continue; // the write is entirely before this view
-            }
-            let vlen = self.array_length(Handle::from_raw(vraw)).unwrap_or(0);
-            let i_lo = byte_start.saturating_sub(off) / size;
-            let i_hi = (byte_end - 1 - off) / size;
-            let mut raw = [0u8; 8];
-            for i in i_lo..=i_hi.min(vlen.saturating_sub(1)) {
-                let start = off + i * size;
-                for (j, b) in raw.iter_mut().take(size).enumerate() {
-                    *b = bytes.get(start + j).copied().unwrap_or(0);
-                }
-                let val = decode_typed_element(kind as u8, &raw[..size]);
-                self.set_element(Handle::from_raw(vraw), i, NanBox::number(val));
-            }
+            self.set_typed_length(v, view_len);
         }
     }
 
@@ -387,6 +290,144 @@ impl Realm {
     #[must_use]
     pub fn bytes_len(&self, handle: Handle) -> Option<usize> {
         self.bytes_at(handle).map(<[u8]>::len)
+    }
+
+    /// Allocates a typed-array *view* — a [`Cell::TypedArray`] over the bytes at
+    /// `buffer` starting at `byte_offset`, spanning `length` elements of `kind`.
+    /// The view owns no element storage; reads/writes go through the shared bytes.
+    pub fn new_typed_array(
+        &mut self,
+        buffer: Handle,
+        byte_offset: usize,
+        length: usize,
+        kind: u8,
+    ) -> Handle {
+        self.heap.alloc(Cell::TypedArray {
+            buffer,
+            byte_offset,
+            length,
+            kind,
+        })
+    }
+
+    /// The element count of the typed-array view at `handle`, if it is one.
+    #[must_use]
+    pub fn typed_len(&self, handle: Handle) -> Option<usize> {
+        self.heap
+            .get(handle)?
+            .as_typed_array()
+            .map(|(_, _, l, _)| l)
+    }
+
+    /// The element-kind index of the typed-array view at `handle`, if it is one.
+    #[must_use]
+    pub fn typed_kind(&self, handle: Handle) -> Option<u8> {
+        self.heap
+            .get(handle)?
+            .as_typed_array()
+            .map(|(_, _, _, k)| k)
+    }
+
+    /// The backing `ArrayBuffer`'s bytes handle of the typed-array view at
+    /// `handle`, if it is one.
+    #[must_use]
+    pub fn typed_buffer(&self, handle: Handle) -> Option<Handle> {
+        self.heap.get(handle)?.as_typed_array().map(|(b, ..)| b)
+    }
+
+    /// The byte offset of the typed-array view at `handle`, if it is one.
+    #[must_use]
+    pub fn typed_byte_offset(&self, handle: Handle) -> Option<usize> {
+        self.heap
+            .get(handle)?
+            .as_typed_array()
+            .map(|(_, o, _, _)| o)
+    }
+
+    /// Rebinds the backing-buffer handle of the typed-array view at `handle` (used
+    /// by snapshot restore's second pass, after every cell's handle exists).
+    /// No-op for a non-view.
+    pub fn set_typed_buffer(&mut self, handle: Handle, new_buffer: Handle) {
+        if let Some(Cell::TypedArray { buffer, .. }) = self.heap.get_mut(handle) {
+            *buffer = new_buffer;
+        }
+    }
+
+    /// `view[i]` — decodes element `i` from the shared bytes, or `undefined` for
+    /// an out-of-range index. `None` if `handle` is not a typed-array view.
+    #[must_use]
+    pub fn typed_get(&self, handle: Handle, i: usize) -> Option<NanBox> {
+        let (buffer, byte_offset, length, kind) = self.heap.get(handle)?.as_typed_array()?;
+        if i >= length {
+            return Some(NanBox::undefined());
+        }
+        let size = typed_elem_size(kind);
+        let start = byte_offset + i * size;
+        let bytes = self.bytes_at(buffer)?;
+        let slice = bytes.get(start..start + size).unwrap_or(&[]);
+        Some(NanBox::number(decode_typed_element(kind, slice)))
+    }
+
+    /// `view[i] = value` — coerces `value` to the view's element kind and encodes
+    /// it into the shared bytes. A write past the view's length is ignored (typed
+    /// arrays are fixed-length). Returns `false` if `handle` is not a view.
+    pub fn typed_set(&mut self, handle: Handle, i: usize, value: NanBox) -> bool {
+        let Some((buffer, byte_offset, length, kind)) =
+            self.heap.get(handle).and_then(Cell::as_typed_array)
+        else {
+            return false;
+        };
+        if i >= length {
+            return true; // out-of-bounds typed-array write is a silent no-op
+        }
+        let n = self.to_number(value);
+        let enc = encode_typed_element(kind, coerce_typed(u16::from(kind), n));
+        let size = typed_elem_size(kind);
+        let start = byte_offset + i * size;
+        if let Some(bytes) = self.bytes_at_mut(buffer) {
+            for (j, &b) in enc.iter().enumerate() {
+                if let Some(slot) = bytes.get_mut(start + j) {
+                    *slot = b;
+                }
+            }
+        }
+        true
+    }
+
+    /// The decoded elements of the typed-array view at `handle` as an owned
+    /// vector, or `None` if it is not a view.
+    #[must_use]
+    pub fn typed_elements(&self, handle: Handle) -> Option<Vec<NanBox>> {
+        let (buffer, byte_offset, length, kind) = self.heap.get(handle)?.as_typed_array()?;
+        let size = typed_elem_size(kind);
+        let bytes = self.bytes_at(buffer)?;
+        Some(
+            (0..length)
+                .map(|i| {
+                    let start = byte_offset + i * size;
+                    let slice = bytes.get(start..start + size).unwrap_or(&[]);
+                    NanBox::number(decode_typed_element(kind, slice))
+                })
+                .collect(),
+        )
+    }
+
+    /// The elements of an array **or** typed-array view at `handle` as an owned
+    /// vector. Unifies the read path so callers (iteration, spread, array
+    /// methods, JSON, …) treat both alike. `None` for any other cell.
+    #[must_use]
+    pub fn elements_vec(&self, handle: Handle) -> Option<Vec<NanBox>> {
+        if let Some(a) = self.array_elements(handle) {
+            return Some(a.to_vec());
+        }
+        self.typed_elements(handle)
+    }
+
+    /// Whether `handle` is an array **or** a typed-array view — the values that
+    /// support indexed element access and a `length`.
+    #[must_use]
+    pub fn is_array_like(&self, handle: Handle) -> bool {
+        self.is_array(handle) || self.typed_len(handle).is_some()
     }
 
     /// Allocates a fresh, unique `Symbol` with the given description.
@@ -940,26 +981,38 @@ impl Realm {
             .is_some_and(crate::object::Object::is_frozen)
     }
 
-    /// The length of the array at `handle`, or `None` if it is not an array.
+    /// The length of the array (or typed-array view) at `handle`, or `None` if it
+    /// is neither.
     #[must_use]
     pub fn array_length(&self, handle: Handle) -> Option<usize> {
-        Some(self.heap.get(handle)?.as_array()?.len())
+        match self.heap.get(handle)? {
+            Cell::Array(a) => Some(a.len()),
+            Cell::TypedArray { length, .. } => Some(*length),
+            _ => None,
+        }
     }
 
     /// `arr[index]` — the element at `index`, or `undefined` if out of range or
-    /// the cell is not an array.
+    /// the cell is not an array (or typed-array view).
     #[must_use]
     pub fn get_element(&self, handle: Handle, index: usize) -> NanBox {
-        self.heap
-            .get(handle)
-            .and_then(Cell::as_array)
-            .and_then(|a| a.get(index).copied())
-            .unwrap_or(NanBox::undefined())
+        match self.heap.get(handle) {
+            Some(Cell::Array(a)) => a.get(index).copied().unwrap_or(NanBox::undefined()),
+            Some(Cell::TypedArray { .. }) => {
+                self.typed_get(handle, index).unwrap_or(NanBox::undefined())
+            }
+            _ => NanBox::undefined(),
+        }
     }
 
     /// `arr[index] = value` — grows the array with `undefined` holes if `index`
     /// is past the end (per JS). Returns `false` if the cell is not an array.
     pub fn set_element(&mut self, handle: Handle, index: usize, value: NanBox) -> bool {
+        // A typed-array view writes through to its shared bytes (coercing to the
+        // element kind); out-of-bounds writes are silent no-ops, per spec.
+        if self.typed_len(handle).is_some() {
+            return self.typed_set(handle, index, value);
+        }
         // A frozen array rejects all element writes; a sealed / non-extensible array
         // rejects only writes that would grow it (a write to an existing index is
         // still allowed when merely sealed).
@@ -1414,7 +1467,6 @@ impl Realm {
         // forwarding function to a closure that repairs the realm's out-of-heap handle tables.
         let Self {
             heap,
-            typed_views,
             frozen_arrays,
             sealed_arrays,
             non_extensible_arrays,
@@ -1425,19 +1477,10 @@ impl Realm {
             ..
         } = self;
         let stats = gc::compact_with(heap, &mut all, &mut |forward| {
-            // The shared-buffer view registry: forward the bytes-handle keys and the
-            // per-view handle entries.
-            let old = core::mem::take(typed_views);
-            for (bytes_raw, views) in old {
-                let new_bytes = forward(Handle::from_raw(bytes_raw)).to_raw();
-                let new_views = views
-                    .into_iter()
-                    .map(|(v, off, kind, size)| {
-                        (forward(Handle::from_raw(v)).to_raw(), off, kind, size)
-                    })
-                    .collect();
-                typed_views.insert(new_bytes, new_views);
-            }
+            // A typed array's backing-buffer handle lives in the `Cell::TypedArray`
+            // itself and is forwarded by the moving collector with every other cell
+            // reference, so the view→buffer link survives compaction intrinsically —
+            // no side registry to relocate.
             // The array integrity flag sets are keyed by the array's (relocated) handle.
             for set in [
                 &mut *frozen_arrays,
@@ -1630,10 +1673,19 @@ impl Realm {
                     }
                 }
                 Some(Cell::BigInt(n)) => alloc::format!("{n}"),
-                // A typed-array view stringifies as its comma-joined elements
-                // (proper element decode is wired with the view model in A3); the
-                // raw byte backing is internal and never directly displayed.
-                Some(Cell::TypedArray { .. }) => alloc::string::String::from("[object TypedArray]"),
+                // A typed-array view stringifies as its comma-joined decoded
+                // elements (`Array#join` semantics over the shared bytes); the raw
+                // byte backing is internal and never directly displayed.
+                Some(Cell::TypedArray { .. }) => {
+                    let elems = self
+                        .typed_elements(Handle::from_raw(raw))
+                        .unwrap_or_default();
+                    let parts: Vec<alloc::string::String> = elems
+                        .iter()
+                        .map(|e| self.to_display_string_seen(*e, seen))
+                        .collect();
+                    parts.join(",")
+                }
                 Some(Cell::Bytes(_)) => alloc::string::String::new(),
                 // A proxy renders as its target would.
                 Some(Cell::Proxy { target, .. }) => {
@@ -2599,15 +2651,14 @@ mod tests {
     }
 
     #[test]
-    fn compaction_relocates_the_shared_buffer_view_registry() {
+    fn compaction_preserves_typed_array_view_aliasing() {
         let mut realm = Realm::new();
-        // A "buffer" bytes array and a "view" element store, with garbage interleaved before
+        // A byte-backed buffer and a Uint8 view over it, with garbage interleaved before
         // them so compaction actually relocates their slots.
         let _g0 = realm.new_string("garbage0");
-        let bytes = realm.new_array(alloc::vec![NanBox::number(0.0); 4]);
+        let bytes = realm.new_bytes(alloc::vec![0u8; 4]);
         let _g1 = realm.new_object();
-        let view = realm.new_array(alloc::vec![NanBox::number(0.0); 4]);
-        realm.register_typed_view(bytes, view, 0, 1, 1); // kind 1 = Uint8, elem_size 1
+        let view = realm.new_typed_array(bytes, 0, 4, 1); // kind 1 = Uint8
 
         let mut roots = [bytes, view];
         realm.compact(&mut roots);
@@ -2615,22 +2666,27 @@ mod tests {
         // The slots moved (garbage created gaps), so the raw handles changed.
         assert_ne!(bytes2.to_raw(), bytes.to_raw());
 
-        // The registry was rewritten to the relocated handles…
-        let entry = realm
-            .typed_views
-            .get(&bytes2.to_raw())
-            .expect("registry re-keyed by the relocated bytes handle");
-        assert_eq!(entry.len(), 1);
-        assert_eq!(entry[0].0, view2.to_raw(), "view handle was forwarded");
-        assert!(
-            !realm.typed_views.contains_key(&bytes.to_raw()),
-            "the stale (pre-compaction) key was removed"
-        );
-
-        // …and propagation through the relocated handles still reaches the view.
-        realm.set_element(bytes2, 1, NanBox::number(200.0));
-        realm.propagate_buffer_write(bytes2, 1, 1, bytes2);
+        // The view's intrinsic buffer link was forwarded with the cell, so a write to
+        // the relocated buffer is still visible through the relocated view.
+        realm.bytes_at_mut(bytes2).unwrap()[1] = 200;
         assert_eq!(realm.get_element(view2, 1).as_number(), Some(200.0));
+        assert_eq!(realm.typed_buffer(view2), Some(bytes2));
+    }
+
+    #[test]
+    fn typed_array_view_aliases_shared_bytes() {
+        let mut realm = Realm::new();
+        let buf = realm.new_bytes(alloc::vec![0u8; 8]);
+        let u8v = realm.new_typed_array(buf, 0, 8, 1); // Uint8
+        let f64v = realm.new_typed_array(buf, 0, 1, 8); // Float64
+        // A write through one view is decoded by the sibling (intrinsic aliasing).
+        realm.typed_set(u8v, 0, NanBox::number(255.0));
+        assert_eq!(realm.get_element(u8v, 0).as_number(), Some(255.0));
+        // Float64 over the same first byte sees the raw bytes change.
+        assert_ne!(realm.get_element(f64v, 0).as_number(), Some(0.0));
+        // resize_buffer grows the bytes and re-lengths the views.
+        realm.resize_buffer(buf, 16);
+        assert_eq!(realm.typed_len(u8v), Some(16));
     }
 
     #[test]
