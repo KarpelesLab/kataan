@@ -249,6 +249,14 @@ pub struct Interp<'a> {
     class_native_super: Vec<Option<u16>>,
     /// Current function-call nesting depth (recursion guard).
     call_depth: usize,
+    /// C2: current *tree-walk* recursion depth — `eval`/`exec` descend on the
+    /// native stack for nested expressions/statements, and the precedence loop in
+    /// the parser flattens `a + a + a + …` into a shallow AST that nonetheless
+    /// drives thousands of nested `eval` calls. The function-call `call_depth`
+    /// guard does not count these, so a deep expression would overflow the host
+    /// stack and abort. This counter is checked against `limits.max_call_depth` at
+    /// the `eval`/`exec` hubs and throws a catchable `RangeError` past the cap.
+    eval_depth: usize,
     /// `xorshift128+` PRNG state backing `Math.random` (pure Rust, no foreign
     /// code). Two 64-bit words give a 2^128-1 period; seeded by
     /// [`math_random_seed`].
@@ -842,6 +850,7 @@ impl<'a> Interp<'a> {
             class_envs: Vec::new(),
             class_native_super: Vec::new(),
             call_depth: 0,
+            eval_depth: 0,
             rng_state: math_random_seed(),
             this_val: NanBox::undefined(),
             new_target: NanBox::undefined(),
@@ -4891,6 +4900,11 @@ impl<'a> Interp<'a> {
         } else {
             None
         };
+        // C2: the tree-walk depth counter measures native recursion *within* one
+        // function frame; reset it for the callee's body (deep function-call
+        // recursion is bounded separately by `call_depth`) so genuine recursion is
+        // not penalised by the depth accumulated in the caller's expressions.
+        let saved_eval_depth = core::mem::replace(&mut self.eval_depth, 0);
         let result = (|| {
             for (i, param) in def.params.iter().enumerate() {
                 let value = if param.rest {
@@ -4921,6 +4935,7 @@ impl<'a> Interp<'a> {
         self.current_home = saved_home;
         self.current_home_static = saved_home_static;
         self.new_target = saved_target;
+        self.eval_depth = saved_eval_depth;
         // A generator call returns an iterator over the values it yielded.
         if def.is_generator {
             let collected = self.gen_sink.take().unwrap_or_default();
@@ -11031,6 +11046,21 @@ impl<'a> Interp<'a> {
     // --- statements ---
 
     fn exec(&mut self, stmt: &'a Stmt) -> Result<Flow, ExecError> {
+        // C2: share the tree-walk recursion budget with `eval` so deeply nested
+        // statements (or expressions reached through them) throw a catchable
+        // `RangeError` rather than overflowing the host stack.
+        if self.eval_depth >= self.realm.limits.max_call_depth {
+            let msg = self.new_str("Maximum call stack size exceeded");
+            let err = self.make_error(N_ERROR_BASE + 2, Some(msg));
+            return Err(ExecError::Throw(err));
+        }
+        self.eval_depth += 1;
+        let r = self.exec_inner(stmt);
+        self.eval_depth -= 1;
+        r
+    }
+
+    fn exec_inner(&mut self, stmt: &'a Stmt) -> Result<Flow, ExecError> {
         match stmt {
             Stmt::Empty { .. } => Ok(Flow::Normal(NanBox::undefined())),
             Stmt::Expr { expression, .. } => Ok(Flow::Normal(self.eval(expression)?)),
@@ -12267,6 +12297,22 @@ impl<'a> Interp<'a> {
     }
 
     fn eval(&mut self, expr: &'a Expr) -> Result<NanBox, ExecError> {
+        // C2: guard the native recursion that `eval` performs on nested
+        // expressions (a deep `a + a + … + a` is shallow in the AST but recurses
+        // here once per term). Throw a catchable `RangeError` past the limit
+        // instead of overflowing the host stack.
+        if self.eval_depth >= self.realm.limits.max_call_depth {
+            let msg = self.new_str("Maximum call stack size exceeded");
+            let err = self.make_error(N_ERROR_BASE + 2, Some(msg));
+            return Err(ExecError::Throw(err));
+        }
+        self.eval_depth += 1;
+        let r = self.eval_inner(expr);
+        self.eval_depth -= 1;
+        r
+    }
+
+    fn eval_inner(&mut self, expr: &'a Expr) -> Result<NanBox, ExecError> {
         match expr {
             Expr::Null(_) => Ok(NanBox::null()),
             Expr::Bool { value, .. } => Ok(NanBox::boolean(*value)),
@@ -16340,6 +16386,33 @@ mod tests {
     /// rather than overflowing the host stack. Run on a generous stack so the
     /// `max_call_depth` guard fires before the (much larger) real overflow point,
     /// exactly as the production / test262 harness threads do.
+    #[test]
+    fn deep_expression_throws_instead_of_overflowing() {
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let src = core::iter::repeat_n("1", 20_000)
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join("+");
+                // Leak the AST: dropping a 20k-deep boxed expression chain would
+                // itself recurse and is unrelated to what we are asserting.
+                let program = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                    Parser::parse_program(&src).expect("parse"),
+                ));
+                let mut interp = Interp::new();
+                let threw = matches!(interp.run(program), Err(ExecError::Throw(_)));
+                core::mem::forget(interp);
+                threw
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        assert!(handle, "deep expression should throw, not abort");
+    }
+
+    /// L1: `ArrayBuffer.prototype.transfer(n)` with an enormous length throws a
+    /// catchable `RangeError` (via `validate_alloc_len`) instead of attempting a
+    /// `usize::MAX` allocation that aborts the process.
     #[test]
     fn surrogate_search_pad_split_iteration_units() {
         // indexOf/includes over UTF-16 units (astral char shifts the index by 2).
