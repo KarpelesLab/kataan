@@ -426,15 +426,176 @@ impl Realm {
             return true; // out-of-bounds typed-array write is a silent no-op
         }
         let n = self.to_number(value);
-        let enc = encode_typed_element(kind, coerce_typed(u16::from(kind), n));
+        let (enc, enc_len) = encode_typed_element(kind, coerce_typed(u16::from(kind), n));
         let size = typed_elem_size(kind);
-        let start = byte_offset + i * size;
+        // Checked offset math: never wrap (debug panic / silent corruption) on a
+        // pathological `i`.
+        let Some(start) = i.checked_mul(size).and_then(|o| byte_offset.checked_add(o)) else {
+            return true;
+        };
         if let Some(bytes) = self.bytes_at_mut(buffer) {
-            for (j, &b) in enc.iter().enumerate() {
+            for (j, &b) in enc[..enc_len].iter().enumerate() {
                 if let Some(slot) = bytes.get_mut(start + j) {
                     *slot = b;
                 }
             }
+        }
+        true
+    }
+
+    /// Bulk `view[start..end] = value` (`TypedArray.prototype.fill`). Resolves the
+    /// view geometry **once**, encodes `value` once, then writes the repeating
+    /// element pattern in a tight loop over a single borrow of the backing bytes —
+    /// no per-element heap lookup or `Vec` allocation. `start`/`end` are clamped to
+    /// the view length. No-op if `handle` is not a view.
+    pub fn typed_fill_range(&mut self, handle: Handle, value: NanBox, start: usize, end: usize) {
+        let Some((buffer, byte_offset, length, kind)) =
+            self.heap.get(handle).and_then(Cell::as_typed_array)
+        else {
+            return;
+        };
+        let size = typed_elem_size(kind);
+        let n = self.to_number(value);
+        let (enc, enc_len) = encode_typed_element(kind, coerce_typed(u16::from(kind), n));
+        let pat = &enc[..enc_len];
+        let start = start.min(length);
+        let end = end.min(length);
+        if start >= end {
+            return;
+        }
+        // `byte_offset + end*size` is the highest byte touched; clamp the loop to
+        // the live byte slice so a stale view never writes out of bounds.
+        let Some(base) = byte_offset.checked_add(start * size) else {
+            return;
+        };
+        if let Some(bytes) = self.bytes_at_mut(buffer) {
+            let mut off = base;
+            for _ in start..end {
+                if let Some(slot) = bytes.get_mut(off..off + size) {
+                    slot.copy_from_slice(pat);
+                }
+                off += size;
+            }
+        }
+    }
+
+    /// Bulk `view.copyWithin(dst, src, count)`: copies `count` elements of the same
+    /// width within the view's backing bytes via a raw `copy_within` (handles
+    /// overlap correctly), resolving the view geometry once. `dst`/`src`/`count`
+    /// are clamped to the view length. No-op if `handle` is not a view.
+    pub fn typed_copy_within(&mut self, handle: Handle, dst: usize, src: usize, count: usize) {
+        let Some((buffer, byte_offset, length, kind)) =
+            self.heap.get(handle).and_then(Cell::as_typed_array)
+        else {
+            return;
+        };
+        let size = typed_elem_size(kind);
+        // Clamp the element count so neither range exceeds the view length.
+        let count = count
+            .min(length.saturating_sub(dst))
+            .min(length.saturating_sub(src));
+        if count == 0 {
+            return;
+        }
+        let (Some(src_byte), Some(dst_byte), Some(byte_count)) = (
+            byte_offset.checked_add(src * size),
+            byte_offset.checked_add(dst * size),
+            count.checked_mul(size),
+        ) else {
+            return;
+        };
+        if let Some(bytes) = self.bytes_at_mut(buffer) {
+            let hi = src_byte.max(dst_byte) + byte_count;
+            if hi <= bytes.len() {
+                bytes.copy_within(src_byte..src_byte + byte_count, dst_byte);
+            }
+        }
+    }
+
+    /// Bulk `view[offset + j] = values[j]` for `TypedArray.prototype.set` /
+    /// constructor write-backs from a numeric source. ToNumber-coerces each value
+    /// up front (which may run user `valueOf`), then writes the encoded elements in
+    /// a single borrow of the backing bytes. Out-of-range slots are skipped. No-op
+    /// if `handle` is not a view.
+    pub fn typed_set_from_numbers(&mut self, handle: Handle, offset: usize, values: &[NanBox]) {
+        let Some((.., kind)) = self.heap.get(handle).and_then(Cell::as_typed_array) else {
+            return;
+        };
+        // ToNumber first (may call user code / resize the buffer); collect plain
+        // f64s so the subsequent byte write needs only one immutable conversion.
+        let nums: Vec<f64> = values.iter().map(|&v| self.to_number(v)).collect();
+        // Re-resolve geometry after coercion (a `valueOf` could have detached or
+        // resized the buffer).
+        let Some((buffer, byte_offset, length, _)) =
+            self.heap.get(handle).and_then(Cell::as_typed_array)
+        else {
+            return;
+        };
+        let size = typed_elem_size(kind);
+        if let Some(bytes) = self.bytes_at_mut(buffer) {
+            for (j, &num) in nums.iter().enumerate() {
+                let i = offset + j;
+                if i >= length {
+                    break;
+                }
+                let (enc, enc_len) = encode_typed_element(kind, coerce_typed(u16::from(kind), num));
+                let Some(start) = i.checked_mul(size).and_then(|o| byte_offset.checked_add(o))
+                else {
+                    break;
+                };
+                if let Some(slot) = bytes.get_mut(start..start + enc_len) {
+                    slot.copy_from_slice(&enc[..enc_len]);
+                }
+            }
+        }
+    }
+
+    /// Fast path for `dst.set(src)` when both are the **same element kind**: copies
+    /// the raw source bytes into the destination at element `offset` (handling
+    /// overlap when they share a backing buffer), skipping the
+    /// decode→ToNumber→re-encode round-trip. Returns `false` (caller falls back to
+    /// the generic path) if either is not a view, the kinds differ, or the copy
+    /// would not fit. `offset + src.len() <= dst.len()` must already hold.
+    pub fn typed_set_same_kind(&mut self, dst: Handle, src: Handle, offset: usize) -> bool {
+        let (Some((dbuf, doff, dlen, dkind)), Some((sbuf, soff, slen, skind))) = (
+            self.heap.get(dst).and_then(Cell::as_typed_array),
+            self.heap.get(src).and_then(Cell::as_typed_array),
+        ) else {
+            return false;
+        };
+        if dkind != skind || offset.checked_add(slen).is_none_or(|e| e > dlen) {
+            return false;
+        }
+        let size = typed_elem_size(dkind);
+        let (Some(dst_byte), Some(src_byte), Some(byte_count)) = (
+            doff.checked_add(offset * size),
+            Some(soff),
+            slen.checked_mul(size),
+        ) else {
+            return false;
+        };
+        if dbuf == sbuf {
+            // Same backing buffer: overlap-safe move within one byte slice.
+            if let Some(bytes) = self.bytes_at_mut(dbuf) {
+                let hi = src_byte.max(dst_byte) + byte_count;
+                if hi <= bytes.len() {
+                    bytes.copy_within(src_byte..src_byte + byte_count, dst_byte);
+                }
+            }
+            return true;
+        }
+        // Distinct buffers: read the source range, then write it to the dest.
+        let Some(chunk) = self
+            .bytes_at(sbuf)
+            .and_then(|b| b.get(src_byte..src_byte + byte_count))
+            .map(<[u8]>::to_vec)
+        else {
+            return false;
+        };
+        if let Some(bytes) = self.bytes_at_mut(dbuf)
+            && let Some(slot) = bytes.get_mut(dst_byte..dst_byte + byte_count)
+        {
+            slot.copy_from_slice(&chunk);
         }
         true
     }

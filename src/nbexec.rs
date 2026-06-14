@@ -5455,9 +5455,8 @@ impl<'a> Interp<'a> {
             let bytes_h = self.array_buffer_bytes(buf).unwrap();
             let view = self.realm.new_typed_array(bytes_h, buf, 0, length, kind);
             if let Some(s) = src {
-                for (i, e) in s.into_iter().enumerate() {
-                    self.realm.typed_set(view, i, e);
-                }
+                // Bulk write-through: one buffer borrow, no per-element heap lookup.
+                self.realm.typed_set_from_numbers(view, 0, &s);
             }
             return Ok(NanBox::handle(view.to_raw()));
         }
@@ -6715,6 +6714,22 @@ impl<'a> Interp<'a> {
         self.realm.set_element(handle, i, value);
     }
 
+    /// Relative-index clamp shared by the typed-array bulk mutators
+    /// (`fill`/`copyWithin`): `undefined` yields `default`; otherwise ToNumber the
+    /// argument, treat a negative value as counting from `len`, and clamp the
+    /// result into `0..=len`.
+    fn typed_clamp_index(&mut self, v: NanBox, default: usize, len: usize) -> usize {
+        if matches!(v.unpack(), Unpacked::Undefined) {
+            return default;
+        }
+        let n = self.realm.to_number(v);
+        if n < 0.0 {
+            (len as f64 + n).max(0.0) as usize
+        } else {
+            (n as usize).min(len)
+        }
+    }
+
     /// C1: a user-facing array element write (`arr[i] = v`). Like
     /// [`Self::set_element_coerced`], but when the index would grow the dense
     /// backing past `limits.max_array_len` the realm refuses the write (a silent
@@ -6800,9 +6815,8 @@ impl<'a> Interp<'a> {
     /// plain array. Used by in-place reorders (`sort`/`reverse`).
     fn write_back_elements(&mut self, handle: Handle, elems: Vec<NanBox>) {
         if self.realm.typed_kind(handle).is_some() {
-            for (i, e) in elems.into_iter().enumerate() {
-                self.realm.set_element(handle, i, e);
-            }
+            // Bulk write-through: one buffer borrow, no per-element heap lookup.
+            self.realm.typed_set_from_numbers(handle, 0, &elems);
         } else {
             self.realm.array_set_all(handle, elems);
         }
@@ -6817,9 +6831,8 @@ impl<'a> Interp<'a> {
             let view = self
                 .realm
                 .new_typed_array(bytes_h, buf, 0, elems.len(), kind);
-            for (i, e) in elems.into_iter().enumerate() {
-                self.realm.typed_set(view, i, e);
-            }
+            // Bulk write-through: one buffer borrow, no per-element heap lookup.
+            self.realm.typed_set_from_numbers(view, 0, &elems);
             NanBox::handle(view.to_raw())
         } else {
             NanBox::handle(self.realm.new_array(elems).to_raw())
@@ -7916,9 +7929,8 @@ impl<'a> Interp<'a> {
             let view = self
                 .realm
                 .new_typed_array(bytes_h, buf, 0, items.len(), kind);
-            for (i, v) in items.into_iter().enumerate() {
-                self.realm.typed_set(view, i, v);
-            }
+            // Bulk write-through: one buffer borrow, no per-element heap lookup.
+            self.realm.typed_set_from_numbers(view, 0, &items);
             return Ok(Some(NanBox::handle(view.to_raw())));
         }
         // `Date.parse(str)` → epoch ms (or NaN) by ISO parsing.
@@ -9444,6 +9456,108 @@ impl<'a> Interp<'a> {
             }
         }
         let handle = array_like.unwrap_or(handle);
+        // S5/S3/S8: bulk typed-array mutators (`fill`/`copyWithin`/`set`/`subarray`)
+        // operate on the backing bytes directly. Handle them up front using the
+        // view's length (`typed_len`) so they never materialize every element just
+        // to read `.len()`, and route through the `Realm` bulk methods (one buffer
+        // borrow, no per-element heap lookup or `Vec` allocation).
+        if let Some(tlen) = self.realm.typed_len(handle) {
+            match method {
+                // `fill(value, start?, end?)` — mutate in place, return the view.
+                // `start`/`end` default to `0`/`len`; negatives count from the end.
+                "fill" => {
+                    let value = arg(0);
+                    let start = self.typed_clamp_index(arg(1), 0, tlen);
+                    let end = self.typed_clamp_index(arg(2), tlen, tlen);
+                    self.realm.typed_fill_range(handle, value, start, end);
+                    return Ok(Some(NanBox::handle(handle.to_raw())));
+                }
+                // `copyWithin(target, start, end?)` — copy a slice within the view
+                // in place (raw same-width byte move); negatives count from the end.
+                "copyWithin" => {
+                    let target = self.typed_clamp_index(arg(0), 0, tlen);
+                    let start = self.typed_clamp_index(arg(1), 0, tlen);
+                    let end = self.typed_clamp_index(arg(2), tlen, tlen);
+                    let count = end.saturating_sub(start);
+                    self.realm.typed_copy_within(handle, target, start, count);
+                    return Ok(Some(NanBox::handle(handle.to_raw())));
+                }
+                // `TypedArray.prototype.set(source, offset?)`: copy a source's
+                // elements into this view at `offset`, coercing each. A same-kind
+                // typed-array source takes the raw byte-copy fast path (S8).
+                "set" => {
+                    let offset_f = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        0.0
+                    } else {
+                        self.realm.to_number(arg(1)).max(0.0)
+                    };
+                    if let Some(src) = arg(0).as_handle().map(Handle::from_raw) {
+                        // M2/T2: reject a saturated/non-finite/out-of-range `offset`
+                        // up front (it must not wrap into the byte math).
+                        let offset = if offset_f.is_finite() && offset_f <= tlen as f64 {
+                            offset_f as usize
+                        } else {
+                            let m = self.new_str("offset is out of bounds");
+                            return Err(ExecError::Throw(
+                                self.make_error(N_ERROR_BASE + 2, Some(m)),
+                            ));
+                        };
+                        // Source length comes from a view or an array (the read path
+                        // `elements_vec` actually backs); an arbitrary object source
+                        // is a no-op, as before.
+                        let src_len = self
+                            .realm
+                            .typed_len(src)
+                            .or_else(|| self.realm.array_length(src));
+                        if let Some(src_len) = src_len {
+                            // `offset + src_len > len` is a RangeError, per spec.
+                            if offset.checked_add(src_len).is_none_or(|e| e > tlen) {
+                                let m = self.new_str("offset is out of bounds");
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_ERROR_BASE + 2, Some(m)),
+                                ));
+                            }
+                            // S8 fast path: same-kind typed source → raw byte copy.
+                            if self.realm.typed_set_same_kind(handle, src, offset) {
+                                return Ok(Some(NanBox::undefined()));
+                            }
+                        }
+                        // Materialize the source's elements and bulk-write (coercing).
+                        if let Some(src_elems) = self.realm.elements_vec(src) {
+                            self.realm
+                                .typed_set_from_numbers(handle, offset, &src_elems);
+                        }
+                    }
+                    return Ok(Some(NanBox::undefined()));
+                }
+                // `subarray(begin, end)` — a new same-kind view sharing the parent's
+                // backing bytes at the parent's byte offset plus `begin * size`.
+                "subarray" => {
+                    let len = tlen as i64;
+                    let norm = |v: NanBox, default: i64, this: &mut Self| -> usize {
+                        if matches!(v.unpack(), Unpacked::Undefined) {
+                            return default as usize;
+                        }
+                        let n = this.realm.to_number(v) as i64;
+                        usize::try_from(if n < 0 { (len + n).max(0) } else { n.min(len) })
+                            .unwrap_or(0)
+                    };
+                    let start = norm(arg(0), 0, self);
+                    let end = norm(arg(1), len, self).max(start);
+                    let kind = self.realm.typed_kind(handle).unwrap_or(0);
+                    let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+                    let bytes_h = self.realm.typed_buffer(handle).unwrap();
+                    let abuf = self.realm.typed_array_object(handle).unwrap();
+                    let parent_off = self.realm.typed_byte_offset(handle).unwrap_or(0);
+                    let sub_off = parent_off + start * elem_size;
+                    let view =
+                        self.realm
+                            .new_typed_array(bytes_h, abuf, sub_off, end - start, kind);
+                    return Ok(Some(NanBox::handle(view.to_raw())));
+                }
+                _ => {}
+            }
+        }
         if let Some(elems) = self.realm.elements_vec(handle) {
             match method {
                 "push" => {
@@ -9753,61 +9867,10 @@ impl<'a> Interp<'a> {
                     self.write_back_elements(handle, out);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
-                // `fill(value, start?, end?)` — mutate in place, return the array.
-                // `start`/`end` default to `0`/`len`; negatives count from the end.
-                // `TypedArray.prototype.set(source, offset?)`: copy a source array's
-                // elements into this typed array starting at `offset`, coercing each
-                // to the element type. (Only typed arrays have `set`.)
-                "set" if self.realm.typed_kind(handle).is_some() => {
-                    let offset = if matches!(arg(1).unpack(), Unpacked::Undefined) {
-                        0
-                    } else {
-                        self.realm.to_number(arg(1)).max(0.0) as usize
-                    };
-                    if let Some(src) = arg(0).as_handle().map(Handle::from_raw)
-                        && let Some(src_elems) = self.realm.elements_vec(src)
-                    {
-                        // Out-of-range writes are a RangeError, per spec.
-                        if offset + src_elems.len() > elems.len() {
-                            let m = self.new_str("offset is out of bounds");
-                            return Err(ExecError::Throw(
-                                self.make_error(N_ERROR_BASE + 2, Some(m)),
-                            ));
-                        }
-                        for (j, v) in src_elems.into_iter().enumerate() {
-                            self.set_element_coerced(handle, offset + j, v);
-                        }
-                    }
-                    return Ok(Some(NanBox::undefined()));
-                }
-                // `subarray(begin, end)` — a new typed array of the same kind that is
-                // a live *view* sharing the parent's backing bytes, at the parent's
-                // byte offset plus `begin * BYTES_PER_ELEMENT`.
-                "subarray" if self.realm.typed_kind(handle).is_some() => {
-                    let len = elems.len() as i64;
-                    let norm = |v: NanBox, default: i64, this: &mut Self| -> usize {
-                        if matches!(v.unpack(), Unpacked::Undefined) {
-                            return default as usize;
-                        }
-                        let n = this.realm.to_number(v) as i64;
-                        usize::try_from(if n < 0 { (len + n).max(0) } else { n.min(len) })
-                            .unwrap_or(0)
-                    };
-                    let start = norm(arg(0), 0, self);
-                    let end = norm(arg(1), len, self).max(start);
-                    let kind = self.realm.typed_kind(handle).unwrap_or(0);
-                    let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
-                    let bytes_h = self.realm.typed_buffer(handle).unwrap();
-                    // subarray shares the parent's `[[ViewedArrayBuffer]]` object so
-                    // `sub.buffer === parent.buffer` (SameValue).
-                    let abuf = self.realm.typed_array_object(handle).unwrap();
-                    let parent_off = self.realm.typed_byte_offset(handle).unwrap_or(0);
-                    let sub_off = parent_off + start * elem_size;
-                    let view =
-                        self.realm
-                            .new_typed_array(bytes_h, abuf, sub_off, end - start, kind);
-                    return Ok(Some(NanBox::handle(view.to_raw())));
-                }
+                // `fill(value, start?, end?)` — mutate a plain array in place,
+                // return it. `start`/`end` default to `0`/`len`; negatives count
+                // from the end. (Typed-array views are handled by the bulk fast
+                // path above and never reach here.)
                 "fill" => {
                     let len = elems.len();
                     let value = arg(0);
@@ -15581,19 +15644,51 @@ fn unit_symbol(unit: &str) -> &str {
 
 /// Little-endian encode of one already-coerced typed-array element value of `kind`
 /// (index into [`TYPED_ARRAY_KINDS`]) — the inverse of [`decode_typed_element`].
-pub(crate) fn encode_typed_element(kind: u8, v: f64) -> alloc::vec::Vec<u8> {
-    match kind {
-        0 => alloc::vec![(v as i64 as i8) as u8],      // Int8
-        1 => alloc::vec![v as i64 as u8],              // Uint8
-        2 => alloc::vec![v.clamp(0.0, 255.0) as u8],   // Uint8Clamped (already integral)
-        3 => (v as i64 as i16).to_le_bytes().to_vec(), // Int16
-        4 => (v as i64 as u16).to_le_bytes().to_vec(), // Uint16
-        5 => (v as i64 as i32).to_le_bytes().to_vec(), // Int32
-        6 => (v as i64 as u32).to_le_bytes().to_vec(), // Uint32
-        7 => (v as f32).to_le_bytes().to_vec(),        // Float32
-        8 => v.to_le_bytes().to_vec(),                 // Float64
-        _ => alloc::vec::Vec::new(),
-    }
+/// Writes into a fixed `[u8; 8]` (no per-element heap allocation) and returns the
+/// buffer alongside the number of bytes actually written (`0` for an unknown kind).
+/// Callers use `&buf[..n]` as the encoded element.
+pub(crate) fn encode_typed_element(kind: u8, v: f64) -> ([u8; 8], usize) {
+    let mut out = [0u8; 8];
+    let n = match kind {
+        0 => {
+            out[0] = (v as i64 as i8) as u8; // Int8
+            1
+        }
+        1 => {
+            out[0] = v as i64 as u8; // Uint8
+            1
+        }
+        2 => {
+            out[0] = v.clamp(0.0, 255.0) as u8; // Uint8Clamped (already integral)
+            1
+        }
+        3 => {
+            out[..2].copy_from_slice(&(v as i64 as i16).to_le_bytes()); // Int16
+            2
+        }
+        4 => {
+            out[..2].copy_from_slice(&(v as i64 as u16).to_le_bytes()); // Uint16
+            2
+        }
+        5 => {
+            out[..4].copy_from_slice(&(v as i64 as i32).to_le_bytes()); // Int32
+            4
+        }
+        6 => {
+            out[..4].copy_from_slice(&(v as i64 as u32).to_le_bytes()); // Uint32
+            4
+        }
+        7 => {
+            out[..4].copy_from_slice(&(v as f32).to_le_bytes()); // Float32
+            4
+        }
+        8 => {
+            out.copy_from_slice(&v.to_le_bytes()); // Float64
+            8
+        }
+        _ => 0,
+    };
+    (out, n)
 }
 
 /// Little-endian decode of one typed-array element of `kind` (index into
