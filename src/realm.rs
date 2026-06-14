@@ -247,6 +247,17 @@ impl Realm {
         Some(self.heap.get(handle)?.as_str()?.materialize_bytes())
     }
 
+    /// Borrows the WTF-8 bytes of the string at `handle` *without allocating* when
+    /// it is an unconcatenated rope leaf (the common case), or `None` when the cell
+    /// is not a string or the rope is a `Concat` tree (use [`Realm::string_bytes`]
+    /// then). Read-only hot paths (equality, ordering, emptiness) take this fast
+    /// path to avoid the owned `Vec` and lossy decode that the `String`-typed
+    /// accessors incur.
+    #[must_use]
+    pub fn string_leaf_bytes(&self, handle: Handle) -> Option<&[u8]> {
+        self.heap.get(handle)?.as_str()?.as_leaf_bytes()
+    }
+
     /// Allocates a contiguous byte store (the backing of an `ArrayBuffer`) from
     /// engine-owned bytes and returns its handle.
     pub fn new_bytes(&mut self, data: alloc::vec::Vec<u8>) -> Handle {

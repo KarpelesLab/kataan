@@ -134,6 +134,20 @@ impl Rope {
         self.concat(&Rope::leaf(s))
     }
 
+    /// Borrows the rope's WTF-8 bytes directly when it is a single, unconcatenated
+    /// `Leaf` (the common case — a string that has never been `+`-joined), returning
+    /// `None` for a `Concat` tree. This is a zero-copy fast path: callers that only
+    /// *read* the bytes (equality, ordering, emptiness) avoid the owned `Vec` that
+    /// [`Rope::materialize_bytes`] allocates. Fall back to `materialize_bytes` when
+    /// this returns `None`.
+    #[must_use]
+    pub fn as_leaf_bytes(&self) -> Option<&[u8]> {
+        match &*self.0 {
+            Node::Leaf(s) => Some(s),
+            Node::Concat { .. } => None,
+        }
+    }
+
     /// Materializes the rope into a flat WTF-8 byte buffer in O(n), iteratively
     /// (so a deeply nested rope cannot overflow the stack). This is the
     /// lossless form — lone surrogates are preserved. Callers wanting a real
@@ -363,6 +377,22 @@ mod tests {
             Rope::from_bytes(&bytes).materialize_bytes(),
             Rope::from_wtf8(bytes.clone()).materialize_bytes()
         );
+    }
+
+    #[test]
+    fn as_leaf_bytes_borrows_unconcatenated_leaf() {
+        // A plain leaf exposes its bytes zero-copy.
+        let leaf = Rope::leaf("hello");
+        assert_eq!(leaf.as_leaf_bytes(), Some(&b"hello"[..]));
+        // A surrogate-bearing leaf is exposed losslessly.
+        let bytes = crate::wtf8::from_utf16(&[0xD800]);
+        let surr = Rope::from_wtf8(bytes.clone());
+        assert_eq!(surr.as_leaf_bytes(), Some(&bytes[..]));
+        // A concatenation has no single backing slice.
+        let joined = Rope::leaf("foo").concat(&Rope::leaf("bar"));
+        assert_eq!(joined.as_leaf_bytes(), None);
+        // …but its materialized bytes still agree with the borrow-or-copy path.
+        assert_eq!(joined.materialize_bytes(), b"foobar");
     }
 
     #[test]
