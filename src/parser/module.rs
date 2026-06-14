@@ -189,7 +189,7 @@ impl<'src> Parser<'src> {
     /// A module specifier string literal (e.g. `"./mod.js"`).
     fn parse_module_specifier(&mut self) -> Result<Box<str>> {
         let tok = self.expect(TokenKind::String)?;
-        Ok(cook::string(tok.text(self.source), tok.span)?.into())
+        Ok(cook::string_key(tok.text(self.source), tok.span)?.into())
     }
 
     /// An import/export name — an identifier name or a string literal.
@@ -199,7 +199,7 @@ impl<'src> Parser<'src> {
             TokenKind::String => {
                 self.bump();
                 Ok(ModuleExportName::Str(
-                    cook::string(tok.text(self.source), tok.span)?.into(),
+                    cook::string_key(tok.text(self.source), tok.span)?.into(),
                 ))
             }
             TokenKind::Identifier => {

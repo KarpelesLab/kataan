@@ -8,7 +8,9 @@
 
 use crate::common::Span;
 use crate::error::{Error, Result};
+use crate::wtf8;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Decodes a numeric-literal token's text into an `f64`.
 ///
@@ -83,45 +85,56 @@ pub(super) fn bigint(text: &str) -> String {
 }
 
 /// Decodes a string-literal token (including its surrounding quotes) into its
-/// runtime value.
-pub(super) fn string(raw: &str, span: Span) -> Result<String> {
+/// runtime value — WTF-8 bytes preserving any lone UTF-16 surrogates.
+pub(super) fn string(raw: &str, span: Span) -> Result<Vec<u8>> {
     // The first and last bytes are the ASCII quote characters.
     let inner = &raw[1..raw.len() - 1];
     decode_escapes(inner, span)
 }
 
+/// Decodes a string-literal token used as a **property key**, returning a
+/// `String`. Property keys are stored in the `&str`-keyed object/shape layer, so
+/// a lone surrogate in a key is decoded lossily (→ U+FFFD); a non-surrogate key
+/// — the overwhelmingly common case — is unchanged. (Surrogate-correct *string
+/// values* go through [`string`], which keeps the WTF-8 bytes.)
+pub(super) fn string_key(raw: &str, span: Span) -> Result<String> {
+    Ok(wtf8::to_string_lossy(&string(raw, span)?))
+}
+
 /// Decodes the escape sequences in a string or template-cooked segment.
 ///
-/// `body` is the text *between* the delimiters. Returns the cooked value.
+/// `body` is the text *between* the delimiters. Returns the cooked value as
+/// **WTF-8 bytes**.
 ///
-/// Lone UTF-16 surrogates (which JS strings can legally contain but Rust's
-/// `String` cannot) are decoded to U+FFFD for now; the engine's eventual
-/// WTF-16-capable string type will preserve them. This only affects string
-/// literals that deliberately encode unpaired surrogates via `\u`.
-pub(super) fn decode_escapes(body: &str, span: Span) -> Result<String> {
-    let mut out = String::with_capacity(body.len());
+/// Lone UTF-16 surrogates (which a JS DOMString can legally contain but Rust's
+/// `String` cannot) are preserved as WTF-8 surrogate code points (via
+/// [`wtf8::encode_utf16_unit`]); an adjacent `\u` high+low pair is combined into
+/// the astral scalar it denotes. A string with no surrogates is byte-identical
+/// to its UTF-8, so the common case is unchanged.
+pub(super) fn decode_escapes(body: &str, span: Span) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(body.len());
     let mut chars = body.chars().peekable();
 
     while let Some(c) = chars.next() {
         if c != '\\' {
-            out.push(c);
+            push_char(&mut out, c);
             continue;
         }
         let Some(esc) = chars.next() else {
             return Err(Error::syntax("unterminated escape sequence", span));
         };
         match esc {
-            'n' => out.push('\n'),
-            't' => out.push('\t'),
-            'r' => out.push('\r'),
-            'b' => out.push('\u{08}'),
-            'f' => out.push('\u{0C}'),
-            'v' => out.push('\u{0B}'),
-            '0' if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => out.push('\0'),
+            'n' => out.push(b'\n'),
+            't' => out.push(b'\t'),
+            'r' => out.push(b'\r'),
+            'b' => out.push(0x08),
+            'f' => out.push(0x0C),
+            'v' => out.push(0x0B),
+            '0' if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => out.push(0),
             'x' => {
                 let hi = hex_digit(chars.next(), span)?;
                 let lo = hex_digit(chars.next(), span)?;
-                out.push(char::from(hi * 16 + lo));
+                push_char(&mut out, char::from(hi * 16 + lo));
             }
             'u' => decode_unicode_escape(&mut chars, &mut out, span)?,
             // Line continuation: a backslash before a line terminator is elided.
@@ -133,18 +146,27 @@ pub(super) fn decode_escapes(body: &str, span: Span) -> Result<String> {
             }
             // Any other escaped character stands for itself (covers `\\`, `\'`,
             // `\"`, `` \` ``, `\$`, `\/`, and the identity escapes).
-            other => out.push(other),
+            other => push_char(&mut out, other),
         }
     }
     Ok(out)
 }
 
+/// Appends a scalar `char`'s UTF-8 bytes to `out`. (A `char` is never a
+/// surrogate, so this is plain UTF-8; surrogates only enter via `\u` escapes,
+/// handled by [`decode_unicode_escape`].)
+fn push_char(out: &mut Vec<u8>, c: char) {
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+}
+
 /// Decodes a `\u` escape body — either `\uXXXX` (already past the `u`) or
-/// `\u{ … }` — appending the result to `out`. Handles `\uXXXX\uXXXX` surrogate
-/// pairs.
+/// `\u{ … }` — appending the result to `out` as WTF-8 bytes. Handles
+/// `\uXXXX\uXXXX` surrogate pairs (combined into one astral scalar) and
+/// preserves a lone surrogate as a surrogate code point.
 fn decode_unicode_escape(
     chars: &mut core::iter::Peekable<core::str::Chars<'_>>,
-    out: &mut String,
+    out: &mut Vec<u8>,
     span: Span,
 ) -> Result<()> {
     if chars.peek() == Some(&'{') {
@@ -163,7 +185,8 @@ fn decode_unicode_escape(
         if value > 0x10_FFFF {
             return Err(Error::syntax("invalid escape sequence", span));
         }
-        out.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
+        // `\u{D800}` is a lone surrogate code point — preserved, not replaced.
+        wtf8::encode_code_point(value, out);
         return Ok(());
     }
 
@@ -176,12 +199,13 @@ fn decode_unicode_escape(
             if (0xDC00..=0xDFFF).contains(&lo) {
                 *chars = clone;
                 let cp = 0x10000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
-                out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                wtf8::encode_code_point(cp, out);
                 return Ok(());
             }
         }
     }
-    out.push(char::from_u32(u32::from(hi)).unwrap_or('\u{FFFD}'));
+    // A BMP scalar, or a lone surrogate kept as a surrogate code point.
+    wtf8::encode_utf16_unit(hi, out);
     Ok(())
 }
 
@@ -240,15 +264,46 @@ mod tests {
 
     #[test]
     fn string_escapes() {
-        assert_eq!(string(r#""hello""#, sp()).unwrap(), "hello");
-        assert_eq!(string(r#""a\tb\nc""#, sp()).unwrap(), "a\tb\nc");
-        assert_eq!(string(r#""\x41\x42""#, sp()).unwrap(), "AB");
-        assert_eq!(string(r#""A""#, sp()).unwrap(), "A");
-        assert_eq!(string(r#""\u{1F600}""#, sp()).unwrap(), "\u{1F600}");
-        assert_eq!(string(r"'it\'s'", sp()).unwrap(), "it's");
+        // Cooked values are WTF-8 bytes; a non-surrogate string is byte-identical
+        // to its UTF-8.
+        assert_eq!(string(r#""hello""#, sp()).unwrap(), b"hello");
+        assert_eq!(string(r#""a\tb\nc""#, sp()).unwrap(), b"a\tb\nc");
+        assert_eq!(string(r#""\x41\x42""#, sp()).unwrap(), b"AB");
+        assert_eq!(string(r#""A""#, sp()).unwrap(), b"A");
+        assert_eq!(
+            string(r#""\u{1F600}""#, sp()).unwrap(),
+            "\u{1F600}".as_bytes()
+        );
+        assert_eq!(string(r"'it\'s'", sp()).unwrap(), b"it's");
         // Surrogate pair for U+1F600.
-        assert_eq!(string(r#""😀""#, sp()).unwrap(), "\u{1F600}");
+        assert_eq!(string(r#""😀""#, sp()).unwrap(), "\u{1F600}".as_bytes());
         // Line continuation.
-        assert_eq!(string("\"a\\\nb\"", sp()).unwrap(), "ab");
+        assert_eq!(string("\"a\\\nb\"", sp()).unwrap(), b"ab");
+    }
+
+    #[test]
+    fn lone_surrogates_preserved() {
+        // A lone high surrogate via `\uXXXX` is kept as a WTF-8 surrogate code
+        // point (3 bytes ED A0 80), not collapsed to U+FFFD.
+        assert_eq!(
+            string(r#""\uD800""#, sp()).unwrap(),
+            wtf8::from_utf16(&[0xD800])
+        );
+        // `\u{D800}` (brace form) likewise.
+        assert_eq!(
+            string(r#""\u{D800}""#, sp()).unwrap(),
+            wtf8::from_utf16(&[0xD800])
+        );
+        // A lone low surrogate.
+        assert_eq!(
+            string(r#""\uDC00""#, sp()).unwrap(),
+            wtf8::from_utf16(&[0xDC00])
+        );
+        // High + low across two escapes pair into the astral scalar.
+        assert_eq!(string(r#""😀""#, sp()).unwrap(), "😀".as_bytes());
+        // A high surrogate followed by a non-low stays lone, then the next char.
+        let mut expected = wtf8::from_utf16(&[0xD800]);
+        expected.push(b'x');
+        assert_eq!(string(r#""\uD800x""#, sp()).unwrap(), expected);
     }
 }

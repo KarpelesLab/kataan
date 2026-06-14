@@ -195,7 +195,7 @@ impl<'src> Parser<'src> {
             TokenKind::String => {
                 self.bump();
                 Ok(PropertyKey::Str(
-                    cook::string(tok.text(self.source), tok.span)?.into(),
+                    cook::string_key(tok.text(self.source), tok.span)?.into(),
                 ))
             }
             TokenKind::Number => {

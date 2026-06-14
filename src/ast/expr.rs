@@ -23,8 +23,11 @@ pub enum Expr {
     /// (separators and the `n` suffix removed, any radix prefix retained) until
     /// the bignum runtime type exists to hold it.
     BigInt { digits: Box<str>, span: Span },
-    /// A string literal with escapes decoded.
-    Str { value: Box<str>, span: Span },
+    /// A string literal with escapes decoded, stored as **WTF-8 bytes** so a
+    /// lone UTF-16 surrogate (`"\uD800"`) round-trips losslessly (DOMString
+    /// semantics — see [`crate::wtf8`]). A literal with no surrogates is
+    /// byte-identical to its UTF-8.
+    Str { value: Box<[u8]>, span: Span },
     /// A regular-expression literal `/pattern/flags` (kept as source text; the
     /// pattern is compiled by the regex engine, not here).
     Regex {
@@ -310,9 +313,10 @@ pub struct TemplateElement {
     /// The raw source text of the segment (escapes *not* decoded), as exposed
     /// to tag functions via `String.raw`.
     pub raw: Box<str>,
-    /// The cooked text (escapes decoded). `None` if the segment contains an
-    /// invalid escape sequence (legal only in tagged templates).
-    pub cooked: Option<Box<str>>,
+    /// The cooked text (escapes decoded), as **WTF-8 bytes** so a lone UTF-16
+    /// surrogate survives (see [`crate::wtf8`]). `None` if the segment contains
+    /// an invalid escape sequence (legal only in tagged templates).
+    pub cooked: Option<Box<[u8]>>,
     /// The span of the segment, excluding the delimiters.
     pub span: Span,
 }

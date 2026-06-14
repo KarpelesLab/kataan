@@ -333,7 +333,7 @@ impl<'src> Parser<'src> {
         if matches!(tok.kind, TokenKind::String | TokenKind::Number) {
             self.bump();
             let key = if tok.kind == TokenKind::String {
-                PropertyKey::Str(cook::string(tok.text(self.source), tok.span)?.into())
+                PropertyKey::Str(cook::string_key(tok.text(self.source), tok.span)?.into())
             } else {
                 PropertyKey::Number(cook::number(tok.text(self.source)))
             };

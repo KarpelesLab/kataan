@@ -88,7 +88,7 @@ fn sexpr(e: &Expr) -> String {
         Expr::Bool { value, .. } => format!("{value}"),
         Expr::Number { value, .. } => format!("{value}"),
         Expr::BigInt { digits, .. } => format!("{digits}n"),
-        Expr::Str { value, .. } => format!("{value:?}"),
+        Expr::Str { value, .. } => format!("{:?}", crate::wtf8::to_string_lossy(value)),
         Expr::Regex { pattern, flags, .. } => format!("/{pattern}/{flags}"),
         Expr::Ident(id) => id.name.clone().into_string(),
         Expr::PrivateName(name, _) => format!("#{name}"),
@@ -328,7 +328,10 @@ fn sexpr_template(t: &TemplateLiteral) -> String {
     use alloc::format;
     let mut parts = Vec::new();
     for (i, q) in t.quasis.iter().enumerate() {
-        let cooked = q.cooked.as_deref().unwrap_or("<bad>");
+        let cooked = q
+            .cooked
+            .as_deref()
+            .map_or_else(|| String::from("<bad>"), crate::wtf8::to_string_lossy);
         parts.push(format!("{cooked:?}"));
         if let Some(e) = t.expressions.get(i) {
             parts.push(format!("${{{}}}", sexpr(e)));
