@@ -15708,6 +15708,33 @@ mod tests {
         interp.realm().to_display_string(value)
     }
 
+    #[test]
+    fn limits_override_changes_runtime_caps() {
+        use crate::limits::Limits;
+        // A lowered `max_string_len` rejects a concatenation the default accepts,
+        // proving the cap is read live from `realm.limits` rather than a constant.
+        let src = "'abcde'.repeat(3)"; // 15 chars
+        assert_eq!(eval_source(src).expect("default ok").1, "abcdeabcdeabcde");
+        let low = Limits {
+            max_string_len: 10,
+            ..Limits::default()
+        };
+        let err = eval_source_with_limits(src, low).expect_err("should exceed length");
+        assert!(err.contains("Invalid string length"), "unexpected: {err}");
+
+        // A low object→dictionary threshold forces the conversion early yet keeps
+        // correct property semantics (count, values, insertion order preserved).
+        let dict = Limits {
+            object_dictionary_threshold: 4,
+            ..Limits::default()
+        };
+        let keys_src = "let o={}; for(let i=0;i<10;i++) o['k'+i]=i; [Object.keys(o).length, o.k0, o.k9, Object.keys(o)[0]].join(',')";
+        assert_eq!(
+            eval_source_with_limits(keys_src, dict).expect("dict ok").1,
+            "10,0,9,k0"
+        );
+    }
+
     /// Runs `src` and returns its captured `console` output.
     fn out(src: &str) -> String {
         let program = Parser::parse_program(src).expect("parse");
