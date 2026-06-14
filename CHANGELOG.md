@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/KarpelesLab/kataan/compare/v0.0.2...v0.0.3) - 2026-06-14
+
+### Added
+
+- *(strings)* B5 — surrogate-aware case + normalize ([#12](https://github.com/KarpelesLab/kataan/pull/12))
+- *(strings)* B4 — wire regex builtins to the UTF-16 code-unit engine ([#12](https://github.com/KarpelesLab/kataan/pull/12))
+- *(strings)* B2/B3 — surrogate-correct string evaluation and UTF-16 ops
+- *(strings)* B2 — carry string-literal cooked values as WTF-8 bytes
+- *(ffi)* embedder buffer-creation API — owned + external (A6, #11)
+- *(wasm)* WebAssembly.Memory shares one byte store with JS (A5, #11)
+- *(wtf8)* WTF-8 string-storage foundation (B1)
+- *(cell)* add Cell::Bytes byte store + TypedArray view variant (A1)
+
+### Fixed
+
+- *(typedarrays)* stable/shared .buffer object + restore wasm_bytes over byte stores
+
+### Other
+
+- *(regex)* fix broken intra-doc links in module docs
+- *(regex)* match over UTF-16 code units with JS u-flag semantics [B4-engine]
+- *(wtf8)* fix broken intra-doc links in rope/atom/wtf8 module docs
+- *(typedarrays)* real byte-backed ArrayBuffer/TypedArray/DataView (A2/A3/A4)
+
 ## [0.0.2](https://github.com/KarpelesLab/kataan/compare/v0.0.1...v0.0.2) - 2026-06-14
 
 ### Added
