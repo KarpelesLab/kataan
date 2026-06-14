@@ -2521,6 +2521,14 @@ fn builtin_method(
 
     // --- array methods ---
     if ctx.realm.is_array(h) {
+        // `elems` snapshots (clones) the backing store. It is used only by the
+        // callback-taking methods (`map`/`filter`/`forEach`/`reduce`/`find`/
+        // `some`/`every`) and the array-building ones (`concat`/`reverse`): a
+        // user callback can re-enter and mutate `h` mid-iteration, so iterating a
+        // live borrow would be both a borrow-checker conflict and a re-entrancy
+        // hazard. The pure scans below (`join`/`includes`/`indexOf`) take no
+        // callback, so they iterate a borrowed `array_elements(h)` directly and
+        // skip the clone (M4).
         let elems = |ctx: &Ctx| {
             ctx.realm
                 .array_elements(h)
@@ -2543,31 +2551,46 @@ fn builtin_method(
                 } else {
                     ctx.realm.to_display_string(arg0())
                 };
-                let parts: Vec<String> = elems(ctx)
-                    .iter()
-                    .map(|e| match e.unpack() {
-                        Unpacked::Undefined | Unpacked::Null => String::new(),
-                        // A direct self-reference renders empty (no recursion).
-                        Unpacked::Handle(raw) if raw == h.to_raw() => String::new(),
-                        _ => ctx.realm.to_display_string(*e),
+                // Pure scan, no callback: borrow the backing store (M4). Both
+                // `array_elements` and `to_display_string` take `&self`, so the
+                // shared borrow held across the map is sound.
+                let parts: Vec<String> = ctx
+                    .realm
+                    .array_elements(h)
+                    .map(|elems| {
+                        elems
+                            .iter()
+                            .map(|e| match e.unpack() {
+                                Unpacked::Undefined | Unpacked::Null => String::new(),
+                                // A direct self-reference renders empty (no recursion).
+                                Unpacked::Handle(raw) if raw == h.to_raw() => String::new(),
+                                _ => ctx.realm.to_display_string(*e),
+                            })
+                            .collect()
                     })
-                    .collect();
+                    .unwrap_or_default();
                 NanBox::handle(ctx.realm.new_string(&parts.join(&sep)).to_raw())
             }
             "includes" => {
                 let t = arg0();
                 // SameValueZero: like `===` but `NaN` matches `NaN`.
                 let t_nan = t.as_number().is_some_and(f64::is_nan);
-                NanBox::boolean(elems(ctx).iter().any(|e| {
-                    ctx.realm.strict_equals(*e, t)
-                        || (t_nan && e.as_number().is_some_and(f64::is_nan))
-                }))
+                // Pure scan, no callback: borrow the backing store (M4).
+                let found = ctx.realm.array_elements(h).is_some_and(|elems| {
+                    elems.iter().any(|e| {
+                        ctx.realm.strict_equals(*e, t)
+                            || (t_nan && e.as_number().is_some_and(f64::is_nan))
+                    })
+                });
+                NanBox::boolean(found)
             }
             "indexOf" => {
                 let t = arg0();
-                let i = elems(ctx)
-                    .iter()
-                    .position(|e| ctx.realm.strict_equals(*e, t));
+                // Pure scan, no callback: borrow the backing store (M4).
+                let i = ctx
+                    .realm
+                    .array_elements(h)
+                    .and_then(|elems| elems.iter().position(|e| ctx.realm.strict_equals(*e, t)));
                 NanBox::number(i.map_or(-1.0, |i| i as f64))
             }
             "map" => {
@@ -8598,5 +8621,86 @@ mod tests {
         ];
         let mut realm = Realm::new();
         assert_eq!(run(&mut realm, &prog, 2), Err(VmError::NotANumber));
+    }
+
+    // --- H2: property-access fast path must preserve exact semantics ---
+
+    #[test]
+    fn getter_takes_precedence_over_data_read() {
+        // A getter accessor is consulted instead of any data slot: the GetProp
+        // fast path must still reach the `accessor` branch before `get_property`.
+        // (Accessor closures that capture outer scope, and setter traps, are a
+        // separate pre-existing limitation of this minimal `compile_and_run`
+        // path — their full semantics are covered by the conformance/test262
+        // suites that exercise the complete object model.)
+        assert_eq!(bc("let o = { get x() { return 42; } }; o.x"), "42");
+        // A getter co-existing with other plain data properties still wins for its
+        // own key and leaves the data reads untouched.
+        assert_eq!(
+            bc("let o = { a: 1, get x() { return 9; }, b: 2 }; o.a + o.x + o.b"),
+            "12"
+        );
+    }
+
+    #[test]
+    fn plain_data_property_read_and_write_unchanged() {
+        // The common case the fast path targets: a plain data property round-trips
+        // unchanged, and a missing property reads `undefined`.
+        assert_eq!(bc("let o = { a: 1 }; o.b = 2; o.a + o.b"), "3");
+        assert_eq!(bc("let o = { a: 1 }; o.missing"), "undefined");
+    }
+
+    #[test]
+    fn special_keys_still_resolve_after_fast_path() {
+        // `name` on a function, and `__proto__`/regexp members must still take
+        // their special paths rather than reading a plain data slot.
+        assert_eq!(bc("function foo() {} foo.name"), "foo");
+        assert_eq!(bc("let r = /ab+c/gi; r.source"), "ab+c");
+        assert_eq!(bc("let r = /ab+c/gi; r.flags"), "gi");
+        assert_eq!(bc("let r = /ab+c/gi; r.global"), "true");
+        assert_eq!(bc("let r = /x/; r.global"), "false");
+    }
+
+    #[test]
+    fn regexp_last_index_round_trips() {
+        // `lastIndex` is a stateful regexp member on both read and write — its
+        // SetProp branch (key-gated `regexp_at`) and the GetProp regexp branch
+        // must still fire after the fast-path reorder.
+        assert_eq!(bc("let r = /x/g; r.lastIndex = 5; r.lastIndex"), "5");
+    }
+
+    // --- M4: read-only array builtins borrow rather than clone ---
+
+    #[test]
+    fn array_pure_scans_correct() {
+        assert_eq!(bc("[1,2,3].includes(2)"), "true");
+        assert_eq!(bc("[1,2,3].includes(9)"), "false");
+        assert_eq!(bc("[NaN].includes(NaN)"), "true");
+        assert_eq!(bc("[1,2,3,2].indexOf(2)"), "1");
+        assert_eq!(bc("[1,2,3].indexOf(9)"), "-1");
+        assert_eq!(bc("[1,2,3].join('-')"), "1-2-3");
+        assert_eq!(bc("[1,null,3].join(',')"), "1,,3");
+        // A self-referential element renders empty (no recursion / no panic).
+        assert_eq!(bc("let a = [1]; a.push(a); a.join('|')"), "1|");
+    }
+
+    #[test]
+    fn foreach_callback_mutating_array_is_safe() {
+        // The callback methods snapshot the backing store, so a callback that
+        // mutates the array mid-iteration cannot corrupt the iteration or panic.
+        // forEach iterates the original three elements even though each call
+        // appends a new one.
+        assert_eq!(
+            bc("let a = [1,2,3]; let sum = 0; \
+                a.forEach(function(x) { sum = sum + x; a.push(99); }); \
+                sum + ':' + a.length"),
+            "6:6"
+        );
+        // A callback that truncates the array must not read freed memory.
+        assert_eq!(
+            bc("let a = [1,2,3]; let n = 0; \
+                a.forEach(function(x) { n = n + 1; a.pop(); }); n"),
+            "3"
+        );
     }
 }
