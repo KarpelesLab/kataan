@@ -202,6 +202,92 @@ fn compile_blowup_rejected() {
     assert!(Regex::new("a{2,4}", "").is_ok());
 }
 
+// --- UTF-16 code-unit API (`*_in_u16`) ---
+
+/// Encodes a `&str` to UTF-16 code units for the u16 entry points.
+fn u16s(s: &str) -> alloc::vec::Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+#[test]
+fn u16_dot_non_unicode_matches_one_code_unit() {
+    // "😀" is U+1F600 → two code units. Without `u`, `.` matches one code unit,
+    // so the first match is length 1 and there are two matches over the string.
+    let units = u16s("😀");
+    assert_eq!(units.len(), 2);
+    let r = re(".", "");
+    let m1 = r.find_in_u16(&units, 0).unwrap();
+    assert_eq!(m1, (0, 1));
+    let m2 = r.find_in_u16(&units, 1).unwrap();
+    assert_eq!(m2, (1, 2));
+    assert!(r.find_in_u16(&units, 2).is_none());
+}
+
+#[test]
+fn u16_dot_unicode_matches_astral_as_one() {
+    // With `u`, `.` matches the whole astral character (a surrogate pair) as one
+    // code point, but the reported span is in code-unit indices (0..2).
+    let units = u16s("😀");
+    let r = re(".", "u");
+    let m = r.find_in_u16(&units, 0).unwrap();
+    assert_eq!(m, (0, 2));
+    // Only one match: after consuming both units we're at the end.
+    assert!(r.find_in_u16(&units, 2).is_none());
+}
+
+#[test]
+fn u16_lone_surrogate_matches() {
+    // A lone high surrogate (0xD83D) is a matchable code unit in both modes.
+    let units: alloc::vec::Vec<u16> = alloc::vec![0xD83D];
+    assert_eq!(re(".", "").find_in_u16(&units, 0), Some((0, 1)));
+    assert_eq!(re(".", "u").find_in_u16(&units, 0), Some((0, 1)));
+    // A class can match the specific lone surrogate via a `\u` escape.
+    let r = re(r"\uD83D", "");
+    assert_eq!(r.find_in_u16(&units, 0), Some((0, 1)));
+}
+
+#[test]
+fn u16_unicode_escape_astral_in_u_mode() {
+    // `\u{1F600}` in `u` mode matches the astral character as one code point.
+    let units = u16s("😀");
+    let r = re(r"\u{1F600}", "u");
+    assert_eq!(r.find_in_u16(&units, 0), Some((0, 2)));
+    // The non-u engine matches it via the surrogate-pair code units too.
+    let r2 = re(r"\u{1F600}", "");
+    assert_eq!(r2.find_in_u16(&units, 0), Some((0, 2)));
+}
+
+#[test]
+fn u16_capture_indices_are_code_unit_based() {
+    // "x😀y" → units: x(1) hi(1) lo(1) y(1) = indices 0,1,2,3.
+    let units = u16s("x😀y");
+    assert_eq!(units.len(), 4);
+    // Capture the astral char in u mode; its span is code units 1..3.
+    let r = re(r"x(.)y", "u");
+    let caps = r.captures_in_u16(&units, 0).unwrap();
+    assert_eq!(caps.whole(), (0, 4));
+    assert_eq!(caps.group(1), Some((1, 3)));
+}
+
+#[test]
+fn u16_astral_quantifier_unicode() {
+    // `.+` in u mode over two astral chars consumes 4 code units.
+    let units = u16s("😀😁");
+    assert_eq!(units.len(), 4);
+    assert_eq!(re(".+", "u").find_in_u16(&units, 0), Some((0, 4)));
+    // Astral class range works in u mode.
+    let r = re(r"[\u{1F600}-\u{1F610}]+", "u");
+    assert_eq!(r.find_in_u16(&units, 0), Some((0, 4)));
+}
+
+#[test]
+fn u16_backtracking_bomb_terminates() {
+    // The step budget still bounds a catastrophic pattern over the u16 API.
+    let subject: alloc::string::String = "a".repeat(40) + "!";
+    let units = u16s(&subject);
+    assert!(re("(a+)+$", "").find_in_u16(&units, 0).is_none());
+}
+
 #[test]
 fn parser_deep_nesting_rejected() {
     let pat: alloc::string::String = "(".repeat(100_000) + "a" + &")".repeat(100_000);

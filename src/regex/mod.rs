@@ -20,8 +20,25 @@
 //! General-category matching is exact when the `intl` feature is on (it consults
 //! the Unicode tables); without it, the common groups and cased/letter/number
 //! subcategories fall back to `char`-method approximations and the finer
-//! categories match nothing. The `u`-flag's code-point (vs code-unit) semantics
-//! are not yet modeled — that lands with full UTF-16 storage (see `ROADMAP.md`).
+//! categories match nothing.
+//!
+//! # Subject model
+//!
+//! The matching core ([`vm`]) operates on a subject of **UTF-16 code units**
+//! (`&[u16]`), so positions are code-unit indices and a lone surrogate is a
+//! matchable unit — this is JavaScript string semantics. The `u` (unicode) flag
+//! selects code-*point* operation (a surrogate pair is one character, `.` and
+//! classes span the whole astral character, `\u{…}` ranges work) while still
+//! reporting code-unit indices. The new public entry points
+//! [`captures_in_u16`](Regex::captures_in_u16) /
+//! [`find_in_u16`](Regex::find_in_u16) take and return code-unit positions.
+//!
+//! The historical `&str` / `&[char]` entry points
+//! ([`is_match`](Regex::is_match), [`captures_from`](Regex::captures_from),
+//! [`captures_in`](Regex::captures_in), …) are preserved as thin **adapters**:
+//! they encode the input to UTF-16, run the u16 core, and translate the returned
+//! unit indices back to scalar (`char`) indices, so their observable behavior is
+//! exactly as before. New callers should migrate to the u16 API.
 
 mod compile;
 mod parser;
@@ -37,7 +54,16 @@ pub use parser::RegexError;
 
 /// A compiled regular expression.
 pub struct Regex {
+    /// The program for the native UTF-16 entry points, compiled per `flags`
+    /// (astral literals split into surrogate units when the `u` flag is off).
     prog: Vec<vm::Inst>,
+    /// A program for the legacy `&str`/`&[char]` adapters, always compiled in
+    /// code-point (unicode) mode so each Unicode scalar is one atom — exactly the
+    /// pre-UTF-16 behavior those adapters must preserve. Identical to `prog` when
+    /// the `u` flag is set, so it is only a distinct allocation for non-`u`
+    /// patterns. The adapters run it with code-point reads over the scalar
+    /// subject, so an astral `char` matches `.`/a literal atomically as before.
+    scalar_prog: Vec<vm::Inst>,
     /// Number of capturing groups (excluding the whole-match group 0).
     group_count: usize,
     /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -58,6 +84,10 @@ pub struct Flags {
     pub dotall: bool,
     /// `y` — sticky: a match must begin exactly at the start position.
     pub sticky: bool,
+    /// `u` — unicode: `.`/classes/quantifiers operate on code points (a surrogate
+    /// pair is one character) and astral `\u{…}`/ranges are honored. Positions
+    /// are still reported as code-unit indices.
+    pub unicode: bool,
 }
 
 impl Flags {
@@ -71,7 +101,8 @@ impl Flags {
                 'm' => f.multiline = true,
                 's' => f.dotall = true,
                 'y' => f.sticky = true,
-                'u' | 'd' => {} // accepted but not yet acted on
+                'u' => f.unicode = true,
+                'd' => {} // accepted but not yet acted on (hasIndices)
                 other => return Err(RegexError::new(alloc::format!("unknown flag `{other}`"))),
             }
         }
@@ -107,10 +138,24 @@ impl Regex {
     /// Compiles `pattern` with the given `flags` string.
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, RegexError> {
         let flags = Flags::parse(flags)?;
-        let (ast, _, group_names) = parser::parse(pattern)?;
-        let (prog, group_count) = compile::compile(&ast, &group_names)?;
+        // The native u16 program follows the `u` flag (splitting astral literals
+        // in non-`u` mode). The legacy adapters need scalar-atomic matching, which
+        // is exactly a unicode-mode compile, so parse/compile that variant too —
+        // reusing the native program when `u` is already set.
+        let (ast, _, group_names) = parser::parse(pattern, flags.unicode)?;
+        let (prog, group_count) = compile::compile(&ast, &group_names, flags.unicode)?;
+        let scalar_prog = if flags.unicode {
+            // Same compile; clone it for the adapter path.
+            let (sp, _) = compile::compile(&ast, &group_names, true)?;
+            sp
+        } else {
+            let (ast_u, _, gn_u) = parser::parse(pattern, true)?;
+            let (sp, _) = compile::compile(&ast_u, &gn_u, true)?;
+            sp
+        };
         Ok(Regex {
             prog,
+            scalar_prog,
             group_count,
             group_names,
             flags,
@@ -138,11 +183,12 @@ impl Regex {
     /// Whether the pattern matches anywhere in `text`.
     #[must_use]
     pub fn is_match(&self, text: &str) -> bool {
-        self.captures_at(&text.chars().collect::<Vec<_>>(), 0)
-            .is_some()
+        // Scalar-atomic path (legacy semantics), so an astral char is one atom.
+        self.captures_from(text, 0).is_some()
     }
 
-    /// The first match at or after `char` index `start`, with captures.
+    /// The first match at or after `char` index `start`, with captures (in `char`
+    /// indices).
     ///
     /// Collects `text` into a `Vec<char>` on every call. Callers that scan a
     /// subject repeatedly (match/matchAll/replace/split loops) must instead
@@ -175,29 +221,93 @@ impl Regex {
         self.captures_at(chars, start).map(|c| c.whole())
     }
 
+    // --- UTF-16 code-unit entry points (the native subject model) ---
+
+    /// The first match at or after code-unit index `start`, with captures
+    /// reported as **code-unit** spans. This is the engine's native entry point;
+    /// the `&str`/`&[char]` methods are adapters over it.
+    #[must_use]
+    pub fn captures_in_u16(&self, units: &[u16], start: usize) -> Option<Captures> {
+        self.captures_at_u16(units, start)
+    }
+
+    /// Like [`captures_in_u16`](Self::captures_in_u16) but returns only the whole
+    /// match span (code-unit indices).
+    #[must_use]
+    pub fn find_in_u16(&self, units: &[u16], start: usize) -> Option<(usize, usize)> {
+        self.captures_at_u16(units, start).map(|c| c.whole())
+    }
+
+    /// Runs the native u16 program, scanning forward from `start` (unless
+    /// sticky). All positions are code-unit indices and the `u` flag drives
+    /// code-point vs code-unit semantics.
+    fn captures_at_u16(&self, units: &[u16], start: usize) -> Option<Captures> {
+        self.scan(&self.prog, units, start, self.flags)
+    }
+
+    /// `&[char]` adapter: encodes the scalar subject to UTF-16, runs the
+    /// scalar-atomic program ([`scalar_prog`](Self::scalar_prog)) with code-point
+    /// reads so each Unicode scalar is one atom (preserving the pre-UTF-16
+    /// behavior), then translates the returned code-unit indices back to `char`
+    /// (scalar) indices. `start` and the returned spans are `char` offsets.
     fn captures_at(&self, chars: &[char], start: usize) -> Option<Captures> {
-        // A sticky (`y`) match must begin exactly at `start`; otherwise the
-        // engine scans forward for the first match at or after `start`.
-        let last = if self.flags.sticky {
-            start
-        } else {
-            chars.len()
+        // Build the UTF-16 subject plus a per-char unit offset table, so we can
+        // map unit indices back to char indices. `char_to_unit[i]` is the unit
+        // index where `chars[i]` begins; the final entry is the total unit len.
+        let mut units: Vec<u16> = Vec::with_capacity(chars.len());
+        let mut char_to_unit: Vec<usize> = Vec::with_capacity(chars.len() + 1);
+        let mut buf = [0u16; 2];
+        for &c in chars {
+            char_to_unit.push(units.len());
+            units.extend_from_slice(c.encode_utf16(&mut buf));
+        }
+        char_to_unit.push(units.len());
+        let unit_start = *char_to_unit.get(start).unwrap_or(&units.len());
+
+        // Run the scalar-atomic program with code-point reads (unicode = true),
+        // so an astral subject char is read as one code point and matched against
+        // the unsplit literal/`.`/class — exactly the legacy `&[char]` behavior.
+        let mut adapter_flags = self.flags;
+        adapter_flags.unicode = true;
+        let caps = self.scan(&self.scalar_prog, &units, unit_start, adapter_flags)?;
+
+        // Translate every span from unit indices back to char indices. A scalar
+        // subject only ever has matches on whole-char boundaries, so each unit
+        // index is the start of some char (binary search on the offset table).
+        let to_char = |u: usize| -> usize {
+            match char_to_unit.binary_search(&u) {
+                Ok(i) => i,
+                // Should not happen on a scalar subject, but stay total: round
+                // down to the enclosing char.
+                Err(i) => i.saturating_sub(1),
+            }
         };
-        // One step counter + budget for the *whole* scan: each start position
-        // draws from the same budget, so a catastrophic-backtracking pattern
-        // can't multiply its cost by trying every start independently (RE-8).
+        let groups = caps
+            .groups
+            .into_iter()
+            .map(|g| g.map(|(s, e)| (to_char(s), to_char(e))))
+            .collect();
+        Some(Captures { groups })
+    }
+
+    /// Scans `prog` forward from unit index `start` (honoring the sticky flag),
+    /// sharing one step budget across all start positions (RE-8). All positions
+    /// are code-unit indices. Used by both the native u16 path and the legacy
+    /// adapters (which differ only in which program and flags they pass).
+    fn scan(
+        &self,
+        prog: &[vm::Inst],
+        units: &[u16],
+        start: usize,
+        flags: Flags,
+    ) -> Option<Captures> {
+        let last = if flags.sticky { start } else { units.len() };
         let steps = core::cell::Cell::new(0u64);
-        let budget = vm::budget_for(chars.len());
+        let budget = vm::budget_for(units.len());
         for s in start..=last {
-            if let Some(groups) = vm::run_shared(
-                &self.prog,
-                chars,
-                s,
-                self.group_count,
-                self.flags,
-                &steps,
-                budget,
-            ) {
+            if let Some(groups) =
+                vm::run_shared(prog, units, s, self.group_count, flags, &steps, budget)
+            {
                 return Some(Captures { groups });
             }
         }

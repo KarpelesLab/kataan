@@ -17,11 +17,13 @@ const MAX_PROG_SIZE: usize = crate::limits::DEFAULT_REGEX_MAX_PROG_SIZE;
 pub(crate) fn compile(
     ast: &Node,
     group_names: &[(usize, alloc::string::String)],
+    unicode: bool,
 ) -> Result<(Vec<Inst>, usize), RegexError> {
     let mut c = Compiler {
         prog: Vec::new(),
         groups: 0,
         group_names,
+        unicode,
     };
     c.emit(Inst::Save(0));
     c.compile(ast)?;
@@ -35,6 +37,10 @@ struct Compiler<'a> {
     groups: usize,
     /// `(index, name)` of each named group, for resolving `\k<name>`.
     group_names: &'a [(usize, alloc::string::String)],
+    /// Whether the `u` flag is set. In non-`u` mode an astral literal compiles to
+    /// its two surrogate code units (each a one-unit `Char`); in `u` mode it
+    /// compiles to a single code-point `Char` that the VM matches as a pair.
+    unicode: bool,
 }
 
 impl Compiler<'_> {
@@ -60,7 +66,7 @@ impl Compiler<'_> {
         match node {
             Node::Empty => {}
             Node::Char(c) => {
-                self.emit(Inst::Char(*c));
+                self.emit_char(*c);
             }
             Node::Any => {
                 self.emit(Inst::Any);
@@ -79,11 +85,11 @@ impl Compiler<'_> {
                 }));
             }
             Node::Class { neg, items } => {
-                let class = Class {
-                    neg: *neg,
-                    members: items.iter().map(convert_item).collect(),
-                };
-                self.emit(Inst::Class(class));
+                let mut members = Vec::new();
+                for item in items {
+                    self.convert_item(item, &mut members);
+                }
+                self.emit(Inst::Class(Class { neg: *neg, members }));
             }
             Node::Concat(nodes) => {
                 for n in nodes {
@@ -114,6 +120,7 @@ impl Compiler<'_> {
                     prog: Vec::new(),
                     groups: 0,
                     group_names: self.group_names,
+                    unicode: self.unicode,
                 };
                 sub.compile(inner)?;
                 sub.emit(Inst::Match);
@@ -128,6 +135,7 @@ impl Compiler<'_> {
                     prog: Vec::new(),
                     groups: 0,
                     group_names: self.group_names,
+                    unicode: self.unicode,
                 };
                 sub.compile(inner)?;
                 sub.emit(Inst::Match);
@@ -216,6 +224,7 @@ impl Compiler<'_> {
                     prog: Vec::new(),
                     groups: 0,
                     group_names: self.group_names,
+                    unicode: self.unicode,
                 };
                 probe.compile(inner)?;
                 let inner_size = probe.prog.len().max(1);
@@ -269,12 +278,48 @@ impl Compiler<'_> {
         };
         Ok(())
     }
+
+    /// Emits a literal scalar code point. In non-`u` mode an astral scalar is
+    /// split into its two surrogate code units, each a one-unit `Char`, so the
+    /// subject is matched code-unit by code-unit (web-compat default). In `u`
+    /// mode a single `Char` carries the whole scalar; the VM reads a code point
+    /// (a surrogate pair) to match it.
+    fn emit_char(&mut self, c: u32) {
+        if !self.unicode && c > 0xFFFF {
+            let (hi, lo) = surrogate_pair(c);
+            self.emit(Inst::Char(hi as u32));
+            self.emit(Inst::Char(lo as u32));
+        } else {
+            self.emit(Inst::Char(c));
+        }
+    }
+
+    /// Lowers one class item into compiled members, splitting an astral literal
+    /// member into its surrogate units in non-`u` mode so `[😀]` (no `u`) matches
+    /// either surrogate half, matching JS web-compat semantics. Astral *ranges*
+    /// are kept whole only in `u` mode; in non-`u` mode their bounds are above
+    /// `0xFFFF` and can never match a single code unit, so they are dropped.
+    fn convert_item(&self, item: &ClassItem, out: &mut Vec<ClassMember>) {
+        match item {
+            ClassItem::Char(c) => {
+                if !self.unicode && *c > 0xFFFF {
+                    let (hi, lo) = surrogate_pair(*c);
+                    out.push(ClassMember::Char(hi as u32));
+                    out.push(ClassMember::Char(lo as u32));
+                } else {
+                    out.push(ClassMember::Char(*c));
+                }
+            }
+            ClassItem::Range(a, b) => out.push(ClassMember::Range(*a, *b)),
+            ClassItem::Shorthand(s) => out.push(ClassMember::Shorthand(*s)),
+        }
+    }
 }
 
-fn convert_item(item: &ClassItem) -> ClassMember {
-    match item {
-        ClassItem::Char(c) => ClassMember::Char(*c),
-        ClassItem::Range(a, b) => ClassMember::Range(*a, *b),
-        ClassItem::Shorthand(s) => ClassMember::Shorthand(*s),
-    }
+/// Splits an astral scalar (`> 0xFFFF`) into its UTF-16 surrogate pair.
+fn surrogate_pair(c: u32) -> (u16, u16) {
+    let v = c - 0x10000;
+    let hi = 0xD800 + (v >> 10) as u16;
+    let lo = 0xDC00 + (v & 0x3FF) as u16;
+    (hi, lo)
 }

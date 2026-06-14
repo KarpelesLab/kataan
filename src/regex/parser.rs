@@ -44,8 +44,10 @@ impl fmt::Display for RegexError {
 pub(crate) enum Node {
     /// Matches nothing (the empty pattern); always succeeds.
     Empty,
-    /// A literal character.
-    Char(char),
+    /// A literal character, as a scalar code point. May be an astral value
+    /// (`> 0xFFFF`) or a lone surrogate (`0xD800..=0xDFFF`, from a `\u` escape);
+    /// the compiler turns it into the right code-unit sequence per the `u` flag.
+    Char(u32),
     /// `.` — any character (subject to the dotall flag).
     Any,
     /// A character class `[ … ]`.
@@ -83,10 +85,11 @@ pub(crate) enum Node {
     },
 }
 
-/// One item inside a character class.
+/// One item inside a character class. Bounds are scalar code points (may be
+/// astral or lone surrogates).
 pub(crate) enum ClassItem {
-    Char(char),
-    Range(char, char),
+    Char(u32),
+    Range(u32, u32),
     Shorthand(Shorthand),
 }
 
@@ -179,13 +182,14 @@ pub(crate) type GroupNames = Vec<(usize, alloc::string::String)>;
 
 /// Parses `pattern` into an AST plus the number of capturing groups and the
 /// `(group index, name)` pairs of any named groups (`(?<name>…)`).
-pub(crate) fn parse(pattern: &str) -> Result<(Node, usize, GroupNames), RegexError> {
+pub(crate) fn parse(pattern: &str, unicode: bool) -> Result<(Node, usize, GroupNames), RegexError> {
     let mut p = Parser {
         chars: pattern.chars().collect(),
         pos: 0,
         group_count: 0,
         group_names: Vec::new(),
         depth: 0,
+        unicode,
     };
     let node = p.parse_alt()?;
     if p.pos != p.chars.len() {
@@ -204,6 +208,9 @@ struct Parser {
     group_names: Vec<(usize, alloc::string::String)>,
     /// Current group/lookaround nesting depth, bounded by `MAX_PARSE_DEPTH`.
     depth: u32,
+    /// Whether the `u` (unicode) flag is set: enables `\u` surrogate-pair
+    /// combination so a pattern like `😀` parses as one astral char.
+    unicode: bool,
 }
 
 impl Parser {
@@ -381,7 +388,7 @@ impl Parser {
             ))),
             Some(c) => {
                 self.pos += 1;
-                Ok(Node::Char(c))
+                Ok(Node::Char(c as u32))
             }
             None => Ok(Node::Empty),
         }
@@ -505,7 +512,7 @@ impl Parser {
             'x' => Node::Char(self.parse_hex_escape(2)?),
             'p' => class_shorthand(Shorthand::Property(self.parse_property()?, false)),
             'P' => class_shorthand(Shorthand::Property(self.parse_property()?, true)),
-            other => Node::Char(escape_char(other)),
+            other => Node::Char(escape_char(other) as u32),
         })
     }
 
@@ -541,9 +548,14 @@ impl Parser {
         })
     }
 
-    /// Parses a `\uHHHH` or `\u{H…}` escape body (the `\u` already consumed).
-    fn parse_unicode_escape(&mut self) -> Result<char, RegexError> {
-        let cp = if self.eat('{') {
+    /// Parses a `\uHHHH` or `\u{H…}` escape body (the `\u` already consumed),
+    /// returning the raw scalar code point. A lone surrogate (from `\uHHHH`) is
+    /// returned as-is so it can match a lone-surrogate code unit; in `u` mode a
+    /// high surrogate immediately followed by `\u` low surrogate is combined into
+    /// the astral code point it represents (ECMAScript surrogate-pair escapes).
+    /// `\u{…}` rejects values above U+10FFFF.
+    fn parse_unicode_escape(&mut self) -> Result<u32, RegexError> {
+        if self.eat('{') {
             let mut v: u32 = 0;
             let mut any = false;
             while let Some(c) = self.peek() {
@@ -561,17 +573,35 @@ impl Parser {
             if !any {
                 return Err(RegexError::new("empty `\\u{}` escape"));
             }
-            v
-        } else {
-            self.parse_hex_digits(4)?
-        };
-        char::from_u32(cp).ok_or_else(|| RegexError::new("escape is not a valid code point"))
+            if v > 0x10_FFFF {
+                return Err(RegexError::new("escape is not a valid code point"));
+            }
+            return Ok(v);
+        }
+        let hi = self.parse_hex_digits(4)?;
+        // In `u` mode, fold a leading high surrogate together with a following
+        // `\u`-escaped low surrogate into one astral code point.
+        if self.unicode
+            && (0xD800..=0xDBFF).contains(&hi)
+            && self.chars.get(self.pos) == Some(&'\\')
+            && self.chars.get(self.pos + 1) == Some(&'u')
+        {
+            let save = self.pos;
+            self.pos += 2; // `\u`
+            let lo = self.parse_hex_digits(4)?;
+            if (0xDC00..=0xDFFF).contains(&lo) {
+                return Ok(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+            }
+            // Not a low surrogate: rewind and keep `hi` as a lone surrogate.
+            self.pos = save;
+        }
+        Ok(hi)
     }
 
-    /// Parses a `\xHH` escape body (the `\x` already consumed).
-    fn parse_hex_escape(&mut self, n: usize) -> Result<char, RegexError> {
-        let cp = self.parse_hex_digits(n)?;
-        char::from_u32(cp).ok_or_else(|| RegexError::new("escape is not a valid code point"))
+    /// Parses a `\xHH` escape body (the `\x` already consumed), returning the raw
+    /// code point (always BMP, so always a valid scalar).
+    fn parse_hex_escape(&mut self, n: usize) -> Result<u32, RegexError> {
+        self.parse_hex_digits(n)
     }
 
     /// Reads exactly `n` hex digits as a code point.
@@ -629,29 +659,34 @@ impl Parser {
                             self.push_class_member(&mut items, ch);
                         }
                         other => {
-                            self.push_class_member(&mut items, escape_char(other));
+                            self.push_class_member(&mut items, escape_char(other) as u32);
                         }
                     }
                 }
                 Some(c) => {
                     self.pos += 1;
-                    self.push_class_member(&mut items, c);
+                    self.push_class_member(&mut items, c as u32);
                 }
             }
         }
         Ok(Node::Class { neg, items })
     }
 
-    /// Pushes `c` into a class, forming a range if a `-` and another member
-    /// follow.
-    fn push_class_member(&mut self, items: &mut Vec<ClassItem>, c: char) {
+    /// Pushes `c` (a scalar code point) into a class, forming a range if a `-`
+    /// and another member follow.
+    fn push_class_member(&mut self, items: &mut Vec<ClassItem>, c: u32) {
         if self.peek() == Some('-') && self.chars.get(self.pos + 1).is_some_and(|&n| n != ']') {
             self.pos += 1; // `-`
             let hi = if self.peek() == Some('\\') {
                 self.pos += 1;
-                escape_char(self.bump().unwrap_or('\\'))
+                match self.bump() {
+                    Some('u') => self.parse_unicode_escape().unwrap_or(c),
+                    Some('x') => self.parse_hex_escape(2).unwrap_or(c),
+                    Some(e) => escape_char(e) as u32,
+                    None => '\\' as u32,
+                }
             } else {
-                self.bump().unwrap_or(c)
+                self.bump().map_or(c, |ch| ch as u32)
             };
             items.push(ClassItem::Range(c, hi));
         } else {

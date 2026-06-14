@@ -1,4 +1,17 @@
 //! The backtracking regex virtual machine.
+//!
+//! The VM matches over a subject of **UTF-16 code units** (`&[u16]`), matching
+//! JavaScript string semantics: positions are code-unit indices and a lone
+//! surrogate is a matchable unit. How many code units one "character" spans
+//! depends on the `u` (unicode) flag:
+//!
+//! * **non-`u`** (the web-compat default): every primitive (`.`, classes,
+//!   literals, quantifiers, backrefs) operates on a single code unit. An astral
+//!   character is two units, so `.` matches one half of a surrogate pair.
+//! * **`u`**: primitives operate on whole code points — a surrogate pair counts
+//!   as one character and the engine advances by a full code point — but the
+//!   reported positions remain code-unit indices (per the spec, indices into the
+//!   UTF-16 string). A lone surrogate in `u` mode matches as a single unit.
 
 use super::Flags;
 use super::parser::{PropKind, Shorthand};
@@ -30,8 +43,10 @@ const MAX_DEPTH: u32 = crate::limits::DEFAULT_REGEX_MAX_DEPTH;
 
 /// A compiled instruction.
 pub(crate) enum Inst {
-    /// Match a specific character.
-    Char(char),
+    /// Match a specific code point (a scalar value; in non-`u` mode the compiler
+    /// only ever emits BMP/lone-surrogate scalars since astral literals are split
+    /// into two `Char` units up front).
+    Char(u32),
     /// `.` — any character (subject to the dotall flag).
     Any,
     /// A character class.
@@ -62,10 +77,10 @@ pub(crate) struct Class {
     pub members: Vec<ClassMember>,
 }
 
-/// One member of a compiled class.
+/// One member of a compiled class. Bounds are scalar values (code points).
 pub(crate) enum ClassMember {
-    Char(char),
-    Range(char, char),
+    Char(u32),
+    Range(u32, u32),
     Shorthand(Shorthand),
 }
 
@@ -77,21 +92,42 @@ pub(crate) enum Assert {
     NotWordBoundary,
 }
 
-/// The step budget for a subject of `input_len` chars: a fixed base plus a
-/// per-char allowance so a legitimate long-subject match is not starved.
+/// The step budget for a subject of `input_len` code units: a fixed base plus a
+/// per-unit allowance so a legitimate long-subject match is not starved.
 pub(crate) fn budget_for(input_len: usize) -> u64 {
     STEP_BASE.saturating_add(STEP_PER_CHAR.saturating_mul(input_len as u64))
 }
 
-/// Runs `prog` against `input` starting at `start`, returning the capture slots
-/// (`2 * (group_count + 1)` of them, as `(start, end)` pairs) on success.
+/// Reads the code point at unit index `sp` and the number of code units it
+/// spans. In `u` mode a well-formed surrogate pair is decoded as one code point
+/// (length 2); a lone surrogate, or any unit in non-`u` mode, is returned as its
+/// own scalar with length 1. The returned scalar is suitable for comparing
+/// against compiled `Char`/`Class` scalars.
+fn read_cp(input: &[u16], sp: usize, unicode: bool) -> Option<(u32, usize)> {
+    let u = *input.get(sp)? as u32;
+    if unicode
+        && (0xD800..=0xDBFF).contains(&u)
+        && let Some(&lo) = input.get(sp + 1)
+    {
+        let lo = lo as u32;
+        if (0xDC00..=0xDFFF).contains(&lo) {
+            let cp = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+            return Some((cp, 2));
+        }
+    }
+    Some((u, 1))
+}
+
+/// Runs `prog` against `input` (UTF-16 code units) starting at unit index
+/// `start`, returning the capture slots (`2 * (group_count + 1)` of them, as
+/// `(start, end)` unit-index pairs) on success.
 ///
 /// Threads a caller-owned step counter and budget so a multi-start find
 /// ([`super::Regex::captures_at`]) shares one budget across all start positions
 /// instead of resetting it per start (RE-8).
 pub(crate) fn run_shared(
     prog: &[Inst],
-    input: &[char],
+    input: &[u16],
     start: usize,
     group_count: usize,
     flags: Flags,
@@ -125,7 +161,7 @@ pub(crate) fn run_shared(
 
 struct Ctx<'a> {
     prog: &'a [Inst],
-    input: &'a [char],
+    input: &'a [u16],
     flags: Flags,
     /// When `Some(p)`, `Match` succeeds only at position `p` (for lookbehind,
     /// which requires the sub-pattern to end exactly at the assertion point).
@@ -150,10 +186,10 @@ impl Ctx<'_> {
 }
 
 /// The recursive backtracking executor. `pc` is the program counter, `sp` the
-/// position in the input, `depth` the current recursion depth. `saves` holds raw
-/// capture positions. Returns `false` (clean no-match) if the step budget or the
-/// recursion-depth cap is exceeded, so an adversarial pattern can never hang or
-/// overflow the stack.
+/// position in the input (a code-unit index), `depth` the current recursion
+/// depth. `saves` holds raw capture positions. Returns `false` (clean no-match)
+/// if the step budget or the recursion-depth cap is exceeded, so an adversarial
+/// pattern can never hang or overflow the stack.
 fn backtrack(
     ctx: &Ctx,
     mut pc: usize,
@@ -169,6 +205,7 @@ fn backtrack(
     if depth > MAX_DEPTH {
         return false;
     }
+    let unicode = ctx.flags.unicode;
     loop {
         // Step backstop: every instruction visited counts toward the budget; once
         // exhausted the whole match unwinds as a no-match.
@@ -178,28 +215,34 @@ fn backtrack(
         match &ctx.prog[pc] {
             Inst::Match => return ctx.match_end.is_none_or(|p| sp == p),
             Inst::Char(c) => {
-                if sp < ctx.input.len() && char_eq(ctx.input[sp], *c, ctx.flags) {
-                    sp += 1;
+                if let Some((cp, len)) = read_cp(ctx.input, sp, unicode)
+                    && cp_eq(cp, *c, ctx.flags)
+                {
+                    sp += len;
                     pc += 1;
-                } else {
-                    return false;
+                    continue;
                 }
+                return false;
             }
             Inst::Any => {
-                if sp < ctx.input.len() && (ctx.flags.dotall || !is_line_term(ctx.input[sp])) {
-                    sp += 1;
+                if let Some((cp, len)) = read_cp(ctx.input, sp, unicode)
+                    && (ctx.flags.dotall || !is_line_term(cp))
+                {
+                    sp += len;
                     pc += 1;
-                } else {
-                    return false;
+                    continue;
                 }
+                return false;
             }
             Inst::Class(class) => {
-                if sp < ctx.input.len() && class_matches(class, ctx.input[sp], ctx.flags) {
-                    sp += 1;
+                if let Some((cp, len)) = read_cp(ctx.input, sp, unicode)
+                    && class_matches(class, cp, ctx.flags)
+                {
+                    sp += len;
                     pc += 1;
-                } else {
-                    return false;
+                    continue;
                 }
+                return false;
             }
             Inst::Jmp(target) => pc = *target,
             Inst::Split(a, b) => {
@@ -216,8 +259,10 @@ fn backtrack(
                         // Greedy: consume as many as possible, recording each
                         // position, then try the continuation from longest down.
                         let mut positions = alloc::vec![sp];
-                        while consume_one(&ctx.prog[consume_pc], ctx.input, sp, ctx.flags) {
-                            sp += 1;
+                        while let Some(adv) =
+                            consume_one(&ctx.prog[consume_pc], ctx.input, sp, ctx.flags)
+                        {
+                            sp += adv;
                             positions.push(sp);
                             if !ctx.tick() {
                                 return false;
@@ -238,10 +283,12 @@ fn backtrack(
                         if backtrack(ctx, cont_pc, sp, saves, depth + 1, loops) {
                             return true;
                         }
-                        if !consume_one(&ctx.prog[consume_pc], ctx.input, sp, ctx.flags) {
+                        let Some(adv) =
+                            consume_one(&ctx.prog[consume_pc], ctx.input, sp, ctx.flags)
+                        else {
                             return false;
-                        }
-                        sp += 1;
+                        };
+                        sp += adv;
                         if !ctx.tick() {
                             return false;
                         }
@@ -340,10 +387,12 @@ fn backtrack(
                     saves.get(2 * g + 1).copied().flatten(),
                 ) {
                     (Some(s), Some(e)) => {
+                        // Backrefs compare raw code units (a captured span is a
+                        // run of units); case folding is applied unit-by-unit.
                         let len = e - s;
                         if sp + len <= ctx.input.len()
                             && (0..len)
-                                .all(|i| char_eq(ctx.input[sp + i], ctx.input[s + i], ctx.flags))
+                                .all(|i| unit_eq(ctx.input[sp + i], ctx.input[s + i], ctx.flags))
                         {
                             sp += len;
                             pc += 1;
@@ -394,7 +443,7 @@ fn simple_loop(prog: &[Inst], split_pc: usize) -> Option<(usize, usize, bool)> {
     None
 }
 
-/// Whether `inst` consumes exactly one input character on success.
+/// Whether `inst` consumes exactly one character (1 or 2 code units) on success.
 fn is_single_consume(inst: &Inst) -> bool {
     matches!(inst, Inst::Char(_) | Inst::Any | Inst::Class(_))
 }
@@ -425,26 +474,50 @@ fn loop_head(prog: &[Inst], split_pc: usize) -> Option<(usize, usize)> {
     }
 }
 
-/// Tries to consume one character with a single-consume instruction at `sp`.
-fn consume_one(inst: &Inst, input: &[char], sp: usize, flags: Flags) -> bool {
-    if sp >= input.len() {
-        return false;
-    }
-    match inst {
-        Inst::Char(c) => char_eq(input[sp], *c, flags),
-        Inst::Any => flags.dotall || !is_line_term(input[sp]),
-        Inst::Class(class) => class_matches(class, input[sp], flags),
+/// Tries to consume one character with a single-consume instruction at `sp`,
+/// returning the number of code units advanced (1 or 2) on success.
+fn consume_one(inst: &Inst, input: &[u16], sp: usize, flags: Flags) -> Option<usize> {
+    let (cp, len) = read_cp(input, sp, flags.unicode)?;
+    let ok = match inst {
+        Inst::Char(c) => cp_eq(cp, *c, flags),
+        Inst::Any => flags.dotall || !is_line_term(cp),
+        Inst::Class(class) => class_matches(class, cp, flags),
         _ => false,
-    }
+    };
+    ok.then_some(len)
 }
 
-fn char_eq(a: char, b: char, flags: Flags) -> bool {
+/// Compares two scalar code points for equality, honoring the `i` flag.
+fn cp_eq(a: u32, b: u32, flags: Flags) -> bool {
     if a == b {
         return true;
     }
     if !flags.ignore_case {
         return false;
     }
+    match (char::from_u32(a), char::from_u32(b)) {
+        (Some(ca), Some(cb)) => char_fold_eq(ca, cb),
+        // Lone surrogates have no case; only exact equality (handled above).
+        _ => false,
+    }
+}
+
+/// Compares two raw code units for equality, honoring the `i` flag. Used by
+/// backreference matching, which works unit-by-unit.
+fn unit_eq(a: u16, b: u16, flags: Flags) -> bool {
+    if a == b {
+        return true;
+    }
+    if !flags.ignore_case {
+        return false;
+    }
+    match (char::from_u32(a as u32), char::from_u32(b as u32)) {
+        (Some(ca), Some(cb)) => char_fold_eq(ca, cb),
+        _ => false,
+    }
+}
+
+fn char_fold_eq(a: char, b: char) -> bool {
     // Case-insensitive: compare by Unicode case folding (spec `Canonicalize`),
     // which catches pairs simple lowercasing misses (e.g. the Kelvin sign
     // U+212A ↔ `k`, long s U+017F ↔ `s`, final sigma ς ↔ σ).
@@ -458,26 +531,21 @@ fn char_eq(a: char, b: char, flags: Flags) -> bool {
     }
 }
 
-fn is_line_term(c: char) -> bool {
-    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+fn is_line_term(c: u32) -> bool {
+    matches!(c, 0x0A | 0x0D | 0x2028 | 0x2029)
 }
 
-fn is_word(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+fn is_word(c: u32) -> bool {
+    matches!(c, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A | 0x5F)
 }
 
-fn class_matches(class: &Class, c: char, flags: Flags) -> bool {
+fn class_matches(class: &Class, c: u32, flags: Flags) -> bool {
     let mut hit = false;
     for m in &class.members {
         let matched = match m {
-            ClassMember::Char(ch) => char_eq(c, *ch, flags),
+            ClassMember::Char(ch) => cp_eq(c, *ch, flags),
             ClassMember::Range(lo, hi) => {
-                (c >= *lo && c <= *hi)
-                    || (flags.ignore_case && {
-                        let cl = c.to_ascii_lowercase();
-                        let cu = c.to_ascii_uppercase();
-                        (cl >= *lo && cl <= *hi) || (cu >= *lo && cu <= *hi)
-                    })
+                (c >= *lo && c <= *hi) || (flags.ignore_case && range_fold_hit(c, *lo, *hi))
             }
             ClassMember::Shorthand(s) => shorthand_matches(*s, c),
         };
@@ -489,20 +557,44 @@ fn class_matches(class: &Class, c: char, flags: Flags) -> bool {
     hit ^ class.neg
 }
 
-fn shorthand_matches(s: Shorthand, c: char) -> bool {
+/// Case-insensitive class-range membership: a character matches `[lo-hi]` under
+/// `i` if either case variant lands in the range. Restricted to ASCII letters,
+/// matching the historical behavior.
+fn range_fold_hit(c: u32, lo: u32, hi: u32) -> bool {
+    let Some(ch) = char::from_u32(c) else {
+        return false;
+    };
+    let cl = ch.to_ascii_lowercase() as u32;
+    let cu = ch.to_ascii_uppercase() as u32;
+    (cl >= lo && cl <= hi) || (cu >= lo && cu <= hi)
+}
+
+fn shorthand_matches(s: Shorthand, c: u32) -> bool {
     match s {
-        Shorthand::Digit => c.is_ascii_digit(),
-        Shorthand::NotDigit => !c.is_ascii_digit(),
+        Shorthand::Digit => is_ascii_digit(c),
+        Shorthand::NotDigit => !is_ascii_digit(c),
         Shorthand::Word => is_word(c),
         Shorthand::NotWord => !is_word(c),
-        Shorthand::Space => c.is_whitespace(),
-        Shorthand::NotSpace => !c.is_whitespace(),
+        Shorthand::Space => is_space(c),
+        Shorthand::NotSpace => !is_space(c),
         Shorthand::Property(kind, neg) => property_matches(kind, c) ^ neg,
     }
 }
 
-/// Matches a `\p{…}` property using pure-Rust `char` predicates.
-fn property_matches(kind: PropKind, c: char) -> bool {
+fn is_ascii_digit(c: u32) -> bool {
+    (0x30..=0x39).contains(&c)
+}
+
+fn is_space(c: u32) -> bool {
+    char::from_u32(c).is_some_and(|ch| ch.is_whitespace())
+}
+
+/// Matches a `\p{…}` property using pure-Rust `char` predicates. A lone
+/// surrogate (no scalar) matches no property.
+fn property_matches(kind: PropKind, c: u32) -> bool {
+    let Some(c) = char::from_u32(c) else {
+        return false;
+    };
     match kind {
         PropKind::Letter => c.is_alphabetic(),
         PropKind::Upper => c.is_uppercase(),
@@ -558,17 +650,17 @@ fn general_category_matches(code: [u8; 2], c: char) -> bool {
     }
 }
 
-fn assert_ok(assert: &Assert, input: &[char], sp: usize, flags: Flags) -> bool {
+fn assert_ok(assert: &Assert, input: &[u16], sp: usize, flags: Flags) -> bool {
     match assert {
-        Assert::Start => sp == 0 || (flags.multiline && is_line_term(input[sp - 1])),
-        Assert::End => sp == input.len() || (flags.multiline && is_line_term(input[sp])),
+        Assert::Start => sp == 0 || (flags.multiline && is_line_term(input[sp - 1] as u32)),
+        Assert::End => sp == input.len() || (flags.multiline && is_line_term(input[sp] as u32)),
         Assert::WordBoundary => is_boundary(input, sp),
         Assert::NotWordBoundary => !is_boundary(input, sp),
     }
 }
 
-fn is_boundary(input: &[char], sp: usize) -> bool {
-    let before = sp > 0 && is_word(input[sp - 1]);
-    let after = sp < input.len() && is_word(input[sp]);
+fn is_boundary(input: &[u16], sp: usize) -> bool {
+    let before = sp > 0 && is_word(input[sp - 1] as u32);
+    let after = sp < input.len() && is_word(input[sp] as u32);
     before != after
 }
