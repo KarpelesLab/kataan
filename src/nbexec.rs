@@ -268,6 +268,14 @@ pub struct Interp<'a> {
     /// by an instance id stored on the instance's export wrappers — so a
     /// `WebAssembly.Instance`'s memory and globals survive across export calls.
     wasm_states: alloc::collections::BTreeMap<u32, crate::wasm_rt::InstanceState>,
+    /// The canonical `WebAssembly.Memory` object of each live WASM instance that
+    /// exports memory, keyed by instance id. Its `ArrayBuffer`'s `Cell::Bytes` is
+    /// the single shared linear-memory store: copied *into* the instance's
+    /// `Store.mem` before each export call and copied back *out* after, so a JS
+    /// `Uint8Array`/`DataView` over `Memory.buffer` observes wasm writes (and wasm
+    /// observes JS writes made before the call). The `ArrayBuffer` object is stable
+    /// across `grow` — only its bytes store is resized (A5, #11).
+    wasm_mem_objs: alloc::collections::BTreeMap<u32, crate::heap::Handle>,
     /// Next WASM-instance id to hand out.
     wasm_next_id: u32,
     /// When running a generator body eagerly, the buffer `yield` appends to.
@@ -832,6 +840,7 @@ impl<'a> Interp<'a> {
             pending_new_target: None,
             reflect_new_target: None,
             wasm_states: alloc::collections::BTreeMap::new(),
+            wasm_mem_objs: alloc::collections::BTreeMap::new(),
             wasm_next_id: 0,
             gen_sink: None,
             symbol_registry: alloc::collections::BTreeMap::new(),
@@ -4566,8 +4575,11 @@ impl<'a> Interp<'a> {
                     .get_property(target, WASM_MEM_BUFFER)
                     .unwrap_or(NanBox::undefined()));
             }
-            // `WebAssembly.Memory.prototype.grow(delta)` → old page count (a new,
-            // larger `ArrayBuffer` replaces `.buffer`, old contents copied).
+            // `WebAssembly.Memory.prototype.grow(delta)` → old page count. The
+            // SAME `ArrayBuffer` object is kept; its canonical `Cell::Bytes` store
+            // is resized in place (zero-extended) and every typed-array/`DataView`
+            // view over it is re-lengthened, so `Memory.buffer` is stable across
+            // grow and the store stays shared with wasm (A5, #11).
             if id == N_WASM_MEM_GROW {
                 let delta = args
                     .first()
@@ -4588,26 +4600,16 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("memory.grow exceeds the declared maximum");
                     return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
                 }
-                let new_buf = self.make_array_buffer(new_pages * WASM_PAGE);
-                // Copy the existing bytes into the new (zero-extended) buffer.
-                if let Some(old_bytes) = self
+                if let Some(bytes_h) = self
                     .realm
                     .get_property(target, WASM_MEM_BUFFER)
                     .and_then(|v| v.as_handle())
                     .map(Handle::from_raw)
                     .and_then(|ob| self.array_buffer_bytes(ob))
-                    .and_then(|h| self.realm.bytes_at(h).map(<[u8]>::to_vec))
-                    && let Some(nb) = self.array_buffer_bytes(new_buf)
-                    && let Some(dst) = self.realm.bytes_at_mut(nb)
                 {
-                    let n = old_bytes.len().min(dst.len());
-                    dst[..n].copy_from_slice(&old_bytes[..n]);
+                    // `resize_buffer` zero-extends the store and re-lengthens views.
+                    self.realm.resize_buffer(bytes_h, new_pages * WASM_PAGE);
                 }
-                self.realm.set_hidden_property(
-                    target,
-                    WASM_MEM_BUFFER,
-                    NanBox::handle(new_buf.to_raw()),
-                );
                 self.realm.set_hidden_property(
                     target,
                     WASM_MEM_PAGES,
@@ -10146,6 +10148,22 @@ impl<'a> Interp<'a> {
         {
             inst.import_state(state);
         }
+        // Copy the canonical, JS-shared linear-memory store INTO the instance
+        // before the call, so wasm reads any JS writes made through a view over
+        // `Memory.buffer` (A5, #11). The Memory's `Cell::Bytes` is authoritative
+        // (it tracks `mem.grow`), so it overrides the resumed `import_state` mem.
+        if let Some(id) = inst_id
+            && let Some(mem_obj) = self.wasm_mem_objs.get(&id).copied()
+            && let Some(bytes_h) = self
+                .realm
+                .get_property(mem_obj, WASM_MEM_BUFFER)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|ab| self.array_buffer_bytes(ab))
+            && let Some(canon) = self.realm.bytes_at(bytes_h).map(<[u8]>::to_vec)
+        {
+            inst.set_memory(canon);
+        }
 
         // The import dispatcher: marshal Vals → JS, call the JS import, marshal the
         // result back. Borrows `self` (the engine) directly — sound because the
@@ -10181,6 +10199,27 @@ impl<'a> Interp<'a> {
         // Persist the post-call memory/globals so the next call sees them.
         if let Some(id) = inst_id {
             self.wasm_states.insert(id, inst.export_state());
+        }
+        // Copy the instance's post-call linear memory BACK into the canonical,
+        // JS-shared store, so a `Uint8Array`/`DataView` over `Memory.buffer`
+        // observes the writes the export made (A5, #11). JS and wasm never run
+        // concurrently within a call, so this snapshot is observably live.
+        if let Some(id) = inst_id
+            && let Some(mem_obj) = self.wasm_mem_objs.get(&id).copied()
+            && let Some(bytes_h) = self
+                .realm
+                .get_property(mem_obj, WASM_MEM_BUFFER)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|ab| self.array_buffer_bytes(ab))
+        {
+            let post = inst.memory().to_vec();
+            // The canonical store may have been grown by `mem.grow`; keep its size
+            // and overwrite the prefix the instance produced.
+            if let Some(dst) = self.realm.bytes_at_mut(bytes_h) {
+                let n = post.len().min(dst.len());
+                dst[..n].copy_from_slice(&post[..n]);
+            }
         }
         // An `i64` result becomes a BigInt (other types map directly to a Number).
         Ok(match results.first() {
@@ -10448,10 +10487,13 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        // Exported memory becomes a `WebAssembly.Memory` whose buffer is a snapshot of
-        // the instance's linear memory after instantiation (data segments + start). (For
-        // modules with no imports, like the global-export case; live JS<->WASM sharing of
-        // the bytes is the same deferred work as typed-array buffer read-backing.)
+        // Exported memory becomes a `WebAssembly.Memory` whose `ArrayBuffer`'s
+        // `Cell::Bytes` is the *canonical, shared* linear-memory store (A5, #11):
+        // initialized from the instance's post-instantiation memory (data segments
+        // + start), then copied in/out of the instance's `Store.mem` around each
+        // export call so JS and wasm observe each other's writes. A wasm module has
+        // at most one memory; if several names export it they all alias the same
+        // `Memory` object. (Modules with no imports, as for the global-export case.)
         let memory_exports: Vec<String> = module
             .memory_exports()
             .iter()
@@ -10464,9 +10506,17 @@ impl<'a> Interp<'a> {
         {
             let mem_bytes = inst.memory().to_vec();
             let pages = mem_bytes.len() / WASM_PAGE;
+            let buf = self.make_array_buffer_from_bytes(&mem_bytes);
+            let mem = self.make_wasm_memory_object(buf, pages, None);
+            // Tag the Memory with its instance id so `grow` resizes the canonical
+            // store and the call boundary can find it; register it for sharing.
+            self.realm.set_hidden_property(
+                mem,
+                WASM_INSTANCE_ID,
+                NanBox::number(f64::from(inst_id)),
+            );
+            self.wasm_mem_objs.insert(inst_id, mem);
             for mname in &memory_exports {
-                let buf = self.make_array_buffer_from_bytes(&mem_bytes);
-                let mem = self.make_wasm_memory_object(buf, pages, None);
                 self.realm
                     .set_property(exports, mname, NanBox::handle(mem.to_raw()));
             }
@@ -20030,4 +20080,112 @@ mod tests {
             "27"
         );
     }
+
+    // --- A5: WebAssembly.Memory shares the byte store (#11) ------------------
+
+    /// Hand-assembled wasm module:
+    ///   (module
+    ///     (memory (export "mem") 1)
+    ///     (func (export "store") (param i32 i32) local.get 0 local.get 1 i32.store)
+    ///     (func (export "load")  (param i32) (result i32) local.get 0 i32.load))
+    fn mem_module_bytes() -> alloc::vec::Vec<u8> {
+        let mut m = alloc::vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Type section: type0 (i32,i32)->(), type1 (i32)->(i32)
+        m.extend([
+            0x01, 0x0b, 0x02, 0x60, 0x02, 0x7f, 0x7f, 0x00, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+        ]);
+        // Function section: func0:type0, func1:type1
+        m.extend([0x03, 0x03, 0x02, 0x00, 0x01]);
+        // Memory section: one memory, min 1
+        m.extend([0x05, 0x03, 0x01, 0x00, 0x01]);
+        // Export section: "mem" mem0, "store" func0, "load" func1
+        m.extend([
+            0x07, 0x16, 0x03, 0x03, b'm', b'e', b'm', 0x02, 0x00, 0x05, b's', b't', b'o', b'r',
+            b'e', 0x00, 0x00, 0x04, b'l', b'o', b'a', b'd', 0x00, 0x01,
+        ]);
+        // Code section: func0 stores, func1 loads
+        m.extend([
+            0x0a, 0x13, 0x02, // section, size, count
+            0x09, 0x00, 0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, 0x0b, // func0
+            0x07, 0x00, 0x20, 0x00, 0x28, 0x02, 0x00, 0x0b, // func1
+        ]);
+        m
+    }
+
+    /// Renders `bytes` as a JS array literal (so a test can build a `Uint8Array`).
+    fn js_byte_array(bytes: &[u8]) -> alloc::string::String {
+        let mut s = alloc::string::String::from("[");
+        for (i, b) in bytes.iter().enumerate() {
+            if i != 0 {
+                s.push(',');
+            }
+            s.push_str(&alloc::format!("{b}"));
+        }
+        s.push(']');
+        s
+    }
+
+    /// Runs `src` with the memory module's bytes pre-installed as the global
+    /// `MOD` (a JS array of byte numbers), returning the completion display.
+    fn run_wasm(src: &str) -> alloc::string::String {
+        let combined = alloc::format!("const MOD = {}; {src}", js_byte_array(&mem_module_bytes()));
+        let program = Parser::parse_program(&combined).expect("parse");
+        let mut interp = Interp::new();
+        let value = interp.run(&program).expect("exec");
+        interp.realm().to_display_string(value)
+    }
+
+    #[test]
+    fn wasm_memory_shares_byte_store_with_js() {
+        // A `Uint8Array` over `mem.buffer` sees a write the exported wasm fn made.
+        assert_eq!(
+            run_wasm(
+                "const inst = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array(MOD)));
+                 const mem = inst.exports.mem;
+                 const u8 = new Uint8Array(mem.buffer);
+                 inst.exports.store(16, 0x41);     // wasm writes mem[16] = 65
+                 u8[16];"
+            ),
+            "65"
+        );
+    }
+
+    #[test]
+    fn wasm_reads_js_write_before_call() {
+        // A JS write through a view (before the call) is read back by wasm.
+        assert_eq!(
+            run_wasm(
+                "const inst = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array(MOD)));
+                 const mem = inst.exports.mem;
+                 const u8 = new Uint8Array(mem.buffer);
+                 u8[20] = 0;
+                 // Store 0x12345678 LE at addr 20 from JS via DataView, then wasm loads it.
+                 const dv = new DataView(mem.buffer);
+                 dv.setInt32(20, 0x12345678, true);
+                 inst.exports.load(20);"
+            ),
+            "305419896" // 0x12345678
+        );
+    }
+
+    #[test]
+    fn wasm_memory_grow_keeps_same_buffer_object_and_shares() {
+        // `mem.grow(1)` keeps the SAME ArrayBuffer object; a view over the grown
+        // buffer works and still shares the store with wasm.
+        assert_eq!(
+            run_wasm(
+                "const inst = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array(MOD)));
+                 const mem = inst.exports.mem;
+                 const before = mem.buffer;
+                 const old = mem.grow(1);             // grow by one 64KiB page
+                 const same = (mem.buffer === before);
+                 const u8 = new Uint8Array(mem.buffer);
+                 // Write near the top of the newly-grown region from wasm, read in JS.
+                 inst.exports.store(70000, 0x7e);
+                 [old, mem.buffer.byteLength, same, u8[70000]].join(',');"
+            ),
+            "1,131072,true,126"
+        );
+    }
+
 }

@@ -2975,6 +2975,14 @@ impl<'m> Instance<'m> {
         &mut self.store.mem
     }
 
+    /// Replaces the instance's linear memory wholesale with `bytes` (its length
+    /// becoming the new memory size). Used to sync a host-canonical, JS-shared
+    /// memory store into the instance before an export call — and, conversely, the
+    /// post-call `memory()` is copied back out (A5: live JS↔wasm memory sharing).
+    pub fn set_memory(&mut self, bytes: Vec<u8>) {
+        self.store.mem = bytes;
+    }
+
     /// Reads `len` bytes of linear memory at `offset` (e.g. to pull a result
     /// buffer back to the host), or `None` if out of bounds.
     #[must_use]
