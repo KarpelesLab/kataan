@@ -2084,28 +2084,49 @@ fn call_closure(
     call_with(ctx, funcs, id, args, &caps, this_val)
 }
 
-/// Dispatches a built-in `Array`/`String` instance method on the fast path.
-/// Returns `None` when `key` isn't a recognized method (the caller then routes
-/// the program to the tree-walker).
-/// Slices `s` by *character* (scalar) indices `[st, en)` — the regex engine's
-/// index space — so a multi-byte character never splits a byte boundary.
+/// Slices a pre-collected `&[u16]` regex subject over the **code-unit** range
+/// `[st, en)` and re-encodes it to WTF-8 bytes (lone surrogates preserved). The
+/// regex engine's native subject model is UTF-16 code units, so match/capture
+/// spans index this buffer directly.
 #[cfg(feature = "regex")]
-fn char_substr(s: &str, st: usize, en: usize) -> String {
-    s.chars().skip(st).take(en.saturating_sub(st)).collect()
+fn u16_substr(units: &[u16], st: usize, en: usize) -> alloc::vec::Vec<u8> {
+    let st = st.min(units.len());
+    let en = en.min(units.len()).max(st);
+    crate::wtf8::from_utf16(&units[st..en])
 }
 
-/// Slices `s` from character index `st` to the end.
+/// Slices a pre-collected `&[u16]` regex subject from code-unit index `st` to
+/// the end, re-encoded to WTF-8 bytes.
 #[cfg(feature = "regex")]
-fn char_substr_from(s: &str, st: usize) -> String {
-    s.chars().skip(st).collect()
+fn u16_substr_from(units: &[u16], st: usize) -> alloc::vec::Vec<u8> {
+    crate::wtf8::from_utf16(&units[st.min(units.len())..])
+}
+
+/// Advances a code-unit position past an empty match (`AdvanceStringIndex`): a
+/// `u`-flag regex steps a whole code point (over a surrogate pair), a non-`u`
+/// regex steps one code unit.
+#[cfg(feature = "regex")]
+fn advance_index_u16(units: &[u16], i: usize, unicode: bool) -> usize {
+    if unicode
+        && i + 1 < units.len()
+        && (0xD800..=0xDBFF).contains(&units[i])
+        && (0xDC00..=0xDFFF).contains(&units[i + 1])
+    {
+        i + 2
+    } else {
+        i + 1
+    }
 }
 
 /// Builds a regex match result object `{ 0: whole, 1: g1, …, index, input,
-/// groups, length }` (the shape `RegExp.exec` / `String.match` return).
+/// groups, length }` (the shape `RegExp.exec` / `String.match` return) from a
+/// `Captures` whose spans are **code-unit** indices into the pre-collected
+/// `&[u16]` subject. Slices are re-encoded to WTF-8 so astral characters survive.
 #[cfg(feature = "regex")]
 fn regex_match_object(
     realm: &mut Realm,
-    text: &str,
+    units: &[u16],
+    input: NanBox,
     caps: &crate::regex::Captures,
     group_names: &[(usize, alloc::string::String)],
 ) -> NanBox {
@@ -2117,14 +2138,15 @@ fn regex_match_object(
         .groups
         .iter()
         .map(|g| match g {
-            Some((s, e)) => NanBox::handle(realm.new_string(&char_substr(text, *s, *e)).to_raw()),
+            Some((s, e)) => {
+                NanBox::handle(realm.new_string_wtf8(u16_substr(units, *s, *e)).to_raw())
+            }
             None => NanBox::undefined(),
         })
         .collect();
     let obj = realm.new_array(elems);
     let index = caps.groups.first().and_then(|g| *g).map_or(0, |(s, _)| s);
     realm.set_property(obj, "index", NanBox::number(index as f64));
-    let input = NanBox::handle(realm.new_string(text).to_raw());
     realm.set_property(obj, "input", input);
     // `.groups`: an object of named captures (or `undefined` if none).
     let groups = if group_names.is_empty() {
@@ -2133,7 +2155,9 @@ fn regex_match_object(
         let g = realm.new_object();
         for (idx, name) in group_names {
             let v = match caps.groups.get(*idx).and_then(|x| *x) {
-                Some((s, e)) => NanBox::handle(realm.new_string(&char_substr(text, s, e)).to_raw()),
+                Some((s, e)) => {
+                    NanBox::handle(realm.new_string_wtf8(u16_substr(units, s, e)).to_raw())
+                }
                 None => NanBox::undefined(),
             };
             realm.set_property(g, name, v);
@@ -2167,21 +2191,29 @@ fn regex_method(
         let Ok(re) = Regex::new(&source, &flags) else {
             return Some(Ok(NanBox::null()));
         };
-        // `g`/`y` regexes resume at `lastIndex` and update it (reset to 0 on miss).
+        // `g`/`y` regexes resume at `lastIndex` and update it (reset to 0 on
+        // miss). `lastIndex` and all reported spans are **code-unit** indices.
         let stateful = flags.contains('g') || flags.contains('y');
         let start = if stateful {
             ctx.realm.regex_last_index(h)
         } else {
             0
         };
-        let caps = re.captures_from(&text, start);
+        // Collect the subject to UTF-16 code units ONCE (RE-7); spans index this
+        // buffer. The subject's lossless WTF-8 bytes feed the unit buffer.
+        let subject_bytes = string_arg_bytes(ctx, arg0);
+        let units: Vec<u16> = crate::wtf8::utf16_units(&subject_bytes).collect();
+        let caps = re.captures_in_u16(&units, start);
         if stateful {
             let next = caps.as_ref().map_or(0, |c| c.whole().1);
             ctx.realm.set_regex_last_index(h, next);
         }
         return Some(Ok(match (key, caps) {
             ("test", c) => NanBox::boolean(c.is_some()),
-            (_, Some(caps)) => regex_match_object(ctx.realm, &text, &caps, re.group_names()),
+            (_, Some(caps)) => {
+                let input = NanBox::handle(ctx.realm.new_string(&text).to_raw());
+                regex_match_object(ctx.realm, &units, input, &caps, re.group_names())
+            }
             (_, None) => NanBox::null(),
         }));
     }
@@ -2200,6 +2232,7 @@ fn regex_method(
         return Some(Ok(NanBox::null()));
     };
     let global = flags.contains('g');
+    let unicode = flags.contains('u');
     // `replaceAll` requires a global RegExp.
     if !global && key == "replaceAll" {
         return Some(Err(VmError::Thrown(make_error(
@@ -2208,30 +2241,41 @@ fn regex_method(
             "replaceAll must be called with a global RegExp",
         ))));
     }
-    // Collect the subject once; the per-match loops below index this slice via
-    // the engine's `*_in` API instead of re-collecting the chars on every call
-    // (which made dense global matches O(n²)). Match positions are char offsets.
-    let chars: Vec<char> = text.chars().collect();
+    // Collect the subject to UTF-16 code units ONCE (RE-7); the per-match loops
+    // below index this `&[u16]` via the engine's `*_in_u16` API instead of
+    // re-collecting per call (which made dense global matches O(n²)). All match,
+    // capture, `.index`, and split positions are **code-unit** indices. (The
+    // subject is surrogate-free on this path — a surrogate-bearing literal defers
+    // to the tree-walker at compile time — but the unit model is what makes an
+    // astral subject report code-unit indices.)
+    let subject_bytes = ctx.realm.string_bytes(h).unwrap_or_default();
+    let units: Vec<u16> = crate::wtf8::utf16_units(&subject_bytes).collect();
+    let len = units.len();
     let result = match key {
         "search" => {
-            let i = re.find_in(&chars, 0).map_or(-1.0, |(s, _)| s as f64);
+            let i = re.find_in_u16(&units, 0).map_or(-1.0, |(s, _)| s as f64);
             NanBox::number(i)
         }
-        "match" if !global => match re.captures_in(&chars, 0) {
-            Some(caps) => regex_match_object(ctx.realm, &text, &caps, re.group_names()),
+        "match" if !global => match re.captures_in_u16(&units, 0) {
+            Some(caps) => {
+                let input = NanBox::handle(ctx.realm.new_string(&text).to_raw());
+                regex_match_object(ctx.realm, &units, input, &caps, re.group_names())
+            }
             None => NanBox::null(),
         },
         "match" => {
             // Global match → an array of the whole matches.
             let mut out = Vec::new();
             let mut pos = 0;
-            while let Some((s, e)) = re.find_in(&chars, pos) {
+            while let Some((s, e)) = re.find_in_u16(&units, pos) {
                 out.push(NanBox::handle(
-                    ctx.realm
-                        .new_string(&chars[s..e].iter().collect::<String>())
-                        .to_raw(),
+                    ctx.realm.new_string_wtf8(u16_substr(&units, s, e)).to_raw(),
                 ));
-                pos = if e > s { e } else { e + 1 };
+                pos = if e > s {
+                    e
+                } else {
+                    advance_index_u16(&units, e, unicode)
+                };
             }
             if out.is_empty() {
                 NanBox::null()
@@ -2250,8 +2294,32 @@ fn regex_method(
             {
                 return None;
             }
-            let repl = ctx.realm.to_display_string(repl_val);
-            NanBox::handle(ctx.realm.new_string(&re.replace(&text, &repl)).to_raw())
+            let templ = ctx.realm.to_display_string(repl_val);
+            // Build the result as WTF-8 bytes so astral characters survive; spans
+            // are code-unit indices. `$&`/`` $` ``/`$'`/`$1`/`$<name>` expand over
+            // the unit buffer.
+            let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            let mut at = 0;
+            while let Some(caps) = re.captures_in_u16(&units, at) {
+                let (st, en) = caps.groups[0].unwrap_or((at, at));
+                out.extend_from_slice(&u16_substr(&units, at, st));
+                expand_replacement_u16(&templ, &units, &caps, re.group_names(), &mut out);
+                if en > st {
+                    at = en;
+                } else {
+                    if en >= len {
+                        break;
+                    }
+                    let next = advance_index_u16(&units, en, unicode);
+                    out.extend_from_slice(&u16_substr(&units, en, next));
+                    at = next;
+                }
+                if !global {
+                    break;
+                }
+            }
+            out.extend_from_slice(&u16_substr_from(&units, at));
+            NanBox::handle(ctx.realm.new_string_wtf8(out).to_raw())
         }
         // "split" — splices capture groups and handles zero-width matches (kept
         // in sync with the tree-walker's `split`).
@@ -2268,42 +2336,47 @@ fn regex_method(
             let mut seg_start = 0;
             let mut search = 0;
             // Match positions are `< len` (spec `q < size`); the tail is appended once.
-            while search < chars.len() && limit.is_none_or(|l| out.len() < l) {
-                let Some(caps) = re.captures_in(&chars, search) else {
+            while search < len && limit.is_none_or(|l| out.len() < l) {
+                let Some(caps) = re.captures_in_u16(&units, search) else {
                     break;
                 };
                 let Some((st, en)) = caps.groups[0] else {
                     break;
                 };
                 if en == seg_start {
-                    if chars.get(search).is_some() {
-                        search = search.max(st) + 1;
+                    let next = search.max(st);
+                    if next < len {
+                        search = advance_index_u16(&units, next, unicode);
                         continue;
                     }
                     break;
                 }
                 out.push(NanBox::handle(
                     ctx.realm
-                        .new_string(&chars[seg_start..st].iter().collect::<String>())
+                        .new_string_wtf8(u16_substr(&units, seg_start, st))
                         .to_raw(),
                 ));
                 for g in &caps.groups[1..] {
                     out.push(match g {
                         Some((gs, ge)) => NanBox::handle(
                             ctx.realm
-                                .new_string(&chars[*gs..*ge].iter().collect::<String>())
+                                .new_string_wtf8(u16_substr(&units, *gs, *ge))
                                 .to_raw(),
                         ),
                         None => NanBox::undefined(),
                     });
                 }
                 seg_start = en;
-                search = if en > st { en } else { en + 1 };
+                search = if en > st {
+                    en
+                } else {
+                    advance_index_u16(&units, en, unicode)
+                };
             }
             if limit.is_none_or(|l| out.len() < l) {
                 out.push(NanBox::handle(
                     ctx.realm
-                        .new_string(&char_substr_from(&text, seg_start))
+                        .new_string_wtf8(u16_substr_from(&units, seg_start))
                         .to_raw(),
                 ));
             }
@@ -2314,6 +2387,93 @@ fn regex_method(
         }
     };
     Some(Ok(result))
+}
+
+/// The WTF-8 bytes of `v` coerced to a string — lossless when `v` is already a
+/// string (so a surrogate-bearing subject matches correctly), lossy otherwise.
+#[cfg(feature = "regex")]
+fn string_arg_bytes(ctx: &Ctx, v: NanBox) -> alloc::vec::Vec<u8> {
+    if let Some(raw) = v.as_handle()
+        && let Some(b) = ctx.realm.string_bytes(Handle::from_raw(raw))
+    {
+        return b;
+    }
+    ctx.realm.to_display_string(v).into_bytes()
+}
+
+/// Expands a `replace` template against `caps`, appending WTF-8 bytes to `out`:
+/// `$&` (whole match), `` $` `` (prefix), `$'` (suffix), `$1`..`$9` (numbered
+/// groups), `$<name>` (named groups), `$$` (literal `$`). `subj` is the
+/// pre-collected `&[u16]` subject and capture spans are **code-unit** indices;
+/// substituted slices are re-encoded to WTF-8 so astral characters survive.
+#[cfg(feature = "regex")]
+fn expand_replacement_u16(
+    templ: &str,
+    subj: &[u16],
+    caps: &crate::regex::Captures,
+    group_names: &[(usize, alloc::string::String)],
+    out: &mut alloc::vec::Vec<u8>,
+) {
+    let group = |i: usize| -> alloc::vec::Vec<u8> {
+        caps.groups
+            .get(i)
+            .and_then(|g| *g)
+            .map(|(s, e)| u16_substr(subj, s, e))
+            .unwrap_or_default()
+    };
+    let (m_start, m_end) = caps.groups.first().and_then(|g| *g).unwrap_or((0, 0));
+    let mut tc = templ.chars().peekable();
+    while let Some(c) = tc.next() {
+        if c == '$' && tc.peek() == Some(&'<') {
+            tc.next();
+            let mut name = String::new();
+            while let Some(&ch) = tc.peek() {
+                tc.next();
+                if ch == '>' {
+                    break;
+                }
+                name.push(ch);
+            }
+            if let Some((idx, _)) = group_names.iter().find(|(_, n)| *n == name) {
+                out.extend_from_slice(&group(*idx));
+            }
+            continue;
+        }
+        if c != '$' {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match tc.peek() {
+            Some('$') => {
+                out.push(b'$');
+                tc.next();
+            }
+            Some('&') => {
+                out.extend_from_slice(&group(0));
+                tc.next();
+            }
+            Some('`') => {
+                out.extend_from_slice(&u16_substr(subj, 0, m_start));
+                tc.next();
+            }
+            Some('\'') => {
+                out.extend_from_slice(&u16_substr_from(subj, m_end));
+                tc.next();
+            }
+            Some(d)
+                if d.is_ascii_digit() && {
+                    let n = (*d as u8 - b'0') as usize;
+                    n >= 1 && n < caps.groups.len()
+                } =>
+            {
+                let n = (*d as u8 - b'0') as usize;
+                tc.next();
+                out.extend_from_slice(&group(n));
+            }
+            _ => out.push(b'$'),
+        }
+    }
 }
 
 fn builtin_method(
@@ -7425,6 +7585,27 @@ mod tests {
         assert_eq!(bc(r"new Map() instanceof Map"), "true");
         assert_eq!(bc(r"new Set() instanceof Set"), "true");
         assert_eq!(bc(r"[] instanceof Map"), "false");
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn bytecode_regex_code_unit_indices_on_astral() {
+        // The bytecode regex path reports **code-unit** indices and matches in the
+        // UTF-16 unit space for an astral (surrogate-free) subject.
+        // u-flag: `.` matches the whole astral char, span length 2 at index 0.
+        assert_eq!(bc(r#"/./u.exec("😀")[0].length"#), "2");
+        assert_eq!(bc(r#"/./u.exec("😀").index"#), "0");
+        // Non-u: `.` matches one code unit → two matches over an astral char.
+        assert_eq!(bc(r#""😀".match(/./g).length"#), "2");
+        assert_eq!(bc(r#"/./.exec("😀")[0].length"#), "1");
+        // `.index` / `lastIndex` / search are code-unit indices.
+        assert_eq!(bc(r#""a😀b".search(/b/)"#), "3");
+        assert_eq!(bc(r#"const r=/y/g; r.exec("😀y"); r.lastIndex"#), "3");
+        // replace splices astral matches back losslessly (string template).
+        assert_eq!(bc(r#""a😀b".replace(/😀/u, "X")"#), "aXb");
+        assert_eq!(bc(r#""x😀y".replace(/(😀)/, "[$1]")"#), "x[😀]y");
+        // split keeps surrounding text whole around an astral separator.
+        assert_eq!(bc(r#""a😀b".split(/😀/).join("|")"#), "a|b");
     }
 
     #[test]
