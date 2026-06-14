@@ -212,6 +212,11 @@ pub enum VerifyError {
     Target(usize),
     /// A `NewArray` length above the allocation cap (a hostile snapshot).
     ArrayLen(usize),
+    /// A `LoadConst` carrying a raw heap handle — a portable artifact's constant
+    /// pool only holds primitives (undefined/null/bool/number); a handle constant
+    /// is a forged/corrupt reference that could alias a live heap slot, so it is
+    /// rejected rather than run.
+    ConstHandle,
 }
 
 /// Maximum eager `NewArray` length accepted by the verifier — mirrors the
@@ -344,10 +349,16 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             }
             Ok(())
         }
-        Op::LoadConst { dst, .. }
-        | Op::NewString { dst, .. }
-        | Op::NewRegExp { dst, .. }
-        | Op::NewObject { dst } => reg(*dst),
+        Op::LoadConst { dst, value } => {
+            reg(*dst)?;
+            // A portable constant pool never holds a heap handle; a handle here is
+            // a forged/corrupt reference (it could collide with a live slot).
+            if value.as_handle().is_some() {
+                return Err(VerifyError::ConstHandle);
+            }
+            Ok(())
+        }
+        Op::NewString { dst, .. } | Op::NewRegExp { dst, .. } | Op::NewObject { dst } => reg(*dst),
         Op::IsBuiltin { dst, obj, .. }
         | Op::InstanceOf { dst, obj, .. }
         | Op::ObjectSpread { dst, src: obj }
@@ -1296,6 +1307,16 @@ mod tests {
         let beyond = p3[0].ops.len() + 100;
         p3[0].ops.push(Op::Jump { target: beyond });
         assert_eq!(verify(&p3), Err(VerifyError::Target(beyond)));
+
+        // Tamper: a `LoadConst` carrying a raw heap handle (a forged reference
+        // never emitted by the compiler) is rejected (M3).
+        let mut p4 =
+            crate::nbvm::compile_program(&Parser::parse_program("let y = 1; y").unwrap()).unwrap();
+        p4[0].ops.push(Op::LoadConst {
+            dst: 0,
+            value: NanBox::handle(0xDEAD_BEEF),
+        });
+        assert_eq!(verify(&p4), Err(VerifyError::ConstHandle));
     }
 
     #[test]
