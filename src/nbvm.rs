@@ -709,6 +709,27 @@ fn make_error(realm: &mut Realm, name: &str, message: &str) -> NanBox {
     NanBox::handle(obj.to_raw())
 }
 
+/// Whether `key` is one of the `RegExp` introspection properties surfaced
+/// directly by [`Op::GetProp`] (`source`, `flags`, the flag-letter booleans, and
+/// `lastIndex`). Used as a cheap pre-filter so the hot path only consults the
+/// (allocating) [`Realm::regexp_at`] probe when the key could actually name a
+/// regexp member — a plain `obj.foo` read never pays for it.
+fn is_regexp_introspection_key(key: &str) -> bool {
+    matches!(
+        key,
+        "source"
+            | "flags"
+            | "global"
+            | "ignoreCase"
+            | "multiline"
+            | "sticky"
+            | "dotAll"
+            | "unicode"
+            | "hasIndices"
+            | "lastIndex"
+    )
+}
+
 const SYM_NUM_ERR: &str = "Cannot convert a Symbol value to a number";
 const SYM_STR_ERR: &str = "Cannot convert a Symbol value to a string";
 
@@ -1535,9 +1556,14 @@ fn run_frame(
                             regs[*dst as usize] = NanBox::handle(s.to_raw());
                             continue;
                         }
-                        // RegExp introspection properties.
+                        // RegExp introspection properties. The (allocating)
+                        // `regexp_at` probe is gated on the key first, so a plain
+                        // `obj.foo` read on a non-regexp pays nothing here — only
+                        // the handful of regexp member names can take this branch.
                         let mut done = true;
-                        if let Some((src, flags)) = ctx.realm.regexp_at(handle) {
+                        if is_regexp_introspection_key(key.as_str())
+                            && let Some((src, flags)) = ctx.realm.regexp_at(handle)
+                        {
                             match key.as_str() {
                                 "source" => {
                                     let s = ctx.realm.new_string(&src);
