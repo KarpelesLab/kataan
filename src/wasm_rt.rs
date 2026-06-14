@@ -2914,6 +2914,26 @@ impl<'m> Instance<'m> {
         }
     }
 
+    /// Consumes the instance, *moving* its mutable state out as an
+    /// [`InstanceState`] (no clone — unlike [`export_state`](Self::export_state)).
+    /// Used by the JS↔WASM boundary to persist post-call state without a redundant
+    /// linear-memory copy (S2).
+    #[must_use]
+    pub fn into_state(self) -> InstanceState {
+        InstanceState {
+            mem: self.store.mem,
+            globals: self.store.globals,
+            dropped: self.store.dropped,
+        }
+    }
+
+    /// The current page count of the instance's linear memory (its length divided
+    /// by the 64 KiB page size).
+    #[must_use]
+    pub fn memory_pages(&self) -> usize {
+        self.store.mem.len() / PAGE_SIZE
+    }
+
     /// Overwrites the instance's mutable state with a previously exported snapshot
     /// (e.g. to resume a JS `WebAssembly.Instance` with the state from its prior
     /// call). The module identity must match the one the state came from.

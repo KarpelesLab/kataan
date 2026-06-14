@@ -268,6 +268,14 @@ pub struct Interp<'a> {
     /// by an instance id stored on the instance's export wrappers — so a
     /// `WebAssembly.Instance`'s memory and globals survive across export calls.
     wasm_states: alloc::collections::BTreeMap<u32, crate::wasm_rt::InstanceState>,
+    /// The decoded `Module` of each live WASM instance, keyed by instance id, so a
+    /// hot loop calling an export reuses the parsed+validated module instead of
+    /// re-`decode_with_limits`-ing the raw bytes every call (S1: the dominant
+    /// per-call cost). A `Module` is immutable once decoded; the mutable per-call
+    /// state lives in `wasm_states`. Borrow-checker note: the module is `take`n out
+    /// for the duration of an export call (so the import-dispatch closure can borrow
+    /// the engine mutably) and put back afterwards.
+    wasm_modules: alloc::collections::BTreeMap<u32, crate::wasm_rt::Module>,
     /// The canonical `WebAssembly.Memory` object of each live WASM instance that
     /// exports memory, keyed by instance id. Its `ArrayBuffer`'s `Cell::Bytes` is
     /// the single shared linear-memory store: copied *into* the instance's
@@ -840,6 +848,7 @@ impl<'a> Interp<'a> {
             pending_new_target: None,
             reflect_new_target: None,
             wasm_states: alloc::collections::BTreeMap::new(),
+            wasm_modules: alloc::collections::BTreeMap::new(),
             wasm_mem_objs: alloc::collections::BTreeMap::new(),
             wasm_next_id: 0,
             gen_sink: None,
@@ -10145,18 +10154,15 @@ impl<'a> Interp<'a> {
     /// The tag used by `Object.prototype.toString` (`"[object <tag>]"`): a
     /// `Symbol.toStringTag` string property if present, else the built-in tag.
     /// Invokes a WASM export wrapper: `data` carries the module bytes and the
-    /// export name; decode, instantiate, marshal `args` across the JS↔WASM
-    /// boundary, and return the (first) result as a JS value.
+    /// export name. Decodes the module *once* (cached per instance id in
+    /// `wasm_modules` — S1: a repeat call reuses the parsed+validated module rather
+    /// than re-`decode_with_limits`-ing the raw bytes), then marshals `args` across
+    /// the JS↔WASM boundary and returns the (first) result as a JS value.
     fn call_wasm_export(
         &mut self,
         data: crate::heap::Handle,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
-        let bytes = self
-            .realm
-            .get_property(data, WASM_BYTES)
-            .and_then(|v| self.wasm_bytes(v))
-            .ok_or_else(|| self.wasm_compile_error("missing module bytes"))?;
         let name = self
             .realm
             .get_property(data, WASM_EXPORT)
@@ -10168,9 +10174,47 @@ impl<'a> Interp<'a> {
             .realm
             .get_property(data, WASM_IMPORTS)
             .unwrap_or(NanBox::undefined());
-        let module = crate::wasm_rt::Module::decode_with_limits(&bytes, &self.realm.limits.wasm)
-            .map_err(|_| self.wasm_compile_error("invalid module"))?;
+        let inst_id = self
+            .realm
+            .get_property(data, WASM_INSTANCE_ID)
+            .and_then(|v| v.as_number())
+            .map(|n| n as u32);
 
+        // S1: reuse the decoded module across calls. Take the cached `Module` out
+        // for the duration of this call (so the import-dispatch closure below can
+        // borrow the engine mutably without aliasing it); decode on the first call.
+        let mut module = match inst_id.and_then(|id| self.wasm_modules.remove(&id)) {
+            Some(m) => m,
+            None => {
+                let bytes = self
+                    .realm
+                    .get_property(data, WASM_BYTES)
+                    .and_then(|v| self.wasm_bytes(v))
+                    .ok_or_else(|| self.wasm_compile_error("missing module bytes"))?;
+                crate::wasm_rt::Module::decode_with_limits(&bytes, &self.realm.limits.wasm)
+                    .map_err(|_| self.wasm_compile_error("invalid module"))?
+            }
+        };
+        // Run the call against the (cached) module, then put the module back into the
+        // cache regardless of outcome so the next call reuses it.
+        let result = self.call_wasm_export_with_module(&module, &name, imports_obj, inst_id, args);
+        if let Some(id) = inst_id {
+            self.wasm_modules.insert(id, core::mem::take(&mut module));
+        }
+        result
+    }
+
+    /// The body of [`call_wasm_export`] over an already-decoded `module` (cached by
+    /// the caller). Resolves imports, marshals arguments, syncs the JS-shared linear
+    /// memory in/out, runs the export, and persists the instance's mutable state.
+    fn call_wasm_export_with_module(
+        &mut self,
+        module: &crate::wasm_rt::Module,
+        name: &str,
+        imports_obj: NanBox,
+        inst_id: Option<u32>,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
         // Resolve each function import to a JS function: importObject[mod][field].
         let import_names: Vec<(String, String)> = module
             .import_names()
@@ -10213,7 +10257,7 @@ impl<'a> Interp<'a> {
 
         // Marshal the export's arguments per its parameter types.
         let export_idx = module
-            .export(&name)
+            .export(name)
             .ok_or_else(|| self.wasm_compile_error("no such export"))?;
         let params = module
             .func_type(export_idx)
@@ -10279,38 +10323,41 @@ impl<'a> Interp<'a> {
         }
 
         let mut inst = if !global_imports.is_empty() {
-            crate::wasm_rt::Instance::with_host_imports_and_globals(&module, import_global_vals)
+            crate::wasm_rt::Instance::with_host_imports_and_globals(module, import_global_vals)
         } else if import_names.is_empty() {
-            crate::wasm_rt::Instance::new(&module)
+            crate::wasm_rt::Instance::new(module)
         } else {
-            crate::wasm_rt::Instance::with_host_imports(&module)
+            crate::wasm_rt::Instance::with_host_imports(module)
         }
         .map_err(|e| self.wasm_compile_error(e.0))?;
 
         // Resume this instance's persistent memory/globals from its prior call, so
         // mutable state (a counter global, written linear memory, …) carries over.
-        let inst_id = self
-            .realm
-            .get_property(data, WASM_INSTANCE_ID)
-            .and_then(|v| v.as_number())
-            .map(|n| n as u32);
         if let Some(id) = inst_id
             && let Some(state) = self.wasm_states.get(&id)
         {
             inst.import_state(state);
         }
+        // S2: only sync the JS-shared linear memory when the instance actually
+        // exports a `WebAssembly.Memory` (otherwise there is nothing JS can observe
+        // and no copy is needed). The canonical `Memory.buffer` byte handle is
+        // resolved once here and reused for the post-call copy-out below.
+        let mem_bytes_h = inst_id
+            .and_then(|id| self.wasm_mem_objs.get(&id).copied())
+            .and_then(|mem_obj| {
+                self.realm
+                    .get_property(mem_obj, WASM_MEM_BUFFER)
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+            })
+            .and_then(|ab| self.array_buffer_bytes(ab));
         // Copy the canonical, JS-shared linear-memory store INTO the instance
         // before the call, so wasm reads any JS writes made through a view over
         // `Memory.buffer` (A5, #11). The Memory's `Cell::Bytes` is authoritative
         // (it tracks `mem.grow`), so it overrides the resumed `import_state` mem.
-        if let Some(id) = inst_id
-            && let Some(mem_obj) = self.wasm_mem_objs.get(&id).copied()
-            && let Some(bytes_h) = self
-                .realm
-                .get_property(mem_obj, WASM_MEM_BUFFER)
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw)
-                .and_then(|ab| self.array_buffer_bytes(ab))
+        // Skipped entirely when the store is empty (no memory / zero-length).
+        if let Some(bytes_h) = mem_bytes_h
+            && self.realm.bytes_len(bytes_h).is_some_and(|n| n != 0)
             && let Some(canon) = self.realm.bytes_at(bytes_h).map(<[u8]>::to_vec)
         {
             inst.set_memory(canon);
@@ -10338,39 +10385,61 @@ impl<'a> Interp<'a> {
                     }
                 }
             };
-            inst.call_export_with_host(&name, &val_args, &mut host)
+            inst.call_export_with_host(name, &val_args, &mut host)
         };
         if let Some(e) = thrown {
-            return Err(e); // propagate a JS exception thrown by an import
+            // A JS exception thrown by an import unwinds the whole call; the
+            // instance's mutable state is discarded (not persisted), matching the
+            // prior behavior, but the cached module is still restored by the caller.
+            return Err(e);
         }
         // An error *executing* an export is a runtime trap (`unreachable`, div-by-zero,
         // out-of-bounds, an indirect-call type mismatch, …) → `WebAssembly.RuntimeError`,
         // not a compile error (which is reserved for decode/validation at `Module`).
         let results = results.map_err(|e| self.wasm_runtime_error(e.0))?;
-        // Persist the post-call memory/globals so the next call sees them.
-        if let Some(id) = inst_id {
-            self.wasm_states.insert(id, inst.export_state());
+        // T6 (grow-during-call): a wasm `memory.grow` inside the call grows only the
+        // instance's `Store.mem`; the canonical JS-shared store still has its old
+        // size. Grow the `Cell::Bytes` to match *before* copying out, so writes the
+        // export made into the newly-grown pages aren't truncated. Also re-length any
+        // views (resize_buffer) so a JS `Uint8Array` over `Memory.buffer` can read
+        // the new region, and keep the Memory's page count in sync.
+        if let Some(bytes_h) = mem_bytes_h {
+            let grown = inst.memory().len();
+            let canon = self.realm.bytes_len(bytes_h).unwrap_or(0);
+            if grown > canon {
+                self.realm.resize_buffer(bytes_h, grown);
+                if let Some(id) = inst_id
+                    && let Some(mem_obj) = self.wasm_mem_objs.get(&id).copied()
+                {
+                    let pages = inst.memory_pages();
+                    self.realm.set_hidden_property(
+                        mem_obj,
+                        WASM_MEM_PAGES,
+                        NanBox::number(pages as f64),
+                    );
+                }
+            }
         }
+        // S2: move the instance's post-call state out (no clone) so we can persist
+        // it and reuse its memory buffer for the copy-out below.
+        let state = inst.into_state();
         // Copy the instance's post-call linear memory BACK into the canonical,
         // JS-shared store, so a `Uint8Array`/`DataView` over `Memory.buffer`
         // observes the writes the export made (A5, #11). JS and wasm never run
-        // concurrently within a call, so this snapshot is observably live.
-        if let Some(id) = inst_id
-            && let Some(mem_obj) = self.wasm_mem_objs.get(&id).copied()
-            && let Some(bytes_h) = self
-                .realm
-                .get_property(mem_obj, WASM_MEM_BUFFER)
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw)
-                .and_then(|ab| self.array_buffer_bytes(ab))
+        // concurrently within a call, so this snapshot is observably live. Only the
+        // instances that export memory have a canonical store to mirror into.
+        if let Some(bytes_h) = mem_bytes_h
+            && let Some(dst) = self.realm.bytes_at_mut(bytes_h)
         {
-            let post = inst.memory().to_vec();
-            // The canonical store may have been grown by `mem.grow`; keep its size
-            // and overwrite the prefix the instance produced.
-            if let Some(dst) = self.realm.bytes_at_mut(bytes_h) {
-                let n = post.len().min(dst.len());
-                dst[..n].copy_from_slice(&post[..n]);
-            }
+            let n = state.mem.len().min(dst.len());
+            dst[..n].copy_from_slice(&state.mem[..n]);
+        }
+        // Persist the post-call memory/globals so the next call sees them. (For a
+        // memory-exporting instance the canonical store is authoritative and is
+        // re-read into `set_memory` next call, but persisting here keeps globals,
+        // dropped segments, and the no-exported-memory case correct.)
+        if let Some(id) = inst_id {
+            self.wasm_states.insert(id, state);
         }
         // An `i64` result becomes a BigInt (other types map directly to a Number).
         Ok(match results.first() {
@@ -20712,6 +20781,44 @@ mod tests {
         m
     }
 
+    /// A module exporting one memory (`mem`, min 1 page) and one function
+    /// (`grow_store`, `(param i32) -> i32`) that grows linear memory by a page,
+    /// stores the parameter as a byte at address 70000 (inside the freshly-grown
+    /// region), and returns the new page count. Used by the T6 grow-during-call
+    /// regression. Hand-assembled because `wat_to_binary` only emits function
+    /// exports (not memory exports).
+    fn mem_grow_module_bytes() -> alloc::vec::Vec<u8> {
+        let mut m = alloc::vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Type section: type0 (i32)->(i32)
+        m.extend([0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]);
+        // Function section: func0:type0
+        m.extend([0x03, 0x02, 0x01, 0x00]);
+        // Memory section: one memory, min 1 page (no max).
+        m.extend([0x05, 0x03, 0x01, 0x00, 0x01]);
+        // Export section: "mem" mem0, "grow_store" func0
+        m.extend([
+            0x07, 0x14, 0x02, // section id, size, count
+            0x03, b'm', b'e', b'm', 0x02, 0x00, // "mem" -> memory 0
+            0x0a, b'g', b'r', b'o', b'w', b'_', b's', b't', b'o', b'r', b'e', 0x00,
+            0x00, // "grow_store" -> func 0
+        ]);
+        // Code section: func0 grows by a page, stores param at 70000, returns size.
+        m.extend([
+            0x0a, 0x14, 0x01, // section id, size, count
+            0x12, // body size (18 bytes)
+            0x00, // 0 local declarations
+            0x41, 0x01, // i32.const 1
+            0x40, 0x00, // memory.grow
+            0x1a, // drop (the old page count)
+            0x41, 0xf0, 0xa2, 0x04, // i32.const 70000
+            0x20, 0x00, // local.get 0
+            0x3a, 0x00, 0x00, // i32.store8 align=0 offset=0
+            0x3f, 0x00, // memory.size
+            0x0b, // end
+        ]);
+        m
+    }
+
     /// Renders `bytes` as a JS array literal (so a test can build a `Uint8Array`).
     fn js_byte_array(bytes: &[u8]) -> alloc::string::String {
         let mut s = alloc::string::String::from("[");
@@ -20785,6 +20892,71 @@ mod tests {
                  [old, mem.buffer.byteLength, same, u8[70000]].join(',');"
             ),
             "1,131072,true,126"
+        );
+    }
+
+    /// Runs `src` with the module compiled from `wat` pre-installed as the global
+    /// `MOD` (a JS array of byte numbers), returning the completion display.
+    fn run_wasm_wat(wat: &str, src: &str) -> alloc::string::String {
+        let bin = crate::wasm_spec::wat_to_binary(wat).expect("compile WAT");
+        let combined = alloc::format!("const MOD = {}; {src}", js_byte_array(&bin));
+        let program = Parser::parse_program(&combined).expect("parse");
+        let mut interp = Interp::new();
+        let value = interp.run(&program).expect("exec");
+        interp.realm().to_display_string(value)
+    }
+
+    /// Like [`run_wasm`] but installs the bytes of [`mem_grow_module_bytes`].
+    fn run_wasm_grow(src: &str) -> alloc::string::String {
+        let combined = alloc::format!(
+            "const MOD = {}; {src}",
+            js_byte_array(&mem_grow_module_bytes())
+        );
+        let program = Parser::parse_program(&combined).expect("parse");
+        let mut interp = Interp::new();
+        let value = interp.run(&program).expect("exec");
+        interp.realm().to_display_string(value)
+    }
+
+    #[test]
+    fn wasm_grow_during_call_persists_new_page(/* T6 */) {
+        // An export that GROWS memory by a page *inside the call* and then stores a
+        // byte into the freshly-grown region. After the call, a JS `Uint8Array` over
+        // `Memory.buffer` must observe both the larger byteLength and the new byte —
+        // i.e. the boundary copy-out must not truncate to the pre-call size, and the
+        // canonical store must be grown to match the instance's enlarged memory.
+        assert_eq!(
+            run_wasm_grow(
+                "const inst = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array(MOD)));
+                 const mem = inst.exports.mem;
+                 const pages = inst.exports.grow_store(0x5a);   // store 90 at 70000
+                 const u8 = new Uint8Array(mem.buffer);
+                 [pages, mem.buffer.byteLength, u8[70000]].join(',');"
+            ),
+            "2,131072,90"
+        );
+    }
+
+    #[test]
+    fn wasm_repeat_calls_reuse_instance_state() {
+        // A mutable global counter incremented by an export must persist across
+        // separate JS→wasm calls (proving the same cached module + carried-over
+        // instance state are reused rather than re-initialized each call).
+        let wat = "(module
+            (global $c (mut i32) (i32.const 0))
+            (func (export \"inc\") (result i32)
+              (global.set $c (i32.add (global.get $c) (i32.const 1)))
+              (global.get $c)))";
+        assert_eq!(
+            run_wasm_wat(
+                wat,
+                "const inst = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array(MOD)));
+                 const a = inst.exports.inc();   // 1
+                 const b = inst.exports.inc();   // 2
+                 const c = inst.exports.inc();   // 3
+                 [a, b, c].join(',');"
+            ),
+            "1,2,3"
         );
     }
 
