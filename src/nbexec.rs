@@ -5382,10 +5382,26 @@ impl<'a> Interp<'a> {
         if id == N_DATA_VIEW {
             let obj = self.realm.new_object();
             let buf = args.first().copied().unwrap_or(NanBox::undefined());
+            let mut buf_len = 0usize;
             if let Some(bh) = buf.as_handle().map(Handle::from_raw) {
                 self.guard_detached_buffer(bh)?;
+                buf_len = self
+                    .array_buffer_bytes(bh)
+                    .and_then(|h| self.realm.bytes_len(h))
+                    .unwrap_or(0);
             }
             let off = args.get(1).map_or(0.0, |v| self.realm.to_number(*v));
+            // M1: a negative/non-integer offset, or one past the buffer, is a
+            // RangeError — never trusted blindly into the access path.
+            if !off.is_finite() || off < 0.0 || (off as usize as f64) != off {
+                let m = self.new_str("Invalid DataView offset");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            let byte_off = off as usize;
+            if byte_off > buf_len {
+                let m = self.new_str("Start offset is outside the bounds of the buffer");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
             self.realm.set_hidden_property(obj, DATA_VIEW_BUF, buf);
             self.realm
                 .set_hidden_property(obj, DATA_VIEW_OFF, NanBox::number(off));
@@ -5394,9 +5410,19 @@ impl<'a> Interp<'a> {
             if let Some(len) = args.get(2)
                 && !matches!(len.unpack(), Unpacked::Undefined)
             {
-                let n = self.realm.to_number(*len);
+                let raw = self.realm.to_number(*len);
+                // M1: validate `byteOffset + byteLength <= buffer.byteLength` with
+                // checked arithmetic (a saturated length must not wrap past the end).
+                let view_len = self.validate_alloc_len(raw, "Invalid DataView length")?;
+                let fits = byte_off
+                    .checked_add(view_len)
+                    .is_some_and(|end| end <= buf_len);
+                if !fits {
+                    let m = self.new_str("Invalid DataView length: exceeds buffer bounds");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
                 self.realm
-                    .set_hidden_property(obj, DATA_VIEW_LEN, NanBox::number(n));
+                    .set_hidden_property(obj, DATA_VIEW_LEN, NanBox::number(view_len as f64));
             }
             return Ok(NanBox::handle(obj.to_raw()));
         }
@@ -5415,20 +5441,64 @@ impl<'a> Interp<'a> {
                 self.guard_detached_buffer(bh)?;
                 let bytes_h = self.array_buffer_bytes(bh).unwrap();
                 let total = self.realm.bytes_len(bytes_h).unwrap_or(0);
-                let byte_off = args
+                // H2/T1: validate the byteOffset. It must be a non-negative integer
+                // that is a multiple of the element size, else a RangeError.
+                let byte_off = match args
                     .get(1)
                     .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
-                    .map_or(0, |a| self.realm.to_number(*a).max(0.0) as usize);
-                let avail = total.saturating_sub(byte_off);
+                {
+                    Some(a) => {
+                        let raw = self.realm.to_number(*a);
+                        if !raw.is_finite() || raw < 0.0 || (raw as usize as f64) != raw {
+                            let m = self.new_str("Invalid typed array offset");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
+                        let off = raw as usize;
+                        if !off.is_multiple_of(elem_size) {
+                            let m =
+                                self.new_str("start offset must be a multiple of the element size");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
+                        off
+                    }
+                    None => 0,
+                };
+                if byte_off > total {
+                    let m = self.new_str("Start offset is outside the bounds of the buffer");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                let avail = total - byte_off;
                 let length = match args
                     .get(2)
                     .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
                 {
                     Some(a) => {
                         let raw = self.realm.to_number(*a);
-                        self.validate_alloc_len(raw, "Invalid typed array length")?
+                        let len = self.validate_alloc_len(raw, "Invalid typed array length")?;
+                        // H2/T1: `byteOffset + length*elem_size` must fit the buffer.
+                        // Checked arithmetic — a saturated length must not wrap.
+                        let fits = len
+                            .checked_mul(elem_size)
+                            .and_then(|need| byte_off.checked_add(need))
+                            .is_some_and(|end| end <= total);
+                        if !fits {
+                            let m =
+                                self.new_str("Invalid typed array length: exceeds buffer bounds");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
+                        len
                     }
-                    None => avail / elem_size,
+                    None => {
+                        // No explicit length: the view spans the rest of the buffer,
+                        // which must divide evenly into elements.
+                        if !avail.is_multiple_of(elem_size) {
+                            let m = self.new_str(
+                                "buffer length minus the byteOffset is not a multiple of the element size",
+                            );
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
+                        avail / elem_size
+                    }
                 };
                 let view = self
                     .realm
@@ -8223,13 +8293,28 @@ impl<'a> Interp<'a> {
             // or an access running past the end is a RangeError — never an out-of-bounds
             // read (returning 0) or a write that silently grows the buffer.
             let total = self.realm.bytes_len(bh).unwrap_or(0);
+            // M1: clamp the recorded view length to what the *live* buffer can back
+            // (a resizable buffer may have shrunk under the view), so the access can
+            // never run past the real bytes.
             let view_len = self
                 .realm
                 .get_property(handle, DATA_VIEW_LEN)
                 .and_then(|n| n.as_number())
-                .map_or(total.saturating_sub(base), |n| n as usize);
+                .map_or(total.saturating_sub(base), |n| n as usize)
+                .min(total.saturating_sub(base));
             let requested = self.realm.to_number(arg(0)) as i64; // ToIndex: truncates; NaN -> 0
-            if requested < 0 || requested as usize + size > view_len {
+            // Checked arithmetic: a saturated `requested` must not wrap past the
+            // bound check (M2-style overflow). Validate against both the view length
+            // and the live buffer.
+            let in_bounds = requested >= 0 && {
+                let r = requested as usize;
+                r.checked_add(size).is_some_and(|end| end <= view_len)
+                    && base
+                        .checked_add(r)
+                        .and_then(|a| a.checked_add(size))
+                        .is_some_and(|e| e <= total)
+            };
+            if !in_bounds {
                 let m = self.new_str("Offset is outside the bounds of the DataView");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
@@ -21468,5 +21553,169 @@ mod tests {
         assert_eq!(back.as_number(), Some(3.5));
         // The external region bytes are the IEEE-754 encoding of 3.5 at offset 8.
         assert_eq!(&region[8..16], &3.5f64.to_le_bytes());
+    }
+
+    #[test]
+    fn typed_array_view_ctor_validates_bounds() {
+        // H2/T1: a length that overruns the buffer is a RangeError.
+        assert_eq!(
+            run(
+                "try{new Uint32Array(new ArrayBuffer(8),0,100);'no'}catch(e){e instanceof RangeError}"
+            ),
+            "true"
+        );
+        // A misaligned byteOffset (not a multiple of the element size) is a RangeError.
+        assert_eq!(
+            run("try{new Uint16Array(new ArrayBuffer(8),1);'no'}catch(e){e instanceof RangeError}"),
+            "true"
+        );
+        // A byteOffset past the buffer end is a RangeError.
+        assert_eq!(
+            run("try{new Uint8Array(new ArrayBuffer(4),8);'no'}catch(e){e instanceof RangeError}"),
+            "true"
+        );
+        // A trailing-bytes length not divisible by the element size is a RangeError.
+        assert_eq!(
+            run("try{new Uint32Array(new ArrayBuffer(6));'no'}catch(e){e instanceof RangeError}"),
+            "true"
+        );
+        // A valid aligned view still constructs.
+        assert_eq!(
+            run("let v=new Uint16Array(new ArrayBuffer(8),2,3); v.length===3 && v.byteOffset===2"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn dataview_ctor_and_access_validate_bounds() {
+        // M1: an explicit byteLength past the buffer is rejected at construction.
+        assert_eq!(
+            run(
+                "try{new DataView(new ArrayBuffer(8),0,100);'no'}catch(e){e instanceof RangeError}"
+            ),
+            "true"
+        );
+        // M1: a stored over-long length cannot be smuggled into an access either;
+        // a valid view's out-of-range access still throws.
+        assert_eq!(
+            run(
+                "try{new DataView(new ArrayBuffer(8),0,8).getInt32(6);'no'}catch(e){e instanceof RangeError}"
+            ),
+            "true"
+        );
+        // A negative offset is a RangeError.
+        assert_eq!(
+            run("try{new DataView(new ArrayBuffer(8),-1);'no'}catch(e){e instanceof RangeError}"),
+            "true"
+        );
+        // A valid DataView access round-trips.
+        assert_eq!(
+            run(
+                "let dv=new DataView(new ArrayBuffer(8)); dv.setInt32(0,0x01020304); dv.getInt32(0)"
+            ),
+            "16909060"
+        );
+    }
+
+    #[test]
+    fn typed_set_same_kind_fast_path_and_overlap() {
+        // Same-kind copy.
+        assert_eq!(
+            run(
+                "let a=new Uint8Array([1,2,3,4]); let b=new Uint8Array([9,8]); a.set(b,1); a.join(',')"
+            ),
+            "1,9,8,4"
+        );
+        // Overlapping copy within the same backing buffer (sibling views).
+        assert_eq!(
+            run(
+                "let buf=new ArrayBuffer(4); let full=new Uint8Array(buf); full.set([1,2,3,4]); \
+                 let dst=new Uint8Array(buf,1,3); let src=new Uint8Array(buf,0,3); dst.set(src); full.join(',')"
+            ),
+            "1,1,2,3"
+        );
+        // Out-of-range set is a RangeError.
+        assert_eq!(
+            run("try{new Uint8Array(2).set([1,2,3]);'no'}catch(e){e instanceof RangeError}"),
+            "true"
+        );
+        // T2: a saturated offset throws rather than panicking.
+        assert_eq!(
+            run("try{new Uint8Array(4).set([1,2],1e308);'no'}catch(e){e instanceof RangeError}"),
+            "true"
+        );
+        // Different-kind set still coerces correctly (generic path).
+        assert_eq!(
+            run("let a=new Uint8Array(3); a.set(new Float64Array([1.9,2.9,3.9])); a.join(',')"),
+            "1,2,3"
+        );
+    }
+
+    #[test]
+    fn typed_fill_and_copy_within_all_kinds() {
+        // fill on each element kind.
+        for ctor in [
+            "Int8Array",
+            "Uint8Array",
+            "Uint8ClampedArray",
+            "Int16Array",
+            "Uint16Array",
+            "Int32Array",
+            "Uint32Array",
+            "Float32Array",
+            "Float64Array",
+        ] {
+            assert_eq!(
+                run(&alloc::format!(
+                    "let a=new {ctor}(4); a.fill(7,1,3); a.join(',')"
+                )),
+                "0,7,7,0",
+                "fill failed for {ctor}"
+            );
+            assert_eq!(
+                run(&alloc::format!(
+                    "let a=new {ctor}([1,2,3,4]); a.copyWithin(0,2); a.join(',')"
+                )),
+                "3,4,3,4",
+                "copyWithin failed for {ctor}"
+            );
+        }
+        // Uint8Clamped fill clamps.
+        assert_eq!(
+            run("let a=new Uint8ClampedArray(2); a.fill(300); a.join(',')"),
+            "255,255"
+        );
+        // fill with negative bounds (count from the end).
+        assert_eq!(
+            run("let a=new Int32Array(5); a.fill(9,-2); a.join(',')"),
+            "0,0,0,9,9"
+        );
+    }
+
+    #[test]
+    fn typed_array_aliasing_sees_bulk_writes() {
+        // A sibling view over the same buffer observes fill/set/copyWithin writes.
+        assert_eq!(
+            run(
+                "let buf=new ArrayBuffer(8); let a=new Uint8Array(buf); let b=new Uint8Array(buf); \
+                 a.fill(5); b.join(',')"
+            ),
+            "5,5,5,5,5,5,5,5"
+        );
+        assert_eq!(
+            run(
+                "let buf=new ArrayBuffer(4); let a=new Uint8Array(buf); let b=new Uint8Array(buf); \
+                 a.set([10,20,30,40]); a.copyWithin(0,2); b.join(',')"
+            ),
+            "30,40,30,40"
+        );
+        // A DataView aliases a typed-array fill.
+        assert_eq!(
+            run(
+                "let buf=new ArrayBuffer(4); let a=new Uint8Array(buf); let dv=new DataView(buf); \
+                 a.fill(0xFF); dv.getUint32(0).toString(16)"
+            ),
+            "ffffffff"
+        );
     }
 }

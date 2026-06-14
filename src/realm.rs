@@ -407,9 +407,13 @@ impl Realm {
             return Some(NanBox::undefined());
         }
         let size = typed_elem_size(kind);
-        let start = byte_offset + i * size;
+        // Checked offset math: `byte_offset + i*size` cannot overflow for an
+        // in-range `i`, but compute defensively so a corrupt view never wraps.
+        let start = i.checked_mul(size).and_then(|o| byte_offset.checked_add(o));
         let bytes = self.bytes_at(buffer)?;
-        let slice = bytes.get(start..start + size).unwrap_or(&[]);
+        let slice = start
+            .and_then(|s| s.checked_add(size).and_then(|e| bytes.get(s..e)))
+            .unwrap_or(&[]);
         Some(NanBox::number(decode_typed_element(kind, slice)))
     }
 
