@@ -13,10 +13,25 @@
 //!
 //! Pure, safe `alloc`-only Rust. (Rope/slice string *values* — the other half
 //! of item 4 — are a separate concern from these key atoms.)
+//!
+//! # Storage: WTF-8 bytes
+//!
+//! Keys are stored as **WTF-8 bytes** (`Box<[u8]>`), so a property key may carry
+//! lone UTF-16 surrogates (a JS property key is a DOMString — see
+//! [`crate::wtf8`]). [`AtomTable::intern`]/[`AtomTable::get`] keep their `&str`
+//! signatures (the common case), and [`AtomTable::intern_bytes`]/
+//! [`AtomTable::get_bytes`] take surrogate-bearing WTF-8. [`AtomTable::resolve`]
+//! still returns `Option<&str>` for the non-surrogate keys existing callers use
+//! (it declines a surrogate-bearing key — those use
+//! [`AtomTable::resolve_bytes`]); [`AtomTable::resolve_lossy`] always yields a
+//! `String` (surrogates → U+FFFD).
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
+
+use crate::wtf8;
 
 /// An interned string: a small, `Copy` handle that compares in O(1). Only
 /// meaningful within the [`AtomTable`] that produced it.
@@ -43,10 +58,10 @@ impl Atom {
 /// strings share one.
 #[derive(Default)]
 pub struct AtomTable {
-    /// Atom index → its text.
-    strings: Vec<Box<str>>,
-    /// Text → atom, for deduplication on intern.
-    lookup: BTreeMap<Box<str>, Atom>,
+    /// Atom index → its WTF-8 key bytes.
+    strings: Vec<Box<[u8]>>,
+    /// Key bytes → atom, for deduplication on intern.
+    lookup: BTreeMap<Box<[u8]>, Atom>,
 }
 
 impl AtomTable {
@@ -59,11 +74,17 @@ impl AtomTable {
     /// Interns `s`, returning its atom — the same atom every time for equal
     /// strings.
     pub fn intern(&mut self, s: &str) -> Atom {
-        if let Some(&atom) = self.lookup.get(s) {
+        self.intern_bytes(s.as_bytes())
+    }
+
+    /// Interns raw WTF-8 `bytes` (the surrogate-bearing path), returning its
+    /// atom — the same atom every time for equal byte sequences.
+    pub fn intern_bytes(&mut self, bytes: &[u8]) -> Atom {
+        if let Some(&atom) = self.lookup.get(bytes) {
             return atom;
         }
         let atom = Atom(self.strings.len() as u32);
-        let boxed: Box<str> = Box::from(s);
+        let boxed: Box<[u8]> = Box::from(bytes);
         self.strings.push(boxed.clone());
         self.lookup.insert(boxed, atom);
         atom
@@ -72,13 +93,36 @@ impl AtomTable {
     /// The atom for `s` if it has been interned, without interning it.
     #[must_use]
     pub fn get(&self, s: &str) -> Option<Atom> {
-        self.lookup.get(s).copied()
+        self.get_bytes(s.as_bytes())
     }
 
-    /// The text of `atom`, or `None` if it does not belong to this table.
+    /// The atom for raw WTF-8 `bytes` if interned, without interning it.
+    #[must_use]
+    pub fn get_bytes(&self, bytes: &[u8]) -> Option<Atom> {
+        self.lookup.get(bytes).copied()
+    }
+
+    /// The text of `atom` as `&str`, or `None` if it does not belong to this
+    /// table **or** its key bears a lone surrogate (use [`Self::resolve_bytes`]
+    /// or [`Self::resolve_lossy`] for those). Non-surrogate keys — the common
+    /// case — resolve for free.
     #[must_use]
     pub fn resolve(&self, atom: Atom) -> Option<&str> {
+        self.resolve_bytes(atom).and_then(wtf8::as_str)
+    }
+
+    /// The raw WTF-8 key bytes of `atom`, or `None` if it does not belong to
+    /// this table. Lossless — preserves lone surrogates.
+    #[must_use]
+    pub fn resolve_bytes(&self, atom: Atom) -> Option<&[u8]> {
         self.strings.get(atom.0 as usize).map(AsRef::as_ref)
+    }
+
+    /// The text of `atom` as a `String`, lossily (lone surrogates → U+FFFD), or
+    /// `None` if it does not belong to this table.
+    #[must_use]
+    pub fn resolve_lossy(&self, atom: Atom) -> Option<String> {
+        self.resolve_bytes(atom).map(wtf8::to_string_lossy)
     }
 
     /// The number of distinct interned strings.
@@ -149,6 +193,39 @@ mod tests {
         let a = t.intern("z");
         assert_eq!(Atom::from_index(a.index()), a);
         assert_eq!(t.resolve(Atom::from_index(a.index())), Some("z"));
+    }
+
+    #[test]
+    fn surrogate_keys_round_trip_via_bytes() {
+        let mut t = AtomTable::new();
+        // A property key bearing a lone high surrogate.
+        let key = crate::wtf8::from_utf16(&[0x6B, 0xD800]); // "k\uD800"
+        let a = t.intern_bytes(&key);
+        // Interning the same bytes dedups.
+        assert_eq!(t.intern_bytes(&key), a);
+        assert_eq!(t.get_bytes(&key), Some(a));
+        // Lossless byte resolution.
+        assert_eq!(t.resolve_bytes(a), Some(key.as_slice()));
+        // `resolve` (str) declines a surrogate-bearing key.
+        assert_eq!(t.resolve(a), None);
+        // Lossy resolution replaces the surrogate.
+        assert_eq!(t.resolve_lossy(a).as_deref(), Some("k\u{FFFD}"));
+        // A normal key still resolves as &str.
+        let b = t.intern("plain");
+        assert_eq!(t.resolve(b), Some("plain"));
+        // The surrogate key and a near-identical plain key are distinct atoms.
+        let c = t.intern("k");
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn intern_str_and_bytes_agree() {
+        let mut t = AtomTable::new();
+        let a = t.intern("hi");
+        let b = t.intern_bytes("hi".as_bytes());
+        assert_eq!(a, b);
+        assert_eq!(t.get("hi"), Some(a));
+        assert_eq!(t.get_bytes("hi".as_bytes()), Some(a));
     }
 
     #[test]

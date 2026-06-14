@@ -86,6 +86,12 @@ pub mod atom;
 /// budgets) with safe defaults, overridable per [`realm::Realm`].
 pub mod limits;
 
+/// WTF-8 string codec: UTF-8 extended to encode lone UTF-16 surrogates, so
+/// DOMString values round-trip losslessly. The storage foundation for rope/atom.
+/// Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod wtf8;
+
 /// Rope strings: lazy O(1) concatenation so building a string piecewise is not
 /// quadratic. Needs `alloc`.
 #[cfg(feature = "alloc")]

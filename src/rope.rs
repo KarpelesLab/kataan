@@ -14,11 +14,25 @@
 //!
 //! Pure, safe `alloc`-only Rust. (Small-string inlining is a later refinement;
 //! the tree already fixes the asymptotics that bite real code.)
+//!
+//! # Storage: WTF-8 bytes
+//!
+//! Leaves hold **WTF-8 bytes** (`Box<[u8]>`), not `Box<str>`, so a string may
+//! carry lone UTF-16 surrogates (DOMString semantics — see [`crate::wtf8`]). A
+//! string with no surrogates is byte-identical to its UTF-8, so the common case
+//! is unchanged. [`Rope::from`]/[`Rope::leaf`] store a `&str`'s (valid-WTF-8)
+//! bytes; [`Rope::from_wtf8`]/[`Rope::from_bytes`] take surrogate-bearing bytes.
+//! [`Rope::materialize_bytes`] returns the WTF-8 bytes; [`Rope::materialize`]
+//! and `Display` stay `String`-typed and are **lossy** (surrogates → U+FFFD),
+//! so existing `&str`/`String` callers compile and behave unchanged for
+//! non-surrogate strings. Surrogate-correct accessors land in a later milestone.
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+
+use crate::wtf8;
 
 /// Maximum length, in bytes, of a string the engine will build by
 /// concatenation. A `+` whose result would exceed this is a `RangeError`
@@ -31,8 +45,8 @@ pub const MAX_STRING_LEN: usize = crate::limits::DEFAULT_MAX_STRING_LEN;
 pub struct Rope(Rc<Node>);
 
 enum Node {
-    /// A contiguous run of text.
-    Leaf(Box<str>),
+    /// A contiguous run of WTF-8 bytes.
+    Leaf(Box<[u8]>),
     /// The concatenation of two ropes, with the total byte length cached.
     Concat { left: Rope, right: Rope, len: usize },
 }
@@ -44,10 +58,25 @@ impl Rope {
         Self::leaf("")
     }
 
-    /// A leaf rope holding `s`.
+    /// A leaf rope holding `s` (stored as its UTF-8 bytes, which are valid
+    /// WTF-8).
     #[must_use]
     pub fn leaf(s: &str) -> Self {
-        Rope(Rc::new(Node::Leaf(Box::from(s))))
+        Rope(Rc::new(Node::Leaf(Box::from(s.as_bytes()))))
+    }
+
+    /// A leaf rope holding raw WTF-8 `bytes` — the surrogate-bearing path. The
+    /// bytes are taken as-is (assumed already well-formed WTF-8, e.g. from
+    /// [`crate::wtf8::from_utf16`] or another rope's [`Rope::materialize_bytes`]).
+    #[must_use]
+    pub fn from_wtf8(bytes: Vec<u8>) -> Self {
+        Rope(Rc::new(Node::Leaf(bytes.into_boxed_slice())))
+    }
+
+    /// A leaf rope copying raw WTF-8 `bytes`.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Rope(Rc::new(Node::Leaf(Box::from(bytes))))
     }
 
     /// The total length in bytes (O(1) — cached).
@@ -105,17 +134,18 @@ impl Rope {
         self.concat(&Rope::leaf(s))
     }
 
-    /// Materializes the rope into a flat `String` in O(n), iteratively (so a
-    /// deeply nested rope cannot overflow the stack). (`Display`/`ToString` are
-    /// also implemented; this form pre-allocates the exact capacity.)
+    /// Materializes the rope into a flat WTF-8 byte buffer in O(n), iteratively
+    /// (so a deeply nested rope cannot overflow the stack). This is the
+    /// lossless form — lone surrogates are preserved. Callers wanting a real
+    /// `&str`/`String` use [`Rope::materialize`] (lossy).
     #[must_use]
-    pub fn materialize(&self) -> String {
-        let mut out = String::with_capacity(self.len());
+    pub fn materialize_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len());
         // Depth-first, left-to-right, using an explicit stack of pending nodes.
         let mut stack: Vec<&Rope> = alloc::vec![self];
         while let Some(node) = stack.pop() {
             match &*node.0 {
-                Node::Leaf(s) => out.push_str(s),
+                Node::Leaf(s) => out.extend_from_slice(s),
                 Node::Concat { left, right, .. } => {
                     // Push right first so left is processed first (LIFO).
                     stack.push(right);
@@ -124,6 +154,16 @@ impl Rope {
             }
         }
         out
+    }
+
+    /// Materializes the rope into a flat `String` in O(n). **Lossy**: any stored
+    /// lone surrogate is replaced with U+FFFD (via [`crate::wtf8::to_string_lossy`]),
+    /// so the signature stays `String` for existing `&str`/`String` callers. A
+    /// non-surrogate string is unchanged. Use [`Rope::materialize_bytes`] for the
+    /// lossless WTF-8 bytes.
+    #[must_use]
+    pub fn materialize(&self) -> String {
+        wtf8::to_string_lossy(&self.materialize_bytes())
     }
 }
 
@@ -136,7 +176,7 @@ impl Drop for Node {
     fn drop(&mut self) {
         // A cheap leaf to swap into a child slot so we can take ownership of the
         // real `Rc<Node>` without recursing through its `Drop`.
-        let sentinel = || Rc::new(Node::Leaf(Box::from("")));
+        let sentinel = || Rc::new(Node::Leaf(Box::from(&[][..])));
         let Node::Concat { left, right, .. } = self else {
             return; // a leaf owns nothing recursive
         };
@@ -172,11 +212,16 @@ impl From<&str> for Rope {
 
 impl core::fmt::Display for Rope {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Stream segments without a temporary allocation.
+        // Stream segments. Leaves are usually plain UTF-8 (the `as_str` fast
+        // path), written without allocation; a leaf bearing lone surrogates is
+        // written lossily (surrogates → U+FFFD), matching `materialize`.
         let mut stack: Vec<&Rope> = alloc::vec![self];
         while let Some(node) = stack.pop() {
             match &*node.0 {
-                Node::Leaf(s) => f.write_str(s)?,
+                Node::Leaf(s) => match wtf8::as_str(s) {
+                    Some(valid) => f.write_str(valid)?,
+                    None => f.write_str(&wtf8::to_string_lossy(s))?,
+                },
                 Node::Concat { left, right, .. } => {
                     stack.push(right);
                     stack.push(left);
@@ -275,6 +320,49 @@ mod tests {
         let r = Rope::leaf("a").push_str("b").concat(&Rope::leaf("cd"));
         assert_eq!(alloc::format!("{r}"), r.materialize());
         assert_eq!(r.materialize(), "abcd");
+    }
+
+    #[test]
+    fn non_surrogate_string_is_byte_identical() {
+        // The common case: a normal string round-trips byte-for-byte through the
+        // rope, exactly as before the WTF-8 storage change.
+        for s in ["", "hello", "héllo 中 😀 mix"] {
+            let r = Rope::from(s);
+            assert_eq!(r.materialize_bytes(), s.as_bytes());
+            assert_eq!(r.materialize(), s);
+            assert_eq!(r.len(), s.len());
+        }
+    }
+
+    #[test]
+    fn lone_surrogate_round_trips_through_rope() {
+        // "a\uD800b" stored via from_wtf8 survives losslessly in the bytes,
+        // while the lossy String form replaces the surrogate with U+FFFD.
+        let bytes = crate::wtf8::from_utf16(&[0x61, 0xD800, 0x62]);
+        let r = Rope::from_wtf8(bytes.clone());
+        assert_eq!(r.materialize_bytes(), bytes);
+        assert_eq!(r.materialize(), "a\u{FFFD}b");
+        assert_eq!(alloc::format!("{r}"), "a\u{FFFD}b");
+        assert_eq!(r.len(), bytes.len()); // byte length, not unit length
+    }
+
+    #[test]
+    fn concat_preserves_surrogate_bytes() {
+        let left = Rope::from("x");
+        let right = Rope::from_wtf8(crate::wtf8::from_utf16(&[0xD800]));
+        let joined = left.concat(&right);
+        let mut expected = alloc::vec![b'x'];
+        expected.extend_from_slice(&crate::wtf8::from_utf16(&[0xD800]));
+        assert_eq!(joined.materialize_bytes(), expected);
+    }
+
+    #[test]
+    fn from_bytes_matches_from_wtf8() {
+        let bytes = crate::wtf8::from_utf16(&[0xDC00, 0x41]);
+        assert_eq!(
+            Rope::from_bytes(&bytes).materialize_bytes(),
+            Rope::from_wtf8(bytes.clone()).materialize_bytes()
+        );
     }
 
     #[test]
