@@ -6700,6 +6700,49 @@ impl<'a> Interp<'a> {
         self.realm.set_element(handle, i, value);
     }
 
+    /// C1: a user-facing array element write (`arr[i] = v`). Like
+    /// [`Self::set_element_coerced`], but when the index would grow the dense
+    /// backing past `limits.max_array_len` the realm refuses the write (a silent
+    /// no-op that would otherwise lose data invisibly); surface that as a
+    /// catchable `RangeError("Invalid array length")` so `a[1e9] = 1` throws
+    /// rather than vanishing. Typed-array views (fixed length, out-of-bounds writes
+    /// are spec no-ops) and frozen/sealed arrays keep their existing behaviour:
+    /// the throw fires only on the dense-array capacity overflow.
+    fn set_element_checked(
+        &mut self,
+        handle: crate::heap::Handle,
+        i: usize,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        // Only a plain dense array can hit the capacity cap; a typed array's
+        // out-of-bounds write is a legitimate no-op, never a RangeError.
+        let over_cap = self.realm.typed_len(handle).is_none()
+            && self.realm.is_array(handle)
+            && i >= self.realm.limits.max_array_len;
+        if over_cap {
+            let m = self.new_str("Invalid array length");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        self.realm.set_element(handle, i, value);
+        Ok(())
+    }
+
+    /// C1: a user-facing `arr.length = n`. The realm refuses to resize past
+    /// `limits.max_array_len`; surface the refusal as a catchable
+    /// `RangeError("Invalid array length")` so `a.length = 1e9` throws rather than
+    /// silently doing nothing.
+    fn set_array_length_checked(
+        &mut self,
+        handle: crate::heap::Handle,
+        n: usize,
+    ) -> Result<(), ExecError> {
+        if !self.realm.set_array_length(handle, n) && n > self.realm.limits.max_array_len {
+            let m = self.new_str("Invalid array length");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok(())
+    }
+
     /// Builds a primitive wrapper object (`new Number`/`String`/`Boolean`,
     /// `Object(primitive)`): an object boxing `prim` behind a `\0prim` slot, with
     /// `\0wraptype` recording the constructor id (for `instanceof`).
@@ -13032,7 +13075,7 @@ impl<'a> Interp<'a> {
                     })
             });
             if let Some(i) = idx {
-                self.set_element_coerced(handle, i, new);
+                self.set_element_checked(handle, i, new)?;
                 return Ok(());
             }
         }
@@ -13077,7 +13120,7 @@ impl<'a> Interp<'a> {
         // `arr.length = n` resizes the array.
         if name == "length" && self.realm.is_array(handle) {
             let n = self.realm.to_number(new).max(0.0) as usize;
-            self.realm.set_array_length(handle, n);
+            self.set_array_length_checked(handle, n)?;
         } else {
             self.realm.set_property(handle, &name, new);
         }
@@ -13903,7 +13946,7 @@ impl<'a> Interp<'a> {
         }
         match property {
             PropertyKey::Number(n) if as_index(*n).is_some() && self.realm.is_array(handle) => {
-                self.set_element_coerced(handle, as_index(*n).unwrap(), new);
+                self.set_element_checked(handle, as_index(*n).unwrap(), new)?;
             }
             PropertyKey::Computed(e) => {
                 let k = self.eval(e)?;
@@ -13912,7 +13955,7 @@ impl<'a> Interp<'a> {
                 if let Some(i) = k.as_number().and_then(as_index)
                     && self.realm.is_array(handle)
                 {
-                    self.set_element_coerced(handle, i, new);
+                    self.set_element_checked(handle, i, new)?;
                 } else {
                     let name = self.coerce_property_key(k)?;
                     if self.allow_property_write(handle, &name)? {
@@ -13925,7 +13968,7 @@ impl<'a> Interp<'a> {
                 // storing a `length` property.
                 if &**s == "length" && self.realm.is_array(handle) {
                     let n = self.realm.to_number(new).max(0.0) as usize;
-                    self.realm.set_array_length(handle, n);
+                    self.set_array_length_checked(handle, n)?;
                 } else if &**s == "prototype"
                     && let Some((func_id, _)) = self.realm.function_at(handle)
                     && let Some(praw) = new.as_handle()
@@ -16226,6 +16269,9 @@ mod tests {
         );
     }
 
+    /// P1/P5/P6: the string-method fast path (single rope flatten, lazy lossy
+    /// `String`, running UTF-16 counts) must not change observable behaviour on
+    /// ordinary or surrogate-bearing strings.
     #[test]
     fn string_method_correctness_after_perf_rework() {
         // charCodeAt / slice / indexOf on ordinary strings.
@@ -16261,6 +16307,39 @@ mod tests {
     /// C1: a dense-array element write or `length` set whose growth would exceed
     /// the configured `max_array_len` cap now throws a catchable
     /// `RangeError("Invalid array length")` instead of being a silent no-op.
+    #[test]
+    fn oversized_array_growth_throws_range_error() {
+        // `a[1e9] = 1` (index 1e9 > the 100M default cap) throws RangeError.
+        assert_eq!(
+            run("var a=[1]; try{a[1e9]=1;'noThrow'}catch(e){e.constructor.name}"),
+            "RangeError"
+        );
+        // `a.length = 1e9` likewise.
+        assert_eq!(
+            run("var a=[1]; try{a.length=1e9;'noThrow'}catch(e){e.constructor.name}"),
+            "RangeError"
+        );
+        // Computed `a["length"] = 1e9` is the same.
+        assert_eq!(
+            run("var a=[1]; try{a['length']=1e9;'noThrow'}catch(e){e.constructor.name}"),
+            "RangeError"
+        );
+        // A within-cap grow / length set still works (no regression).
+        assert_eq!(
+            run("var a=[1]; a[5]=9; JSON.stringify(a)"),
+            "[1,null,null,null,null,9]"
+        );
+        assert_eq!(
+            run("var a=[1,2,3,4,5]; a.length=2; JSON.stringify(a)"),
+            "[1,2]"
+        );
+    }
+
+    /// C2: a deeply nested expression (shallow in the AST via the precedence loop,
+    /// but thousands of native `eval` recursions) throws a catchable `RangeError`
+    /// rather than overflowing the host stack. Run on a generous stack so the
+    /// `max_call_depth` guard fires before the (much larger) real overflow point,
+    /// exactly as the production / test262 harness threads do.
     #[test]
     fn surrogate_search_pad_split_iteration_units() {
         // indexOf/includes over UTF-16 units (astral char shifts the index by 2).

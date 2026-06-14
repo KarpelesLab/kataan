@@ -1256,6 +1256,18 @@ fn run_frame(
             Op::SetElem { arr, index, src } => {
                 let handle = object_handle(regs[*arr as usize])?;
                 let i = num(regs[*index as usize])? as usize;
+                // C1: a dense-array write past the capacity cap is refused by the
+                // realm (a silent no-op); surface it as a catchable
+                // `RangeError("Invalid array length")` so `a[1e9] = 1` throws
+                // rather than vanishing. A typed-array out-of-bounds write stays a
+                // spec no-op.
+                if ctx.realm.typed_len(handle).is_none()
+                    && ctx.realm.is_array(handle)
+                    && i >= ctx.realm.limits.max_array_len
+                {
+                    let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                    handle_throw!(VmError::Thrown(e));
+                }
                 ctx.realm.set_element(handle, i, regs[*src as usize]);
             }
             Op::GetKey { dst, obj, key } => {
@@ -1300,13 +1312,31 @@ fn run_frame(
                 let k = regs[*key as usize];
                 match k.as_number() {
                     Some(n) if ctx.realm.is_array(handle) => {
-                        ctx.realm
-                            .set_element(handle, n as usize, regs[*src as usize]);
+                        // C1: refuse-past-cap surfaces as a catchable RangeError
+                        // (see `Op::SetElem`).
+                        let i = n as usize;
+                        if i >= ctx.realm.limits.max_array_len {
+                            let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                            handle_throw!(VmError::Thrown(e));
+                        }
+                        ctx.realm.set_element(handle, i, regs[*src as usize]);
                     }
                     _ => {
                         // ToPropertyKey: an object key uses its `toString`.
                         let pk = to_primitive(ctx, funcs, k, false);
                         let ks = ctx.realm.to_display_string(pk);
+                        // C1: a computed `arr["length"] = n` (numeric string key) on
+                        // an array resizes; a refusal past the cap throws.
+                        if ctx.realm.is_array(handle) && ks == "length" {
+                            let n = num(regs[*src as usize]).unwrap_or(0.0).max(0.0) as usize;
+                            if !ctx.realm.set_array_length(handle, n)
+                                && n > ctx.realm.limits.max_array_len
+                            {
+                                let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                                handle_throw!(VmError::Thrown(e));
+                            }
+                            continue;
+                        }
                         ctx.realm.set_property(handle, &ks, regs[*src as usize]);
                     }
                 }
@@ -1497,6 +1527,19 @@ fn run_frame(
                 if key.as_str() == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
                     let n = num(regs[*src as usize]).unwrap_or(0.0).max(0.0) as usize;
                     ctx.realm.set_regex_last_index(handle, n);
+                    continue;
+                }
+                // `arr.length = n` resizes the array (truncate/pad). C1: a resize
+                // past the capacity cap is refused by the realm; surface it as a
+                // catchable `RangeError("Invalid array length")` so `a.length = 1e9`
+                // throws rather than silently doing nothing.
+                if key.as_str() == "length" && ctx.realm.is_array(handle) {
+                    let n = num(regs[*src as usize]).unwrap_or(0.0).max(0.0) as usize;
+                    if !ctx.realm.set_array_length(handle, n) && n > ctx.realm.limits.max_array_len
+                    {
+                        let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                        handle_throw!(VmError::Thrown(e));
+                    }
                     continue;
                 }
                 // A setter accessor takes precedence over a data slot.
@@ -6508,6 +6551,48 @@ mod tests {
         let mut realm = Realm::new();
         let value = compile_and_run(&mut realm, &program).expect("compile+run");
         realm.to_display_string(value)
+    }
+
+    /// C1: in the bytecode VM, a dense-array element write or `length` set past
+    /// the `max_array_len` cap raises a catchable `RangeError`. Exercised through
+    /// the production `execute` entry (VM with the tree-walker fallback) since a
+    /// raw `bc()` run has no fallback for the `try`/`catch` and `RangeError` ctor.
+    #[test]
+    fn vm_oversized_array_growth_throws_range_error() {
+        let v = |src: &str| -> String {
+            match execute(src) {
+                Ok((_, value)) => value,
+                Err(e) => alloc::format!("ERR:{e}"),
+            }
+        };
+        // Caught inside JS → RangeError instance.
+        assert_eq!(
+            v("var a=[1]; try{a[1e9]=1;'no'}catch(e){e.constructor.name}"),
+            "RangeError"
+        );
+        assert_eq!(
+            v("var a=[1]; try{a.length=1e9;'no'}catch(e){e.constructor.name}"),
+            "RangeError"
+        );
+        // Uncaught → surfaced as a RangeError completion (not a silent no-op).
+        assert_eq!(
+            v("var a=[1]; a[1e9]=1"),
+            "ERR:RangeError: Invalid array length"
+        );
+        assert_eq!(
+            v("var a=[1]; a.length=1e9"),
+            "ERR:RangeError: Invalid array length"
+        );
+        // Within-cap writes / length sets are unchanged; `arr.length = n` now also
+        // truncates correctly on the VM path.
+        assert_eq!(
+            v("var a=[1]; a[5]=9; JSON.stringify(a)"),
+            "[1,null,null,null,null,9]"
+        );
+        assert_eq!(
+            v("var a=[1,2,3,4,5]; a.length=2; JSON.stringify(a)+':'+a.length"),
+            "[1,2]:2"
+        );
     }
 
     #[test]
