@@ -70,6 +70,33 @@ int kt_version_copy(char *buf, size_t *len);
 int kt_eval(const char *source, size_t source_len, char *out, size_t *out_len);
 
 /*
+ * Evaluate `source` with a pre-installed global ArrayBuffer named `buffer`, built
+ * as an engine-OWNED copy of the caller's `data` region (`data_len` bytes). After
+ * the run, the buffer's (possibly script-mutated) bytes are written back into
+ * `data` in place, so the caller observes JS writes made through a view over
+ * `buffer` (e.g. `new Uint8Array(buffer)[0] = 9`). The completion value's string
+ * is written into `out` per the in/out length convention.
+ *
+ * Returns KT_OK on success, KT_INVALID_INPUT on a parse error / uncaught throw
+ * (`out` holds the message), or the same buffer/pointer/internal codes as kt_eval.
+ * If `data_len > 0`, `data` must point to `data_len` readable/writable bytes.
+ */
+int kt_eval_with_buffer(const char *source, size_t source_len, unsigned char *data,
+                        size_t data_len, char *out, size_t *out_len);
+
+/*
+ * Like kt_eval_with_buffer, but the global ArrayBuffer `buffer` wraps the caller's
+ * `data` region ZERO-COPY: JS writes through a view over `buffer` hit `data` in
+ * place and are visible to the caller immediately after the call returns (no copy
+ * back). The engine does NOT free the region; `data`/`data_len` must remain a
+ * valid, uniquely-owned mutable region for the entire duration of the call.
+ *
+ * Returns the same codes as kt_eval_with_buffer.
+ */
+int kt_eval_with_external_buffer(const char *source, size_t source_len, unsigned char *data,
+                                 size_t data_len, char *out, size_t *out_len);
+
+/*
  * Compile `source` (UTF-8 JavaScript, `source_len` bytes) to a portable `.ktbc`
  * bytecode artifact, written into `out` (capacity *out_len bytes) per the in/out
  * length convention. Call with *out_len == 0 to query the required size.

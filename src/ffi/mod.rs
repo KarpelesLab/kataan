@@ -154,12 +154,196 @@ pub unsafe extern "C" fn kt_eval(
     }
 }
 
+/// Evaluates `source` with a pre-installed global `ArrayBuffer` named `buffer`,
+/// built as an engine-**owned** copy of the caller's `data` region (A6, #11).
+/// After the run, the buffer's (possibly script-mutated) bytes are written back
+/// into `data` in place, so the caller observes JS-level writes through a view
+/// over `buffer`. The completion value's string is written into `out` per the
+/// in/out length convention.
+///
+/// Returns [`KtStatus::Ok`] on success; [`KtStatus::InvalidInput`] (with the
+/// error message in `out`) on a parse error / uncaught throw; a caught panic
+/// yields [`KtStatus::Internal`].
+///
+/// # Safety
+///
+/// `out_len` must be a valid pointer to a `usize`. If `source_len > 0`, `source`
+/// must cover `source_len` readable bytes. If `data_len > 0`, `data` must point
+/// to `data_len` readable/writable bytes (read in, written back). If the output
+/// fits, `out` must point to `*out_len` writable bytes.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_eval_with_buffer(
+    source: *const c_char,
+    source_len: usize,
+    data: *mut u8,
+    data_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if out_len.is_null()
+            || (source.is_null() && source_len != 0)
+            || (data.is_null() && data_len != 0)
+        {
+            return KtStatus::NullPointer;
+        }
+        // SAFETY: caller guarantees `source` covers `source_len` bytes.
+        let sbytes: &[u8] = if source.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+        };
+        let Ok(src) = core::str::from_utf8(sbytes) else {
+            return KtStatus::InvalidInput;
+        };
+        // SAFETY: caller guarantees `data` covers `data_len` readable/writable bytes.
+        let region: &mut [u8] = if data.is_null() {
+            &mut []
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(data, data_len) }
+        };
+        let (text, ok) = match eval_with_owned_buffer(src, region) {
+            Ok(value) => (value, true),
+            Err(message) => (message, false),
+        };
+        // SAFETY: `out_len` is non-null; `out` honors the length convention.
+        match unsafe { copy_out(text.as_bytes(), out, out_len) } {
+            KtStatus::Ok if !ok => KtStatus::InvalidInput,
+            other => other,
+        }
+    }));
+    match outcome {
+        Ok(status) => status as c_int,
+        Err(_) => KtStatus::Internal as c_int,
+    }
+}
+
+/// Evaluates `source` with a pre-installed global `ArrayBuffer` named `buffer`
+/// that wraps the caller's `data` region **zero-copy** (A6, #11): JS writes
+/// through a view over `buffer` hit `data` in place and are observed by the
+/// caller immediately after the call returns — no copy back. The region is *not*
+/// freed by the engine; it must outlive the call. The completion value's string
+/// is written into `out` per the in/out length convention.
+///
+/// Returns [`KtStatus::Ok`] on success; [`KtStatus::InvalidInput`] on a parse
+/// error / uncaught throw; [`KtStatus::Internal`] on a caught panic.
+///
+/// # Safety
+///
+/// All of [`kt_eval_with_buffer`]'s contract, plus: `data`/`data_len` must remain
+/// a valid, **uniquely-owned** mutable region for the entire duration of this
+/// call (no other alias may be used while the engine holds it). The engine
+/// reads and writes it in place and does not deallocate it.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_eval_with_external_buffer(
+    source: *const c_char,
+    source_len: usize,
+    data: *mut u8,
+    data_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if out_len.is_null()
+            || (source.is_null() && source_len != 0)
+            || (data.is_null() && data_len != 0)
+        {
+            return KtStatus::NullPointer;
+        }
+        // SAFETY: caller guarantees `source` covers `source_len` bytes.
+        let sbytes: &[u8] = if source.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+        };
+        let Ok(src) = core::str::from_utf8(sbytes) else {
+            return KtStatus::InvalidInput;
+        };
+        // SAFETY: forwarded to the caller's `kt_eval_with_external_buffer`
+        // contract — `data`/`data_len` is a valid, unique mutable region for the
+        // call; the wrapped buffer is dropped before this returns.
+        let (text, ok) = match unsafe { eval_with_external_buffer(src, data, data_len) } {
+            Ok(value) => (value, true),
+            Err(message) => (message, false),
+        };
+        // SAFETY: `out_len` is non-null; `out` honors the length convention.
+        match unsafe { copy_out(text.as_bytes(), out, out_len) } {
+            KtStatus::Ok if !ok => KtStatus::InvalidInput,
+            other => other,
+        }
+    }));
+    match outcome {
+        Ok(status) => status as c_int,
+        Err(_) => KtStatus::Internal as c_int,
+    }
+}
+
 /// Parses and runs `src`, returning the completion value's string on success or
 /// the thrown value's string on an uncaught throw / parse error.
 #[cfg(feature = "std")]
 fn eval_to_string(src: &str) -> Result<alloc::string::String, alloc::string::String> {
     // The new-representation engine: the bytecode VM with a tree-walker fallback.
     crate::nbvm::execute(src).map(|(_output, completion)| completion)
+}
+
+/// Runs `src` with a pre-installed global `ArrayBuffer` named `buffer`, built as
+/// an engine-**owned** copy of `data` (A6, #11). After the run, the buffer's
+/// (possibly script-mutated) bytes are written back into `data` in place — so a
+/// caller observes JS-level writes through a view over `buffer`, and the owned
+/// store round-trips. Returns the completion string, or an error message.
+#[cfg(feature = "std")]
+fn eval_with_owned_buffer(
+    src: &str,
+    data: &mut [u8],
+) -> Result<alloc::string::String, alloc::string::String> {
+    use alloc::string::ToString;
+    let program = crate::parser::Parser::parse_program(src).map_err(|e| e.to_string())?;
+    let mut interp = crate::nbexec::Interp::new();
+    let buf = interp.array_buffer_from_bytes(data);
+    interp.declare_global("buffer", crate::nanbox::NanBox::handle(buf.to_raw()));
+    let value = interp.run(&program).map_err(|e| alloc::format!("{e:?}"))?;
+    // Copy the post-run store back into the caller's region (round-trip proof).
+    if let Some(bytes_h) = interp.array_buffer_bytes_handle(buf)
+        && let Some(post) = interp.realm().bytes_at(bytes_h)
+    {
+        let n = post.len().min(data.len());
+        data[..n].copy_from_slice(&post[..n]);
+    }
+    Ok(interp.realm().to_display_string(value))
+}
+
+/// Runs `src` with a pre-installed global `ArrayBuffer` named `buffer` that wraps
+/// the caller's `data` region **zero-copy** (A6, #11): JS writes through a view
+/// over `buffer` hit `data` in place, observed by the caller after the call. The
+/// region must stay valid for the duration of the call (it is not freed here).
+/// Returns the completion string, or an error message.
+///
+/// # Safety
+/// `data` must be a unique, valid mutable region for the whole call; no other
+/// alias may be used while the engine holds it.
+#[cfg(feature = "std")]
+#[allow(unsafe_code)]
+unsafe fn eval_with_external_buffer(
+    src: &str,
+    data: *mut u8,
+    len: usize,
+) -> Result<alloc::string::String, alloc::string::String> {
+    use alloc::string::ToString;
+    let program = crate::parser::Parser::parse_program(src).map_err(|e| e.to_string())?;
+    let mut interp = crate::nbexec::Interp::new();
+    // SAFETY: the caller's contract guarantees `data`/`len` is a valid, unique
+    // mutable region for the duration of this call; `None` free => the engine
+    // never deallocates it. The buffer (and any view) is dropped with `interp`
+    // at the end of this function, before the call returns to the caller.
+    #[allow(unsafe_code)]
+    let buf = unsafe { interp.array_buffer_from_external(data, len, None) };
+    interp.declare_global("buffer", crate::nanbox::NanBox::handle(buf.to_raw()));
+    let value = interp.run(&program).map_err(|e| alloc::format!("{e:?}"))?;
+    Ok(interp.realm().to_display_string(value))
 }
 
 /// Compiles `src` to a portable `.ktbc` bytecode artifact, or an error message.
@@ -499,6 +683,85 @@ mod tests {
         let (status, out) = eval_str("[1, 2, 3].map(x => x * x).join(',')");
         assert_eq!(status, KtStatus::Ok);
         assert_eq!(out, "1,4,9");
+    }
+
+    /// Runs `src` once through `kt_eval_with_buffer` over `data` (mutated in
+    /// place), returning `(status, completion)`. A single call with an ample
+    /// `out` is used (no length-query pass), because the owned-buffer entry point
+    /// mutates `data` — re-running it would not be idempotent.
+    #[cfg(feature = "std")]
+    fn eval_buf(src: &str, data: &mut [u8]) -> (KtStatus, alloc::string::String) {
+        let mut buf = alloc::vec![0i8; 256];
+        let mut len: usize = buf.len();
+        let rc = unsafe {
+            kt_eval_with_buffer(
+                src.as_ptr() as *const c_char,
+                src.len(),
+                data.as_mut_ptr(),
+                data.len(),
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        let bytes: alloc::vec::Vec<u8> = buf[..len].iter().map(|&b| b as u8).collect();
+        let text = alloc::string::String::from_utf8(bytes).unwrap();
+        let status = if rc == KtStatus::Ok as i32 {
+            KtStatus::Ok
+        } else {
+            KtStatus::InvalidInput
+        };
+        (status, text)
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn eval_with_owned_buffer_round_trips() {
+        // The script reads the seeded bytes (sum) and mutates one; the owned store
+        // is written back into the caller's `data` (round-trip proof, A6).
+        let mut data = [1u8, 2, 3, 4];
+        let (status, out) = eval_buf(
+            "const v = new Uint8Array(buffer); const s = v[0]+v[1]+v[2]+v[3]; v[0] = 200; s",
+            &mut data,
+        );
+        assert_eq!(status, KtStatus::Ok);
+        assert_eq!(out, "10");
+        assert_eq!(data, [200u8, 2, 3, 4]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn eval_with_external_buffer_is_zero_copy() {
+        // The script writes through a view over the wrapped region; the caller's
+        // own bytes change in place (no copy back is performed — zero-copy, A6).
+        let mut data = [0u8; 8];
+        data[0] = 9;
+        let mut len: usize = 0;
+        let src = "const v = new Uint8Array(buffer); const seen = v[0]; v[5] = 77; seen";
+        unsafe {
+            kt_eval_with_external_buffer(
+                src.as_ptr() as *const c_char,
+                src.len(),
+                data.as_mut_ptr(),
+                data.len(),
+                core::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        let mut buf = alloc::vec![0i8; len];
+        let rc = unsafe {
+            kt_eval_with_external_buffer(
+                src.as_ptr() as *const c_char,
+                src.len(),
+                data.as_mut_ptr(),
+                data.len(),
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, KtStatus::Ok as i32);
+        let bytes: alloc::vec::Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+        assert_eq!(alloc::string::String::from_utf8(bytes).unwrap(), "9");
+        assert_eq!(data[5], 77); // the external region itself was mutated
     }
 
     #[cfg(feature = "std")]

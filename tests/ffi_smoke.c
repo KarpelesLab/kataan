@@ -110,6 +110,35 @@ int main(void) {
         return 1;
     }
 
+    /* kt_eval_with_buffer: a global ArrayBuffer from owned bytes; JS reads the
+     * seeded bytes and mutates one, written back into our region (round-trip). */
+    unsigned char region[4] = {1, 2, 3, 4};
+    const char *bsrc =
+        "const v = new Uint8Array(buffer); const s = v[0]+v[1]+v[2]+v[3]; v[0] = 200; s";
+    out_len = sizeof(out);
+    rc = kt_eval_with_buffer(bsrc, strlen(bsrc), region, sizeof(region), out, &out_len);
+    out[out_len] = '\0';
+    if (rc != KT_OK || strcmp(out, "10") != 0 || region[0] != 200) {
+        fprintf(stderr, "FAIL: kt_eval_with_buffer rc=%d out='%s' region[0]=%d\n",
+                rc, out, region[0]);
+        return 1;
+    }
+    printf("kt_eval_with_buffer: sum=%s, region[0] now %d\n", out, region[0]);
+
+    /* kt_eval_with_external_buffer: zero-copy over our region; the JS write hits
+     * our bytes in place (no copy back), observed right after the call. */
+    unsigned char ext[8] = {9, 0, 0, 0, 0, 0, 0, 0};
+    const char *esrc = "const v = new Uint8Array(buffer); const seen = v[0]; v[5] = 77; seen";
+    out_len = sizeof(out);
+    rc = kt_eval_with_external_buffer(esrc, strlen(esrc), ext, sizeof(ext), out, &out_len);
+    out[out_len] = '\0';
+    if (rc != KT_OK || strcmp(out, "9") != 0 || ext[5] != 77) {
+        fprintf(stderr, "FAIL: kt_eval_with_external_buffer rc=%d out='%s' ext[5]=%d\n",
+                rc, out, ext[5]);
+        return 1;
+    }
+    printf("kt_eval_with_external_buffer: seen=%s, ext[5] now %d (zero-copy)\n", out, ext[5]);
+
     printf("ffi_smoke: all checks passed\n");
     return 0;
 }

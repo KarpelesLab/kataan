@@ -3557,6 +3557,102 @@ impl<'a> Interp<'a> {
         &self.realm
     }
 
+    /// The underlying realm, mutably (e.g. for an embedder to read/write a byte
+    /// store via `bytes_at`/`bytes_at_mut` or build views with `new_typed_array`).
+    pub fn realm_mut(&mut self) -> &mut Realm {
+        &mut self.realm
+    }
+
+    // --- Embedder buffer-creation API (A6, #11) -----------------------------
+    //
+    // These build the *JS-visible* `ArrayBuffer` object — a heap object carrying
+    // the hidden `ARRAY_BUFFER_BYTES` slot, exactly like a JS-created
+    // `ArrayBuffer`, so the engine's `ArrayBuffer.prototype` methods, typed-array
+    // views, `instanceof`, and WASM marshaling all treat it uniformly. The
+    // returned `Handle` is a live heap object; keep it rooted (e.g. install it on
+    // a global, pass it to script, or hold it across a call) to keep it — and its
+    // owned/external `Cell::Bytes` — alive across collection.
+
+    /// Builds a JS-visible `ArrayBuffer` object whose contiguous `Cell::Bytes`
+    /// store is an engine-owned copy of `bytes`. Round-trips through JS like any
+    /// `new ArrayBuffer(n)`; mutations via a view are visible through
+    /// [`realm`](Self::realm)`.bytes_at(buffer_bytes)`.
+    pub fn array_buffer_from_bytes(&mut self, bytes: &[u8]) -> Handle {
+        let obj = self.realm.new_object();
+        let store = self.realm.new_bytes(bytes.to_vec());
+        self.realm
+            .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(store.to_raw()));
+        obj
+    }
+
+    /// Builds a JS-visible `ArrayBuffer` object that wraps an **external**,
+    /// caller-owned memory region `[ptr, ptr+len)` **zero-copy**: JS reads and
+    /// writes (through typed-array/`DataView` views) hit the region in place, and
+    /// `free` (if any) runs when the buffer's `Cell::Bytes` is collected.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null and valid for reads and writes of `len` bytes until
+    /// `free` is invoked (or, if `free` is `None`, for as long as the resulting
+    /// buffer — or any view over it — remains reachable). No other mutable alias
+    /// to the region may be used while the engine holds it. See
+    /// [`Realm::wrap_external_bytes`](crate::realm::Realm::wrap_external_bytes).
+    #[allow(unsafe_code)]
+    pub unsafe fn array_buffer_from_external(
+        &mut self,
+        ptr: *mut u8,
+        len: usize,
+        free: Option<crate::cell::ExternFree>,
+    ) -> Handle {
+        let obj = self.realm.new_object();
+        // SAFETY: forwarded to the caller's contract documented above.
+        #[allow(unsafe_code)]
+        let store = unsafe { self.realm.wrap_external_bytes(ptr, len, free) };
+        self.realm
+            .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(store.to_raw()));
+        obj
+    }
+
+    /// The contiguous `Cell::Bytes` store handle backing the `ArrayBuffer` object
+    /// `buffer`, if it is one — so an embedder can read it back via
+    /// [`realm`](Self::realm)`.bytes_at(..)` or mutate it via `bytes_at_mut`.
+    #[must_use]
+    pub fn array_buffer_bytes_handle(&self, buffer: Handle) -> Option<Handle> {
+        self.array_buffer_bytes(buffer)
+    }
+
+    /// Binds `value` as a global named `name` — declaring it in the global scope
+    /// and installing it on `globalThis` — so subsequently-`run` script can read
+    /// it (e.g. an embedder-built `ArrayBuffer`). Existing bindings of the same
+    /// name are shadowed.
+    pub fn declare_global(&mut self, name: &str, value: NanBox) {
+        self.current.declare(name, value);
+        if let Some(g) = self.global_this.as_handle().map(Handle::from_raw) {
+            self.realm.set_property(g, name, value);
+        }
+    }
+
+    /// Builds a typed-array view of element-`kind` over `buffer` (an `ArrayBuffer`
+    /// object from [`array_buffer_from_bytes`](Self::array_buffer_from_bytes) /
+    /// [`array_buffer_from_external`](Self::array_buffer_from_external) or JS),
+    /// spanning `length` elements starting at byte `offset`. `kind` is the
+    /// engine's element-kind index (its element size is
+    /// [`typed_elem_size`](crate::realm::typed_elem_size); e.g. `1` = `Uint8`,
+    /// `8` = `Float64`). Returns `None` if `buffer` is not an `ArrayBuffer` object.
+    /// `.buffer` on the view returns `buffer` itself (SameValue-stable, shared).
+    pub fn typed_array_over(
+        &mut self,
+        buffer: Handle,
+        kind: u8,
+        offset: usize,
+        length: usize,
+    ) -> Option<Handle> {
+        let bytes_h = self.array_buffer_bytes(buffer)?;
+        Some(
+            self.realm
+                .new_typed_array(bytes_h, buffer, offset, length, kind),
+        )
+    }
+
     /// Captures the object graph reachable from `roots` (the heap objects among
     /// them — primitives are skipped) and serializes it to portable bytes: a D′
     /// snapshot of live values that can later be reloaded into a fresh interpreter
@@ -10322,11 +10418,7 @@ impl<'a> Interp<'a> {
 
     /// An `ArrayBuffer` whose contiguous [`Cell::Bytes`] store is a copy of `bytes`.
     fn make_array_buffer_from_bytes(&mut self, bytes: &[u8]) -> Handle {
-        let obj = self.realm.new_object();
-        let store = self.realm.new_bytes(bytes.to_vec());
-        self.realm
-            .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(store.to_raw()));
-        obj
+        self.array_buffer_from_bytes(bytes)
     }
 
     /// The contiguous byte store handle of the `ArrayBuffer` object `buf`, if it has one.
@@ -20188,4 +20280,68 @@ mod tests {
         );
     }
 
+    // --- A6: embedder buffer-creation API (#11) -----------------------------
+
+    #[test]
+    fn embedder_array_buffer_from_bytes_round_trips() {
+        // An ArrayBuffer built from owned bytes is visible to JS and round-trips:
+        // JS reads the seeded bytes, mutates one, and the owned store reflects it.
+        let mut interp = Interp::new();
+        let buf = interp.array_buffer_from_bytes(&[10, 20, 30, 40]);
+        interp.declare_global("buf", NanBox::handle(buf.to_raw()));
+        let program = Parser::parse_program(
+            "const v = new Uint8Array(buf); const sum = v[0]+v[1]+v[2]+v[3]; v[1] = 99; sum",
+        )
+        .expect("parse");
+        let value = interp.run(&program).expect("exec");
+        assert_eq!(interp.realm().to_display_string(value), "100");
+        // The owned store now reads back the JS mutation.
+        let bytes_h = interp.array_buffer_bytes_handle(buf).expect("bytes");
+        assert_eq!(interp.realm().bytes_at(bytes_h).unwrap(), &[10, 99, 30, 40]);
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // wraps a leaked 'static region zero-copy (A6)
+    fn embedder_array_buffer_from_external_is_zero_copy() {
+        // A `'static`/leaked external region wrapped zero-copy: a JS write through
+        // a view changes the *external region itself* (proving no copy was made).
+        let region: &'static mut [u8] = alloc::vec![0u8; 8].leak();
+        region[0] = 1;
+        let ptr = region.as_mut_ptr();
+        let len = region.len();
+        let mut interp = Interp::new();
+        // SAFETY: `region` is a leaked `'static` allocation; it stays valid for the
+        // realm's lifetime and is never aliased mutably elsewhere during the run.
+        let buf = unsafe { interp.array_buffer_from_external(ptr, len, None) };
+        interp.declare_global("ext", NanBox::handle(buf.to_raw()));
+        let program = Parser::parse_program(
+            "const v = new Uint8Array(ext); const seen = v[0]; v[3] = 222; v[7] = 111; seen",
+        )
+        .expect("parse");
+        let value = interp.run(&program).expect("exec");
+        // JS saw the externally-seeded byte...
+        assert_eq!(interp.realm().to_display_string(value), "1");
+        // ...and the external region itself observed the JS writes (zero-copy).
+        assert_eq!(region[3], 222);
+        assert_eq!(region[7], 111);
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // wraps a leaked 'static region zero-copy (A6)
+    fn embedder_typed_array_over_external_buffer() {
+        // `typed_array_over` builds a Float64 view over an external buffer; a JS
+        // store is reflected in the raw region (decoded via the same view).
+        let region: &'static mut [u8] = alloc::vec![0u8; 16].leak();
+        let ptr = region.as_mut_ptr();
+        let mut interp = Interp::new();
+        // SAFETY: leaked `'static`, uniquely owned for the run.
+        let buf = unsafe { interp.array_buffer_from_external(ptr, 16, None) };
+        let view = interp.typed_array_over(buf, 8, 0, 2).expect("float64 view");
+        // Write 3.5 into element 1 through the realm API, read it back.
+        interp.realm_mut().typed_set(view, 1, NanBox::number(3.5));
+        let back = interp.realm().typed_get(view, 1).unwrap();
+        assert_eq!(back.as_number(), Some(3.5));
+        // The external region bytes are the IEEE-754 encoding of 3.5 at offset 8.
+        assert_eq!(&region[8..16], &3.5f64.to_le_bytes());
+    }
 }
