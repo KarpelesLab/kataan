@@ -61,7 +61,17 @@ pub struct Regex {
     /// the `u` flag is set, so it is only a distinct allocation for non-`u`
     /// patterns. The adapters run it with code-point reads over the scalar
     /// subject, so an astral `char` matches `.`/a literal atomically as before.
-    scalar_prog: Vec<vm::Inst>,
+    ///
+    /// Built **lazily** on the first adapter call (RE-P2): the interpreter never
+    /// uses the `&str`/`&[char]` adapters (it scans via `captures_in_u16` /
+    /// `find_in_u16`), so for every real compile this second parse+compile is
+    /// skipped entirely. Only the in-crate tests exercise the adapters, and they
+    /// pay the cost once per `Regex`. `OnceCell` keeps `Regex` single-threaded
+    /// (it lives behind an `Rc`, never shared across threads).
+    scalar_prog: core::cell::OnceCell<Vec<vm::Inst>>,
+    /// The original pattern source, retained so [`scalar_prog`](Self::scalar_prog)
+    /// can be parsed+compiled lazily on first adapter use.
+    source: alloc::string::String,
     /// Number of capturing groups (excluding the whole-match group 0).
     group_count: usize,
     /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -137,26 +147,40 @@ impl Regex {
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, RegexError> {
         let flags = Flags::parse(flags)?;
         // The native u16 program follows the `u` flag (splitting astral literals
-        // in non-`u` mode). The legacy adapters need scalar-atomic matching, which
-        // is exactly a unicode-mode compile, so parse/compile that variant too —
-        // reusing the native program when `u` is already set.
+        // in non-`u` mode). The scalar-atomic adapter program is built lazily on
+        // first `&str`/`&[char]` use (RE-P2) — the interpreter never takes that
+        // path, so this is the only compile that runs for real callers.
         let (ast, _, group_names) = parser::parse(pattern, flags.unicode)?;
         let (prog, group_count) = compile::compile(&ast, &group_names, flags.unicode)?;
-        let scalar_prog = if flags.unicode {
-            // Same compile; clone it for the adapter path.
-            let (sp, _) = compile::compile(&ast, &group_names, true)?;
-            sp
-        } else {
-            let (ast_u, _, gn_u) = parser::parse(pattern, true)?;
-            let (sp, _) = compile::compile(&ast_u, &gn_u, true)?;
-            sp
-        };
         Ok(Regex {
             prog,
-            scalar_prog,
+            scalar_prog: core::cell::OnceCell::new(),
+            source: alloc::string::String::from(pattern),
             group_count,
             group_names,
             flags,
+        })
+    }
+
+    /// The scalar-atomic adapter program, compiled on first use (RE-P2).
+    ///
+    /// Compiled in unicode (code-point) mode so each Unicode scalar is one atom —
+    /// the pre-UTF-16 behavior the `&str`/`&[char]` adapters must preserve. When
+    /// the `u` flag is already set this is the same compile as `prog`; we still
+    /// build a fresh copy here, but only the first adapter call pays for it.
+    fn scalar_prog(&self) -> &[vm::Inst] {
+        self.scalar_prog.get_or_init(|| {
+            // Re-parse/compile in unicode mode. The pattern compiled cleanly in
+            // `new` (otherwise this `Regex` would not exist), and the only
+            // difference here is `unicode = true`, which never introduces a new
+            // failure for a pattern that already parsed — so fall back to an empty
+            // program in the impossible error case rather than panicking.
+            let Ok((ast, _, gn)) = parser::parse(&self.source, true) else {
+                return Vec::new();
+            };
+            compile::compile(&ast, &gn, true)
+                .map(|(sp, _)| sp)
+                .unwrap_or_default()
         })
     }
 
@@ -267,7 +291,7 @@ impl Regex {
         // the unsplit literal/`.`/class — exactly the legacy `&[char]` behavior.
         let mut adapter_flags = self.flags;
         adapter_flags.unicode = true;
-        let caps = self.scan(&self.scalar_prog, &units, unit_start, adapter_flags)?;
+        let caps = self.scan(self.scalar_prog(), &units, unit_start, adapter_flags)?;
 
         // Translate every span from unit indices back to char indices. A scalar
         // subject only ever has matches on whole-char boundaries, so each unit

@@ -295,3 +295,35 @@ fn parser_deep_nesting_rejected() {
     let ok: alloc::string::String = "(".repeat(50) + "a" + &")".repeat(50);
     assert!(Regex::new(&ok, "").is_ok());
 }
+
+#[test]
+fn lazy_scalar_prog_reused_is_consistent() {
+    // RE-P2: the scalar adapter program is built lazily on first `&str` use; a
+    // single compiled `Regex` reused across many adapter calls must keep
+    // returning identical results (the `OnceCell` is filled once, not rebuilt).
+    let r = re(r"(\d+)", "");
+    for _ in 0..5 {
+        assert_eq!(r.captures_from("a12b", 0).unwrap().whole(), (1, 3));
+        assert_eq!(r.find_from("xx99", 0), Some((2, 4)));
+        assert!(r.is_match("z7"));
+    }
+
+    // The native u16 path (what the interpreter uses) and the scalar adapter path
+    // agree for the same reused regex, and stay consistent over repeated calls.
+    let g = re(r"(\d+)", "g");
+    for _ in 0..3 {
+        let units = u16s("a1b22c333");
+        let mut pos = 0;
+        let mut found = alloc::vec::Vec::new();
+        while let Some((s, e)) = g.find_in_u16(&units, pos) {
+            found.push((s, e));
+            pos = if e > s { e } else { e + 1 };
+        }
+        assert_eq!(found, alloc::vec![(1, 2), (3, 5), (6, 9)]);
+    }
+
+    // Astral scalar atomicity through the lazily-built scalar program: an astral
+    // char is one atom for `.` on the `&str` adapter path.
+    let dot = re(".", "");
+    assert_eq!(dot.find_from("😀x", 0), Some((0, 1)));
+}
