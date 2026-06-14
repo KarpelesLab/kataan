@@ -1917,6 +1917,18 @@ impl Realm {
     }
 
     fn compare(&self, a: NanBox, b: NanBox) -> Option<core::cmp::Ordering> {
+        // Fast path: two real string cells compare by their WTF-8 bytes, with no
+        // `String` allocation (a single-leaf string borrows its bytes zero-copy).
+        // WTF-8 byte order matches UTF-16 code-unit order across the BMP, the
+        // accepted basis for JS string ordering here, and — unlike a lossy
+        // `materialize()` — keeps lone surrogates distinct.
+        if let (Some(ha), Some(hb)) = (a.as_handle(), b.as_handle()) {
+            let ca = self.heap.get(Handle::from_raw(ha)).and_then(Cell::as_str);
+            let cb = self.heap.get(Handle::from_raw(hb)).and_then(Cell::as_str);
+            if let (Some(ra), Some(rb)) = (ca, cb) {
+                return Some(rope_bytes(ra).cmp(&rope_bytes(rb)));
+            }
+        }
         // The abstract relational comparison applies ToPrimitive(Number) to each
         // operand: a string (or an object that stringifies, e.g. an array or plain
         // object) yields a string; everything else (numbers, booleans, and Dates —
@@ -2202,13 +2214,31 @@ impl Realm {
                 let sa = self.heap.get(Handle::from_raw(ha)).and_then(Cell::as_str);
                 let sb = self.heap.get(Handle::from_raw(hb)).and_then(Cell::as_str);
                 match (sa, sb) {
-                    (Some(ra), Some(rb)) => ra.materialize() == rb.materialize(),
+                    // Compare the WTF-8 bytes directly: no `String` allocation, an
+                    // O(1) length fast-reject, and — unlike the old lossy
+                    // `materialize()` (which mapped every lone surrogate to U+FFFD,
+                    // making `"\uD800" === "\uDC00"` wrongly true) — byte equality is
+                    // exact.
+                    (Some(ra), Some(rb)) => {
+                        ra.len() == rb.len() && rope_bytes(ra) == rope_bytes(rb)
+                    }
                     _ => false, // distinct non-string references
                 }
             }
             // At least one primitive: decided by the boxed value itself.
             _ => a.strict_equals(b),
         }
+    }
+}
+
+/// Borrows a rope's WTF-8 bytes zero-copy when it is an unconcatenated leaf, and
+/// only materializes (one `Vec`) for a `Concat` tree. Used by the string-equality
+/// and ordering hot paths so the overwhelmingly common single-leaf string compares
+/// without allocating.
+fn rope_bytes(r: &Rope) -> alloc::borrow::Cow<'_, [u8]> {
+    match r.as_leaf_bytes() {
+        Some(b) => alloc::borrow::Cow::Borrowed(b),
+        None => alloc::borrow::Cow::Owned(r.materialize_bytes()),
     }
 }
 
@@ -2891,5 +2921,120 @@ mod tests {
         assert_eq!(stats.swept, 1);
         assert!(realm.is_live(parent) && realm.is_live(child));
         assert_eq!(realm.string_value(child).as_deref(), Some("attached"));
+    }
+
+    // ---- C1: unbounded-array OOM guard --------------------------------------
+
+    #[test]
+    fn set_element_refuses_to_grow_past_cap_instead_of_aborting() {
+        let mut realm = Realm::new();
+        let arr = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        let cap = realm.limits.max_array_len;
+        // A huge index (`a[1e9] = 1`, well past the 100M cap) must be refused,
+        // not turned into a multi-gigabyte `Vec::resize`.
+        assert!(!realm.set_element(arr, 1_000_000_000, NanBox::number(2.0)));
+        // The array is untouched and still tiny.
+        assert_eq!(realm.array_length(arr), Some(1));
+        // The boundary: exactly `cap` is past the last valid index (`cap - 1`).
+        assert!(!realm.set_element(arr, cap, NanBox::number(3.0)));
+        // `usize::MAX` would overflow `index + 1`; `checked_add` refuses it.
+        assert!(!realm.set_element(arr, usize::MAX, NanBox::number(4.0)));
+        assert_eq!(realm.array_length(arr), Some(1));
+    }
+
+    #[test]
+    fn set_array_length_refuses_past_cap() {
+        let mut realm = Realm::new();
+        let arr = realm.new_array(Vec::new());
+        // `a.length = 1e9` (> 100M cap) is refused, leaving the array empty.
+        assert!(!realm.set_array_length(arr, 1_000_000_000));
+        assert_eq!(realm.array_length(arr), Some(0));
+        // A modest length within the cap still works.
+        assert!(realm.set_array_length(arr, 5));
+        assert_eq!(realm.array_length(arr), Some(5));
+    }
+
+    #[test]
+    fn set_element_within_cap_still_grows() {
+        let mut realm = Realm::new();
+        let arr = realm.new_array(Vec::new());
+        assert!(realm.set_element(arr, 10, NanBox::number(7.0)));
+        assert_eq!(realm.array_length(arr), Some(11));
+        assert_eq!(realm.get_element(arr, 10), NanBox::number(7.0));
+    }
+
+    // ---- P4: byte-exact string equality / ordering --------------------------
+
+    #[test]
+    fn strict_equals_distinguishes_lone_surrogates() {
+        let mut realm = Realm::new();
+        // "\uD800" and "\uDC00" are distinct lone surrogates. The old lossy
+        // `materialize()` mapped both to U+FFFD and wrongly compared them equal;
+        // byte comparison keeps them distinct.
+        let hi = realm.new_string_wtf8(crate::wtf8::from_utf16(&[0xD800]));
+        let lo = realm.new_string_wtf8(crate::wtf8::from_utf16(&[0xDC00]));
+        let hi2 = realm.new_string_wtf8(crate::wtf8::from_utf16(&[0xD800]));
+        assert!(!realm.strict_equals(NanBox::handle(hi.to_raw()), NanBox::handle(lo.to_raw())));
+        // Equal content in distinct allocations is still equal.
+        assert!(realm.strict_equals(NanBox::handle(hi.to_raw()), NanBox::handle(hi2.to_raw())));
+    }
+
+    #[test]
+    fn strict_equals_and_ordering_on_plain_strings_unchanged() {
+        let mut realm = Realm::new();
+        let a = realm.new_string("apple");
+        let a2 = realm.new_string("apple");
+        let b = realm.new_string("banana");
+        let (na, na2, nb) = (
+            NanBox::handle(a.to_raw()),
+            NanBox::handle(a2.to_raw()),
+            NanBox::handle(b.to_raw()),
+        );
+        assert!(realm.strict_equals(na, na2));
+        assert!(!realm.strict_equals(na, nb));
+        assert_eq!(realm.less_than(na, nb), NanBox::boolean(true));
+        assert_eq!(realm.less_than(nb, na), NanBox::boolean(false));
+        // A concatenated rope (no single leaf) compares correctly too.
+        let joined = {
+            let r = realm.heap.get(a).unwrap().as_str().unwrap().clone();
+            let suffix = Rope::leaf("!");
+            realm.heap.alloc(Cell::Str(r.concat(&suffix)))
+        };
+        let nj = NanBox::handle(joined.to_raw());
+        assert!(!realm.strict_equals(na, nj)); // "apple" != "apple!"
+        assert_eq!(realm.less_than(na, nj), NanBox::boolean(true));
+    }
+
+    // ---- H3: truthy without materializing -----------------------------------
+
+    #[test]
+    fn truthy_on_strings_is_emptiness_only() {
+        let mut realm = Realm::new();
+        let empty = realm.new_string("");
+        let nonempty = realm.new_string("x");
+        assert!(!realm.truthy(NanBox::handle(empty.to_raw())));
+        assert!(realm.truthy(NanBox::handle(nonempty.to_raw())));
+        // A lone surrogate is a one-code-unit, non-empty string → truthy.
+        let surr = realm.new_string_wtf8(crate::wtf8::from_utf16(&[0xD800]));
+        assert!(realm.truthy(NanBox::handle(surr.to_raw())));
+    }
+
+    // ---- P2: leaf-byte borrow accessor --------------------------------------
+
+    #[test]
+    fn string_leaf_bytes_borrows_when_unconcatenated() {
+        let mut realm = Realm::new();
+        let leaf = realm.new_string("hi");
+        assert_eq!(realm.string_leaf_bytes(leaf), Some(&b"hi"[..]));
+        // A concatenated rope has no single backing slice.
+        let joined = {
+            let r = realm.heap.get(leaf).unwrap().as_str().unwrap().clone();
+            realm.heap.alloc(Cell::Str(r.concat(&Rope::leaf("!"))))
+        };
+        assert_eq!(realm.string_leaf_bytes(joined), None);
+        assert_eq!(realm.string_bytes(joined).as_deref(), Some(&b"hi!"[..]));
+        // A non-string cell yields `None`.
+        let arr = realm.new_array(Vec::new());
+        assert_eq!(realm.string_leaf_bytes(arr), None);
     }
 }
