@@ -52,8 +52,8 @@ fn stringify_seen(
         })),
         Unpacked::Handle(raw) => {
             let h = Handle::from_raw(raw);
-            if let Some(s) = realm.string_value(h) {
-                return Ok(Some(quote(&s)));
+            if let Some(bytes) = realm.string_bytes(h) {
+                return Ok(Some(quote_wtf8(&bytes)));
             }
             // A bytecode-VM closure is a tagged array but a function — omitted.
             if realm.is_vm_function(h) {
@@ -126,8 +126,8 @@ fn stringify_at(
     match v.unpack() {
         Unpacked::Handle(raw) => {
             let h = Handle::from_raw(raw);
-            if let Some(s) = realm.string_value(h) {
-                return Ok(Some(quote(&s)));
+            if let Some(bytes) = realm.string_bytes(h) {
+                return Ok(Some(quote_wtf8(&bytes)));
             }
             // A bytecode-VM closure is a tagged array but a function — omitted.
             if realm.is_vm_function(h) {
@@ -180,19 +180,44 @@ fn stringify_at(
 }
 
 /// Quotes a string as a JSON string literal.
+///
+/// Iterates UTF-16 code units so a **lone surrogate** is escaped as `\uXXXX`
+/// (per the spec, `JSON.stringify` emits well-formed JSON for any DOMString); a
+/// valid surrogate pair emits the astral character directly. A non-surrogate
+/// string is unchanged.
 #[must_use]
 pub fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    quote_wtf8(s.as_bytes())
+}
+
+/// Like [`quote`] but over raw **WTF-8 bytes**, so lone surrogates round-trip
+/// (escaped as `\uXXXX`). This is the form `JSON.stringify` uses for string
+/// values; [`quote`] is the `&str` convenience wrapper.
+///
+/// Iterates code points: a scalar (BMP or astral) emits its character; a **lone
+/// surrogate** is escaped as `\uXXXX` (valid pairs are already scalars here, so
+/// they emit the astral character directly, matching the spec).
+#[must_use]
+pub fn quote_wtf8(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&alloc::format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    for cp in crate::wtf8::code_points(bytes) {
+        match cp {
+            0x22 => out.push_str("\\\""),
+            0x5C => out.push_str("\\\\"),
+            0x0A => out.push_str("\\n"),
+            0x0D => out.push_str("\\r"),
+            0x09 => out.push_str("\\t"),
+            // C0 controls and lone surrogates → `\uXXXX`.
+            cp if cp < 0x20 || crate::wtf8::is_surrogate(cp) => {
+                out.push_str(&alloc::format!("\\u{cp:04x}"));
+            }
+            // A scalar value (BMP or astral): emit the character.
+            cp => {
+                if let Some(c) = char::from_u32(cp) {
+                    out.push(c);
+                }
+            }
         }
     }
     out.push('"');
@@ -233,7 +258,7 @@ fn parse_value(
         'f' => lit(c, pos, "false", NanBox::boolean(false)),
         '"' => {
             let s = parse_string(c, pos)?;
-            Ok(NanBox::handle(realm.new_string(&s).to_raw()))
+            Ok(NanBox::handle(realm.new_string_wtf8(s).to_raw()))
         }
         '[' => {
             *pos += 1;
@@ -271,7 +296,9 @@ fn parse_value(
                 if c.get(*pos) != Some(&'"') {
                     return Err(String::from("Expected property name in JSON"));
                 }
-                let key = parse_string(c, pos)?;
+                // Property keys live in the `&str`-keyed object layer; a lone
+                // surrogate in a *key* (an exotic edge) is decoded lossily.
+                let key = crate::wtf8::to_string_lossy(&parse_string(c, pos)?);
                 skip_ws(c, pos);
                 if c.get(*pos) != Some(&':') {
                     return Err(String::from("Expected ':' in JSON"));
@@ -320,9 +347,18 @@ fn lit(c: &[char], pos: &mut usize, word: &str, value: NanBox) -> Result<NanBox,
     }
 }
 
-fn parse_string(c: &[char], pos: &mut usize) -> Result<String, String> {
+/// Parses a JSON string literal into **WTF-8 bytes**, preserving lone surrogates
+/// (a `\uXXXX` for a surrogate code point that has no valid partner is kept as a
+/// surrogate, not collapsed to U+FFFD). Adjacent `\uXXXX\uXXXX` halves of a valid
+/// pair combine into the astral scalar. A non-surrogate string is byte-identical
+/// to its UTF-8.
+fn parse_string(c: &[char], pos: &mut usize) -> Result<Vec<u8>, String> {
     *pos += 1; // opening quote
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
+    let push_char = |out: &mut Vec<u8>, ch: char| {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    };
     loop {
         match c.get(*pos) {
             None => return Err(String::from("Unterminated string in JSON")),
@@ -333,32 +369,53 @@ fn parse_string(c: &[char], pos: &mut usize) -> Result<String, String> {
             Some('\\') => {
                 *pos += 1;
                 match c.get(*pos) {
-                    Some('"') => out.push('"'),
-                    Some('\\') => out.push('\\'),
-                    Some('/') => out.push('/'),
-                    Some('n') => out.push('\n'),
-                    Some('r') => out.push('\r'),
-                    Some('t') => out.push('\t'),
-                    Some('b') => out.push('\u{0008}'),
-                    Some('f') => out.push('\u{000c}'),
+                    Some('"') => out.push(b'"'),
+                    Some('\\') => out.push(b'\\'),
+                    Some('/') => out.push(b'/'),
+                    Some('n') => out.push(b'\n'),
+                    Some('r') => out.push(b'\r'),
+                    Some('t') => out.push(b'\t'),
+                    Some('b') => out.push(0x08),
+                    Some('f') => out.push(0x0C),
                     Some('u') => {
-                        let hex: String = c.get(*pos + 1..*pos + 5).unwrap_or(&[]).iter().collect();
-                        let code = u32::from_str_radix(&hex, 16)
-                            .ok()
-                            .and_then(char::from_u32)
-                            .ok_or_else(|| String::from("Invalid \\u escape in JSON"))?;
-                        out.push(code);
+                        let hi = parse_hex4(c, *pos + 1)?;
                         *pos += 4;
+                        // A high surrogate may be followed by `\uXXXX` low half.
+                        if (0xD800..=0xDBFF).contains(&hi)
+                            && c.get(*pos + 1) == Some(&'\\')
+                            && c.get(*pos + 2) == Some(&'u')
+                            && let Ok(lo) = parse_hex4(c, *pos + 3)
+                            && (0xDC00..=0xDFFF).contains(&lo)
+                        {
+                            let cp = 0x1_0000
+                                + ((u32::from(hi) - 0xD800) << 10)
+                                + (u32::from(lo) - 0xDC00);
+                            crate::wtf8::encode_code_point(cp, &mut out);
+                            *pos += 6;
+                        } else {
+                            // A BMP scalar, or a lone surrogate kept as-is.
+                            crate::wtf8::encode_utf16_unit(hi, &mut out);
+                        }
                     }
                     _ => return Err(String::from("Invalid escape in JSON")),
                 }
                 *pos += 1;
             }
             Some(&ch) => {
-                out.push(ch);
+                push_char(&mut out, ch);
                 *pos += 1;
             }
         }
+    }
+}
+
+/// Reads exactly four hex digits starting at `at` into a `u16`.
+fn parse_hex4(c: &[char], at: usize) -> Result<u16, String> {
+    let hex: String = c.get(at..at + 4).unwrap_or(&[]).iter().collect();
+    if hex.len() == 4 {
+        u16::from_str_radix(&hex, 16).map_err(|_| String::from("Invalid \\u escape in JSON"))
+    } else {
+        Err(String::from("Invalid \\u escape in JSON"))
     }
 }
 

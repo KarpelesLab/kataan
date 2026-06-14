@@ -3287,7 +3287,7 @@ impl<'a> Interp<'a> {
             'f' => self.json_lit(c, pos, "false", NanBox::boolean(false)),
             '"' => {
                 let s = self.json_string(c, pos)?;
-                Ok(self.new_str(&s))
+                Ok(self.new_str_bytes(s))
             }
             '[' => {
                 *pos += 1;
@@ -3325,7 +3325,9 @@ impl<'a> Interp<'a> {
                     if c.get(*pos) != Some(&'"') {
                         return Err(self.json_error("Expected property name"));
                     }
-                    let key = self.json_string(c, pos)?;
+                    // Keys live in the `&str`-keyed object layer; a lone surrogate
+                    // in a *key* (an exotic edge) decodes lossily.
+                    let key = crate::wtf8::to_string_lossy(&self.json_string(c, pos)?);
                     skip_ws(c, pos);
                     if c.get(*pos) != Some(&':') {
                         return Err(self.json_error("Expected ':'"));
@@ -3380,11 +3382,12 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Parses a JSON string literal (the opening `"` is at `pos`), handling the
-    /// standard escapes.
-    fn json_string(&mut self, c: &[char], pos: &mut usize) -> Result<String, ExecError> {
+    /// Parses a JSON string literal (the opening `"` is at `pos`) into **WTF-8
+    /// bytes**, preserving lone surrogates (a `\uXXXX` surrogate with no valid
+    /// partner is kept) and combining `\uXXXX\uXXXX` pairs into the astral scalar.
+    fn json_string(&mut self, c: &[char], pos: &mut usize) -> Result<Vec<u8>, ExecError> {
         *pos += 1; // opening quote
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         loop {
             match c.get(*pos) {
                 None => {
@@ -3397,30 +3400,41 @@ impl<'a> Interp<'a> {
                 Some('\\') => {
                     *pos += 1;
                     match c.get(*pos) {
-                        Some('"') => out.push('"'),
-                        Some('\\') => out.push('\\'),
-                        Some('/') => out.push('/'),
-                        Some('n') => out.push('\n'),
-                        Some('t') => out.push('\t'),
-                        Some('r') => out.push('\r'),
-                        Some('b') => out.push('\u{8}'),
-                        Some('f') => out.push('\u{c}'),
+                        Some('"') => out.push(b'"'),
+                        Some('\\') => out.push(b'\\'),
+                        Some('/') => out.push(b'/'),
+                        Some('n') => out.push(b'\n'),
+                        Some('t') => out.push(b'\t'),
+                        Some('r') => out.push(b'\r'),
+                        Some('b') => out.push(0x08),
+                        Some('f') => out.push(0x0C),
                         Some('u') => {
-                            let hex: String =
-                                c.get(*pos + 1..*pos + 5).unwrap_or(&[]).iter().collect();
-                            let code = u32::from_str_radix(&hex, 16)
-                                .ok()
-                                .and_then(char::from_u32)
+                            let hi = json_hex4(c, *pos + 1)
                                 .ok_or_else(|| self.json_error("Invalid \\u escape in JSON"))?;
-                            out.push(code);
                             *pos += 4;
+                            // A high surrogate may pair with a following `\uXXXX`.
+                            if (0xD800..=0xDBFF).contains(&hi)
+                                && c.get(*pos + 1) == Some(&'\\')
+                                && c.get(*pos + 2) == Some(&'u')
+                                && let Some(lo) = json_hex4(c, *pos + 3)
+                                && (0xDC00..=0xDFFF).contains(&lo)
+                            {
+                                let cp = 0x1_0000
+                                    + ((u32::from(hi) - 0xD800) << 10)
+                                    + (u32::from(lo) - 0xDC00);
+                                crate::wtf8::encode_code_point(cp, &mut out);
+                                *pos += 6;
+                            } else {
+                                crate::wtf8::encode_utf16_unit(hi, &mut out);
+                            }
                         }
                         _ => return Err(self.json_error("Invalid escape in JSON")),
                     }
                     *pos += 1;
                 }
                 Some(&ch) => {
-                    out.push(ch);
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                     *pos += 1;
                 }
             }
@@ -3492,8 +3506,8 @@ impl<'a> Interp<'a> {
             })),
             Unpacked::Handle(raw) => {
                 let h = Handle::from_raw(raw);
-                if let Some(s) = self.realm.string_value(h) {
-                    return Ok(Some(json_quote(&s)));
+                if let Some(bytes) = self.realm.string_bytes(h) {
+                    return Ok(Some(json_quote_wtf8(&bytes)));
                 }
                 // A container that is already an ancestor is a cycle → TypeError.
                 if (self.realm.array_elements(h).is_some() || self.realm.object_keys(h).is_some())
@@ -7975,9 +7989,9 @@ impl<'a> Interp<'a> {
             }
             Some(N_STRING) if method == "fromCharCode" => {
                 // Each argument is ToUint16'd into a UTF-16 code unit; the resulting
-                // sequence is then decoded, so an adjacent high/low surrogate pair
-                // combines into one astral code point (a lone surrogate, which UTF-8
-                // can't store, becomes U+FFFD).
+                // sequence is decoded to WTF-8, so an adjacent high/low surrogate
+                // pair combines into one astral code point and a **lone surrogate
+                // is preserved** (DOMString semantics).
                 let units: Vec<u16> = args
                     .iter()
                     .map(|a| {
@@ -7990,10 +8004,7 @@ impl<'a> Interp<'a> {
                         }
                     })
                     .collect();
-                let s: String = char::decode_utf16(units)
-                    .map(|r| r.unwrap_or('\u{FFFD}'))
-                    .collect();
-                return Ok(Some(self.new_str(&s)));
+                return Ok(Some(self.new_str_bytes(crate::wtf8::from_utf16(&units))));
             }
             // `String.fromCodePoint(...cps)` — each argument is a full Unicode
             // code point (may be astral).
@@ -8854,6 +8865,10 @@ impl<'a> Interp<'a> {
 
         // --- string methods ---
         if let Some(s) = self.realm.string_value(handle) {
+            // The lossless WTF-8 bytes — used by the UTF-16-unit-correct ops
+            // (length/index/slice/search/pad/for-of); `s` (lossy `String`) is
+            // still used by case-mapping / normalize / regex (a later milestone).
+            let bytes = self.realm.string_bytes(handle).unwrap_or_default();
             let out = match method {
                 // The locale variants behave like the locale-independent ones here
                 // (no locale-specific case tailoring).
@@ -8861,44 +8876,37 @@ impl<'a> Interp<'a> {
                 "toLowerCase" | "toLocaleLowerCase" => Some(self.new_str(&s.to_lowercase())),
                 "trim" => Some(self.new_str(s.trim())),
                 "charAt" => {
-                    // UTF-16-indexed: the unit at `i` as a one-unit string (a
-                    // lone surrogate renders as U+FFFD via lossy decoding). A
-                    // negative index is out of range (`NaN`/no-arg → 0).
+                    // UTF-16-indexed: the unit at `i` as a one-unit string,
+                    // preserving a lone surrogate (stored via WTF-8). A negative
+                    // index is out of range (`NaN`/no-arg → 0).
                     let out = match str_char_index(self.realm.to_number(arg(0))) {
-                        Some(i) => s
-                            .encode_utf16()
-                            .nth(i)
-                            .map(|u| String::from_utf16_lossy(&[u]))
+                        Some(i) => crate::wtf8::utf16_index(&bytes, i)
+                            .map(|u| crate::wtf8::from_utf16(&[u]))
                             .unwrap_or_default(),
-                        None => String::new(),
+                        None => Vec::new(),
                     };
-                    Some(self.new_str(&out))
+                    Some(self.new_str_bytes(out))
                 }
                 "includes" => {
-                    let needle = self.realm.to_display_string(arg(0));
-                    let chars: Vec<char> = s.chars().collect();
+                    let needle = self.arg_string_bytes(arg(0));
+                    let units = crate::wtf8::utf16_len(&bytes);
                     let pos = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
-                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(chars.len())
+                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(units)
                     };
-                    let sub: String = chars[pos..].iter().collect();
-                    Some(NanBox::boolean(sub.contains(&needle)))
+                    Some(NanBox::boolean(index_of_units(&bytes, &needle, pos) >= 0.0))
                 }
                 "indexOf" => {
-                    let needle = self.realm.to_display_string(arg(0));
-                    // An optional `fromIndex` (char offset) starts the search.
-                    let chars: Vec<char> = s.chars().collect();
+                    let needle = self.arg_string_bytes(arg(0));
+                    // An optional `fromIndex` (UTF-16 unit offset) starts the search.
+                    let units = crate::wtf8::utf16_len(&bytes);
                     let from = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
-                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(chars.len())
+                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(units)
                     };
-                    let byte_off: usize = chars[..from].iter().map(|c| c.len_utf8()).sum();
-                    let idx = s[byte_off..]
-                        .find(&needle)
-                        .map_or(-1.0, |b| s[..byte_off + b].chars().count() as f64);
-                    Some(NanBox::number(idx))
+                    Some(NanBox::number(index_of_units(&bytes, &needle, from)))
                 }
                 "repeat" => {
                     // A negative or `+Infinity` count is a `RangeError`; a finite
@@ -8908,53 +8916,62 @@ impl<'a> Interp<'a> {
                     let n = nf as usize;
                     // A product that fits `usize` can still be enormous
                     // (`"x".repeat(2**40)` ≈ 1 TB); cap the result length too.
-                    let total = n.checked_mul(s.len());
+                    let total = n.checked_mul(bytes.len());
                     let max_string_len = self.realm.limits.max_string_len;
                     if nf < 0.0 || nf.is_infinite() || total.is_none_or(|t| t > max_string_len) {
                         let m = self.new_str("Invalid string length");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
-                    Some(self.new_str(&s.repeat(n)))
+                    // Repeat the WTF-8 bytes so a surrogate-bearing string repeats
+                    // losslessly.
+                    Some(self.new_str_bytes(bytes.repeat(n)))
                 }
                 "startsWith" => {
-                    let needle = self.realm.to_display_string(arg(0));
-                    let chars: Vec<char> = s.chars().collect();
-                    let pos = (self.realm.to_number(arg(1)).max(0.0) as usize).min(chars.len());
-                    let sub: String = chars[pos..].iter().collect();
-                    Some(NanBox::boolean(sub.starts_with(&needle)))
+                    let needle = self.arg_string_bytes(arg(0));
+                    let units = crate::wtf8::utf16_len(&bytes);
+                    let pos = (self.realm.to_number(arg(1)).max(0.0) as usize).min(units);
+                    // A prefix match at exactly `pos` units.
+                    let start_byte = unit_to_byte(&bytes, pos);
+                    let matched = bytes.len() - start_byte >= needle.len()
+                        && bytes[start_byte..start_byte + needle.len()] == needle[..];
+                    Some(NanBox::boolean(matched))
                 }
                 "endsWith" => {
-                    let needle = self.realm.to_display_string(arg(0));
-                    let chars: Vec<char> = s.chars().collect();
+                    let needle = self.arg_string_bytes(arg(0));
+                    let units = crate::wtf8::utf16_len(&bytes);
                     // `endPosition` defaults to the full length.
                     let end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
-                        chars.len()
+                        units
                     } else {
-                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(chars.len())
+                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(units)
                     };
-                    let sub: String = chars[..end].iter().collect();
-                    Some(NanBox::boolean(sub.ends_with(&needle)))
+                    let end_byte = unit_to_byte(&bytes, end);
+                    let matched = end_byte >= needle.len()
+                        && bytes[end_byte - needle.len()..end_byte] == needle[..];
+                    Some(NanBox::boolean(matched))
                 }
                 "slice" => {
-                    let chars: Vec<char> = s.chars().collect();
-                    let (a, b) = slice_bounds(
-                        self.realm.to_number(arg(0)),
-                        arg(1),
-                        &self.realm,
-                        chars.len(),
-                    );
-                    Some(self.new_str(&chars[a..b].iter().collect::<String>()))
+                    // UTF-16-unit range, surrogate-boundary correct.
+                    let units = crate::wtf8::utf16_len(&bytes);
+                    let (a, b) =
+                        slice_bounds(self.realm.to_number(arg(0)), arg(1), &self.realm, units);
+                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(&bytes, a, b)))
                 }
                 "split" => {
-                    let sep = self.realm.to_display_string(arg(0));
+                    let sep = self.arg_string_bytes(arg(0));
                     let mut parts: Vec<NanBox> = if sep.is_empty() {
-                        let chars: Vec<char> = s.chars().collect();
-                        chars
-                            .iter()
-                            .map(|c| self.new_str(&String::from(*c)))
+                        // Empty separator → one entry per UTF-16 code unit (a lone
+                        // surrogate is its own one-unit entry).
+                        let units = crate::wtf8::utf16_len(&bytes);
+                        (0..units)
+                            .map(|i| crate::wtf8::slice_utf16(&bytes, i, i + 1))
+                            .map(|b| self.new_str_bytes(b))
                             .collect()
                     } else {
-                        s.split(&sep).map(|p| self.new_str(p)).collect()
+                        split_units(&bytes, &sep)
+                            .into_iter()
+                            .map(|b| self.new_str_bytes(b))
+                            .collect()
                     };
                     // An optional limit caps the number of returned segments.
                     if !matches!(arg(1).unpack(), Unpacked::Undefined) {
@@ -8975,7 +8992,8 @@ impl<'a> Interp<'a> {
                         match s.find(&from) {
                             Some(pos) => {
                                 let m = self.new_str(&from);
-                                let off = NanBox::number(s[..pos].chars().count() as f64);
+                                // The match position is a UTF-16 unit index.
+                                let off = NanBox::number(s[..pos].encode_utf16().count() as f64);
                                 let whole = self.new_str(&s);
                                 let r = self.call(repl, &[m, off, whole])?;
                                 let rs = self.realm.to_display_string(r);
@@ -9011,7 +9029,8 @@ impl<'a> Interp<'a> {
                             let abs = last + rel;
                             out.push_str(&s[last..abs]);
                             let m = self.new_str(&from);
-                            let off = NanBox::number(s[..abs].chars().count() as f64);
+                            // The match position is a UTF-16 unit index.
+                            let off = NanBox::number(s[..abs].encode_utf16().count() as f64);
                             let whole = self.new_str(&s);
                             let r = self.call(repl, &[m, off, whole])?;
                             out.push_str(&self.realm.to_display_string(r));
@@ -9040,16 +9059,17 @@ impl<'a> Interp<'a> {
                 "at" => {
                     let i = self.realm.to_number(arg(0));
                     // UTF-16-indexed with negative-from-end support.
-                    let units: Vec<u16> = s.encode_utf16().collect();
-                    let idx = if i < 0.0 { units.len() as f64 + i } else { i };
-                    Some(match as_index(idx).and_then(|u| units.get(u)) {
-                        Some(&u) => self.new_str(&String::from_utf16_lossy(&[u])),
-                        None => NanBox::undefined(),
-                    })
+                    let units = crate::wtf8::utf16_len(&bytes);
+                    let idx = if i < 0.0 { units as f64 + i } else { i };
+                    Some(
+                        match as_index(idx).and_then(|u| crate::wtf8::utf16_index(&bytes, u)) {
+                            Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
+                            None => NanBox::undefined(),
+                        },
+                    )
                 }
                 "substring" => {
-                    let chars: Vec<char> = s.chars().collect();
-                    let len = chars.len();
+                    let len = crate::wtf8::utf16_len(&bytes);
                     let clamp = |n: f64| (n.max(0.0) as usize).min(len);
                     let mut a = clamp(self.realm.to_number(arg(0)));
                     let mut b = if matches!(arg(1).unpack(), Unpacked::Undefined) {
@@ -9060,38 +9080,41 @@ impl<'a> Interp<'a> {
                     if a > b {
                         core::mem::swap(&mut a, &mut b);
                     }
-                    Some(self.new_str(&chars[a..b].iter().collect::<String>()))
+                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(&bytes, a, b)))
                 }
                 "substr" => {
-                    let chars: Vec<char> = s.chars().collect();
-                    let len = chars.len() as f64;
+                    let len = crate::wtf8::utf16_len(&bytes);
+                    let lenf = len as f64;
                     let start = self.realm.to_number(arg(0));
                     let start = if start < 0.0 {
-                        (len + start).max(0.0)
+                        (lenf + start).max(0.0)
                     } else {
-                        start.min(len)
+                        start.min(lenf)
                     } as usize;
                     let count = if matches!(arg(1).unpack(), Unpacked::Undefined) {
-                        chars.len() - start
+                        len - start
                     } else {
-                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(chars.len() - start)
+                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(len - start)
                     };
-                    Some(self.new_str(&chars[start..start + count].iter().collect::<String>()))
+                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(&bytes, start, start + count)))
                 }
                 "trimStart" => Some(self.new_str(s.trim_start())),
                 "trimEnd" => Some(self.new_str(s.trim_end())),
                 // A string's `toString`/`valueOf` is the string itself.
                 "toString" | "valueOf" => Some(recv),
-                // Strings are stored as well-formed UTF-8 (lone surrogates cannot
-                // be represented), so these are always well-formed already.
-                "isWellFormed" => Some(NanBox::boolean(true)),
-                "toWellFormed" => Some(self.new_str(&s)),
+                // `isWellFormed`/`toWellFormed`: a string is well-formed iff it has
+                // no lone surrogate. The WTF-8 bytes are valid UTF-8 exactly then.
+                "isWellFormed" => Some(NanBox::boolean(crate::wtf8::is_utf8(&bytes))),
+                "toWellFormed" => {
+                    // Replace each lone surrogate with U+FFFD (the lossy decode).
+                    Some(self.new_str(&crate::wtf8::to_string_lossy(&bytes)))
+                }
                 // `charCodeAt(i)` is the UTF-16 code unit at index `i` (NaN if
                 // out of range); a surrogate half reads as that 16-bit value.
                 "charCodeAt" => {
                     // A negative or out-of-range index is `NaN` (`NaN`/no-arg → 0).
                     let unit = str_char_index(self.realm.to_number(arg(0)))
-                        .and_then(|i| s.encode_utf16().nth(i));
+                        .and_then(|i| crate::wtf8::utf16_index(&bytes, i));
                     Some(unit.map_or(NanBox::number(f64::NAN), |u| NanBox::number(f64::from(u))))
                 }
                 // `codePointAt(i)` combines a surrogate pair at UTF-16 index `i`.
@@ -9099,10 +9122,9 @@ impl<'a> Interp<'a> {
                     let Some(i) = str_char_index(self.realm.to_number(arg(0))) else {
                         return Ok(Some(NanBox::undefined()));
                     };
-                    let units: Vec<u16> = s.encode_utf16().collect();
-                    Some(match units.get(i).copied() {
+                    Some(match crate::wtf8::utf16_index(&bytes, i) {
                         Some(u) if (0xD800..0xDC00).contains(&u) => {
-                            match units.get(i + 1).copied() {
+                            match crate::wtf8::utf16_index(&bytes, i + 1) {
                                 Some(low) if (0xDC00..0xE000).contains(&low) => {
                                     let cp = 0x1_0000
                                         + ((u32::from(u) - 0xD800) << 10)
@@ -9119,63 +9141,51 @@ impl<'a> Interp<'a> {
                 "padStart" => {
                     let target = self.pad_target(self.realm.to_number(arg(0)))?;
                     let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
-                        String::from(" ")
+                        alloc::vec![b' ']
                     } else {
-                        self.realm.to_display_string(arg(1))
+                        self.arg_string_bytes(arg(1))
                     };
-                    Some(self.new_str(&pad_start(&s, target, &pad)))
+                    Some(self.new_str_bytes(pad_units(&bytes, target, &pad, true)))
                 }
                 "padEnd" => {
                     let target = self.pad_target(self.realm.to_number(arg(0)))?;
                     let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
-                        String::from(" ")
+                        alloc::vec![b' ']
                     } else {
-                        self.realm.to_display_string(arg(1))
+                        self.arg_string_bytes(arg(1))
                     };
-                    Some(self.new_str(&pad_end(&s, target, &pad)))
+                    Some(self.new_str_bytes(pad_units(&bytes, target, &pad, false)))
                 }
                 "lastIndexOf" => {
-                    let needle = self.realm.to_display_string(arg(0));
-                    // `fromIndex` (a char index): the match may *start* at or before it;
-                    // `undefined`/`NaN` mean +Infinity (search the whole string).
+                    let needle = self.arg_string_bytes(arg(0));
+                    // `fromIndex` (a UTF-16 unit index): the match may *start* at or
+                    // before it; `undefined`/`NaN` mean +Infinity (whole string).
                     let n = self.realm.to_number(arg(1));
                     let from = if n.is_nan() {
                         usize::MAX
                     } else {
                         n.max(0.0).min(usize::MAX as f64) as usize
                     };
-                    let chars: Vec<char> = s.chars().collect();
-                    let needle_chars: Vec<char> = needle.chars().collect();
-                    let (len, nlen) = (chars.len(), needle_chars.len());
-                    let idx = if nlen == 0 {
-                        from.min(len) as f64
-                    } else if nlen <= len {
-                        let upper = from.min(len - nlen);
-                        (0..=upper)
-                            .rev()
-                            .find(|&k| chars[k..k + nlen] == needle_chars[..])
-                            .map_or(-1.0, |k| k as f64)
-                    } else {
-                        -1.0
-                    };
-                    Some(NanBox::number(idx))
+                    Some(NanBox::number(last_index_of_units(&bytes, &needle, from)))
                 }
-                // `concat` appends each argument's string form.
+                // `concat` appends each argument's string form (WTF-8 bytes, so a
+                // surrogate-bearing receiver or argument concatenates losslessly).
                 "concat" => {
-                    let mut out = s.clone();
+                    let mut out = bytes.clone();
                     for a in args {
                         // ToString each argument, honoring a user `toString`.
                         let p = self.coerce_object(*a, "string")?;
-                        out.push_str(&self.realm.to_display_string(p));
+                        out.extend_from_slice(&self.arg_string_bytes(p));
                     }
-                    Some(self.new_str(&out))
+                    Some(self.new_str_bytes(out))
                 }
                 // `search(str)` — index of the first match (string needle).
                 "search" => {
                     let needle = self.realm.to_display_string(arg(0));
+                    // The result is a UTF-16 unit index.
                     let idx = s
                         .find(&needle)
-                        .map_or(-1.0, |b| s[..b].chars().count() as f64);
+                        .map_or(-1.0, |b| s[..b].encode_utf16().count() as f64);
                     Some(NanBox::number(idx))
                 }
                 // `normalize()` — Unicode normalization; a no-op here (the engine
@@ -10726,6 +10736,25 @@ impl<'a> Interp<'a> {
         NanBox::handle(self.realm.new_string(s).to_raw())
     }
 
+    /// Allocates a heap string from raw **WTF-8 bytes** (lone surrogates
+    /// preserved) and returns its boxed handle.
+    fn new_str_bytes(&mut self, bytes: alloc::vec::Vec<u8>) -> NanBox {
+        NanBox::handle(self.realm.new_string_wtf8(bytes).to_raw())
+    }
+
+    /// The WTF-8 bytes of `v` coerced to a string — lossless when `v` is already
+    /// a string (so a surrogate needle matches surrogate haystack bytes), lossy
+    /// otherwise (numbers/etc. carry no surrogates). Used by the unit-based
+    /// string search ops.
+    fn arg_string_bytes(&self, v: NanBox) -> alloc::vec::Vec<u8> {
+        if let Some(raw) = v.as_handle()
+            && let Some(b) = self.realm.string_bytes(Handle::from_raw(raw))
+        {
+            return b;
+        }
+        self.realm.to_display_string(v).into_bytes()
+    }
+
     /// Sorts `elems` with a JS comparator (a negative result orders `a` before
     /// `b`); without one, by the elements' string forms. Insertion sort, so the
     /// comparator can call back into the interpreter.
@@ -11267,12 +11296,16 @@ impl<'a> Interp<'a> {
         if let Some(elems) = self.realm.elements_vec(h) {
             return Ok(elems);
         }
-        if let Some(s) = self.realm.string_value(h) {
-            let chars: Vec<char> = s.chars().collect();
-            return Ok(chars
-                .iter()
-                .map(|c| self.new_str(&String::from(*c)))
-                .collect());
+        if let Some(bytes) = self.realm.string_bytes(h) {
+            // `for…of` yields one string per Unicode code point; a lone surrogate
+            // is a single item (its own one-unit string).
+            let mut out = Vec::new();
+            for cp in crate::wtf8::code_points(&bytes) {
+                let mut buf = Vec::new();
+                crate::wtf8::encode_code_point(cp, &mut buf);
+                out.push(self.new_str_bytes(buf));
+            }
+            return Ok(out);
         }
         // `Map`/`Set` iterate their entries; `WeakMap`/`WeakSet` are not iterable
         // (they fall through to the not-iterable TypeError below).
@@ -12042,6 +12075,19 @@ impl<'a> Interp<'a> {
         Ok(self.realm.to_display_string(v))
     }
 
+    /// Like [`Self::coerce_to_string`] but returns **WTF-8 bytes**, preserving
+    /// lone surrogates when `v` is already a string. Other kinds (numbers,
+    /// objects via `toString`) never carry surrogates, so their lossy `String`
+    /// form is byte-identical to its UTF-8.
+    fn coerce_to_string_bytes(&mut self, v: NanBox) -> Result<Vec<u8>, ExecError> {
+        if let Some(raw) = v.as_handle()
+            && let Some(bytes) = self.realm.string_bytes(Handle::from_raw(raw))
+        {
+            return Ok(bytes);
+        }
+        Ok(self.coerce_to_string(v)?.into_bytes())
+    }
+
     fn eval(&mut self, expr: &'a Expr) -> Result<NanBox, ExecError> {
         match expr {
             Expr::Null(_) => Ok(NanBox::null()),
@@ -12052,7 +12098,8 @@ impl<'a> Interp<'a> {
                 Ok(NanBox::handle(self.realm.new_bigint(n).to_raw()))
             }
             Expr::Str { value, .. } => {
-                let h = self.realm.new_string(value);
+                // The cooked value is WTF-8 bytes; preserve any lone surrogates.
+                let h = self.realm.new_string_wtf8(value.to_vec());
                 Ok(NanBox::handle(h.to_raw()))
             }
             Expr::Ident(id) => match &*id.name {
@@ -12074,11 +12121,13 @@ impl<'a> Interp<'a> {
                 self.realm.new_regexp(pattern, flags).to_raw(),
             )),
             // A template literal: interleave cooked quasis with interpolations.
+            // Built as WTF-8 bytes so a surrogate-bearing quasi (`` `\uD800` ``)
+            // round-trips.
             Expr::Template(t) => {
-                let mut out = String::new();
+                let mut out: Vec<u8> = Vec::new();
                 for (i, quasi) in t.quasis.iter().enumerate() {
                     match &quasi.cooked {
-                        Some(cooked) => out.push_str(cooked),
+                        Some(cooked) => out.extend_from_slice(cooked),
                         // An invalid escape is allowed only in a *tagged* template; in a
                         // plain template literal it is a SyntaxError.
                         None => {
@@ -12088,11 +12137,10 @@ impl<'a> Interp<'a> {
                     }
                     if let Some(e) = t.expressions.get(i) {
                         let v = self.eval(e)?;
-                        let s = self.coerce_to_string(v)?;
-                        out.push_str(&s);
+                        out.extend_from_slice(&self.coerce_to_string_bytes(v)?);
                     }
                 }
-                Ok(self.new_str(&out))
+                Ok(self.new_str_bytes(out))
             }
             // The comma operator: evaluate all, yield the last.
             Expr::Sequence { expressions, .. } => {
@@ -12116,7 +12164,7 @@ impl<'a> Interp<'a> {
                         .quasis
                         .iter()
                         .map(|q| match q.cooked.as_deref() {
-                            Some(s) => self.new_str(s),
+                            Some(s) => self.new_str_bytes(s.to_vec()),
                             None => NanBox::undefined(),
                         })
                         .collect();
@@ -12939,12 +12987,13 @@ impl<'a> Interp<'a> {
         handle: crate::heap::Handle,
         name: &str,
     ) -> Result<NanBox, ExecError> {
-        // String index access (`"abc"[1]`) → the UTF-16 code unit at the index.
+        // String index access (`"abc"[1]`) → the UTF-16 code unit at the index
+        // (a lone surrogate preserved as a one-unit string).
         if let Ok(i) = name.parse::<usize>()
-            && let Some(s) = self.realm.string_value(handle)
+            && let Some(bytes) = self.realm.string_bytes(handle)
         {
-            return Ok(match s.encode_utf16().nth(i) {
-                Some(u) => self.new_str(&String::from_utf16_lossy(&[u])),
+            return Ok(match crate::wtf8::utf16_index(&bytes, i) {
+                Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
                 None => NanBox::undefined(),
             });
         }
@@ -13305,15 +13354,14 @@ impl<'a> Interp<'a> {
         // string (`new String("hi").length`, `wrapper[0]`).
         if let Some(prim) = self.realm.get_property(handle, PRIM_WRAP)
             && let Some(ph) = prim.as_handle().map(Handle::from_raw)
-            && let Some(s) = self.realm.string_value(ph)
+            && let Some(bytes) = self.realm.string_bytes(ph)
         {
             if name == "length" {
-                return Ok(NanBox::number(s.encode_utf16().count() as f64));
+                return Ok(NanBox::number(crate::wtf8::utf16_len(&bytes) as f64));
             }
             if let Ok(i) = name.parse::<usize>() {
-                let ch = s.chars().nth(i);
-                return Ok(match ch {
-                    Some(c) => self.new_str(c.encode_utf8(&mut [0u8; 4])),
+                return Ok(match crate::wtf8::utf16_index(&bytes, i) {
+                    Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
                     None => NanBox::undefined(),
                 });
             }
@@ -13407,9 +13455,10 @@ impl<'a> Interp<'a> {
             if let Some(len) = self.realm.array_length(handle) {
                 return NanBox::number(len as f64);
             }
-            if let Some(s) = self.realm.string_value(handle) {
-                // `String.length` counts UTF-16 code units (astral chars = 2).
-                return NanBox::number(s.encode_utf16().count() as f64);
+            if let Some(bytes) = self.realm.string_bytes(handle) {
+                // `String.length` counts UTF-16 code units (astral chars = 2,
+                // a lone surrogate = 1).
+                return NanBox::number(crate::wtf8::utf16_len(&bytes) as f64);
             }
         }
         // `Map`/`Set` expose `size`.
@@ -14572,7 +14621,7 @@ fn has_use_strict(stmts: &[Stmt]) -> bool {
         match stmt {
             Stmt::Expr { expression, .. } => match &**expression {
                 Expr::Str { value, .. } => {
-                    if &**value == "use strict" {
+                    if &**value == b"use strict" {
                         return true;
                     }
                 }
@@ -14654,6 +14703,122 @@ fn compound_op(op: AssignOp) -> Result<BinaryOp, ExecError> {
     })
 }
 
+/// The byte offset in WTF-8 `bytes` immediately after the first `unit` UTF-16
+/// code units (clamped to `bytes.len()`). A `unit` landing inside an astral
+/// surrogate pair rounds *down* to that character's start (a search position
+/// never splits a pair).
+fn unit_to_byte(bytes: &[u8], unit: usize) -> usize {
+    let mut units = 0;
+    for (cp, off, len) in wtf8_code_point_iter(bytes) {
+        if units >= unit {
+            return off;
+        }
+        units += if cp >= 0x1_0000 { 2 } else { 1 };
+        let _ = len;
+    }
+    bytes.len()
+}
+
+/// The number of UTF-16 code units in `bytes[..byte_off]`.
+fn byte_to_unit(bytes: &[u8], byte_off: usize) -> usize {
+    crate::wtf8::utf16_len(&bytes[..byte_off.min(bytes.len())])
+}
+
+/// Iterates `(code_point, byte_offset, byte_len)` over WTF-8 `bytes`. A thin
+/// shim over [`crate::wtf8::code_points`] that also tracks the byte offset, for
+/// the unit↔byte conversions the search/slice ops need.
+fn wtf8_code_point_iter(bytes: &[u8]) -> impl Iterator<Item = (u32, usize, usize)> + '_ {
+    let mut off = 0usize;
+    core::iter::from_fn(move || {
+        if off >= bytes.len() {
+            return None;
+        }
+        let start = off;
+        // Re-decode a single code point's byte length from the lead byte.
+        let b0 = bytes[off];
+        let len = if b0 < 0x80 {
+            1
+        } else if b0 < 0xE0 {
+            2
+        } else if b0 < 0xF0 {
+            3
+        } else {
+            4
+        }
+        .min(bytes.len() - off);
+        let cp = crate::wtf8::code_points(&bytes[off..off + len])
+            .next()
+            .unwrap_or(0xFFFD);
+        off += len;
+        Some((cp, start, len))
+    })
+}
+
+/// `String.prototype.indexOf` over UTF-16 units: searches the WTF-8 `hay` for
+/// the WTF-8 `needle` starting at UTF-16 unit `from`, returning the unit index
+/// of the match (or `-1`). Mirrors JS: an empty needle matches at `from`.
+fn index_of_units(hay: &[u8], needle: &[u8], from: usize) -> f64 {
+    let start_byte = unit_to_byte(hay, from);
+    if needle.is_empty() {
+        return byte_to_unit(hay, start_byte) as f64;
+    }
+    let mut i = start_byte;
+    while i + needle.len() <= hay.len() {
+        if &hay[i..i + needle.len()] == needle {
+            return byte_to_unit(hay, i) as f64;
+        }
+        i += 1;
+    }
+    -1.0
+}
+
+/// `String.prototype.lastIndexOf` over UTF-16 units: the last match of `needle`
+/// in `hay` at or before unit `from` (`usize::MAX` for "anywhere"), as a unit
+/// index, or `-1`.
+fn last_index_of_units(hay: &[u8], needle: &[u8], from: usize) -> f64 {
+    let limit_byte = if from == usize::MAX {
+        hay.len()
+    } else {
+        unit_to_byte(hay, from)
+    };
+    if needle.is_empty() {
+        return byte_to_unit(hay, limit_byte.min(hay.len())) as f64;
+    }
+    // A needle longer than the haystack can never match.
+    if needle.len() > hay.len() {
+        return -1.0;
+    }
+    let max_start = hay.len() - needle.len();
+    // The last start byte allowed is min(limit, max_start); scan downward.
+    let upper = limit_byte.min(max_start);
+    for i in (0..=upper).rev() {
+        if &hay[i..i + needle.len()] == needle {
+            return byte_to_unit(hay, i) as f64;
+        }
+    }
+    -1.0
+}
+
+/// Splits WTF-8 `hay` on the non-empty WTF-8 `sep`, returning the segments as
+/// WTF-8 byte buffers (the byte-level split is exact: `sep` is well-formed
+/// WTF-8, so matches land on code-point boundaries and never split a surrogate).
+fn split_units(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + sep.len() <= hay.len() {
+        if &hay[i..i + sep.len()] == sep {
+            out.push(hay[start..i].to_vec());
+            i += sep.len();
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(hay[start..].to_vec());
+    out
+}
+
 /// Computes `[start, end)` char indices for `slice`, handling negative indices
 /// (from the end) and an `undefined` end (to the length), clamped to `[0, len]`.
 fn slice_bounds(start: f64, end_arg: NanBox, realm: &Realm, len: usize) -> (usize, usize) {
@@ -14672,32 +14837,37 @@ fn slice_bounds(start: f64, end_arg: NanBox, realm: &Realm, len: usize) -> (usiz
     (a, b.max(a))
 }
 
-/// `padStart`: left-pads `s` with `pad` (repeated/truncated) to `target` chars.
-fn pad_start(s: &str, target: usize, pad: &str) -> String {
-    let len = s.chars().count();
+/// `padStart`/`padEnd` over UTF-16 units, on WTF-8 bytes: pads `s` with `pad`
+/// (repeated, then truncated to a unit boundary) so the result is `target` units
+/// long. `at_start == true` prepends the filler (padStart); otherwise appends
+/// (padEnd). A `target` no greater than `s`'s length, or an empty `pad`, returns
+/// `s` unchanged. Unit-length aware so an astral pad character counts as two.
+fn pad_units(s: &[u8], target: usize, pad: &[u8], at_start: bool) -> Vec<u8> {
+    let len = crate::wtf8::utf16_len(s);
     if len >= target || pad.is_empty() {
-        return String::from(s);
+        return s.to_vec();
     }
     let need = target - len;
-    let filler = build_filler(need, pad);
-    filler + s
-}
-
-/// Builds a string of exactly `need` characters by repeating `pad`, tracking the
-/// running char count with a counter (not recounting the whole buffer each
-/// iteration — that is O(n²)). `pad` must be non-empty.
-fn build_filler(need: usize, pad: &str) -> String {
-    let pad_len = pad.chars().count();
-    let mut filler = String::with_capacity(need.saturating_mul(pad.len() / pad_len.max(1)));
+    let pad_units = crate::wtf8::utf16_len(pad);
+    // Repeat the pad until it covers `need` units, then trim to exactly `need`.
+    let mut filler: Vec<u8> = Vec::new();
     let mut have = 0usize;
     while have < need {
-        filler.push_str(pad);
-        have += pad_len;
+        filler.extend_from_slice(pad);
+        have += pad_units;
     }
     if have > need {
-        filler = filler.chars().take(need).collect();
+        filler = crate::wtf8::slice_utf16(&filler, 0, need);
     }
-    filler
+    let mut out = Vec::with_capacity(filler.len() + s.len());
+    if at_start {
+        out.extend_from_slice(&filler);
+        out.extend_from_slice(s);
+    } else {
+        out.extend_from_slice(s);
+        out.extend_from_slice(&filler);
+    }
+    out
 }
 
 /// `Number.prototype.toPrecision(p)`: render `n` with `p` significant digits,
@@ -14737,34 +14907,46 @@ fn format_precision(n: f64, p: usize) -> String {
     alloc::format!("{:.*}", decimals, n)
 }
 
-/// `String.prototype.padEnd`: append `pad` (repeated) until length `target`.
-fn pad_end(s: &str, target: usize, pad: &str) -> String {
-    let len = s.chars().count();
-    if len >= target || pad.is_empty() {
-        return String::from(s);
-    }
-    let need = target - len;
-    let filler = build_filler(need, pad);
-    String::from(s) + &filler
+/// Quotes and escapes a string as a JSON string literal (the `&str` form, used
+/// for property keys). [`json_quote_wtf8`] is the surrogate-preserving form for
+/// string *values*.
+fn json_quote(s: &str) -> String {
+    json_quote_wtf8(s.as_bytes())
 }
 
-/// Quotes and escapes a string as a JSON string literal.
-fn json_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+/// Quotes and escapes WTF-8 bytes as a JSON string literal, iterating code
+/// points so a **lone surrogate** is escaped as `\uXXXX` (well-formed JSON per
+/// the spec) and astral scalars emit their characters directly.
+fn json_quote_wtf8(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&alloc::format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    for cp in crate::wtf8::code_points(bytes) {
+        match cp {
+            0x22 => out.push_str("\\\""),
+            0x5C => out.push_str("\\\\"),
+            0x0A => out.push_str("\\n"),
+            0x0D => out.push_str("\\r"),
+            0x09 => out.push_str("\\t"),
+            cp if cp < 0x20 || crate::wtf8::is_surrogate(cp) => {
+                out.push_str(&alloc::format!("\\u{cp:04x}"));
+            }
+            cp => {
+                if let Some(c) = char::from_u32(cp) {
+                    out.push(c);
+                }
+            }
         }
     }
     out.push('"');
     out
+}
+
+/// Reads exactly four hex digits from the char slice `c` starting at `at`,
+/// returning the `u16` code unit. `None` if fewer than four hex digits are
+/// present (a malformed `\u` escape).
+fn json_hex4(c: &[char], at: usize) -> Option<u16> {
+    let hex: String = c.get(at..at + 4)?.iter().collect();
+    u16::from_str_radix(&hex, 16).ok()
 }
 
 /// Renders the integer part of `n` in `radix` (2–36), with a leading `-` for
@@ -15736,6 +15918,116 @@ mod tests {
         let mut interp = Interp::new();
         let value = interp.run(&program).expect("exec");
         interp.realm().to_display_string(value)
+    }
+
+    #[test]
+    fn lone_surrogates_round_trip_through_string_ops() {
+        // Creation preserves a lone surrogate; length is in UTF-16 units.
+        assert_eq!(run(r#""\uD800".length === 1"#), "true");
+        assert_eq!(run(r#""\uD800".charCodeAt(0) === 0xD800"#), "true");
+        assert_eq!(run(r#""\u{D834}".charCodeAt(0) === 0xD834"#), "true");
+        // An astral char is two units, one code point.
+        assert_eq!(
+            run(
+                r#""😀".length === 2 && "😀".codePointAt(0) === 0x1F600 && "😀".charCodeAt(0) === 0xD83D"#
+            ),
+            "true"
+        );
+        // slice over UTF-16 units keeps a lone surrogate.
+        assert_eq!(
+            run(r#""a\uD800b".slice(1,2).charCodeAt(0) === 0xD800"#),
+            "true"
+        );
+        assert_eq!(
+            run(r#""a\uD800b".substring(1,2).charCodeAt(0) === 0xD800"#),
+            "true"
+        );
+        assert_eq!(run(r#""a\uD800b".at(1) === "\uD800""#), "true");
+        assert_eq!(run(r#""a\uD800b"[1].charCodeAt(0) === 0xD800"#), "true");
+        // charAt of a lone surrogate is a one-unit string carrying the surrogate.
+        assert_eq!(
+            run(r#""\uD800".charAt(0).charCodeAt(0) === 0xD800"#),
+            "true"
+        );
+        // fromCharCode preserves a lone surrogate.
+        assert_eq!(
+            run("String.fromCharCode(0xD800).charCodeAt(0) === 0xD800"),
+            "true"
+        );
+        assert_eq!(
+            run("String.fromCharCode(0xD83D, 0xDE00).codePointAt(0) === 0x1F600"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn surrogate_search_pad_split_iteration_units() {
+        // indexOf/includes over UTF-16 units (astral char shifts the index by 2).
+        assert_eq!(run(r#""😀x".indexOf("x") === 2"#), "true");
+        assert_eq!(run(r#""😀x".includes("x")"#), "true");
+        assert_eq!(run(r#""a😀b".lastIndexOf("b") === 3"#), "true");
+        assert_eq!(run(r#""😀b".startsWith("😀")"#), "true");
+        assert_eq!(run(r#""a😀".endsWith("😀")"#), "true");
+        // padStart/padEnd count UTF-16 units; an astral pad char counts as two.
+        assert_eq!(run(r#""x".padStart(3, "😀").length === 3"#), "true");
+        assert_eq!(run(r#""x".padEnd(2).length === 2"#), "true");
+        // split('') yields one entry per UTF-16 unit (astral → two halves).
+        assert_eq!(run(r#""😀".split("").length === 2"#), "true");
+        assert_eq!(run(r#""a\uD800b".split("").length === 3"#), "true");
+        // for-of yields code points: an astral char is a single iteration.
+        assert_eq!(run(r#"[..."😀"].length === 1"#), "true");
+        assert_eq!(run(r#"[..."a\uD800b"].length === 3"#), "true");
+        // repeat/concat preserve surrogates losslessly.
+        assert_eq!(run(r#""\uD800".repeat(2).length === 2"#), "true");
+        assert_eq!(
+            run(r#""\uD800".repeat(2).charCodeAt(1) === 0xD800"#),
+            "true"
+        );
+        assert_eq!(
+            run(r#"("a".concat("\uD800")).charCodeAt(1) === 0xD800"#),
+            "true"
+        );
+    }
+
+    #[test]
+    fn json_preserves_lone_surrogates() {
+        // stringify escapes a lone surrogate as `\uXXXX` (well-formed JSON).
+        assert_eq!(run(r#"JSON.stringify("\uD800") === '"\\ud800"'"#), "true");
+        // A valid astral char round-trips as the character.
+        assert_eq!(run(r#"JSON.stringify("😀") === '"😀"'"#), "true");
+        // parse of a `\uXXXX` lone surrogate preserves it.
+        assert_eq!(
+            run(r#"JSON.parse('"\\ud800"').charCodeAt(0) === 0xD800"#),
+            "true"
+        );
+        assert_eq!(run(r#"JSON.parse('"\\ud800"').length === 1"#), "true");
+        // parse pairs `😀` into one astral code point.
+        assert_eq!(
+            run(r#"JSON.parse('"\\ud83d\\ude00"').codePointAt(0) === 0x1F600"#),
+            "true"
+        );
+        // Round-trip a string with an embedded lone surrogate.
+        assert_eq!(
+            run(r#"JSON.parse(JSON.stringify("a\uD800b")).charCodeAt(1) === 0xD800"#),
+            "true"
+        );
+    }
+
+    #[test]
+    fn non_surrogate_strings_behave_as_before() {
+        // A plain corpus must be unchanged by the WTF-8 storage move.
+        assert_eq!(run(r#""hello".length"#), "5");
+        assert_eq!(run(r#""héllo 中".length"#), "7");
+        assert_eq!(run(r#""abcde".slice(1,3)"#), "bc");
+        assert_eq!(run(r#""a,b,c".split(",").length"#), "3");
+        assert_eq!(run(r#""banana".indexOf("na")"#), "2");
+        assert_eq!(run(r#""banana".lastIndexOf("na")"#), "4");
+        assert_eq!(run(r#""x".padStart(3, "ab")"#), "abx");
+        assert_eq!(
+            run(r#"JSON.stringify({a:1,b:"hi"})"#),
+            r#"{"a":1,"b":"hi"}"#
+        );
+        assert_eq!(run(r#"`a${1}b${2}c`"#), "a1b2c");
     }
 
     #[test]

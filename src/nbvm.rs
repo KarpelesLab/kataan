@@ -1257,7 +1257,11 @@ fn run_frame(
                             ctx.realm.get_element(handle, i)
                         } else if ks == "length"
                             && let Some(len) = ctx.realm.array_length(handle).or_else(|| {
-                                ctx.realm.string_value(handle).map(|s| s.chars().count())
+                                // String length counts UTF-16 code units (astral
+                                // chars = 2, a lone surrogate = 1).
+                                ctx.realm
+                                    .string_bytes(handle)
+                                    .map(|b| crate::wtf8::utf16_len(&b))
                             })
                         {
                             // Computed `arr["length"]` / `str["length"]`.
@@ -1361,11 +1365,13 @@ fn run_frame(
                         .map_or(0, |p| p.length);
                     regs[*dst as usize] = NanBox::number(n as f64);
                 } else {
-                    // `.length` on an array, or a string's character count.
-                    let len = ctx
-                        .realm
-                        .array_length(handle)
-                        .or_else(|| ctx.realm.string_value(handle).map(|s| s.chars().count()));
+                    // `.length` on an array, or a string's UTF-16 code-unit count
+                    // (astral chars = 2, a lone surrogate = 1).
+                    let len = ctx.realm.array_length(handle).or_else(|| {
+                        ctx.realm
+                            .string_bytes(handle)
+                            .map(|b| crate::wtf8::utf16_len(&b))
+                    });
                     regs[*dst as usize] = match len {
                         Some(n) => NanBox::number(n as f64),
                         // Otherwise an explicit `length` data property (e.g. a regex
@@ -4891,10 +4897,16 @@ impl Compiler {
             Expr::Bool { value, .. } => self.constant(NanBox::boolean(*value)),
             Expr::Null(_) => self.constant(NanBox::null()),
             Expr::Str { value, .. } => {
+                // The bytecode `NewString` op is `String`-typed; a literal bearing
+                // a lone surrogate (rare) can't round-trip through it, so defer to
+                // the (surrogate-correct) tree-walker rather than lose data.
+                let value = crate::wtf8::as_str(value).ok_or(CompileError::Unsupported(
+                    "lone surrogate in string literal",
+                ))?;
                 let r = self.alloc();
                 self.ops.push(Op::NewString {
                     dst: r,
-                    value: String::from(&**value),
+                    value: String::from(value),
                 });
                 Ok(r)
             }
@@ -5515,6 +5527,17 @@ impl Compiler {
             }
             // A tagged template `tag`a${x}b`` → `tag(strings, x, …)`.
             Expr::TaggedTemplate { tag, quasi, .. } => {
+                // A surrogate-bearing cooked/raw quasi can't round-trip through the
+                // `String`-typed constant pool; defer to the (correct) tree-walker.
+                if quasi.quasis.iter().any(|q| {
+                    q.cooked
+                        .as_deref()
+                        .is_some_and(|b| crate::wtf8::as_str(b).is_none())
+                }) {
+                    return Err(CompileError::Unsupported(
+                        "lone surrogate in tagged template",
+                    ));
+                }
                 let strings = self.alloc();
                 self.ops.push(Op::NewArray {
                     dst: strings,
@@ -5524,7 +5547,7 @@ impl Compiler {
                     // An invalid escape yields no cooked value (`undefined`); `.raw`
                     // still preserves it (ES2018 tagged-template revision).
                     let s = match q.cooked.as_deref() {
-                        Some(c) => self.constant_str(c),
+                        Some(c) => self.constant_str(&crate::wtf8::to_string_lossy(c)),
                         None => self.constant(NanBox::undefined())?,
                     };
                     self.ops.push(Op::ArrayPush {
@@ -5605,8 +5628,11 @@ impl Compiler {
                 // `new RegExp(source, flags)` (string-literal args) → a regex.
                 if &*id.name == "RegExp" && self.classes.get("RegExp").is_none() {
                     let lit = |a: Option<&crate::ast::Argument>| match a {
+                        // RegExp source/flags are valid UTF-8 in practice (regex
+                        // surrogate handling is a separate milestone); a
+                        // surrogate-bearing arg falls back to the runtime path.
                         Some(crate::ast::Argument::Item(Expr::Str { value, .. })) => {
-                            Some(String::from(&**value))
+                            crate::wtf8::as_str(value).map(String::from)
                         }
                         None => Some(String::new()),
                         _ => None,
@@ -5727,8 +5753,22 @@ impl Compiler {
                         "invalid escape in template literal",
                     ));
                 }
+                // A surrogate-bearing quasi can't round-trip through the
+                // `String`-typed bytecode; defer to the (correct) tree-walker.
+                if t.quasis.iter().any(|q| {
+                    q.cooked
+                        .as_deref()
+                        .is_some_and(|b| crate::wtf8::as_str(b).is_none())
+                }) {
+                    return Err(CompileError::Unsupported(
+                        "lone surrogate in template literal",
+                    ));
+                }
                 let cooked = |q: &crate::ast::TemplateElement| -> String {
-                    q.cooked.as_deref().map(String::from).unwrap_or_default()
+                    q.cooked
+                        .as_deref()
+                        .map(crate::wtf8::to_string_lossy)
+                        .unwrap_or_default()
                 };
                 let mut acc = self.alloc();
                 self.ops.push(Op::NewString {

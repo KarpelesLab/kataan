@@ -39,7 +39,8 @@ pub fn eval(realm: &mut Realm, expr: &Expr) -> Result<NanBox, EvalError> {
         Expr::Bool { value, .. } => Ok(NanBox::boolean(*value)),
         Expr::Number { value, .. } => Ok(NanBox::number(*value)),
         Expr::Str { value, .. } => {
-            let h = realm.new_string(value);
+            // The cooked value is WTF-8 bytes; preserve any lone surrogates.
+            let h = realm.new_string_wtf8(value.to_vec());
             Ok(NanBox::handle(h.to_raw()))
         }
 

@@ -232,6 +232,21 @@ impl Realm {
         self.heap.alloc(Cell::Str(Rope::from(s)))
     }
 
+    /// Allocates a string value from raw **WTF-8 bytes**, preserving any lone
+    /// UTF-16 surrogates (DOMString semantics — see [`crate::wtf8`]). The common
+    /// case (no surrogates) is byte-identical to [`Realm::new_string`].
+    pub fn new_string_wtf8(&mut self, bytes: alloc::vec::Vec<u8>) -> Handle {
+        self.heap.alloc(Cell::Str(Rope::from_wtf8(bytes)))
+    }
+
+    /// The string at `handle` as raw **WTF-8 bytes** (lossless — lone surrogates
+    /// preserved), or `None` if it is not a string. Use this for surrogate-aware
+    /// string operations; [`Realm::string_value`] is the lossy `String` form.
+    #[must_use]
+    pub fn string_bytes(&self, handle: Handle) -> Option<alloc::vec::Vec<u8>> {
+        Some(self.heap.get(handle)?.as_str()?.materialize_bytes())
+    }
+
     /// Allocates a contiguous byte store (the backing of an `ArrayBuffer`) from
     /// engine-owned bytes and returns its handle.
     pub fn new_bytes(&mut self, data: alloc::vec::Vec<u8>) -> Handle {
