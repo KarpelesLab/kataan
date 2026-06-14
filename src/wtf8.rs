@@ -11,7 +11,8 @@
 //! U+D800..=U+DFFF, each as the natural 3-byte form `ED A0..BF 80..BF`. A WTF-8
 //! string therefore round-trips every UTF-16 sequence, lone surrogates and all,
 //! while a string with *no* surrogates is byte-identical to its UTF-8 — which is
-//! the overwhelmingly common case, so [`as_str`] hands those back for free.
+//! the overwhelmingly common case, so [`as_str`](crate::wtf8::as_str) hands
+//! those back for free.
 //!
 //! This module is a pure, safe `alloc`-only codec over `&[u8]`: no `unsafe`, no
 //! `std`. (Storage moves to WTF-8 bytes in `rope`/`atom`; the surrogate-correct

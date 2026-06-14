@@ -18,13 +18,11 @@
 //!
 //! Keys are stored as **WTF-8 bytes** (`Box<[u8]>`), so a property key may carry
 //! lone UTF-16 surrogates (a JS property key is a DOMString — see
-//! [`crate::wtf8`]). [`AtomTable::intern`]/[`AtomTable::get`] keep their `&str`
-//! signatures (the common case), and [`AtomTable::intern_bytes`]/
-//! [`AtomTable::get_bytes`] take surrogate-bearing WTF-8. [`AtomTable::resolve`]
+//! [`crate::wtf8`]). `intern`/`get` keep their `&str` signatures (the common
+//! case), and `intern_bytes`/`get_bytes` take surrogate-bearing WTF-8. `resolve`
 //! still returns `Option<&str>` for the non-surrogate keys existing callers use
-//! (it declines a surrogate-bearing key — those use
-//! [`AtomTable::resolve_bytes`]); [`AtomTable::resolve_lossy`] always yields a
-//! `String` (surrogates → U+FFFD).
+//! (it declines a surrogate-bearing key — those use `resolve_bytes`);
+//! `resolve_lossy` always yields a `String` (surrogates → U+FFFD).
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
