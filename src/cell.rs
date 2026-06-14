@@ -215,6 +215,15 @@ pub enum Cell {
         flags: alloc::boxed::Box<str>,
         /// The mutable `lastIndex` (where the next `g`/`y` search resumes).
         last_index: usize,
+        /// A transient cache of the compiled program (RE-P1), populated on first
+        /// match so a reused RegExp (`for(…) re.test(x)`, `str.replace(/…/g,…)`)
+        /// is parsed+compiled once, not per call. It holds no heap handles (the
+        /// compiled program is plain instructions), so `Trace`/`Relocate` ignore
+        /// it; it is **not** serialized — a snapshot reconstructs the RegExp from
+        /// `source`/`flags` with an empty cache, refilled lazily on first use.
+        /// `lastIndex` is separate mutable state and is unaffected by the cache.
+        #[cfg(feature = "regex")]
+        compiled: core::cell::RefCell<Option<alloc::rc::Rc<crate::regex::Regex>>>,
     },
     /// A class constructor: an index into the interpreter's class table plus the
     /// scope it was defined in.

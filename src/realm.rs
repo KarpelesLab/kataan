@@ -763,7 +763,38 @@ impl Realm {
             source: alloc::boxed::Box::from(source),
             flags: alloc::boxed::Box::from(flags),
             last_index: 0,
+            #[cfg(feature = "regex")]
+            compiled: core::cell::RefCell::new(None),
         })
+    }
+
+    /// The compiled program for the `RegExp` at `handle`, compiled+cached on first
+    /// use (RE-P1) and returned as a cheap `Rc` clone thereafter. Returns `None`
+    /// if `handle` is not a `RegExp` or its pattern fails to compile (callers then
+    /// surface the same `null`/error behavior as a fresh `Regex::new` failure).
+    ///
+    /// The cache is a transient `RefCell` on the cell; it holds no heap handles
+    /// and is never serialized, so reusing one RegExp across many calls compiles
+    /// the pattern exactly once. `lastIndex` is independent mutable state and is
+    /// not touched here.
+    #[cfg(feature = "regex")]
+    #[must_use]
+    pub fn regex_compiled(&self, handle: Handle) -> Option<alloc::rc::Rc<crate::regex::Regex>> {
+        let Some(Cell::RegExp {
+            source,
+            flags,
+            compiled,
+            ..
+        }) = self.heap.get(handle)
+        else {
+            return None;
+        };
+        if let Some(rc) = compiled.borrow().as_ref() {
+            return Some(rc.clone());
+        }
+        let re = alloc::rc::Rc::new(crate::regex::Regex::new(source, flags).ok()?);
+        *compiled.borrow_mut() = Some(re.clone());
+        Some(re)
     }
 
     /// The `RegExp`'s `lastIndex` (0 if not a RegExp).

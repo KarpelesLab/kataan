@@ -2247,17 +2247,18 @@ fn regex_method(
     key: &str,
     args: &[NanBox],
 ) -> Option<Result<NanBox, VmError>> {
-    use crate::regex::Regex;
     let h = recv.as_handle().map(Handle::from_raw)?;
     let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
 
     // `re.test(s)` / `re.exec(s)`.
-    if let Some((source, flags)) = ctx.realm.regexp_at(h) {
+    if let Some((_source, flags)) = ctx.realm.regexp_at(h) {
         if !matches!(key, "test" | "exec") {
             return None;
         }
         let text = ctx.realm.to_display_string(arg0);
-        let Ok(re) = Regex::new(&source, &flags) else {
+        // Use the RegExp cell's compiled-program cache (RE-P1): a reused regex is
+        // compiled once, not per call. Clone the `Rc` out before any match work.
+        let Some(re) = ctx.realm.regex_compiled(h) else {
             return Some(Ok(NanBox::null()));
         };
         // `g`/`y` regexes resume at `lastIndex` and update it (reset to 0 on
@@ -2293,11 +2294,11 @@ fn regex_method(
     if !matches!(key, "match" | "replace" | "replaceAll" | "split" | "search") {
         return None;
     }
-    let (src, flags) = arg0
-        .as_handle()
-        .map(Handle::from_raw)
-        .and_then(|rh| ctx.realm.regexp_at(rh))?;
-    let Ok(re) = Regex::new(&src, &flags) else {
+    let rh = arg0.as_handle().map(Handle::from_raw)?;
+    let (_src, flags) = ctx.realm.regexp_at(rh)?;
+    // Use the RegExp argument's compiled-program cache (RE-P1). Clone the `Rc` out
+    // before any match work so we don't alias the heap borrow.
+    let Some(re) = ctx.realm.regex_compiled(rh) else {
         return Some(Ok(NanBox::null()));
     };
     let global = flags.contains('g');

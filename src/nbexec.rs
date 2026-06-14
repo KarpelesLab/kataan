@@ -8446,14 +8446,17 @@ impl<'a> Interp<'a> {
             }));
         }
         // --- RegExp instance methods (`test`/`exec`) ---
-        if let Some((source, flags)) = self.realm.regexp_at(handle) {
-            let _ = (&source, &flags);
+        if let Some((_source, flags)) = self.realm.regexp_at(handle) {
+            let _ = &flags;
             #[cfg(feature = "regex")]
             {
                 let text = self.realm.to_display_string(arg(0));
-                let re = crate::regex::Regex::new(&source, &flags);
+                // Use the RegExp cell's compiled-program cache (RE-P1): a reused
+                // regex compiles once, not per call. The `Rc` is cloned out, so
+                // no heap borrow is held during match work.
+                let re = self.realm.regex_compiled(handle);
                 if matches!(method, "test" | "exec")
-                    && let Ok(re) = re
+                    && let Some(re) = re
                 {
                     // `g`/`y` regexes are stateful: search resumes at `lastIndex`
                     // and is updated to the match end (or reset to 0 on no match).
@@ -8732,17 +8735,29 @@ impl<'a> Interp<'a> {
             };
 
         // --- regex-backed String methods (when the argument is a RegExp) ---
+        // When the argument is a RegExp object, compile via its cell cache (RE-P1)
+        // so a reused regex compiles once. A string-coerced pattern (`string_pat`,
+        // no backing cell) still compiles fresh into an `Rc` for type uniformity.
+        #[cfg(feature = "regex")]
+        let arg_regexp_handle = arg(0)
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|&raw| self.realm.regexp_at(raw).is_some());
         #[cfg(feature = "regex")]
         if let Some(s) = self.realm.string_value(handle)
             && matches!(
                 method,
                 "match" | "matchAll" | "search" | "replace" | "replaceAll" | "split"
             )
-            && let Some((src, flags)) = arg(0)
-                .as_handle()
-                .and_then(|raw| self.realm.regexp_at(Handle::from_raw(raw)))
+            && let Some((_src, flags)) = arg_regexp_handle
+                .and_then(|raw| self.realm.regexp_at(raw))
                 .or(string_pat)
-            && let Ok(re) = crate::regex::Regex::new(&src, &flags)
+            && let Some(re) = match arg_regexp_handle {
+                Some(rh) => self.realm.regex_compiled(rh),
+                None => crate::regex::Regex::new(&_src, &flags)
+                    .ok()
+                    .map(alloc::rc::Rc::new),
+            }
         {
             let global = flags.contains('g');
             // `matchAll`/`replaceAll` require a global RegExp.
@@ -16353,6 +16368,82 @@ mod tests {
             "true"
         );
         assert_eq!(run(r#""😀".length"#), "2");
+    }
+
+    /// RE-P1: a `RegExp` whose compiled program is now cached on its cell must
+    /// still behave identically when reused across many calls — the cache returns
+    /// a consistent program, `lastIndex` keeps advancing for `g`/`y`, and two
+    /// regexes that share a source but differ in flags must not collide.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn regex_compiled_cache_preserves_behaviour() {
+        // Reusing one regex across a loop yields the same result every call (the
+        // cached program is used, not recompiled into something different).
+        assert_eq!(
+            run(r#"{
+                    let re = /a(\d)/;
+                    let out = [];
+                    for (let i = 0; i < 5; i++) out.push(re.test("a7") + "" + (re.exec("a7")[1]));
+                    out.join(",")
+                }"#),
+            "true7,true7,true7,true7,true7"
+        );
+
+        // A global regex reused via String.match collects every occurrence.
+        assert_eq!(
+            run(r#"{ let re=/(\d+)/g; "a1b22c333".match(re).join(",") }"#),
+            "1,22,333"
+        );
+
+        // `lastIndex` advances across repeated stateful `exec`/`test` calls and
+        // resets to 0 after the final miss — unaffected by the program cache.
+        assert_eq!(
+            run(r#"{
+                    let re = /\d/g;
+                    let s = "a1b2";
+                    let idx = [];
+                    re.exec(s); idx.push(re.lastIndex);
+                    re.exec(s); idx.push(re.lastIndex);
+                    re.exec(s); idx.push(re.lastIndex);   // miss -> reset to 0
+                    idx.join(",")
+                }"#),
+            "2,4,0"
+        );
+
+        // A sticky regex's lastIndex advances exactly at the match boundary.
+        assert_eq!(
+            run(r#"{
+                    let re = /\d/y;
+                    re.lastIndex = 1;
+                    let m = re.test("a1b2");
+                    m + ":" + re.lastIndex
+                }"#),
+            "true:2"
+        );
+
+        // Same source, different flags are distinct programs and must not collide
+        // through the cache: `/x/u` (unicode) vs `/x/` (plain) behave per their
+        // own flags. `/😀/u` matches the astral char as one unit-pair; `/./` only
+        // ever spans one code unit, while `/./u` spans the whole astral char.
+        assert_eq!(run(r#"/x/u.test("x") && !/x/u.global"#), "true");
+        assert_eq!(run(r#"/x/.test("x") && /x/g.global"#), "true");
+        // `.` with and without `u` over an astral subject: non-`u` `.` matches one
+        // code unit (length-1 match), `u` `.` matches the whole code point (2).
+        assert_eq!(run(r#""😀".match(/./)[0].length"#), "1");
+        assert_eq!(run(r#""😀".match(/./u)[0].length"#), "2");
+
+        // Two regexes built from the same source string but different flags, used
+        // in the same scope, keep independent compiled programs.
+        assert_eq!(
+            run(r#"{
+                    let a = /\w+/;
+                    let b = /\w+/g;
+                    let r1 = "foo bar".match(a).length;     // non-global: 1 match
+                    let r2 = "foo bar".match(b).length;     // global: 2 matches
+                    r1 + "," + r2
+                }"#),
+            "1,2"
+        );
     }
 
     /// C1: a dense-array element write or `length` set whose growth would exceed
