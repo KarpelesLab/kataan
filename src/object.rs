@@ -12,7 +12,7 @@
 //!
 //! An object that accumulates more own properties than the realm's
 //! `object_dictionary_threshold` switches, behind this same method API, from the
-//! shaped representation to a **dictionary** ([`ObjectData::Dict`]): an
+//! shaped representation to a **dictionary** (`ObjectData::Dict`): an
 //! insertion-ordered map that creates no further shape transitions. This bounds
 //! the shape transition-tree's growth for programs that pile up unbounded unique
 //! keys (MEM-3), at the cost of the per-shape inline-cache fast path for those
@@ -43,12 +43,12 @@ fn array_index(k: &str) -> Option<u32> {
 
 /// The internal storage representation of an [`Object`]'s data properties.
 ///
-/// Objects start in [`Shaped`](ObjectData::Shaped) mode — a shared hidden-class
+/// Objects start in `Shaped` mode — a shared hidden-class
 /// [`Shape`] plus a dense slot vector — which is the zero-overhead representation
 /// for normal objects whose structure is shared across many instances. An object
 /// that accumulates more own properties than the realm's
 /// `object_dictionary_threshold` converts in place to
-/// [`Dict`](ObjectData::Dict) mode, an insertion-ordered map that adds **no**
+/// `Dict` mode, an insertion-ordered map that adds **no**
 /// shape transitions: this bounds the shape transition-tree's growth for
 /// programs that pile up unbounded unique keys (MEM-3).
 enum ObjectData {

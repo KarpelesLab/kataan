@@ -366,13 +366,17 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                     .last()
                     .cloned()
                     .unwrap_or_else(crate::env::Scope::root);
-                // SNAP-2: `func_id` is taken from the snapshot verbatim and is
-                // NOT validated against any loaded function table here — it is a
-                // raw index into whatever program is later run. A restored
-                // closure must therefore only be invoked when the matching
-                // compiled program is loaded; invoking one against a different
-                // (or absent) program is undefined. The FFI restore path never
-                // calls restored closures, so this is currently unreachable.
+                // SNAP-2: `func_id` is a raw index into whatever compiled program
+                // is later run. It is validated for self-consistency at
+                // deserialize time against the snapshot's recorded `func_count`
+                // bound (see `deserialize`/`serialize`), so a corrupt or forged
+                // snapshot carrying an out-of-range index is rejected before any
+                // cell is restored — by the time we reach here, `func_id` is known
+                // to be `< func_count`. It is still a program-relative index: a
+                // restored closure must only be invoked when the matching compiled
+                // program is loaded; invoking one against a different (or absent)
+                // program is undefined. The FFI restore path never calls restored
+                // closures, so that case is currently unreachable.
                 (realm.new_function(*func_id, innermost), Some(chain))
             }
             SnapCell::Collection { is_set, .. } => (realm.new_collection(*is_set), None),
@@ -499,7 +503,9 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
 
 /// `KSNP` — the on-disk heap-snapshot magic.
 const MAGIC: &[u8; 4] = b"KSNP";
-const VERSION: u16 = 1;
+/// Version 2 adds a `func_count` bound in the header (SNAP-2). Bumped from 1 so
+/// that older snapshots — which lack the bound — are rejected with [`SnapError::BadHeader`].
+const VERSION: u16 = 2;
 
 /// Why a serialized snapshot failed to load.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -512,6 +518,14 @@ pub enum SnapError {
     BadTag(u8),
     /// Non-UTF-8 string bytes.
     BadString,
+    /// A `Function` cell's `func_id` is out of range for the snapshot's recorded
+    /// function-table bound (a corrupt, forged, or truncated snapshot).
+    BadFuncId {
+        /// the offending function-table index
+        func_id: u32,
+        /// the recorded bound (`func_id` must be `< count`)
+        count: u32,
+    },
 }
 
 fn w_u32(v: u32, out: &mut Vec<u8>) {
@@ -547,6 +561,23 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
+    // SNAP-2: a self-consistency bound on `func_id`s. Snapshots don't carry the
+    // compiled program, so the only sound bound derivable here is the largest
+    // `func_id` actually present plus one — every serialized `Function` cell is
+    // `< func_count` by construction, so a legitimate snapshot always round-trips,
+    // while a forged/corrupt one carrying a larger `func_id` is rejected at
+    // deserialize. (`Realm::fn_protos` is not used: it counts `.prototype` objects,
+    // not the program's function table, and `serialize` has no `Realm` anyway.)
+    let func_count = snap
+        .cells
+        .iter()
+        .filter_map(|c| match c {
+            SnapCell::Function { func_id, .. } => Some(*func_id),
+            _ => None,
+        })
+        .max()
+        .map_or(0, |m| m.saturating_add(1));
+    w_u32(func_count, &mut out);
     w_u32(snap.roots.len() as u32, &mut out);
     for r in &snap.roots {
         w_u32(*r as u32, &mut out);
@@ -706,6 +737,9 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
     if r.take(4)? != MAGIC || r.u16()? != VERSION {
         return Err(SnapError::BadHeader);
     }
+    // SNAP-2: the recorded function-table bound (see `serialize`). Every restored
+    // `Function` cell's `func_id` is validated against it below.
+    let func_count = r.u32()?;
     let n_roots = r.u32()? as usize;
     let mut roots = Vec::with_capacity(n_roots.min(r.remaining()));
     for _ in 0..n_roots {
@@ -753,6 +787,13 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
             4 => SnapCell::BigInt(r.string()?),
             5 => {
                 let func_id = r.u32()?;
+                // SNAP-2: reject an out-of-range index before any restore runs.
+                if func_id >= func_count {
+                    return Err(SnapError::BadFuncId {
+                        func_id,
+                        count: func_count,
+                    });
+                }
                 let nf = r.u32()? as usize;
                 let mut frames = Vec::with_capacity(nf.min(r.remaining()));
                 for _ in 0..nf {
@@ -1289,6 +1330,62 @@ mod tests {
         assert_eq!(
             deserialize(&good[..good.len() - 1]),
             Err(SnapError::Truncated)
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_old_version() {
+        // A pre-SNAP-2 (version 1) header lacks the `func_count` field and must be
+        // rejected cleanly rather than misread.
+        let old = b"KSNP\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        assert_eq!(deserialize(old), Err(SnapError::BadHeader));
+    }
+
+    #[test]
+    fn deserialize_rejects_out_of_range_func_id() {
+        use crate::env::Scope;
+        // A legitimate closure round-trips: its recorded `func_count` covers its
+        // `func_id`, so it deserializes and restores cleanly.
+        let mut realm = Realm::new();
+        let func = realm.new_function(3, Scope::root());
+        let snap = capture(&realm, &[func]);
+        let bytes = serialize(&snap);
+        let reloaded = deserialize(&bytes).expect("valid closure round-trips");
+        assert_eq!(reloaded, snap);
+        let mut realm2 = Realm::new();
+        let f2 = restore(&mut realm2, &reloaded)[0];
+        assert_eq!(realm2.function_at(f2).map(|(id, _)| id), Some(3));
+
+        // Now corrupt the serialized `func_id` so it exceeds the recorded
+        // `func_count`. Header layout: MAGIC(4) VERSION(2) func_count(4)
+        // n_roots(4) roots(4*n_roots) n_cells(4) then cells. For this single-cell
+        // snapshot the lone cell is a Function: tag(1) func_id(4) ...
+        let func_count = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
+        assert_eq!(func_count, 4, "max func_id (3) + 1");
+        let n_roots = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
+        // offset of n_cells, then the first cell.
+        let cells_off = 14 + 4 * n_roots;
+        let first_cell = cells_off + 4;
+        assert_eq!(bytes[first_cell], 5, "first cell is a Function (tag 5)");
+        let func_id_off = first_cell + 1;
+        let mut corrupt = bytes.clone();
+        // Set func_id to func_count (out of range: must be < func_count).
+        corrupt[func_id_off..func_id_off + 4].copy_from_slice(&func_count.to_le_bytes());
+        assert_eq!(
+            deserialize(&corrupt),
+            Err(SnapError::BadFuncId {
+                func_id: func_count,
+                count: func_count
+            }),
+            "an out-of-range func_id is rejected at deserialize, with no panic"
+        );
+
+        // A hand-crafted snapshot with func_count = 0 but a Function cell rejects too.
+        let mut forged = bytes.clone();
+        forged[6..10].copy_from_slice(&0u32.to_le_bytes()); // func_count = 0
+        assert!(
+            matches!(deserialize(&forged), Err(SnapError::BadFuncId { .. })),
+            "any func_id >= 0-bound is rejected"
         );
     }
 
