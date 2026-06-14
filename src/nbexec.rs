@@ -2908,9 +2908,10 @@ impl<'a> Interp<'a> {
             // `WebAssembly.validate(bytes)` — true iff `bytes` decodes to a
             // well-formed module. Accepts an `ArrayBuffer` or a byte array.
             N_WASM_VALIDATE => {
-                let ok = self
-                    .wasm_bytes(arg(0))
-                    .is_some_and(|b| crate::wasm_rt::Module::decode(&b).is_ok());
+                let limits = self.realm.limits.wasm;
+                let ok = self.wasm_bytes(arg(0)).is_some_and(|b| {
+                    crate::wasm_rt::Module::decode_with_limits(&b, &limits).is_ok()
+                });
                 NanBox::boolean(ok)
             }
             // `WebAssembly.Module.exports(module)` / `.imports(module)` — arrays of
@@ -2922,8 +2923,9 @@ impl<'a> Interp<'a> {
                     .and_then(|h| self.realm.get_property(h, WASM_BYTES))
                     .and_then(|v| self.wasm_bytes(v))
                     .ok_or_else(|| self.wasm_type_error("expected a WebAssembly.Module"))?;
-                let module = crate::wasm_rt::Module::decode(&bytes)
-                    .map_err(|e| self.wasm_compile_error(e.0))?;
+                let module =
+                    crate::wasm_rt::Module::decode_with_limits(&bytes, &self.realm.limits.wasm)
+                        .map_err(|e| self.wasm_compile_error(e.0))?;
                 let mut out = Vec::new();
                 if id == N_WASM_MODULE_EXPORTS {
                     let descs: Vec<(String, u8)> = module
@@ -10147,7 +10149,7 @@ impl<'a> Interp<'a> {
             .realm
             .get_property(data, WASM_IMPORTS)
             .unwrap_or(NanBox::undefined());
-        let module = crate::wasm_rt::Module::decode(&bytes)
+        let module = crate::wasm_rt::Module::decode_with_limits(&bytes, &self.realm.limits.wasm)
             .map_err(|_| self.wasm_compile_error("invalid module"))?;
 
         // Resolve each function import to a JS function: importObject[mod][field].
@@ -10485,7 +10487,7 @@ impl<'a> Interp<'a> {
         let bytes = self
             .wasm_bytes(bytes_arr)
             .ok_or_else(|| self.wasm_compile_error("invalid module source"))?;
-        crate::wasm_rt::Module::decode(&bytes)
+        crate::wasm_rt::Module::decode_with_limits(&bytes, &self.realm.limits.wasm)
             .map_err(|_| self.wasm_compile_error("invalid module"))?;
         let module = self.realm.new_object();
         self.realm.set_property(module, WASM_BYTES, bytes_arr);
@@ -10507,7 +10509,7 @@ impl<'a> Interp<'a> {
         let bytes = self
             .wasm_bytes(bytes_arr)
             .ok_or_else(|| self.wasm_compile_error("invalid module source"))?;
-        let module = crate::wasm_rt::Module::decode(&bytes)
+        let module = crate::wasm_rt::Module::decode_with_limits(&bytes, &self.realm.limits.wasm)
             .map_err(|_| self.wasm_compile_error("invalid module"))?;
         // Validate function imports eagerly: a required import that is absent or not
         // callable makes `new WebAssembly.Instance` fail with a LinkError (rather than the

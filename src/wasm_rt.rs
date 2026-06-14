@@ -173,6 +173,10 @@ pub struct Module {
     mem_imported: bool,
     /// The `start` function index, run automatically at instantiation, if any.
     start: Option<u32>,
+    /// Resource limits in force for this module: the decode-time caps applied
+    /// while decoding, and the run-time call-depth/fuel budget read by `exec`.
+    /// Seeded by [`Module::decode_with_limits`] (default via [`Module::decode`]).
+    limits: crate::limits::WasmLimits,
 }
 
 /// A host function backing an `import` — receives the WASM call's arguments and
@@ -270,6 +274,17 @@ impl<'a> Reader<'a> {
             }
         }
         Ok(result)
+    }
+    /// Reads a `block`/`loop`/`if` **blocktype**, consuming all of its bytes.
+    ///
+    /// The blocktype is encoded as a single signed LEB128 value: `0x40` (which
+    /// decodes to `-64`) means an empty type; any other negative value is a
+    /// single inline value type (`0x7f/0x7e/0x7d/0x7c` etc.); a non-negative
+    /// value is a *type index* into the module's type section (a multi-byte LEB
+    /// when ≥ 0x80). Reading it as a full signed LEB — rather than one raw byte —
+    /// is what keeps a type-index blocktype from desyncing the byte stream.
+    fn blocktype(&mut self) -> Result<i64, WasmRtError> {
+        self.i64()
     }
     fn done(&self) -> bool {
         self.pos >= self.bytes.len()
@@ -621,28 +636,39 @@ fn read_const_i32_expr(s: &mut Reader) -> Result<i32, WasmRtError> {
 /// allocation (abort) or billions of loop iterations (CPU exhaustion). These
 /// limits are far larger than any legitimate module needs.
 ///
-/// Maximum table elements (`Option<u32>` slots = 8 bytes each → ≤ 80 MiB).
-const MAX_TABLE_ELEMS: u32 = 10_000_000;
-/// Maximum linear-memory pages in a declared minimum/maximum — matches the
-/// `memory.grow` ceiling of 2^16 pages (4 GiB).
-const MAX_MEM_PAGES: u32 = 0x1_0000;
-/// Maximum locals per function (the common engine limit; V8 uses 50_000).
-const MAX_LOCALS: u32 = 50_000;
+/// The decode-time caps (table elements, memory pages, locals per function) and
+/// the run-time caps (call/block-nesting depth, the instruction fuel budget) now
+/// live in [`crate::limits::WasmLimits`], threaded in via
+/// [`Module::decode_with_limits`] and stored on the [`Module`]. The historical
+/// hard-coded constants are reproduced by [`WasmLimits::default`].
+///
 /// A reasonable cap on speculative `Vec::with_capacity` reserves driven by a
 /// declared count, so an attacker count can't pre-reserve a huge buffer before
 /// any element is read.
 const MAX_RESERVE: usize = 1024;
-/// Maximum combined call-frame + block-nesting depth before a "call stack
-/// exhausted" trap, guarding the native (Rust) stack against unbounded
-/// recursion through `call`/`call_indirect` and nested `block`/`loop`/`if`.
-const MAX_CALL_DEPTH: u32 = 1024;
 
 impl Module {
-    /// Decodes a WebAssembly binary module.
+    /// Decodes a WebAssembly binary module with the default [`WasmLimits`].
+    ///
+    /// [`WasmLimits`]: crate::limits::WasmLimits
     ///
     /// # Errors
     /// Returns `WasmRtError` on a bad magic/version or a malformed section.
     pub fn decode(bytes: &[u8]) -> Result<Module, WasmRtError> {
+        Self::decode_with_limits(bytes, &crate::limits::WasmLimits::default())
+    }
+
+    /// Decodes a WebAssembly binary module, enforcing `limits` on the decode-time
+    /// caps (memory pages, table elements, locals per function) and storing them
+    /// on the module so execution reads the same call-depth/fuel budget.
+    ///
+    /// # Errors
+    /// Returns `WasmRtError` on a bad magic/version, a malformed section, or a
+    /// declared size that exceeds the supplied limits.
+    pub fn decode_with_limits(
+        bytes: &[u8],
+        limits: &crate::limits::WasmLimits,
+    ) -> Result<Module, WasmRtError> {
         let mut r = Reader::new(bytes);
         if r.bytes(4)? != b"\0asm" {
             return Err(WasmRtError("bad magic"));
@@ -650,7 +676,10 @@ impl Module {
         if r.bytes(4)? != [0x01, 0, 0, 0] {
             return Err(WasmRtError("unsupported version"));
         }
-        let mut m = Module::default();
+        let mut m = Module {
+            limits: *limits,
+            ..Module::default()
+        };
         while !r.done() {
             let id = r.byte()?;
             let size = r.u32()? as usize;
@@ -659,15 +688,15 @@ impl Module {
             match id {
                 0 => {} // custom section: ignore
                 1 => Self::decode_types(&mut s, &mut m)?,
-                2 => Self::decode_imports(&mut s, &mut m)?,
+                2 => Self::decode_imports(&mut s, &mut m, limits)?,
                 3 => Self::decode_functions(&mut s, &mut m)?,
-                4 => Self::decode_table(&mut s, &mut m)?,
-                5 => Self::decode_memory(&mut s, &mut m)?,
+                4 => Self::decode_table(&mut s, &mut m, limits)?,
+                5 => Self::decode_memory(&mut s, &mut m, limits)?,
                 6 => Self::decode_globals(&mut s, &mut m)?,
                 7 => Self::decode_exports(&mut s, &mut m)?,
                 8 => m.start = Some(s.u32()?),
                 9 => Self::decode_elements(&mut s, &mut m)?,
-                10 => Self::decode_code(&mut s, &mut m)?,
+                10 => Self::decode_code(&mut s, &mut m, limits)?,
                 11 => Self::decode_data(&mut s, &mut m)?,
                 // Other sections (import/start) are skipped for now.
                 _ => {}
@@ -784,17 +813,32 @@ impl Module {
                 _ => return None,
             })
         };
-        // Parse a block type: empty (0x40) or a single result; `None` signals a
-        // multi-value (type-index) block, which we don't model — bail to accept.
+        // Parse a block type (WASM-9: a full signed LEB128, consuming all bytes):
+        // `0x40` (=-64) = empty; another negative = a single inline result type;
+        // a non-negative value = a type index, resolved to that signature's
+        // (params, results). `None` signals a type we can't model — bail to
+        // accept (a valid module is never rejected).
         type BlockType = Option<(Vec<ValType>, Vec<ValType>)>;
         let block_type = |r: &mut Reader| -> Result<BlockType, WasmRtError> {
-            let b = r.byte()?;
-            if b == 0x40 {
+            let bt = r.blocktype()?;
+            if bt == -64 {
                 Ok(Some((Vec::new(), Vec::new())))
-            } else if let Ok(t) = val_type(b) {
-                Ok(Some((Vec::new(), alloc::vec![t])))
+            } else if bt < 0 {
+                // A negative blocktype is `0x80 - byte` re-encoded; map it back to
+                // the inline value-type byte and resolve.
+                let byte = (bt & 0x7f) as u8;
+                match val_type(byte) {
+                    Ok(t) => Ok(Some((Vec::new(), alloc::vec![t]))),
+                    Err(_) => Ok(None),
+                }
             } else {
-                Ok(None)
+                match u32::try_from(bt)
+                    .ok()
+                    .and_then(|i| self.types.get(i as usize))
+                {
+                    Some(ft) => Ok(Some((ft.params.clone(), ft.results.clone()))),
+                    None => Ok(None),
+                }
             }
         };
 
@@ -1151,7 +1195,11 @@ impl Module {
         Ok(())
     }
 
-    fn decode_imports(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
+    fn decode_imports(
+        s: &mut Reader,
+        m: &mut Module,
+        limits: &crate::limits::WasmLimits,
+    ) -> Result<(), WasmRtError> {
         let count = s.u32()?;
         for _ in 0..count {
             let mlen = s.u32()? as usize;
@@ -1190,7 +1238,7 @@ impl Module {
                     let max = if flag == 1 { Some(s.u32()?) } else { None };
                     // Bound the declared minimum (the host allocates `min` pages),
                     // matching the `memory.grow` ceiling, and require min <= max.
-                    if min > MAX_MEM_PAGES {
+                    if min > limits.max_mem_pages {
                         return Err(WasmRtError("memory minimum exceeds limit"));
                     }
                     if let Some(max) = max
@@ -1272,7 +1320,11 @@ impl Module {
             .collect()
     }
 
-    fn decode_memory(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
+    fn decode_memory(
+        s: &mut Reader,
+        m: &mut Module,
+        limits: &crate::limits::WasmLimits,
+    ) -> Result<(), WasmRtError> {
         let count = s.u32()?;
         if count > 0 {
             // limits: flag (0 = min only, 1 = min+max), then min (and max).
@@ -1283,7 +1335,7 @@ impl Module {
             }
             // Bound the declared minimum (it sizes the `new_store` allocation),
             // matching the `memory.grow` ceiling, and require min <= max.
-            if min > MAX_MEM_PAGES {
+            if min > limits.max_mem_pages {
                 return Err(WasmRtError("memory minimum exceeds limit"));
             }
             if let Some(max) = m.mem_max_pages
@@ -1296,7 +1348,11 @@ impl Module {
         Ok(())
     }
 
-    fn decode_table(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
+    fn decode_table(
+        s: &mut Reader,
+        m: &mut Module,
+        limits: &crate::limits::WasmLimits,
+    ) -> Result<(), WasmRtError> {
         let count = s.u32()?;
         for _ in 0..count {
             let _elemtype = s.byte()?; // 0x70 funcref (or 0x6f externref)
@@ -1307,7 +1363,7 @@ impl Module {
             }
             // Reject an oversized declared minimum before allocating: an unchecked
             // `min` (e.g. 0xFFFF_FFFF) would request ~34 GiB and abort.
-            if min > MAX_TABLE_ELEMS {
+            if min > limits.max_table_elems {
                 return Err(WasmRtError("table minimum exceeds limit"));
             }
             // One table per module (multi-table is post-MVP); size to `min`.
@@ -1430,7 +1486,11 @@ impl Module {
         Ok(())
     }
 
-    fn decode_code(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
+    fn decode_code(
+        s: &mut Reader,
+        m: &mut Module,
+        limits: &crate::limits::WasmLimits,
+    ) -> Result<(), WasmRtError> {
         let count = s.u32()?;
         for _ in 0..count {
             let body_size = s.u32()? as usize;
@@ -1447,7 +1507,7 @@ impl Module {
                 let t = val_type(b.byte()?)?;
                 total = total
                     .checked_add(n)
-                    .filter(|t| *t <= MAX_LOCALS)
+                    .filter(|t| *t <= limits.max_locals)
                     .ok_or(WasmRtError("too many locals"))?;
                 for _ in 0..n {
                     locals.push(t);
@@ -1570,13 +1630,17 @@ impl Module {
         let mut store = self.new_store()?;
         // No host: an imported call (which an import-free module has none of) errors.
         let mut none = |_i: usize, _a: &[Val]| Err(WasmRtError("missing host function for import"));
-        self.call_with_store(index, args, &mut store, &mut none, 0)
+        // Seed one fuel budget for the whole call tree (WASM-7). `u64::MAX` is a
+        // harmless sentinel when fuel is disabled — it is never decremented.
+        let mut fuel = self.limits.fuel.unwrap_or(u64::MAX);
+        self.call_with_store(index, args, &mut store, &mut none, 0, &mut fuel)
     }
 
     /// Like [`call`](Self::call) but over a caller-provided instance store and
     /// import dispatcher (both shared across nested `call`s). `depth` is the
     /// combined call-frame + block-nesting depth, threaded to bound native
-    /// recursion (see [`MAX_CALL_DEPTH`]).
+    /// recursion (`limits.max_call_depth`). `fuel` is the shared instruction
+    /// budget for the whole call tree (WASM-7); ignored when fuel is disabled.
     fn call_with_store(
         &self,
         index: u32,
@@ -1584,11 +1648,12 @@ impl Module {
         store: &mut Store,
         host: ImportHost,
         depth: u32,
+        fuel: &mut u64,
     ) -> Result<Vec<Val>, WasmRtError> {
         // Each entered call frame counts toward the shared depth budget; reject
         // before recursing so a self-recursive wasm fn traps instead of
         // overflowing the Rust stack.
-        if depth >= MAX_CALL_DEPTH {
+        if depth >= self.limits.max_call_depth {
             return Err(WasmRtError("call stack exhausted"));
         }
         let ty = self
@@ -1614,7 +1679,15 @@ impl Module {
             locals.push(zero_val(*lt));
         }
         let mut stack: Vec<Val> = Vec::new();
-        self.exec(&body.code, &mut locals, &mut stack, store, host, depth + 1)?;
+        self.exec(
+            &body.code,
+            &mut locals,
+            &mut stack,
+            store,
+            host,
+            depth + 1,
+            fuel,
+        )?;
         // Take the result count off the top of the stack.
         let n = ty.results.len();
         if stack.len() < n {
@@ -1624,8 +1697,10 @@ impl Module {
     }
 
     /// Executes an instruction stream, mutating `locals`/`stack`. Returns `Ok`
-    /// on normal completion (`end`/`return`).
-    #[allow(clippy::too_many_lines)]
+    /// on normal completion (`end`/`return`). `fuel` is the shared instruction
+    /// budget (WASM-7): decremented once per executed instruction; when it hits 0
+    /// (and fuel is enabled) execution traps with "out of fuel".
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn exec(
         &self,
         code: &[u8],
@@ -1634,13 +1709,18 @@ impl Module {
         store: &mut Store,
         host: ImportHost,
         depth: u32,
+        fuel: &mut u64,
     ) -> Result<Flow, WasmRtError> {
         // Guard the native stack: `exec` recurses (block/loop/if → exec_block →
         // exec, call → call_with_store → exec). One shared budget covers both
         // call frames and block nesting.
-        if depth >= MAX_CALL_DEPTH {
+        if depth >= self.limits.max_call_depth {
             return Err(WasmRtError("call stack exhausted"));
         }
+        // Whether fuel metering is active for this call tree (seeded from
+        // `limits.fuel`). When disabled, `fuel` carries the `u64::MAX` sentinel
+        // and is never touched.
+        let metered = self.limits.fuel.is_some();
         let mut r = Reader::new(code);
         macro_rules! pop {
             () => {
@@ -1715,6 +1795,12 @@ impl Module {
         }
         while !r.done() {
             let op = r.byte()?;
+            // WASM-7: charge one unit of fuel per instruction at this single
+            // chokepoint. When the budget is exhausted, trap instead of looping
+            // forever (e.g. `(loop (br 0))`). No-op when fuel is disabled.
+            if metered {
+                *fuel = fuel.checked_sub(1).ok_or(WasmRtError("out of fuel"))?;
+            }
             match op {
                 0x00 => return Err(WasmRtError("unreachable executed")), // unreachable (trap)
                 0x01 => {}                                               // nop
@@ -1766,7 +1852,7 @@ impl Module {
                         return Err(WasmRtError("call argument underflow"));
                     }
                     let cargs = stack.split_off(stack.len() - n);
-                    let res = self.call_with_store(callee, &cargs, store, host, depth)?;
+                    let res = self.call_with_store(callee, &cargs, store, host, depth, fuel)?;
                     stack.extend(res);
                 }
                 // call_indirect: typeidx, tableidx; pop the table index, look up
@@ -1795,7 +1881,7 @@ impl Module {
                         return Err(WasmRtError("call argument underflow"));
                     }
                     let cargs = stack.split_off(stack.len() - n);
-                    let res = self.call_with_store(func, &cargs, store, host, depth)?;
+                    let res = self.call_with_store(func, &cargs, store, host, depth, fuel)?;
                     stack.extend(res);
                 }
                 // --- linear memory ---
@@ -2335,7 +2421,16 @@ impl Module {
                 0xa6 => bin_f64!(f64_copysign),
                 // structured control: block / loop
                 0x02 | 0x03 => {
-                    let _blocktype = r.byte()?; // 0x40 (empty) or a value type
+                    // WASM-9: read the blocktype as a full signed LEB so a
+                    // multi-byte type-index blocktype consumes all its bytes and
+                    // does not desync the stream (the security-relevant fix). The
+                    // interpreter is stack-based and resolves block results from
+                    // the operand stack, so a type-index block's result arity is
+                    // handled implicitly. TODO: multi-value block *parameters*
+                    // (a type-index block that consumes operands on entry) are a
+                    // remaining conformance gap; type-checking for them is
+                    // modeled in `validate_types` but not enforced at execution.
+                    let _blocktype = r.blocktype()?;
                     let is_loop = op == 0x03;
                     let (consumed, flow) = self.exec_block(
                         &code[r.pos..],
@@ -2345,6 +2440,7 @@ impl Module {
                         host,
                         is_loop,
                         depth,
+                        fuel,
                     )?;
                     r.pos += consumed;
                     match flow {
@@ -2359,7 +2455,8 @@ impl Module {
                 }
                 // if / else / end: pop the condition, run the chosen arm.
                 0x04 => {
-                    let _blocktype = r.byte()?;
+                    // WASM-9: full signed-LEB blocktype (see block/loop above).
+                    let _blocktype = r.blocktype()?;
                     let cond = pop!().as_i32()? != 0;
                     let body = &code[r.pos..];
                     let inner_len = block_len(body)?; // includes the matching `end`
@@ -2374,7 +2471,7 @@ impl Module {
                         }
                     };
                     r.pos += inner_len;
-                    match self.exec(arm, locals, stack, store, host, depth + 1)? {
+                    match self.exec(arm, locals, stack, store, host, depth + 1, fuel)? {
                         Flow::Return => return Ok(Flow::Return),
                         Flow::Branch(n) => return Ok(Flow::Branch(n.saturating_sub(1))),
                         Flow::Normal => {}
@@ -2522,12 +2619,13 @@ impl Module {
         host: ImportHost,
         is_loop: bool,
         depth: u32,
+        fuel: &mut u64,
     ) -> Result<(usize, Flow), WasmRtError> {
         let inner_len = block_len(code)?;
         let inner = &code[..inner_len - 1]; // exclude the matching `end`
         loop {
             // Entering the block body consumes one unit of the depth budget.
-            match self.exec(inner, locals, stack, store, host, depth + 1)? {
+            match self.exec(inner, locals, stack, store, host, depth + 1, fuel)? {
                 Flow::Branch(0) => {
                     if is_loop {
                         continue; // re-run the loop body
@@ -2681,7 +2779,10 @@ impl<'m> Instance<'m> {
                 .get(i)
                 .ok_or(WasmRtError("missing host function for import"))?(a)
         };
-        module.call_with_store(index, args, store, &mut host, 0)
+        // One fuel budget for the whole call tree (WASM-7), from the module's
+        // limits; `u64::MAX` is an unused sentinel when fuel is disabled.
+        let mut fuel = module.limits.fuel.unwrap_or(u64::MAX);
+        module.call_with_store(index, args, store, &mut host, 0, &mut fuel)
     }
 
     /// Instantiates `module` whose function imports are dispatched through an
@@ -2758,8 +2859,10 @@ impl<'m> Instance<'m> {
         args: &[Val],
         host: ImportHost,
     ) -> Result<Vec<Val>, WasmRtError> {
+        // Seed one fuel budget for the whole call tree (WASM-7).
+        let mut fuel = self.module.limits.fuel.unwrap_or(u64::MAX);
         self.module
-            .call_with_store(index, args, &mut self.store, host, 0)
+            .call_with_store(index, args, &mut self.store, host, 0, &mut fuel)
     }
 
     /// Resolves an exported function by name and calls it, dispatching imports
@@ -2916,7 +3019,7 @@ fn else_split(code: &[u8]) -> Result<Option<usize>, WasmRtError> {
         match op {
             0x02..=0x04 => {
                 depth += 1;
-                r.byte()?; // blocktype
+                r.blocktype()?; // WASM-9: full signed-LEB blocktype (no desync)
             }
             0x0b => depth -= 1, // end of a nested block (the body has no top `end`)
             0x05 if depth == 0 => return Ok(Some(at)),
@@ -2974,7 +3077,7 @@ fn block_len(code: &[u8]) -> Result<usize, WasmRtError> {
         match op {
             0x02..=0x04 => {
                 depth += 1;
-                r.byte()?; // blocktype
+                r.blocktype()?; // WASM-9: full signed-LEB blocktype (no desync)
             }
             0x0b => {
                 if depth == 0 {
@@ -4266,5 +4369,130 @@ mod tests {
     #[test]
     fn rejects_bad_magic() {
         assert!(Module::decode(&[0, 0, 0, 0, 1, 0, 0, 0]).is_err());
+    }
+
+    /// WASM-7: an exported `(func (export "run") (loop (br 0)))` is an infinite
+    /// loop; with fuel metering it must trap with "out of fuel" instead of
+    /// hanging.
+    #[test]
+    fn infinite_loop_traps_out_of_fuel() {
+        // (module (func (export "run") (loop (br 0))))
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0: () -> ()
+        m.extend([0x03, 0x02, 0x01, 0x00]); // func 0: type 0
+        m.extend([0x07, 0x07, 0x01, 0x03, b'r', b'u', b'n', 0x00, 0x00]); // export "run"
+        // body: 0 locals, loop (blocktype 0x40) { br 0 } end, end
+        let body: Vec<u8> = vec![0x00, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x0b];
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+
+        // A small fuel budget so the loop trips quickly.
+        let limits = crate::limits::WasmLimits {
+            fuel: Some(1000),
+            ..Default::default()
+        };
+        let module = Module::decode_with_limits(&m, &limits).expect("decode");
+        let f = module.export("run").expect("export run");
+        let err = module.call(f, &[]).expect_err("must trap, not hang");
+        assert_eq!(err.0, "out of fuel");
+
+        // With fuel disabled the same module would loop forever, so we only
+        // assert the metered path here (the unbounded path is exercised by the
+        // other finite tests, which run with default `Some(..)` fuel).
+    }
+
+    /// WASM-9: a `block` whose blocktype is a multi-byte (≥ 0x80 signed-LEB)
+    /// *type index* must decode and run without desyncing the instruction stream.
+    /// Type index 64 encodes as the two bytes `0xc0 0x00`; reading it as a single
+    /// byte (the old bug) would leave `0x00` unconsumed and corrupt the stream.
+    #[test]
+    fn type_index_blocktype_no_desync() {
+        // Unsigned LEB128, for section sizes / counts that exceed 127.
+        fn uleb(mut v: u32, out: &mut Vec<u8>) {
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(b);
+                    break;
+                }
+                out.push(b | 0x80);
+            }
+        }
+        fn section(id: u8, body: &[u8]) -> Vec<u8> {
+            let mut s = vec![id];
+            uleb(body.len() as u32, &mut s);
+            s.extend_from_slice(body);
+            s
+        }
+
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Type section: 65 types, every one () -> i32. Type 0 is the function's
+        // signature; type 64 is the block's type index — and 64 as a *signed*
+        // LEB needs two bytes (`0xc0 0x00`), which is exactly the multi-byte
+        // blocktype that used to desync the stream.
+        let n_types: u32 = 65;
+        let mut tbody = Vec::new();
+        uleb(n_types, &mut tbody);
+        for _ in 0..n_types {
+            tbody.extend([0x60, 0x00, 0x01, 0x7f]); // () -> i32
+        }
+        m.extend(section(0x01, &tbody));
+        m.extend(section(0x03, &[0x01, 0x00])); // func section: func 0 = type 0
+        m.extend(section(0x07, &[0x01, 0x01, b'f', 0x00, 0x00])); // export "f" func 0
+        // code body: 0 locals; block (type index 64 => 0xc0 0x00) { i32.const 42 }
+        // end ; end. The block produces one i32 (matching type 64's result), the
+        // function returns it. A desync here would misread the stream and corrupt
+        // the result or trap.
+        let body: Vec<u8> = vec![
+            0x00, // 0 local runs
+            0x02, 0xc0, 0x00, // block (blocktype = type index 64, 2-byte LEB)
+            0x41, 0x2a, // i32.const 42
+            0x0b, // end (block)
+            0x0b, // end (function)
+        ];
+        let mut cbody = Vec::new();
+        uleb(1, &mut cbody); // 1 function body
+        uleb(body.len() as u32, &mut cbody);
+        cbody.extend(body);
+        m.extend(section(0x0a, &cbody));
+
+        let module = Module::decode(&m).expect("decode type-index blocktype module");
+        let f = module.export("f").expect("export f");
+        assert_eq!(module.call(f, &[]).unwrap(), vec![Val::I32(42)]);
+    }
+
+    /// WASM-6: a custom low `max_call_depth` must trap a deep recursion earlier
+    /// than the default would. A self-recursive function with no base case
+    /// exhausts the depth budget and traps "call stack exhausted".
+    #[test]
+    fn custom_low_call_depth_traps_early() {
+        // (module (func $f (export "rec") (call $f)))  -- unbounded recursion
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        m.extend([0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0: () -> ()
+        m.extend([0x03, 0x02, 0x01, 0x00]); // func 0: type 0
+        m.extend([0x07, 0x07, 0x01, 0x03, b'r', b'e', b'c', 0x00, 0x00]); // export "rec"
+        // body: 0 locals, call 0, end
+        let body: Vec<u8> = vec![0x00, 0x10, 0x00, 0x0b];
+        m.push(0x0a);
+        m.push((body.len() + 2) as u8);
+        m.push(0x01);
+        m.push(body.len() as u8);
+        m.extend(body);
+
+        // A very low call-depth cap so the trap fires almost immediately; keep
+        // fuel generous so the depth guard (not fuel) is what trips.
+        let limits = crate::limits::WasmLimits {
+            max_call_depth: 8,
+            fuel: Some(10_000_000),
+            ..Default::default()
+        };
+        let module = Module::decode_with_limits(&m, &limits).expect("decode");
+        let f = module.export("rec").expect("export rec");
+        let err = module.call(f, &[]).expect_err("must trap on depth");
+        assert_eq!(err.0, "call stack exhausted");
     }
 }
