@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/kataan/compare/v0.0.3...v0.0.4) - 2026-06-14
+
+### Fixed
+
+- *(typed-array)* validate view/DataView bounds + checked offset math
+- *(nbexec)* L1 — ArrayBuffer.prototype.transfer(n) caps length via validate_alloc_len
+- *(nbexec)* C2 — guard tree-walk recursion depth to avoid native stack overflow
+- *(arrays)* C1 — throw RangeError on oversized array element write / length set
+- *(realm)* C1 cap dense-array growth; M3 skip frozen-set probes
+
+### Other
+
+- *(typed-array)* bulk byte ops for fill/copyWithin/set + alloc-free encode
+- *(regex)* build the scalar adapter program lazily (RE-P2)
+- *(regex)* cache the compiled Regex on the RegExp cell (RE-P1)
+- *(string)* P1/P3/P5/P6 — stop double-flattening strings, borrow leaf bytes, run UTF-16 counts
+- *(wasm)* cache decoded Module + cut per-call memory copies at JS↔wasm boundary
+- *(nbvm)* M4 — borrow array backing for pure-scan builtins; tests
+- *(nbvm)* H2 — gate regexp probe on key in GetProp hot path
+- *(realm)* P4 byte-exact string comparison; add tests for C1/H3/P4/P2
+- *(realm)* H3 truthy tests emptiness without materializing the string
+- *(rope/realm)* P2 zero-copy leaf-byte borrow fast path
+- *(bytecode)* verifier rejects LoadConst with a raw heap handle (M3)
+
 ## [0.0.3](https://github.com/KarpelesLab/kataan/compare/v0.0.2...v0.0.3) - 2026-06-14
 
 ### Added
