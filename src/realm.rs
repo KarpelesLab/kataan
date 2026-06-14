@@ -1060,18 +1060,35 @@ impl Realm {
         }
         // A frozen array rejects all element writes; a sealed / non-extensible array
         // rejects only writes that would grow it (a write to an existing index is
-        // still allowed when merely sealed).
-        if self.frozen_arrays.contains(&handle.to_raw()) {
+        // still allowed when merely sealed). The frozen/non-extensible registries
+        // are empty for the overwhelming majority of arrays, so skip both `BTreeSet`
+        // probes in that common case.
+        let any_restricted =
+            !self.frozen_arrays.is_empty() || !self.non_extensible_arrays.is_empty();
+        if any_restricted && self.frozen_arrays.contains(&handle.to_raw()) {
             return false;
         }
-        let non_ext = self.non_extensible_arrays.contains(&handle.to_raw());
+        let non_ext = any_restricted && self.non_extensible_arrays.contains(&handle.to_raw());
         match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
                 if index >= a.len() {
                     if non_ext {
                         return false;
                     }
-                    a.resize(index + 1, NanBox::undefined());
+                    // C1: never grow the dense backing past the configured cap — a
+                    // huge index (`a[4294967295] = 1`) would otherwise request a
+                    // multi-gigabyte `Vec::resize` and abort the process. Refuse the
+                    // grow (a no-op `false`, the same signal a frozen array returns)
+                    // so the engine stays alive; callers can surface a catchable
+                    // `RangeError("Invalid array length")`. `checked_add` guards the
+                    // `usize` overflow at `index == usize::MAX`.
+                    let Some(new_len) = index.checked_add(1) else {
+                        return false;
+                    };
+                    if new_len > self.limits.max_array_len {
+                        return false;
+                    }
+                    a.resize(new_len, NanBox::undefined());
                 }
                 a[index] = value;
                 self.write_barrier(handle, value);
@@ -1084,11 +1101,21 @@ impl Realm {
     /// `arr.push(value)` — appends, returning the new length, or `None` if the
     /// cell is not an array (or the array is frozen).
     pub fn array_push(&mut self, handle: Handle, value: NanBox) -> Option<usize> {
-        // A sealed / non-extensible (or frozen) array cannot grow.
-        if self.non_extensible_arrays.contains(&handle.to_raw()) {
+        // A sealed / non-extensible (or frozen) array cannot grow. The registry is
+        // empty for almost all arrays, so skip the `BTreeSet` probe in that case.
+        if !self.non_extensible_arrays.is_empty()
+            && self.non_extensible_arrays.contains(&handle.to_raw())
+        {
             return None;
         }
+        let max = self.limits.max_array_len;
         let a = self.heap.get_mut(handle).and_then(Cell::as_array_mut)?;
+        // C1: refuse to grow past the configured cap rather than risk an unbounded
+        // allocation (a single push only adds one element, but an array already at
+        // the cap must not exceed it).
+        if a.len() >= max {
+            return None;
+        }
         a.push(value);
         Some(a.len())
     }
@@ -1106,8 +1133,18 @@ impl Realm {
     }
 
     /// Sets an array's `length` (`arr.length = n`): truncates if smaller, pads
-    /// with `undefined` if larger. Returns `false` if not an array.
+    /// with `undefined` if larger. Returns `false` if not an array **or if the
+    /// requested length exceeds [`Limits::max_array_len`]** — in the latter case
+    /// the array is left untouched rather than triggering an unbounded
+    /// `Vec::resize` (`arr.length = 4e9` would otherwise request a multi-gigabyte
+    /// allocation and abort the process). A `false` here lets callers surface a
+    /// catchable `RangeError("Invalid array length")`.
+    ///
+    /// [`Limits::max_array_len`]: crate::limits::Limits::max_array_len
     pub fn set_array_length(&mut self, handle: Handle, len: usize) -> bool {
+        if len > self.limits.max_array_len {
+            return false;
+        }
         match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
                 a.resize(len, NanBox::undefined());
