@@ -61,6 +61,99 @@ pub struct PromiseState {
     pub reactions: Vec<Reaction>,
 }
 
+/// The free/release hook for an externally-owned byte region, run once when the
+/// backing [`ByteStore::External`] is dropped (swept). `ptr`/`len` are exactly
+/// the values passed to [`ByteStore::external`].
+pub type ExternFree = unsafe fn(ptr: *mut u8, len: usize);
+
+/// The contiguous byte backing of an `ArrayBuffer` / typed array.
+///
+/// `Owned` is a heap `Vec<u8>` the engine manages. `External` is a caller-owned
+/// region wrapped zero-copy (e.g. an IPC shared-memory page): the engine reads
+/// and writes it in place and never moves it (the moving GC relocates the
+/// `Cell`'s 24-byte header, not the region the pointer addresses), and frees it
+/// via the optional [`ExternFree`] hook when the cell is collected.
+pub enum ByteStore {
+    /// Engine-owned bytes.
+    Owned(Vec<u8>),
+    /// A zero-copy wrapper over a caller-owned region.
+    External(ExternalBytes),
+}
+
+/// A zero-copy wrapper over an external byte region (see [`ByteStore::External`]).
+/// Its [`Drop`] runs the optional free hook exactly once; a move (GC compaction)
+/// is a bitwise copy and does not drop, so the region is freed only on sweep.
+pub struct ExternalBytes {
+    ptr: *mut u8,
+    len: usize,
+    free: Option<ExternFree>,
+}
+
+impl ByteStore {
+    /// Wraps an external region. `ptr` must be non-null, valid for reads/writes
+    /// of `len` bytes, and remain valid until `free` (if any) is called on drop;
+    /// if `free` is `None` the region must outlive the realm.
+    ///
+    /// # Safety
+    /// The caller upholds the validity/lifetime contract above.
+    #[must_use]
+    #[allow(unsafe_code)]
+    pub unsafe fn external(ptr: *mut u8, len: usize, free: Option<ExternFree>) -> Self {
+        ByteStore::External(ExternalBytes { ptr, len, free })
+    }
+
+    /// The number of bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            ByteStore::Owned(v) => v.len(),
+            ByteStore::External(e) => e.len,
+        }
+    }
+
+    /// Whether the store is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// A read view of the bytes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ByteStore::Owned(v) => v,
+            // SAFETY: per the `external` contract, `ptr` is valid for `len` bytes
+            // for the lifetime of this store (an audited primitive under the
+            // crate's `unsafe_code = "deny"` policy).
+            #[allow(unsafe_code)]
+            ByteStore::External(e) => unsafe { core::slice::from_raw_parts(e.ptr, e.len) },
+        }
+    }
+
+    /// A mutable view of the bytes.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            ByteStore::Owned(v) => v,
+            // SAFETY: as `as_slice`, and `&mut self` guarantees exclusive access.
+            #[allow(unsafe_code)]
+            ByteStore::External(e) => unsafe { core::slice::from_raw_parts_mut(e.ptr, e.len) },
+        }
+    }
+}
+
+impl Drop for ExternalBytes {
+    fn drop(&mut self) {
+        if let Some(free) = self.free {
+            // SAFETY: `free` was supplied for exactly this `(ptr, len)` and Drop
+            // runs once (moves are bitwise and do not drop).
+            #[allow(unsafe_code)]
+            unsafe {
+                free(self.ptr, self.len);
+            }
+        }
+    }
+}
+
 /// A heap-allocated reference value.
 pub enum Cell {
     /// An ordinary object (shape + value slots).
@@ -69,6 +162,23 @@ pub enum Cell {
     Str(Rope),
     /// A dense array of element values.
     Array(Vec<NanBox>),
+    /// Contiguous raw bytes — the backing store of an `ArrayBuffer` (and thus of
+    /// the typed-array / `DataView` views over it). One byte per byte (no NaN-box
+    /// blow-up); may wrap external memory zero-copy. Holds no handles.
+    Bytes(ByteStore),
+    /// A typed-array *view* over an `ArrayBuffer`'s [`Cell::Bytes`]: it owns no
+    /// elements, reading/writing the shared bytes directly so sibling views and
+    /// `DataView`s alias the same storage.
+    TypedArray {
+        /// The backing `ArrayBuffer`'s bytes cell.
+        buffer: Handle,
+        /// Byte offset of the view's first element within the buffer.
+        byte_offset: usize,
+        /// Element count.
+        length: usize,
+        /// Element kind index into `TYPED_ARRAY_KINDS` (0..=8).
+        kind: u8,
+    },
     /// A closure: an index into the interpreter's function table plus the
     /// lexical scope it captured at definition.
     Function {
@@ -188,6 +298,37 @@ impl Cell {
         }
     }
 
+    /// The raw bytes, if this cell is a byte store.
+    #[must_use]
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Cell::Bytes(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// The byte store mutably, if this cell is one (for in-place writes/resize).
+    pub fn as_byte_store_mut(&mut self) -> Option<&mut ByteStore> {
+        match self {
+            Cell::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// The typed-array view `(buffer, byte_offset, length, kind)`, if this is one.
+    #[must_use]
+    pub fn as_typed_array(&self) -> Option<(Handle, usize, usize, u8)> {
+        match self {
+            Cell::TypedArray {
+                buffer,
+                byte_offset,
+                length,
+                kind,
+            } => Some((*buffer, *byte_offset, *length, *kind)),
+            _ => None,
+        }
+    }
+
     /// The function's `(func_id, captured env)`, if this cell is a function.
     #[must_use]
     pub fn as_function(&self) -> Option<(u32, &Scope)> {
@@ -287,11 +428,15 @@ impl Cell {
             Cell::BigInt(_) => "bigint",
             Cell::Object(_)
             | Cell::Array(_)
+            | Cell::TypedArray { .. }
             | Cell::Collection { .. }
             | Cell::Promise(_)
             | Cell::Date(_)
             | Cell::RegExp { .. }
             | Cell::Proxy { .. } => "object",
+            // An internal byte backing store is never a user-visible value; it is
+            // reached only through its owning ArrayBuffer/view.
+            Cell::Bytes(_) => "object",
         }
     }
 
@@ -380,6 +525,8 @@ impl Trace for Cell {
                     visit(r.result);
                 }
             }
+            // A typed-array view keeps its backing buffer reachable.
+            Cell::TypedArray { buffer, .. } => visit(*buffer),
             // A bound native keeps its target reachable.
             Cell::BoundNative { target, .. } => visit(*target),
             // A proxy keeps its target and handler reachable.
@@ -389,13 +536,15 @@ impl Trace for Cell {
                 visit(*target);
                 visit(*handler);
             }
-            // Strings, native functions, dates, and regexes reference no handles.
+            // Strings, native functions, dates, regexes, and raw byte stores
+            // reference no handles.
             Cell::Str(_)
             | Cell::Native(_)
             | Cell::Date(_)
             | Cell::RegExp { .. }
             | Cell::Symbol { .. }
-            | Cell::BigInt(_) => {}
+            | Cell::BigInt(_)
+            | Cell::Bytes(_) => {}
         }
     }
 }
@@ -427,6 +576,7 @@ impl crate::gc::Relocate for Cell {
                     r.result = forward(r.result);
                 }
             }
+            Cell::TypedArray { buffer, .. } => *buffer = forward(*buffer),
             Cell::BoundNative { target, .. } => *target = forward(*target),
             Cell::Proxy {
                 target, handler, ..
@@ -439,7 +589,8 @@ impl crate::gc::Relocate for Cell {
             | Cell::Date(_)
             | Cell::RegExp { .. }
             | Cell::Symbol { .. }
-            | Cell::BigInt(_) => {}
+            | Cell::BigInt(_)
+            | Cell::Bytes(_) => {}
         }
     }
 }
@@ -466,6 +617,45 @@ mod tests {
         let a = Cell::Array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)]);
         assert_eq!(a.as_array().map(<[_]>::len), Some(2));
         assert_eq!(a.type_of(), "object");
+    }
+
+    #[test]
+    fn byte_store_owned_and_external() {
+        // Owned: read + mutate in place.
+        let mut s = ByteStore::Owned(alloc::vec![1u8, 2, 3]);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.as_slice(), &[1, 2, 3]);
+        s.as_mut_slice()[1] = 9;
+        assert_eq!(s.as_slice(), &[1, 9, 3]);
+
+        // External: zero-copy view over a caller-owned region; writes go through.
+        let mut region = alloc::boxed::Box::new([10u8, 20, 30]);
+        let ptr = region.as_mut_ptr();
+        // SAFETY: `region` outlives `ext`; no free hook (caller owns it).
+        #[allow(unsafe_code)]
+        let mut ext = unsafe { ByteStore::external(ptr, 3, None) };
+        assert_eq!(ext.as_slice(), &[10, 20, 30]);
+        ext.as_mut_slice()[0] = 99;
+        assert_eq!(region[0], 99); // wrote through to the external region
+    }
+
+    #[test]
+    fn external_free_hook_runs_once_on_drop() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static FREED: AtomicUsize = AtomicUsize::new(0);
+        #[allow(unsafe_code)]
+        unsafe fn record_free(_p: *mut u8, _l: usize) {
+            FREED.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut region = alloc::boxed::Box::new([0u8; 4]);
+        let ptr = region.as_mut_ptr();
+        // SAFETY: region kept alive past the store; the hook only records.
+        #[allow(unsafe_code)]
+        let store = unsafe { ByteStore::external(ptr, 4, Some(record_free)) };
+        let cell = Cell::Bytes(store);
+        assert_eq!(FREED.load(Ordering::SeqCst), 0);
+        drop(cell); // sweeping the cell runs the free hook exactly once
+        assert_eq!(FREED.load(Ordering::SeqCst), 1);
     }
 
     #[test]

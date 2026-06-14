@@ -329,6 +329,66 @@ impl Realm {
         self.heap.alloc(Cell::Str(Rope::from(s)))
     }
 
+    /// Allocates a contiguous byte store (the backing of an `ArrayBuffer`) from
+    /// engine-owned bytes and returns its handle.
+    pub fn new_bytes(&mut self, data: alloc::vec::Vec<u8>) -> Handle {
+        self.heap
+            .alloc(Cell::Bytes(crate::cell::ByteStore::Owned(data)))
+    }
+
+    /// Allocates a byte store that wraps an external, caller-owned region
+    /// zero-copy (e.g. IPC shared memory). The engine reads/writes the region in
+    /// place and runs `free` (if any) when the cell is collected.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null and valid for reads and writes of `len` bytes until
+    /// `free` is invoked (or, if `free` is `None`, for the realm's lifetime). See
+    /// [`crate::cell::ByteStore::external`].
+    #[allow(unsafe_code)]
+    pub unsafe fn wrap_external_bytes(
+        &mut self,
+        ptr: *mut u8,
+        len: usize,
+        free: Option<crate::cell::ExternFree>,
+    ) -> Handle {
+        // SAFETY: forwarded to the caller's contract on `wrap_external_bytes`.
+        #[allow(unsafe_code)]
+        let store = unsafe { crate::cell::ByteStore::external(ptr, len, free) };
+        self.heap.alloc(Cell::Bytes(store))
+    }
+
+    /// A read view of the byte store at `handle`, if it is one.
+    #[must_use]
+    pub fn bytes_at(&self, handle: Handle) -> Option<&[u8]> {
+        self.heap.get(handle).and_then(Cell::as_bytes)
+    }
+
+    /// A mutable view of the byte store at `handle`, if it is one.
+    pub fn bytes_at_mut(&mut self, handle: Handle) -> Option<&mut [u8]> {
+        self.heap
+            .get_mut(handle)
+            .and_then(Cell::as_byte_store_mut)
+            .map(crate::cell::ByteStore::as_mut_slice)
+    }
+
+    /// Resizes an owned byte store to `new_len` (zero-filling on growth). No-op
+    /// for an external store (returns `false`); returns `true` on success.
+    pub fn bytes_resize(&mut self, handle: Handle, new_len: usize) -> bool {
+        match self.heap.get_mut(handle).and_then(Cell::as_byte_store_mut) {
+            Some(crate::cell::ByteStore::Owned(v)) => {
+                v.resize(new_len, 0);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The length of the byte store at `handle`, if it is one.
+    #[must_use]
+    pub fn bytes_len(&self, handle: Handle) -> Option<usize> {
+        self.bytes_at(handle).map(<[u8]>::len)
+    }
+
     /// Allocates a fresh, unique `Symbol` with the given description.
     pub fn new_symbol(&mut self, description: &str) -> Handle {
         let id = self.next_symbol_id;
@@ -1570,6 +1630,11 @@ impl Realm {
                     }
                 }
                 Some(Cell::BigInt(n)) => alloc::format!("{n}"),
+                // A typed-array view stringifies as its comma-joined elements
+                // (proper element decode is wired with the view model in A3); the
+                // raw byte backing is internal and never directly displayed.
+                Some(Cell::TypedArray { .. }) => alloc::string::String::from("[object TypedArray]"),
+                Some(Cell::Bytes(_)) => alloc::string::String::new(),
                 // A proxy renders as its target would.
                 Some(Cell::Proxy { target, .. }) => {
                     let h = Handle::from_raw(raw);

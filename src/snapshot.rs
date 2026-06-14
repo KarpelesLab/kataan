@@ -111,6 +111,9 @@ pub enum SnapCell {
         /// the symbol's description string
         description: String,
     },
+    /// the contiguous byte backing of an `ArrayBuffer` (an external store is
+    /// captured as an owned copy).
+    Bytes(Vec<u8>),
 }
 
 /// One captured scope frame: its `(name, value, is_const)` bindings.
@@ -164,6 +167,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             || realm.regexp_at(*r).is_some()
             || realm.symbol_at(*r).is_some()
             || realm.array_elements(*r).is_some()
+            || realm.bytes_at(*r).is_some()
             || realm.object_keys(*r).is_some();
         if serializable {
             root_indices.push(intern(&mut index_of, &mut order, *r));
@@ -243,6 +247,8 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             }
         } else if let Some((description, _id)) = realm.symbol_at(h) {
             SnapCell::Symbol { description }
+        } else if let Some(bytes) = realm.bytes_at(h) {
+            SnapCell::Bytes(bytes.to_vec())
         } else if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
             let vals = elems
                 .iter()
@@ -397,6 +403,7 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 (h, None)
             }
             SnapCell::Symbol { description } => (realm.new_symbol(description), None),
+            SnapCell::Bytes(data) => (realm.new_bytes(data.clone()), None),
         };
         handles.push(h);
         fn_chains.push(chain);
@@ -417,7 +424,7 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
     for (idx, (cell, h)) in snap.cells.iter().zip(&handles).enumerate() {
         match cell {
             // Reference-free cells were built fully in pass 1.
-            SnapCell::Str(_) | SnapCell::Date(_) | SnapCell::BigInt(_) => {}
+            SnapCell::Str(_) | SnapCell::Date(_) | SnapCell::BigInt(_) | SnapCell::Bytes(_) => {}
             SnapCell::Array(vals) => {
                 let elems: Vec<NanBox> = vals.iter().map(|v| resolve(v, &handles)).collect();
                 realm.array_set_all(*h, elems);
@@ -505,7 +512,7 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
 const MAGIC: &[u8; 4] = b"KSNP";
 /// Version 2 adds a `func_count` bound in the header (SNAP-2). Bumped from 1 so
 /// that older snapshots — which lack the bound — are rejected with [`SnapError::BadHeader`].
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 
 /// Why a serialized snapshot failed to load.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -670,6 +677,11 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
             SnapCell::Symbol { description } => {
                 out.push(10);
                 w_str(description, &mut out);
+            }
+            SnapCell::Bytes(data) => {
+                out.push(11);
+                w_u32(data.len() as u32, &mut out);
+                out.extend_from_slice(data);
             }
         }
     }
@@ -843,6 +855,10 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
             10 => SnapCell::Symbol {
                 description: r.string()?,
             },
+            11 => {
+                let n = r.u32()? as usize;
+                SnapCell::Bytes(r.take(n)?.to_vec())
+            }
             t => return Err(SnapError::BadTag(t)),
         };
         cells.push(cell);
@@ -1035,6 +1051,20 @@ mod mmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round_trips_a_byte_store() {
+        let mut realm = Realm::new();
+        let bytes = realm.new_bytes(alloc::vec![0u8, 1, 2, 250, 255]);
+        let snap = capture(&realm, &[bytes]);
+        // Serialize → deserialize → restore into a fresh realm.
+        let bin = serialize(&snap);
+        let snap2 = deserialize(&bin).expect("decode");
+        let mut realm2 = Realm::new();
+        let roots = restore(&mut realm2, &snap2);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(realm2.bytes_at(roots[0]), Some(&[0u8, 1, 2, 250, 255][..]));
+    }
 
     #[test]
     fn round_trips_an_object_graph() {
