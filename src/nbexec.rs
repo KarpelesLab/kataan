@@ -8144,11 +8144,16 @@ impl<'a> Interp<'a> {
                 .bytes_at(bh)
                 .map(<[u8]>::to_vec)
                 .unwrap_or_default();
-            // `transfer()` keeps the size; `transfer(n)` resizes (truncating or zero-padding).
+            // `transfer()` keeps the size; `transfer(n)` resizes (truncating or
+            // zero-padding). L1: route the requested length through
+            // `validate_alloc_len` so a huge `transfer(1e309)` throws a catchable
+            // `RangeError` instead of attempting a `usize::MAX` allocation that
+            // aborts the process (the ArrayBuffer constructor caps the same way).
             let new_len = if matches!(arg(0).unpack(), Unpacked::Undefined) {
                 bytes.len()
             } else {
-                self.realm.to_number(arg(0)).max(0.0) as usize
+                let raw = self.realm.to_number(arg(0));
+                self.validate_alloc_len(raw, "Invalid ArrayBuffer length")?
             };
             bytes.resize(new_len, 0);
             let nb = self.make_array_buffer_from_bytes(&bytes);
@@ -16413,6 +16418,21 @@ mod tests {
     /// L1: `ArrayBuffer.prototype.transfer(n)` with an enormous length throws a
     /// catchable `RangeError` (via `validate_alloc_len`) instead of attempting a
     /// `usize::MAX` allocation that aborts the process.
+    #[test]
+    fn array_buffer_transfer_huge_length_throws() {
+        assert_eq!(
+            run(
+                "var b=new ArrayBuffer(4); try{b.transfer(1e309);'noThrow'}catch(e){e.constructor.name}"
+            ),
+            "RangeError"
+        );
+        // A reasonable resize still works.
+        assert_eq!(
+            run("var b=new ArrayBuffer(4); b.transfer(8).byteLength"),
+            "8"
+        );
+    }
+
     #[test]
     fn surrogate_search_pad_split_iteration_units() {
         // indexOf/includes over UTF-16 units (astral char shifts the index by 2).
