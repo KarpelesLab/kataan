@@ -17,11 +17,6 @@ use alloc::vec::Vec;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Circular;
 
-/// Maximum structural nesting `JSON.stringify` will walk before reporting it as a
-/// cycle (the caller throws), rather than overflowing the host stack on a deep
-/// acyclic structure.
-const MAX_STRINGIFY_DEPTH: usize = 1000;
-
 /// Serializes `v` to a JSON string, or `None` when it has no JSON form
 /// (`undefined` or a function — which `JSON.stringify` omits).
 #[must_use]
@@ -69,7 +64,7 @@ fn stringify_seen(
                 // A repeated handle is a cycle; depth past the cap is treated the
                 // same (the caller throws) so a deep acyclic structure cannot
                 // overflow the native stack.
-                if seen.contains(&h) || seen.len() >= MAX_STRINGIFY_DEPTH {
+                if seen.contains(&h) || seen.len() >= realm.limits.max_json_depth {
                     return Err(Circular); // circular or too-deeply-nested structure
                 }
                 seen.push(h);
@@ -141,7 +136,7 @@ fn stringify_at(
             let inner = alloc::format!("{cur}{indent}");
             let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
             if is_container {
-                if seen.contains(&h) || seen.len() >= MAX_STRINGIFY_DEPTH {
+                if seen.contains(&h) || seen.len() >= realm.limits.max_json_depth {
                     return Err(Circular); // circular or too-deeply-nested structure
                 }
                 seen.push(h);
@@ -219,10 +214,6 @@ pub fn parse(realm: &mut Realm, src: &str) -> Result<NanBox, String> {
     Ok(v)
 }
 
-/// Maximum array/object nesting depth before `JSON.parse` reports an error
-/// rather than recursing into a stack overflow.
-const MAX_JSON_DEPTH: usize = 1000;
-
 fn parse_value(
     realm: &mut Realm,
     c: &[char],
@@ -233,7 +224,7 @@ fn parse_value(
     let Some(&ch) = c.get(*pos) else {
         return Err(String::from("Unexpected end of JSON input"));
     };
-    if matches!(ch, '[' | '{') && depth >= MAX_JSON_DEPTH {
+    if matches!(ch, '[' | '{') && depth >= realm.limits.max_json_depth {
         return Err(String::from("Maximum JSON nesting depth exceeded"));
     }
     match ch {

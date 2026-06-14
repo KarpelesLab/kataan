@@ -737,30 +737,9 @@ const HOME_OBJECT: &str = "\u{0}home";
 /// yielded values and the current `next()` cursor.
 /// Sentinel description for a `Symbol()` created with no argument (so its
 /// `.description` is `undefined`, distinct from `Symbol("")`).
-/// Maximum function-call nesting before a `RangeError` (recursion guard). Sized
-/// to fire before the large stack the engine entry points run on overflows (the
-/// tree-walker uses several tens of KB of host stack per JS call).
-const MAX_CALL_DEPTH: usize = 3500;
-/// Maximum element/byte count for a single allocation driven by an untrusted
-/// length (typed arrays, `ArrayBuffer`, WASM memory/table, the `Array`
-/// constructor). The dense NanBox-backed model amplifies this 8×, so a generous
-/// cap still bounds the allocation while admitting every legitimate test.
-const MAX_ALLOC_LEN: usize = 100_000_000;
-/// Maximum length (in `char`s/bytes) of a string produced by a single builtin
-/// (`repeat`, `padStart`/`padEnd`, `+` concatenation). `RangeError("Invalid
-/// string length")` past this — matches the spec's "invalid string length"
-/// guard while keeping the bound far below an OOM.
-const MAX_STRING_LEN: usize = 1 << 30;
-/// Maximum recursion depth for the native structural walkers (`JSON.stringify`,
-/// `structuredClone`, `Array.prototype.flat`, display stringification). Deep
-/// acyclic nesting past this throws rather than overflowing the host stack.
-const MAX_NATIVE_DEPTH: usize = 1000;
-/// Maximum bit-length of a `BigInt` grown by an attacker-controlled exponent
-/// (`**`, `<<`). `RangeError("Maximum BigInt size exceeded")` past this.
-const MAX_BIGINT_BITS: u64 = 1 << 30;
-/// Maximum array/object nesting depth before `JSON.parse` reports an error
-/// rather than recursing into a stack overflow.
-const MAX_JSON_DEPTH: usize = 1000;
+// The call-depth, allocation-length, string-length, native-recursion,
+// BigInt-size, and JSON-depth caps now live in [`crate::limits::Limits`] and are
+// read live from `self.realm.limits`, so an embedder can tune them per realm.
 const SYMBOL_NO_DESC: &str = "\u{0}nodesc";
 /// Hidden key holding a `WeakRef`'s target (returned by `deref`).
 const WEAKREF_TARGET: &str = "\u{0}wrtarget";
@@ -830,11 +809,18 @@ const N_MATH_CLZ32: u16 = 156;
 const N_MATH_IMUL: u16 = 157;
 
 impl<'a> Interp<'a> {
-    /// A fresh interpreter with a single (global) scope and a starter stdlib.
+    /// A fresh interpreter with a single (global) scope and a starter stdlib,
+    /// using default [`Limits`](crate::limits::Limits).
     #[must_use]
     pub fn new() -> Self {
+        Self::new_with_limits(crate::limits::Limits::default())
+    }
+
+    /// A fresh interpreter with the given resource [`Limits`](crate::limits::Limits).
+    #[must_use]
+    pub fn new_with_limits(limits: crate::limits::Limits) -> Self {
         let mut interp = Self {
-            realm: Realm::new(),
+            realm: Realm::with_limits(limits),
             current: Scope::root(),
             functions: Vec::new(),
             classes: Vec::new(),
@@ -1448,7 +1434,7 @@ impl<'a> Interp<'a> {
                         // sink (`BigInt("9".repeat(1e7))`). Cap the input length to
                         // the same size budget as `**`/`<<` (MAX_BIGINT_BITS bits ≈
                         // that many binary digits — a generous decimal bound).
-                        if s.trim().len() as u64 > MAX_BIGINT_BITS {
+                        if s.trim().len() as u64 > self.realm.limits.max_bigint_bits {
                             let m = self.new_str("Maximum BigInt size exceeded");
                             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                         }
@@ -3285,7 +3271,7 @@ impl<'a> Interp<'a> {
         let Some(&ch) = c.get(*pos) else {
             return Err(err(self));
         };
-        if matches!(ch, '[' | '{') && depth >= MAX_JSON_DEPTH {
+        if matches!(ch, '[' | '{') && depth >= self.realm.limits.max_json_depth {
             return Err(self.json_error("Maximum JSON nesting depth exceeded"));
         }
         match ch {
@@ -4689,7 +4675,7 @@ impl<'a> Interp<'a> {
         this_val: NanBox,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
-        if self.call_depth >= MAX_CALL_DEPTH {
+        if self.call_depth >= self.realm.limits.max_call_depth {
             let msg = self.new_str("Maximum call stack size exceeded");
             // A proper `RangeError` object (id 2 in `ERROR_NAMES`) so `instanceof
             // RangeError`/`Error` and `.name` work on the caught value.
@@ -5518,7 +5504,7 @@ impl<'a> Interp<'a> {
         }
         // Bound the recursion so a deep acyclic structure throws rather than
         // overflowing the host stack.
-        if seen.len() >= MAX_NATIVE_DEPTH {
+        if seen.len() >= self.realm.limits.max_display_depth {
             let m = self.new_str("Maximum call stack size exceeded");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
@@ -7786,7 +7772,8 @@ impl<'a> Interp<'a> {
             // `BigInt.asUintN(1e18, 0n)`) would otherwise build a ~10^17-byte
             // BigInt and OOM/abort. Cap `bits` to the same size budget as the
             // `**`/`<<` operators before building any power-of-two (MEM-6).
-            if bits > MAX_BIGINT_BITS {
+            let max_bigint_bits = self.realm.limits.max_bigint_bits;
+            if bits > max_bigint_bits {
                 let m = self.new_str("Maximum BigInt size exceeded");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
@@ -7797,7 +7784,7 @@ impl<'a> Interp<'a> {
                 .unwrap_or_else(BigInt::zero);
             // `try_pow` re-checks the projected size as defense in depth: even if
             // the cap above were ever loosened, no oversized allocation occurs.
-            let Some(modulus) = BigInt::from_i128(2).try_pow(bits, MAX_BIGINT_BITS) else {
+            let Some(modulus) = BigInt::from_i128(2).try_pow(bits, max_bigint_bits) else {
                 let m = self.new_str("Maximum BigInt size exceeded");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             };
@@ -8926,7 +8913,8 @@ impl<'a> Interp<'a> {
                     // A product that fits `usize` can still be enormous
                     // (`"x".repeat(2**40)` ≈ 1 TB); cap the result length too.
                     let total = n.checked_mul(s.len());
-                    if nf < 0.0 || nf.is_infinite() || total.is_none_or(|t| t > MAX_STRING_LEN) {
+                    let max_string_len = self.realm.limits.max_string_len;
+                    if nf < 0.0 || nf.is_infinite() || total.is_none_or(|t| t > max_string_len) {
                         let m = self.new_str("Invalid string length");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
@@ -10358,7 +10346,7 @@ impl<'a> Interp<'a> {
     /// `MAX_STRING_LEN` is an unrepresentable string, a `RangeError`. A negative,
     /// `NaN`, or zero target is clamped to 0 (the source is returned unchanged).
     fn pad_target(&mut self, n: f64) -> Result<usize, ExecError> {
-        if n > MAX_STRING_LEN as f64 {
+        if n > self.realm.limits.max_string_len as f64 {
             let m = self.new_str("Invalid string length");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
@@ -10373,7 +10361,11 @@ impl<'a> Interp<'a> {
     fn validate_alloc_len(&mut self, n: f64, what: &str) -> Result<usize, ExecError> {
         // `floor()` is std-only; once `n` is finite, non-negative, and within the
         // cap, the `usize` round-trip is a core-friendly integrality check.
-        if !n.is_finite() || n < 0.0 || n > MAX_ALLOC_LEN as f64 || (n as usize as f64) != n {
+        if !n.is_finite()
+            || n < 0.0
+            || n > self.realm.limits.max_array_len as f64
+            || (n as usize as f64) != n
+        {
             let m = self.new_str(what);
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
@@ -11196,16 +11188,16 @@ impl<'a> Interp<'a> {
     /// The values iterated by `for-of`: array elements, string chars, `Set`
     /// values, or `Map` `[key, value]` pairs.
     /// Recursively flattens nested arrays up to `depth` levels (for `flat`).
-    /// `rec` is the current recursion depth; nesting past [`MAX_NATIVE_DEPTH`]
-    /// throws rather than overflowing the host stack (`flat(Infinity)` on a
-    /// pathologically deep array).
+    /// `rec` is the current recursion depth; nesting past
+    /// `limits.max_display_depth` throws rather than overflowing the host stack
+    /// (`flat(Infinity)` on a pathologically deep array).
     fn flatten(
         &mut self,
         elems: &[NanBox],
         depth: i32,
         rec: usize,
     ) -> Result<Vec<NanBox>, ExecError> {
-        if rec >= MAX_NATIVE_DEPTH {
+        if rec >= self.realm.limits.max_display_depth {
             let m = self.new_str("Maximum call stack size exceeded");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
@@ -13829,7 +13821,7 @@ impl<'a> Interp<'a> {
                     // before the (possibly multi-GB) allocation, else `2n ** 1e10n`
                     // OOMs. Belt and suspenders: the same cap is enforced here so
                     // the error path is unmistakable.
-                    let Some(p) = x.try_pow(e, MAX_BIGINT_BITS) else {
+                    let Some(p) = x.try_pow(e, self.realm.limits.max_bigint_bits) else {
                         let m = self.new_str("Maximum BigInt size exceeded");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     };
@@ -13856,7 +13848,7 @@ impl<'a> Interp<'a> {
                     } else {
                         mag
                     };
-                    if projected > MAX_BIGINT_BITS {
+                    if projected > self.realm.limits.max_bigint_bits {
                         let m = self.new_str("Maximum BigInt size exceeded");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
@@ -15505,9 +15497,21 @@ fn skip_ws(c: &[char], pos: &mut usize) {
 /// # Errors
 /// Returns a parse or execution error message on failure.
 pub fn eval_source(source: &str) -> Result<(String, String), String> {
+    eval_source_with_limits(source, crate::limits::Limits::default())
+}
+
+/// Like [`eval_source`], but with caller-supplied resource
+/// [`Limits`](crate::limits::Limits).
+///
+/// # Errors
+/// Returns a parse or execution error message on failure.
+pub fn eval_source_with_limits(
+    source: &str,
+    limits: crate::limits::Limits,
+) -> Result<(String, String), String> {
     let program =
         crate::parser::Parser::parse_program(source).map_err(|e| alloc::format!("{e}"))?;
-    let mut interp = Interp::new();
+    let mut interp = Interp::new_with_limits(limits);
     let value = match interp.run(&program) {
         Ok(v) => v,
         // Render an uncaught throw readably: an error object as `name: message`,

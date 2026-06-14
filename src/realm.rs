@@ -39,11 +39,6 @@ use alloc::vec::Vec;
 /// [`Realm::typed_views`]: `(view_handle, byte_offset, element_kind, element_size)`.
 type TypedView = (u64, usize, u16, usize);
 
-/// Maximum nesting depth `to_display_string` walks before rendering a level as
-/// empty (matching the cycle rule), so a deep acyclic array/proxy chain cannot
-/// overflow the host stack during stringification.
-const MAX_DISPLAY_DEPTH: usize = 1000;
-
 /// An object-model context: the heap, the shared root shape, and the atom table.
 pub struct Realm {
     heap: Heap<Cell>,
@@ -94,6 +89,9 @@ pub struct Realm {
     /// [`new_object`](Realm::new_object) once the global environment is set up. A
     /// `None`-proto object (`Object.create(null)`) opts out explicitly.
     default_object_proto: Option<Handle>,
+    /// Tunable resource limits for work driven in this realm. Defaults to
+    /// [`crate::limits::Limits::default`]; override with [`Realm::with_limits`].
+    pub limits: crate::limits::Limits,
 }
 
 impl Default for Realm {
@@ -103,9 +101,15 @@ impl Default for Realm {
 }
 
 impl Realm {
-    /// Creates an empty realm.
+    /// Creates an empty realm with default [`Limits`](crate::limits::Limits).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_limits(crate::limits::Limits::default())
+    }
+
+    /// Creates an empty realm with the given resource [`Limits`](crate::limits::Limits).
+    #[must_use]
+    pub fn with_limits(limits: crate::limits::Limits) -> Self {
         Self {
             heap: Heap::new(),
             root_shape: Shape::root(),
@@ -121,6 +125,7 @@ impl Realm {
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
             typed_views: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
+            limits,
         }
     }
 
@@ -1509,7 +1514,7 @@ impl Realm {
                     // A circular reference back to this array renders empty; so
                     // does nesting past the depth cap, so a deep acyclic array
                     // cannot overflow the host stack here.
-                    if seen.contains(&h) || seen.len() >= MAX_DISPLAY_DEPTH {
+                    if seen.contains(&h) || seen.len() >= self.limits.max_display_depth {
                         return alloc::string::String::new();
                     }
                     seen.push(h);
@@ -1562,7 +1567,7 @@ impl Realm {
                 // A proxy renders as its target would.
                 Some(Cell::Proxy { target, .. }) => {
                     let h = Handle::from_raw(raw);
-                    if seen.contains(&h) || seen.len() >= MAX_DISPLAY_DEPTH {
+                    if seen.contains(&h) || seen.len() >= self.limits.max_display_depth {
                         return alloc::string::String::new();
                     }
                     seen.push(h);

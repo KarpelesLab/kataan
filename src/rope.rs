@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 /// Maximum length, in bytes, of a string the engine will build by
 /// concatenation. A `+` whose result would exceed this is a `RangeError`
 /// ("Invalid string length") rather than a `usize` overflow / OOM bomb.
-pub const MAX_STRING_LEN: usize = 1 << 30;
+pub const MAX_STRING_LEN: usize = crate::limits::DEFAULT_MAX_STRING_LEN;
 
 /// A string value represented as a tree of concatenated segments. Cloning is a
 /// reference-count bump; concatenation and length are O(1).

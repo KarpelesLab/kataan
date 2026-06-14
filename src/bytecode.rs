@@ -217,7 +217,7 @@ pub enum VerifyError {
 /// Maximum eager `NewArray` length accepted by the verifier — mirrors the
 /// `NewArrayCtor` / `Array(n)` cap so a crafted snapshot can't request an
 /// `usize::MAX`-element allocation that aborts at run time.
-pub const MAX_ARRAY_LEN: usize = 100_000_000;
+pub const MAX_ARRAY_LEN: usize = crate::limits::DEFAULT_MAX_ARRAY_LEN;
 
 /// Verifies a decoded program is **safe to run**: every register reference is in
 /// `0..n_regs`, every function index addresses a real function, and every jump /

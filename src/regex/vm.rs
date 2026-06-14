@@ -18,7 +18,7 @@ use core::cell::Cell;
 /// counter is created once per *find* (in `captures_at`) and shared across all
 /// start positions via `run_shared`, so the bound covers the whole operation,
 /// not each start independently (RE-8).
-const STEP_BASE: u64 = 300_000;
+const STEP_BASE: u64 = crate::limits::DEFAULT_REGEX_STEP_BASE;
 const STEP_PER_CHAR: u64 = 1_000;
 
 /// Maximum `backtrack` recursion depth before the match aborts cleanly. The VM
@@ -26,7 +26,7 @@ const STEP_PER_CHAR: u64 = 1_000;
 /// few thousand frames is safe. Picked conservatively to avoid SIGSEGV on
 /// adversarial input (e.g. `/a*/` on a very long string) while remaining far
 /// above any realistic legitimate nesting/iteration depth.
-const MAX_DEPTH: u32 = 2_000;
+const MAX_DEPTH: u32 = crate::limits::DEFAULT_REGEX_MAX_DEPTH;
 
 /// A compiled instruction.
 pub(crate) enum Inst {

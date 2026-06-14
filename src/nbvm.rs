@@ -388,26 +388,9 @@ struct Ctx<'a> {
     call_depth: usize,
 }
 
-/// Maximum function-call nesting before a `RangeError` (recursion guard), sized
-/// to fire before the large stack the engine entry points run on overflows.
-const MAX_VM_CALL_DEPTH: usize = 3500;
-
-/// Maximum live exception-handler entries in a single frame. A verified artifact
-/// can route a back-edge around a `PushHandler`; this caps the handler stack so it
-/// can't grow unboundedly (OOM). Generous relative to any real `try` nesting.
-const MAX_HANDLER_DEPTH: usize = 100_000;
-
-/// Maximum nesting the interpreter-aware JSON walkers (`json_revive`,
-/// `json_normalize`) descend before throwing a catchable `RangeError`. These
-/// recurse on the native stack with cycle detection only, so deep non-cyclic
-/// nesting would otherwise overflow the stack independent of `call_depth`.
-const MAX_JSON_DEPTH: usize = 2000;
-
-/// Maximum length (in bytes) of a string produced by a single builtin
-/// (`repeat`, …). Mirrors the tree-walker's cap: past this the result is an
-/// unrepresentable string and a `RangeError("Invalid string length")` is thrown
-/// rather than alloc-aborting the process.
-const MAX_STRING_LEN: usize = 1 << 30;
+// The recursion-guard, handler-stack, JSON-depth, and string-length caps now
+// live in `crate::limits::Limits` and are read live from `ctx.realm.limits`, so
+// an embedder can tune them per realm.
 
 /// Tier state for one function: its activation count and, once hot, its
 /// optimized bytecode body.
@@ -480,7 +463,7 @@ fn call_with(
     this_val: NanBox,
 ) -> Result<NanBox, VmError> {
     // Recursion guard: throw a catchable `RangeError` rather than overflowing.
-    if ctx.call_depth >= MAX_VM_CALL_DEPTH {
+    if ctx.call_depth >= ctx.realm.limits.max_call_depth {
         let e = make_error(ctx.realm, "RangeError", "Maximum call stack size exceeded");
         return Err(VmError::Thrown(e));
     }
@@ -1218,7 +1201,7 @@ fn run_frame(
             Op::NewArray { dst, len } => {
                 // Defence in depth: the verifier rejects oversized lengths, but the
                 // call-free `run` entrypoint runs unverified ops, so cap here too.
-                if *len > 100_000_000 {
+                if *len > ctx.realm.limits.max_array_len {
                     let e = make_error(ctx.realm, "RangeError", "Array length too large");
                     return Err(VmError::Thrown(e));
                 }
@@ -1234,7 +1217,7 @@ fn run_frame(
                         let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                         return Err(VmError::Thrown(e));
                     }
-                    if n > 100_000_000.0 {
+                    if n > ctx.realm.limits.max_array_len as f64 {
                         let e = make_error(ctx.realm, "RangeError", "Array length too large");
                         return Err(VmError::Thrown(e));
                     }
@@ -1765,7 +1748,7 @@ fn run_frame(
                 // A crafted artifact can loop a back-edge around this push; bound the
                 // handler stack so it can't grow without limit (OOM). Surface a
                 // catchable RangeError rather than aborting.
-                if handlers.len() >= MAX_HANDLER_DEPTH {
+                if handlers.len() >= ctx.realm.limits.max_handler_depth {
                     let e = make_error(ctx.realm, "RangeError", "Handler stack overflow");
                     handle_throw!(VmError::Thrown(e));
                 } else {
@@ -1886,7 +1869,7 @@ fn json_revive(
     reviver: NanBox,
     depth: usize,
 ) -> Result<NanBox, VmError> {
-    if depth >= MAX_JSON_DEPTH {
+    if depth >= ctx.realm.limits.max_json_depth {
         return Err(VmError::Thrown(make_error(
             ctx.realm,
             "RangeError",
@@ -1971,7 +1954,7 @@ fn json_normalize(
     seen: &mut Vec<Handle>,
     depth: usize,
 ) -> Result<NanBox, VmError> {
-    if depth >= MAX_JSON_DEPTH {
+    if depth >= ctx.realm.limits.max_json_depth {
         return Err(VmError::Thrown(make_error(
             ctx.realm,
             "RangeError",
@@ -2568,7 +2551,10 @@ fn builtin_method(
                 let nf = ctx.realm.to_number(arg0());
                 let n = nf as usize;
                 let total = n.checked_mul(s.len());
-                if nf < 0.0 || !nf.is_finite() || total.is_none_or(|t| t > MAX_STRING_LEN) {
+                if nf < 0.0
+                    || !nf.is_finite()
+                    || total.is_none_or(|t| t > ctx.realm.limits.max_string_len)
+                {
                     let e = make_error(ctx.realm, "RangeError", "Invalid string length");
                     return Some(Err(VmError::Thrown(e)));
                 }
@@ -3133,20 +3119,34 @@ pub fn compile_run_output(
 /// Returns a parse or execution error message.
 #[cfg(feature = "std")]
 pub fn execute(source: &str) -> Result<(String, String), String> {
+    execute_with_limits(source, crate::limits::Limits::default())
+}
+
+/// Like [`execute`], but with caller-supplied resource
+/// [`Limits`](crate::limits::Limits). The limits flow into the realm of both the
+/// bytecode path and the tree-walker fallback.
+///
+/// # Errors
+/// Returns a parse or execution error message.
+#[cfg(feature = "std")]
+pub fn execute_with_limits(
+    source: &str,
+    limits: crate::limits::Limits,
+) -> Result<(String, String), String> {
     let program =
         crate::parser::Parser::parse_program(source).map_err(|e| alloc::format!("{e}"))?;
     // Compile to bytecode; an unsupported construct routes the whole program to
     // the tree-walker (compilation happens before execution, so no output has
     // been produced yet — the fallback is clean).
     let Ok(protos) = compile_program(&program) else {
-        return crate::nbexec::eval_source(source);
+        return crate::nbexec::eval_source_with_limits(source, limits);
     };
-    let mut realm = Realm::new();
+    let mut realm = Realm::with_limits(limits);
     match run_program_capturing(&mut realm, &protos, 0, &[]) {
         Ok((value, output)) => Ok((output, realm.to_display_string(value))),
         // A runtime fault on the bytecode path (an unsupported coercion, etc.):
         // re-run on the reference tree-walker.
-        Err(_) => crate::nbexec::eval_source(source),
+        Err(_) => crate::nbexec::eval_source_with_limits(source, limits),
     }
 }
 

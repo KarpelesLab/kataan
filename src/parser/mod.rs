@@ -47,7 +47,7 @@ use alloc::vec::Vec;
 /// a 1 MiB stack with margin and leaves ~8x headroom on the stated 8 MiB target,
 /// while sitting comfortably in the few-hundred-to-~1000 range engines use and
 /// far above any realistic program's nesting.
-const MAX_PARSE_DEPTH: u32 = 300;
+const MAX_PARSE_DEPTH: u32 = crate::limits::DEFAULT_MAX_PARSE_DEPTH;
 
 /// A recursive-descent parser over a borrowed source string.
 pub struct Parser<'src> {

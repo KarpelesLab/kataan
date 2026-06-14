@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 /// generous quantifiers (`a{N}` / `(a{K}){K}`) expand by literal copying, so the
 /// projected size is checked against this budget before emitting; an over-budget
 /// expansion is a compile error rather than an OOM/hang (RE-3).
-const MAX_PROG_SIZE: usize = 100_000;
+const MAX_PROG_SIZE: usize = crate::limits::DEFAULT_REGEX_MAX_PROG_SIZE;
 
 /// Compiles `ast` to a program. The program is wrapped in `Save(0)…Save(1)` so
 /// group 0 records the whole match, and ends in `Match`. Returns the program

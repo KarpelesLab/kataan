@@ -9,7 +9,7 @@ use core::fmt;
 /// above this are rejected at parse time so a pattern like `a{99999999999}` can
 /// never reach the compiler and blow up instruction count / memory (RE-3). The
 /// compiler enforces a stricter *expanded-size* budget on top of this.
-const MAX_QUANT: usize = 1_000_000;
+const MAX_QUANT: usize = crate::limits::DEFAULT_REGEX_MAX_QUANT;
 
 /// Maximum nesting depth the parser will descend (groups / lookaround). Past this
 /// the parser errors instead of recursing, so a pathological pattern such as
@@ -18,7 +18,7 @@ const MAX_QUANT: usize = 1_000_000;
 /// `parse_alt`/`concat`/`quantified`/`atom` → `parse_group`), so this is kept
 /// well below the point that would exhaust a small (2 MiB) embedding stack while
 /// remaining far above any realistic legitimate nesting.
-const MAX_PARSE_DEPTH: u32 = 300;
+const MAX_PARSE_DEPTH: u32 = crate::limits::DEFAULT_REGEX_MAX_PARSE_DEPTH;
 
 /// A regex compilation error.
 #[derive(Debug, Clone, PartialEq, Eq)]

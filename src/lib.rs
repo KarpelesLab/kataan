@@ -82,6 +82,10 @@ pub mod ic;
 #[cfg(feature = "alloc")]
 pub mod atom;
 
+/// Tunable resource limits (recursion depths, allocation sizes, regex/wasm
+/// budgets) with safe defaults, overridable per [`realm::Realm`].
+pub mod limits;
+
 /// Rope strings: lazy O(1) concatenation so building a string piecewise is not
 /// quadratic. Needs `alloc`.
 #[cfg(feature = "alloc")]
@@ -165,6 +169,7 @@ pub mod regex;
 pub mod ffi;
 
 pub use error::{Error, Result};
+pub use limits::{Limits, WasmLimits};
 
 /// The crate version, from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
