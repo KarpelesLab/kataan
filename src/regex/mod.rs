@@ -24,18 +24,16 @@
 //!
 //! # Subject model
 //!
-//! The matching core ([`vm`]) operates on a subject of **UTF-16 code units**
-//! (`&[u16]`), so positions are code-unit indices and a lone surrogate is a
-//! matchable unit — this is JavaScript string semantics. The `u` (unicode) flag
-//! selects code-*point* operation (a surrogate pair is one character, `.` and
-//! classes span the whole astral character, `\u{…}` ranges work) while still
-//! reporting code-unit indices. The new public entry points
-//! [`captures_in_u16`](Regex::captures_in_u16) /
-//! [`find_in_u16`](Regex::find_in_u16) take and return code-unit positions.
+//! The matching core (the `vm` module) operates on a subject of **UTF-16 code
+//! units** (`&[u16]`), so positions are code-unit indices and a lone surrogate
+//! is a matchable unit — this is JavaScript string semantics. The `u` (unicode)
+//! flag selects code-*point* operation (a surrogate pair is one character, `.`
+//! and classes span the whole astral character, `\u{…}` ranges work) while still
+//! reporting code-unit indices. The new public entry points `captures_in_u16` /
+//! `find_in_u16` take and return code-unit positions.
 //!
-//! The historical `&str` / `&[char]` entry points
-//! ([`is_match`](Regex::is_match), [`captures_from`](Regex::captures_from),
-//! [`captures_in`](Regex::captures_in), …) are preserved as thin **adapters**:
+//! The historical `&str` / `&[char]` entry points (`is_match`, `captures_from`,
+//! `captures_in`, …) are preserved as thin **adapters**:
 //! they encode the input to UTF-16, run the u16 core, and translate the returned
 //! unit indices back to scalar (`char`) indices, so their observable behavior is
 //! exactly as before. New callers should migrate to the u16 API.
