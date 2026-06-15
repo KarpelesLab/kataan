@@ -13191,8 +13191,51 @@ impl<'a> Interp<'a> {
     fn assign_destructure(&mut self, target: &'a Expr, value: NanBox) -> Result<(), ExecError> {
         match target {
             Expr::Array { elements, .. } => {
-                // A non-iterable right-hand side (null, a plain object) is a TypeError.
-                let items = self.iterate_values(value)?;
+                let has_rest = elements
+                    .iter()
+                    .any(|e| matches!(e, ArrayElement::Spread(_)));
+                let needed = elements
+                    .iter()
+                    .filter(|e| !matches!(e, ArrayElement::Spread(_)))
+                    .count();
+                // Without a rest target, a *user* iterator is pulled lazily for only
+                // the values the pattern needs, then closed (`IteratorClose`) — so
+                // `[a, b] = infiniteIterator` terminates and `return()` runs.
+                // (Mirrors the declaration path in `bind_pattern`.) Built-in
+                // iterables (arrays/strings/Sets/generators) take the eager path.
+                let items = if !has_rest
+                    && let Some(ih) = self.for_of_get_iterator(value)?
+                {
+                    if self.realm.get_property(ih, GEN_BUF).is_some() {
+                        self.iterate_values(NanBox::handle(ih.to_raw()))?
+                    } else {
+                        let iterator = NanBox::handle(ih.to_raw());
+                        let mut out = Vec::with_capacity(needed);
+                        let mut exhausted = false;
+                        for _ in 0..needed {
+                            let next_fn = self.read_member(ih, "next")?;
+                            let res = self.call_with_this(next_fn, iterator, &[])?;
+                            let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                                return Err(ExecError::Throw(
+                                    self.new_str("iterator result is not an object"),
+                                ));
+                            };
+                            let done = self.read_member(rh, "done")?;
+                            if self.realm.truthy(done) {
+                                exhausted = true;
+                                break;
+                            }
+                            out.push(self.read_member(rh, "value")?);
+                        }
+                        if !exhausted {
+                            self.iterator_close(ih)?;
+                        }
+                        out
+                    }
+                } else {
+                    // A non-iterable right-hand side (null, a plain object) is a TypeError.
+                    self.iterate_values(value)?
+                };
                 let mut i = 0;
                 for el in elements {
                     match el {
@@ -13212,6 +13255,12 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::Object { members, .. } => {
+                // Object destructuring requires a coercible value: `null`/`undefined`
+                // throw a TypeError (RequireObjectCoercible).
+                if matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    let m = self.new_str("Cannot destructure 'null' or 'undefined' as an object");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 let src = value.as_handle().map(Handle::from_raw);
                 let mut used: Vec<String> = Vec::new();
                 for m in members {
@@ -13220,9 +13269,12 @@ impl<'a> Interp<'a> {
                             key, value: tgt, ..
                         } => {
                             let k = self.eval_prop_key(key)?;
-                            let v = src
-                                .and_then(|h| self.realm.get_property(h, &k))
-                                .unwrap_or(NanBox::undefined());
+                            // Read through `read_member` so accessors fire and
+                            // inherited / length properties resolve.
+                            let v = match src {
+                                Some(h) => self.read_member(h, &k)?,
+                                None => NanBox::undefined(),
+                            };
                             used.push(k);
                             self.assign_destructure(tgt, v)?;
                         }
@@ -13255,7 +13307,18 @@ impl<'a> Interp<'a> {
                 ..
             } => {
                 let v = if matches!(value.unpack(), Unpacked::Undefined) {
-                    self.eval(default_expr)?
+                    let d = self.eval(default_expr)?;
+                    // `[a = function(){}] = []` names the function after the target
+                    // (`a`) when the default is an anonymous function/class/arrow.
+                    if let Expr::Ident(id) = &**inner
+                        && matches!(
+                            &**default_expr,
+                            Expr::Function(_) | Expr::Class(_) | Expr::Arrow(_)
+                        )
+                    {
+                        self.set_fn_name(d, &id.name);
+                    }
+                    d
                 } else {
                     value
                 };
