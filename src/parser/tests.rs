@@ -1188,3 +1188,58 @@ fn module_source_type_inferred() {
         crate::ast::SourceType::Script
     );
 }
+
+// === `let` in single-statement position (Annex B / lookahead) ===========
+
+#[test]
+fn sloppy_let_in_single_statement_position_is_expression() {
+    // In single-statement position `let` is the identifier `let`, so each of
+    // these is valid: `let` (ASI) followed by the next statement.
+    assert!(Parser::parse_program("if (false) let\n{}").is_ok());
+    assert!(Parser::parse_program("if (false) let\nx = 1;").is_ok());
+    assert!(Parser::parse_program("while (false) let\nx = 1;").is_ok());
+    assert!(Parser::parse_program("for (;false;) let\n{}").is_ok());
+    assert!(Parser::parse_program("with ({}) let\n{}").is_ok());
+    assert!(Parser::parse_program("L: let\nx = 1;").is_ok());
+    // Same-line member access `let[...]` is *not* the `let [` statement-leading
+    // form, because the operand of the `if` is already in expression position.
+    assert!(Parser::parse_program("if (x) let.foo;").is_ok());
+}
+
+#[test]
+fn let_bracket_lookahead_rejected_in_single_statement_position() {
+    // `let [` may begin neither an ExpressionStatement (lookahead restriction)
+    // nor a declaration (not a Statement) in single-statement position — a
+    // newline does not lift the restriction.
+    assert!(Parser::parse_program("if (false) let\n[a] = 0;").is_err());
+    assert!(Parser::parse_program("while (false) let\n[a] = 0;").is_err());
+    assert!(Parser::parse_program("do let\n[x] = 0\nwhile (false);").is_err());
+}
+
+#[test]
+fn genuine_lexical_declaration_in_single_statement_position_rejected() {
+    // A real `let`/`const`/`class` declaration is never a Statement.
+    assert!(Parser::parse_program("if (x) let y = 1;").is_err());
+    assert!(Parser::parse_program("while (x) const y = 1;").is_err());
+    assert!(Parser::parse_program("if (x) class C {}").is_err());
+    // …but a lexical declaration is fine at statement-list position.
+    assert!(Parser::parse_program("let [a] = b;").is_ok());
+    assert!(Parser::parse_program("{ let y = 1; }").is_ok());
+}
+
+#[test]
+fn annexb_sloppy_function_redeclaration_in_block_and_switch() {
+    // Annex B.3.3: duplicate *plain* function declarations are allowed in a
+    // sloppy block or switch scope.
+    assert!(Parser::parse_program("{ function a() {} function a() {} }").is_ok());
+    assert!(
+        Parser::parse_program("switch (x) { case 1: function a() {} case 2: function a() {} }")
+            .is_ok()
+    );
+    // But not when strict, not across a generator/async, and not vs let/class.
+    assert!(Parser::parse_program("'use strict'; { function a() {} function a() {} }").is_err());
+    assert!(Parser::parse_program("{ function a() {} function* a() {} }").is_err());
+    assert!(Parser::parse_program("{ async function a() {} function a() {} }").is_err());
+    assert!(Parser::parse_program("{ let a; function a() {} }").is_err());
+    assert!(Parser::parse_program("{ class a {} function a() {} }").is_err());
+}
