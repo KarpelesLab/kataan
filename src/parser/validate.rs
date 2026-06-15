@@ -222,7 +222,18 @@ impl Validator {
             } => {
                 if let Some(init) = init {
                     match init {
-                        crate::ast::ForInit::Var(d) => self.var_decl(d, ctx)?,
+                        crate::ast::ForInit::Var(d) => {
+                            self.var_decl(d, ctx)?;
+                            // A lexical (`let`/`const`/`using`) head declaration
+                            // may not be redeclared by a `var` in the loop body.
+                            if d.kind != VarDeclKind::Var {
+                                let mut bound = Vec::new();
+                                for decl in &d.declarations {
+                                    collect_bound_names(&decl.target, &mut bound);
+                                }
+                                self.check_no_var_redeclare(&bound, body)?;
+                            }
+                        }
                         crate::ast::ForInit::Expr(e) => self.expr(e, ctx)?,
                     }
                 }
@@ -245,25 +256,15 @@ impl Validator {
                 // It is a Syntax Error if any element of the BoundNames of a
                 // `let`/`const`/`using`/`await using` ForDeclaration also occurs
                 // in the VarDeclaredNames of the loop body. (`var` heads are
-                // exempt — they share the same var scope.)
+                // exempt — they share the same var scope.) The BoundNames must
+                // also be distinct (no `for (let [x, x] of …)`).
                 if let ForLeft::Decl { kind, target, .. } = left
                     && *kind != VarDeclKind::Var
                 {
                     let mut bound = Vec::new();
                     collect_bound_names(target, &mut bound);
-                    if !bound.is_empty() {
-                        let mut vars = Vec::new();
-                        collect_vars_only(body, &mut vars);
-                        for (name, span) in &bound {
-                            if vars.iter().any(|v| v.as_ref() == name.as_str()) {
-                                return Err(self.err(
-                                    *span,
-                                    "a for-in/of binding may not be redeclared by a \
-                                     `var` in the loop body",
-                                ));
-                            }
-                        }
-                    }
+                    self.check_no_dup_bound_names(&bound)?;
+                    self.check_no_var_redeclare(&bound, body)?;
                 }
                 self.expr(right, ctx)?;
                 self.check_loop_body(body)?;
@@ -476,6 +477,23 @@ impl Validator {
                     Ok(())
                 }
             }
+            // A `LabelledStatement` is itself a `Statement`, so it is syntactically
+            // valid in single-statement position — but its (possibly nested)
+            // `LabelledItem` may not be a `FunctionDeclaration`. The Annex B
+            // allowance for a sloppy labelled function applies only at a
+            // `StatementListItem` position (top of a block/script/function body),
+            // not as the body of an `if`/loop/`with`/labelled substatement.
+            Stmt::Labeled { body, .. } => {
+                if labels_a_function(body) {
+                    Err(self.err(
+                        body.span(),
+                        "a labelled function declaration may not appear in \
+                         single-statement position",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -498,6 +516,41 @@ impl Validator {
                 self.expr(e, ctx)
             }
         }
+    }
+
+    /// It is a Syntax Error if any element of `bound` (the BoundNames of a
+    /// lexical for-head declaration) also occurs in the VarDeclaredNames of the
+    /// loop body.
+    fn check_no_var_redeclare(&self, bound: &[(String, Span)], body: &Stmt) -> Result<()> {
+        if bound.is_empty() {
+            return Ok(());
+        }
+        let mut vars = Vec::new();
+        collect_vars_only(body, &mut vars);
+        for (name, span) in bound {
+            if vars.iter().any(|v| v.as_ref() == name.as_str()) {
+                return Err(self.err(
+                    *span,
+                    "a lexical for-head binding may not be redeclared by a `var` \
+                     in the loop body",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// It is a Syntax Error if the BoundNames of a for-head ForDeclaration
+    /// contain any duplicate entries (e.g. `for (let [x, x] of …)`).
+    fn check_no_dup_bound_names(&self, bound: &[(String, Span)]) -> Result<()> {
+        for (i, (name, _)) in bound.iter().enumerate() {
+            if bound[..i].iter().any(|(n, _)| n == name) {
+                return Err(self.err(
+                    bound[i].1,
+                    "a for-in/of binding list may not contain a duplicate name",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn var_decl(&mut self, decl: &VarDecl, ctx: &Ctx) -> Result<()> {
@@ -1340,6 +1393,18 @@ fn labels_an_iteration(stmt: &Stmt) -> bool {
         | Stmt::While { .. }
         | Stmt::DoWhile { .. } => true,
         Stmt::Labeled { body, .. } => labels_an_iteration(body),
+        _ => false,
+    }
+}
+
+/// Whether a (possibly label-nested) statement is, at its core, a
+/// `FunctionDeclaration` — i.e. a `LabelledItem : FunctionDeclaration`. Used to
+/// reject a labelled function in single-statement position (its Annex B
+/// allowance applies only at a `StatementListItem` position).
+fn labels_a_function(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Function(_) => true,
+        Stmt::Labeled { body, .. } => labels_a_function(body),
         _ => false,
     }
 }

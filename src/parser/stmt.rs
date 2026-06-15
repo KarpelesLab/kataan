@@ -629,6 +629,15 @@ impl<'src> Parser<'src> {
             return Ok(ForHead::Empty);
         }
 
+        // The `for-of` head forbids a left-hand side beginning with the tokens
+        // `async of` (`for ( [lookahead ∉ { let, async of }] LeftHandSideExpr of
+        // … )`): `for (async of …)` is a Syntax Error (use `for ((async) of …)`
+        // to iterate into the variable `async`). A bare `async` followed by `of`
+        // can only be this forbidden form, so reject it eagerly.
+        if self.peek_tok().text(self.source) == "async" && self.nth_is_named(1, "of") {
+            return Err(self.err("`async` may not be the left-hand side of a `for-of` loop"));
+        }
+
         // `for (using x …)` / `for (await using x …)` — explicit-resource
         // management bindings in a `for` head (classic or `for-of`). The
         // for-head variants exclude a binding named `of` so that
