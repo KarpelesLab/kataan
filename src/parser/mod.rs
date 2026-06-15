@@ -1418,6 +1418,12 @@ impl<'src> Parser<'src> {
     /// a generator and the cursor is at `yield`).
     fn parse_yield(&mut self) -> Result<Expr> {
         let start = self.bump().span; // `yield`
+        // `yield [no LineTerminator here] * AssignmentExpression` — a line
+        // terminator between `yield` and `*` is a Syntax Error (it is not ASI'd
+        // into `yield; *expr`).
+        if self.at(TokenKind::Star) && self.nth_newline(0) {
+            return Err(self.err("no line terminator is allowed between `yield` and `*`"));
+        }
         let delegate = self.eat(TokenKind::Star);
         // `yield*` always takes an operand; bare `yield` takes one unless a line
         // terminator or an expression-terminating token follows.

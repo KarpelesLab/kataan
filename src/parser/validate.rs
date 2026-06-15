@@ -126,6 +126,10 @@ struct Ctx {
     in_breakable: bool,
     /// Whether an unlabeled `continue` has a target (inside a loop).
     in_iteration: bool,
+    /// Whether the current code is directly inside a class static initialization
+    /// block (with no intervening function boundary). The block is `[~Await]`, so
+    /// an `await` expression there is an early Syntax Error.
+    in_static_block: bool,
 }
 
 impl Ctx {
@@ -139,6 +143,7 @@ impl Ctx {
             allow_new_target: false,
             in_breakable: false,
             in_iteration: false,
+            in_static_block: false,
         }
     }
 
@@ -154,6 +159,7 @@ impl Ctx {
             allow_new_target: true,
             in_breakable: false,
             in_iteration: false,
+            in_static_block: false,
         }
     }
 }
@@ -743,6 +749,9 @@ impl Validator {
             allow_new_target: ctx.allow_new_target,
             in_breakable: false,
             in_iteration: false,
+            // A non-async arrow inside a static block stays `[~Await]`; an async
+            // arrow establishes its own await context.
+            in_static_block: ctx.in_static_block && !a.is_async,
         };
         let saved_labels = core::mem::take(&mut self.labels);
         for p in &a.params {
@@ -1006,8 +1015,10 @@ impl Validator {
                 ClassMember::StaticBlock { body, .. } => {
                     // A static block is a function boundary for jumps but does not
                     // permit `return`; `arguments`/`super()` are also forbidden.
+                    // It is `[~Await]`, so an `await` expression is an early error.
                     let mut c2 = Ctx::function_boundary(true, false, true);
                     c2.in_function = false;
+                    c2.in_static_block = true;
                     let saved = core::mem::take(&mut self.labels);
                     // A class static block is always strict-mode code.
                     self.check_top_level_scope(body, true)?;
@@ -1195,6 +1206,23 @@ impl Validator {
                     }
                 }
                 for m in members {
+                    // A private name (`#x`) is only a valid key inside a class
+                    // body, never in an object literal.
+                    if let ObjectMember::Property {
+                        key: PropertyKey::Private(_),
+                        span,
+                        ..
+                    }
+                    | ObjectMember::Accessor {
+                        key: PropertyKey::Private(_),
+                        span,
+                        ..
+                    } = m
+                    {
+                        return Err(
+                            self.err(*span, "a private name is only valid as a class member")
+                        );
+                    }
                     match m {
                         ObjectMember::Property {
                             key,
@@ -1413,7 +1441,15 @@ impl Validator {
                 }
                 Ok(())
             }
-            Expr::Await { argument, .. } => self.expr(argument, ctx),
+            Expr::Await { argument, span } => {
+                if ctx.in_static_block {
+                    return Err(self.err(
+                        *span,
+                        "`await` is not allowed in a class static initialization block",
+                    ));
+                }
+                self.expr(argument, ctx)
+            }
         }
     }
 
@@ -1473,10 +1509,10 @@ impl Validator {
 
     /// Catch-clause early errors (14.15.1, with Annex B.3.4):
     /// - The `CatchParameter` BoundNames must be distinct (`catch ([x, x])`).
+    /// - They must not occur in the body's LexicallyDeclaredNames
+    ///   (`catch (x) { let x; }`, incl. a block-level function declaration).
     /// - They must not occur in the body's VarDeclaredNames — *except* a simple
-    ///   `catch (e)` binding may be redeclared by a `var` (Annex B), but never by
-    ///   a block-level `FunctionDeclaration`. (The lexical-name conflict is
-    ///   already enforced by `check_lexical_scope`.)
+    ///   `catch (e)` binding may be redeclared by a `var` (Annex B).
     fn check_catch_param(&self, param: &BindingTarget, body: &[Stmt]) -> Result<()> {
         let mut bound = Vec::new();
         collect_bound_names(param, &mut bound);
@@ -1484,19 +1520,19 @@ impl Validator {
 
         let simple = matches!(param, BindingTarget::Ident(_));
 
-        // Block-level function declarations in the catch body always conflict
-        // with a catch binding of the same name.
+        // Any lexically-declared name in the catch body (let/const/class or a
+        // block-level function declaration) conflicts with a catch binding of the
+        // same name.
         let mut lexical: Vec<(Box<str>, Span, bool)> = Vec::new();
         let mut sink = Vec::new();
         for stmt in body {
             collect_top_level_decls(stmt, &mut lexical, &mut sink, false);
         }
-        for (name, span, is_function) in &lexical {
-            if *is_function && bound.iter().any(|(n, _)| n.as_str() == name.as_ref()) {
+        for (name, span, _) in &lexical {
+            if bound.iter().any(|(n, _)| n.as_str() == name.as_ref()) {
                 return Err(self.err(
                     *span,
-                    "a function declaration in a `catch` body may not redeclare the \
-                     catch parameter",
+                    "a `catch` body may not lexically redeclare the catch parameter",
                 ));
             }
         }
