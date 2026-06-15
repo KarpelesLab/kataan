@@ -48,7 +48,7 @@ pub(crate) fn validate_program(program: &Program) -> Result<()> {
         private_scopes: Vec::new(),
     };
     let ctx = Ctx::top(strict);
-    v.check_lexical_scope(&program.body)?;
+    v.check_top_level_scope(&program.body)?;
     for stmt in &program.body {
         v.stmt(stmt, &ctx)?;
     }
@@ -202,7 +202,7 @@ impl Validator {
             } => {
                 self.expr(discriminant, ctx)?;
                 let all: Vec<&Stmt> = cases.iter().flat_map(|c| c.body.iter()).collect();
-                self.check_lexical_scope_refs(&all)?;
+                self.check_lexical_scope_refs(&all, false)?;
                 for case in cases {
                     if let Some(t) = &case.test {
                         self.expr(t, ctx)?;
@@ -328,9 +328,14 @@ impl Validator {
                 if *kind != VarDeclKind::Var {
                     self.check_lexical_binding_names(target)?;
                 }
-                Ok(())
+                self.binding_target(target, ctx)
             }
-            ForLeft::Target(e) => self.expr(e, ctx),
+            ForLeft::Target(e) => {
+                if !is_valid_assign_target(e) {
+                    return Err(self.err(e.span(), "invalid for-in/of assignment target"));
+                }
+                self.expr(e, ctx)
+            }
         }
     }
 
@@ -343,6 +348,17 @@ impl Validator {
                 self.expr(init, ctx)?;
             }
             self.binding_target(&d.target, ctx)?;
+        }
+        Ok(())
+    }
+
+    /// A strict-mode `BindingIdentifier` may not be `eval` or `arguments`.
+    fn check_binding_ident_name(&self, name: &str, span: Span) -> Result<()> {
+        if name == "eval" || name == "arguments" {
+            return Err(self.err(
+                span,
+                "`eval` and `arguments` may not be bound in strict mode",
+            ));
         }
         Ok(())
     }
@@ -361,7 +377,15 @@ impl Validator {
 
     fn binding_target(&mut self, target: &BindingTarget, ctx: &Ctx) -> Result<()> {
         match target {
-            BindingTarget::Ident(_) => Ok(()),
+            BindingTarget::Ident(id) => {
+                if ctx.strict && (&*id.name == "eval" || &*id.name == "arguments") {
+                    return Err(self.err(
+                        id.span,
+                        "`eval` and `arguments` may not be bound in strict mode",
+                    ));
+                }
+                Ok(())
+            }
             BindingTarget::Array(p) => {
                 for el in &p.elements {
                     match el {
@@ -403,6 +427,9 @@ impl Validator {
 
     fn function(&mut self, f: &Function, ctx: &Ctx) -> Result<()> {
         let strict = ctx.strict || body_is_strict(&f.body);
+        if strict && let Some(id) = &f.id {
+            self.check_binding_ident_name(&id.name, id.span)?;
+        }
         self.check_params(&f.params, strict, &f.body)?;
         // A regular function establishes its own `arguments` and `super`
         // bindings, so it leaves any enclosing field-initializer restrictions.
@@ -414,7 +441,7 @@ impl Validator {
         for p in &f.params {
             self.param(p, &c)?;
         }
-        self.check_lexical_scope(&f.body)?;
+        self.check_top_level_scope(&f.body)?;
         for s in &f.body {
             self.stmt(s, &c)?;
         }
@@ -437,7 +464,7 @@ impl Validator {
         for p in &f.params {
             self.param(p, &c)?;
         }
-        self.check_lexical_scope(&f.body)?;
+        self.check_top_level_scope(&f.body)?;
         for s in &f.body {
             self.stmt(s, &c)?;
         }
@@ -467,7 +494,7 @@ impl Validator {
         }
         match &a.body {
             ArrowBody::Block(body) => {
-                self.check_lexical_scope(body)?;
+                self.check_top_level_scope(body)?;
                 for s in body {
                     self.stmt(s, &c)?;
                 }
@@ -522,7 +549,10 @@ impl Validator {
     // --- classes --------------------------------------------------------
 
     fn class(&mut self, c: &Class, _ctx: &Ctx) -> Result<()> {
-        // Class bodies are always strict.
+        // Class bodies are always strict, so the class name is a strict binding.
+        if let Some(id) = &c.id {
+            self.check_binding_ident_name(&id.name, id.span)?;
+        }
         let cls_ctx = Ctx::top(true);
 
         // 1. The heritage clause is checked with the *enclosing* private scope —
@@ -651,7 +681,7 @@ impl Validator {
                         allow_super_call: false,
                         in_field_init: true,
                     };
-                    self.check_lexical_scope(body)?;
+                    self.check_top_level_scope(body)?;
                     for s in body {
                         self.stmt(s, &c2)?;
                     }
@@ -843,7 +873,18 @@ impl Validator {
                 }
                 self.expr(argument, ctx)
             }
-            Expr::Update { argument, .. } => self.expr(argument, ctx),
+            Expr::Update { argument, .. } => {
+                // The operand of `++`/`--` must be a *simple* reference — an
+                // identifier or member access — never a call, literal, or
+                // destructuring pattern.
+                if !is_simple_update_target(argument) {
+                    return Err(self.err(argument.span(), "invalid operand for `++`/`--`"));
+                }
+                if ctx.strict {
+                    self.check_not_eval_arguments(argument)?;
+                }
+                self.expr(argument, ctx)
+            }
             Expr::Binary { .. } | Expr::Logical { .. } => {
                 // Binary/logical operators chain left-associatively, so a long
                 // `a + b + c + …` is a left-deep spine. Walk that spine
@@ -871,7 +912,21 @@ impl Validator {
                 self.expr(consequent, ctx)?;
                 self.expr(alternate, ctx)
             }
-            Expr::Assign { target, value, .. } => {
+            Expr::Assign {
+                op, target, value, ..
+            } => {
+                // A simple assignment `=` may target a destructuring pattern; a
+                // compound assignment (`+=`, …) requires a simple reference.
+                if matches!(op, crate::ast::AssignOp::Assign) {
+                    if !is_valid_assign_target(target) {
+                        return Err(self.err(target.span(), "invalid assignment target"));
+                    }
+                } else if !is_simple_update_target(target) {
+                    return Err(self.err(target.span(), "invalid target for compound assignment"));
+                }
+                if ctx.strict {
+                    self.check_not_eval_arguments(target)?;
+                }
                 self.expr(target, ctx)?;
                 self.expr(value, ctx)
             }
@@ -896,19 +951,29 @@ impl Validator {
 
     // --- lexical redeclaration ------------------------------------------
 
+    /// Checks a *block* lexical scope (a `{ … }` block or catch/finally body),
+    /// where a function declaration is itself a lexically-declared name.
     fn check_lexical_scope(&self, body: &[Stmt]) -> Result<()> {
         let refs: Vec<&Stmt> = body.iter().collect();
-        self.check_lexical_scope_refs(&refs)
+        self.check_lexical_scope_refs(&refs, false)
+    }
+
+    /// Checks a *top-level* scope (the program body, a function body, or a
+    /// static block), where a top-level function declaration is **var**-scoped
+    /// rather than lexical and so does not clash with a `var` of the same name.
+    fn check_top_level_scope(&self, body: &[Stmt]) -> Result<()> {
+        let refs: Vec<&Stmt> = body.iter().collect();
+        self.check_lexical_scope_refs(&refs, true)
     }
 
     /// Enforces that a scope's lexically-declared names are unique and do not
     /// collide with var-declared names hoisted into the same scope.
-    fn check_lexical_scope_refs(&self, body: &[&Stmt]) -> Result<()> {
+    fn check_lexical_scope_refs(&self, body: &[&Stmt], top_level: bool) -> Result<()> {
         let mut lexical: Vec<(Box<str>, Span)> = Vec::new();
         let mut vars: Vec<Box<str>> = Vec::new();
 
         for stmt in body {
-            collect_top_level_decls(stmt, &mut lexical, &mut vars);
+            collect_top_level_decls(stmt, &mut lexical, &mut vars, top_level);
         }
         for i in 0..lexical.len() {
             for j in (i + 1)..lexical.len() {
@@ -939,6 +1004,7 @@ fn collect_top_level_decls(
     stmt: &Stmt,
     lexical: &mut Vec<(Box<str>, Span)>,
     vars: &mut Vec<Box<str>>,
+    top_level: bool,
 ) {
     match stmt {
         Stmt::Var(decl) => {
@@ -956,7 +1022,14 @@ fn collect_top_level_decls(
         }
         Stmt::Function(f) => {
             if let Some(id) = &f.id {
-                lexical.push((id.name.clone(), id.span));
+                // At program / function-body top level a function declaration is
+                // var-scoped (its name is a VarDeclaredName); inside a block or
+                // switch it is a lexically-declared name.
+                if top_level {
+                    vars.push(id.name.clone());
+                } else {
+                    lexical.push((id.name.clone(), id.span));
+                }
             }
         }
         Stmt::Class(c) => {
@@ -964,7 +1037,7 @@ fn collect_top_level_decls(
                 lexical.push((id.name.clone(), id.span));
             }
         }
-        Stmt::Labeled { body, .. } => collect_top_level_decls(body, lexical, vars),
+        Stmt::Labeled { body, .. } => collect_top_level_decls(body, lexical, vars, top_level),
         // `var` hoists out of nested non-function statements.
         other => collect_vars_only(other, vars),
     }
@@ -1100,6 +1173,63 @@ fn contains_private_ref(e: &Expr) -> bool {
         Expr::Member { property, .. } => matches!(property, PropertyKey::Private(_)),
         Expr::OptChain { expr, .. } => contains_private_ref(expr),
         _ => false,
+    }
+}
+
+/// Whether `e` is a *simple* reference usable as the operand of `++`/`--` or the
+/// target of a compound assignment: an identifier or a member access. (A private
+/// member access `obj.#x` is also a valid reference here.)
+fn is_simple_update_target(e: &Expr) -> bool {
+    matches!(e, Expr::Ident(_) | Expr::Member { .. })
+}
+
+/// Whether `e` is a valid target for a *simple* (`=`) assignment. This permits
+/// destructuring patterns (with `= default` inside them) but rejects a bare
+/// parenthesized assignment such as `(x = y) = 1` — represented here as a
+/// top-level [`Expr::Assign`] target.
+fn is_valid_assign_target(e: &Expr) -> bool {
+    match e {
+        Expr::Ident(_) | Expr::Member { .. } => true,
+        Expr::Array { elements, .. } => elements.iter().all(|el| match el {
+            crate::ast::ArrayElement::Hole => true,
+            crate::ast::ArrayElement::Item(x) => is_pattern_element(x),
+            crate::ast::ArrayElement::Spread(x) => is_valid_assign_target(x),
+        }),
+        Expr::Object { members, .. } => members.iter().all(|m| match m {
+            ObjectMember::Property { value, .. } => is_pattern_element(value),
+            ObjectMember::Spread { value, .. } => is_valid_assign_target(value),
+            ObjectMember::Accessor { .. } => false,
+        }),
+        _ => false,
+    }
+}
+
+/// An element inside a destructuring assignment pattern: a valid target, or a
+/// target with a `= default`.
+fn is_pattern_element(e: &Expr) -> bool {
+    match e {
+        Expr::Assign {
+            op: crate::ast::AssignOp::Assign,
+            target,
+            ..
+        } => is_valid_assign_target(target),
+        _ => is_valid_assign_target(e),
+    }
+}
+
+impl Validator {
+    /// In strict mode, the assignment / update targets `eval` and `arguments`
+    /// are forbidden.
+    fn check_not_eval_arguments(&self, target: &Expr) -> Result<()> {
+        if let Expr::Ident(id) = target
+            && (&*id.name == "eval" || &*id.name == "arguments")
+        {
+            return Err(self.err(
+                id.span,
+                "`eval` and `arguments` may not be assigned in strict mode",
+            ));
+        }
+        Ok(())
     }
 }
 
