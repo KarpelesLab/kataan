@@ -16299,23 +16299,97 @@ pub fn eval_source_with_limits(
 /// Formats an uncaught thrown value for an error message: `name: message` for an
 /// error-shaped object, otherwise the value's display string.
 fn format_thrown(interp: &Interp, thrown: NanBox) -> String {
-    if let Some(raw) = thrown.as_handle() {
-        let h = Handle::from_raw(raw);
-        let realm = interp.realm();
-        if let Some(name) = realm.get_property(h, "name") {
-            let name = realm.to_display_string(name);
-            let message = realm
-                .get_property(h, "message")
-                .map(|m| realm.to_display_string(m))
-                .unwrap_or_default();
-            return if message.is_empty() {
-                name
-            } else {
-                alloc::format!("{name}: {message}")
-            };
-        }
+    if let Some((name, message)) = error_name_message(interp, thrown) {
+        return if message.is_empty() {
+            name
+        } else {
+            alloc::format!("{name}: {message}")
+        };
     }
     interp.display(thrown)
+}
+
+/// Extracts `(name, message)` from an error-shaped thrown object — the basis for
+/// both the human-readable [`format_thrown`] and the structured [`Thrown`] the
+/// conformance runner uses to verify a negative test's declared error *type*.
+/// Returns `None` for a non-error thrown value (e.g. `throw 42`).
+fn error_name_message(interp: &Interp, thrown: NanBox) -> Option<(String, String)> {
+    let raw = thrown.as_handle()?;
+    let h = Handle::from_raw(raw);
+    let realm = interp.realm();
+    let name = realm.get_property(h, "name")?;
+    let name = realm.to_display_string(name);
+    let message = realm
+        .get_property(h, "message")
+        .map(|m| realm.to_display_string(m))
+        .unwrap_or_default();
+    Some((name, message))
+}
+
+/// The phase at which a program failed: parsing, or runtime execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorPhase {
+    /// The program failed to parse (always a `SyntaxError`).
+    Parse,
+    /// The program threw during execution.
+    Runtime,
+}
+
+/// A thrown error surfaced to the host with its JS *type*, so a conformance
+/// runner can check a Test262 `negative: { phase, type }` expectation. For an
+/// error-shaped throw `name` is the constructor name (`"TypeError"`, …); for a
+/// non-error throw (`throw 42`) it is the value's display string.
+#[derive(Debug, Clone)]
+pub struct Thrown {
+    /// Whether the failure occurred at parse time or runtime.
+    pub phase: ErrorPhase,
+    /// The error's `name` (its JS type), e.g. `"TypeError"` or `"SyntaxError"`.
+    pub name: String,
+    /// The error's `message` (empty when absent).
+    pub message: String,
+}
+
+/// Like [`eval_source_with_limits`], but on failure returns a structured
+/// [`Thrown`] carrying the error's *type* (for Test262 negative-test checking)
+/// instead of a flattened message string.
+///
+/// # Errors
+/// Returns [`Thrown`] for a parse failure (`SyntaxError`) or an uncaught throw.
+pub fn eval_source_typed(
+    source: &str,
+    limits: crate::limits::Limits,
+) -> Result<(String, String), Thrown> {
+    let program = match crate::parser::Parser::parse_program(source) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(Thrown {
+                phase: ErrorPhase::Parse,
+                name: String::from("SyntaxError"),
+                message: alloc::format!("{e}"),
+            });
+        }
+    };
+    let mut interp = Interp::new_with_limits(limits);
+    match interp.run(&program) {
+        Ok(value) => {
+            let completion = interp.display(value);
+            Ok((String::from(interp.output()), completion))
+        }
+        Err(ExecError::Throw(thrown)) => {
+            let (name, message) = error_name_message(&interp, thrown)
+                .unwrap_or_else(|| (interp.display(thrown), String::new()));
+            Err(Thrown {
+                phase: ErrorPhase::Runtime,
+                name,
+                message,
+            })
+        }
+        Err(other) => Err(Thrown {
+            phase: ErrorPhase::Runtime,
+            name: String::from("Error"),
+            message: alloc::format!("{other:?}"),
+        }),
+    }
 }
 
 /// The current time in milliseconds since the Unix epoch (`0.0` without `std`,

@@ -3453,6 +3453,40 @@ pub fn execute_with_limits(
     }
 }
 
+/// Like [`execute_with_limits`], but on failure returns a structured
+/// [`Thrown`](crate::nbexec::Thrown) carrying the error's JS *type* — the entry
+/// point the Test262 conformance runner uses to verify a `negative` test fails
+/// with the declared error type. Runs the production bytecode path; any fault
+/// (an unsupported construct or a genuine JS throw) re-runs on the reference
+/// tree-walker, which surfaces the typed throw with complete semantics.
+///
+/// # Errors
+/// Returns [`Thrown`](crate::nbexec::Thrown) for a parse failure or uncaught throw.
+#[cfg(feature = "std")]
+pub fn execute_typed(
+    source: &str,
+    limits: crate::limits::Limits,
+) -> Result<(String, String), crate::nbexec::Thrown> {
+    let program = match crate::parser::Parser::parse_program(source) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(crate::nbexec::Thrown {
+                phase: crate::nbexec::ErrorPhase::Parse,
+                name: String::from("SyntaxError"),
+                message: alloc::format!("{e}"),
+            });
+        }
+    };
+    let Ok(protos) = compile_program(&program) else {
+        return crate::nbexec::eval_source_typed(source, limits);
+    };
+    let mut realm = Realm::with_limits(limits);
+    match run_program_capturing(&mut realm, &protos, 0, &[]) {
+        Ok((value, output)) => Ok((output, realm.to_display_string(value))),
+        Err(_) => crate::nbexec::eval_source_typed(source, limits),
+    }
+}
+
 /// Compiles `program` to a function table (function 0 is the top-level body).
 ///
 /// # Errors
