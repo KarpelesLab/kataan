@@ -254,8 +254,10 @@ pub struct Interp<'a> {
     /// the parser flattens `a + a + a + …` into a shallow AST that nonetheless
     /// drives thousands of nested `eval` calls. The function-call `call_depth`
     /// guard does not count these, so a deep expression would overflow the host
-    /// stack and abort. This counter is checked against `limits.max_call_depth` at
-    /// the `eval`/`exec` hubs and throws a catchable `RangeError` past the cap.
+    /// stack and abort. This counter is checked against `limits.max_eval_depth`
+    /// (a dedicated knob, separate from `max_call_depth`, because each tree-walk
+    /// level burns far more native stack than a bytecode call frame) at the
+    /// `eval`/`exec` hubs and throws a catchable `RangeError` past the cap.
     eval_depth: usize,
     /// `xorshift128+` PRNG state backing `Math.random` (pure Rust, no foreign
     /// code). Two 64-bit words give a 2^128-1 period; seeded by
@@ -11216,8 +11218,9 @@ impl<'a> Interp<'a> {
     fn exec(&mut self, stmt: &'a Stmt) -> Result<Flow, ExecError> {
         // C2: share the tree-walk recursion budget with `eval` so deeply nested
         // statements (or expressions reached through them) throw a catchable
-        // `RangeError` rather than overflowing the host stack.
-        if self.eval_depth >= self.realm.limits.max_call_depth {
+        // `RangeError` rather than overflowing the host stack. Bounded by the
+        // dedicated `max_eval_depth` knob (separate from `max_call_depth`).
+        if self.eval_depth >= self.realm.limits.max_eval_depth {
             let msg = self.new_str("Maximum call stack size exceeded");
             let err = self.make_error(N_ERROR_BASE + 2, Some(msg));
             return Err(ExecError::Throw(err));
@@ -12468,8 +12471,9 @@ impl<'a> Interp<'a> {
         // C2: guard the native recursion that `eval` performs on nested
         // expressions (a deep `a + a + … + a` is shallow in the AST but recurses
         // here once per term). Throw a catchable `RangeError` past the limit
-        // instead of overflowing the host stack.
-        if self.eval_depth >= self.realm.limits.max_call_depth {
+        // instead of overflowing the host stack. Bounded by the dedicated
+        // `max_eval_depth` knob (separate from `max_call_depth`).
+        if self.eval_depth >= self.realm.limits.max_eval_depth {
             let msg = self.new_str("Maximum call stack size exceeded");
             let err = self.make_error(N_ERROR_BASE + 2, Some(msg));
             return Err(ExecError::Throw(err));
@@ -16660,7 +16664,7 @@ mod tests {
     /// C2: a deeply nested expression (shallow in the AST via the precedence loop,
     /// but thousands of native `eval` recursions) throws a catchable `RangeError`
     /// rather than overflowing the host stack. Run on a generous stack so the
-    /// `max_call_depth` guard fires before the (much larger) real overflow point,
+    /// `max_eval_depth` guard fires before the (much larger) real overflow point,
     /// exactly as the production / test262 harness threads do.
     #[test]
     fn deep_expression_throws_instead_of_overflowing() {
@@ -16870,6 +16874,87 @@ mod tests {
             eval_source_with_limits(keys_src, dict).expect("dict ok").1,
             "10,0,9,k0"
         );
+    }
+
+    /// C2 follow-up: a custom low `max_eval_depth` (via `Realm::with_limits`,
+    /// threaded through `eval_source_with_limits`) is honored live. The tree-walk
+    /// recursion that the interpreter performs on a deeply nested expression
+    /// trips the dedicated knob — a depth the *default* realm evaluates fine is
+    /// rejected once the cap is lowered, proving `max_eval_depth` bounds the
+    /// eval/exec recursion independently of `max_call_depth`.
+    #[test]
+    fn max_eval_depth_override_honored() {
+        // Each tree-walk level burns a lot of native stack, so run on a generous
+        // stack (like the production / test262 threads) where the *guard*, not a
+        // real overflow, is the limiting factor.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                use crate::limits::Limits;
+                // A left-deep `1+1+…+1`: shallow allocations but `depth` nested
+                // native `eval` recursions (one per `+` term), driving
+                // `eval_depth` up by one per level within a single frame.
+                fn deep_add(depth: usize) -> String {
+                    core::iter::repeat_n("1", depth)
+                        .collect::<alloc::vec::Vec<_>>()
+                        .join("+")
+                }
+
+                // 600 terms evaluate cleanly under the default cap…
+                let src = deep_add(600);
+                assert_eq!(eval_source(&src).expect("default ok").1, "600");
+
+                // …but a realm whose `max_eval_depth` is lowered below that depth
+                // rejects the very same source with a catchable stack-overflow
+                // `RangeError`, while `max_call_depth` is left at its (much
+                // higher) default — proving the dedicated knob is honored live.
+                let low = Limits {
+                    max_eval_depth: 100,
+                    ..Limits::default()
+                };
+                let err = eval_source_with_limits(&src, low).expect_err("should exceed eval depth");
+                assert!(
+                    err.contains("Maximum call stack size exceeded"),
+                    "unexpected error: {err}"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// C2 follow-up: interpreter recursion past `max_eval_depth` throws a
+    /// catchable `RangeError` (caught by a JS `try/catch`, surfacing as
+    /// `RangeError`) instead of crashing the host. Run on a generous native
+    /// stack so the guard — not a real overflow — is what stops the recursion.
+    #[test]
+    fn deep_eval_recursion_throws_range_error_catchable() {
+        let kind = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                // A left-deep `1+1+…+1` far past the default `max_eval_depth`
+                // (1500): each `+` term is a native `eval` recursion, so the
+                // guard fires mid-evaluation and the throw is caught by JS.
+                let deep = core::iter::repeat_n("1", 20_000)
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join("+");
+                let src = alloc::format!(
+                    "try {{ {deep}; 'noThrow' }} catch (e) {{ e.constructor.name }}"
+                );
+                // Leak the AST: dropping a 20k-deep boxed expression chain would
+                // itself recurse and is unrelated to what we are asserting.
+                let program = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                    Parser::parse_program(&src).expect("parse"),
+                ));
+                let mut interp = Interp::new();
+                let res = interp.run(program).map(|v| interp.display(v));
+                core::mem::forget(interp);
+                res
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        assert_eq!(kind.expect("eval ok"), "RangeError");
     }
 
     /// Runs `src` and returns its captured `console` output.

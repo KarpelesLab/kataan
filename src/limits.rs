@@ -21,6 +21,21 @@
 
 /// Default maximum JS-level call/recursion depth before a `RangeError`.
 pub const DEFAULT_MAX_CALL_DEPTH: usize = 3500;
+/// Default maximum *tree-walk* eval/exec recursion depth before a `RangeError`.
+///
+/// The `nbexec` interpreter descends the native stack once per nested
+/// expression/statement, and each level consumes far more native stack than a
+/// bytecode call frame does. This cap is therefore set well below
+/// [`DEFAULT_MAX_CALL_DEPTH`] so the guard fires (throwing a catchable
+/// `RangeError`) before a small (~2 MB) host stack overflows and aborts.
+///
+/// The value is empirically chosen: on a 2 MB stack an optimized build of the
+/// interpreter overflows on a left-deep `1+1+…+1` expression at roughly depth
+/// 3700, so a cap of 1500 keeps a comfortable (~2.5×) safety margin while still
+/// permitting genuinely deep nesting. It does not regress test262/conformance,
+/// since deep *call* recursion resets the eval-depth counter at each function
+/// frame (and is bounded separately by [`DEFAULT_MAX_CALL_DEPTH`]).
+pub const DEFAULT_MAX_EVAL_DEPTH: usize = 1500;
 /// Default maximum try/catch handler-stack depth.
 pub const DEFAULT_MAX_HANDLER_DEPTH: usize = 100_000;
 /// Default maximum `JSON.parse`/`JSON.stringify` nesting depth.
@@ -97,6 +112,13 @@ impl Default for WasmLimits {
 pub struct Limits {
     /// Maximum JS call/recursion depth before a `RangeError` (live).
     pub max_call_depth: usize,
+    /// Maximum tree-walk `eval`/`exec` recursion depth before a `RangeError`
+    /// (live). Bounds how deeply the `nbexec` interpreter may recurse on the
+    /// native stack for nested expressions/statements. Kept separate from (and
+    /// below) [`Self::max_call_depth`] because each tree-walk level consumes
+    /// much more native stack than a bytecode call frame, so the JS call-depth
+    /// cap is too high to protect a small host stack on this path.
+    pub max_eval_depth: usize,
     /// Maximum try/catch handler-stack depth (live).
     pub max_handler_depth: usize,
     /// Maximum `JSON.parse`/`stringify` nesting depth (live).
@@ -126,6 +148,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_call_depth: DEFAULT_MAX_CALL_DEPTH,
+            max_eval_depth: DEFAULT_MAX_EVAL_DEPTH,
             max_handler_depth: DEFAULT_MAX_HANDLER_DEPTH,
             max_json_depth: DEFAULT_MAX_JSON_DEPTH,
             max_display_depth: DEFAULT_MAX_DISPLAY_DEPTH,
