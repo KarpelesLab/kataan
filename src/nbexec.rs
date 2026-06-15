@@ -1090,6 +1090,11 @@ const N_MATH_F16ROUND: u16 = 241;
 const N_DATE_TO_PRIMITIVE: u16 = 243;
 /// `Date.prototype.toJSON` — a generic method (length 1) callable on any object.
 const N_DATE_TO_JSON: u16 = 244;
+/// A first-class `String.prototype.<method>`: applies RequireObjectCoercible and
+/// ToString to the call's `this` (so `String.prototype.slice.call(true)` coerces
+/// to `"true"` and a `null`/`undefined` `this` throws), then dispatches. The two
+/// identity methods `toString`/`valueOf` instead require a String value.
+const N_STRING_PROTO_FN: u16 = 245;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib,
@@ -1771,7 +1776,7 @@ impl<'a> Interp<'a> {
         // that dispatch on their `this`, so the classic `Array.prototype.slice.call`
         // / `String.prototype.X.call` / `Function.prototype.bind.call` idioms work.
         self.setup_first_class_prototype("Array", ARRAY_PROTO_METHODS);
-        self.setup_first_class_prototype("String", STRING_PROTO_METHODS);
+        self.setup_first_class_prototype_id("String", STRING_PROTO_METHODS, N_STRING_PROTO_FN);
         self.setup_first_class_prototype("Number", NUMBER_PROTO_METHODS);
         // The `Number` numeric constants are own data properties of the
         // constructor with the built-in attributes `{ writable: false,
@@ -6105,6 +6110,47 @@ impl<'a> Interp<'a> {
                     .call_method(prim, &name, args)?
                     .unwrap_or(NanBox::undefined()));
             }
+            // A first-class `String.prototype.<method>`: RequireObjectCoercible +
+            // ToString the call's `this`, then dispatch on the resulting string.
+            // `toString`/`valueOf` instead require an actual String value.
+            if id == N_STRING_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                if name == "toString" || name == "valueOf" {
+                    // thisStringValue: a string primitive or a String wrapper.
+                    let s = if let Some(s) = this_val
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.string_value(h))
+                    {
+                        Some(s)
+                    } else {
+                        this_val
+                            .as_handle()
+                            .map(Handle::from_raw)
+                            .and_then(|h| self.realm.get_property(h, PRIM_WRAP))
+                            .and_then(|p| p.as_handle())
+                            .map(Handle::from_raw)
+                            .and_then(|ph| self.realm.string_value(ph))
+                    };
+                    let Some(s) = s else {
+                        return Err(self.type_error(&alloc::format!(
+                            "String.prototype.{name} requires that 'this' be a String"
+                        )));
+                    };
+                    return Ok(self.new_str(&s));
+                }
+                // RequireObjectCoercible: `undefined`/`null` `this` is a TypeError.
+                if matches!(this_val.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    return Err(self.type_error(&alloc::format!(
+                        "String.prototype.{name} called on null or undefined"
+                    )));
+                }
+                let s = self.coerce_to_string(this_val)?;
+                let str_recv = self.new_str(&s);
+                return Ok(self
+                    .call_method(str_recv, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
             // A first-class `Date.prototype.<method>`: the call's `this` must have
             // a `[[DateValue]]` (be a Date), else a `TypeError`.
             if id == N_DATE_PROTO_FN {
@@ -6572,6 +6618,13 @@ impl<'a> Interp<'a> {
                 return Ok(ret);
             }
             return Ok(this);
+        }
+        // `new Object(value)` — Object is a namespace object, matched by identity.
+        // With no/`null`/`undefined` argument it makes a fresh object; otherwise it
+        // is ToObject(value) (the same as calling `Object(value)`).
+        if self.current.get("Object").and_then(|v| v.as_handle()) == callee.as_handle() {
+            let v = args.first().copied().unwrap_or(NanBox::undefined());
+            return Ok(self.coerce_to_object(v));
         }
         // `new Array(...)` — Array is a namespace object, matched by identity.
         // A single number argument is the length; otherwise the elements.
