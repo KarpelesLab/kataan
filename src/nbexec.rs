@@ -632,6 +632,58 @@ const N_AB_PROTO_FN: u16 = 233;
 /// the call's `this` must be a BigInt or a BigInt wrapper object, else a
 /// `TypeError` (so `BigInt.prototype.valueOf.call({})` rejects per spec).
 const N_BIGINT_PROTO_FN: u16 = 240;
+/// A first-class `Date.prototype.<method>`: a bound native carrying the method
+/// name. Calling it requires the call's `this` to have a `[[DateValue]]`
+/// (i.e. be a Date), else a `TypeError`; otherwise it re-dispatches through
+/// `call_method` so `Date.prototype.getTime.call(d)` and direct `d.getTime()`
+/// share one implementation.
+const N_DATE_PROTO_FN: u16 = 242;
+/// The `Date.prototype` methods exposed as first-class values.
+const DATE_PROTO_METHODS: &[&str] = &[
+    "getTime",
+    "valueOf",
+    "getFullYear",
+    "getUTCFullYear",
+    "getMonth",
+    "getUTCMonth",
+    "getDate",
+    "getUTCDate",
+    "getDay",
+    "getUTCDay",
+    "getHours",
+    "getUTCHours",
+    "getMinutes",
+    "getUTCMinutes",
+    "getSeconds",
+    "getUTCSeconds",
+    "getMilliseconds",
+    "getUTCMilliseconds",
+    "getTimezoneOffset",
+    "toISOString",
+    "toJSON",
+    "toDateString",
+    "toTimeString",
+    "toString",
+    "toUTCString",
+    "toLocaleDateString",
+    "toLocaleTimeString",
+    "toLocaleString",
+    "setTime",
+    "setFullYear",
+    "setUTCFullYear",
+    "setMonth",
+    "setUTCMonth",
+    "setDate",
+    "setUTCDate",
+    "setHours",
+    "setUTCHours",
+    "setMinutes",
+    "setUTCMinutes",
+    "setSeconds",
+    "setUTCSeconds",
+    "setMilliseconds",
+    "setUTCMilliseconds",
+];
 /// The `Array.prototype` methods exposed as first-class values (each re-dispatched
 /// through `call_method`).
 const ARRAY_PROTO_METHODS: &[&str] = &[
@@ -1754,6 +1806,7 @@ impl<'a> Interp<'a> {
             }
         }
         self.setup_first_class_prototype_id("BigInt", BIGINT_PROTO_METHODS, N_BIGINT_PROTO_FN);
+        self.setup_first_class_prototype_id("Date", DATE_PROTO_METHODS, N_DATE_PROTO_FN);
         // `BigInt.prototype[Symbol.toStringTag]` is the string "BigInt", an own data
         // property `{writable:false, enumerable:false, configurable:true}`. Being
         // configurable, it can be redefined (e.g. tests overwrite it with a non-string
@@ -5963,6 +6016,23 @@ impl<'a> Interp<'a> {
                     .call_method(prim, &name, args)?
                     .unwrap_or(NanBox::undefined()));
             }
+            // A first-class `Date.prototype.<method>`: the call's `this` must have
+            // a `[[DateValue]]` (be a Date), else a `TypeError`.
+            if id == N_DATE_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let is_date = this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| self.realm.date_at(h).is_some());
+                if !is_date {
+                    return Err(self.type_error(&alloc::format!(
+                        "Date.prototype.{name} is not a Date object"
+                    )));
+                }
+                return Ok(self
+                    .call_method(this_val, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
             // A first-class `Iterator.prototype.<helper>` (map/filter/take/…) run
             // on the call's `this` iterator.
             if id == N_ITERATOR_PROTO_FN {
@@ -6559,32 +6629,63 @@ impl<'a> Interp<'a> {
         if id == N_DATE {
             let ms = if args.len() >= 2 {
                 // `new Date(year, month, day?, h?, m?, s?, ms?)` (local ≈ UTC here).
-                let num =
-                    |i: usize, dflt: f64| args.get(i).map_or(dflt, |a| self.realm.to_number(*a));
-                let year = num(0, 1970.0) as i64;
-                let month = num(1, 0.0) as i64; // 0-indexed, may overflow
-                let day = num(2, 1.0) as i64;
-                let hours = num(3, 0.0) as i64;
-                let mins = num(4, 0.0) as i64;
-                let secs = num(5, 0.0) as i64;
-                let millis = num(6, 0.0) as i64;
-                // Normalize the (possibly out-of-range) month into the year.
-                let total_months = year * 12 + month;
-                let y = total_months.div_euclid(12);
-                let mo = total_months.rem_euclid(12) as u32 + 1; // 1..=12
-                let days = crate::realm::days_from_civil(y, mo, day as u32);
-                (days * 86_400_000 + hours * 3_600_000 + mins * 60_000 + secs * 1_000 + millis)
-                    as f64
+                // Every supplied argument is ToNumber'd in order (Symbol → TypeError,
+                // a throwing `valueOf` propagates).
+                let mut nums = Vec::with_capacity(args.len());
+                for a in args {
+                    let v = self.coerce_to_number(*a)?;
+                    nums.push(self.realm.to_number(v));
+                }
+                let getn = |i: usize, dflt: f64| nums.get(i).copied().unwrap_or(dflt);
+                let year_n = getn(0, 1970.0);
+                let month = getn(1, 0.0);
+                let day = getn(2, 1.0);
+                let hours = getn(3, 0.0);
+                let mins = getn(4, 0.0);
+                let secs = getn(5, 0.0);
+                let millis = getn(6, 0.0);
+                // Any NaN component yields an invalid date.
+                if [year_n, month, day, hours, mins, secs, millis]
+                    .iter()
+                    .any(|v| v.is_nan() || !v.is_finite())
+                {
+                    f64::NAN
+                } else {
+                    // A two-digit year (0..=99) maps to 1900+year.
+                    let yi = year_n as i64;
+                    let year = if (0..=99).contains(&yi) { 1900 + yi } else { yi };
+                    let total_months = year * 12 + month as i64;
+                    let y = total_months.div_euclid(12);
+                    let mo = total_months.rem_euclid(12) as u32 + 1; // 1..=12
+                    let days = crate::realm::days_from_civil(y, mo, day as i64 as u32);
+                    time_clip(
+                        (days * 86_400_000
+                            + hours as i64 * 3_600_000
+                            + mins as i64 * 60_000
+                            + secs as i64 * 1_000
+                            + millis as i64) as f64,
+                    )
+                }
             } else {
-                match args.first() {
-                    // A string argument is parsed as an ISO date; otherwise ToNumber.
+                match args.first().copied() {
                     Some(a) => {
-                        if let Some(h) = a.as_handle().map(Handle::from_raw)
-                            && let Some(s) = self.realm.string_value(h)
+                        // A Date argument copies its time value directly.
+                        if let Some(existing) =
+                            a.as_handle().map(Handle::from_raw).and_then(|h| self.realm.date_at(h))
                         {
-                            crate::realm::parse_iso_date(&s).unwrap_or(f64::NAN)
+                            time_clip(existing)
                         } else {
-                            self.realm.to_number(*a)
+                            // ToPrimitive(value): a string is parsed as a date,
+                            // anything else is ToNumber'd → TimeClip.
+                            let prim = self.coerce_primitive(a, "default")?;
+                            if let Some(h) = prim.as_handle().map(Handle::from_raw)
+                                && let Some(s) = self.realm.string_value(h)
+                            {
+                                crate::realm::parse_iso_date(&s).map_or(f64::NAN, time_clip)
+                            } else {
+                                let v = self.coerce_to_number(prim)?;
+                                time_clip(self.realm.to_number(v))
+                            }
                         }
                     }
                     None => now_ms(),
@@ -9946,71 +10047,96 @@ impl<'a> Interp<'a> {
                 }
                 // --- `set*` mutators (all UTC; a setter returns the new time) ---
                 "setTime" => {
-                    let nms = self.realm.to_number(arg(0));
+                    // ToNumber(time) → TimeClip.
+                    let raw = self.coerce_to_number(arg(0))?;
+                    let nms = time_clip(self.realm.to_number(raw));
                     self.realm.set_date_ms(handle, nms);
                     NanBox::number(nms)
                 }
                 "setFullYear" | "setUTCFullYear" | "setMonth" | "setUTCMonth" | "setDate"
                 | "setUTCDate" | "setHours" | "setUTCHours" | "setMinutes" | "setUTCMinutes"
                 | "setSeconds" | "setUTCSeconds" | "setMilliseconds" | "setUTCMilliseconds" => {
-                    // Decompose the current time, replace one field, recompose.
+                    // The number of components this setter consumes, in order.
+                    let max_components = match method {
+                        "setHours" | "setUTCHours" => 4,
+                        "setFullYear" | "setUTCFullYear" | "setMinutes" | "setUTCMinutes" => 3,
+                        "setMonth" | "setUTCMonth" | "setSeconds" | "setUTCSeconds" => 2,
+                        _ => 1, // setDate / setMilliseconds
+                    };
+                    // `setFullYear` works on an invalid date (treating the time as
+                    // +0); the others propagate NaN. The date value is read *before*
+                    // coercing the arguments.
+                    let is_full_year = matches!(method, "setFullYear" | "setUTCFullYear");
+                    let date_is_nan = !ms.is_finite();
+                    // Coerce each *provided* argument exactly once, in order — even
+                    // when the date is NaN (a later abrupt completion still throws).
+                    let take = max_components.min(args.len());
+                    let mut comps = Vec::with_capacity(take);
+                    for i in 0..take {
+                        let num = self.coerce_to_number(arg(i))?;
+                        comps.push(self.realm.to_number(num));
+                    }
+                    if date_is_nan && !is_full_year {
+                        // Invalid date stays invalid; arguments were still coerced.
+                        return Ok(Some(NanBox::number(f64::NAN)));
+                    }
+                    // Decompose the (possibly zeroed, for setFullYear) current time.
                     let (mut yy, mut mo0, mut dd) = (y, (mo as i64) - 1, d as i64);
                     let mut hh = tod / 3_600_000;
                     let mut mi = tod / 60_000 % 60;
                     let mut ss = tod / 1000 % 60;
                     let mut mss = tod % 1000;
-                    let n = self.realm.to_number(arg(0)) as i64;
-                    let argc = args.len();
-                    // The higher-order setters also accept the *following* components as
-                    // optional args (`setFullYear(y, month, date)`, `setHours(h, m, s, ms)`).
-                    let a1 = self.realm.to_number(arg(1)) as i64;
-                    let a2 = self.realm.to_number(arg(2)) as i64;
-                    let a3 = self.realm.to_number(arg(3)) as i64;
+                    if is_full_year && date_is_nan {
+                        // Time treated as +0: all components reset to their epoch value.
+                        yy = 1970;
+                        mo0 = 0;
+                        dd = 1;
+                        hh = 0;
+                        mi = 0;
+                        ss = 0;
+                        mss = 0;
+                    }
+                    // Any NaN component makes the whole result NaN (TimeClip).
+                    let mut any_nan = false;
+                    let mut comp = |slot: &mut i64, idx: usize| {
+                        if let Some(&v) = comps.get(idx) {
+                            if v.is_nan() || !v.is_finite() {
+                                any_nan = true;
+                            }
+                            *slot = v as i64;
+                        }
+                    };
                     match method {
                         "setFullYear" | "setUTCFullYear" => {
-                            yy = n;
-                            if argc > 1 {
-                                mo0 = a1;
-                            }
-                            if argc > 2 {
-                                dd = a2;
-                            }
+                            comp(&mut yy, 0);
+                            comp(&mut mo0, 1);
+                            comp(&mut dd, 2);
                         }
                         "setMonth" | "setUTCMonth" => {
-                            mo0 = n;
-                            if argc > 1 {
-                                dd = a1;
-                            }
+                            comp(&mut mo0, 0);
+                            comp(&mut dd, 1);
                         }
-                        "setDate" | "setUTCDate" => dd = n,
+                        "setDate" | "setUTCDate" => comp(&mut dd, 0),
                         "setHours" | "setUTCHours" => {
-                            hh = n;
-                            if argc > 1 {
-                                mi = a1;
-                            }
-                            if argc > 2 {
-                                ss = a2;
-                            }
-                            if argc > 3 {
-                                mss = a3;
-                            }
+                            comp(&mut hh, 0);
+                            comp(&mut mi, 1);
+                            comp(&mut ss, 2);
+                            comp(&mut mss, 3);
                         }
                         "setMinutes" | "setUTCMinutes" => {
-                            mi = n;
-                            if argc > 1 {
-                                ss = a1;
-                            }
-                            if argc > 2 {
-                                mss = a2;
-                            }
+                            comp(&mut mi, 0);
+                            comp(&mut ss, 1);
+                            comp(&mut mss, 2);
                         }
                         "setSeconds" | "setUTCSeconds" => {
-                            ss = n;
-                            if argc > 1 {
-                                mss = a1;
-                            }
+                            comp(&mut ss, 0);
+                            comp(&mut mss, 1);
                         }
-                        _ => mss = n, // setMilliseconds
+                        _ => comp(&mut mss, 0), // setMilliseconds
+                    }
+                    if any_nan {
+                        self.realm.set_date_ms(handle, f64::NAN);
+                        return Ok(Some(NanBox::number(f64::NAN)));
                     }
                     // Normalize a possibly out-of-range month into the year, then
                     // measure the day as an offset from the 1st (so out-of-range
@@ -10018,9 +10144,13 @@ impl<'a> Interp<'a> {
                     let yy2 = yy + mo0.div_euclid(12);
                     let mo1 = (mo0.rem_euclid(12) + 1) as u32;
                     let base_days = crate::realm::days_from_civil(yy2, mo1, 1) + (dd - 1);
-                    let nms =
-                        (base_days * 86_400_000 + hh * 3_600_000 + mi * 60_000 + ss * 1000 + mss)
-                            as f64;
+                    let nms = time_clip(
+                        (base_days * 86_400_000
+                            + hh * 3_600_000
+                            + mi * 60_000
+                            + ss * 1000
+                            + mss) as f64,
+                    );
                     self.realm.set_date_ms(handle, nms);
                     NanBox::number(nms)
                 }
@@ -18031,6 +18161,17 @@ fn f16_to_f64(h: u16) -> f64 {
         }
         _ => sign * (1.0 + mant / 1024.0) * 2.0f64.powi(exp as i32 - 15),
     }
+}
+
+/// `TimeClip(t)`: `NaN` for a non-finite value or a magnitude beyond the maximum
+/// representable time (8.64e15 ms ≈ ±100,000,000 days), otherwise the integer
+/// part (truncated toward zero, normalizing `-0` to `+0`).
+fn time_clip(t: f64) -> f64 {
+    if !t.is_finite() || t.abs() > 8.64e15 {
+        return f64::NAN;
+    }
+    let truncated = t.trunc();
+    if truncated == 0.0 { 0.0 } else { truncated }
 }
 
 fn int_to_radix(n: f64, radix: u32) -> String {
