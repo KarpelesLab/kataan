@@ -1687,7 +1687,58 @@ impl<'a> Interp<'a> {
         self.setup_first_class_prototype("Array", ARRAY_PROTO_METHODS);
         self.setup_first_class_prototype("String", STRING_PROTO_METHODS);
         self.setup_first_class_prototype("Number", NUMBER_PROTO_METHODS);
+        // The `Number` numeric constants are own data properties of the
+        // constructor with the built-in attributes `{ writable: false,
+        // enumerable: false, configurable: false }` (so `hasOwnProperty` and
+        // `verifyProperty` see them).
+        if let Some(num_ctor) = self
+            .current
+            .get("Number")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            let consts: &[(&str, f64)] = &[
+                ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0),
+                ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0),
+                ("MAX_VALUE", f64::MAX),
+                ("MIN_VALUE", f64::from_bits(1)),
+                ("EPSILON", f64::EPSILON),
+                ("POSITIVE_INFINITY", f64::INFINITY),
+                ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+                ("NaN", f64::NAN),
+            ];
+            for &(name, value) in consts {
+                self.realm.set_property(num_ctor, name, NanBox::number(value));
+                self.realm.mark_hidden(num_ctor, name);
+                self.realm.set_readonly_property(num_ctor, name);
+                self.realm.set_non_configurable_property(num_ctor, name);
+            }
+        }
         self.setup_first_class_prototype("Boolean", BOOLEAN_PROTO_METHODS);
+        // `Number.prototype`/`Boolean.prototype`/`String.prototype` are themselves
+        // wrapper objects with a default `[[NumberData]]`/`[[BooleanData]]`/
+        // `[[StringData]]` (`+0`, `false`, `""`). They carry the matching
+        // `PRIM_WRAP` so `Number.prototype.valueOf()` is `0` and
+        // `Object.prototype.toString.call(Number.prototype)` is `"[object Number]"`.
+        for (ctor, prim) in [
+            ("Number", NanBox::number(0.0)),
+            ("Boolean", NanBox::boolean(false)),
+        ] {
+            if let Some(proto) = self
+                .current
+                .get(ctor)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|c| self.realm.get_property(c, "prototype"))
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw)
+            {
+                self.realm.set_hidden_property(proto, PRIM_WRAP, prim);
+                let id = if ctor == "Number" { N_NUMBER } else { N_BOOLEAN };
+                self.realm
+                    .set_hidden_property(proto, PRIM_WRAP_TYPE, NanBox::number(f64::from(id)));
+            }
+        }
         self.setup_first_class_prototype_id("BigInt", BIGINT_PROTO_METHODS, N_BIGINT_PROTO_FN);
         // `BigInt.prototype[Symbol.toStringTag]` is the string "BigInt", an own data
         // property `{writable:false, enumerable:false, configurable:true}`. Being
@@ -1879,16 +1930,20 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_string(&s).to_raw())
             }
             N_NUMBER => {
-                // `Number(bigint)` converts to the nearest double.
-                if let Some(big) = arg(0)
+                // `Number()` with no arguments is `+0`.
+                if args.is_empty() {
+                    NanBox::number(0.0)
+                } else if let Some(big) = arg(0)
                     .as_handle()
                     .and_then(|r| self.realm.bigint_at(Handle::from_raw(r)))
                 {
+                    // `Number(bigint)` converts to the nearest double.
                     NanBox::number(big.to_f64())
                 } else {
-                    // `Number(obj)` runs the object through ToNumber (number
-                    // hint), honoring a custom `valueOf`.
-                    let p = self.coerce_object(arg(0), "number")?;
+                    // `Number(value)` runs `value` through ToNumber (number hint),
+                    // honoring a custom `valueOf`/`Symbol.toPrimitive` and throwing
+                    // a TypeError for a Symbol.
+                    let p = self.coerce_to_number(arg(0))?;
                     NanBox::number(self.realm.to_number(p))
                 }
             }
@@ -8237,6 +8292,25 @@ impl<'a> Interp<'a> {
 
     fn make_primitive_wrapper(&mut self, prim: NanBox, ctor_id: u16) -> NanBox {
         let obj = self.realm.new_object();
+        // The wrapper's `[[Prototype]]` is the corresponding constructor's
+        // `.prototype` (so `Object.getPrototypeOf(new Number(1)) === Number.prototype`
+        // and inherited methods such as `toFixed` resolve to the prototype's).
+        let ctor_name = match ctor_id {
+            N_NUMBER => Some("Number"),
+            N_STRING => Some("String"),
+            N_BOOLEAN => Some("Boolean"),
+            _ => None,
+        };
+        if let Some(proto) = ctor_name
+            .and_then(|n| self.current.get(n))
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_object_proto(obj, Some(proto));
+        }
         self.realm.set_hidden_property(obj, PRIM_WRAP, prim);
         self.realm
             .set_hidden_property(obj, PRIM_WRAP_TYPE, NanBox::number(f64::from(ctor_id)));
@@ -8794,12 +8868,24 @@ impl<'a> Interp<'a> {
         if let Some(n) = recv.as_number() {
             return Ok(match method {
                 "toString" => {
-                    // An optional radix (2–36) for integers, else base 10.
+                    // The radix is ToIntegerOrInfinity'd; it must be in [2, 36] or
+                    // a RangeError (undefined defaults to 10).
                     let radix = match args.first() {
-                        Some(a) => self.realm.to_number(*a) as u32,
-                        None => 10,
+                        Some(a) if !matches!(a.unpack(), Unpacked::Undefined) => {
+                            let r = self.coerce_to_integer_or_infinity(*a)?;
+                            if !(2.0..=36.0).contains(&r) {
+                                let m =
+                                    self.new_str("toString() radix must be between 2 and 36");
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_RANGE_ERROR, Some(m)),
+                                ));
+                            }
+                            r as u32
+                        }
+                        _ => 10,
                     };
-                    if radix == 10 || !(2..=36).contains(&radix) {
+                    // A non-finite value or base 10 uses the spec `Number::toString`.
+                    if radix == 10 || !n.is_finite() {
                         Some(self.new_str(&self.realm.to_display_string(recv)))
                     } else {
                         Some(self.new_str(&int_to_radix(n, radix)))
@@ -8814,10 +8900,11 @@ impl<'a> Interp<'a> {
                 }
                 #[cfg(feature = "std")]
                 "toFixed" => {
-                    // `fractionDigits` is ToIntegerOrInfinity'd (undefined/NaN → 0)
-                    // and must be in [0, 100], else a RangeError.
-                    let d = self.realm.to_number(arg(0));
-                    let f = if d.is_nan() { 0 } else { d as i64 };
+                    // `fractionDigits` is ToIntegerOrInfinity'd (undefined/NaN → 0,
+                    // a Symbol/BigInt → TypeError) and must be in [0, 100], else a
+                    // RangeError.
+                    let d = self.coerce_to_integer_or_infinity(arg(0))?;
+                    let f = d as i64;
                     if !(0..=100).contains(&f) {
                         let m = self.new_str("toFixed() digits argument must be between 0 and 100");
                         return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
@@ -8876,36 +8963,24 @@ impl<'a> Interp<'a> {
                 // `toExponential(d)` — exponential notation with `d` fractional
                 // digits and a signed exponent (`1.23e+3`).
                 "toExponential" => {
+                    // `fractionDigits` is ToIntegerOrInfinity'd first (a Symbol/BigInt
+                    // → TypeError, and a user `valueOf` runs) — even for a non-finite
+                    // `this`, whose result is then the spec ToString.
+                    let undefined_digits = matches!(arg(0).unpack(), Unpacked::Undefined);
+                    let di = self.coerce_to_integer_or_infinity(arg(0))? as i64;
                     if !n.is_finite() {
                         // `Infinity`/`-Infinity`/`NaN` use the spec ToString.
                         Some(self.new_str(&self.realm.to_display_string(NanBox::number(n))))
+                    } else if undefined_digits {
+                        Some(self.new_str(&format_exponential(n, None)))
                     } else {
-                        let raw = if matches!(arg(0).unpack(), Unpacked::Undefined) {
-                            alloc::format!("{n:e}")
-                        } else {
-                            // `fractionDigits` is ToIntegerOrInfinity'd and must be
-                            // in [0, 100], else a RangeError (an unvalidated value
-                            // would panic Rust's formatter at large widths).
-                            let dn = self.realm.to_number(arg(0));
-                            let di = if dn.is_nan() { 0 } else { dn as i64 };
-                            if !(0..=100).contains(&di) {
-                                let m = self
-                                    .new_str("toExponential() argument must be between 0 and 100");
-                                return Err(ExecError::Throw(
-                                    self.make_error(N_RANGE_ERROR, Some(m)),
-                                ));
-                            }
-                            let d = di as usize;
-                            alloc::format!("{n:.d$e}")
-                        };
-                        // Rust prints `1.23e3`; JS wants `1.23e+3`.
-                        let fixed = match raw.find('e') {
-                            Some(i) if !raw[i + 1..].starts_with('-') => {
-                                alloc::format!("{}e+{}", &raw[..i], &raw[i + 1..])
-                            }
-                            _ => raw,
-                        };
-                        Some(self.new_str(&fixed))
+                        // `fractionDigits` must be in [0, 100], else a RangeError.
+                        if !(0..=100).contains(&di) {
+                            let m =
+                                self.new_str("toExponential() argument must be between 0 and 100");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
+                        Some(self.new_str(&format_exponential(n, Some(di as usize))))
                     }
                 }
                 // `toPrecision(p)` — p significant digits (no arg → default
@@ -8914,17 +8989,23 @@ impl<'a> Interp<'a> {
                     if matches!(arg(0).unpack(), Unpacked::Undefined) {
                         Some(self.new_str(&self.realm.to_display_string(recv)))
                     } else {
-                        // `precision` must be in [1, 100], else a RangeError (an
-                        // unvalidated width would panic Rust's formatter).
-                        let pn = self.realm.to_number(arg(0));
-                        let pi = if pn.is_nan() { 0 } else { pn as i64 };
-                        if !(1..=100).contains(&pi) {
-                            let m =
-                                self.new_str("toPrecision() argument must be between 1 and 100");
-                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        // Spec order: ToIntegerOrInfinity(precision) first (a
+                        // Symbol/BigInt → TypeError); then a non-finite `this`
+                        // returns its ToString; then the [1, 100] RangeError check.
+                        let pi = self.coerce_to_integer_or_infinity(arg(0))? as i64;
+                        if !n.is_finite() {
+                            Some(self.new_str(&self.realm.to_display_string(recv)))
+                        } else {
+                            if !(1..=100).contains(&pi) {
+                                let m = self
+                                    .new_str("toPrecision() argument must be between 1 and 100");
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_RANGE_ERROR, Some(m)),
+                                ));
+                            }
+                            let p = pi as usize;
+                            Some(self.new_str(&format_precision(n, p)))
                         }
-                        let p = pi as usize;
-                        Some(self.new_str(&format_precision(n, p)))
                     }
                 }
                 _ => None,
@@ -17016,6 +17097,97 @@ fn pad_units(s: &[u8], target: usize, pad: &[u8], at_start: bool) -> Vec<u8> {
 
 /// `Number.prototype.toPrecision(p)`: render `n` with `p` significant digits,
 /// choosing fixed or exponential notation by magnitude (as the spec does).
+/// `Number.prototype.toExponential` with `frac` fractional digits (`None` =
+/// "as many digits as needed to represent the value uniquely"). Uses ties-away
+/// rounding (the spec picks the larger `n` on an exact tie), unlike Rust's
+/// ties-to-even formatter, and never emits a `-0` sign. The exponent carries an
+/// explicit sign (`1.23e+4`, `5e-3`).
+fn format_exponential(n: f64, frac: Option<usize>) -> String {
+    debug_assert!(n.is_finite());
+    let neg = n.is_sign_negative() && n != 0.0;
+    let abs = n.abs();
+    // Build the mantissa string and its exponent. For a fixed digit count we
+    // render with one guard digit and round ties-away (the spec picks the larger
+    // value on an exact tie), unlike Rust's ties-to-even formatter. The exponent
+    // is read from the *same* rendering so a tie-induced carry (`9.995 → 1.00`,
+    // exponent +1) stays consistent.
+    let (mantissa, exp) = match frac {
+        Some(f) => {
+            // Render with many guard digits so the ties-away rounding decision
+            // sees the exact decimal expansion (one guard digit alone is itself
+            // pre-rounded by Rust's formatter and would mis-round, e.g.
+            // `123456 → 1.235` then up to `1.24` instead of `1.23`).
+            let mantissa_full = alloc::format!("{:.*e}", f + 25, abs);
+            let mut exp: i32 = mantissa_full
+                .rfind('e')
+                .and_then(|i| mantissa_full[i + 1..].parse().ok())
+                .unwrap_or(0);
+            let m = round_exp_mantissa(&mantissa_full, f, &mut exp);
+            (m, exp)
+        }
+        None => {
+            // Shortest unique mantissa: Rust's default `{:e}` already does this.
+            let sci = alloc::format!("{abs:e}");
+            let exp: i32 = sci
+                .rfind('e')
+                .and_then(|i| sci[i + 1..].parse().ok())
+                .unwrap_or(0);
+            (String::from(sci.split('e').next().unwrap_or("0")), exp)
+        }
+    };
+    let sign = if exp < 0 { '-' } else { '+' };
+    if neg {
+        alloc::format!("-{mantissa}e{sign}{}", exp.abs())
+    } else {
+        alloc::format!("{mantissa}e{sign}{}", exp.abs())
+    }
+}
+
+/// Rounds a scientific-notation mantissa string (e.g. `"2.50"`, from Rust's
+/// ties-to-even formatter rendered with one guard digit) to `f` fractional
+/// digits using ties-away rounding, adjusting `exp` if a carry bumps the leading
+/// digit (`9.95 → 1.00`, exponent +1).
+fn round_exp_mantissa(mantissa_full: &str, f: usize, exp: &mut i32) -> String {
+    // `mantissa_full` is `d.ddd...` with `f + 1` fractional digits (no exponent
+    // part — we strip it).
+    let core = mantissa_full.split('e').next().unwrap_or(mantissa_full);
+    let digits: Vec<u8> = core.bytes().filter(u8::is_ascii_digit).collect();
+    // We keep `f + 1` digits total (1 integer + f fractional) and round on the
+    // last guard digit.
+    let keep = f + 1;
+    let mut kept: Vec<u8> = digits.iter().take(keep).copied().collect();
+    while kept.len() < keep {
+        kept.push(b'0');
+    }
+    let round_up = digits.get(keep).is_some_and(|&d| d >= b'5');
+    if round_up {
+        let mut i = kept.len();
+        loop {
+            if i == 0 {
+                // Carry past the most significant digit: prepend 1 and bump exp.
+                kept.insert(0, b'1');
+                kept.pop();
+                *exp += 1;
+                break;
+            }
+            i -= 1;
+            if kept[i] == b'9' {
+                kept[i] = b'0';
+            } else {
+                kept[i] += 1;
+                break;
+            }
+        }
+    }
+    let int_part = kept[0] as char;
+    if f == 0 {
+        alloc::format!("{int_part}")
+    } else {
+        let frac_part: String = kept[1..=f].iter().map(|&b| b as char).collect();
+        alloc::format!("{int_part}.{frac_part}")
+    }
+}
+
 fn format_precision(n: f64, p: usize) -> String {
     if n == 0.0 {
         return alloc::format!("{:.*}", p - 1, 0.0);
