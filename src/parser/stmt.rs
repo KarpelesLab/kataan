@@ -43,11 +43,16 @@ impl<'src> Parser<'src> {
         } else {
             SourceType::Script
         };
-        Ok(Program {
+        let program = Program {
             body,
             source_type,
             span: Span::new(0, source.len() as u32),
-        })
+        };
+        // Static-semantics early errors (private names, lexical redeclaration,
+        // strict-mode rules, …) are enforced as a post-parse pass so they surface
+        // as a parse-phase `SyntaxError`.
+        super::validate::validate_program(&program)?;
+        Ok(program)
     }
 
     /// Parses statements until `terminator` (or `Eof`).

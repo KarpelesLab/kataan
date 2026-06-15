@@ -1,0 +1,1106 @@
+//! Static-semantics (early-error) validation pass over a freshly parsed
+//! [`Program`].
+//!
+//! The recursive-descent parser in this module accepts the *cover grammar* — it
+//! produces an AST for any source that matches the productions, deferring a
+//! family of context-sensitive "early errors" that the specification requires to
+//! be reported at parse time (before any evaluation). This pass walks the
+//! finished tree and enforces those rules, returning a syntax [`Error`] so the
+//! engine surfaces a parse-phase `SyntaxError` exactly as the spec mandates.
+//!
+//! Rules implemented here (all parse-time `SyntaxError`s):
+//! - **Private names**: every `obj.#x` / `#x in obj` reference must resolve to a
+//!   private name declared in an enclosing class body; `#constructor` is never a
+//!   valid private name; duplicate private names in one class body are illegal (a
+//!   get/set accessor pair is the sole exception); `delete` of a private
+//!   reference is illegal; `super.#x` is illegal.
+//! - **Class members**: at most one `constructor`; `constructor` may not be a
+//!   getter/setter/generator/async method or a field; a `static` member may not
+//!   be named `prototype`; a class field may not be named `constructor`. A field
+//!   initializer / static block may not reference `arguments` or call `super()`.
+//! - **`super()`** calls outside a derived-class constructor.
+//! - **`with`** is forbidden in strict mode, and its body may not be a
+//!   declaration.
+//! - **Single-statement position**: a lexical/class/generator/async-function
+//!   declaration may not be the body of an `if`/`else`/loop/labeled statement
+//!   (and a plain function declaration is also rejected in a loop body or strict
+//!   mode).
+//! - **Lexical redeclaration**: duplicate lexically-declared names, and
+//!   `var`/lexical conflicts, within a block, switch, function, or program
+//!   scope; lexical declarations may not bind the name `let`.
+//! - **Duplicate parameters** in a strict-mode or non-simple parameter list, and
+//!   a `"use strict"` directive in a non-simple-parameter function.
+
+use crate::ast::{
+    Arrow, ArrowBody, BindingTarget, Class, ClassMember, Expr, ForLeft, Function, MethodKind,
+    ObjectMember, Param, Program, PropertyKey, SourceType, Stmt, UnaryOp, VarDecl, VarDeclKind,
+};
+use crate::common::Span;
+use crate::error::{Error, Result};
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+/// Validates a parsed [`Program`], returning the first early error found.
+pub(crate) fn validate_program(program: &Program) -> Result<()> {
+    let strict = program.source_type == SourceType::Module || body_is_strict(&program.body);
+    let mut v = Validator {
+        private_scopes: Vec::new(),
+    };
+    let ctx = Ctx::top(strict);
+    v.check_lexical_scope(&program.body)?;
+    for stmt in &program.body {
+        v.stmt(stmt, &ctx)?;
+    }
+    Ok(())
+}
+
+/// Whether a directive prologue in `body` contains a literal `"use strict"`.
+fn body_is_strict(body: &[Stmt]) -> bool {
+    for stmt in body {
+        if let Stmt::Expr { expression, .. } = stmt {
+            if let Expr::Str { value, span } = &**expression {
+                // A directive's *source* must be exactly `"use strict"` (11 cooked
+                // bytes inside 13 source bytes — quotes included — i.e. no
+                // escapes). Checking the span length rules out e.g. `"use\x20strict"`.
+                if &**value == b"use strict" && span.end.saturating_sub(span.start) == 12 {
+                    return true;
+                }
+                // Other directive — keep scanning the prologue.
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// Contextual flags threaded through the statement/expression walk.
+#[derive(Clone, Copy)]
+struct Ctx {
+    /// Whether the current code runs in strict mode.
+    strict: bool,
+    /// Whether a `super(...)` call is syntactically permitted here — true only
+    /// inside the constructor of a derived class (one with an `extends` clause).
+    allow_super_call: bool,
+    /// Whether we are directly inside a class field initializer or static
+    /// initialization block (with no intervening function boundary). In that
+    /// position a reference to `arguments` and a `super(...)` call are early
+    /// errors.
+    in_field_init: bool,
+}
+
+impl Ctx {
+    /// A fresh non-strict top-level context.
+    fn top(strict: bool) -> Self {
+        Ctx {
+            strict,
+            allow_super_call: false,
+            in_field_init: false,
+        }
+    }
+}
+
+struct Validator {
+    /// Stack of private-name scopes — one frame per enclosing class body, each
+    /// holding the private names that class declares.
+    private_scopes: Vec<Vec<Box<str>>>,
+}
+
+/// What a private member declaration is, for duplicate detection.
+#[derive(Clone, Copy, PartialEq)]
+enum PrivKind {
+    Field,
+    Method,
+    Get,
+    Set,
+}
+
+impl Validator {
+    fn err(&self, span: Span, msg: &str) -> Error {
+        Error::syntax(msg, span)
+    }
+
+    // --- statements -----------------------------------------------------
+
+    fn stmt(&mut self, stmt: &Stmt, ctx: &Ctx) -> Result<()> {
+        match stmt {
+            Stmt::Expr { expression, .. } => self.expr(expression, ctx),
+            Stmt::Block { body, .. } => {
+                self.check_lexical_scope(body)?;
+                for s in body {
+                    self.stmt(s, ctx)?;
+                }
+                Ok(())
+            }
+            Stmt::Empty { .. } | Stmt::Debugger { .. } => Ok(()),
+            Stmt::Var(decl) => self.var_decl(decl, ctx),
+            Stmt::If {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                self.expr(test, ctx)?;
+                self.check_substatement(consequent, ctx)?;
+                self.stmt(consequent, ctx)?;
+                if let Some(a) = alternate {
+                    self.check_substatement(a, ctx)?;
+                    self.stmt(a, ctx)?;
+                }
+                Ok(())
+            }
+            Stmt::For {
+                init,
+                test,
+                update,
+                body,
+                ..
+            } => {
+                if let Some(init) = init {
+                    match init {
+                        crate::ast::ForInit::Var(d) => self.var_decl(d, ctx)?,
+                        crate::ast::ForInit::Expr(e) => self.expr(e, ctx)?,
+                    }
+                }
+                if let Some(t) = test {
+                    self.expr(t, ctx)?;
+                }
+                if let Some(u) = update {
+                    self.expr(u, ctx)?;
+                }
+                self.check_loop_body(body)?;
+                self.stmt(body, ctx)
+            }
+            Stmt::ForIn {
+                left, right, body, ..
+            }
+            | Stmt::ForOf {
+                left, right, body, ..
+            } => {
+                self.for_left(left, ctx)?;
+                self.expr(right, ctx)?;
+                self.check_loop_body(body)?;
+                self.stmt(body, ctx)
+            }
+            Stmt::While { test, body, .. } => {
+                self.expr(test, ctx)?;
+                self.check_loop_body(body)?;
+                self.stmt(body, ctx)
+            }
+            Stmt::DoWhile { body, test, .. } => {
+                self.check_loop_body(body)?;
+                self.stmt(body, ctx)?;
+                self.expr(test, ctx)
+            }
+            Stmt::Switch {
+                discriminant,
+                cases,
+                ..
+            } => {
+                self.expr(discriminant, ctx)?;
+                let all: Vec<&Stmt> = cases.iter().flat_map(|c| c.body.iter()).collect();
+                self.check_lexical_scope_refs(&all)?;
+                for case in cases {
+                    if let Some(t) = &case.test {
+                        self.expr(t, ctx)?;
+                    }
+                    for s in &case.body {
+                        self.stmt(s, ctx)?;
+                    }
+                }
+                Ok(())
+            }
+            Stmt::Try {
+                block,
+                handler,
+                finalizer,
+                ..
+            } => {
+                self.check_lexical_scope(block)?;
+                for s in block {
+                    self.stmt(s, ctx)?;
+                }
+                if let Some(h) = handler {
+                    self.check_lexical_scope(&h.body)?;
+                    if let Some(p) = &h.param {
+                        self.binding_target(p, ctx)?;
+                    }
+                    for s in &h.body {
+                        self.stmt(s, ctx)?;
+                    }
+                }
+                if let Some(f) = finalizer {
+                    self.check_lexical_scope(f)?;
+                    for s in f {
+                        self.stmt(s, ctx)?;
+                    }
+                }
+                Ok(())
+            }
+            Stmt::Return { argument, .. } => {
+                if let Some(a) = argument {
+                    self.expr(a, ctx)?;
+                }
+                Ok(())
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
+            Stmt::Throw { argument, .. } => self.expr(argument, ctx),
+            Stmt::Labeled { body, .. } => {
+                self.check_labeled_body(body, ctx)?;
+                self.stmt(body, ctx)
+            }
+            Stmt::With { object, body, .. } => {
+                if ctx.strict {
+                    return Err(self.err(stmt.span(), "`with` is not allowed in strict mode"));
+                }
+                self.expr(object, ctx)?;
+                self.check_substatement(body, ctx)?;
+                self.stmt(body, ctx)
+            }
+            Stmt::Function(f) => self.function(f, ctx),
+            Stmt::Class(c) => self.class(c, ctx),
+            Stmt::Import(_) | Stmt::Export(_) => Ok(()),
+        }
+    }
+
+    /// The single-statement body of an `if`/`else` branch may not be a
+    /// declaration. A plain `function` declaration is permitted in sloppy mode
+    /// (Annex B); a `let`/`const`/class/generator/async-function is never
+    /// permitted, and a plain `function` is also forbidden in strict mode.
+    fn check_substatement(&self, body: &Stmt, ctx: &Ctx) -> Result<()> {
+        self.reject_decl_substatement(body, ctx, /* allow_sloppy_fn */ true)
+    }
+
+    /// The body of a `for`/`while`/`do-while` loop may not be *any* declaration
+    /// — not even a plain `function` (Annex B does not apply to loop bodies).
+    fn check_loop_body(&self, body: &Stmt) -> Result<()> {
+        // Loop bodies forbid even sloppy function declarations.
+        self.reject_decl_substatement(body, &Ctx::top(true), /* allow_sloppy_fn */ false)
+    }
+
+    /// The body of a labeled statement may not be a `let`/`const`/class
+    /// declaration or a generator/async function; a plain `function`
+    /// declaration is allowed in sloppy mode only (Annex B).
+    fn check_labeled_body(&self, body: &Stmt, ctx: &Ctx) -> Result<()> {
+        // `LabelledItem : FunctionDeclaration` is allowed only for a non-async,
+        // non-generator function in sloppy mode.
+        self.reject_decl_substatement(body, ctx, /* allow_sloppy_fn */ true)
+    }
+
+    /// Shared core: rejects a declaration found in single-statement position.
+    fn reject_decl_substatement(
+        &self,
+        body: &Stmt,
+        ctx: &Ctx,
+        allow_sloppy_fn: bool,
+    ) -> Result<()> {
+        match body {
+            Stmt::Var(decl) if decl.kind != VarDeclKind::Var => Err(self.err(
+                decl.span,
+                "lexical declarations may not appear in single-statement position",
+            )),
+            Stmt::Class(c) => Err(self.err(
+                c.span,
+                "a class declaration may not appear in single-statement position",
+            )),
+            Stmt::Function(f) => {
+                // Generators and async functions are never allowed here; a plain
+                // function is allowed only in sloppy mode where Annex B permits.
+                if f.is_generator || f.is_async || ctx.strict || !allow_sloppy_fn {
+                    Err(self.err(
+                        f.span,
+                        "a function declaration may not appear in single-statement position",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn for_left(&mut self, left: &ForLeft, ctx: &Ctx) -> Result<()> {
+        match left {
+            ForLeft::Decl { kind, target, .. } => {
+                if *kind != VarDeclKind::Var {
+                    self.check_lexical_binding_names(target)?;
+                }
+                Ok(())
+            }
+            ForLeft::Target(e) => self.expr(e, ctx),
+        }
+    }
+
+    fn var_decl(&mut self, decl: &VarDecl, ctx: &Ctx) -> Result<()> {
+        for d in &decl.declarations {
+            if decl.kind != VarDeclKind::Var {
+                self.check_lexical_binding_names(&d.target)?;
+            }
+            if let Some(init) = &d.init {
+                self.expr(init, ctx)?;
+            }
+            self.binding_target(&d.target, ctx)?;
+        }
+        Ok(())
+    }
+
+    /// Lexical declarations (`let`/`const`) may not bind the name `let`.
+    fn check_lexical_binding_names(&self, target: &BindingTarget) -> Result<()> {
+        let mut names = Vec::new();
+        collect_bound_names(target, &mut names);
+        for (name, span) in names {
+            if name == "let" {
+                return Err(self.err(span, "`let` is not a valid lexical binding name"));
+            }
+        }
+        Ok(())
+    }
+
+    fn binding_target(&mut self, target: &BindingTarget, ctx: &Ctx) -> Result<()> {
+        match target {
+            BindingTarget::Ident(_) => Ok(()),
+            BindingTarget::Array(p) => {
+                for el in &p.elements {
+                    match el {
+                        crate::ast::ArrayPatternElement::Hole => {}
+                        crate::ast::ArrayPatternElement::Item {
+                            target, default, ..
+                        } => {
+                            self.binding_target(target, ctx)?;
+                            if let Some(d) = default {
+                                self.expr(d, ctx)?;
+                            }
+                        }
+                        crate::ast::ArrayPatternElement::Rest { target, .. } => {
+                            self.binding_target(target, ctx)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            BindingTarget::Object(p) => {
+                for prop in &p.properties {
+                    if let PropertyKey::Computed(e) = &prop.key {
+                        self.expr(e, ctx)?;
+                    }
+                    self.binding_target(&prop.value, ctx)?;
+                    if let Some(d) = &prop.default {
+                        self.expr(d, ctx)?;
+                    }
+                }
+                if let Some(r) = &p.rest {
+                    self.binding_target(r, ctx)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // --- functions ------------------------------------------------------
+
+    fn function(&mut self, f: &Function, ctx: &Ctx) -> Result<()> {
+        let strict = ctx.strict || body_is_strict(&f.body);
+        self.check_params(&f.params, strict, &f.body)?;
+        // A regular function establishes its own `arguments` and `super`
+        // bindings, so it leaves any enclosing field-initializer restrictions.
+        let c = Ctx {
+            strict,
+            allow_super_call: false,
+            in_field_init: false,
+        };
+        for p in &f.params {
+            self.param(p, &c)?;
+        }
+        self.check_lexical_scope(&f.body)?;
+        for s in &f.body {
+            self.stmt(s, &c)?;
+        }
+        Ok(())
+    }
+
+    fn method_function(
+        &mut self,
+        f: &Function,
+        parent: &Ctx,
+        allow_super_call: bool,
+    ) -> Result<()> {
+        let strict = parent.strict || body_is_strict(&f.body);
+        self.check_params(&f.params, strict, &f.body)?;
+        let c = Ctx {
+            strict,
+            allow_super_call,
+            in_field_init: false,
+        };
+        for p in &f.params {
+            self.param(p, &c)?;
+        }
+        self.check_lexical_scope(&f.body)?;
+        for s in &f.body {
+            self.stmt(s, &c)?;
+        }
+        Ok(())
+    }
+
+    fn arrow(&mut self, a: &Arrow, ctx: &Ctx) -> Result<()> {
+        let strict = ctx.strict
+            || match &a.body {
+                ArrowBody::Block(body) => body_is_strict(body),
+                ArrowBody::Expr(_) => false,
+            };
+        let body_slice: &[Stmt] = match &a.body {
+            ArrowBody::Block(body) => body,
+            ArrowBody::Expr(_) => &[],
+        };
+        self.check_params(&a.params, strict, body_slice)?;
+        // An arrow inherits `super`, `this`, and `arguments` (and thus the
+        // field-initializer restrictions) from its enclosing scope.
+        let c = Ctx {
+            strict,
+            allow_super_call: ctx.allow_super_call,
+            in_field_init: ctx.in_field_init,
+        };
+        for p in &a.params {
+            self.param(p, &c)?;
+        }
+        match &a.body {
+            ArrowBody::Block(body) => {
+                self.check_lexical_scope(body)?;
+                for s in body {
+                    self.stmt(s, &c)?;
+                }
+            }
+            ArrowBody::Expr(e) => self.expr(e, &c)?,
+        }
+        Ok(())
+    }
+
+    fn param(&mut self, p: &Param, ctx: &Ctx) -> Result<()> {
+        if let Some(d) = &p.default {
+            self.expr(d, ctx)?;
+        }
+        self.binding_target(&p.target, ctx)
+    }
+
+    /// Parameter-list early errors:
+    /// - a name may not repeat in a strict-mode function or in any function with
+    ///   a non-simple parameter list (defaults, destructuring, or a rest
+    ///   element);
+    /// - a function whose parameter list is non-simple may not contain a
+    ///   `"use strict"` directive in its body.
+    fn check_params(&self, params: &[Param], strict: bool, body: &[Stmt]) -> Result<()> {
+        let simple = params
+            .iter()
+            .all(|p| !p.rest && p.default.is_none() && matches!(p.target, BindingTarget::Ident(_)));
+        if !simple && body_is_strict(body) {
+            // The directive begins the body; point the error there.
+            let span = body.first().map_or(Span::new(0, 0), Stmt::span);
+            return Err(self.err(
+                span,
+                "a `\"use strict\"` directive is not allowed in a function with a non-simple parameter list",
+            ));
+        }
+        if simple && !strict {
+            return Ok(());
+        }
+        let mut names: Vec<(String, Span)> = Vec::new();
+        for p in params {
+            let mut bound = Vec::new();
+            collect_bound_names(&p.target, &mut bound);
+            for (name, span) in bound {
+                if names.iter().any(|(n, _)| *n == name) {
+                    return Err(self.err(span, "duplicate parameter name not allowed here"));
+                }
+                names.push((name, span));
+            }
+        }
+        Ok(())
+    }
+
+    // --- classes --------------------------------------------------------
+
+    fn class(&mut self, c: &Class, _ctx: &Ctx) -> Result<()> {
+        // Class bodies are always strict.
+        let cls_ctx = Ctx::top(true);
+
+        // 1. The heritage clause is checked with the *enclosing* private scope —
+        //    the class's own private environment is not yet active there.
+        if let Some(sc) = &c.super_class {
+            self.expr(sc, &cls_ctx)?;
+        }
+
+        // 2. Collect this class's private names and validate member early errors.
+        let mut privates: Vec<Box<str>> = Vec::new();
+        let mut seen: Vec<(Box<str>, bool, PrivKind)> = Vec::new();
+        let mut ctor_count = 0u32;
+        for member in &c.body {
+            match member {
+                ClassMember::Method(m) => {
+                    if let PropertyKey::Private(name) = &m.key {
+                        if &**name == "constructor" {
+                            return Err(
+                                self.err(m.span, "`#constructor` is not a valid private name")
+                            );
+                        }
+                        privates.push(name.clone());
+                        let pk = match m.kind {
+                            MethodKind::Get => PrivKind::Get,
+                            MethodKind::Set => PrivKind::Set,
+                            _ => PrivKind::Method,
+                        };
+                        self.check_private_dup(&mut seen, name, m.is_static, pk, m.span)?;
+                    }
+                    if matches!(m.kind, MethodKind::Constructor) {
+                        ctor_count += 1;
+                        if ctor_count > 1 {
+                            return Err(self.err(m.span, "a class may have only one constructor"));
+                        }
+                    }
+                    if m.is_static && key_is_named(&m.key, "prototype") {
+                        return Err(
+                            self.err(m.span, "a static class member may not be named `prototype`")
+                        );
+                    }
+                    // A non-static getter/setter/generator/async method named
+                    // `constructor` is illegal (only a plain method is the ctor).
+                    if !m.is_static
+                        && key_is_named(&m.key, "constructor")
+                        && (matches!(m.kind, MethodKind::Get | MethodKind::Set)
+                            || m.value.is_async
+                            || m.value.is_generator)
+                    {
+                        return Err(self.err(
+                            m.span,
+                            "class `constructor` may not be an accessor, generator, or async method",
+                        ));
+                    }
+                }
+                ClassMember::Field(field) => {
+                    if let PropertyKey::Private(name) = &field.key {
+                        if &**name == "constructor" {
+                            return Err(
+                                self.err(field.span, "`#constructor` is not a valid private name")
+                            );
+                        }
+                        privates.push(name.clone());
+                        self.check_private_dup(
+                            &mut seen,
+                            name,
+                            field.is_static,
+                            PrivKind::Field,
+                            field.span,
+                        )?;
+                    }
+                    if key_is_named(&field.key, "constructor") {
+                        return Err(
+                            self.err(field.span, "a class field may not be named `constructor`")
+                        );
+                    }
+                    if field.is_static && key_is_named(&field.key, "prototype") {
+                        return Err(self.err(
+                            field.span,
+                            "a static class field may not be named `prototype`",
+                        ));
+                    }
+                }
+                ClassMember::StaticBlock { .. } => {}
+            }
+        }
+
+        // 3. Push the private scope and walk member bodies/initializers.
+        self.private_scopes.push(privates);
+        let has_heritage = c.super_class.is_some();
+        let result = self.class_members(c, &cls_ctx, has_heritage);
+        self.private_scopes.pop();
+        result
+    }
+
+    fn class_members(&mut self, c: &Class, ctx: &Ctx, has_heritage: bool) -> Result<()> {
+        for member in &c.body {
+            match member {
+                ClassMember::Method(m) => {
+                    if let PropertyKey::Computed(e) = &m.key {
+                        self.expr(e, ctx)?;
+                    }
+                    // `super(...)` is only legal inside the constructor of a
+                    // derived class.
+                    let allow_super_call =
+                        has_heritage && matches!(m.kind, MethodKind::Constructor);
+                    self.method_function(&m.value, ctx, allow_super_call)?;
+                }
+                ClassMember::Field(field) => {
+                    if let PropertyKey::Computed(e) = &field.key {
+                        self.expr(e, ctx)?;
+                    }
+                    if let Some(v) = &field.value {
+                        // A field initializer may use `super.prop`, `this`, and
+                        // private names, but never `super(...)` or `arguments`.
+                        let c2 = Ctx {
+                            strict: true,
+                            allow_super_call: false,
+                            in_field_init: true,
+                        };
+                        self.expr(v, &c2)?;
+                    }
+                }
+                ClassMember::StaticBlock { body, .. } => {
+                    let c2 = Ctx {
+                        strict: true,
+                        allow_super_call: false,
+                        in_field_init: true,
+                    };
+                    self.check_lexical_scope(body)?;
+                    for s in body {
+                        self.stmt(s, &c2)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Private names share a single namespace across the whole class body
+    /// (static and instance alike), so any repeat of a name is a duplicate —
+    /// except a single get/set accessor pair, which must additionally agree on
+    /// staticness.
+    fn check_private_dup(
+        &self,
+        seen: &mut Vec<(Box<str>, bool, PrivKind)>,
+        name: &str,
+        is_static: bool,
+        kind: PrivKind,
+        span: Span,
+    ) -> Result<()> {
+        for (n, s, k) in seen.iter() {
+            if &**n != name {
+                continue;
+            }
+            // The only legal repeat is a getter paired with a setter, both with
+            // matching staticness.
+            let pair_ok = *s == is_static
+                && matches!(
+                    (*k, kind),
+                    (PrivKind::Get, PrivKind::Set) | (PrivKind::Set, PrivKind::Get)
+                );
+            if !pair_ok {
+                return Err(self.err(span, "duplicate private name in class body"));
+            }
+        }
+        seen.push((name.into(), is_static, kind));
+        Ok(())
+    }
+
+    /// Whether `name` is a private name visible in an enclosing class scope.
+    fn private_in_scope(&self, name: &str) -> bool {
+        self.private_scopes
+            .iter()
+            .any(|frame| frame.iter().any(|n| &**n == name))
+    }
+
+    // --- expressions ----------------------------------------------------
+
+    fn expr(&mut self, e: &Expr, ctx: &Ctx) -> Result<()> {
+        match e {
+            Expr::Null(_)
+            | Expr::Bool { .. }
+            | Expr::Number { .. }
+            | Expr::BigInt { .. }
+            | Expr::Str { .. }
+            | Expr::Regex { .. }
+            | Expr::This(_)
+            | Expr::NewTarget(_) => Ok(()),
+            Expr::Ident(id) => {
+                // A class field initializer / static block has no `arguments`.
+                if ctx.in_field_init && &*id.name == "arguments" {
+                    return Err(self.err(
+                        id.span,
+                        "`arguments` is not allowed in a class field initializer",
+                    ));
+                }
+                Ok(())
+            }
+            Expr::Super(_) => {
+                // The validity of a bare `super` keyword depends on whether the
+                // enclosing function is a method, which the cover-grammar AST does
+                // not record unambiguously (an object method and a
+                // function-valued property are identical here). Defer this check
+                // to the runtime, where the home-object is known; the unambiguous
+                // `super.#private` rule is still enforced at the `Member` node.
+                let _ = ctx;
+                Ok(())
+            }
+            Expr::PrivateName(name, span) => {
+                if !self.private_in_scope(name) {
+                    return Err(self.err(*span, "reference to undeclared private name"));
+                }
+                Ok(())
+            }
+            Expr::Template(t) => {
+                for x in &t.expressions {
+                    self.expr(x, ctx)?;
+                }
+                Ok(())
+            }
+            Expr::TaggedTemplate { tag, quasi, .. } => {
+                self.expr(tag, ctx)?;
+                for x in &quasi.expressions {
+                    self.expr(x, ctx)?;
+                }
+                Ok(())
+            }
+            Expr::Array { elements, .. } => {
+                for el in elements {
+                    match el {
+                        crate::ast::ArrayElement::Hole => {}
+                        crate::ast::ArrayElement::Item(x) | crate::ast::ArrayElement::Spread(x) => {
+                            self.expr(x, ctx)?
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Expr::Object { members, .. } => {
+                for m in members {
+                    match m {
+                        ObjectMember::Property { key, value, .. } => {
+                            if let PropertyKey::Computed(k) = key {
+                                self.expr(k, ctx)?;
+                            }
+                            self.expr(value, ctx)?;
+                        }
+                        ObjectMember::Spread { value, .. } => self.expr(value, ctx)?,
+                        ObjectMember::Accessor { key, value, .. } => {
+                            if let PropertyKey::Computed(k) = key {
+                                self.expr(k, ctx)?;
+                            }
+                            self.method_function(value, ctx, false)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Expr::Member {
+                object, property, ..
+            } => {
+                if let (Expr::Super(_), PropertyKey::Private(_)) = (&**object, property) {
+                    return Err(self.err(
+                        e.span(),
+                        "private names may not be accessed through `super`",
+                    ));
+                }
+                self.expr(object, ctx)?;
+                if let PropertyKey::Private(name) = property
+                    && !self.private_in_scope(name)
+                {
+                    return Err(self.err(e.span(), "reference to undeclared private name"));
+                }
+                if let PropertyKey::Computed(k) = property {
+                    self.expr(k, ctx)?;
+                }
+                Ok(())
+            }
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                // `super(...)` is legal only in a derived-class constructor.
+                if let Expr::Super(span) = &**callee
+                    && !ctx.allow_super_call
+                {
+                    return Err(self.err(
+                        *span,
+                        "`super()` is only valid in a derived class constructor",
+                    ));
+                }
+                self.expr(callee, ctx)?;
+                for a in arguments {
+                    match a {
+                        crate::ast::Argument::Item(x) | crate::ast::Argument::Spread(x) => {
+                            self.expr(x, ctx)?
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Expr::New {
+                callee, arguments, ..
+            } => {
+                self.expr(callee, ctx)?;
+                for a in arguments {
+                    match a {
+                        crate::ast::Argument::Item(x) | crate::ast::Argument::Spread(x) => {
+                            self.expr(x, ctx)?
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Expr::OptChain { expr, .. } => self.expr(expr, ctx),
+            Expr::Unary { op, argument, .. } => {
+                if matches!(op, UnaryOp::Delete) && contains_private_ref(argument) {
+                    return Err(self.err(e.span(), "`delete` of a private member is not allowed"));
+                }
+                self.expr(argument, ctx)
+            }
+            Expr::Update { argument, .. } => self.expr(argument, ctx),
+            Expr::Binary { .. } | Expr::Logical { .. } => {
+                // Binary/logical operators chain left-associatively, so a long
+                // `a + b + c + …` is a left-deep spine. Walk that spine
+                // iteratively to keep stack use O(1) in the chain length (the
+                // parser builds such chains in a loop, not by recursion, so they
+                // can be far deeper than `MAX_PARSE_DEPTH`).
+                let mut node = e;
+                loop {
+                    match node {
+                        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+                            self.expr(right, ctx)?;
+                            node = left;
+                        }
+                        other => break self.expr(other, ctx),
+                    }
+                }
+            }
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                self.expr(test, ctx)?;
+                self.expr(consequent, ctx)?;
+                self.expr(alternate, ctx)
+            }
+            Expr::Assign { target, value, .. } => {
+                self.expr(target, ctx)?;
+                self.expr(value, ctx)
+            }
+            Expr::Sequence { expressions, .. } => {
+                for x in expressions {
+                    self.expr(x, ctx)?;
+                }
+                Ok(())
+            }
+            Expr::Function(f) => self.function(f, ctx),
+            Expr::Arrow(a) => self.arrow(a, ctx),
+            Expr::Class(c) => self.class(c, ctx),
+            Expr::Yield { argument, .. } => {
+                if let Some(a) = argument {
+                    self.expr(a, ctx)?;
+                }
+                Ok(())
+            }
+            Expr::Await { argument, .. } => self.expr(argument, ctx),
+        }
+    }
+
+    // --- lexical redeclaration ------------------------------------------
+
+    fn check_lexical_scope(&self, body: &[Stmt]) -> Result<()> {
+        let refs: Vec<&Stmt> = body.iter().collect();
+        self.check_lexical_scope_refs(&refs)
+    }
+
+    /// Enforces that a scope's lexically-declared names are unique and do not
+    /// collide with var-declared names hoisted into the same scope.
+    fn check_lexical_scope_refs(&self, body: &[&Stmt]) -> Result<()> {
+        let mut lexical: Vec<(Box<str>, Span)> = Vec::new();
+        let mut vars: Vec<Box<str>> = Vec::new();
+
+        for stmt in body {
+            collect_top_level_decls(stmt, &mut lexical, &mut vars);
+        }
+        for i in 0..lexical.len() {
+            for j in (i + 1)..lexical.len() {
+                if lexical[i].0 == lexical[j].0 {
+                    return Err(
+                        self.err(lexical[j].1, "duplicate lexical declaration in this scope")
+                    );
+                }
+            }
+        }
+        for (name, span) in &lexical {
+            if vars.iter().any(|v| v == name) {
+                return Err(self.err(
+                    *span,
+                    "a lexical declaration conflicts with a `var` of the same name",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Records the top-level lexical and var declarations of a single statement for
+/// the redeclaration check. `var` names are collected through nested
+/// non-function blocks (hoisting); lexical names are only the immediate
+/// declarations of this scope.
+fn collect_top_level_decls(
+    stmt: &Stmt,
+    lexical: &mut Vec<(Box<str>, Span)>,
+    vars: &mut Vec<Box<str>>,
+) {
+    match stmt {
+        Stmt::Var(decl) => {
+            if decl.kind == VarDeclKind::Var {
+                push_var_names(decl, vars);
+            } else {
+                for d in &decl.declarations {
+                    let mut names = Vec::new();
+                    collect_bound_names(&d.target, &mut names);
+                    for (n, span) in names {
+                        lexical.push((n.into(), span));
+                    }
+                }
+            }
+        }
+        Stmt::Function(f) => {
+            if let Some(id) = &f.id {
+                lexical.push((id.name.clone(), id.span));
+            }
+        }
+        Stmt::Class(c) => {
+            if let Some(id) = &c.id {
+                lexical.push((id.name.clone(), id.span));
+            }
+        }
+        Stmt::Labeled { body, .. } => collect_top_level_decls(body, lexical, vars),
+        // `var` hoists out of nested non-function statements.
+        other => collect_vars_only(other, vars),
+    }
+}
+
+/// Pushes the names bound by a `var` declaration.
+fn push_var_names(decl: &VarDecl, vars: &mut Vec<Box<str>>) {
+    for d in &decl.declarations {
+        let mut names = Vec::new();
+        collect_bound_names(&d.target, &mut names);
+        for (n, _) in names {
+            vars.push(n.into());
+        }
+    }
+}
+
+/// Collects only `var`-declared names hoisted through non-function nested
+/// statements (a function creates a new var scope and stops the recursion).
+fn collect_vars_only(stmt: &Stmt, vars: &mut Vec<Box<str>>) {
+    match stmt {
+        Stmt::Var(decl) if decl.kind == VarDeclKind::Var => push_var_names(decl, vars),
+        Stmt::Block { body, .. } => {
+            for s in body {
+                collect_vars_only(s, vars);
+            }
+        }
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            collect_vars_only(consequent, vars);
+            if let Some(a) = alternate {
+                collect_vars_only(a, vars);
+            }
+        }
+        Stmt::For { init, body, .. } => {
+            if let Some(crate::ast::ForInit::Var(d)) = init
+                && d.kind == VarDeclKind::Var
+            {
+                push_var_names(d, vars);
+            }
+            collect_vars_only(body, vars);
+        }
+        Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
+            if let ForLeft::Decl {
+                kind: VarDeclKind::Var,
+                target,
+                ..
+            } = left
+            {
+                let mut names = Vec::new();
+                collect_bound_names(target, &mut names);
+                for (n, _) in names {
+                    vars.push(n.into());
+                }
+            }
+            collect_vars_only(body, vars);
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::With { body, .. } => {
+            collect_vars_only(body, vars);
+        }
+        Stmt::Labeled { body, .. } => collect_vars_only(body, vars),
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            for s in block {
+                collect_vars_only(s, vars);
+            }
+            if let Some(h) = handler {
+                for s in &h.body {
+                    collect_vars_only(s, vars);
+                }
+            }
+            if let Some(f) = finalizer {
+                for s in f {
+                    collect_vars_only(s, vars);
+                }
+            }
+        }
+        Stmt::Switch { cases, .. } => {
+            for case in cases {
+                for s in &case.body {
+                    collect_vars_only(s, vars);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collects the identifier names (with spans) bound by a [`BindingTarget`].
+fn collect_bound_names(target: &BindingTarget, out: &mut Vec<(String, Span)>) {
+    match target {
+        BindingTarget::Ident(id) => out.push((id.name.to_string(), id.span)),
+        BindingTarget::Array(p) => {
+            for el in &p.elements {
+                match el {
+                    crate::ast::ArrayPatternElement::Hole => {}
+                    crate::ast::ArrayPatternElement::Item { target, .. }
+                    | crate::ast::ArrayPatternElement::Rest { target, .. } => {
+                        collect_bound_names(target, out)
+                    }
+                }
+            }
+        }
+        BindingTarget::Object(p) => {
+            for prop in &p.properties {
+                collect_bound_names(&prop.value, out);
+            }
+            if let Some(r) = &p.rest {
+                collect_bound_names(r, out);
+            }
+        }
+    }
+}
+
+/// Whether a property key is a (non-computed) name equal to `name`.
+fn key_is_named(key: &PropertyKey, name: &str) -> bool {
+    match key {
+        PropertyKey::Ident(n) | PropertyKey::Str(n) => &**n == name,
+        _ => false,
+    }
+}
+
+/// Whether the operand of a `delete` directly references a private member
+/// (`a.#x`, `a?.#x`, or such inside a chain boundary).
+fn contains_private_ref(e: &Expr) -> bool {
+    match e {
+        Expr::Member { property, .. } => matches!(property, PropertyKey::Private(_)),
+        Expr::OptChain { expr, .. } => contains_private_ref(expr),
+        _ => false,
+    }
+}
+
+use alloc::string::ToString;

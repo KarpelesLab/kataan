@@ -16,6 +16,7 @@ mod cook;
 mod function;
 mod module;
 mod stmt;
+mod validate;
 
 #[cfg(test)]
 mod tests;
