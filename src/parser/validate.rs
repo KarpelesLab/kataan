@@ -242,6 +242,29 @@ impl Validator {
                 left, right, body, ..
             } => {
                 self.for_left(left, ctx)?;
+                // It is a Syntax Error if any element of the BoundNames of a
+                // `let`/`const`/`using`/`await using` ForDeclaration also occurs
+                // in the VarDeclaredNames of the loop body. (`var` heads are
+                // exempt — they share the same var scope.)
+                if let ForLeft::Decl { kind, target, .. } = left
+                    && *kind != VarDeclKind::Var
+                {
+                    let mut bound = Vec::new();
+                    collect_bound_names(target, &mut bound);
+                    if !bound.is_empty() {
+                        let mut vars = Vec::new();
+                        collect_vars_only(body, &mut vars);
+                        for (name, span) in &bound {
+                            if vars.iter().any(|v| v.as_ref() == name.as_str()) {
+                                return Err(self.err(
+                                    *span,
+                                    "a for-in/of binding may not be redeclared by a \
+                                     `var` in the loop body",
+                                ));
+                            }
+                        }
+                    }
+                }
                 self.expr(right, ctx)?;
                 self.check_loop_body(body)?;
                 self.stmt(body, &loop_ctx(ctx))
@@ -737,12 +760,19 @@ impl Validator {
 
     // --- classes --------------------------------------------------------
 
-    fn class(&mut self, c: &Class, _ctx: &Ctx) -> Result<()> {
+    fn class(&mut self, c: &Class, ctx: &Ctx) -> Result<()> {
         // Class bodies are always strict, so the class name is a strict binding.
         if let Some(id) = &c.id {
             self.check_binding_ident_name(&id.name, id.span)?;
         }
-        let cls_ctx = Ctx::top(true);
+        // Heritage and computed member keys are evaluated in the *enclosing*
+        // scope, so they inherit the `arguments`-forbidden state of a containing
+        // class field initializer / static block. (Per `ContainsArguments`, a
+        // computed key like `[arguments]` in a class nested inside a static block
+        // is an early error, even though the method *bodies* — function
+        // boundaries — get their own `arguments`.)
+        let mut cls_ctx = Ctx::top(true);
+        cls_ctx.in_field_init = ctx.in_field_init;
 
         // 1. The heritage clause is checked with the *enclosing* private scope —
         //    the class's own private environment is not yet active there.
@@ -940,7 +970,7 @@ impl Validator {
                 if ctx.in_field_init && &*id.name == "arguments" {
                     return Err(self.err(
                         id.span,
-                        "`arguments` is not allowed in a class field initializer",
+                        "`arguments` is not allowed in a class field initializer or static block",
                     ));
                 }
                 // In strict mode the future-reserved words (and `yield`) may not

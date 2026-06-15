@@ -1174,9 +1174,13 @@ pub(crate) fn is_identifier_start_char(ch: char) -> bool {
     }
     #[cfg(feature = "intl")]
     {
-        use intl::unicode::category::GeneralCategory as Gc;
-        let gc = intl::unicode::general_category(ch);
-        gc.is_letter() || gc == Gc::LetterNumber
+        // ECMAScript `UnicodeIDStart` is the Unicode `ID_Start` property. The
+        // `intl` crate exposes the UAX #31 `XID_Start` set, which differs from a
+        // bare general-category letter test in one crucial way: it excludes
+        // `Pattern_Syntax` characters. For example U+2E2F VERTICAL TILDE is a
+        // `Lm` (modifier letter) but is `Pattern_Syntax`, so it is NOT a valid
+        // identifier character — `gc.is_letter()` wrongly accepted it.
+        intl::unicode::is_xid_start(ch)
     }
     #[cfg(not(feature = "intl"))]
     {
@@ -1226,14 +1230,11 @@ fn is_identifier_part_char(ch: char) -> bool {
     }
     #[cfg(feature = "intl")]
     {
-        use intl::unicode::category::GeneralCategory as Gc;
-        let gc = intl::unicode::general_category(ch);
-        gc.is_letter()
-            || gc.is_mark()
-            || matches!(
-                gc,
-                Gc::LetterNumber | Gc::DecimalNumber | Gc::ConnectorPunctuation
-            )
+        // ECMAScript `UnicodeIDContinue` is the Unicode `ID_Continue` property.
+        // As with `ID_Start`, the `intl` `XID_Continue` set is the authoritative
+        // UAX #31 set and excludes `Pattern_Syntax` characters that a bare
+        // general-category test (letter/mark/Nd/Nl/Pc) would wrongly accept.
+        intl::unicode::is_xid_continue(ch)
     }
     #[cfg(not(feature = "intl"))]
     {

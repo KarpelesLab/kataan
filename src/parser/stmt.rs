@@ -247,6 +247,32 @@ impl<'src> Parser<'src> {
             && self.nth_is_binding_ident(2)
     }
 
+    /// Whether the cursor begins a `using` declaration **in a `for` head**. This
+    /// is the same as [`at_using_decl`], except the binding name may not be `of`:
+    /// per the explicit-resource-management grammar, `for (using of …)` is always
+    /// interpreted as the identifier `using` being the for-of left-hand side (the
+    /// `of` after it being the `for-of` keyword), never as a `using` declaration
+    /// binding `of`. Excluding `of` here lets the head fall through to ordinary
+    /// expression parsing.
+    fn at_for_using_decl(&self) -> bool {
+        self.at_using_decl() && !self.nth_is_named(1, "of")
+    }
+
+    /// Whether the cursor begins an `await using` declaration in a `for` head;
+    /// like [`at_await_using_decl`] but the binding name may not be `of`
+    /// (see [`at_for_using_decl`]).
+    fn at_for_await_using_decl(&self) -> bool {
+        self.at_await_using_decl() && !self.nth_is_named(2, "of")
+    }
+
+    /// Whether the token `n` ahead is an identifier (or contextual keyword)
+    /// spelled exactly `name`.
+    fn nth_is_named(&self, n: usize, name: &str) -> bool {
+        self.tokens
+            .get(self.pos + n)
+            .is_some_and(|t| t.text(self.source) == name)
+    }
+
     /// Whether the token `n` ahead is a `BindingIdentifier` that may follow
     /// `using` — an identifier (but not `using` itself) or `yield`/`await` used
     /// as a name. Patterns (`[`/`{`) are not permitted after `using`.
@@ -604,8 +630,10 @@ impl<'src> Parser<'src> {
         }
 
         // `for (using x …)` / `for (await using x …)` — explicit-resource
-        // management bindings in a `for` head (classic or `for-of`).
-        if self.at_using_decl() || self.at_await_using_decl() {
+        // management bindings in a `for` head (classic or `for-of`). The
+        // for-head variants exclude a binding named `of` so that
+        // `for (using of …)` parses `using` as an ordinary LHS identifier.
+        if self.at_for_using_decl() || self.at_for_await_using_decl() {
             return self.parse_for_using_head();
         }
 
