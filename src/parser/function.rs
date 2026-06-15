@@ -202,6 +202,12 @@ impl<'src> Parser<'src> {
         self.in_async = saved_async;
         let params = params_result?;
 
+        // `ArrowFunction : ArrowParameters [no LineTerminator here] =>` — a line
+        // terminator between the parameters and `=>` is a Syntax Error (ASI would
+        // otherwise turn `x \n => y` into an incomplete statement).
+        if self.at(TokenKind::Arrow) && self.nth_newline(0) {
+            return Err(self.err("no line terminator is allowed before `=>`"));
+        }
         self.expect(TokenKind::Arrow)?;
         // An arrow is never a generator; an async arrow enables `await`, and a
         // plain arrow inherits `await` from the enclosing context.

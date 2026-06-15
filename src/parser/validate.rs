@@ -425,7 +425,10 @@ impl Validator {
                     return Err(self.err(stmt.span(), "`with` is not allowed in strict mode"));
                 }
                 self.expr(object, ctx)?;
-                self.check_substatement(body, ctx)?;
+                // The body of a `with` is a `Statement`; unlike an `if` branch,
+                // Annex B does not allow a (sloppy) `FunctionDeclaration` here, so
+                // a bare or labelled function declaration is rejected.
+                self.reject_decl_substatement(body, ctx, /* allow_sloppy_fn */ false)?;
                 self.stmt(body, ctx)
             }
             Stmt::Function(f) => self.function(f, ctx),
@@ -805,6 +808,22 @@ impl Validator {
     ///   element);
     /// - a function whose parameter list is non-simple may not contain a
     ///   `"use strict"` directive in its body.
+    /// A getter must declare no parameters; a setter must declare exactly one,
+    /// which may not be a rest parameter.
+    fn check_accessor_arity(&self, is_getter: bool, f: &Function) -> Result<()> {
+        if is_getter {
+            if !f.params.is_empty() {
+                return Err(self.err(f.span, "a getter may not declare any parameters"));
+            }
+        } else if f.params.len() != 1 || f.params[0].rest {
+            return Err(self.err(
+                f.span,
+                "a setter must declare exactly one (non-rest) parameter",
+            ));
+        }
+        Ok(())
+    }
+
     fn check_params(
         &self,
         params: &[Param],
@@ -958,6 +977,12 @@ impl Validator {
                 ClassMember::Method(m) => {
                     if let PropertyKey::Computed(e) = &m.key {
                         self.expr(e, ctx)?;
+                    }
+                    // A get/set accessor has a fixed parameter arity.
+                    match m.kind {
+                        MethodKind::Get => self.check_accessor_arity(true, &m.value)?,
+                        MethodKind::Set => self.check_accessor_arity(false, &m.value)?,
+                        _ => {}
                     }
                     // `super(...)` is only legal inside the constructor of a
                     // derived class.
@@ -1212,10 +1237,16 @@ impl Validator {
                             self.in_assign_target = in_assign_target;
                             self.expr(value, ctx)?
                         }
-                        ObjectMember::Accessor { key, value, .. } => {
+                        ObjectMember::Accessor {
+                            key,
+                            value,
+                            is_getter,
+                            ..
+                        } => {
                             if let PropertyKey::Computed(k) = key {
                                 self.expr(k, ctx)?;
                             }
+                            self.check_accessor_arity(*is_getter, value)?;
                             self.method_function(value, ctx, false)?;
                         }
                     }
@@ -1288,8 +1319,21 @@ impl Validator {
             }
             Expr::OptChain { expr, .. } => self.expr(expr, ctx),
             Expr::Unary { op, argument, .. } => {
-                if matches!(op, UnaryOp::Delete) && contains_private_ref(argument) {
-                    return Err(self.err(e.span(), "`delete` of a private member is not allowed"));
+                if matches!(op, UnaryOp::Delete) {
+                    if contains_private_ref(argument) {
+                        return Err(
+                            self.err(e.span(), "`delete` of a private member is not allowed")
+                        );
+                    }
+                    // In strict mode, `delete` of a direct reference to a variable,
+                    // function argument, or function name (a bare identifier, even
+                    // parenthesized) is a Syntax Error.
+                    if ctx.strict && matches!(&**argument, Expr::Ident(_)) {
+                        return Err(self.err(
+                            e.span(),
+                            "`delete` of an unqualified identifier is not allowed in strict mode",
+                        ));
+                    }
                 }
                 self.expr(argument, ctx)
             }
