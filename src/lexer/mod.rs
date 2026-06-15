@@ -69,6 +69,9 @@ pub struct Lexer<'src> {
     prev_significant: Option<TokenKind>,
     /// Open-brace stack for template-substitution tracking.
     brace_stack: Vec<BraceKind>,
+    /// Set while scanning an identifier (or private name) that contained a
+    /// `\u` escape; consumed and cleared by [`Lexer::make`].
+    cur_had_escape: bool,
 }
 
 impl<'src> Lexer<'src> {
@@ -81,6 +84,7 @@ impl<'src> Lexer<'src> {
             pos: 0,
             prev_significant: None,
             brace_stack: Vec::new(),
+            cur_had_escape: false,
         }
     }
 
@@ -110,6 +114,12 @@ impl<'src> Lexer<'src> {
     /// returned token's [`Token::newline_before`] records whether a line
     /// terminator was skipped before it (for ASI).
     pub fn next_token(&mut self) -> Result<Token> {
+        // A hashbang (`#!…`) comment is only recognized as the very first thing
+        // in the source (before any whitespace), and runs to the end of the
+        // line. It is otherwise lexically a line comment.
+        if self.pos == 0 && self.peek() == Some(b'#') && self.peek_at(1) == Some(b'!') {
+            self.skip_line_comment(); // consumes `#!` and the rest of the line
+        }
         let newline_before = self.skip_trivia();
         let start = self.pos;
 
@@ -165,6 +175,10 @@ impl<'src> Lexer<'src> {
             b'`' => return self.read_template_start(start, newline_before),
             b'#' => self.read_private_name()?,
             b'0'..=b'9' => self.read_number()?,
+            // A `\` here can only legally begin an identifier via a `\u` escape
+            // whose code point is an identifier-start char (e.g. `a` for
+            // `a`); `read_identifier_or_keyword` validates that.
+            b'\\' if self.peek_at(1) == Some(b'u') => self.read_identifier_or_keyword()?,
             _ => {
                 if is_identifier_start_byte(c)
                     || (c >= 0x80 && self.peek_char().is_some_and(is_identifier_start_char))
@@ -719,19 +733,39 @@ impl<'src> Lexer<'src> {
     fn read_private_name(&mut self) -> Result<TokenKind> {
         let start = self.pos;
         self.advance(); // `#`
-        match self.peek() {
-            Some(c)
-                if is_identifier_start_byte(c)
-                    || (c >= 0x80 && self.peek_char().is_some_and(is_identifier_start_char)) =>
-            {
-                self.read_identifier_tail();
-                Ok(TokenKind::PrivateName)
+        // The first char of a private name follows the identifier-start rules,
+        // and may itself be a `\u` escape.
+        if self.peek() == Some(b'\\') {
+            let cp = self.read_ident_unicode_escape(start)?;
+            if !is_identifier_start_char(cp) {
+                return Err(Error::syntax(
+                    "escape sequence is not a valid identifier start",
+                    Span::new(start as u32, self.pos as u32),
+                ));
             }
-            _ => Err(Error::syntax(
-                "expected an identifier after `#`",
-                Span::new(start as u32, self.pos as u32),
-            )),
+            self.cur_had_escape = true;
+        } else {
+            match self.peek() {
+                Some(c)
+                    if is_identifier_start_byte(c)
+                        || (c >= 0x80
+                            && self.peek_char().is_some_and(is_identifier_start_char)) =>
+                {
+                    self.advance_any();
+                }
+                _ => {
+                    return Err(Error::syntax(
+                        "expected an identifier after `#`",
+                        Span::new(start as u32, self.pos as u32),
+                    ));
+                }
+            }
         }
+        let had_escape = self.read_identifier_tail(start)?;
+        if had_escape {
+            self.cur_had_escape = true;
+        }
+        Ok(TokenKind::PrivateName)
     }
 
     fn read_number(&mut self) -> Result<TokenKind> {
@@ -885,7 +919,30 @@ impl<'src> Lexer<'src> {
 
     fn read_identifier_or_keyword(&mut self) -> Result<TokenKind> {
         let start = self.pos;
-        self.read_identifier_tail();
+        // The leading char: either a `\u` escape or a literal identifier-start.
+        if self.peek() == Some(b'\\') {
+            let cp = self.read_ident_unicode_escape(start)?;
+            if !is_identifier_start_char(cp) {
+                return Err(Error::syntax(
+                    "escape sequence is not a valid identifier start",
+                    Span::new(start as u32, self.pos as u32),
+                ));
+            }
+            self.cur_had_escape = true;
+        } else {
+            // A literal start char (validated by the caller); consume it.
+            self.advance_any();
+        }
+        let had_escape = self.read_identifier_tail(start)?;
+
+        // A keyword spelled with any escape (e.g. `if`) is *not* the
+        // keyword token — it is an ordinary `IdentifierName` whose cooked value
+        // happens to match a reserved word. Position-sensitive reserved-word
+        // rules are enforced by the parser/validator.
+        if had_escape || self.cur_had_escape {
+            self.cur_had_escape = true;
+            return Ok(TokenKind::Identifier);
+        }
         let text = &self.source[start..self.pos];
         Ok(match Keyword::from_str(text) {
             Some(kw) => TokenKind::Keyword(kw),
@@ -893,26 +950,98 @@ impl<'src> Lexer<'src> {
         })
     }
 
-    /// Consumes identifier-continue characters from the current position.
-    fn read_identifier_tail(&mut self) {
-        // The start char may already be consumed by the caller, or not; this
-        // routine just eats all identifier-part chars from here.
-        while let Some(c) = self.peek() {
-            if c < 0x80 {
-                if is_identifier_part_byte(c) {
-                    self.advance();
-                } else {
-                    break;
+    /// Consumes identifier-continue characters (including `\u` escapes) from the
+    /// current position. Returns whether any escape was seen. `name_start` is
+    /// the offset of the whole identifier, used only for error spans.
+    fn read_identifier_tail(&mut self, name_start: usize) -> Result<bool> {
+        let mut had_escape = false;
+        loop {
+            match self.peek() {
+                Some(b'\\') => {
+                    let cp = self.read_ident_unicode_escape(name_start)?;
+                    if !is_identifier_part_char(cp) {
+                        return Err(Error::syntax(
+                            "escape sequence is not a valid identifier part",
+                            Span::new(name_start as u32, self.pos as u32),
+                        ));
+                    }
+                    had_escape = true;
                 }
-            } else {
-                let ch = self.peek_char().expect("non-empty");
-                if is_identifier_part_char(ch) {
-                    self.advance_char(ch);
-                } else {
-                    break;
+                Some(c) if c < 0x80 => {
+                    if is_identifier_part_byte(c) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
                 }
+                Some(_) => {
+                    let ch = self.peek_char().expect("non-empty");
+                    if is_identifier_part_char(ch) {
+                        self.advance_char(ch);
+                    } else {
+                        break;
+                    }
+                }
+                None => break,
             }
         }
+        Ok(had_escape)
+    }
+
+    /// Consumes a `\uXXXX` or `\u{…}` escape appearing inside an identifier and
+    /// returns its decoded scalar value. The cursor must be at the `\`. A code
+    /// point above U+10FFFF or a surrogate is rejected (surrogates are never
+    /// valid identifier chars). `name_start` is used for error spans.
+    fn read_ident_unicode_escape(&mut self, name_start: usize) -> Result<char> {
+        debug_assert_eq!(self.peek(), Some(b'\\'));
+        self.advance(); // `\`
+        if self.peek() != Some(b'u') {
+            return Err(Error::syntax(
+                "expected a Unicode escape in identifier",
+                Span::new(name_start as u32, self.pos as u32),
+            ));
+        }
+        self.advance(); // `u`
+        let value: u32 = if self.peek() == Some(b'{') {
+            self.advance();
+            let mut v: u32 = 0;
+            let mut any = false;
+            while let Some(b) = self.peek() {
+                let Some(d) = (b as char).to_digit(16) else {
+                    break;
+                };
+                any = true;
+                v = v.saturating_mul(16).saturating_add(d);
+                self.advance();
+            }
+            if !any || self.peek() != Some(b'}') {
+                return Err(Error::syntax(
+                    "invalid Unicode code-point escape in identifier",
+                    Span::new(name_start as u32, self.pos as u32),
+                ));
+            }
+            self.advance(); // `}`
+            v
+        } else {
+            let mut v: u32 = 0;
+            for _ in 0..4 {
+                let Some(d) = self.peek().and_then(|b| (b as char).to_digit(16)) else {
+                    return Err(Error::syntax(
+                        "invalid Unicode escape sequence in identifier",
+                        Span::new(name_start as u32, self.pos as u32),
+                    ));
+                };
+                v = v * 16 + d;
+                self.advance();
+            }
+            v
+        };
+        char::from_u32(value).ok_or_else(|| {
+            Error::syntax(
+                "invalid code point in identifier escape",
+                Span::new(name_start as u32, self.pos as u32),
+            )
+        })
     }
 
     // --- regex-vs-division heuristic ------------------------------------
@@ -1007,10 +1136,12 @@ impl<'src> Lexer<'src> {
         if kind != TokenKind::Eof {
             self.prev_significant = Some(kind);
         }
+        let had_escape = core::mem::take(&mut self.cur_had_escape);
         Token {
             kind,
             span: Span::new(start as u32, self.pos as u32),
             newline_before,
+            had_escape,
         }
     }
 }
@@ -1038,6 +1169,9 @@ pub(crate) fn is_identifier_start_char(ch: char) -> bool {
     if ch.is_ascii() {
         return is_identifier_start_byte(ch as u8);
     }
+    if is_other_id_start(ch) {
+        return true;
+    }
     #[cfg(feature = "intl")]
     {
         use intl::unicode::category::GeneralCategory as Gc;
@@ -1048,6 +1182,28 @@ pub(crate) fn is_identifier_start_char(ch: char) -> bool {
     {
         ch.is_alphabetic()
     }
+}
+
+/// The `Other_ID_Start` compatibility set — a small, Unicode-stability-fixed
+/// list of code points that are `ID_Start` despite not being letters/Nl (so the
+/// general-category test misses them). Required for spec-conformant identifiers.
+#[inline]
+fn is_other_id_start(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{1885}' | '\u{1886}' | '\u{2118}' | '\u{212E}' | '\u{309B}' | '\u{309C}'
+    )
+}
+
+/// The `Other_ID_Continue` compatibility set — code points that are
+/// `ID_Continue` despite not falling in the marks/digits/connector categories.
+/// Like `Other_ID_Start`, fixed by Unicode's identifier-stability guarantee.
+#[inline]
+fn is_other_id_continue(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00B7}' | '\u{0387}' | '\u{1369}'..='\u{1371}' | '\u{19DA}'
+    )
 }
 
 /// Whether a non-ASCII char may continue an identifier (`ID_Continue`:
@@ -1062,6 +1218,11 @@ fn is_identifier_part_char(ch: char) -> bool {
     }
     if ch == '\u{200C}' || ch == '\u{200D}' {
         return true; // ZWNJ / ZWJ
+    }
+    // `ID_Continue` is a superset of `ID_Start`, so include the `Other_ID_Start`
+    // set as well as the `Other_ID_Continue` set.
+    if is_other_id_start(ch) || is_other_id_continue(ch) {
+        return true;
     }
     #[cfg(feature = "intl")]
     {

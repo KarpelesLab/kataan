@@ -56,9 +56,24 @@ pub(crate) fn validate_program(program: &Program) -> Result<()> {
     let mut v = Validator {
         private_scopes: Vec::new(),
         labels: Vec::new(),
+        is_module: program.source_type == SourceType::Module,
     };
     let ctx = Ctx::top(strict);
     v.check_top_level_scope(&program.body, strict)?;
+    // `using` / `await using` declarations are not permitted at the top level of
+    // a *Script* (they are allowed in a Module, a block, or a function body).
+    if program.source_type == SourceType::Script {
+        for stmt in &program.body {
+            if let Stmt::Var(decl) = stmt
+                && matches!(decl.kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+            {
+                return Err(v.err(
+                    decl.span,
+                    "a `using` declaration is not allowed at the top level of a script",
+                ));
+            }
+        }
+    }
     for stmt in &program.body {
         v.stmt(stmt, &ctx)?;
     }
@@ -150,6 +165,9 @@ struct Validator {
     /// labels an iteration statement (so `continue label` is only valid for an
     /// iteration label). Reset to empty at every function boundary.
     labels: Vec<(Box<str>, bool)>,
+    /// Whether the program's goal symbol is Module (vs Script). `import.meta`
+    /// is valid only in a module.
+    is_module: bool,
 }
 
 /// What a private member declaration is, for duplicate detection.
@@ -254,6 +272,17 @@ impl Validator {
                         self.expr(t, ctx)?;
                     }
                     for s in &case.body {
+                        // A `using` / `await using` declaration may not appear as
+                        // a direct statement of a `CaseClause`/`DefaultClause`
+                        // (it must be inside a block).
+                        if let Stmt::Var(decl) = s
+                            && matches!(decl.kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+                        {
+                            return Err(self.err(
+                                decl.span,
+                                "a `using` declaration is not allowed directly in a `switch` case",
+                            ));
+                        }
                         self.stmt(s, &c)?;
                     }
                 }
@@ -334,6 +363,14 @@ impl Validator {
             }
             Stmt::Throw { argument, .. } => self.expr(argument, ctx),
             Stmt::Labeled { label, body, .. } => {
+                // A `LabelIdentifier` may not be a strict-mode reserved word in
+                // strict code (e.g. an escaped `yield` label `yield:`).
+                if ctx.strict && is_strict_reserved_word(&label.name) {
+                    return Err(self.err(
+                        label.span,
+                        "a strict-mode reserved word may not be used as a label",
+                    ));
+                }
                 // A duplicate label in the enclosing set is an early error.
                 if self.labels.iter().any(|(n, _)| **n == *label.name) {
                     return Err(self.err(label.span, "label has already been declared"));
@@ -453,12 +490,22 @@ impl Validator {
         Ok(())
     }
 
-    /// A strict-mode `BindingIdentifier` may not be `eval` or `arguments`.
+    /// A strict-mode `BindingIdentifier` may not be `eval`, `arguments`, or any
+    /// of the strict-mode future-reserved words (`implements`, `interface`,
+    /// `let`, `package`, `private`, `protected`, `public`, `static`, `yield`).
+    /// The parser accepts these spellings as identifiers (they are valid in
+    /// sloppy code); this is where the strict-mode restriction is enforced.
     fn check_binding_ident_name(&self, name: &str, span: Span) -> Result<()> {
         if name == "eval" || name == "arguments" {
             return Err(self.err(
                 span,
                 "`eval` and `arguments` may not be bound in strict mode",
+            ));
+        }
+        if is_strict_reserved_word(name) {
+            return Err(self.err(
+                span,
+                "a strict-mode reserved word may not be bound in strict mode",
             ));
         }
         Ok(())
@@ -479,11 +526,8 @@ impl Validator {
     fn binding_target(&mut self, target: &BindingTarget, ctx: &Ctx) -> Result<()> {
         match target {
             BindingTarget::Ident(id) => {
-                if ctx.strict && (&*id.name == "eval" || &*id.name == "arguments") {
-                    return Err(self.err(
-                        id.span,
-                        "`eval` and `arguments` may not be bound in strict mode",
-                    ));
+                if ctx.strict {
+                    self.check_binding_ident_name(&id.name, id.span)?;
                 }
                 Ok(())
             }
@@ -531,6 +575,7 @@ impl Validator {
         if strict && let Some(id) = &f.id {
             self.check_binding_ident_name(&id.name, id.span)?;
         }
+        self.check_param_yield_await(&f.params, f.is_generator, f.is_async)?;
         self.check_params(&f.params, strict, &f.body)?;
         // A regular function establishes its own `arguments`/`super` bindings and
         // a fresh label/jump environment.
@@ -554,6 +599,7 @@ impl Validator {
         allow_super_call: bool,
     ) -> Result<()> {
         let strict = parent.strict || body_is_strict(&f.body);
+        self.check_param_yield_await(&f.params, f.is_generator, f.is_async)?;
         self.check_params(&f.params, strict, &f.body)?;
         let c = Ctx::function_boundary(strict, allow_super_call, false);
         let saved_labels = core::mem::take(&mut self.labels);
@@ -578,6 +624,9 @@ impl Validator {
             ArrowBody::Block(body) => body,
             ArrowBody::Expr(_) => &[],
         };
+        // An async arrow's parameters are in an `[+Await]` context: an `await`
+        // expression there is a Syntax Error. (An arrow is never a generator.)
+        self.check_param_yield_await(&a.params, false, a.is_async)?;
         self.check_params(&a.params, strict, body_slice)?;
         // An arrow inherits `super`, `this`, and `arguments` (and thus the
         // field-initializer restrictions) from its enclosing scope, but is a
@@ -608,6 +657,39 @@ impl Validator {
             ArrowBody::Expr(e) => self.expr(e, &c)?,
         }
         self.labels = saved_labels;
+        Ok(())
+    }
+
+    /// Rejects a `yield` expression in a generator's parameter list and an
+    /// `await` expression in an async function/arrow's parameter list (the
+    /// `[+Yield]`/`[+Await]` parameter contexts forbid them). The parser parses
+    /// params in the function's own context, so a `yield`/`await` *binding name*
+    /// is already rejected there; this catches the *expression* forms in
+    /// defaults and computed keys (e.g. `function* g(x = yield) {}`).
+    fn check_param_yield_await(
+        &self,
+        params: &[Param],
+        is_generator: bool,
+        is_async: bool,
+    ) -> Result<()> {
+        if !is_generator && !is_async {
+            return Ok(());
+        }
+        for p in params {
+            if let Some((span, kind)) = first_param_yield_await(p, is_generator, is_async) {
+                return Err(self.err(
+                    span,
+                    match kind {
+                        YieldOrAwait::Yield => {
+                            "`yield` is not allowed in a generator's parameter list"
+                        }
+                        YieldOrAwait::Await => {
+                            "`await` is not allowed in an async function's parameter list"
+                        }
+                    },
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -861,6 +943,17 @@ impl Validator {
                         "`arguments` is not allowed in a class field initializer",
                     ));
                 }
+                // In strict mode the future-reserved words (and `yield`) may not
+                // appear as an `IdentifierReference`. The parser accepts the
+                // spelling as an identifier (valid in sloppy code); this is where
+                // the strict-mode restriction is enforced for *references* (the
+                // binding-position rule lives in `check_binding_ident_name`).
+                if ctx.strict && is_strict_reserved_word(&id.name) {
+                    return Err(self.err(
+                        id.span,
+                        "a strict-mode reserved word may not be used as an identifier",
+                    ));
+                }
                 Ok(())
             }
             Expr::Super(_) => {
@@ -935,6 +1028,15 @@ impl Validator {
                         e.span(),
                         "private names may not be accessed through `super`",
                     ));
+                }
+                // `import.meta` (desugared by the parser to a member access on the
+                // reserved `import` reference) is valid only in a Module.
+                if !self.is_module
+                    && let Expr::Ident(id) = &**object
+                    && &*id.name == "import"
+                    && matches!(property, PropertyKey::Ident(n) if &**n == "meta")
+                {
+                    return Err(self.err(e.span(), "`import.meta` is only allowed in a module"));
                 }
                 self.expr(object, ctx)?;
                 if let PropertyKey::Private(name) = property
@@ -1294,6 +1396,228 @@ fn collect_vars_only(stmt: &Stmt, vars: &mut Vec<Box<str>>) {
 }
 
 /// Collects the identifier names (with spans) bound by a [`BindingTarget`].
+/// Which of `yield`/`await` was found in a parameter list.
+#[derive(Clone, Copy)]
+enum YieldOrAwait {
+    Yield,
+    Await,
+}
+
+/// Finds the first forbidden `yield`/`await` *expression* in a parameter's
+/// default initializer or pattern computed keys, without descending into nested
+/// functions/arrows (which introduce their own parameter context).
+fn first_param_yield_await(
+    p: &Param,
+    is_generator: bool,
+    is_async: bool,
+) -> Option<(Span, YieldOrAwait)> {
+    let mut found = None;
+    if let Some(d) = &p.default {
+        find_yield_await(d, is_generator, is_async, &mut found);
+    }
+    bound_target_yield_await(&p.target, is_generator, is_async, &mut found);
+    found
+}
+
+/// Scans a binding target's computed keys / nested defaults for `yield`/`await`.
+fn bound_target_yield_await(
+    target: &BindingTarget,
+    is_generator: bool,
+    is_async: bool,
+    found: &mut Option<(Span, YieldOrAwait)>,
+) {
+    match target {
+        BindingTarget::Ident(_) => {}
+        BindingTarget::Array(p) => {
+            for el in &p.elements {
+                match el {
+                    crate::ast::ArrayPatternElement::Hole => {}
+                    crate::ast::ArrayPatternElement::Item {
+                        target, default, ..
+                    } => {
+                        bound_target_yield_await(target, is_generator, is_async, found);
+                        if let Some(d) = default {
+                            find_yield_await(d, is_generator, is_async, found);
+                        }
+                    }
+                    crate::ast::ArrayPatternElement::Rest { target, .. } => {
+                        bound_target_yield_await(target, is_generator, is_async, found);
+                    }
+                }
+            }
+        }
+        BindingTarget::Object(p) => {
+            for prop in &p.properties {
+                if let PropertyKey::Computed(e) = &prop.key {
+                    find_yield_await(e, is_generator, is_async, found);
+                }
+                bound_target_yield_await(&prop.value, is_generator, is_async, found);
+                if let Some(d) = &prop.default {
+                    find_yield_await(d, is_generator, is_async, found);
+                }
+            }
+            if let Some(r) = &p.rest {
+                bound_target_yield_await(r, is_generator, is_async, found);
+            }
+        }
+    }
+}
+
+/// Recursively records the first `yield`/`await` expression in `e`, stopping at
+/// nested function/arrow/class boundaries (they have their own contexts).
+fn find_yield_await(
+    e: &Expr,
+    is_generator: bool,
+    is_async: bool,
+    found: &mut Option<(Span, YieldOrAwait)>,
+) {
+    if found.is_some() {
+        return;
+    }
+    match e {
+        Expr::Yield { span, .. } if is_generator => {
+            *found = Some((*span, YieldOrAwait::Yield));
+        }
+        Expr::Await { span, .. } if is_async => {
+            *found = Some((*span, YieldOrAwait::Await));
+        }
+        // Do not descend into a nested function/arrow/class: it establishes its
+        // own parameter context, so a `yield`/`await` inside it is governed by
+        // that context, not this parameter list's.
+        Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_) => {}
+        // Leaves with no sub-expressions.
+        Expr::Null(_)
+        | Expr::Bool { .. }
+        | Expr::Number { .. }
+        | Expr::BigInt { .. }
+        | Expr::Str { .. }
+        | Expr::Regex { .. }
+        | Expr::Ident(_)
+        | Expr::PrivateName(..)
+        | Expr::This(_)
+        | Expr::Super(_)
+        | Expr::NewTarget(_) => {}
+        Expr::Yield { argument, .. } => {
+            // Reached only when `!is_generator` (the generator arm matched
+            // above); still scan the operand for an `await` in an async context.
+            if let Some(a) = argument {
+                find_yield_await(a, is_generator, is_async, found);
+            }
+        }
+        Expr::Await { argument, .. } => {
+            find_yield_await(argument, is_generator, is_async, found);
+        }
+        Expr::Template(t) => {
+            for x in &t.expressions {
+                find_yield_await(x, is_generator, is_async, found);
+            }
+        }
+        Expr::TaggedTemplate { tag, quasi, .. } => {
+            find_yield_await(tag, is_generator, is_async, found);
+            for x in &quasi.expressions {
+                find_yield_await(x, is_generator, is_async, found);
+            }
+        }
+        Expr::Array { elements, .. } => {
+            for el in elements {
+                match el {
+                    crate::ast::ArrayElement::Hole => {}
+                    crate::ast::ArrayElement::Item(x) | crate::ast::ArrayElement::Spread(x) => {
+                        find_yield_await(x, is_generator, is_async, found);
+                    }
+                }
+            }
+        }
+        Expr::Object { members, .. } => {
+            for m in members {
+                match m {
+                    crate::ast::ObjectMember::Property { key, value, .. } => {
+                        if let PropertyKey::Computed(k) = key {
+                            find_yield_await(k, is_generator, is_async, found);
+                        }
+                        find_yield_await(value, is_generator, is_async, found);
+                    }
+                    crate::ast::ObjectMember::Spread { value, .. } => {
+                        find_yield_await(value, is_generator, is_async, found);
+                    }
+                    // An accessor's value is a function — its own context.
+                    crate::ast::ObjectMember::Accessor { .. } => {}
+                }
+            }
+        }
+        Expr::Member {
+            object, property, ..
+        } => {
+            find_yield_await(object, is_generator, is_async, found);
+            if let PropertyKey::Computed(k) = property {
+                find_yield_await(k, is_generator, is_async, found);
+            }
+        }
+        Expr::Call {
+            callee, arguments, ..
+        }
+        | Expr::New {
+            callee, arguments, ..
+        } => {
+            find_yield_await(callee, is_generator, is_async, found);
+            for a in arguments {
+                match a {
+                    crate::ast::Argument::Item(x) | crate::ast::Argument::Spread(x) => {
+                        find_yield_await(x, is_generator, is_async, found);
+                    }
+                }
+            }
+        }
+        Expr::OptChain { expr, .. } => {
+            find_yield_await(expr, is_generator, is_async, found);
+        }
+        Expr::Unary { argument, .. } | Expr::Update { argument, .. } => {
+            find_yield_await(argument, is_generator, is_async, found);
+        }
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            find_yield_await(left, is_generator, is_async, found);
+            find_yield_await(right, is_generator, is_async, found);
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            find_yield_await(test, is_generator, is_async, found);
+            find_yield_await(consequent, is_generator, is_async, found);
+            find_yield_await(alternate, is_generator, is_async, found);
+        }
+        Expr::Assign { target, value, .. } => {
+            find_yield_await(target, is_generator, is_async, found);
+            find_yield_await(value, is_generator, is_async, found);
+        }
+        Expr::Sequence { expressions, .. } => {
+            for x in expressions {
+                find_yield_await(x, is_generator, is_async, found);
+            }
+        }
+    }
+}
+
+/// Whether `name` is a strict-mode future-reserved word — a word the parser
+/// accepts as an identifier (valid in sloppy code) but which may not be used as
+/// a `BindingIdentifier` or assignment target in strict mode.
+fn is_strict_reserved_word(name: &str) -> bool {
+    matches!(
+        name,
+        "implements"
+            | "interface"
+            | "let"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "static"
+            | "yield"
+    )
+}
+
 fn collect_bound_names(target: &BindingTarget, out: &mut Vec<(String, Span)>) {
     match target {
         BindingTarget::Ident(id) => out.push((id.name.to_string(), id.span)),

@@ -16,6 +16,12 @@ pub struct Token {
     /// Whether at least one line terminator (or a block comment containing
     /// one) appeared in the trivia immediately before this token.
     pub newline_before: bool,
+    /// Whether this token's source text contains a Unicode escape sequence
+    /// (`\uXXXX` / `\u{…}`). Only meaningful for [`TokenKind::Identifier`] and
+    /// [`TokenKind::PrivateName`]: an identifier that contains an escape is
+    /// never a reserved word (so `if` is the identifier `if`, not the
+    /// keyword), and its name must be cooked from the raw text before use.
+    pub had_escape: bool,
 }
 
 impl Token {

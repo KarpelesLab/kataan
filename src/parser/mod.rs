@@ -193,6 +193,60 @@ impl<'src> Parser<'src> {
         Error::syntax(message, self.cur_span())
     }
 
+    /// The cooked name of an identifier (or private-name) token: its raw source
+    /// text, with any `\uXXXX` / `\u{…}` escapes decoded. The common
+    /// no-escape case borrows the source directly; only an escaped identifier
+    /// allocates. Use this everywhere an identifier *name* is read so that, e.g.
+    /// `a` and `a` denote the same binding/property.
+    fn ident_name(&self, tok: Token) -> alloc::borrow::Cow<'src, str> {
+        let text = tok.span.slice(self.source);
+        if tok.had_escape {
+            alloc::borrow::Cow::Owned(cook::identifier_name(text))
+        } else {
+            alloc::borrow::Cow::Borrowed(text)
+        }
+    }
+
+    /// Like [`Self::ident_name`], but for positions that require a
+    /// non-reserved identifier (a `BindingIdentifier`, `IdentifierReference`,
+    /// or `LabelIdentifier`). A reserved word written *with* a Unicode escape
+    /// (e.g. `if` for `if`) tokenizes as an `Identifier`, but its
+    /// `StringValue` is a reserved word, which is a Syntax Error here (an
+    /// un-escaped reserved word would have tokenized as a keyword and never
+    /// reached an identifier site). Contextual keywords (`async`, `let`, …) are
+    /// not reserved and remain valid identifiers.
+    fn checked_ident_name(&self, tok: Token) -> Result<alloc::borrow::Cow<'src, str>> {
+        let name = self.ident_name(tok);
+        if tok.had_escape {
+            // An escaped always-reserved word is never a valid identifier.
+            // `yield`/`await` are reserved only in a generator/async context
+            // respectively — an un-escaped one is intercepted earlier as a
+            // keyword, but an escaped one arrives here as an `Identifier`, so it
+            // must be rejected under the same context rule.
+            if is_always_reserved_word(&name)
+                || (name == "yield" && self.in_generator)
+                || (name == "await" && self.in_async)
+            {
+                return Err(self.err_at(
+                    tok.span,
+                    "an escaped reserved word may not be used as an identifier",
+                ));
+            }
+        }
+        Ok(name)
+    }
+
+    /// The cooked name of a `PrivateName` token (`#x`): the text after the `#`,
+    /// with any `\u` escapes decoded.
+    fn private_name(&self, tok: Token) -> Box<str> {
+        let text = &tok.span.slice(self.source)[1..]; // drop leading `#`
+        if tok.had_escape {
+            cook::identifier_name(text).into()
+        } else {
+            text.into()
+        }
+    }
+
     /// Enters one recursive-descent nesting level, returning a [`DepthGuard`]
     /// that holds the parser and releases the level when dropped. Returns a
     /// syntax [`Error`] (never a panic) when [`MAX_PARSE_DEPTH`] is exceeded.
@@ -618,6 +672,23 @@ impl<'src> Parser<'src> {
             }
             return Err(self.err("expected `target` after `new.`"));
         }
+        // A dynamic import call — `import(...)`, `import.source(...)`,
+        // `import.defer(...)` — is a `CallExpression`, which may not be the
+        // callee of `new`. `import.meta` (a meta-property) is a valid member
+        // expression and is allowed through.
+        if self.at(TokenKind::Keyword(Kw::Import)) {
+            let is_call = self.nth_kind(1) == TokenKind::LParen
+                || (self.nth_kind(1) == TokenKind::Dot
+                    && self.nth_kind(2) == TokenKind::Identifier
+                    && matches!(
+                        self.tokens.get(self.pos + 2).map(|t| t.text(self.source)),
+                        Some("source" | "defer")
+                    )
+                    && self.nth_kind(3) == TokenKind::LParen);
+            if is_call {
+                return Err(self.err("a dynamic import call is not a valid `new` callee"));
+            }
+        }
         let callee = if self.at(TokenKind::Keyword(Kw::New)) {
             self.parse_new()?
         } else {
@@ -761,7 +832,7 @@ impl<'src> Parser<'src> {
         match tok.kind {
             TokenKind::Identifier => {
                 self.bump();
-                Ok((PropertyKey::Ident(tok.text(self.source).into()), tok.span))
+                Ok((PropertyKey::Ident(self.ident_name(tok).into()), tok.span))
             }
             TokenKind::Keyword(kw) => {
                 self.bump();
@@ -769,9 +840,8 @@ impl<'src> Parser<'src> {
             }
             TokenKind::PrivateName => {
                 self.bump();
-                // Strip the leading `#`.
-                let name = &tok.text(self.source)[1..];
-                Ok((PropertyKey::Private(name.into()), tok.span))
+                // Strip the leading `#`, then cook any escapes in the name.
+                Ok((PropertyKey::Private(self.private_name(tok)), tok.span))
             }
             _ => Err(self.err(format!("expected a property name, found {:?}", tok.kind))),
         }
@@ -862,7 +932,10 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Identifier => {
                 self.bump();
-                Ok(Expr::Ident(Ident::new(tok.text(self.source), tok.span)))
+                Ok(Expr::Ident(Ident::new(
+                    self.checked_ident_name(tok)?,
+                    tok.span,
+                )))
             }
             // `async function …` is a function expression. This must precede the
             // contextual-keyword arm below, which would otherwise treat `async`
@@ -885,6 +958,29 @@ impl<'src> Parser<'src> {
                 self.bump();
                 Ok(Expr::Ident(Ident::new(kw.as_str(), tok.span)))
             }
+            // `yield` outside a generator and `await` outside an async body are
+            // ordinary identifier references (in sloppy code; strict-mode misuse
+            // is a static-semantics error caught by the validator). Inside a
+            // generator/async body the respective keyword is intercepted earlier
+            // (`parse_assignment` / `parse_unary`) and never reaches here.
+            TokenKind::Keyword(Kw::Yield) if !self.in_generator => {
+                self.bump();
+                Ok(Expr::Ident(Ident::new(Kw::Yield.as_str(), tok.span)))
+            }
+            TokenKind::Keyword(Kw::Await) if !self.in_async => {
+                self.bump();
+                Ok(Expr::Ident(Ident::new(Kw::Await.as_str(), tok.span)))
+            }
+            // `import(specifier)` (dynamic import) and `import.meta` (the module
+            // meta-property). Both are expression forms accepted in script *and*
+            // module code. There is no first-class AST node for either, and the
+            // tree-walker's `Expr` match is closed, so we desugar to a node the
+            // evaluators already understand: a call of / member on the reference
+            // `import`. That reference is unbound at runtime, so evaluation fails
+            // with a `ReferenceError` — the failure moves from the parse phase to
+            // the runtime phase (full dynamic-import semantics are a separate,
+            // higher layer that is out of scope here).
+            TokenKind::Keyword(Kw::Import) => self.parse_import_expr(tok.span),
             TokenKind::LParen => self.parse_paren(),
             TokenKind::LBracket => self.parse_array(),
             TokenKind::LBrace => self.parse_object(),
@@ -893,11 +989,99 @@ impl<'src> Parser<'src> {
             // A bare `#x` — only valid as the left of `#x in obj` (brand check).
             TokenKind::PrivateName => {
                 self.bump();
-                let name = &tok.text(self.source)[1..];
-                Ok(Expr::PrivateName(name.into(), tok.span))
+                Ok(Expr::PrivateName(self.private_name(tok), tok.span))
             }
             _ => Err(self.err(format!("unexpected token {:?}", tok.kind))),
         }
+    }
+
+    /// Parses an `import` expression: dynamic `import(specifier)` /
+    /// `import(specifier, options)` or the `import.meta` meta-property (the
+    /// cursor is at the `import` keyword). See the dispatch site in
+    /// [`Self::parse_primary`] for why both desugar to a reference named
+    /// `import` (a closed evaluator `Expr` match plus no first-class node).
+    fn parse_import_expr(&mut self, import_span: Span) -> Result<Expr> {
+        self.bump(); // `import`
+        let import_ref = Expr::Ident(Ident::new("import", import_span));
+        match self.peek() {
+            TokenKind::Dot => {
+                self.bump(); // `.`
+                // After `import.` the valid continuations are the `import.meta`
+                // meta-property, and the source-phase / deferred-import call
+                // forms `import.source(...)` / `import.defer(...)` (each valid
+                // only immediately before `(`). All other `import.<x>` forms are
+                // a SyntaxError. `meta`/`source`/`defer` are contextual, so they
+                // arrive as identifiers.
+                if !self.at(TokenKind::Identifier) {
+                    return Err(self.err("expected `meta` after `import.`"));
+                }
+                let prop = self.peek_tok();
+                match prop.text(self.source) {
+                    "meta" => {
+                        self.bump(); // `meta`
+                        Ok(Expr::Member {
+                            object: Box::new(import_ref),
+                            property: PropertyKey::Ident("meta".into()),
+                            optional: false,
+                            span: import_span.to(prop.span),
+                        })
+                    }
+                    "source" | "defer" if self.nth_kind(1) == TokenKind::LParen => {
+                        // `import.source(specifier)` / `import.defer(specifier)`.
+                        // Desugar to a call of the unbound `import` reference so
+                        // it errors at runtime, like a plain dynamic `import()`.
+                        self.bump(); // `source` / `defer`
+                        let arguments = self.parse_dynamic_import_args()?;
+                        let span = import_span.to(self.prev_span());
+                        Ok(Expr::Call {
+                            callee: Box::new(import_ref),
+                            arguments,
+                            optional: false,
+                            span,
+                        })
+                    }
+                    _ => Err(self.err("expected `meta` after `import.`")),
+                }
+            }
+            // `import(specifier [, options])` — dynamic import.
+            TokenKind::LParen => {
+                let arguments = self.parse_dynamic_import_args()?;
+                let span = import_span.to(self.prev_span());
+                Ok(Expr::Call {
+                    callee: Box::new(import_ref),
+                    arguments,
+                    optional: false,
+                    span,
+                })
+            }
+            _ => Err(self.err("expected `(` or `.meta` after `import`")),
+        }
+    }
+
+    /// Parses the argument list of a dynamic import: `( AssignmentExpression
+    /// (, AssignmentExpression)? ,? )` — one required specifier, an optional
+    /// options argument, and an optional trailing comma. Unlike a general call
+    /// argument list, a spread (`...`) argument and an empty list are Syntax
+    /// Errors here (per the `ImportCall` grammar).
+    fn parse_dynamic_import_args(&mut self) -> Result<Vec<Argument>> {
+        self.expect(TokenKind::LParen)?;
+        if self.at(TokenKind::RParen) {
+            return Err(self.err("dynamic import requires a specifier argument"));
+        }
+        if self.at(TokenKind::DotDotDot) {
+            return Err(self.err("a spread argument is not allowed in dynamic import"));
+        }
+        let mut args = alloc::vec![Argument::Item(self.without_no_in(Self::parse_assignment)?)];
+        // Optional second (options) argument.
+        if self.eat(TokenKind::Comma) && !self.at(TokenKind::RParen) {
+            if self.at(TokenKind::DotDotDot) {
+                return Err(self.err("a spread argument is not allowed in dynamic import"));
+            }
+            args.push(Argument::Item(self.without_no_in(Self::parse_assignment)?));
+            self.eat(TokenKind::Comma); // optional trailing comma
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(args)
     }
 
     /// `( Expression )` — no parenthesized-expression node is retained; an
@@ -1071,8 +1255,10 @@ impl<'src> Parser<'src> {
         // Identifier-name key: either `name: value` (any IdentifierName) or the
         // shorthand `{ name }` (only a real identifier reference).
         let (name, can_shorthand): (Box<str>, bool) = match tok.kind {
-            TokenKind::Identifier => (tok.text(self.source).into(), true),
-            TokenKind::Keyword(kw) if kw.is_contextual() => (kw.as_str().into(), true),
+            TokenKind::Identifier => (self.ident_name(tok).into(), true),
+            TokenKind::Keyword(kw) if self.keyword_is_binding_ident(kw) => {
+                (kw.as_str().into(), true)
+            }
             TokenKind::Keyword(kw) => (kw.as_str().into(), false),
             _ => return Err(self.err(format!("expected a property key, found {:?}", tok.kind))),
         };
@@ -1108,6 +1294,10 @@ impl<'src> Parser<'src> {
                 "reserved word cannot be used as a shorthand property",
             ));
         }
+        // A shorthand is an `IdentifierReference`, so an escaped reserved word
+        // (`{ if }`) is a Syntax Error even though it is a valid IdentifierName
+        // as a key (`{ if: x }`).
+        self.checked_ident_name(tok)?;
         let ident_expr = Expr::Ident(Ident::new(name.clone(), tok.span));
         // CoverInitializedName `{ name = default }` — only meaningful when the
         // object is reinterpreted as a destructuring assignment target; the
@@ -1274,6 +1464,33 @@ impl<'src> Parser<'src> {
         (self.in_generator, self.in_async) = saved;
         r
     }
+}
+
+/// Whether `name` is an *always-reserved* ECMAScript keyword — one that is
+/// reserved in every context (so it may never be an identifier, even spelled
+/// with a Unicode escape). The strict-mode-only reserved words and the
+/// contextual keywords (`async`, `let`, `yield`, `await`, …) are deliberately
+/// excluded: their identifier-vs-keyword status is position/mode dependent and
+/// is handled elsewhere.
+fn is_always_reserved_word(name: &str) -> bool {
+    matches!(
+        Kw::from_str(name),
+        Some(kw)
+            if !kw.is_contextual()
+                && !matches!(
+                    kw,
+                    Kw::Let
+                        | Kw::Static
+                        | Kw::Yield
+                        | Kw::Await
+                        | Kw::Implements
+                        | Kw::Interface
+                        | Kw::Package
+                        | Kw::Private
+                        | Kw::Protected
+                        | Kw::Public
+                )
+    )
 }
 
 /// Builds an `Expr::Binary` with a span covering both operands.

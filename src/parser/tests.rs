@@ -1243,3 +1243,65 @@ fn annexb_sloppy_function_redeclaration_in_block_and_switch() {
     assert!(Parser::parse_program("{ let a; function a() {} }").is_err());
     assert!(Parser::parse_program("{ class a {} function a() {} }").is_err());
 }
+
+#[test]
+fn dynamic_import_and_import_meta_parse() {
+    // Dynamic import is a CallExpression accepted in script code.
+    assert!(Parser::parse_program("import('mod');").is_ok());
+    assert!(Parser::parse_program("import('mod').then(x => x);").is_ok());
+    assert!(Parser::parse_program("import('mod', { with: {} });").is_ok());
+    assert!(Parser::parse_program("import('mod',);").is_ok()); // trailing comma
+    // `import.meta` parses; it is a member of the (reserved) `import` reference.
+    assert!(Parser::parse_program("import x from 'm'; import.meta.url;").is_ok());
+    // Invalid import expression forms.
+    assert!(Parser::parse_program("import();").is_err()); // no specifier
+    assert!(Parser::parse_program("import(...a);").is_err()); // spread
+    assert!(Parser::parse_program("new import('x');").is_err()); // not a new callee
+    assert!(Parser::parse_program("import.foo;").is_err()); // only `.meta`
+    // `import.meta` is module-only; a bare script using it is rejected.
+    assert!(Parser::parse_program("import.meta;").is_err());
+}
+
+#[test]
+fn yield_and_await_as_identifiers_outside_generator_async() {
+    // Sloppy, non-generator/non-async: `yield`/`await` are ordinary identifiers.
+    assert!(Parser::parse_program("var yield = 1; yield + 1;").is_ok());
+    assert!(Parser::parse_program("var await = 1; await + 1;").is_ok());
+    assert!(Parser::parse_program("function f(yield, await) { return yield + await; }").is_ok());
+    assert!(Parser::parse_program("({ yield, await });").is_ok());
+    // Inside a generator, `yield` is reserved (param + reference).
+    assert!(Parser::parse_program("function* g(yield) {}").is_err());
+    assert!(Parser::parse_program("function* g(x = yield) {}").is_err());
+    // Inside async, `await` is reserved.
+    assert!(Parser::parse_program("async function f(await) {}").is_err());
+    assert!(Parser::parse_program("async function f(x = await 1) {}").is_err());
+    // Strict mode forbids `yield` as a binding/reference.
+    assert!(Parser::parse_program("'use strict'; var yield = 1;").is_err());
+}
+
+#[test]
+fn escaped_identifiers_parse_and_cook() {
+    // An escaped identifier name cooks to the same AST as the plain spelling.
+    assert_eq!(prog(r"var \u0061 = 1;"), prog("var a = 1;"));
+    // A reserved word is allowed as an IdentifierName (property key) when escaped.
+    assert!(Parser::parse_program(r"var y = { bre\u0061k: 1 }; y.bre\u0061k;").is_ok());
+    // ...but not as a binding/reference identifier (the StringValue is reserved).
+    assert!(Parser::parse_program(r"var \u0069f = 1;").is_err());
+    assert!(Parser::parse_program(r"\u0069f (x) {}").is_err());
+    assert!(Parser::parse_program(r"({ \u0069f });").is_err()); // shorthand reference
+}
+
+#[test]
+fn using_declarations_parse() {
+    // `using` / `await using` declarations in blocks / functions.
+    assert!(Parser::parse_program("{ using x = res(); }").is_ok());
+    assert!(Parser::parse_program("async function f() { await using x = res(); }").is_ok());
+    assert!(Parser::parse_program("function f() { for (using x of xs) {} }").is_ok());
+    // `using` remains an identifier when not a declaration head.
+    assert!(Parser::parse_program("var using = 1; using + using;").is_ok());
+    assert!(Parser::parse_program("using;").is_ok());
+    assert!(Parser::parse_program("using\nx;").is_ok()); // ASI: `using` is an ident
+    // Restrictions.
+    assert!(Parser::parse_program("{ using x; }").is_err()); // initializer required
+    assert!(Parser::parse_program("using x = 1;").is_err()); // not at script top level
+}

@@ -76,6 +76,49 @@ fn from_radix(digits: &str, radix: u32) -> f64 {
     acc
 }
 
+/// Decodes the `\uXXXX` / `\u{…}` escapes in an `IdentifierName`'s raw source
+/// text into its `StringValue` (the cooked identifier name). Identifiers may
+/// only contain Unicode escapes (no `\x`, no string-style escapes), and the
+/// lexer has already validated each escape's shape and that every code point is
+/// a valid identifier char, so this only reassembles the scalar values.
+#[must_use]
+pub(super) fn identifier_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        // `\u` (the lexer guarantees the `u` and a well-formed body follow).
+        chars.next(); // `u`
+        let mut value: u32 = 0;
+        if chars.peek() == Some(&'{') {
+            chars.next(); // `{`
+            while let Some(&d) = chars.peek() {
+                if d == '}' {
+                    break;
+                }
+                value = value
+                    .saturating_mul(16)
+                    .saturating_add(d.to_digit(16).unwrap_or(0));
+                chars.next();
+            }
+            chars.next(); // `}`
+        } else {
+            for _ in 0..4 {
+                if let Some(d) = chars.next().and_then(|d| d.to_digit(16)) {
+                    value = value * 16 + d;
+                }
+            }
+        }
+        if let Some(ch) = char::from_u32(value) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Normalizes a `BigInt` literal token (`123n`, `0xFFn`, `1_000n`) into its
 /// digit string: separators and the trailing `n` removed, any radix prefix
 /// retained (so `0xFFn` → `0xFF`).

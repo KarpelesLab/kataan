@@ -91,10 +91,13 @@ impl<'src> Parser<'src> {
         // a static initialization block.
         let is_static = if self.at(TokenKind::Keyword(Kw::Static)) {
             match self.nth_kind(1) {
-                // `static { … }` — static block.
+                // `static { … }` — static block. Its body is in an `[+Await]`
+                // context: `await` is reserved (it may not be used as an
+                // identifier), so parse with the async flag set. It is not a
+                // generator, so `yield` remains an ordinary identifier.
                 TokenKind::LBrace => {
                     self.bump(); // `static`
-                    let body = self.parse_block_body()?;
+                    let body = self.in_function_context(false, true, Self::parse_block_body)?;
                     return Ok(ClassMember::StaticBlock {
                         body,
                         span: start.to(self.prev_span()),
@@ -184,7 +187,7 @@ impl<'src> Parser<'src> {
         match tok.kind {
             TokenKind::PrivateName => {
                 self.bump();
-                Ok(PropertyKey::Private(tok.text(self.source)[1..].into()))
+                Ok(PropertyKey::Private(self.private_name(tok)))
             }
             TokenKind::LBracket => {
                 self.bump();
@@ -204,7 +207,7 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Identifier => {
                 self.bump();
-                Ok(PropertyKey::Ident(tok.text(self.source).into()))
+                Ok(PropertyKey::Ident(self.ident_name(tok).into()))
             }
             TokenKind::Keyword(kw) => {
                 self.bump();
@@ -251,7 +254,10 @@ impl<'src> Parser<'src> {
     ) -> Result<Function> {
         let start = self.cur_span();
         self.expect(TokenKind::LParen)?;
-        let params = self.parse_params()?;
+        // A method's parameters are in its own `[?Yield, ?Await]` context (e.g. a
+        // generator method may not bind `yield`, an async method may not bind
+        // `await`).
+        let params = self.in_function_context(is_generator, is_async, Self::parse_params)?;
         self.expect(TokenKind::RParen)?;
         let body = self.in_function_context(is_generator, is_async, Self::parse_block_body)?;
         Ok(Function {

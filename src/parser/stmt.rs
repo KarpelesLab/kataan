@@ -113,6 +113,16 @@ impl<'src> Parser<'src> {
                 Ok(Stmt::Empty { span })
             }
             TokenKind::Keyword(Kw::Var | Kw::Let | Kw::Const) => self.parse_var_statement(),
+            // `using x = …` / `await using x = …` — explicit-resource-management
+            // declarations (only at a `StatementListItem` position). `using` and
+            // `await` are otherwise ordinary identifiers, so this is gated on a
+            // tight lookahead (see `at_using_decl` / `at_await_using_decl`).
+            TokenKind::Identifier if decl_ok && self.at_using_decl() => {
+                self.parse_using_statement(false)
+            }
+            TokenKind::Keyword(Kw::Await) if decl_ok && self.at_await_using_decl() => {
+                self.parse_using_statement(true)
+            }
             TokenKind::Keyword(Kw::If) => self.parse_if(),
             TokenKind::Keyword(Kw::For) => self.parse_for(),
             TokenKind::Keyword(Kw::While) => self.parse_while(),
@@ -187,7 +197,7 @@ impl<'src> Parser<'src> {
     fn parse_labeled(&mut self) -> Result<Stmt> {
         let tok = self.bump();
         let name: Box<str> = match tok.kind {
-            TokenKind::Identifier => tok.text(self.source).into(),
+            TokenKind::Identifier => self.checked_ident_name(tok)?.into(),
             TokenKind::Keyword(kw) => kw.as_str().into(),
             _ => unreachable!("labeled dispatch guaranteed an identifier"),
         };
@@ -211,6 +221,88 @@ impl<'src> Parser<'src> {
         let decl = self.parse_declarator_tail(kind, kw.span, first)?;
         self.semicolon()?;
         Ok(Stmt::Var(decl))
+    }
+
+    /// Whether the cursor begins a `using` declaration: the contextual keyword
+    /// `using`, then — with no intervening line terminator (a restricted
+    /// production) — a `BindingIdentifier`. The follower must be a binding name
+    /// and not itself `using`; a bare `using` (e.g. `using;`, `using = 1`,
+    /// `using\n x`) remains an ordinary identifier expression.
+    fn at_using_decl(&self) -> bool {
+        self.peek_tok().text(self.source) == "using"
+            && !self.nth_newline(1)
+            && self.nth_is_binding_ident(1)
+    }
+
+    /// Whether the cursor begins an `await using` declaration: `await`, then
+    /// `using` (no line terminator between `using` and the binding name), then a
+    /// `BindingIdentifier`.
+    fn at_await_using_decl(&self) -> bool {
+        self.nth_kind(1) == TokenKind::Identifier
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|t| t.text(self.source) == "using")
+            && !self.nth_newline(2)
+            && self.nth_is_binding_ident(2)
+    }
+
+    /// Whether the token `n` ahead is a `BindingIdentifier` that may follow
+    /// `using` — an identifier (but not `using` itself) or `yield`/`await` used
+    /// as a name. Patterns (`[`/`{`) are not permitted after `using`.
+    fn nth_is_binding_ident(&self, n: usize) -> bool {
+        match self.nth_kind(n) {
+            TokenKind::Identifier => self
+                .tokens
+                .get(self.pos + n)
+                .is_some_and(|t| t.text(self.source) != "using"),
+            TokenKind::Keyword(kw) => self.keyword_is_binding_ident(kw),
+            _ => false,
+        }
+    }
+
+    /// Parses a `using` / `await using` declaration (the cursor is at `using`
+    /// or `await`). Each binding must be a plain identifier with an initializer;
+    /// destructuring patterns are not permitted.
+    fn parse_using_statement(&mut self, is_await: bool) -> Result<Stmt> {
+        let start = self.cur_span();
+        if is_await {
+            self.bump(); // `await`
+        }
+        self.bump(); // `using`
+        let kind = if is_await {
+            VarDeclKind::AwaitUsing
+        } else {
+            VarDeclKind::Using
+        };
+        let mut declarations = Vec::new();
+        loop {
+            let d_start = self.cur_span();
+            let name = self.parse_binding_ident()?;
+            // A `using` / `await using` declaration (outside a `for-of` head)
+            // requires an initializer, like `const`.
+            if !self.eat(TokenKind::Eq) {
+                return Err(self.err_at(
+                    d_start.to(self.prev_span()),
+                    "a `using` declaration must be initialized",
+                ));
+            }
+            let init = self.parse_assignment()?;
+            declarations.push(VarDeclarator {
+                target: BindingTarget::Ident(name),
+                init: Some(init),
+                span: d_start.to(self.prev_span()),
+            });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.semicolon()?;
+        Ok(Stmt::Var(VarDecl {
+            kind,
+            declarations,
+            span: start.to(self.prev_span()),
+        }))
     }
 
     /// Parses one `target (= init)?` declarator.
@@ -271,11 +363,11 @@ impl<'src> Parser<'src> {
             TokenKind::Identifier => {
                 self.bump();
                 Ok(BindingTarget::Ident(Ident::new(
-                    tok.text(self.source),
+                    self.checked_ident_name(tok)?,
                     tok.span,
                 )))
             }
-            TokenKind::Keyword(kw) if kw.is_contextual() => {
+            TokenKind::Keyword(kw) if self.keyword_is_binding_ident(kw) => {
                 self.bump();
                 Ok(BindingTarget::Ident(Ident::new(kw.as_str(), tok.span)))
             }
@@ -390,8 +482,10 @@ impl<'src> Parser<'src> {
 
         // Identifier-name key: `name`, `name: target`, with optional default.
         let (name, can_shorthand): (Box<str>, bool) = match tok.kind {
-            TokenKind::Identifier => (tok.text(self.source).into(), true),
-            TokenKind::Keyword(kw) if kw.is_contextual() => (kw.as_str().into(), true),
+            TokenKind::Identifier => (self.ident_name(tok).into(), true),
+            TokenKind::Keyword(kw) if self.keyword_is_binding_ident(kw) => {
+                (kw.as_str().into(), true)
+            }
             TokenKind::Keyword(kw) => (kw.as_str().into(), false),
             _ => return Err(self.err(format!("expected a property key, found {:?}", tok.kind))),
         };
@@ -412,6 +506,9 @@ impl<'src> Parser<'src> {
         if !can_shorthand {
             return Err(self.err_at(tok.span, "reserved word cannot be a shorthand binding"));
         }
+        // A shorthand binding is a `BindingIdentifier`; an escaped reserved word
+        // is a Syntax Error here (unlike as a key).
+        self.checked_ident_name(tok)?;
         let value = BindingTarget::Ident(Ident::new(name.clone(), tok.span));
         let default = self.parse_optional_default()?;
         Ok(ObjectPatternProp {
@@ -506,6 +603,12 @@ impl<'src> Parser<'src> {
             return Ok(ForHead::Empty);
         }
 
+        // `for (using x …)` / `for (await using x …)` — explicit-resource
+        // management bindings in a `for` head (classic or `for-of`).
+        if self.at_using_decl() || self.at_await_using_decl() {
+            return self.parse_for_using_head();
+        }
+
         if let Some(kind) = var_kind(self.peek()) {
             let kw = self.bump();
             let target = self.parse_binding_target()?;
@@ -541,6 +644,67 @@ impl<'src> Parser<'src> {
         }
         self.expect(TokenKind::Semicolon)?;
         Ok(ForHead::Classic(Some(ForInit::Expr(Box::new(expr)))))
+    }
+
+    /// Parses a `using` / `await using` binding list in a `for` head (the
+    /// cursor is at `using` or `await`). Supports the `for-of` form
+    /// (`for (using x of it)`) and the classic form (`for (using x = e; …; …)`);
+    /// `for-in` is not permitted with `using`.
+    fn parse_for_using_head(&mut self) -> Result<ForHead> {
+        let start = self.cur_span();
+        let is_await = self.at_await_using_decl();
+        if is_await {
+            self.bump(); // `await`
+        }
+        self.bump(); // `using`
+        let kind = if is_await {
+            VarDeclKind::AwaitUsing
+        } else {
+            VarDeclKind::Using
+        };
+        let first_name = self.parse_binding_ident()?;
+        // `for (using x of iterable)`.
+        if self.eat(TokenKind::Keyword(Kw::Of)) {
+            return Ok(ForHead::InOf {
+                left: ForLeft::Decl {
+                    kind,
+                    target: BindingTarget::Ident(first_name),
+                    span: start.to(self.prev_span()),
+                },
+                is_of: true,
+            });
+        }
+        // Classic loop: `using x = e [, y = e2 …] ;`.
+        let init = if self.eat(TokenKind::Eq) {
+            Some(self.parse_assignment()?)
+        } else {
+            None
+        };
+        let mut declarations = alloc::vec![VarDeclarator {
+            target: BindingTarget::Ident(first_name),
+            init,
+            span: start.to(self.prev_span()),
+        }];
+        while self.eat(TokenKind::Comma) {
+            let d_start = self.cur_span();
+            let name = self.parse_binding_ident()?;
+            let d_init = if self.eat(TokenKind::Eq) {
+                Some(self.parse_assignment()?)
+            } else {
+                None
+            };
+            declarations.push(VarDeclarator {
+                target: BindingTarget::Ident(name),
+                init: d_init,
+                span: d_start.to(self.prev_span()),
+            });
+        }
+        self.expect(TokenKind::Semicolon)?;
+        Ok(ForHead::Classic(Some(ForInit::Var(VarDecl {
+            kind,
+            declarations,
+            span: start.to(self.prev_span()),
+        }))))
     }
 
     fn decl_for_left(
@@ -795,8 +959,8 @@ impl<'src> Parser<'src> {
     fn try_parse_label(&mut self) -> Option<Ident> {
         let tok = self.peek_tok();
         let name: Box<str> = match tok.kind {
-            TokenKind::Identifier => tok.text(self.source).into(),
-            TokenKind::Keyword(kw) if kw.is_contextual() => kw.as_str().into(),
+            TokenKind::Identifier => self.ident_name(tok).into(),
+            TokenKind::Keyword(kw) if self.keyword_is_binding_ident(kw) => kw.as_str().into(),
             _ => return None,
         };
         self.bump();

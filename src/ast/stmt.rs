@@ -181,6 +181,13 @@ pub enum VarDeclKind {
     Var,
     Let,
     Const,
+    /// `using x = …` — a synchronous explicit-resource-management declaration.
+    /// Block-scoped like `const` (the binding is immutable and requires an
+    /// initializer); disposal semantics are a runtime concern.
+    Using,
+    /// `await using x = …` — the async form of [`VarDeclKind::Using`], valid
+    /// only inside an async context.
+    AwaitUsing,
 }
 
 impl VarDeclKind {
@@ -191,7 +198,16 @@ impl VarDeclKind {
             VarDeclKind::Var => "var",
             VarDeclKind::Let => "let",
             VarDeclKind::Const => "const",
+            VarDeclKind::Using => "using",
+            VarDeclKind::AwaitUsing => "await using",
         }
+    }
+
+    /// Whether this is a block-scoped lexical declaration (`let`/`const`/`using`/
+    /// `await using`) rather than a function-scoped `var`.
+    #[must_use]
+    pub fn is_lexical(self) -> bool {
+        !matches!(self, VarDeclKind::Var)
     }
 }
 

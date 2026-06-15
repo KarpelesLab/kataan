@@ -206,7 +206,7 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Identifier => {
                 self.bump();
-                Ok(ModuleExportName::Ident(tok.text(self.source).into()))
+                Ok(ModuleExportName::Ident(self.ident_name(tok).into()))
             }
             TokenKind::Keyword(kw) => {
                 self.bump();

@@ -279,3 +279,38 @@ fn keywords_classified() {
         ]
     );
 }
+
+#[test]
+fn escaped_identifier_is_identifier_not_keyword() {
+    use TokenKind::*;
+    // `class` cooks to `class` but is an Identifier, not the keyword, and
+    // the token records that it contained an escape.
+    let toks = Lexer::new(r"cl\u0061ss").tokenize().expect("lex ok");
+    assert_eq!(toks[0].kind, Identifier);
+    assert!(toks[0].had_escape);
+    // A plain keyword has no escape flag and the keyword kind.
+    let toks2 = Lexer::new("class").tokenize().expect("lex ok");
+    assert_eq!(toks2[0].kind, Keyword(self::Keyword::Class));
+    assert!(!toks2[0].had_escape);
+    // An escape that is not a valid identifier start (here U+0020 space) is
+    // rejected.
+    assert!(Lexer::new(r"\u0020abc").tokenize().is_err());
+}
+
+#[test]
+fn hashbang_comment_at_start() {
+    use TokenKind::*;
+    // A leading `#!` line is a comment.
+    assert_eq!(kinds("#!/usr/bin/env node\nx"), &[Identifier]);
+    // `#!` not at the very start is not a hashbang (here `#` begins a private
+    // name, which is an error outside a class — surfaced as a lex error).
+    assert!(Lexer::new(" #!/x").tokenize().is_err());
+}
+
+#[test]
+fn other_id_start_continue_chars() {
+    use TokenKind::*;
+    // U+2118 (℘) is `Other_ID_Start`; U+00B7 (·) is `Other_ID_Continue`.
+    assert_eq!(kinds("\u{2118}"), &[Identifier]);
+    assert_eq!(kinds("a\u{00B7}b"), &[Identifier]);
+}

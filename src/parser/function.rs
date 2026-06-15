@@ -49,15 +49,36 @@ impl<'src> Parser<'src> {
     ) -> Result<Function> {
         self.expect(TokenKind::Keyword(Kw::Function))?;
         let is_generator = self.eat(TokenKind::Star);
-        let id = if self.at_binding_ident() {
+        // A *function expression*'s name uses the *function's own* `[Yield,
+        // Await]` context, not the enclosing one: it is reserved iff this
+        // function is a generator (for `yield`) / async (for `await`). So
+        // `(function yield(){})` inside a generator is valid (the inner function
+        // is not a generator), while `(function* yield(){})` and
+        // `(async function await(){})` are Syntax Errors. A *declaration*'s name
+        // uses the surrounding context, which is already in effect.
+        let id = if !require_name {
+            let (sg, sa) = (self.in_generator, self.in_async);
+            self.in_generator = is_generator;
+            self.in_async = is_async;
+            let id = if self.at_binding_ident() {
+                Some(self.parse_binding_ident()?)
+            } else {
+                None
+            };
+            self.in_generator = sg;
+            self.in_async = sa;
+            id
+        } else if self.at_binding_ident() {
             Some(self.parse_binding_ident()?)
-        } else if require_name {
-            return Err(self.err("a function declaration requires a name"));
         } else {
-            None
+            return Err(self.err("a function declaration requires a name"));
         };
         self.expect(TokenKind::LParen)?;
-        let params = self.parse_params()?;
+        // Parameters of a generator/async function are parsed in the function's
+        // own `[?Yield, ?Await]` context: a generator's params may not bind or
+        // reference `yield`, and an async function's may not use `await` (so
+        // `function*(yield){}` / `function* g(x = yield){}` are Syntax Errors).
+        let params = self.in_function_context(is_generator, is_async, Self::parse_params)?;
         self.expect(TokenKind::RParen)?;
         let body = self.in_function_context(is_generator, is_async, Self::parse_block_body)?;
         Ok(Function {
@@ -157,21 +178,29 @@ impl<'src> Parser<'src> {
             self.bump();
         }
 
-        let params = if self.at(TokenKind::LParen) {
-            self.bump();
-            let params = self.parse_params()?;
-            self.expect(TokenKind::RParen)?;
-            params
-        } else {
-            let pstart = self.cur_span();
-            let target = self.parse_binding_target()?;
-            alloc::vec![Param {
-                target,
-                default: None,
-                rest: false,
-                span: pstart.to(self.prev_span()),
-            }]
-        };
+        // An async arrow's parameters are in a `[+Await]` context (so `await` may
+        // not be a parameter name); `yield` follows the enclosing context.
+        let saved_async = self.in_async;
+        self.in_async = is_async || self.in_async;
+        let params_result = (|| -> Result<Vec<Param>> {
+            if self.at(TokenKind::LParen) {
+                self.bump();
+                let params = self.parse_params()?;
+                self.expect(TokenKind::RParen)?;
+                Ok(params)
+            } else {
+                let pstart = self.cur_span();
+                let target = self.parse_binding_target()?;
+                Ok(alloc::vec![Param {
+                    target,
+                    default: None,
+                    rest: false,
+                    span: pstart.to(self.prev_span()),
+                }])
+            }
+        })();
+        self.in_async = saved_async;
+        let params = params_result?;
 
         self.expect(TokenKind::Arrow)?;
         // An arrow is never a generator; an async arrow enables `await`, and a
@@ -196,10 +225,37 @@ impl<'src> Parser<'src> {
     // --- shared ---------------------------------------------------------
 
     /// Whether the cursor is a binding identifier (a plain identifier or a
-    /// contextual keyword used as a name).
+    /// keyword that is usable as a name in the current context).
     pub(super) fn at_binding_ident(&self) -> bool {
-        matches!(self.peek(), TokenKind::Identifier)
-            || matches!(self.peek(), TokenKind::Keyword(kw) if kw.is_contextual())
+        match self.peek() {
+            TokenKind::Identifier => true,
+            TokenKind::Keyword(kw) => self.keyword_is_binding_ident(kw),
+            _ => false,
+        }
+    }
+
+    /// Whether a keyword may be used as a `BindingIdentifier` here. The
+    /// contextual keywords (`async`, `of`, `get`, …) always may. `yield` may
+    /// outside a generator body and `await` outside an async body — both are
+    /// then ordinary identifiers (in sloppy code; strict-mode use is rejected by
+    /// the post-parse validator, which is where strict mode is known).
+    pub(super) fn keyword_is_binding_ident(&self, kw: Kw) -> bool {
+        kw.is_contextual()
+            || (kw == Kw::Yield && !self.in_generator)
+            || (kw == Kw::Await && !self.in_async)
+            // Strict-mode future-reserved words are ordinary identifiers in
+            // sloppy code; the post-parse validator rejects them in strict mode.
+            || matches!(
+                kw,
+                Kw::Let
+                    | Kw::Static
+                    | Kw::Implements
+                    | Kw::Interface
+                    | Kw::Package
+                    | Kw::Private
+                    | Kw::Protected
+                    | Kw::Public
+            )
     }
 
     /// Parses a binding identifier into an [`Ident`].
@@ -208,9 +264,9 @@ impl<'src> Parser<'src> {
         match tok.kind {
             TokenKind::Identifier => {
                 self.bump();
-                Ok(Ident::new(tok.text(self.source), tok.span))
+                Ok(Ident::new(self.checked_ident_name(tok)?, tok.span))
             }
-            TokenKind::Keyword(kw) if kw.is_contextual() => {
+            TokenKind::Keyword(kw) if self.keyword_is_binding_ident(kw) => {
                 self.bump();
                 Ok(Ident::new(kw.as_str(), tok.span))
             }
