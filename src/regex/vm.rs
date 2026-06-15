@@ -332,7 +332,12 @@ fn backtrack(
                 return false;
             }
             Inst::Look { neg, prog } => {
-                // Zero-width: run the sub-program at `sp` (captures discarded).
+                // Zero-width: run the sub-program at `sp`. A *positive* lookahead
+                // propagates the groups its sub-match captured to the outer match
+                // (`/(?=(\d+))/.exec("123")` captures `"123"`); a *negative* one
+                // contributes nothing. Seed the sub-saves from the current saves so
+                // groups already bound outside (and backrefs to them) stay visible
+                // inside the assertion.
                 let sub = Ctx {
                     prog,
                     input: ctx.input,
@@ -341,18 +346,32 @@ fn backtrack(
                     steps: ctx.steps,
                     budget: ctx.budget,
                 };
-                let mut sub_saves = alloc::vec![None; saves.len()];
+                let mut sub_saves = saves.clone();
                 let mut sub_loops = Vec::new();
                 let matched = backtrack(&sub, 0, sp, &mut sub_saves, depth + 1, &mut sub_loops);
-                if matched != *neg {
-                    pc += 1;
-                } else {
+                if matched == *neg {
                     return false;
                 }
+                if *neg {
+                    // Negative lookahead: zero-width, no captures contributed.
+                    pc += 1;
+                    continue;
+                }
+                // Positive: adopt the sub-match's captures, then continue. On a
+                // later failure restore the originals so backtracking past the
+                // assertion is sound.
+                let saved = core::mem::replace(saves, sub_saves);
+                if backtrack(ctx, pc + 1, sp, saves, depth + 1, loops) {
+                    return true;
+                }
+                *saves = saved;
+                return false;
             }
             Inst::LookBehind { neg, prog } => {
                 // The sub-pattern must match some substring ending exactly at
-                // `sp`; try every start position `j <= sp`.
+                // `sp`; try every start position `j <= sp`. A *positive* lookbehind
+                // propagates the captures of the matched substring; a *negative*
+                // one contributes nothing.
                 let sub = Ctx {
                     prog,
                     input: ctx.input,
@@ -361,25 +380,34 @@ fn backtrack(
                     steps: ctx.steps,
                     budget: ctx.budget,
                 };
-                let mut matched = false;
+                let mut found: Option<Vec<Option<usize>>> = None;
                 for j in (0..=sp).rev() {
                     // Each rescan start counts as a step; the O(n) rescan is thus
                     // bounded by the shared budget (RE-6 backstop).
                     if !ctx.tick() {
                         return false;
                     }
-                    let mut sub_saves = alloc::vec![None; saves.len()];
+                    let mut sub_saves = saves.clone();
                     let mut sub_loops = Vec::new();
                     if backtrack(&sub, 0, j, &mut sub_saves, depth + 1, &mut sub_loops) {
-                        matched = true;
+                        found = Some(sub_saves);
                         break;
                     }
                 }
-                if matched != *neg {
-                    pc += 1;
-                } else {
+                let matched = found.is_some();
+                if matched == *neg {
                     return false;
                 }
+                if *neg {
+                    pc += 1;
+                    continue;
+                }
+                let saved = core::mem::replace(saves, found.unwrap());
+                if backtrack(ctx, pc + 1, sp, saves, depth + 1, loops) {
+                    return true;
+                }
+                *saves = saved;
+                return false;
             }
             Inst::Backref(g) => {
                 match (
