@@ -17,8 +17,16 @@ pub enum Expr {
     Null(Span),
     /// A `true` / `false` literal.
     Bool { value: bool, span: Span },
-    /// A numeric literal, cooked to an IEEE-754 double.
-    Number { value: f64, span: Span },
+    /// A numeric literal, cooked to an IEEE-754 double. `legacy_octal` marks a
+    /// `LegacyOctalIntegerLiteral` (`0123`) or `NonOctalDecimalIntegerLiteral`
+    /// (`08`) — a `0`-prefixed integer that is an early Syntax Error in strict
+    /// mode code (enforced in the validator, since strictness is not known during
+    /// the parse).
+    Number {
+        value: f64,
+        span: Span,
+        legacy_octal: bool,
+    },
     /// A `BigInt` literal. The value is kept as its normalized digit string
     /// (separators and the `n` suffix removed, any radix prefix retained) until
     /// the bignum runtime type exists to hold it.

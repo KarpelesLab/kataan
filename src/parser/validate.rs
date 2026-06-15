@@ -952,6 +952,14 @@ impl Validator {
 
     fn expr(&mut self, e: &Expr, ctx: &Ctx) -> Result<()> {
         match e {
+            Expr::Number {
+                legacy_octal: true,
+                span,
+                ..
+            } if ctx.strict => Err(self.err(
+                *span,
+                "legacy octal / non-octal-decimal literals are not allowed in strict mode",
+            )),
             Expr::Null(_)
             | Expr::Bool { .. }
             | Expr::Number { .. }

@@ -34,6 +34,18 @@ pub(super) fn number(text: &str) -> f64 {
         return from_radix(rest, 2);
     }
 
+    // A `LegacyOctalIntegerLiteral` — a leading `0` followed by one or more
+    // octal digits (0–7), with no fraction/exponent — is interpreted as octal in
+    // sloppy mode. A leading-zero run containing an `8`/`9`
+    // (`NonOctalDecimalIntegerLiteral`, e.g. `09`, `0189`) stays decimal. The
+    // lexer has already rejected separators and BigInt suffixes on these forms.
+    if let Some(rest) = cleaned.strip_prefix('0')
+        && !rest.is_empty()
+        && rest.bytes().all(|b| (b'0'..=b'7').contains(&b))
+    {
+        return from_radix(rest, 8);
+    }
+
     // Decimal / float / exponent. Rust's float parser is strict about a leading
     // or trailing `.`, which JS allows (`.5`, `5.`), so normalize those.
     let mut s = cleaned;
@@ -49,6 +61,17 @@ pub(super) fn number(text: &str) -> f64 {
         }
     }
     s.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// Whether a (lexer-validated) numeric-literal token is a
+/// `LegacyOctalIntegerLiteral` (`0123`) or `NonOctalDecimalIntegerLiteral`
+/// (`08`, `0189`) — i.e. a `0`-prefixed integer whose second character is a
+/// decimal digit. (`0x`/`0o`/`0b` carry a letter; `0.5`/`0e5` a `.`/`e`; `0n` an
+/// `n`; a bare `0` has no second digit — none of these match.) Such literals are
+/// an early Syntax Error in strict mode.
+pub(super) fn is_legacy_octal_literal(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() >= 2 && b[0] == b'0' && b[1].is_ascii_digit()
 }
 
 /// If `s` is `0` followed by one of `markers`, returns the digits after the

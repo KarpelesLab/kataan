@@ -777,6 +777,15 @@ impl<'src> Lexer<'src> {
                 Some(b'x' | b'X') => return self.read_radix_number(16, start),
                 Some(b'o' | b'O') => return self.read_radix_number(8, start),
                 Some(b'b' | b'B') => return self.read_radix_number(2, start),
+                // A `0` immediately followed by a decimal digit is a
+                // `LegacyOctalIntegerLiteral` (`0123`) or a
+                // `NonOctalDecimalIntegerLiteral` (`08`, `09`). Neither
+                // production admits a `NumericLiteralSeparator`, so `0`-prefixed
+                // integers with a `_` (e.g. `0_0`, `01_0`, `08_0`) are a parse
+                // error. A `0` directly followed by `_` is likewise invalid: the
+                // leading `0` is already a complete `DecimalIntegerLiteral`.
+                Some(b'0'..=b'9') => return self.read_legacy_zero_prefixed_number(start),
+                Some(b'_') => return Err(self.sep_error(start)),
                 _ => {}
             }
         }
@@ -812,6 +821,58 @@ impl<'src> Lexer<'src> {
         }
 
         let _ = is_float; // both fold to TokenKind::Number for now
+        self.reject_identifier_after_number(start)?;
+        Ok(TokenKind::Number)
+    }
+
+    /// Reads a `0`-prefixed legacy integer literal: a `LegacyOctalIntegerLiteral`
+    /// (`0` followed by octal digits, e.g. `0123`) or a
+    /// `NonOctalDecimalIntegerLiteral` (a `0`-prefixed run containing an `8` or
+    /// `9`, e.g. `08`, `0192`). The cursor is at the leading `0`, which is known
+    /// to be followed by a decimal digit. Neither production admits a numeric
+    /// separator, so an embedded `_` is a parse error. A legacy-octal literal is
+    /// integer-only — no fraction, exponent, or BigInt suffix. A non-octal one is
+    /// a `DecimalIntegerLiteral`, so it may carry a fraction/exponent (`08.5`,
+    /// `08e2`) but still never a BigInt suffix.
+    fn read_legacy_zero_prefixed_number(&mut self, start: usize) -> Result<TokenKind> {
+        self.advance(); // leading `0`
+        let mut has_nonoctal = false; // saw an `8` or `9`
+        while let Some(c) = self.peek() {
+            match c {
+                b'0'..=b'7' => self.advance(),
+                b'8' | b'9' => {
+                    has_nonoctal = true;
+                    self.advance();
+                }
+                // Separators are not part of the legacy productions.
+                b'_' => return Err(self.sep_error(start)),
+                _ => break,
+            }
+        }
+
+        // A BigInt suffix is never valid on a legacy-octal / non-octal-decimal
+        // literal (`00n`, `08n`, `0123n` are all errors).
+        if self.peek() == Some(b'n') {
+            self.advance();
+            return Err(Error::syntax(
+                "a BigInt literal may not have a leading zero",
+                Span::new(start as u32, self.pos as u32),
+            ));
+        }
+
+        // Only a non-octal-decimal literal (an `8`/`9` present) is a
+        // `DecimalIntegerLiteral` and may carry a fraction or exponent; a
+        // legacy-octal literal is integer-only.
+        if has_nonoctal {
+            if self.peek() == Some(b'.') {
+                self.advance();
+                if self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                    self.read_decimal_digits()?;
+                }
+            }
+            self.read_exponent()?;
+        }
+
         self.reject_identifier_after_number(start)?;
         Ok(TokenKind::Number)
     }

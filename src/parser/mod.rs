@@ -873,9 +873,11 @@ impl<'src> Parser<'src> {
         match tok.kind {
             TokenKind::Number => {
                 self.bump();
+                let text = tok.text(self.source);
                 Ok(Expr::Number {
-                    value: cook::number(tok.text(self.source)),
+                    value: cook::number(text),
                     span: tok.span,
+                    legacy_octal: cook::is_legacy_octal_literal(text),
                 })
             }
             TokenKind::BigInt => {
