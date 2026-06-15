@@ -10974,12 +10974,18 @@ impl<'a> Interp<'a> {
                     Some(self.new_str_bytes(out))
                 }
                 "includes" => {
+                    // A RegExp `searchString` is a TypeError (IsRegExp).
+                    if self.is_regexp_arg(arg(0)) {
+                        return Err(self.type_error(
+                            "String.prototype.includes argument must not be a regular expression",
+                        ));
+                    }
                     let needle = self.arg_string_bytes(arg(0));
                     let units = crate::wtf8::utf16_len(&bytes);
                     let pos = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
-                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(units)
+                        (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
                     Some(NanBox::boolean(index_of_units(&bytes, &needle, pos) >= 0.0))
                 }
@@ -11013,9 +11019,18 @@ impl<'a> Interp<'a> {
                     Some(self.new_str_bytes(bytes.repeat(n)))
                 }
                 "startsWith" => {
+                    if self.is_regexp_arg(arg(0)) {
+                        return Err(self.type_error(
+                            "String.prototype.startsWith argument must not be a regular expression",
+                        ));
+                    }
                     let needle = self.arg_string_bytes(arg(0));
                     let units = crate::wtf8::utf16_len(&bytes);
-                    let pos = (self.realm.to_number(arg(1)).max(0.0) as usize).min(units);
+                    let pos = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        0
+                    } else {
+                        (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
+                    };
                     // A prefix match at exactly `pos` units.
                     let start_byte = unit_to_byte(&bytes, pos);
                     let matched = bytes.len() - start_byte >= needle.len()
@@ -11023,13 +11038,18 @@ impl<'a> Interp<'a> {
                     Some(NanBox::boolean(matched))
                 }
                 "endsWith" => {
+                    if self.is_regexp_arg(arg(0)) {
+                        return Err(self.type_error(
+                            "String.prototype.endsWith argument must not be a regular expression",
+                        ));
+                    }
                     let needle = self.arg_string_bytes(arg(0));
                     let units = crate::wtf8::utf16_len(&bytes);
                     // `endPosition` defaults to the full length.
                     let end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         units
                     } else {
-                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(units)
+                        (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
                     let end_byte = unit_to_byte(&bytes, end);
                     let matched = end_byte >= needle.len()
@@ -14341,6 +14361,22 @@ impl<'a> Interp<'a> {
         None
     }
 
+    /// `IsRegExp(value)`: a value with a truthy `@@match` property, or (absent that
+    /// property) a RegExp instance. A non-object is not a RegExp.
+    fn is_regexp_arg(&mut self, v: NanBox) -> bool {
+        let Some(h) = v.as_handle().map(Handle::from_raw) else {
+            return false;
+        };
+        let sym = self.well_known_symbol("match");
+        let key = self.member_key(sym);
+        if let Some(m) = self.realm.get_property(h, &key)
+            && !matches!(m.unpack(), Unpacked::Undefined)
+        {
+            return self.realm.truthy(m);
+        }
+        self.realm.regexp_at(h).is_some()
+    }
+
     fn coerce_to_bigint(&mut self, v: NanBox) -> Result<crate::bignum::BigInt, ExecError> {
         match v.unpack() {
             Unpacked::Bool(b) => Ok(if b {
@@ -15038,17 +15074,34 @@ impl<'a> Interp<'a> {
                         if *call_optional {
                             return Err(ExecError::OptShortCircuit);
                         }
-                        // The receiver is a primitive. For `null`/`undefined`,
-                        // accessing any member is a catchable TypeError ("cannot read
-                        // property"); for other primitives, the member is not a
-                        // callable here — also a catchable TypeError. Either way,
-                        // surface a JS error rather than an internal `NotCallable`.
-                        let msg = if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                            "cannot read property of null or undefined"
-                        } else {
-                            "is not a function"
-                        };
-                        let m = self.new_str(msg);
+                        // The receiver is a primitive. `null`/`undefined` cannot be
+                        // coerced, so any member access is a catchable TypeError.
+                        if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                            let m = self.new_str("cannot read property of null or undefined");
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
+                        // For a number/boolean primitive, an inherited (or
+                        // prototype-assigned) method is found by boxing the value and
+                        // walking its prototype chain — then invoked with the original
+                        // primitive as `this` (e.g.
+                        // `Number.prototype.toLowerCase = String.prototype.toLowerCase`).
+                        if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property {
+                            let boxed = self.coerce_to_object(recv);
+                            if let Some(bh) = boxed.as_handle().map(Handle::from_raw) {
+                                let f = self.read_member(bh, name)?;
+                                if *call_optional
+                                    && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null)
+                                {
+                                    return Err(ExecError::OptShortCircuit);
+                                }
+                                if f.as_handle()
+                                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                                {
+                                    return self.call_with_this(f, recv, &args);
+                                }
+                            }
+                        }
+                        let m = self.new_str("is not a function");
                         return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     };
                     let f = self.member(Handle::from_raw(raw), property)?;
