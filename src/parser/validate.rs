@@ -58,7 +58,7 @@ pub(crate) fn validate_program(program: &Program) -> Result<()> {
         labels: Vec::new(),
     };
     let ctx = Ctx::top(strict);
-    v.check_top_level_scope(&program.body)?;
+    v.check_top_level_scope(&program.body, strict)?;
     for stmt in &program.body {
         v.stmt(stmt, &ctx)?;
     }
@@ -172,7 +172,7 @@ impl Validator {
         match stmt {
             Stmt::Expr { expression, .. } => self.expr(expression, ctx),
             Stmt::Block { body, .. } => {
-                self.check_lexical_scope(body)?;
+                self.check_lexical_scope(body, ctx.strict)?;
                 for s in body {
                     self.stmt(s, ctx)?;
                 }
@@ -245,7 +245,7 @@ impl Validator {
             } => {
                 self.expr(discriminant, ctx)?;
                 let all: Vec<&Stmt> = cases.iter().flat_map(|c| c.body.iter()).collect();
-                self.check_lexical_scope_refs(&all, false)?;
+                self.check_lexical_scope_refs(&all, false, ctx.strict)?;
                 // A `switch` is a `break` target but not a `continue` target.
                 let mut c = *ctx;
                 c.in_breakable = true;
@@ -265,12 +265,12 @@ impl Validator {
                 finalizer,
                 ..
             } => {
-                self.check_lexical_scope(block)?;
+                self.check_lexical_scope(block, ctx.strict)?;
                 for s in block {
                     self.stmt(s, ctx)?;
                 }
                 if let Some(h) = handler {
-                    self.check_lexical_scope(&h.body)?;
+                    self.check_lexical_scope(&h.body, ctx.strict)?;
                     if let Some(p) = &h.param {
                         self.binding_target(p, ctx)?;
                     }
@@ -279,7 +279,7 @@ impl Validator {
                     }
                 }
                 if let Some(f) = finalizer {
-                    self.check_lexical_scope(f)?;
+                    self.check_lexical_scope(f, ctx.strict)?;
                     for s in f {
                         self.stmt(s, ctx)?;
                     }
@@ -539,7 +539,7 @@ impl Validator {
         for p in &f.params {
             self.param(p, &c)?;
         }
-        self.check_top_level_scope(&f.body)?;
+        self.check_top_level_scope(&f.body, strict)?;
         for s in &f.body {
             self.stmt(s, &c)?;
         }
@@ -560,7 +560,7 @@ impl Validator {
         for p in &f.params {
             self.param(p, &c)?;
         }
-        self.check_top_level_scope(&f.body)?;
+        self.check_top_level_scope(&f.body, strict)?;
         for s in &f.body {
             self.stmt(s, &c)?;
         }
@@ -600,7 +600,7 @@ impl Validator {
         }
         match &a.body {
             ArrowBody::Block(body) => {
-                self.check_top_level_scope(body)?;
+                self.check_top_level_scope(body, strict)?;
                 for s in body {
                     self.stmt(s, &c)?;
                 }
@@ -786,7 +786,8 @@ impl Validator {
                     let mut c2 = Ctx::function_boundary(true, false, true);
                     c2.in_function = false;
                     let saved = core::mem::take(&mut self.labels);
-                    self.check_top_level_scope(body)?;
+                    // A class static block is always strict-mode code.
+                    self.check_top_level_scope(body, true)?;
                     for s in body {
                         self.stmt(s, &c2)?;
                     }
@@ -1068,23 +1069,34 @@ impl Validator {
 
     /// Checks a *block* lexical scope (a `{ … }` block or catch/finally body),
     /// where a function declaration is itself a lexically-declared name.
-    fn check_lexical_scope(&self, body: &[Stmt]) -> Result<()> {
+    fn check_lexical_scope(&self, body: &[Stmt], strict: bool) -> Result<()> {
         let refs: Vec<&Stmt> = body.iter().collect();
-        self.check_lexical_scope_refs(&refs, false)
+        self.check_lexical_scope_refs(&refs, false, strict)
     }
 
     /// Checks a *top-level* scope (the program body, a function body, or a
     /// static block), where a top-level function declaration is **var**-scoped
     /// rather than lexical and so does not clash with a `var` of the same name.
-    fn check_top_level_scope(&self, body: &[Stmt]) -> Result<()> {
+    fn check_top_level_scope(&self, body: &[Stmt], strict: bool) -> Result<()> {
         let refs: Vec<&Stmt> = body.iter().collect();
-        self.check_lexical_scope_refs(&refs, true)
+        self.check_lexical_scope_refs(&refs, true, strict)
     }
 
     /// Enforces that a scope's lexically-declared names are unique and do not
     /// collide with var-declared names hoisted into the same scope.
-    fn check_lexical_scope_refs(&self, body: &[&Stmt], top_level: bool) -> Result<()> {
-        let mut lexical: Vec<(Box<str>, Span)> = Vec::new();
+    ///
+    /// Per Annex B.3.3 (block) / B.3.2 (`switch` case block), in *sloppy* mode a
+    /// pair of duplicate `LexicallyDeclaredNames` is tolerated when **both** are
+    /// bound by `FunctionDeclaration`s — block-level functions get web-compat
+    /// var-style hoisting. Duplicates involving a `let`/`const`/`class`, and any
+    /// duplicate at all in strict mode, remain early errors.
+    fn check_lexical_scope_refs(
+        &self,
+        body: &[&Stmt],
+        top_level: bool,
+        strict: bool,
+    ) -> Result<()> {
+        let mut lexical: Vec<(Box<str>, Span, bool)> = Vec::new();
         let mut vars: Vec<Box<str>> = Vec::new();
 
         for stmt in body {
@@ -1093,13 +1105,19 @@ impl Validator {
         for i in 0..lexical.len() {
             for j in (i + 1)..lexical.len() {
                 if lexical[i].0 == lexical[j].0 {
+                    // The sole tolerated duplicate: two function declarations in
+                    // a sloppy block/switch scope (Annex B).
+                    let both_functions = lexical[i].2 && lexical[j].2;
+                    if both_functions && !strict {
+                        continue;
+                    }
                     return Err(
                         self.err(lexical[j].1, "duplicate lexical declaration in this scope")
                     );
                 }
             }
         }
-        for (name, span) in &lexical {
+        for (name, span, _) in &lexical {
             if vars.iter().any(|v| v == name) {
                 return Err(self.err(
                     *span,
@@ -1117,7 +1135,7 @@ impl Validator {
 /// declarations of this scope.
 fn collect_top_level_decls(
     stmt: &Stmt,
-    lexical: &mut Vec<(Box<str>, Span)>,
+    lexical: &mut Vec<(Box<str>, Span, bool)>,
     vars: &mut Vec<Box<str>>,
     top_level: bool,
 ) {
@@ -1130,7 +1148,7 @@ fn collect_top_level_decls(
                     let mut names = Vec::new();
                     collect_bound_names(&d.target, &mut names);
                     for (n, span) in names {
-                        lexical.push((n.into(), span));
+                        lexical.push((n.into(), span, false));
                     }
                 }
             }
@@ -1139,17 +1157,22 @@ fn collect_top_level_decls(
             if let Some(id) = &f.id {
                 // At program / function-body top level a function declaration is
                 // var-scoped (its name is a VarDeclaredName); inside a block or
-                // switch it is a lexically-declared name.
+                // switch it is a lexically-declared name. The flag marks the
+                // binding as eligible for the Annex B duplicate exception, which
+                // covers *plain* function declarations only — generator and
+                // async functions do not get block-level function hoisting, so a
+                // duplicate involving one of them remains an early error.
+                let annexb_fn = !f.is_generator && !f.is_async;
                 if top_level {
                     vars.push(id.name.clone());
                 } else {
-                    lexical.push((id.name.clone(), id.span));
+                    lexical.push((id.name.clone(), id.span, annexb_fn));
                 }
             }
         }
         Stmt::Class(c) => {
             if let Some(id) = &c.id {
-                lexical.push((id.name.clone(), id.span));
+                lexical.push((id.name.clone(), id.span, false));
             }
         }
         Stmt::Labeled { body, .. } => collect_top_level_decls(body, lexical, vars, top_level),
