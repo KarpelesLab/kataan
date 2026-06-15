@@ -4,6 +4,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  schedule:
+    # Nightly full Test262 conformance run (07:17 UTC — off the busy top of hour).
+    - cron: "17 7 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -114,3 +118,30 @@ jobs:
 
       - name: cargo doc --no-deps --all-features
         run: cargo doc --no-deps --all-features
+
+  test262_official:
+    name: Test262 full conformance (nightly)
+    # Heavy: runs the whole ~53k-test official corpus. Only on the nightly
+    # schedule or a manual dispatch, never on every PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Pull the pinned tc39/test262 corpus submodule (shallow).
+          submodules: recursive
+
+      - name: Fetch the intl crate (path-dependency sibling)
+        run: git clone --depth 1 https://github.com/KarpelesLab/intlrs.git ../unicoders
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      # Gates against tests/test262-status.txt: fails if any test regresses
+      # (fails while not listed in the ledger). Prints the measured pass-rate.
+      - name: Run the official Test262 corpus
+        run: cargo test --release --test test262_official -- --ignored --nocapture
