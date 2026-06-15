@@ -96,6 +96,13 @@ pub struct Realm {
     /// descriptor reports it and a later `length` redefine is validated. Same
     /// non-GC-root caveat as `frozen_arrays`.
     nonwritable_array_lengths: alloc::collections::BTreeSet<u64>,
+    /// Logical `length` of an array set above its dense backing capacity (a valid
+    /// uint32 length up to 2^32-1 that exceeds [`Limits::max_array_len`]). The dense
+    /// `Vec` storage is not actually grown that far (a multi-gigabyte allocation);
+    /// instead the spec-visible `length` is recorded here so `arr.length` and a
+    /// `length` descriptor report it. Cleared once the dense storage catches up or
+    /// `length` is set back within the cap. Same non-GC-root caveat as `aux_props`.
+    sparse_array_lengths: alloc::collections::BTreeMap<u64, usize>,
     /// The default prototype (`Object.prototype`) installed on objects created by
     /// [`new_object`](Realm::new_object) once the global environment is set up. A
     /// `None`-proto object (`Object.create(null)`) opts out explicitly.
@@ -143,6 +150,7 @@ impl Realm {
             sealed_arrays: alloc::collections::BTreeSet::new(),
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
             nonwritable_array_lengths: alloc::collections::BTreeSet::new(),
+            sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
             native_protos: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
@@ -1426,7 +1434,18 @@ impl Realm {
     #[must_use]
     pub fn array_length(&self, handle: Handle) -> Option<usize> {
         match self.heap.get(handle)? {
-            Cell::Array(a) => Some(a.len()),
+            Cell::Array(a) => {
+                let dense = a.len();
+                // A `length` set above the dense capacity (a valid uint32 beyond the
+                // storage cap) is recorded as a logical override; report whichever is
+                // larger so a later element write (growing the dense `Vec`) still wins.
+                Some(
+                    self.sparse_array_lengths
+                        .get(&handle.to_raw())
+                        .copied()
+                        .map_or(dense, |logical| logical.max(dense)),
+                )
+            }
             Cell::TypedArray { length, .. } => Some(*length),
             _ => None,
         }
@@ -1528,21 +1547,33 @@ impl Realm {
     }
 
     /// Sets an array's `length` (`arr.length = n`): truncates if smaller, pads
-    /// with `undefined` if larger. Returns `false` if not an array **or if the
-    /// requested length exceeds [`Limits::max_array_len`]** — in the latter case
-    /// the array is left untouched rather than triggering an unbounded
-    /// `Vec::resize` (`arr.length = 4e9` would otherwise request a multi-gigabyte
-    /// allocation and abort the process). A `false` here lets callers surface a
-    /// catchable `RangeError("Invalid array length")`.
+    /// with `undefined` if larger. Returns `false` only if not an array.
+    ///
+    /// A `len` within [`Limits::max_array_len`] resizes the dense backing `Vec`
+    /// directly. A larger `len` (still a valid uint32, validated by the caller) is
+    /// a *sparse* length: growing the dense `Vec` that far would request a
+    /// multi-gigabyte allocation, so the dense storage is left untouched and the
+    /// spec-visible `length` is recorded as a logical override (see
+    /// [`array_length`](Realm::array_length)). This makes `arr.length = 4294967295`
+    /// on an empty array report `4294967295` without materializing 4 billion holes.
     ///
     /// [`Limits::max_array_len`]: crate::limits::Limits::max_array_len
     pub fn set_array_length(&mut self, handle: Handle, len: usize) -> bool {
-        if len > self.limits.max_array_len {
-            return false;
-        }
+        let cap = self.limits.max_array_len;
+        let raw = handle.to_raw();
         match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
-                a.resize(len, NanBox::undefined());
+                if len > cap {
+                    // Sparse: keep whatever dense elements exist (already <= cap), and
+                    // record the logical length. A lowering below the dense size still
+                    // truncates the dense `Vec`, but here `len > cap >= a.len()`.
+                    self.sparse_array_lengths.insert(raw, len);
+                } else {
+                    // Within the dense cap: resize for real and drop any prior sparse
+                    // override (the dense length is now authoritative).
+                    a.resize(len, NanBox::undefined());
+                    self.sparse_array_lengths.remove(&raw);
+                }
                 true
             }
             None => false,
@@ -1985,12 +2016,14 @@ impl Realm {
             }
         }
         // A named aux property (e.g. a custom property on an array/function) follows
-        // its stored hidden flag.
+        // its stored hidden flag. The property may be a data slot *or* an accessor
+        // (a data property converted to a getter/setter keeps its enumerable flag),
+        // so consult both — `contains` only sees data slots.
         self.aux_props
             .get(&handle.to_raw())
             .and_then(|aux| self.heap.get(*aux))
             .and_then(Cell::as_object)
-            .is_some_and(|o| o.contains(key) && !o.is_hidden(key))
+            .is_some_and(|o| (o.contains(key) || o.accessor(key).is_some()) && !o.is_hidden(key))
     }
 
     /// Marks own property `key` non-enumerable (without changing its value).
@@ -3766,15 +3799,19 @@ mod tests {
     }
 
     #[test]
-    fn set_array_length_refuses_past_cap() {
+    fn set_array_length_sparse_past_cap() {
         let mut realm = Realm::new();
         let arr = realm.new_array(Vec::new());
-        // `a.length = 1e9` (> 100M cap) is refused, leaving the array empty.
-        assert!(!realm.set_array_length(arr, 1_000_000_000));
-        assert_eq!(realm.array_length(arr), Some(0));
-        // A modest length within the cap still works.
+        // `a.length = 1e9` (> 100M cap) is a *sparse* length: the dense backing is
+        // not grown (no multi-gigabyte allocation), but `length` reports the value.
+        assert!(realm.set_array_length(arr, 1_000_000_000));
+        assert_eq!(realm.array_length(arr), Some(1_000_000_000));
+        // A modest length within the cap resizes for real and drops the override.
         assert!(realm.set_array_length(arr, 5));
         assert_eq!(realm.array_length(arr), Some(5));
+        // Growing back past the cap re-arms the sparse override.
+        assert!(realm.set_array_length(arr, 4_294_967_295));
+        assert_eq!(realm.array_length(arr), Some(4_294_967_295));
     }
 
     #[test]

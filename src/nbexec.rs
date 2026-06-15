@@ -718,6 +718,8 @@ const NUMBER_PROTO_METHODS: &[&str] = &[
 ];
 /// `Boolean.prototype` methods exposed as first-class values.
 const BOOLEAN_PROTO_METHODS: &[&str] = &["toString", "valueOf"];
+/// `BigInt.prototype` methods exposed as first-class values.
+const BIGINT_PROTO_METHODS: &[&str] = &["toString", "toLocaleString", "valueOf"];
 /// `Set.prototype` methods exposed as first-class values.
 const SET_PROTO_METHODS: &[&str] = &[
     "add",
@@ -1621,6 +1623,27 @@ impl<'a> Interp<'a> {
         self.setup_first_class_prototype("String", STRING_PROTO_METHODS);
         self.setup_first_class_prototype("Number", NUMBER_PROTO_METHODS);
         self.setup_first_class_prototype("Boolean", BOOLEAN_PROTO_METHODS);
+        self.setup_first_class_prototype("BigInt", BIGINT_PROTO_METHODS);
+        // `BigInt.prototype[Symbol.toStringTag]` is the string "BigInt", an own data
+        // property `{writable:false, enumerable:false, configurable:true}`. Being
+        // configurable, it can be redefined (e.g. tests overwrite it with a non-string
+        // to verify `Object.prototype.toString` ignores non-string tags).
+        if let Some(bi_proto) = self
+            .current
+            .get("BigInt")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|f| self.realm.get_property(f, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            let tag_sym = self.well_known_symbol("toStringTag");
+            let tag_key = self.member_key(tag_sym);
+            let tag_val = self.new_str("BigInt");
+            self.realm.set_property(bi_proto, &tag_key, tag_val);
+            self.realm.mark_hidden(bi_proto, &tag_key);
+            self.realm.set_readonly_property(bi_proto, &tag_key);
+        }
         self.setup_first_class_prototype("Function", FUNCTION_PROTO_METHODS);
         self.setup_first_class_prototype("Set", SET_PROTO_METHODS);
         self.setup_first_class_prototype("Map", MAP_PROTO_METHODS);
@@ -6610,11 +6633,50 @@ impl<'a> Interp<'a> {
             // Otherwise allocate a fresh backing buffer and view it from offset 0.
             // `new T(arrayLike)` copies+coerces the source's elements into the buffer;
             // `new T(length)` / `new T()` zero-fill.
-            let src: Option<Vec<NanBox>> = args
+            let mut src: Option<Vec<NanBox>> = args
                 .first()
                 .copied()
                 .and_then(|v| v.as_handle().map(Handle::from_raw))
                 .and_then(|h| self.realm.elements_vec(h));
+            // InitializeTypedArrayFromArrayLike: a *plain object* with a `length`
+            // property and no `Symbol.iterator` (real arrays / typed arrays / buffers
+            // were already handled above; the iterable path is handled elsewhere).
+            // Read `length` (ToLength), then Get each index 0..length in order; the
+            // per-element ToNumber / ToBigInt coercion happens on the write below.
+            if src.is_none()
+                && let Some(h) = args
+                    .first()
+                    .copied()
+                    .and_then(|v| v.as_handle().map(Handle::from_raw))
+                && self.realm.object_keys(h).is_some()
+                && self.realm.string_value(h).is_none()
+            {
+                let iter_sym = self.well_known_symbol("iterator");
+                let iter_key = self.member_key(iter_sym);
+                let has_iter = self
+                    .realm
+                    .get_property(h, &iter_key)
+                    .is_some_and(|f| !matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null));
+                if !has_iter {
+                    let len_val = self.read_member(h, "length")?;
+                    // ToLength: ToNumber (fallible — a Symbol length is a TypeError),
+                    // then validate it as an allocatable length.
+                    let len_num = self.coerce_to_number(len_val)?;
+                    let raw = self.realm.to_number(len_num);
+                    let len = self.validate_alloc_len(raw, "Invalid typed array length")?;
+                    let bigint = is_bigint_kind(kind);
+                    let mut elems = Vec::with_capacity(len);
+                    for i in 0..len {
+                        let v = self.read_member(h, &alloc::format!("{i}"))?;
+                        // Coerce each element eagerly so a throwing `valueOf` / a Symbol
+                        // / (for a BigInt array) a non-BigInt value surfaces here rather
+                        // than being swallowed by the infallible bulk write below.
+                        let v = if bigint { v } else { self.coerce_to_number(v)? };
+                        elems.push(v);
+                    }
+                    src = Some(elems);
+                }
+            }
             let length = match (&src, args.first().copied()) {
                 (Some(s), _) => s.len(),
                 (None, Some(v)) => {
@@ -7944,19 +8006,21 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    /// C1: a user-facing `arr.length = n`. The realm refuses to resize past
-    /// `limits.max_array_len`; surface the refusal as a catchable
-    /// `RangeError("Invalid array length")` so `a.length = 1e9` throws rather than
-    /// silently doing nothing.
+    /// C1: a user-facing `arr.length = n`. A length above the uint32 ceiling
+    /// (2^32-1) is invalid per spec — surface a catchable
+    /// `RangeError("Invalid array length")`. A valid length above the dense
+    /// `limits.max_array_len` is stored as a *sparse* logical length by the realm
+    /// (no multi-gigabyte allocation), so it succeeds rather than throwing.
     fn set_array_length_checked(
         &mut self,
         handle: crate::heap::Handle,
         n: usize,
     ) -> Result<(), ExecError> {
-        if !self.realm.set_array_length(handle, n) && n > self.realm.limits.max_array_len {
+        if n as u64 > u64::from(u32::MAX) {
             let m = self.new_str("Invalid array length");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
+        self.realm.set_array_length(handle, n);
         Ok(())
     }
 
@@ -13688,6 +13752,24 @@ impl<'a> Interp<'a> {
         Ok(value)
     }
 
+    /// `ToNumber(value)` as a fallible operation: an object is taken through
+    /// ToPrimitive(number) (running `valueOf`/`toString`, which may throw), and a
+    /// Symbol is a TypeError. Returns the resulting `Number` NanBox. Used where a
+    /// later infallible `Realm::to_number` would silently swallow these errors —
+    /// e.g. coercing an array-like object's elements during typed-array construction.
+    fn coerce_to_number(&mut self, value: NanBox) -> Result<NanBox, ExecError> {
+        let prim = self.coerce_primitive(value, "number")?;
+        if prim
+            .as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| self.realm.symbol_at(h).is_some())
+        {
+            let m = self.new_str("Cannot convert a Symbol value to a number");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        Ok(NanBox::number(self.realm.to_number(prim)))
+    }
+
     fn coerce_object(&mut self, v: NanBox, hint: &str) -> Result<NanBox, ExecError> {
         if let Some(h) = v.as_handle().map(Handle::from_raw) {
             if self.realm.is_array(h) {
@@ -18165,24 +18247,32 @@ mod tests {
         );
     }
 
-    /// C1: a dense-array element write or `length` set whose growth would exceed
-    /// the configured `max_array_len` cap now throws a catchable
-    /// `RangeError("Invalid array length")` instead of being a silent no-op.
+    /// C1: a dense-array element *write* whose growth would exceed the configured
+    /// `max_array_len` cap throws a catchable `RangeError("Invalid array length")`
+    /// instead of being a silent no-op. A *length* set to a valid uint32 above the
+    /// cap is a spec-conformant sparse length (no allocation), not a RangeError;
+    /// only a length above the uint32 ceiling (2^32-1) is invalid.
     #[test]
     fn oversized_array_growth_throws_range_error() {
-        // `a[1e9] = 1` (index 1e9 > the 100M default cap) throws RangeError.
+        // `a[1e9] = 1` (index 1e9 > the 100M default cap) throws RangeError — a
+        // dense element write past the cap cannot be served.
         assert_eq!(
             run("var a=[1]; try{a[1e9]=1;'noThrow'}catch(e){e.constructor.name}"),
             "RangeError"
         );
-        // `a.length = 1e9` likewise.
+        // `a.length = 1e9` is a valid uint32: a sparse length, reported as-is, no throw.
         assert_eq!(
-            run("var a=[1]; try{a.length=1e9;'noThrow'}catch(e){e.constructor.name}"),
-            "RangeError"
+            run("var a=[1]; a.length=1e9; String(a.length)"),
+            "1000000000"
         );
-        // Computed `a["length"] = 1e9` is the same.
+        // Computed `a["length"] = 1e9` behaves the same.
         assert_eq!(
-            run("var a=[1]; try{a['length']=1e9;'noThrow'}catch(e){e.constructor.name}"),
+            run("var a=[1]; a['length']=1e9; String(a.length)"),
+            "1000000000"
+        );
+        // A length above the uint32 ceiling (2^32) is invalid → RangeError.
+        assert_eq!(
+            run("var a=[1]; try{a.length=4294967296;'noThrow'}catch(e){e.constructor.name}"),
             "RangeError"
         );
         // A within-cap grow / length set still works (no regression).

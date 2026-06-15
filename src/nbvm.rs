@@ -1494,15 +1494,16 @@ fn run_frame(
                         let pk = to_primitive(ctx, funcs, k, false);
                         let ks = ctx.realm.to_display_string(pk);
                         // C1: a computed `arr["length"] = n` (numeric string key) on
-                        // an array resizes; a refusal past the cap throws.
+                        // an array resizes; a length above the uint32 ceiling is
+                        // invalid (RangeError), a valid one past the dense cap is
+                        // stored as a sparse logical length.
                         if ctx.realm.is_array(handle) && ks == "length" {
                             let n = num(regs[*src as usize]).unwrap_or(0.0).max(0.0) as usize;
-                            if !ctx.realm.set_array_length(handle, n)
-                                && n > ctx.realm.limits.max_array_len
-                            {
+                            if n as u64 > u64::from(u32::MAX) {
                                 let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                                 handle_throw!(VmError::Thrown(e));
                             }
+                            ctx.realm.set_array_length(handle, n);
                             continue;
                         }
                         ctx.realm.set_property(handle, &ks, regs[*src as usize]);
@@ -1701,17 +1702,16 @@ fn run_frame(
                     ctx.realm.set_regex_last_index(handle, n);
                     continue;
                 }
-                // `arr.length = n` resizes the array (truncate/pad). C1: a resize
-                // past the capacity cap is refused by the realm; surface it as a
-                // catchable `RangeError("Invalid array length")` so `a.length = 1e9`
-                // throws rather than silently doing nothing.
+                // `arr.length = n` resizes the array (truncate/pad). A length above
+                // the uint32 ceiling is invalid (catchable `RangeError`); a valid one
+                // past the dense capacity cap is stored as a sparse logical length.
                 if key.as_str() == "length" && ctx.realm.is_array(handle) {
                     let n = num(regs[*src as usize]).unwrap_or(0.0).max(0.0) as usize;
-                    if !ctx.realm.set_array_length(handle, n) && n > ctx.realm.limits.max_array_len
-                    {
+                    if n as u64 > u64::from(u32::MAX) {
                         let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                         handle_throw!(VmError::Thrown(e));
                     }
+                    ctx.realm.set_array_length(handle, n);
                     continue;
                 }
                 // A setter accessor takes precedence over a data slot.
@@ -6808,10 +6808,12 @@ mod tests {
         realm.to_display_string(value)
     }
 
-    /// C1: in the bytecode VM, a dense-array element write or `length` set past
-    /// the `max_array_len` cap raises a catchable `RangeError`. Exercised through
-    /// the production `execute` entry (VM with the tree-walker fallback) since a
-    /// raw `bc()` run has no fallback for the `try`/`catch` and `RangeError` ctor.
+    /// C1: in the bytecode VM, a dense-array element write past the
+    /// `max_array_len` cap raises a catchable `RangeError`. A `length` set to a
+    /// valid uint32 above the cap is a spec-conformant sparse length (no throw);
+    /// only a length above the uint32 ceiling is invalid. Exercised through the
+    /// production `execute` entry (VM with the tree-walker fallback) since a raw
+    /// `bc()` run has no fallback for the `try`/`catch` and `RangeError` ctor.
     #[test]
     fn vm_oversized_array_growth_throws_range_error() {
         let v = |src: &str| -> String {
@@ -6820,23 +6822,26 @@ mod tests {
                 Err(e) => alloc::format!("ERR:{e}"),
             }
         };
-        // Caught inside JS → RangeError instance.
+        // A dense element write past the cap → caught RangeError instance.
         assert_eq!(
             v("var a=[1]; try{a[1e9]=1;'no'}catch(e){e.constructor.name}"),
             "RangeError"
         );
+        // A valid uint32 `length` set is a sparse length (no throw); reported as-is.
+        assert_eq!(v("var a=[1]; a.length=1e9; String(a.length)"), "1000000000");
         assert_eq!(
-            v("var a=[1]; try{a.length=1e9;'no'}catch(e){e.constructor.name}"),
-            "RangeError"
+            v("var a=[1]; a['length']=1e9; String(a.length)"),
+            "1000000000"
         );
-        // Uncaught → surfaced as a RangeError completion (not a silent no-op).
+        // Uncaught element-write overflow → surfaced as a RangeError completion.
         assert_eq!(
             v("var a=[1]; a[1e9]=1"),
             "ERR:RangeError: Invalid array length"
         );
+        // A length above the uint32 ceiling (2^32) is invalid → RangeError.
         assert_eq!(
-            v("var a=[1]; a.length=1e9"),
-            "ERR:RangeError: Invalid array length"
+            v("var a=[1]; try{a.length=4294967296;'no'}catch(e){e.constructor.name}"),
+            "RangeError"
         );
         // Within-cap writes / length sets are unchanged; `arr.length = n` now also
         // truncates correctly on the VM path.
