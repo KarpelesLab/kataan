@@ -333,6 +333,25 @@ impl Parser {
         };
         // A trailing `?` makes the quantifier lazy.
         let greedy = !self.eat('?');
+        // A quantifier may not follow a non-quantifiable assertion. A lookbehind
+        // can never be quantified; a lookahead is quantifiable only under Annex B
+        // (non-`u`). `^`, `$`, `\b`, `\B` are likewise unquantifiable under `u`.
+        match &atom {
+            Node::LookBehind { .. } => {
+                return Err(RegexError::new(
+                    "a lookbehind assertion is not quantifiable",
+                ));
+            }
+            Node::Look { .. } if self.unicode => {
+                return Err(RegexError::new(
+                    "a lookahead assertion is not quantifiable in unicode mode",
+                ));
+            }
+            Node::Start | Node::End | Node::WordBoundary { .. } if self.unicode => {
+                return Err(RegexError::new("this assertion is not quantifiable"));
+            }
+            _ => {}
+        }
         Ok(Node::Repeat {
             inner: Box::new(atom),
             min,

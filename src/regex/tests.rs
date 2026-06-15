@@ -468,3 +468,20 @@ fn unicode_mode_strict_syntax() {
     // SyntaxCharacter identity escapes are valid under `u`.
     assert!(Regex::new(r"\.\*\+\?\(\)\[\]\{\}\|\^\$\\\/", "u").is_ok());
 }
+
+#[test]
+fn quantifier_on_assertion() {
+    // A lookbehind is never quantifiable (both modes).
+    assert!(Regex::new(r"(?<=a)?b", "").is_err());
+    assert!(Regex::new(r"(?<=a)?b", "u").is_err());
+    assert!(Regex::new(r"(?<=a){2}b", "u").is_err());
+    // A lookahead is quantifiable under Annex B (non-`u`) but not under `u`.
+    assert!(Regex::new(r"(?=a)?b", "").is_ok());
+    assert!(Regex::new(r"(?=a)*b", "").is_ok());
+    assert!(Regex::new(r"(?=a)?b", "u").is_err());
+    // `^`, `$`, `\b` are unquantifiable under `u`.
+    assert!(Regex::new(r"^?a", "u").is_err());
+    assert!(Regex::new(r"\b?a", "u").is_err());
+    // A quantified group around an assertion is fine.
+    assert!(Regex::new(r"(?:^)+", "u").is_ok());
+}
