@@ -30,6 +30,15 @@
 //!   scope; lexical declarations may not bind the name `let`.
 //! - **Duplicate parameters** in a strict-mode or non-simple parameter list, and
 //!   a `"use strict"` directive in a non-simple-parameter function.
+//! - **Jumps/labels**: `return` only inside a function; `break`/`continue` only
+//!   with a valid (in-scope, loop-vs-switch-appropriate) target; no duplicate
+//!   label; the label/jump state resets at each function boundary.
+//! - **Assignment/update targets**: `++`/`--` and compound-assignment operands
+//!   must be simple references; a `=` target must be a valid (possibly
+//!   destructuring) target with a trailing-only rest; in strict mode neither the
+//!   target nor any binding may be `eval`/`arguments`.
+//! - **`new.target`** only inside a function-like body (not top-level).
+//! - **Optional chains** may not carry a tagged template tail.
 
 use crate::ast::{
     Arrow, ArrowBody, BindingTarget, Class, ClassMember, Expr, ForLeft, Function, MethodKind,
