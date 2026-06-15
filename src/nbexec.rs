@@ -845,7 +845,9 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "getMinutes" | "getUTCMinutes" | "getSeconds" | "getUTCSeconds"
         | "getMilliseconds" | "getUTCMilliseconds" | "getTimezoneOffset"
         | "toISOString" | "toDateString" | "toTimeString" | "toUTCString"
-        | "toLocaleDateString" | "toLocaleTimeString" => 0,
+        | "toLocaleDateString" | "toLocaleTimeString"
+        // `Date.now()` takes no arguments.
+        | "now" => 0,
         // Two-argument methods.
         "slice" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
         | "replaceAll" | "padStart" | "padEnd" | "with" | "setInt8" | "setUint8" | "asIntN"
@@ -6771,7 +6773,7 @@ impl<'a> Interp<'a> {
                             if let Some(h) = prim.as_handle().map(Handle::from_raw)
                                 && let Some(s) = self.realm.string_value(h)
                             {
-                                crate::realm::parse_iso_date(&s).map_or(f64::NAN, time_clip)
+                                crate::realm::parse_date_string(&s).map_or(f64::NAN, time_clip)
                             } else {
                                 let v = self.coerce_to_number(prim)?;
                                 time_clip(self.realm.to_number(v))
@@ -9691,9 +9693,10 @@ impl<'a> Interp<'a> {
         }
         // `Date.parse(str)` → epoch ms (or NaN) by ISO parsing.
         if self.realm.native_at(handle) == Some(N_DATE) && method == "parse" {
-            let s = self.realm.to_display_string(arg(0));
+            // ToString(arg), then parse and TimeClip (out-of-range → NaN).
+            let s = self.coerce_to_string(arg(0))?;
             return Ok(Some(NanBox::number(
-                crate::realm::parse_iso_date(&s).unwrap_or(f64::NAN),
+                crate::realm::parse_date_string(&s).map_or(f64::NAN, time_clip),
             )));
         }
         // --- `Date.UTC(year, month, day?, h?, m?, s?, ms?)` → epoch ms ---
@@ -10108,6 +10111,27 @@ impl<'a> Interp<'a> {
         }
         // --- Date instance methods ---
         if let Some(ms) = self.realm.date_at(handle) {
+            // A user-overridden prototype method wins over the built-in dispatch
+            // (e.g. `Date.prototype.toString = Object.prototype.toString`). If the
+            // method resolves on the proto chain to anything other than a first-class
+            // `Date.prototype` native, call that instead.
+            if let Some(m) = self.realm.object_proto(handle).and_then(|p| {
+                let mut cur = Some(p);
+                while let Some(c) = cur {
+                    if self.realm.has_own(c, method) {
+                        return self.realm.get_property(c, method);
+                    }
+                    cur = self.realm.object_proto(c);
+                }
+                None
+            }) && let Some(mh) = m.as_handle().map(Handle::from_raw)
+                && self.realm.bound_native_at(mh).map(|(id, _)| id) != Some(N_DATE_PROTO_FN)
+                && self.realm.native_at(mh) != Some(N_DATE_TO_JSON)
+                && self.realm.native_at(mh) != Some(N_DATE_TO_PRIMITIVE)
+                && self.is_callable(mh)
+            {
+                return Ok(Some(self.call_with_this(m, recv, args)?));
+            }
             // An invalid (NaN) date: every numeric getter is `NaN` (the field
             // decomposition below would otherwise read garbage from `0`).
             if !ms.is_finite()

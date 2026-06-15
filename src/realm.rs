@@ -3179,7 +3179,13 @@ pub fn parse_iso_date(s: &str) -> Option<f64> {
         (1, date)
     };
     let mut dp = date_body.split('-');
-    let y: i64 = year_sign * dp.next()?.parse::<i64>().ok()?;
+    let year_field = dp.next()?;
+    let y_mag: i64 = year_field.parse::<i64>().ok()?;
+    // `-000000` (negative zero as an expanded year) is invalid per spec.
+    if year_sign < 0 && y_mag == 0 {
+        return None;
+    }
+    let y: i64 = year_sign * y_mag;
     // Month and day are optional: `YYYY` and `YYYY-MM` are valid ISO date forms
     // (defaulting the omitted fields to 1), per Date Time String Format.
     let mo: u32 = match dp.next() {
@@ -3243,6 +3249,57 @@ pub fn parse_iso_date(s: &str) -> Option<f64> {
             ms += padded.parse::<i64>().ok()?;
         }
         ms -= offset_min * 60_000;
+    }
+    Some(ms as f64)
+}
+
+/// Parses a date string for `Date.parse`/`new Date(string)`: the ISO-8601 form
+/// first, then the implementation-defined human-readable forms this engine emits
+/// (`toString` and `toUTCString`, both UTC). Returns `None` on failure.
+#[must_use]
+pub fn parse_date_string(s: &str) -> Option<f64> {
+    if let Some(ms) = parse_iso_date(s) {
+        return Some(ms);
+    }
+    parse_human_date(s)
+}
+
+/// Parses the engine's `toString`/`toUTCString`/`toDateString` output:
+/// - `"Thu, 01 Jan 1970 00:00:00 GMT"` (toUTCString)
+/// - `"Thu Jan 01 1970 00:00:00 GMT+0000 (…)"` (toString)
+/// - `"Thu Jan 01 1970"` (toDateString)
+fn parse_human_date(s: &str) -> Option<f64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let s = s.trim();
+    // Drop a leading weekday token (`Thu` / `Thu,`).
+    let rest = s.split_once(' ').map(|(_, r)| r).unwrap_or(s);
+    let toks: alloc::vec::Vec<&str> = rest.split_whitespace().collect();
+    // Two layouts: `Mon DD YYYY [time…]` (toString) or `DD Mon YYYY [time…]`
+    // (toUTCString).
+    let (mon_str, day_str, year_str, time_idx) = if toks.len() >= 3
+        && MONTHS.contains(&toks[0])
+    {
+        (toks[0], toks[1], toks[2], 3)
+    } else if toks.len() >= 3 && MONTHS.contains(&toks[1]) {
+        (toks[1], toks[0], toks[2], 3)
+    } else {
+        return None;
+    };
+    let mo = MONTHS.iter().position(|&m| m == mon_str)? as u32 + 1;
+    let day: u32 = day_str.parse().ok()?;
+    let year: i64 = year_str.parse().ok()?;
+    let mut ms = days_from_civil(year, mo, day) * 86_400_000;
+    // Optional `HH:MM:SS` time component.
+    if let Some(time) = toks.get(time_idx)
+        && time.contains(':')
+    {
+        let mut tp = time.split(':');
+        let h: i64 = tp.next()?.parse().ok()?;
+        let mi: i64 = tp.next().unwrap_or("0").parse().ok()?;
+        let se: i64 = tp.next().unwrap_or("0").parse().ok()?;
+        ms += h * 3_600_000 + mi * 60_000 + se * 1000;
     }
     Some(ms as f64)
 }
