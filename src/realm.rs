@@ -1190,6 +1190,37 @@ impl Realm {
             }
             return Some(names);
         }
+        // A native / bound-native / VM-function cell keeps its own named properties
+        // (e.g. a built-in function's `name`/`length`) in its auxiliary object.
+        if matches!(
+            self.heap.get(handle),
+            Some(
+                Cell::Native(_)
+                    | Cell::BoundNative { .. }
+                    | Cell::Function { .. }
+                    | Cell::Class { .. }
+            )
+        ) {
+            let mut names = Vec::new();
+            if let Some(aux) = self
+                .aux_props
+                .get(&handle.to_raw())
+                .and_then(|h| self.heap.get(*h))
+                .and_then(Cell::as_object)
+            {
+                // `[[OwnPropertyKeys]]` order: integer indices ascending, then the
+                // rest in insertion order. `name`/`length` are stored as ordinary
+                // named keys, so `ordered_keys` already yields the spec order.
+                for k in aux
+                    .ordered_keys()
+                    .iter()
+                    .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                {
+                    names.push(alloc::string::String::from(*k));
+                }
+            }
+            return Some(names);
+        }
         None
     }
 
@@ -1482,20 +1513,35 @@ impl Realm {
     /// anything was removed.
     pub fn delete_property(&mut self, handle: Handle, key: &str) -> bool {
         let root = Rc::clone(&self.root_shape);
-        match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
-            Some(o) => {
-                // Deleting a non-configurable property (a sealed/frozen object, or
-                // one marked `configurable: false`) fails — but only if it exists;
-                // deleting a missing property is a no-op that still "succeeds".
-                if (o.is_sealed() || o.is_non_configurable(key)) && o.has_own_key(key) {
-                    return false;
-                }
-                o.delete(root, key);
-                true
+        if self.heap.get(handle).and_then(Cell::as_object).is_some() {
+            let o = self
+                .heap
+                .get_mut(handle)
+                .and_then(Cell::as_object_mut)
+                .expect("object cell");
+            // Deleting a non-configurable property (a sealed/frozen object, or
+            // one marked `configurable: false`) fails — but only if it exists;
+            // deleting a missing property is a no-op that still "succeeds".
+            if (o.is_sealed() || o.is_non_configurable(key)) && o.has_own_key(key) {
+                return false;
             }
-            // A non-object receiver: nothing to delete, which counts as success.
-            None => true,
+            o.delete(root, key);
+            return true;
         }
+        // A callable/array cell stores named props in its auxiliary object (e.g. a
+        // built-in function's `name`/`length`); delete there so `delete fn.length`
+        // actually removes the configurable own property.
+        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+            && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+        {
+            if (o.is_sealed() || o.is_non_configurable(key)) && o.has_own_key(key) {
+                return false;
+            }
+            o.delete(root, key);
+        }
+        // A non-object receiver with no aux: nothing to delete, which counts as
+        // success.
+        true
     }
 
     /// `Object.preventExtensions(obj)` — disallow new properties.
@@ -1628,9 +1674,7 @@ impl Realm {
         // Arrays, user functions, and native functions carry auxiliary named
         // properties (e.g. static methods on a built-in constructor); other
         // primitives (strings, numbers, …) reject property writes.
-        let aux_eligible = self.heap.get(handle).is_some_and(|c| {
-            c.as_array().is_some() || c.as_function().is_some() || c.as_native().is_some()
-        });
+        let aux_eligible = self.aux_eligible(handle);
         if aux_eligible {
             let aux = self.aux_object(handle);
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
@@ -1643,11 +1687,44 @@ impl Realm {
         false
     }
 
+    /// The object cell carrying `handle`'s named properties: the cell itself when
+    /// it is a plain object, otherwise its auxiliary object (a native/function/
+    /// array stores its named props — and their attribute flags — there). Returns
+    /// `None` when no property-bearing cell exists yet.
+    fn props_object(&self, handle: Handle) -> Option<&Object> {
+        if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
+            return Some(o);
+        }
+        let aux = self.aux_props.get(&handle.to_raw())?;
+        self.heap.get(*aux)?.as_object()
+    }
+
+    /// Whether the cell at `handle` keeps its named properties (and their
+    /// attribute flags) in an auxiliary object — arrays, user functions, native
+    /// functions, and bound natives (first-class prototype/static methods) all do.
+    fn aux_eligible(&self, handle: Handle) -> bool {
+        self.heap.get(handle).is_some_and(|c| {
+            c.as_array().is_some()
+                || c.as_function().is_some()
+                || c.as_native().is_some()
+                || c.as_bound_native().is_some()
+        })
+    }
+
     /// Marks own property `key` of the object at `handle` non-writable
-    /// (`defineProperty` with `writable: false`).
+    /// (`defineProperty` with `writable: false`). For a callable cell with no
+    /// inline object part (a native/function), the flag is recorded on its
+    /// auxiliary object so the property descriptor reports it.
     pub fn set_readonly_property(&mut self, handle: Handle, key: &str) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.set_readonly(key);
+            return;
+        }
+        if self.aux_eligible(handle) {
+            let aux = self.aux_object(handle);
+            if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                o.set_readonly(key);
+            }
         }
     }
 
@@ -1656,22 +1733,34 @@ impl Realm {
     pub fn clear_readonly_property(&mut self, handle: Handle, key: &str) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.clear_readonly(key);
+            return;
+        }
+        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+            && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+        {
+            o.clear_readonly(key);
         }
     }
 
-    /// Marks own property `key` non-configurable (it cannot be deleted).
+    /// Marks own property `key` non-configurable (it cannot be deleted). Recorded
+    /// on the auxiliary object for a callable cell with no inline object part.
     pub fn set_non_configurable_property(&mut self, handle: Handle, key: &str) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.set_non_configurable(key);
+            return;
+        }
+        if self.aux_eligible(handle) {
+            let aux = self.aux_object(handle);
+            if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                o.set_non_configurable(key);
+            }
         }
     }
 
     /// Whether own property `key` is non-writable (frozen or read-only).
     #[must_use]
     pub fn property_is_readonly(&self, handle: Handle, key: &str) -> bool {
-        self.heap
-            .get(handle)
-            .and_then(Cell::as_object)
+        self.props_object(handle)
             .is_some_and(|o| o.is_frozen() || o.is_readonly(key))
     }
 
@@ -1682,9 +1771,7 @@ impl Realm {
         if self.frozen_arrays.contains(&handle.to_raw()) {
             return true;
         }
-        self.heap
-            .get(handle)
-            .and_then(Cell::as_object)
+        self.props_object(handle)
             .is_some_and(|o| o.is_sealed() || o.is_non_configurable(key))
     }
 
@@ -1723,9 +1810,7 @@ impl Realm {
         }
         // Arrays/functions/natives keep named properties — and their non-enumerable
         // flags — in their auxiliary object (e.g. a native's `name`/`length`).
-        let aux_eligible = self.heap.get(handle).is_some_and(|c| {
-            c.as_array().is_some() || c.as_function().is_some() || c.as_native().is_some()
-        });
+        let aux_eligible = self.aux_eligible(handle);
         if aux_eligible {
             let aux = self.aux_object(handle);
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
@@ -1748,9 +1833,7 @@ impl Realm {
         }
         // Arrays/functions/natives carry hidden slots in their auxiliary object
         // (e.g. a VM closure's function marker), kept non-enumerable there too.
-        let aux_eligible = self.heap.get(handle).is_some_and(|c| {
-            c.as_array().is_some() || c.as_function().is_some() || c.as_native().is_some()
-        });
+        let aux_eligible = self.aux_eligible(handle);
         if aux_eligible {
             let aux = self.aux_object(handle);
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {

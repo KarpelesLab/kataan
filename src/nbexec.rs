@@ -580,6 +580,12 @@ const N_REFLECT_PREVENT_EXT: u16 = 205;
 /// method name; calling it (via `.call`/`.apply`) dispatches that array method on
 /// the supplied `this` (so `Array.prototype.slice.call(arguments)` works).
 const N_ARRAY_PROTO_FN: u16 = 206;
+/// A first-class `ArrayBuffer.prototype.<method>` (e.g. `slice`). Like
+/// [`N_ARRAY_PROTO_FN`] but validates that the call's `this` has an
+/// `[[ArrayBufferData]]` internal slot first (throwing a `TypeError` otherwise),
+/// so `ArrayBuffer.prototype.slice.call(nonBuffer)` rejects per spec rather than
+/// being silently treated as a generic array-like.
+const N_AB_PROTO_FN: u16 = 233;
 /// The `Array.prototype` methods exposed as first-class values (each re-dispatched
 /// through `call_method`).
 const ARRAY_PROTO_METHODS: &[&str] = &[
@@ -719,6 +725,66 @@ const DATA_VIEW_METHODS: &[&str] = &[
     "setBigInt64",
     "setBigUint64",
 ];
+/// The spec `length` (declared arity) of a first-class built-in *method* — an
+/// `Array`/`String`/`Map`/`Set`/… prototype method or a readable static method,
+/// exposed as a bound native. Per ECMA-262 each built-in function's `length` is
+/// the count of required leading parameters. Names not listed default to 1
+/// (the overwhelmingly common arity), which keeps unknown/auxiliary methods from
+/// reporting a misleading 0.
+#[must_use]
+fn builtin_method_arity(name: &str) -> u32 {
+    match name {
+        // Zero-argument methods (predicates, coercion, iterators, accessors).
+        "pop" | "shift" | "reverse" | "keys" | "values" | "entries" | "toString"
+        | "toLocaleString" | "valueOf" | "flat" | "clear" | "trim" | "trimStart" | "trimEnd"
+        | "toUpperCase" | "toLowerCase" | "toLocaleUpperCase" | "toLocaleLowerCase"
+        | "toReversed" | "toSorted" | "isWellFormed" | "toWellFormed" | "getInt8" | "getUint8" => 0,
+        // Two-argument methods.
+        "slice" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
+        | "replaceAll" | "padStart" | "padEnd" | "with" | "setInt8" | "setUint8" => 2,
+        // Three-argument typed-array helpers (none currently bound) → fall through.
+        // Everything else (map/filter/forEach/reduce/indexOf/slice/at/push/…)
+        // declares a single required parameter.
+        _ => 1,
+    }
+}
+
+/// The spec `length` of a built-in *constructor*/global function, keyed by its
+/// native dispatch id. Only ids that escape as first-class values need an exact
+/// answer for `verifyProperty`; unmapped ids default to 1.
+#[must_use]
+fn builtin_native_arity(id: u16) -> u32 {
+    match id {
+        // Length 0.
+        N_MATH_RANDOM => 0,
+        // Length 2.
+        N_OBJECT_SET_PROTO
+        | N_OBJECT_IS
+        | N_OBJECT_HAS_OWN
+        | N_OBJECT_DEFINE_PROPS
+        | N_REFLECT_GET
+        | N_REFLECT_HAS
+        | N_REFLECT_GET_OWN_DESC
+        | N_REFLECT_SET_PROTO
+        | N_REFLECT_DELETE
+        | N_REFLECT_APPLY
+        | N_PARSE_INT
+        | N_OBJECT_GET_OWN_DESC
+        | N_MATH_MAX
+        | N_MATH_MIN
+        | N_MATH_POW
+        | N_MATH_ATAN2
+        | N_MATH_HYPOT
+        | N_MATH_IMUL => 2,
+        // Length 3.
+        N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP => 3,
+        // Default (String, Number, Boolean, Array, Object, Error family, RegExp,
+        // Promise, Map, Set, Symbol, parseFloat, the single-arg Object/Reflect
+        // statics, …) — one declared parameter.
+        _ => 1,
+    }
+}
+
 /// Bound native: the `revoke` function from `Proxy.revocable` (carries the proxy).
 const N_PROXY_REVOKE: u16 = 122;
 const N_SYMBOL: u16 = 38;
@@ -805,6 +871,15 @@ const DATA_VIEW_OFF: &str = "\u{0}dvoff";
 /// An explicit `DataView` byteLength (the 3rd constructor arg); absent → the rest
 /// of the buffer from the offset.
 const DATA_VIEW_LEN: &str = "\u{0}dvlen";
+/// Brands the `ArrayBuffer.prototype` / `DataView.prototype` / `%TypedArray%`-kind
+/// prototype objects. The `byteLength`/`buffer`/`byteOffset`/`detached`/… accessors
+/// are spec accessor *properties* defined on these prototypes: invoking the getter
+/// with a receiver that lacks the matching internal slot throws a `TypeError`. A
+/// branded prototype itself has no slot, so reading the accessor on it (or on any
+/// non-branded receiver inheriting it) must throw rather than return `undefined`.
+const ARRAY_BUFFER_PROTO_BRAND: &str = "\u{0}abproto";
+const DATA_VIEW_PROTO_BRAND: &str = "\u{0}dvproto";
+const TYPED_ARRAY_PROTO_BRAND: &str = "\u{0}taproto";
 const BOUND_TARGET: &str = "\u{0}bnd_t";
 const BOUND_THIS: &str = "\u{0}bnd_this";
 const BOUND_ARGS: &str = "\u{0}bnd_args";
@@ -911,13 +986,31 @@ impl<'a> Interp<'a> {
         self.realm.to_display_string(value)
     }
 
-    /// Creates a native function carrying its own (non-enumerable) `name`, per the
-    /// spec's named built-ins (`Math.max.name === "max"`).
-    fn new_named_native(&mut self, name: &str, id: u16) -> Handle {
-        let f = self.realm.new_native(id);
+    /// Installs the built-in function `name` and `length` own data properties on
+    /// `f` with the spec attributes `{ writable: false, enumerable: false,
+    /// configurable: true }`. Storing them physically (rather than synthesizing on
+    /// read) makes `f.hasOwnProperty("name")`, `delete f.length`, and
+    /// `defineProperty` redefinitions behave per spec — exactly what Test262's
+    /// `verifyProperty` exercises.
+    fn install_fn_name_length(&mut self, f: Handle, name: &str, length: u32) {
+        // Spec own-key order for a function is `length` before `name`.
+        self.realm
+            .set_property(f, "length", NanBox::number(f64::from(length)));
+        self.realm.mark_hidden(f, "length");
+        self.realm.set_readonly_property(f, "length");
         let name_v = self.new_str(name);
         self.realm.set_property(f, "name", name_v);
         self.realm.mark_hidden(f, "name");
+        self.realm.set_readonly_property(f, "name");
+    }
+
+    /// Creates a native function carrying its own `name`/`length` data properties,
+    /// per the spec's named built-ins (`Math.max.name === "max"`,
+    /// `Math.max.length === 2`), each with attributes `{ writable: false,
+    /// enumerable: false, configurable: true }`.
+    fn new_named_native(&mut self, name: &str, id: u16) -> Handle {
+        let f = self.realm.new_native(id);
+        self.install_fn_name_length(f, name, builtin_native_arity(id));
         f
     }
 
@@ -938,6 +1031,7 @@ impl<'a> Interp<'a> {
         for &name in methods {
             let name_h = self.realm.new_string(name);
             let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
+            self.install_fn_name_length(f, name, builtin_method_arity(name));
             self.realm
                 .set_property(proto, name, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(proto, name);
@@ -969,6 +1063,7 @@ impl<'a> Interp<'a> {
         let ta = self.new_named_native("TypedArray", N_TYPED_ARRAY_ABSTRACT);
         self.realm
             .set_hidden_property(ta, "length", NanBox::number(0.0));
+        self.realm.set_readonly_property(ta, "length");
         self.realm.set_typed_array_intrinsic(ta);
         // Its `[[Prototype]]` is `Function.prototype`.
         if let Some(func_proto) = self
@@ -987,6 +1082,11 @@ impl<'a> Interp<'a> {
         let ta_proto = self.realm.new_object_with_proto(Some(obj_proto));
         self.realm
             .set_hidden_property(ta_proto, "constructor", NanBox::handle(ta.to_raw()));
+        // Brand `%TypedArray%.prototype` so its `buffer`/`byteLength`/`byteOffset`/
+        // `length` accessors throw a TypeError on a receiver without the
+        // `[[TypedArrayName]]` internal slot (e.g. the prototype itself).
+        self.realm
+            .set_hidden_property(ta_proto, TYPED_ARRAY_PROTO_BRAND, NanBox::boolean(true));
         self.realm
             .set_property(ta, "prototype", NanBox::handle(ta_proto.to_raw()));
         self.realm.mark_hidden(ta, "prototype");
@@ -994,12 +1094,14 @@ impl<'a> Interp<'a> {
         let from_fn = self.new_named_native("from", N_TYPED_ARRAY_FROM);
         self.realm
             .set_hidden_property(from_fn, "length", NanBox::number(1.0));
+        self.realm.set_readonly_property(from_fn, "length");
         self.realm
             .set_property(ta, "from", NanBox::handle(from_fn.to_raw()));
         self.realm.mark_hidden(ta, "from");
         let of_fn = self.new_named_native("of", N_TYPED_ARRAY_OF);
         self.realm
             .set_hidden_property(of_fn, "length", NanBox::number(0.0));
+        self.realm.set_readonly_property(of_fn, "length");
         self.realm
             .set_property(ta, "of", NanBox::handle(of_fn.to_raw()));
         self.realm.mark_hidden(ta, "of");
@@ -1056,6 +1158,16 @@ impl<'a> Interp<'a> {
             let proto = self.realm.new_object_with_proto(Some(obj_proto));
             self.realm
                 .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
+            // Brand the prototype so its slot-requiring accessors throw a TypeError
+            // when read with a receiver (e.g. the prototype itself) that has no
+            // internal slot.
+            let brand = if name == "ArrayBuffer" {
+                ARRAY_BUFFER_PROTO_BRAND
+            } else {
+                DATA_VIEW_PROTO_BRAND
+            };
+            self.realm
+                .set_hidden_property(proto, brand, NanBox::boolean(true));
             self.realm
                 .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
             self.realm.mark_hidden(ctor, "prototype");
@@ -1067,6 +1179,17 @@ impl<'a> Interp<'a> {
     fn readable_native_method(&mut self, name: &str) -> NanBox {
         let name_h = self.realm.new_string(name);
         let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
+        self.install_fn_name_length(f, name, builtin_method_arity(name));
+        NanBox::handle(f.to_raw())
+    }
+
+    /// Like [`readable_native_method`], but for an `ArrayBuffer.prototype` method
+    /// whose dispatch must first reject a `this` lacking the `[[ArrayBufferData]]`
+    /// internal slot (see [`N_AB_PROTO_FN`]).
+    fn readable_ab_method(&mut self, name: &str) -> NanBox {
+        let name_h = self.realm.new_string(name);
+        let f = self.realm.new_bound_native(N_AB_PROTO_FN, name_h);
+        self.install_fn_name_length(f, name, builtin_method_arity(name));
         NanBox::handle(f.to_raw())
     }
 
@@ -1090,6 +1213,7 @@ impl<'a> Interp<'a> {
                 NanBox::handle(name_h.to_raw()),
             ]);
             let f = self.realm.new_bound_native(N_STATIC_METHOD, pair);
+            self.install_fn_name_length(f, name, builtin_method_arity(name));
             self.realm
                 .set_property(ns, name, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(ns, name);
@@ -1400,6 +1524,7 @@ impl<'a> Interp<'a> {
             );
             let name = self.new_str("Object");
             self.realm.set_hidden_property(obj_ns, "name", name);
+            self.realm.set_readonly_property(obj_ns, "name");
         }
         // `<Ctor>.prototype` as a real object whose methods are first-class values
         // that dispatch on their `this`, so the classic `Array.prototype.slice.call`
@@ -1444,6 +1569,32 @@ impl<'a> Interp<'a> {
         self.setup_static_methods("Symbol", &["for", "keyFor"]);
         self.setup_static_methods("Date", &["now", "parse", "UTC"]);
         self.setup_static_methods("BigInt", &["asIntN", "asUintN"]);
+        // `Object`/`Array`/`Reflect` are modeled as namespace objects (their call
+        // behavior is special-cased) rather than native-function cells, so they
+        // miss the function `name`/`length` synthesis. Install those own data
+        // properties explicitly with the built-in attributes
+        // `{ writable: false, enumerable: false, configurable: true }` so
+        // `verifyProperty` on e.g. `Object.length`/`Array.name` matches the spec.
+        // (`Object.name` was already installed above.) `Object.length === 1`,
+        // `Array.length === 1`.
+        for (ctor, ctor_name) in [("Array", "Array"), ("Reflect", "Reflect")] {
+            if let Some(h) = self.current.get(ctor).and_then(NanBox::as_handle) {
+                let h = Handle::from_raw(h);
+                let nv = self.new_str(ctor_name);
+                self.realm.set_hidden_property(h, "name", nv);
+                self.realm.set_readonly_property(h, "name");
+            }
+        }
+        // The callable namespace constructors `Object` and `Array` declare a
+        // single parameter; `Reflect` is a non-callable namespace (no `length`).
+        for ctor in ["Object", "Array"] {
+            if let Some(h) = self.current.get(ctor).and_then(NanBox::as_handle) {
+                let h = Handle::from_raw(h);
+                self.realm
+                    .set_hidden_property(h, "length", NanBox::number(1.0));
+                self.realm.set_readonly_property(h, "length");
+            }
+        }
         // Newly-created plain objects now inherit from `Object.prototype`.
         self.realm.set_default_object_proto(obj_proto);
         // `globalThis`: an object mirroring the global bindings, referencing
@@ -4365,6 +4516,31 @@ impl<'a> Interp<'a> {
                 return Some(NanBox::handle(d.to_raw()));
             }
         }
+        // Every built-in/ordinary function has own `length` and `name` data
+        // properties with attributes `{ writable: false, enumerable: false,
+        // configurable: true }` (ECMA-262 — "Built-in Function Objects" and
+        // CreateBuiltinFunction). When the value is computed rather than stored —
+        // natives carry no physical `length`; a bound function / class derives
+        // both `name` and `length` — synthesize the descriptor from the live
+        // value. A physically-stored own property (a user `defineProperty`, or a
+        // native whose `name` was installed as a real slot) flows through the
+        // generic data-property path below, which reads its recorded attributes.
+        if matches!(key, "length" | "name")
+            && !self.realm.has_own(obj, key)
+            && (self.is_callable(obj) || self.realm.class_at(obj).is_some())
+            && !self.realm.is_array(obj)
+        {
+            let v = self.read_member(obj, key).unwrap_or(NanBox::undefined());
+            let d = self.realm.new_object();
+            self.realm.set_property(d, "value", v);
+            self.realm
+                .set_property(d, "writable", NanBox::boolean(false));
+            self.realm
+                .set_property(d, "enumerable", NanBox::boolean(false));
+            self.realm
+                .set_property(d, "configurable", NanBox::boolean(true));
+            return Some(NanBox::handle(d.to_raw()));
+        }
         let configurable = NanBox::boolean(!self.realm.property_is_non_configurable(obj, key));
         if let Some((g, s)) = self.realm.accessor(obj, key) {
             let d = self.realm.new_object();
@@ -4803,6 +4979,23 @@ impl<'a> Interp<'a> {
         }
         // A bound native (promise resolve/reject) carries its target.
         if let Some((id, target)) = self.realm.bound_native_at(handle) {
+            // A first-class `ArrayBuffer.prototype.<method>`: reject a `this` that is
+            // not an Object with an `[[ArrayBufferData]]` slot, then dispatch.
+            if id == N_AB_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let ok = this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| self.realm.get_property(h, ARRAY_BUFFER_BYTES).is_some());
+                if !ok {
+                    return Err(self.type_error(&alloc::format!(
+                        "ArrayBuffer.prototype.{name} called on a non-ArrayBuffer object"
+                    )));
+                }
+                return Ok(self
+                    .call_method(this_val, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
             // A first-class `Array.prototype.<method>`: run that array method on the
             // call's `this` (e.g. `Array.prototype.slice.call(arguments)`).
             if id == N_ARRAY_PROTO_FN {
@@ -7208,6 +7401,33 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(Some(out))
+    }
+
+    /// A `TypeError` throw with `message`, ready to bubble out of `read_member`
+    /// etc. as `Err(ExecError::Throw(..))`.
+    fn type_error(&mut self, message: &str) -> ExecError {
+        let m = self.new_str(message);
+        ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
+    }
+
+    /// Whether `handle` or any object on its prototype chain carries the hidden
+    /// `brand` marker. Used to detect that a receiver inherits a branded built-in
+    /// prototype (`ArrayBuffer.prototype`, `%TypedArray%.prototype`, …) whose
+    /// slot-requiring accessors must throw when no internal slot is present.
+    fn brand_on_chain(&self, handle: Handle, brand: &str) -> bool {
+        let mut cur = Some(handle);
+        let mut guard = 0;
+        while let Some(h) = cur {
+            if self.realm.has_own(h, brand) {
+                return true;
+            }
+            guard += 1;
+            if guard > 1000 {
+                break;
+            }
+            cur = self.realm.object_proto(h);
+        }
+        false
     }
 
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
@@ -13770,6 +13990,38 @@ impl<'a> Interp<'a> {
                 self.new_str(def.name)
             });
         }
+        // A built-in function's `name` and `length`. Plain natives carry `name` in
+        // their aux object (resolved above / via `member_value`) but no physical
+        // `length`; first-class prototype/static methods (bound natives) carry
+        // neither. Synthesize both from the dispatch identity so every built-in
+        // function exposes the spec-mandated own `name`/`length` data properties.
+        if matches!(name, "length" | "name") && !self.realm.has_own(handle, name) {
+            if let Some((id, target)) = self.realm.bound_native_at(handle) {
+                let method = if id == N_ARRAY_PROTO_FN || id == N_AB_PROTO_FN {
+                    self.realm.string_value(target)
+                } else if id == N_STATIC_METHOD {
+                    self.realm
+                        .array_elements(target)
+                        .and_then(|p| p.get(1).copied())
+                        .and_then(|v| v.as_handle().map(Handle::from_raw))
+                        .and_then(|h| self.realm.string_value(h))
+                } else {
+                    None
+                };
+                if let Some(method) = method {
+                    return Ok(if name == "name" {
+                        self.new_str(&method)
+                    } else {
+                        NanBox::number(builtin_method_arity(&method) as f64)
+                    });
+                }
+            }
+            if let Some(id) = self.realm.native_at(handle)
+                && name == "length"
+            {
+                return Ok(NanBox::number(builtin_native_arity(id) as f64));
+            }
+        }
         // `Number.*` static constants.
         if self.realm.native_at(handle) == Some(N_NUMBER) {
             match name {
@@ -13829,16 +14081,61 @@ impl<'a> Interp<'a> {
                 _ => self.member_value(handle, name),
             });
         }
+        // Branded-prototype accessors. `ArrayBuffer.prototype.byteLength`,
+        // `DataView.prototype.buffer`, `%TypedArray%.prototype.buffer`, … are spec
+        // accessor properties whose getter requires the matching internal slot on
+        // its receiver (RequireInternalSlot). When the receiver inherits the
+        // branded prototype but lacks the slot — most visibly the prototype object
+        // itself (`ArrayBuffer.prototype.byteLength`) — the getter throws a
+        // TypeError instead of returning `undefined`. The slot-bearing instance
+        // paths below are reached first for real buffers/views/typed arrays (they
+        // have the `ARRAY_BUFFER_BYTES`/`DATA_VIEW_BUF`/typed-kind tags), so this
+        // only fires for slot-less receivers.
+        if self
+            .realm
+            .get_property(handle, ARRAY_BUFFER_BYTES)
+            .is_none()
+            && matches!(
+                name,
+                "byteLength" | "detached" | "maxByteLength" | "resizable"
+            )
+            && self.brand_on_chain(handle, ARRAY_BUFFER_PROTO_BRAND)
+        {
+            return Err(self
+                .type_error("ArrayBuffer.prototype accessor called on a non-ArrayBuffer object"));
+        }
+        if self.realm.get_property(handle, DATA_VIEW_BUF).is_none()
+            && matches!(name, "buffer" | "byteLength" | "byteOffset")
+            && self.brand_on_chain(handle, DATA_VIEW_PROTO_BRAND)
+        {
+            return Err(
+                self.type_error("DataView.prototype accessor called on a non-DataView object")
+            );
+        }
+        if self.realm.typed_kind(handle).is_none()
+            && matches!(name, "buffer" | "byteLength" | "byteOffset" | "length")
+            && self.brand_on_chain(handle, TYPED_ARRAY_PROTO_BRAND)
+        {
+            return Err(
+                self.type_error("TypedArray.prototype accessor called on a non-TypedArray object")
+            );
+        }
         // `ArrayBuffer.prototype.slice` as a readable method (so `typeof ab.slice ===
         // "function"` and a detached `ab.slice.call(ab, …)` work; it is dispatched in
         // `call_method`).
         if matches!(name, "slice" | "transfer" | "resize")
-            && self
+            && (self
                 .realm
                 .get_property(handle, ARRAY_BUFFER_BYTES)
                 .is_some()
+                // Also resolve as a method on `ArrayBuffer.prototype` itself, so
+                // `ArrayBuffer.prototype.slice.call(badThis)` reaches dispatch and
+                // throws a TypeError for the bad receiver (rather than failing as a
+                // non-callable read).
+                || self.brand_on_chain(handle, ARRAY_BUFFER_PROTO_BRAND))
         {
-            return Ok(self.readable_native_method(name));
+            // A receiver-validating bound native (rejects a non-ArrayBuffer `this`).
+            return Ok(self.readable_ab_method(name));
         }
         // `ArrayBuffer.prototype.resizable` / `.maxByteLength` (ES2024 resizable buffers).
         if matches!(name, "resizable" | "maxByteLength")
