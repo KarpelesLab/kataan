@@ -12680,14 +12680,10 @@ impl<'a> Interp<'a> {
             return Ok(result);
         }
         // A custom iterable: call `obj[Symbol.iterator]()` and drain `.next()`.
-        // The method may be an own/inherited property or a class method whose
-        // computed key is `Symbol.iterator` (`class C { *[Symbol.iterator]() {…} }`).
-        let iter_sym = self.well_known_symbol("iterator");
-        let iter_key = self.member_key(iter_sym);
-        let mut iter_fn = self.realm.get_property(h, &iter_key);
-        if iter_fn.is_none() {
-            iter_fn = self.class_iterator_method(h)?;
-        }
+        // The method may be an own/inherited property (anywhere on the prototype
+        // chain) or a class method whose computed key is `Symbol.iterator`
+        // (`class C { *[Symbol.iterator]() {…} }`).
+        let iter_fn = self.find_iterator_fn(h)?;
         if let Some(f) = iter_fn
             && f.as_handle()
                 .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
@@ -12769,6 +12765,27 @@ impl<'a> Interp<'a> {
         Ok(None)
     }
 
+    /// Resolves an object's `[Symbol.iterator]` method (`GetMethod`), looking up
+    /// the property through the *entire* prototype chain — so an iterable whose
+    /// `Symbol.iterator` is inherited (`Object.create(iterable)`, a subclass of
+    /// `Iterator`, a class instance whose method lives on its prototype) is found.
+    /// Falls back to the class-method scan for class instances whose computed
+    /// `[Symbol.iterator]` method is not yet materialized as a prototype property.
+    /// Returns `None` only when no iterator method exists anywhere on the chain.
+    fn find_iterator_fn(&mut self, h: crate::heap::Handle) -> Result<Option<NanBox>, ExecError> {
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
+        // `read_member` walks the prototype chain (and fires inherited accessors),
+        // so an inherited `Symbol.iterator` resolves here.
+        let fn_val = self.read_member(h, &iter_key)?;
+        if !matches!(fn_val.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Ok(Some(fn_val));
+        }
+        // A class instance whose `[Symbol.iterator]` is defined with a computed
+        // key may not surface as a readable prototype property; scan the class body.
+        self.class_iterator_method(h)
+    }
+
     /// The keys iterated by `for-in`: object property names or array indices,
     /// as strings.
     fn iterate_keys(&mut self, v: NanBox) -> Vec<NanBox> {
@@ -12829,13 +12846,9 @@ impl<'a> Interp<'a> {
         {
             return Ok(None);
         }
-        let iter_sym = self.well_known_symbol("iterator");
-        let iter_key = self.member_key(iter_sym);
-        let mut iter_fn = self.realm.get_property(h, &iter_key);
-        if iter_fn.is_none() {
-            iter_fn = self.class_iterator_method(h)?;
-        }
-        let Some(f) = iter_fn else { return Ok(None) };
+        let Some(f) = self.find_iterator_fn(h)? else {
+            return Ok(None);
+        };
         if !f
             .as_handle()
             .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
@@ -12892,8 +12905,10 @@ impl<'a> Interp<'a> {
             let r = (|| {
                 match left {
                     ForLeft::Decl { target, .. } => self.bind_pattern(target, item)?,
+                    // The head may be a plain reference or a destructuring pattern
+                    // (`for ([a, b] of …)`, `for ({ x } of …)`).
                     ForLeft::Target(expr) => {
-                        self.assign_to(expr, item)?;
+                        self.assign_destructure(expr, item)?;
                     }
                 }
                 self.exec(body)
@@ -12935,8 +12950,10 @@ impl<'a> Interp<'a> {
             let r = (|| {
                 match left {
                     ForLeft::Decl { target, .. } => self.bind_pattern(target, item)?,
+                    // The head may be a plain reference or a destructuring pattern
+                    // (`for ([a, b] of …)`, `for ({ x } of …)`).
                     ForLeft::Target(expr) => {
-                        self.assign_to(expr, item)?;
+                        self.assign_destructure(expr, item)?;
                     }
                 }
                 self.exec(body)

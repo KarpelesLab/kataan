@@ -376,7 +376,9 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*dst)?;
             reg(*obj)
         }
-        Op::ArrayPush { arr: a, src: b } | Op::ArrayExtend { arr: a, src: b } => {
+        Op::IterValues { dst: a, src: b }
+        | Op::ArrayPush { arr: a, src: b }
+        | Op::ArrayExtend { arr: a, src: b } => {
             reg(*a)?;
             reg(*b)
         }
@@ -726,6 +728,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
         Op::CollectionSize { dst, recv } => un(32, *dst, *recv, out),
         Op::ArrayPush { arr, src } => un(33, *arr, *src, out),
         Op::ArrayExtend { arr, src } => un(34, *arr, *src, out),
+        Op::IterValues { dst, src } => un(55, *dst, *src, out),
         Op::ArraySliceFrom { dst, src, from } => bin(35, *dst, *src, *from, out),
         Op::ObjectRest { dst, src, exclude } => {
             w_u8(36, out);
@@ -1090,6 +1093,10 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         54 => Op::NewArrayCtor {
             dst: r.reg()?,
             arg: r.reg()?,
+        },
+        55 => Op::IterValues {
+            dst: r.reg()?,
+            src: r.reg()?,
         },
         t => return Err(DecodeError::BadTag(t)),
     })

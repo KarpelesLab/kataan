@@ -133,6 +133,13 @@ pub enum Op {
     ArrayPush { arr: Reg, src: Reg },
     /// Appends every element of the array in `src` to `arr` (a spread).
     ArrayExtend { arr: Reg, src: Reg },
+    /// `dst = a fresh array of every value produced by iterating `src`` — the
+    /// built-in iteration of an array / typed array / string / `Map` / `Set`.
+    /// For any other value (a user iterable whose `[Symbol.iterator]` the VM
+    /// cannot resolve, or a non-iterable) this faults so the whole program
+    /// re-runs on the reference tree-walker, which drives the full iterator
+    /// protocol. Backs `for (… of …)` and `[...iterable]` over built-ins.
+    IterValues { dst: Reg, src: Reg },
     /// `dst = src.slice(from)` — a new array of `src`'s elements from index
     /// `from` (a numeric register) onward (for a rest pattern).
     ArraySliceFrom { dst: Reg, src: Reg, from: Reg },
@@ -629,6 +636,51 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         call_depth: 0,
     };
     Ok(run_frame(&mut ctx, &[], program, &mut regs)?.unwrap_or(NanBox::undefined()))
+}
+
+/// Collects every value produced by iterating `v`, for the bytecode VM's
+/// `for (… of …)` and array/argument spread over **built-in** iterables: a real
+/// array, a typed array, a string (per code point), or a `Map`/`Set` (a `Set`
+/// yields its values, a `Map` `[key, value]` pairs).
+///
+/// Returns `None` for anything else — a user object carrying a `[Symbol.iterator]`
+/// (whose well-known symbol key the VM does not track), a generator, or a
+/// non-iterable. The caller turns that into a `VmError` so the whole program
+/// re-runs on the reference tree-walker ([`crate::nbexec`]), which drives the
+/// full iterator protocol (including iterator-close and user `.next()`).
+fn vm_iterable_values(ctx: &mut Ctx, v: NanBox) -> Option<Vec<NanBox>> {
+    let h = v.as_handle().map(Handle::from_raw)?;
+    // A real array or typed-array view: snapshot its elements.
+    if let Some(elems) = ctx.realm.elements_vec(h) {
+        return Some(elems);
+    }
+    // A string iterates one entry per Unicode code point (a lone surrogate is a
+    // single one-unit string), exactly like the tree-walker.
+    if let Some(bytes) = ctx.realm.string_bytes(h) {
+        let mut out = Vec::new();
+        for cp in crate::wtf8::code_points(&bytes) {
+            let mut buf = Vec::new();
+            crate::wtf8::encode_code_point(cp, &mut buf);
+            out.push(NanBox::handle(ctx.realm.new_string_wtf8(buf).to_raw()));
+        }
+        return Some(out);
+    }
+    // `Map`/`Set` iterate their entries; the weak variants are not iterable.
+    if !ctx.realm.collection_is_weak(h)
+        && let Some(entries) = ctx.realm.collection_entries(h)
+    {
+        if ctx.realm.collection_is_set(h) == Some(true) {
+            return Some(entries.iter().map(|(k, _)| *k).collect());
+        }
+        let mut out = Vec::with_capacity(entries.len());
+        for (k, val) in entries {
+            out.push(NanBox::handle(
+                ctx.realm.new_array(alloc::vec![k, val]).to_raw(),
+            ));
+        }
+        return Some(out);
+    }
+    None
 }
 
 /// Builds an error value `{ name, message }` in the realm (for runtime throws).
@@ -1569,16 +1621,20 @@ fn run_frame(
             }
             Op::ArrayExtend { arr, src } => {
                 let handle = object_handle(regs[*arr as usize])?;
-                let srch = object_handle(regs[*src as usize])?;
-                let elems = ctx
-                    .realm
-                    .array_elements(srch)
-                    .map(<[_]>::to_vec)
+                // A spread of any built-in iterable (array / typed array / string
+                // / Map / Set); a user iterable faults to the tree-walker, which
+                // drives the full iterator protocol.
+                let elems = vm_iterable_values(ctx, regs[*src as usize])
                     .ok_or(VmError::NotAnObject)?;
                 let start = ctx.realm.array_length(handle).unwrap_or(0);
                 for (i, e) in elems.into_iter().enumerate() {
                     ctx.realm.set_element(handle, start + i, e);
                 }
+            }
+            Op::IterValues { dst, src } => {
+                let elems = vm_iterable_values(ctx, regs[*src as usize])
+                    .ok_or(VmError::NotAnObject)?;
+                regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(elems).to_raw());
             }
             Op::ObjectRest { dst, src, exclude } => {
                 let srch = object_handle(regs[*src as usize])?;
@@ -5157,7 +5213,10 @@ impl Compiler {
                 self.exit_loop(top); // `continue` re-tests
                 Ok(None)
             }
-            // `for (const x of arr)` over an array, indexed by a hidden counter.
+            // `for (const x of iterable)` — materialize the iterable's values into
+            // an array (the built-in iteration of an array / typed array / string /
+            // Map / Set; a user iterable or generator faults at `IterValues` and the
+            // program re-runs on the tree-walker), then index it by a hidden counter.
             Stmt::ForOf {
                 left, right, body, ..
             } => {
@@ -5166,7 +5225,9 @@ impl Compiler {
                     return Err(CompileError::Unsupported("for-of binding"));
                 };
                 self.scopes.push(alloc::collections::BTreeMap::new());
-                let arr = self.expr(right)?;
+                let src = self.expr(right)?;
+                let arr = self.alloc();
+                self.ops.push(Op::IterValues { dst: arr, src });
                 let len = self.alloc();
                 self.ops.push(Op::ArrayLen { dst: len, arr });
                 let i = self.alloc();
