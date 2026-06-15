@@ -10707,7 +10707,9 @@ impl<'a> Interp<'a> {
                 } else {
                     String::new()
                 };
-                Some((self.realm.to_display_string(arg(0)), flags))
+                // ToString the pattern argument, honoring a user `toString`/
+                // `@@toPrimitive` (which may throw).
+                Some((self.coerce_to_string(arg(0))?, flags))
             } else {
                 None
             };
@@ -11145,7 +11147,9 @@ impl<'a> Interp<'a> {
                 }
                 "replace" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    let from = self.realm.to_display_string(arg(0));
+                    // ToString the searchValue, propagating a throwing user
+                    // `toString` (the RegExp-argument form is not modeled here).
+                    let from = self.coerce_to_string(arg(0))?;
                     let repl = arg(1);
                     let is_fn = repl
                         .as_handle()
@@ -11180,7 +11184,7 @@ impl<'a> Interp<'a> {
                 }
                 "replaceAll" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    let from = self.realm.to_display_string(arg(0));
+                    let from = self.coerce_to_string(arg(0))?;
                     let repl = arg(1);
                     let is_fn = repl
                         .as_handle()
