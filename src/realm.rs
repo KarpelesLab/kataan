@@ -28,7 +28,10 @@ use crate::cell::Cell;
 use crate::gc::{self, Stats};
 use crate::heap::{Handle, Heap};
 use crate::nanbox::NanBox;
-use crate::nbexec::{coerce_typed, decode_typed_element, encode_typed_element};
+use crate::nbexec::{
+    coerce_typed, decode_bigint_element, decode_typed_element, encode_bigint_element,
+    encode_typed_element, is_bigint_kind,
+};
 use crate::object::Object;
 use crate::rope::Rope;
 use crate::shape::Shape;
@@ -37,8 +40,9 @@ use alloc::vec::Vec;
 
 /// Bytes-per-element for each typed-array `kind` (index into the engine's
 /// `TYPED_ARRAY_KINDS` table: Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32,
-/// Uint32, Float32, Float64). A `kind` outside `0..9` reads as size 1.
-const TYPED_ELEM_SIZE: [usize; 9] = [1, 1, 1, 2, 2, 4, 4, 4, 8];
+/// Uint32, Float32, Float64, BigInt64, BigUint64). A `kind` outside the table
+/// reads as size 1.
+const TYPED_ELEM_SIZE: [usize; 11] = [1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8];
 
 /// The byte size of one element of typed-array `kind`.
 #[must_use]
@@ -436,9 +440,10 @@ impl Realm {
     }
 
     /// `view[i]` — decodes element `i` from the shared bytes, or `undefined` for
-    /// an out-of-range index. `None` if `handle` is not a typed-array view.
-    #[must_use]
-    pub fn typed_get(&self, handle: Handle, i: usize) -> Option<NanBox> {
+    /// an out-of-range index. `None` if `handle` is not a typed-array view. A
+    /// `BigInt64Array`/`BigUint64Array` element decodes to a freshly allocated
+    /// `BigInt` (hence `&mut self`).
+    pub fn typed_get(&mut self, handle: Handle, i: usize) -> Option<NanBox> {
         let (buffer, byte_offset, length, kind) = self.heap.get(handle)?.as_typed_array()?;
         if i >= length {
             return Some(NanBox::undefined());
@@ -451,6 +456,10 @@ impl Realm {
         let slice = start
             .and_then(|s| s.checked_add(size).and_then(|e| bytes.get(s..e)))
             .unwrap_or(&[]);
+        if is_bigint_kind(kind) {
+            let big = decode_bigint_element(kind, slice);
+            return Some(NanBox::handle(self.new_bigint(big).to_raw()));
+        }
         Some(NanBox::number(decode_typed_element(kind, slice)))
     }
 
@@ -466,8 +475,22 @@ impl Realm {
         if i >= length {
             return true; // out-of-bounds typed-array write is a silent no-op
         }
-        let n = self.to_number(value);
-        let (enc, enc_len) = encode_typed_element(kind, coerce_typed(u16::from(kind), n));
+        let (enc, enc_len) = if is_bigint_kind(kind) {
+            // A BigInt element: the value must be a BigInt (the interpreter has
+            // already applied ToBigInt and thrown for a Number). A non-BigInt
+            // reaching here is rejected rather than silently written.
+            let Some(big) = value
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.bigint_at(h))
+            else {
+                return false;
+            };
+            (encode_bigint_element(&big), 8)
+        } else {
+            let n = self.to_number(value);
+            encode_typed_element(kind, coerce_typed(u16::from(kind), n))
+        };
         let size = typed_elem_size(kind);
         // Checked offset math: never wrap (debug panic / silent corruption) on a
         // pathological `i`.
@@ -496,8 +519,22 @@ impl Realm {
             return;
         };
         let size = typed_elem_size(kind);
-        let n = self.to_number(value);
-        let (enc, enc_len) = encode_typed_element(kind, coerce_typed(u16::from(kind), n));
+        let (enc, enc_len) = if is_bigint_kind(kind) {
+            // A BigInt-element fill: the value is a BigInt (already ToBigInt'd by
+            // the interpreter). A non-BigInt is a no-op (the interpreter throws
+            // before calling).
+            let Some(big) = value
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.bigint_at(h))
+            else {
+                return;
+            };
+            (encode_bigint_element(&big), 8)
+        } else {
+            let n = self.to_number(value);
+            encode_typed_element(kind, coerce_typed(u16::from(kind), n))
+        };
         let pat = &enc[..enc_len];
         let start = start.min(length);
         let end = end.min(length);
@@ -562,6 +599,44 @@ impl Realm {
         let Some((.., kind)) = self.heap.get(handle).and_then(Cell::as_typed_array) else {
             return;
         };
+        if is_bigint_kind(kind) {
+            // BigInt-element write-through: each source value must already be a
+            // BigInt (the interpreter applies ToBigInt and throws for a Number
+            // before calling). Pre-extract the low-64-bit encodings, then write
+            // them in one borrow of the backing bytes. A non-BigInt slot is left
+            // unwritten.
+            let encs: Vec<Option<[u8; 8]>> = values
+                .iter()
+                .map(|&v| {
+                    v.as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.bigint_at(h))
+                        .map(|b| encode_bigint_element(&b))
+                })
+                .collect();
+            let Some((buffer, byte_offset, length, _)) =
+                self.heap.get(handle).and_then(Cell::as_typed_array)
+            else {
+                return;
+            };
+            if let Some(bytes) = self.bytes_at_mut(buffer) {
+                for (j, enc) in encs.iter().enumerate() {
+                    let i = offset + j;
+                    if i >= length {
+                        break;
+                    }
+                    let Some(enc) = enc else { continue };
+                    let Some(start) = i.checked_mul(8).and_then(|o| byte_offset.checked_add(o))
+                    else {
+                        break;
+                    };
+                    if let Some(slot) = bytes.get_mut(start..start + 8) {
+                        slot.copy_from_slice(enc);
+                    }
+                }
+            }
+            return;
+        }
         // ToNumber first (may call user code / resize the buffer); collect plain
         // f64s so the subsequent byte write needs only one immutable conversion.
         let nums: Vec<f64> = values.iter().map(|&v| self.to_number(v)).collect();
@@ -642,11 +717,28 @@ impl Realm {
     }
 
     /// The decoded elements of the typed-array view at `handle` as an owned
-    /// vector, or `None` if it is not a view.
-    #[must_use]
-    pub fn typed_elements(&self, handle: Handle) -> Option<Vec<NanBox>> {
+    /// vector, or `None` if it is not a view. `BigInt64Array`/`BigUint64Array`
+    /// elements decode to freshly allocated `BigInt`s (hence `&mut self`).
+    pub fn typed_elements(&mut self, handle: Handle) -> Option<Vec<NanBox>> {
         let (buffer, byte_offset, length, kind) = self.heap.get(handle)?.as_typed_array()?;
         let size = typed_elem_size(kind);
+        if is_bigint_kind(kind) {
+            // Decode the raw BigInts first (immutable borrow of the bytes), then
+            // allocate each on the heap (needs `&mut self`).
+            let bytes = self.bytes_at(buffer)?;
+            let bigs: Vec<crate::bignum::BigInt> = (0..length)
+                .map(|i| {
+                    let start = byte_offset + i * size;
+                    let slice = bytes.get(start..start + size).unwrap_or(&[]);
+                    decode_bigint_element(kind, slice)
+                })
+                .collect();
+            return Some(
+                bigs.into_iter()
+                    .map(|b| NanBox::handle(self.new_bigint(b).to_raw()))
+                    .collect(),
+            );
+        }
         let bytes = self.bytes_at(buffer)?;
         Some(
             (0..length)
@@ -662,8 +754,7 @@ impl Realm {
     /// The elements of an array **or** typed-array view at `handle` as an owned
     /// vector. Unifies the read path so callers (iteration, spread, array
     /// methods, JSON, …) treat both alike. `None` for any other cell.
-    #[must_use]
-    pub fn elements_vec(&self, handle: Handle) -> Option<Vec<NanBox>> {
+    pub fn elements_vec(&mut self, handle: Handle) -> Option<Vec<NanBox>> {
         if let Some(a) = self.array_elements(handle) {
             return Some(a.to_vec());
         }
@@ -1342,9 +1433,9 @@ impl Realm {
     }
 
     /// `arr[index]` — the element at `index`, or `undefined` if out of range or
-    /// the cell is not an array (or typed-array view).
-    #[must_use]
-    pub fn get_element(&self, handle: Handle, index: usize) -> NanBox {
+    /// the cell is not an array (or typed-array view). Takes `&mut self` because a
+    /// `BigInt64Array`/`BigUint64Array` element read allocates a `BigInt`.
+    pub fn get_element(&mut self, handle: Handle, index: usize) -> NanBox {
         match self.heap.get(handle) {
             Some(Cell::Array(a)) => a.get(index).copied().unwrap_or(NanBox::undefined()),
             Some(Cell::TypedArray { .. }) => {
@@ -2473,14 +2564,30 @@ impl Realm {
                 Some(Cell::BigInt(n)) => alloc::format!("{n}"),
                 // A typed-array view stringifies as its comma-joined decoded
                 // elements (`Array#join` semantics over the shared bytes); the raw
-                // byte backing is internal and never directly displayed.
-                Some(Cell::TypedArray { .. }) => {
-                    let elems = self
-                        .typed_elements(Handle::from_raw(raw))
-                        .unwrap_or_default();
-                    let parts: Vec<alloc::string::String> = elems
-                        .iter()
-                        .map(|e| self.to_display_string_seen(*e, seen))
+                // byte backing is internal and never directly displayed. Decode
+                // each element straight to its string (no heap allocation), so this
+                // stays a `&self` method even for the BigInt element kinds.
+                Some(Cell::TypedArray {
+                    buffer,
+                    byte_offset,
+                    length,
+                    kind,
+                    ..
+                }) => {
+                    let (buffer, byte_offset, length, kind) =
+                        (*buffer, *byte_offset, *length, *kind);
+                    let size = typed_elem_size(kind);
+                    let bytes = self.bytes_at(buffer).unwrap_or(&[]);
+                    let parts: Vec<alloc::string::String> = (0..length)
+                        .map(|i| {
+                            let start = byte_offset + i * size;
+                            let slice = bytes.get(start..start + size).unwrap_or(&[]);
+                            if is_bigint_kind(kind) {
+                                alloc::format!("{}", decode_bigint_element(kind, slice))
+                            } else {
+                                js_number_string(decode_typed_element(kind, slice))
+                            }
+                        })
                         .collect();
                     parts.join(",")
                 }

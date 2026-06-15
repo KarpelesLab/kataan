@@ -483,8 +483,11 @@ const N_TYPED_ARRAY_SPECIES: u16 = 232;
 /// The typed-array constructors occupy `[BASE, BASE + KINDS.len())`; the id minus
 /// the base indexes [`TYPED_ARRAY_KINDS`].
 const N_TYPED_ARRAY_BASE: u16 = 168;
-/// `(name, bytes-per-element)` for each typed-array kind, in id order.
-const TYPED_ARRAY_KINDS: [(&str, u8); 9] = [
+/// `(name, bytes-per-element)` for each typed-array kind, in id order. Kinds 9
+/// and 10 hold **BigInt** elements (8 bytes, signed i64 / unsigned u64); the
+/// element read/write paths special-case them (see [`encode_typed_element`] /
+/// [`decode_typed_element`] and the BigInt coercion in [`Realm::typed_set`]).
+const TYPED_ARRAY_KINDS: [(&str, u8); 11] = [
     ("Int8Array", 1),
     ("Uint8Array", 1),
     ("Uint8ClampedArray", 1),
@@ -494,9 +497,19 @@ const TYPED_ARRAY_KINDS: [(&str, u8); 9] = [
     ("Uint32Array", 4),
     ("Float32Array", 4),
     ("Float64Array", 8),
+    ("BigInt64Array", 8),
+    ("BigUint64Array", 8),
 ];
-const N_ARRAY_BUFFER: u16 = 177;
-const N_DATA_VIEW: u16 = 178;
+/// Whether typed-array `kind` index holds BigInt elements (9 = `BigInt64Array`,
+/// 10 = `BigUint64Array`).
+#[must_use]
+pub(crate) fn is_bigint_kind(kind: u8) -> bool {
+    kind == 9 || kind == 10
+}
+// Moved out of [168, 179) so the typed-array kind block can grow to 11 entries
+// (the two BigInt kinds occupy the former 177/178 slots).
+const N_ARRAY_BUFFER: u16 = 234;
+const N_DATA_VIEW: u16 = 235;
 // `WebAssembly.validate` — decode a module and report well-formedness.
 const N_WASM_VALIDATE: u16 = 184;
 // `WebAssembly.instantiate` — build an instance object with callable exports.
@@ -6413,6 +6426,18 @@ impl<'a> Interp<'a> {
             let bytes_h = self.array_buffer_bytes(buf).unwrap();
             let view = self.realm.new_typed_array(bytes_h, buf, 0, length, kind);
             if let Some(s) = src {
+                // For a BigInt typed array, ToBigInt every source element up front
+                // (a Number element throws TypeError, per spec); other kinds write
+                // the values straight through.
+                let s = if is_bigint_kind(kind) {
+                    let mut coerced = Vec::with_capacity(s.len());
+                    for v in s {
+                        coerced.push(self.coerce_typed_array_write(view, v)?);
+                    }
+                    coerced
+                } else {
+                    s
+                };
                 // Bulk write-through: one buffer borrow, no per-element heap lookup.
                 self.realm.typed_set_from_numbers(view, 0, &s);
             }
@@ -7710,6 +7735,10 @@ impl<'a> Interp<'a> {
             let m = self.new_str("Invalid array length");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
+        // A write to a BigInt typed-array element ToBigInt-coerces the value (a
+        // Number throws TypeError) — even for an out-of-bounds index, where the
+        // store itself is a no-op but the coercion's side effects/throw still run.
+        let value = self.coerce_typed_array_write(handle, value)?;
         self.realm.set_element(handle, i, value);
         Ok(())
     }
@@ -9236,13 +9265,10 @@ impl<'a> Interp<'a> {
             if is_set {
                 let le = self.realm.truthy(arg(2));
                 let bits = if is_bigint {
-                    // `setBigInt64`/`setBigUint64`: the value is a BigInt; its low
-                    // 64 bits are stored.
-                    let big = arg(1)
-                        .as_handle()
-                        .map(Handle::from_raw)
-                        .and_then(|h| self.realm.bigint_at(h));
-                    big.and_then(|b| b.to_i128()).unwrap_or(0) as u64
+                    // `setBigInt64`/`setBigUint64`: ToBigInt the value (a Number
+                    // throws TypeError), then store its low 64 bits.
+                    let big = self.coerce_to_bigint(arg(1))?;
+                    big.to_u64_wrapping()
                 } else if is_float {
                     let value = self.realm.to_number(arg(1));
                     if size == 4 {
@@ -10465,7 +10491,9 @@ impl<'a> Interp<'a> {
                 // `fill(value, start?, end?)` — mutate in place, return the view.
                 // `start`/`end` default to `0`/`len`; negatives count from the end.
                 "fill" => {
-                    let value = arg(0);
+                    // A BigInt-element fill ToBigInt-coerces the value once (a
+                    // Number throws TypeError); otherwise the value passes through.
+                    let value = self.coerce_typed_array_write(handle, arg(0))?;
                     let start = self.typed_clamp_index(arg(1), 0, tlen);
                     let end = self.typed_clamp_index(arg(2), tlen, tlen);
                     self.realm.typed_fill_range(handle, value, start, end);
@@ -10523,6 +10551,18 @@ impl<'a> Interp<'a> {
                         }
                         // Materialize the source's elements and bulk-write (coercing).
                         if let Some(src_elems) = self.realm.elements_vec(src) {
+                            // For a BigInt destination, ToBigInt every source value
+                            // up front (a Number element throws TypeError).
+                            let src_elems =
+                                if self.realm.typed_kind(handle).is_some_and(is_bigint_kind) {
+                                    let mut coerced = Vec::with_capacity(src_elems.len());
+                                    for v in src_elems {
+                                        coerced.push(self.coerce_typed_array_write(handle, v)?);
+                                    }
+                                    coerced
+                                } else {
+                                    src_elems
+                                };
                             self.realm
                                 .typed_set_from_numbers(handle, offset, &src_elems);
                         }
@@ -13286,6 +13326,89 @@ impl<'a> Interp<'a> {
     /// ToPrimitive of an object/array with `hint`: an array becomes its `join`
     /// string (arrays have no readable `valueOf`/`toString`); a plain object goes
     /// through `coerce_primitive`. Non-objects pass through.
+    /// `ToBigInt(v)` (ES2020 7.1.13) — the coercion for writing a
+    /// `BigInt64Array`/`BigUint64Array` element (and the value of
+    /// `DataView.prototype.setBig*`). A BigInt passes through; a Boolean maps to
+    /// `0n`/`1n`; a String parses (an invalid one is a `SyntaxError`); an object is
+    /// taken through ToPrimitive(number) and re-coerced. A **Number**, Symbol,
+    /// `undefined`, or `null` is a `TypeError` (notably: assigning a Number to a
+    /// BigInt typed-array element throws).
+    fn coerce_to_bigint(&mut self, v: NanBox) -> Result<crate::bignum::BigInt, ExecError> {
+        match v.unpack() {
+            Unpacked::Bool(b) => Ok(if b {
+                crate::bignum::BigInt::from_i128(1)
+            } else {
+                crate::bignum::BigInt::zero()
+            }),
+            Unpacked::Number(_) => {
+                let m = self.new_str("Cannot convert a Number to a BigInt");
+                Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
+            }
+            Unpacked::Undefined | Unpacked::Null => {
+                let m = self.new_str("Cannot convert undefined or null to a BigInt");
+                Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
+            }
+            Unpacked::Handle(raw) => {
+                let h = Handle::from_raw(raw);
+                if let Some(big) = self.realm.bigint_at(h) {
+                    return Ok(big);
+                }
+                if let Some(s) = self.realm.string_value(h) {
+                    // StringToBigInt: an empty/whitespace string is `0n`; an
+                    // otherwise-invalid string is a SyntaxError.
+                    let t = s.trim();
+                    if t.is_empty() {
+                        return Ok(crate::bignum::BigInt::zero());
+                    }
+                    let (radix, body) = match t.get(0..2) {
+                        Some("0x" | "0X") => (16, &t[2..]),
+                        Some("0o" | "0O") => (8, &t[2..]),
+                        Some("0b" | "0B") => (2, &t[2..]),
+                        _ => (10, t),
+                    };
+                    return match crate::bignum::BigInt::from_str_radix(body, radix) {
+                        Some(b) => Ok(b),
+                        None => {
+                            let m = self.new_str("Cannot convert string to a BigInt");
+                            Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))))
+                        }
+                    };
+                }
+                if self.realm.symbol_at(h).is_some() {
+                    let m = self.new_str("Cannot convert a Symbol value to a BigInt");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                // An object: ToPrimitive(number), then ToBigInt on the primitive
+                // (which is no longer an object, so the recursion terminates).
+                let prim = self.coerce_primitive(v, "number")?;
+                if prim.as_handle() == v.as_handle() {
+                    // ToPrimitive produced no primitive (still the same object):
+                    // treat as a non-coercible value.
+                    let m = self.new_str("Cannot convert object to a BigInt");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                self.coerce_to_bigint(prim)
+            }
+        }
+    }
+
+    /// If `target` is a `BigInt64Array`/`BigUint64Array`, ToBigInt-coerce `value`
+    /// (throwing `TypeError` for a Number, per spec) and return the resulting
+    /// BigInt as a heap value ready to store; otherwise return `value` unchanged.
+    /// The single chokepoint every typed-array element write funnels through so a
+    /// Number assigned to a BigInt element throws rather than silently writing 0.
+    fn coerce_typed_array_write(
+        &mut self,
+        target: Handle,
+        value: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        if self.realm.typed_kind(target).is_some_and(is_bigint_kind) {
+            let big = self.coerce_to_bigint(value)?;
+            return Ok(NanBox::handle(self.realm.new_bigint(big).to_raw()));
+        }
+        Ok(value)
+    }
+
     fn coerce_object(&mut self, v: NanBox, hint: &str) -> Result<NanBox, ExecError> {
         if let Some(h) = v.as_handle().map(Handle::from_raw) {
             if self.realm.is_array(h) {
@@ -16829,8 +16952,31 @@ pub(crate) fn decode_typed_element(kind: u8, bytes: &[u8]) -> f64 {
         6 => f64::from(u32::from_le_bytes([b(0), b(1), b(2), b(3)])), // Uint32
         7 => f64::from(f32::from_le_bytes([b(0), b(1), b(2), b(3)])), // Float32
         8 => f64::from_le_bytes([b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7)]), // Float64
+        // BigInt kinds (9/10) do not decode to an f64 — use `decode_bigint_element`.
         _ => 0.0,
     }
+}
+
+/// Little-endian decode of one **BigInt** typed-array element of `kind`
+/// (9 = `BigInt64Array`, signed i64; 10 = `BigUint64Array`, unsigned u64) from
+/// `bytes` (short/empty slices read as zero), as an arbitrary-precision
+/// [`BigInt`](crate::bignum::BigInt).
+pub(crate) fn decode_bigint_element(kind: u8, bytes: &[u8]) -> crate::bignum::BigInt {
+    use crate::bignum::BigInt;
+    let b = |i: usize| bytes.get(i).copied().unwrap_or(0);
+    let raw = u64::from_le_bytes([b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7)]);
+    if kind == 9 {
+        BigInt::from_i128(i128::from(raw as i64)) // signed reinterpretation
+    } else {
+        BigInt::from_i128(i128::from(raw)) // unsigned
+    }
+}
+
+/// Little-endian encode of the low 64 bits of a [`BigInt`](crate::bignum::BigInt)
+/// into an 8-byte buffer — the element encoding shared by `BigInt64Array` and
+/// `BigUint64Array` (`ToBigInt64` / `ToBigUint64` keep only the low 64 bits).
+pub(crate) fn encode_bigint_element(value: &crate::bignum::BigInt) -> [u8; 8] {
+    value.to_u64_wrapping().to_le_bytes()
 }
 
 /// Maps an ISO-4217 currency code to its symbol for `style: "currency"` (a small
@@ -20916,6 +21062,101 @@ mod tests {
     }
 
     #[test]
+    fn bigint_typed_arrays() {
+        // Both kinds exist, are 64-bit, and share the %TypedArray% hierarchy.
+        assert_eq!(run("typeof BigInt64Array"), "function");
+        assert_eq!(run("typeof BigUint64Array"), "function");
+        assert_eq!(run("BigInt64Array.BYTES_PER_ELEMENT"), "8");
+        assert_eq!(run("BigUint64Array.BYTES_PER_ELEMENT"), "8");
+        assert_eq!(run("new BigInt64Array(2).BYTES_PER_ELEMENT"), "8");
+        assert_eq!(run("BigInt64Array.name"), "BigInt64Array");
+        assert_eq!(
+            run("Object.getPrototypeOf(BigInt64Array)===Object.getPrototypeOf(Int8Array)"),
+            "true"
+        );
+        assert_eq!(run("new BigInt64Array(3).length"), "3");
+        assert_eq!(run("new BigInt64Array(2)[0] === 0n"), "true");
+        // Elements are BigInt; reading yields a BigInt, writing accepts BigInt.
+        assert_eq!(run("var a=new BigInt64Array([1n,2n]); a[1]===2n"), "true");
+        assert_eq!(run("new BigInt64Array([-1n])[0]"), "-1");
+        // Little-endian i64 / u64 codec with low-64-bit two's-complement wrapping.
+        assert_eq!(
+            run("new BigUint64Array([18446744073709551615n])[0]"),
+            "18446744073709551615"
+        );
+        assert_eq!(
+            run("var a=new BigUint64Array(1); a[0]=-1n; a[0]"),
+            "18446744073709551615"
+        );
+        assert_eq!(
+            run("var a=new BigInt64Array(1); a[0]=18446744073709551617n; a[0]"),
+            "1"
+        );
+        // ToBigInt on write: a Boolean / String coerces; a Number throws TypeError.
+        assert_eq!(
+            run("var a=new BigInt64Array(2); a[0]=true; a[1]='5'; a.join(',')"),
+            "1,5"
+        );
+        assert_eq!(
+            run("try{var a=new BigInt64Array(1);a[0]=5;'no'}catch(e){e.constructor.name}"),
+            "TypeError"
+        );
+        assert_eq!(
+            run("try{new BigInt64Array([1,2]);'no'}catch(e){e.constructor.name}"),
+            "TypeError"
+        );
+        // Methods are BigInt-aware.
+        assert_eq!(
+            run("new BigInt64Array([5n,6n,7n]).slice(1).join(',')"),
+            "6,7"
+        );
+        assert_eq!(
+            run("new BigInt64Array([5n,6n,7n]).subarray(1).join(',')"),
+            "6,7"
+        );
+        assert_eq!(
+            run("var a=new BigInt64Array(3); a.set([9n,8n],1); a.join(',')"),
+            "0,9,8"
+        );
+        assert_eq!(run("new BigInt64Array(2).fill(7n).join(',')"), "7,7");
+        assert_eq!(
+            run("try{new BigInt64Array(2).fill(3);'no'}catch(e){e.constructor.name}"),
+            "TypeError"
+        );
+        assert_eq!(run("BigInt64Array.of(3n,4n).join(',')"), "3,4");
+        assert_eq!(
+            run("var s=0n; for(var x of new BigInt64Array([1n,2n,3n])) s+=x; s===6n"),
+            "true"
+        );
+        // A typed array constructed from another BigInt typed array copies values.
+        assert_eq!(
+            run(
+                "var a=new BigUint64Array([10n,20n]); var b=new BigUint64Array(a); b[0]===10n && b!==a"
+            ),
+            "true"
+        );
+        // DataView round-trips the 64-bit BigInt accessors (little-endian arg).
+        assert_eq!(
+            run(
+                "var dv=new DataView(new ArrayBuffer(8)); dv.setBigInt64(0,-7n); dv.getBigInt64(0)===-7n"
+            ),
+            "true"
+        );
+        assert_eq!(
+            run(
+                "var dv=new DataView(new ArrayBuffer(8)); dv.setBigUint64(0,5n,true); dv.getBigUint64(0,true)===5n"
+            ),
+            "true"
+        );
+        assert_eq!(
+            run(
+                "try{new DataView(new ArrayBuffer(8)).setBigInt64(0,5);'no'}catch(e){e.constructor.name}"
+            ),
+            "TypeError"
+        );
+    }
+
+    #[test]
     fn typed_array_view_aliasing() {
         // Sibling views over one ArrayBuffer share bytes intrinsically.
         assert_eq!(
@@ -22748,7 +22989,7 @@ mod tests {
         let view = interp.typed_array_over(buf, 8, 0, 2).expect("float64 view");
         // Write 3.5 into element 1 through the realm API, read it back.
         interp.realm_mut().typed_set(view, 1, NanBox::number(3.5));
-        let back = interp.realm().typed_get(view, 1).unwrap();
+        let back = interp.realm_mut().typed_get(view, 1).unwrap();
         assert_eq!(back.as_number(), Some(3.5));
         // The external region bytes are the IEEE-754 encoding of 3.5 at offset 8.
         assert_eq!(&region[8..16], &3.5f64.to_le_bytes());

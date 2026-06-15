@@ -95,6 +95,24 @@ impl BigInt {
         }
     }
 
+    /// The low 64 bits of the value in two's-complement, regardless of magnitude
+    /// (the `BigInt64Array`/`BigUint64Array` element encoding: `ToBigInt64` /
+    /// `ToBigUint64` keep only the low 64 bits). For a negative value this is the
+    /// wrapped two's-complement bit pattern (`(-1n) -> 0xFFFF_FFFF_FFFF_FFFF`).
+    #[must_use]
+    pub fn to_u64_wrapping(&self) -> u64 {
+        // Assemble the low 64 bits of the magnitude (limbs 0 and 1), then negate
+        // in 64-bit two's complement if the value is negative.
+        let lo = u64::from(self.mag.first().copied().unwrap_or(0));
+        let hi = u64::from(self.mag.get(1).copied().unwrap_or(0));
+        let mag = lo | (hi << 32);
+        if self.negative {
+            mag.wrapping_neg()
+        } else {
+            mag
+        }
+    }
+
     fn normalized(mut self) -> Self {
         while self.mag.last() == Some(&0) {
             self.mag.pop();

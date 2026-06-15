@@ -710,6 +710,77 @@ fn make_error(realm: &mut Realm, name: &str, message: &str) -> NanBox {
     NanBox::handle(obj.to_raw())
 }
 
+/// ToBigInt-coerces `value` for a write to element of `target` **iff** `target`
+/// is a `BigInt64Array`/`BigUint64Array`; otherwise returns `value` unchanged.
+/// Mirrors the tree-walker's `Interp::coerce_to_bigint` for the
+/// values reachable on the bytecode path (BigInt / Boolean / String); a Number
+/// (and any other non-coercible) is `Err(TypeError)`. Keeps a Number-into-BigInt
+/// store on the VM path a throw rather than a silent no-op.
+fn coerce_bigint_typed_write(
+    realm: &mut Realm,
+    target: Handle,
+    value: NanBox,
+) -> Result<NanBox, NanBox> {
+    use crate::nanbox::Unpacked;
+    if !realm
+        .typed_kind(target)
+        .is_some_and(crate::nbexec::is_bigint_kind)
+    {
+        return Ok(value);
+    }
+    let big = match value.unpack() {
+        Unpacked::Bool(b) => {
+            if b {
+                crate::bignum::BigInt::from_i128(1)
+            } else {
+                crate::bignum::BigInt::zero()
+            }
+        }
+        Unpacked::Handle(raw) => {
+            let h = Handle::from_raw(raw);
+            if realm.bigint_at(h).is_some() {
+                return Ok(value); // already a BigInt
+            } else if let Some(s) = realm.string_value(h) {
+                let t = s.trim();
+                if t.is_empty() {
+                    crate::bignum::BigInt::zero()
+                } else {
+                    let (radix, body) = match t.get(0..2) {
+                        Some("0x" | "0X") => (16, &t[2..]),
+                        Some("0o" | "0O") => (8, &t[2..]),
+                        Some("0b" | "0B") => (2, &t[2..]),
+                        _ => (10, t),
+                    };
+                    match crate::bignum::BigInt::from_str_radix(body, radix) {
+                        Some(b) => b,
+                        None => {
+                            return Err(make_error(
+                                realm,
+                                "SyntaxError",
+                                "Cannot convert string to a BigInt",
+                            ));
+                        }
+                    }
+                }
+            } else {
+                return Err(make_error(
+                    realm,
+                    "TypeError",
+                    "Cannot convert value to a BigInt",
+                ));
+            }
+        }
+        _ => {
+            return Err(make_error(
+                realm,
+                "TypeError",
+                "Cannot convert a Number to a BigInt",
+            ));
+        }
+    };
+    Ok(NanBox::handle(realm.new_bigint(big).to_raw()))
+}
+
 /// Whether `key` is one of the `RegExp` introspection properties surfaced
 /// directly by [`Op::GetProp`] (`source`, `flags`, the flag-letter booleans, and
 /// `lastIndex`). Used as a cheap pre-filter so the hot path only consults the
@@ -1294,7 +1365,14 @@ fn run_frame(
                     let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                     handle_throw!(VmError::Thrown(e));
                 }
-                ctx.realm.set_element(handle, i, regs[*src as usize]);
+                // A BigInt typed-array element write ToBigInt-coerces (a Number
+                // throws TypeError) instead of silently no-op'ing.
+                match coerce_bigint_typed_write(ctx.realm, handle, regs[*src as usize]) {
+                    Ok(v) => {
+                        ctx.realm.set_element(handle, i, v);
+                    }
+                    Err(e) => handle_throw!(VmError::Thrown(e)),
+                }
             }
             Op::GetKey { dst, obj, key } => {
                 let handle = object_handle(regs[*obj as usize])?;
@@ -1337,6 +1415,17 @@ fn run_frame(
                 let handle = object_handle(regs[*obj as usize])?;
                 let k = regs[*key as usize];
                 match k.as_number() {
+                    Some(n) if ctx.realm.typed_len(handle).is_some() => {
+                        // A numeric key on a typed array writes through to its
+                        // bytes; a BigInt element ToBigInt-coerces (Number throws).
+                        let i = n as usize;
+                        match coerce_bigint_typed_write(ctx.realm, handle, regs[*src as usize]) {
+                            Ok(v) => {
+                                ctx.realm.set_element(handle, i, v);
+                            }
+                            Err(e) => handle_throw!(VmError::Thrown(e)),
+                        }
+                    }
                     Some(n) if ctx.realm.is_array(handle) => {
                         // C1: refuse-past-cap surfaces as a catchable RangeError
                         // (see `Op::SetElem`).
@@ -3260,7 +3349,8 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                     .unwrap_or_default()
                 {
                     if let Some(ph) = pair.as_handle().map(Handle::from_raw) {
-                        let k = ctx.realm.to_display_string(ctx.realm.get_element(ph, 0));
+                        let key_el = ctx.realm.get_element(ph, 0);
+                        let k = ctx.realm.to_display_string(key_el);
                         let v = ctx.realm.get_element(ph, 1);
                         ctx.realm.set_property(obj, &k, v);
                     }
