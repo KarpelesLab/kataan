@@ -9947,23 +9947,37 @@ impl<'a> Interp<'a> {
                 }
                 return Ok(Some(self.new_str_bytes(crate::wtf8::from_utf16(&out))));
             }
-            // `String.raw(strings, ...subs)` — interleave `strings.raw[i]` with
-            // each substitution (the cooked-escape-free template form).
+            // `String.raw(template, ...subs)` — interleave `ToString(template.raw[i])`
+            // with `ToString(subs[i])`. `template.raw` is treated as an array-like
+            // (length + indexed reads), not necessarily a real array.
             Some(N_STRING) if method == "raw" => {
-                let raw = arg(0)
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .and_then(|h| self.realm.get_property(h, "raw"))
-                    .and_then(|r| r.as_handle())
-                    .map(Handle::from_raw)
-                    .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
-                    .unwrap_or_default();
+                let cooked = self.coerce_to_object(arg(0));
+                let Some(ch) = cooked.as_handle().map(Handle::from_raw) else {
+                    return Err(self.type_error("Cannot convert undefined or null to object"));
+                };
+                let raw_v = self
+                    .realm
+                    .get_property(ch, "raw")
+                    .unwrap_or(NanBox::undefined());
+                let raw_obj = self.coerce_to_object(raw_v);
+                let Some(rh) = raw_obj.as_handle().map(Handle::from_raw) else {
+                    return Err(self.type_error("Cannot convert undefined or null to object"));
+                };
+                // ToLength(raw.length).
+                let len_v = self.read_member(rh, "length")?;
+                let lit_count = self.coerce_to_integer_or_infinity(len_v)?.max(0.0) as usize;
                 let subs = &args[1.min(args.len())..];
                 let mut out = String::new();
-                for (i, piece) in raw.iter().enumerate() {
-                    out.push_str(&self.realm.to_display_string(*piece));
+                for i in 0..lit_count {
+                    let piece = self.read_member(rh, &alloc::format!("{i}"))?;
+                    let bytes = self.coerce_to_string_bytes(piece)?;
+                    out.push_str(&crate::wtf8::to_string_lossy(&bytes));
+                    if i + 1 == lit_count {
+                        break;
+                    }
                     if let Some(s) = subs.get(i) {
-                        out.push_str(&self.realm.to_display_string(*s));
+                        let sb = self.coerce_to_string_bytes(*s)?;
+                        out.push_str(&crate::wtf8::to_string_lossy(&sb));
                     }
                 }
                 return Ok(Some(self.new_str(&out)));
