@@ -859,8 +859,16 @@ fn try_catch_finally() {
 
 #[test]
 fn jumps_and_labels() {
-    assert_eq!(prog("return;"), "(return)");
-    assert_eq!(prog("return a + b;"), "(return (+ a b))");
+    // `return` is only valid inside a function body (an early error otherwise),
+    // so wrap it to inspect the statement's shape.
+    assert_eq!(
+        prog("function f() { return; }"),
+        "(fn f () (block (return)))"
+    );
+    assert_eq!(
+        prog("function f() { return a + b; }"),
+        "(fn f () (block (return (+ a b))))"
+    );
     assert_eq!(prog("throw e;"), "(throw e)");
     assert_eq!(
         prog("loop: for (;;) break loop;"),
@@ -879,8 +887,12 @@ fn asi_inserts_semicolons() {
     // Newline-separated statements need no explicit `;`.
     assert_eq!(prog("a\nb\nc"), "(expr a) (expr b) (expr c)");
     // `return` with a newline before its operand returns undefined (restricted
-    // production): two statements, not `return a`.
-    assert_eq!(prog("return\na"), "(return) (expr a)");
+    // production): two statements, not `return a`. (`return` requires a function
+    // body, so wrap it.)
+    assert_eq!(
+        prog("function f() { return\na }"),
+        "(fn f () (block (return) (expr a)))"
+    );
     // A newline after `throw` is an error.
     assert!(sperr("throw\ne").contains("newline after `throw`"));
     // Missing separator without a newline is an error.

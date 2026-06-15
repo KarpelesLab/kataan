@@ -46,6 +46,7 @@ pub(crate) fn validate_program(program: &Program) -> Result<()> {
     let strict = program.source_type == SourceType::Module || body_is_strict(&program.body);
     let mut v = Validator {
         private_scopes: Vec::new(),
+        labels: Vec::new(),
     };
     let ctx = Ctx::top(strict);
     v.check_top_level_scope(&program.body)?;
@@ -90,6 +91,12 @@ struct Ctx {
     /// position a reference to `arguments` and a `super(...)` call are early
     /// errors.
     in_field_init: bool,
+    /// Whether we are inside a function body (so `return` is allowed).
+    in_function: bool,
+    /// Whether an unlabeled `break` has a target (inside a loop or `switch`).
+    in_breakable: bool,
+    /// Whether an unlabeled `continue` has a target (inside a loop).
+    in_iteration: bool,
 }
 
 impl Ctx {
@@ -99,6 +106,22 @@ impl Ctx {
             strict,
             allow_super_call: false,
             in_field_init: false,
+            in_function: false,
+            in_breakable: false,
+            in_iteration: false,
+        }
+    }
+
+    /// A fresh context at a function boundary (the jump/`return` state resets;
+    /// `super`/field-init are passed in by the caller).
+    fn function_boundary(strict: bool, allow_super_call: bool, in_field_init: bool) -> Self {
+        Ctx {
+            strict,
+            allow_super_call,
+            in_field_init,
+            in_function: true,
+            in_breakable: false,
+            in_iteration: false,
         }
     }
 }
@@ -107,6 +130,10 @@ struct Validator {
     /// Stack of private-name scopes — one frame per enclosing class body, each
     /// holding the private names that class declares.
     private_scopes: Vec<Vec<Box<str>>>,
+    /// Active labels in scope, innermost last, each tagged with whether it
+    /// labels an iteration statement (so `continue label` is only valid for an
+    /// iteration label). Reset to empty at every function boundary.
+    labels: Vec<(Box<str>, bool)>,
 }
 
 /// What a private member declaration is, for duplicate detection.
@@ -172,7 +199,7 @@ impl Validator {
                     self.expr(u, ctx)?;
                 }
                 self.check_loop_body(body)?;
-                self.stmt(body, ctx)
+                self.stmt(body, &loop_ctx(ctx))
             }
             Stmt::ForIn {
                 left, right, body, ..
@@ -183,16 +210,16 @@ impl Validator {
                 self.for_left(left, ctx)?;
                 self.expr(right, ctx)?;
                 self.check_loop_body(body)?;
-                self.stmt(body, ctx)
+                self.stmt(body, &loop_ctx(ctx))
             }
             Stmt::While { test, body, .. } => {
                 self.expr(test, ctx)?;
                 self.check_loop_body(body)?;
-                self.stmt(body, ctx)
+                self.stmt(body, &loop_ctx(ctx))
             }
             Stmt::DoWhile { body, test, .. } => {
                 self.check_loop_body(body)?;
-                self.stmt(body, ctx)?;
+                self.stmt(body, &loop_ctx(ctx))?;
                 self.expr(test, ctx)
             }
             Stmt::Switch {
@@ -203,12 +230,15 @@ impl Validator {
                 self.expr(discriminant, ctx)?;
                 let all: Vec<&Stmt> = cases.iter().flat_map(|c| c.body.iter()).collect();
                 self.check_lexical_scope_refs(&all, false)?;
+                // A `switch` is a `break` target but not a `continue` target.
+                let mut c = *ctx;
+                c.in_breakable = true;
                 for case in cases {
                     if let Some(t) = &case.test {
                         self.expr(t, ctx)?;
                     }
                     for s in &case.body {
-                        self.stmt(s, ctx)?;
+                        self.stmt(s, &c)?;
                     }
                 }
                 Ok(())
@@ -240,17 +270,69 @@ impl Validator {
                 }
                 Ok(())
             }
-            Stmt::Return { argument, .. } => {
+            Stmt::Return { argument, span } => {
+                if !ctx.in_function {
+                    return Err(self.err(*span, "`return` is only valid inside a function"));
+                }
                 if let Some(a) = argument {
                     self.expr(a, ctx)?;
                 }
                 Ok(())
             }
-            Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
+            Stmt::Break { label, span } => {
+                match label {
+                    Some(l) => {
+                        if !self.labels.iter().any(|(n, _)| **n == *l.name) {
+                            return Err(self.err(l.span, "undefined break label"));
+                        }
+                    }
+                    None if !ctx.in_breakable => {
+                        return Err(self.err(*span, "`break` must be inside a loop or `switch`"));
+                    }
+                    None => {}
+                }
+                Ok(())
+            }
+            Stmt::Continue { label, span } => {
+                match label {
+                    Some(l) => {
+                        // `continue label` requires the label to mark an
+                        // iteration statement.
+                        match self.labels.iter().find(|(n, _)| **n == *l.name) {
+                            None => return Err(self.err(l.span, "undefined continue label")),
+                            Some((_, is_iter)) if !*is_iter => {
+                                return Err(self.err(
+                                    l.span,
+                                    "`continue` label does not denote an iteration statement",
+                                ));
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    None if !ctx.in_iteration => {
+                        return Err(self.err(*span, "`continue` must be inside a loop"));
+                    }
+                    None => {}
+                }
+                Ok(())
+            }
             Stmt::Throw { argument, .. } => self.expr(argument, ctx),
-            Stmt::Labeled { body, .. } => {
+            Stmt::Labeled { label, body, .. } => {
+                // A duplicate label in the enclosing set is an early error.
+                if self.labels.iter().any(|(n, _)| **n == *label.name) {
+                    return Err(self.err(label.span, "label has already been declared"));
+                }
                 self.check_labeled_body(body, ctx)?;
-                self.stmt(body, ctx)
+                // Mark the label as an iteration label when it (transitively
+                // through nested labels) labels a loop, so `continue label` is
+                // accepted.
+                let is_iter = labels_an_iteration(body);
+                self.labels.push((label.name.clone(), is_iter));
+                // A labeled iteration statement is itself a `continue` target for
+                // its own label; the loop body sets `in_iteration` already.
+                let result = self.stmt(body, ctx);
+                self.labels.pop();
+                result
             }
             Stmt::With { object, body, .. } => {
                 if ctx.strict {
@@ -431,13 +513,10 @@ impl Validator {
             self.check_binding_ident_name(&id.name, id.span)?;
         }
         self.check_params(&f.params, strict, &f.body)?;
-        // A regular function establishes its own `arguments` and `super`
-        // bindings, so it leaves any enclosing field-initializer restrictions.
-        let c = Ctx {
-            strict,
-            allow_super_call: false,
-            in_field_init: false,
-        };
+        // A regular function establishes its own `arguments`/`super` bindings and
+        // a fresh label/jump environment.
+        let c = Ctx::function_boundary(strict, false, false);
+        let saved_labels = core::mem::take(&mut self.labels);
         for p in &f.params {
             self.param(p, &c)?;
         }
@@ -445,6 +524,7 @@ impl Validator {
         for s in &f.body {
             self.stmt(s, &c)?;
         }
+        self.labels = saved_labels;
         Ok(())
     }
 
@@ -456,11 +536,8 @@ impl Validator {
     ) -> Result<()> {
         let strict = parent.strict || body_is_strict(&f.body);
         self.check_params(&f.params, strict, &f.body)?;
-        let c = Ctx {
-            strict,
-            allow_super_call,
-            in_field_init: false,
-        };
+        let c = Ctx::function_boundary(strict, allow_super_call, false);
+        let saved_labels = core::mem::take(&mut self.labels);
         for p in &f.params {
             self.param(p, &c)?;
         }
@@ -468,6 +545,7 @@ impl Validator {
         for s in &f.body {
             self.stmt(s, &c)?;
         }
+        self.labels = saved_labels;
         Ok(())
     }
 
@@ -483,12 +561,17 @@ impl Validator {
         };
         self.check_params(&a.params, strict, body_slice)?;
         // An arrow inherits `super`, `this`, and `arguments` (and thus the
-        // field-initializer restrictions) from its enclosing scope.
+        // field-initializer restrictions) from its enclosing scope, but is a
+        // function boundary for `return` and the label/jump environment.
         let c = Ctx {
             strict,
             allow_super_call: ctx.allow_super_call,
             in_field_init: ctx.in_field_init,
+            in_function: true,
+            in_breakable: false,
+            in_iteration: false,
         };
+        let saved_labels = core::mem::take(&mut self.labels);
         for p in &a.params {
             self.param(p, &c)?;
         }
@@ -501,6 +584,7 @@ impl Validator {
             }
             ArrowBody::Expr(e) => self.expr(e, &c)?,
         }
+        self.labels = saved_labels;
         Ok(())
     }
 
@@ -667,24 +751,23 @@ impl Validator {
                     if let Some(v) = &field.value {
                         // A field initializer may use `super.prop`, `this`, and
                         // private names, but never `super(...)` or `arguments`.
-                        let c2 = Ctx {
-                            strict: true,
-                            allow_super_call: false,
-                            in_field_init: true,
-                        };
+                        // It is a function boundary, so `return` is not allowed.
+                        let mut c2 = Ctx::function_boundary(true, false, true);
+                        c2.in_function = false;
                         self.expr(v, &c2)?;
                     }
                 }
                 ClassMember::StaticBlock { body, .. } => {
-                    let c2 = Ctx {
-                        strict: true,
-                        allow_super_call: false,
-                        in_field_init: true,
-                    };
+                    // A static block is a function boundary for jumps but does not
+                    // permit `return`; `arguments`/`super()` are also forbidden.
+                    let mut c2 = Ctx::function_boundary(true, false, true);
+                    c2.in_function = false;
+                    let saved = core::mem::take(&mut self.labels);
                     self.check_top_level_scope(body)?;
                     for s in body {
                         self.stmt(s, &c2)?;
                     }
+                    self.labels = saved;
                 }
             }
         }
@@ -1040,6 +1123,29 @@ fn collect_top_level_decls(
         Stmt::Labeled { body, .. } => collect_top_level_decls(body, lexical, vars, top_level),
         // `var` hoists out of nested non-function statements.
         other => collect_vars_only(other, vars),
+    }
+}
+
+/// Derives the context for a loop body: it is both a `break` and a `continue`
+/// target.
+fn loop_ctx(ctx: &Ctx) -> Ctx {
+    let mut c = *ctx;
+    c.in_breakable = true;
+    c.in_iteration = true;
+    c
+}
+
+/// Whether a (possibly label-nested) statement is an iteration statement, so a
+/// label applied to it makes `continue label` valid.
+fn labels_an_iteration(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::For { .. }
+        | Stmt::ForIn { .. }
+        | Stmt::ForOf { .. }
+        | Stmt::While { .. }
+        | Stmt::DoWhile { .. } => true,
+        Stmt::Labeled { body, .. } => labels_an_iteration(body),
+        _ => false,
     }
 }
 

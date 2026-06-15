@@ -1547,9 +1547,8 @@ mod tests {
         let wasm = binary(src);
         assert!(wasm.contains(&0x0c)); // br
         section_ids(&wasm);
-        // break/continue outside a while loop is rejected.
-        let bad = Parser::parse_program("function g(){ break; }").unwrap();
-        assert!(compile_module(&bad).is_err());
+        // `break` outside a loop/switch is now a parse-time early error.
+        assert!(Parser::parse_program("function g(){ break; }").is_err());
     }
 
     #[test]
