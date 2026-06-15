@@ -1710,6 +1710,11 @@ impl Realm {
     pub fn prevent_extensions(&mut self, handle: Handle) {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.non_extensible_arrays.insert(handle.to_raw());
+        } else if matches!(self.heap.get(handle), Some(Cell::TypedArray { .. })) {
+            let aux = self.aux_object(handle);
+            if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                o.prevent_extensions();
+            }
         } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.prevent_extensions();
         }
@@ -1720,6 +1725,11 @@ impl Realm {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.sealed_arrays.insert(handle.to_raw());
             self.non_extensible_arrays.insert(handle.to_raw());
+        } else if matches!(self.heap.get(handle), Some(Cell::TypedArray { .. })) {
+            let aux = self.aux_object(handle);
+            if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                o.seal();
+            }
         } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.seal();
         }
@@ -1735,6 +1745,16 @@ impl Realm {
         }
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
             return o.is_extensible();
+        }
+        // A typed array is extensible by default; `preventExtensions`/`seal`/
+        // `freeze` records the flag on its auxiliary object.
+        if matches!(self.heap.get(handle), Some(Cell::TypedArray { .. })) {
+            return self
+                .aux_props
+                .get(&handle.to_raw())
+                .and_then(|a| self.heap.get(*a))
+                .and_then(Cell::as_object)
+                .is_none_or(Object::is_extensible);
         }
         matches!(
             self.heap.get(handle),
@@ -1902,6 +1922,7 @@ impl Realm {
                 || c.as_function().is_some()
                 || c.as_native().is_some()
                 || c.as_bound_native().is_some()
+                || matches!(c, Cell::TypedArray { .. })
         })
     }
 

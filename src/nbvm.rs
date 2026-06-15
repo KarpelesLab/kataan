@@ -1401,7 +1401,21 @@ fn run_frame(
             Op::GetElem { dst, arr, index } => {
                 let handle = object_handle(regs[*arr as usize])?;
                 let i = num(regs[*index as usize])? as usize;
-                regs[*dst as usize] = ctx.realm.get_element(handle, i);
+                // A plain Array's element keys are [0, 2**32−1); the boundary value
+                // 2**32−1 is an ordinary named property, not an element. Typed
+                // arrays accept any in-bounds index.
+                if ctx.realm.typed_len(handle).is_none()
+                    && ctx.realm.is_array(handle)
+                    && (i as u64) >= u64::from(u32::MAX)
+                {
+                    let k = alloc::format!("{i}");
+                    regs[*dst as usize] = ctx
+                        .realm
+                        .get_property(handle, &k)
+                        .unwrap_or(NanBox::undefined());
+                } else {
+                    regs[*dst as usize] = ctx.realm.get_element(handle, i);
+                }
             }
             Op::SetElem { arr, index, src } => {
                 let handle = object_handle(regs[*arr as usize])?;
@@ -1418,20 +1432,30 @@ fn run_frame(
                     let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                     handle_throw!(VmError::Thrown(e));
                 }
-                // A BigInt typed-array element write ToBigInt-coerces (a Number
-                // throws TypeError) instead of silently no-op'ing.
-                match coerce_bigint_typed_write(ctx.realm, handle, regs[*src as usize]) {
-                    Ok(v) => {
-                        ctx.realm.set_element(handle, i, v);
+                // A plain Array's element keys are [0, 2**32−1); the boundary value
+                // 2**32−1 is an ordinary named property (no ArraySetLength).
+                if ctx.realm.typed_len(handle).is_none()
+                    && ctx.realm.is_array(handle)
+                    && (i as u64) >= u64::from(u32::MAX)
+                {
+                    let k = alloc::format!("{i}");
+                    ctx.realm.set_property(handle, &k, regs[*src as usize]);
+                } else {
+                    // A BigInt typed-array element write ToBigInt-coerces (a Number
+                    // throws TypeError) instead of silently no-op'ing.
+                    match coerce_bigint_typed_write(ctx.realm, handle, regs[*src as usize]) {
+                        Ok(v) => {
+                            ctx.realm.set_element(handle, i, v);
+                        }
+                        Err(e) => handle_throw!(VmError::Thrown(e)),
                     }
-                    Err(e) => handle_throw!(VmError::Thrown(e)),
                 }
             }
             Op::GetKey { dst, obj, key } => {
                 let handle = object_handle(regs[*obj as usize])?;
                 let k = regs[*key as usize];
                 regs[*dst as usize] = match k.as_number() {
-                    Some(n) if ctx.realm.is_array(handle) => {
+                    Some(n) if ctx.realm.is_array(handle) && (n as u64) < u64::from(u32::MAX) => {
                         ctx.realm.get_element(handle, n as usize)
                     }
                     _ => {
@@ -1439,10 +1463,12 @@ fn run_frame(
                         let pk = to_primitive(ctx, funcs, k, false);
                         let ks = ctx.realm.to_display_string(pk);
                         // A canonical numeric string key on an array (`arr["0"]`)
-                        // reads the element, like `arr[0]`.
+                        // reads the element, like `arr[0]` — for a valid array index
+                        // [0, 2**32−1); the boundary value is an ordinary property.
                         if ctx.realm.is_array(handle)
                             && let Ok(i) = ks.parse::<usize>()
                             && alloc::format!("{i}") == ks
+                            && (i as u64) < u64::from(u32::MAX)
                         {
                             ctx.realm.get_element(handle, i)
                         } else if ks == "length"
@@ -1479,7 +1505,7 @@ fn run_frame(
                             Err(e) => handle_throw!(VmError::Thrown(e)),
                         }
                     }
-                    Some(n) if ctx.realm.is_array(handle) => {
+                    Some(n) if ctx.realm.is_array(handle) && (n as u64) < u64::from(u32::MAX) => {
                         // C1: refuse-past-cap surfaces as a catchable RangeError
                         // (see `Op::SetElem`).
                         let i = n as usize;
