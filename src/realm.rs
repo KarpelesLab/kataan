@@ -1745,13 +1745,14 @@ impl Realm {
         self.heap.is_live(handle)
     }
 
-    /// Handles held only by the realm's value-reachable-only side-tables — auxiliary
-    /// property objects (`aux_props`), lazily-created function prototypes/constructors
-    /// (`fn_protos`/`fn_ctor`), and interned symbol objects (`symbols_by_id`). These are not
-    /// reachable through the object graph, so the collector must treat them as extra roots,
-    /// else a collection would free state the tables still point at (leaving dangling
-    /// handles). Compaction additionally relocates the tables (see [`compact`](Self::compact)).
-    fn gc_extra_roots(&self) -> alloc::vec::Vec<Handle> {
+    /// All value handles held by the realm's value-reachable-only side-tables —
+    /// auxiliary property objects (`aux_props`), lazily-created function
+    /// prototypes/constructors (`fn_protos`/`fn_ctor`), and interned symbol objects
+    /// (`symbols_by_id`). These are reachable only through the tables, so a minor
+    /// collection (which does **not** prune the weak-key tables — see
+    /// [`collect`](Self::collect)) treats every value as a root to avoid freeing
+    /// state the tables still point at.
+    fn gc_side_table_values(&self) -> alloc::vec::Vec<Handle> {
         let mut r = alloc::vec::Vec::new();
         r.extend(self.aux_props.values().copied());
         r.extend(self.fn_protos.values().copied());
@@ -1760,22 +1761,184 @@ impl Realm {
         r
     }
 
+    /// Pushes, into `extra`, the value handles of every side-table entry whose
+    /// **key is live** (reachable from the real roots) — the ephemeron rule a
+    /// weak-key map needs: an entry's value is a root only while its key is alive.
+    /// Handed the heap so it can find symbols still referenced as object property
+    /// keys (`\0sym:{id}`), which are *not* otherwise reachable through the graph.
+    /// Never pushes keys, so a dead key stays collectable.
+    #[allow(clippy::too_many_arguments)] // one ref per side-table, to fit split borrows
+    fn ephemeron_expand(
+        heap: &Heap<Cell>,
+        marked: &alloc::collections::BTreeSet<Handle>,
+        aux_props: &alloc::collections::BTreeMap<u64, Handle>,
+        fn_protos: &alloc::collections::BTreeMap<u32, Handle>,
+        fn_ctor: &alloc::collections::BTreeMap<u32, Handle>,
+        symbols_by_id: &alloc::collections::BTreeMap<u64, Handle>,
+        extra: &mut Vec<Handle>,
+    ) {
+        // `aux_props`: keyed by the owning cell's handle. If that cell is live,
+        // its aux object (and so its named properties) must survive.
+        for (cell_raw, obj) in aux_props {
+            if marked.contains(&Handle::from_raw(*cell_raw)) {
+                extra.push(*obj);
+            }
+        }
+        // `fn_ctor`/`fn_protos`: keyed by function id. The id is "live" iff the
+        // most-recent function handle for it is live; then both its constructor
+        // back-reference and its lazily-built `.prototype` must survive.
+        for (id, fh) in fn_ctor {
+            if marked.contains(fh) {
+                extra.push(*fh);
+                if let Some(proto) = fn_protos.get(id) {
+                    extra.push(*proto);
+                }
+            }
+        }
+        // `symbols_by_id`: a symbol is live if its handle is reachable directly,
+        // *or* if a live object still uses it as a property key (stored as the
+        // string `\0sym:{id}`, which carries no handle edge). Scan the live
+        // objects' keys for referenced ids and root those symbols.
+        for h in marked {
+            if let Some(obj) = heap.get(*h).and_then(Cell::as_object) {
+                for k in obj.all_keys() {
+                    if let Some(idstr) = k.strip_prefix("\u{0}sym:")
+                        && let Ok(id) = idstr.parse::<u64>()
+                        && let Some(sym) = symbols_by_id.get(&id)
+                    {
+                        extra.push(*sym);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drops every side-table entry whose key is **not** marked-live (a dead key
+    /// must not be kept alive by its own entry). `key_collectable(handle)` decides
+    /// whether a given key handle is eligible for pruning this cycle — always
+    /// `true` for a full collection; restricted to young-generation keys for a
+    /// minor collection (an old key was not scanned, so unmarked ≠ dead). Called
+    /// after the ephemeron fixpoint, so any value still kept alive by a live key
+    /// is already marked.
+    #[allow(clippy::too_many_arguments)] // one ref per side-table, to fit split borrows
+    fn ephemeron_prune(
+        marked: &alloc::collections::BTreeSet<Handle>,
+        key_collectable: &dyn Fn(Handle) -> bool,
+        aux_props: &mut alloc::collections::BTreeMap<u64, Handle>,
+        fn_protos: &mut alloc::collections::BTreeMap<u32, Handle>,
+        fn_ctor: &mut alloc::collections::BTreeMap<u32, Handle>,
+        symbols_by_id: &mut alloc::collections::BTreeMap<u64, Handle>,
+        frozen_arrays: &mut alloc::collections::BTreeSet<u64>,
+        sealed_arrays: &mut alloc::collections::BTreeSet<u64>,
+        non_extensible_arrays: &mut alloc::collections::BTreeSet<u64>,
+    ) {
+        let dead = |raw: u64| {
+            let h = Handle::from_raw(raw);
+            key_collectable(h) && !marked.contains(&h)
+        };
+        aux_props.retain(|cell_raw, _| !dead(*cell_raw));
+        frozen_arrays.retain(|raw| !dead(*raw));
+        sealed_arrays.retain(|raw| !dead(*raw));
+        non_extensible_arrays.retain(|raw| !dead(*raw));
+        // `fn_ctor`/`fn_protos` are id-keyed; the function handle is the key's
+        // identity. Drop both when the function handle is collectable-and-dead.
+        let dead_ids: alloc::vec::Vec<u32> = fn_ctor
+            .iter()
+            .filter(|(_, fh)| key_collectable(**fh) && !marked.contains(*fh))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead_ids {
+            fn_ctor.remove(&id);
+            fn_protos.remove(&id);
+        }
+        // `symbols_by_id` is keyed by the symbol's own handle; prune those whose
+        // handle is collectable-and-dead (the expand pass has already kept any
+        // symbol still referenced as a live object's property key).
+        symbols_by_id.retain(|_, sh| !key_collectable(*sh) || marked.contains(sh));
+    }
+
     /// Runs a full (**major**) garbage collection, keeping everything reachable
     /// from `roots` and freeing the rest (including cycles). Survivors are
     /// promoted toward the old generation. Returns the collection statistics.
+    ///
+    /// The realm's value-reachable side-tables (`aux_props`, `fn_protos`,
+    /// `fn_ctor`, `symbols_by_id`, and the array-integrity flag sets) are treated
+    /// as **weak-key (ephemeron)** maps: an entry survives iff its key is reachable
+    /// from the real roots; a surviving entry's value handles are then kept alive;
+    /// an entry whose key has become unreachable is dropped (so it no longer pins
+    /// its dead key's handle — fixing the unbounded side-table leak). See
+    /// [`gc::mark_with_ephemerons`] and [`gc::sweep_full`].
     pub fn collect(&mut self, roots: &[Handle]) -> Stats {
-        let mut all = roots.to_vec();
-        all.extend(self.gc_extra_roots());
-        gc::collect(&mut self.heap, &all)
+        let Self {
+            heap,
+            aux_props,
+            fn_protos,
+            fn_ctor,
+            symbols_by_id,
+            frozen_arrays,
+            sealed_arrays,
+            non_extensible_arrays,
+            ..
+        } = self;
+        // Phase 1 — mark from the real roots, expanding the weak-key side-tables
+        // to a fixpoint (an entry's value is a root only while its key is live).
+        let marked =
+            gc::mark_with_ephemerons(heap, roots.iter().copied(), |heap, marked, extra| {
+                Self::ephemeron_expand(
+                    heap,
+                    marked,
+                    aux_props,
+                    fn_protos,
+                    fn_ctor,
+                    symbols_by_id,
+                    extra,
+                );
+            });
+        // Phase 2 — drop every entry whose key is unmarked (full collection: an
+        // unmarked key is genuinely dead, so no generation guard is needed).
+        Self::ephemeron_prune(
+            &marked,
+            &|_| true,
+            aux_props,
+            fn_protos,
+            fn_ctor,
+            symbols_by_id,
+            frozen_arrays,
+            sealed_arrays,
+            non_extensible_arrays,
+        );
+        // Phase 3 — sweep the unmarked objects and promote the survivors.
+        gc::sweep_full(heap, &marked)
     }
 
     /// Runs a **minor** (generational) collection — reclaims only short-lived
     /// objects in the young generation, treating the old generation as roots.
     /// Cheap when most allocation is short-lived. Returns the statistics.
+    ///
+    /// A minor cycle scans only the young generation, so an old-generation
+    /// side-table key being unmarked does **not** mean it is dead. To stay sound
+    /// the minor path does not prune the weak-key tables (full
+    /// [`collect`](Self::collect) reclaims dead entries); it simply roots every
+    /// side-table value so nothing the tables point at is freed mid-cycle.
     pub fn collect_minor(&mut self, roots: &[Handle]) -> Stats {
         let mut all = roots.to_vec();
-        all.extend(self.gc_extra_roots());
+        all.extend(self.gc_side_table_values());
         gc::collect_minor(&mut self.heap, &all)
+    }
+
+    /// Test-only: the live entry counts of the value-reachable side-tables, used
+    /// to assert the weak-key pruning shrinks them back after a collection.
+    #[cfg(test)]
+    fn side_table_lens(&self) -> [usize; 7] {
+        [
+            self.aux_props.len(),
+            self.fn_protos.len(),
+            self.fn_ctor.len(),
+            self.symbols_by_id.len(),
+            self.frozen_arrays.len(),
+            self.sealed_arrays.len(),
+            self.non_extensible_arrays.len(),
+        ]
     }
 
     /// Runs a **moving (compacting)** collection: keeps everything reachable from
@@ -1783,11 +1946,56 @@ impl Realm {
     /// the slot table), and rewrites every reference — including the caller's
     /// `roots`, updated in place — to the new locations. Returns the statistics.
     pub fn compact(&mut self, roots: &mut [Handle]) -> Stats {
-        // The value-reachable-only side-tables must be marked (else their objects are swept)
-        // *and* relocated. Append them as extra roots for the marking/relocation, then copy
-        // the caller's portion back afterwards.
-        let extra = self.gc_extra_roots();
         let n = roots.len();
+
+        // The side-tables are weak-key (ephemeron) maps. Run the three phases
+        // sequentially so each borrows the tables at a disjoint time:
+        //   1. mark from the real roots + ephemeron expansion (shared borrow);
+        //   2. prune dead-key entries (mutable borrow);
+        //   3. compact/relocate, marking the surviving values as extra roots and
+        //      forwarding every table key/value to its new handle.
+        {
+            let Self {
+                heap,
+                aux_props,
+                fn_protos,
+                fn_ctor,
+                symbols_by_id,
+                frozen_arrays,
+                sealed_arrays,
+                non_extensible_arrays,
+                ..
+            } = self;
+            let marked =
+                gc::mark_with_ephemerons(heap, roots.iter().copied(), |heap, marked, extra| {
+                    Self::ephemeron_expand(
+                        heap,
+                        marked,
+                        aux_props,
+                        fn_protos,
+                        fn_ctor,
+                        symbols_by_id,
+                        extra,
+                    );
+                });
+            Self::ephemeron_prune(
+                &marked,
+                &|_| true,
+                aux_props,
+                fn_protos,
+                fn_ctor,
+                symbols_by_id,
+                frozen_arrays,
+                sealed_arrays,
+                non_extensible_arrays,
+            );
+        }
+
+        // The surviving entries' value handles are reachable only through the
+        // tables, so they must be extra roots for the moving collector (which
+        // re-marks from scratch); after pruning, every remaining key is live, so
+        // this reproduces the same marked set.
+        let extra = self.gc_side_table_values();
         let mut all: alloc::vec::Vec<Handle> = roots.iter().copied().chain(extra).collect();
 
         // Split the borrow so the moving collector (which takes `&mut heap`) can hand the
@@ -3281,5 +3489,186 @@ mod tests {
         // A non-string cell yields `None`.
         let arr = realm.new_array(Vec::new());
         assert_eq!(realm.string_leaf_bytes(arr), None);
+    }
+
+    // ---- H/GC: weak-key (ephemeron) side-table pruning ----------------------
+
+    /// Populates every value-reachable side-table with `n` short-lived entries,
+    /// returning nothing (all keys go out of scope), so a full `collect` should
+    /// reclaim them all.
+    #[cfg(test)]
+    fn populate_side_tables(realm: &mut Realm, n: usize) {
+        for i in 0..n {
+            // aux_props: a named property on an array cell.
+            let arr = realm.new_array(alloc::vec![NanBox::number(i as f64)]);
+            realm.set_property(arr, "tag", NanBox::number(i as f64));
+            // fn_protos + fn_ctor: a function, with its `.prototype` materialized.
+            let f = realm.new_function(1_000_000 + i as u32, crate::env::Scope::root());
+            let _proto = realm.function_prototype(1_000_000 + i as u32);
+            let _ = f;
+            // symbols_by_id: a fresh symbol (not referenced anywhere afterwards).
+            let _sym = realm.new_symbol("s");
+            // frozen/sealed/non_extensible_arrays: freeze a throwaway array.
+            let fa = realm.new_array(alloc::vec![NanBox::number(0.0)]);
+            realm.freeze_object(fa);
+        }
+    }
+
+    #[test]
+    fn weak_key_side_tables_do_not_leak_across_collections() {
+        let mut realm = Realm::new();
+        // Baseline: nothing in the side-tables.
+        assert_eq!(realm.side_table_lens(), [0; 7]);
+
+        // Repeatedly create short-lived state, drop it, and full-collect. The
+        // side-table lengths must return to baseline each iteration rather than
+        // grow without bound.
+        for _ in 0..5 {
+            populate_side_tables(&mut realm, 50);
+            // The tables actually filled up (sanity: not a no-op test).
+            assert!(realm.side_table_lens().iter().any(|&l| l >= 50));
+            realm.collect(&[]); // no roots: every populated key is now dead
+            assert_eq!(
+                realm.side_table_lens(),
+                [0; 7],
+                "weak-key entries for dead objects must be pruned by a full collect",
+            );
+        }
+    }
+
+    #[test]
+    fn live_keys_keep_their_side_table_entries() {
+        let mut realm = Realm::new();
+
+        // An array with an aux property, kept rooted.
+        let arr = realm.new_array(alloc::vec![NanBox::number(7.0)]);
+        realm.set_property(arr, "tag", NanBox::number(42.0));
+
+        // A frozen array, kept rooted.
+        let fa = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        realm.freeze_object(fa);
+
+        // A function with a materialized prototype + constructor back-ref, rooted.
+        let fid = 7u32;
+        let f = realm.new_function(fid, crate::env::Scope::root());
+        let proto = realm.function_prototype(fid);
+
+        // A symbol used as a property key on a rooted object (the symbol cell is
+        // reachable only via the `\0sym:{id}` key string — the ephemeron expand
+        // must keep it alive).
+        let host = realm.new_object();
+        let sym = realm.new_symbol("k");
+        let (_d, sid) = realm.symbol_at(sym).unwrap();
+        let symkey = alloc::format!("\u{0}sym:{sid}");
+        realm.set_property(host, &symkey, NanBox::number(99.0));
+
+        // Also create a pile of dead entries that SHOULD be pruned.
+        populate_side_tables(&mut realm, 30);
+
+        realm.collect(&[arr, fa, f, proto, host]);
+
+        // The live-key entries survived with their aux state intact.
+        assert!(realm.is_live(arr));
+        assert_eq!(realm.get_property(arr, "tag"), Some(NanBox::number(42.0)));
+        assert!(realm.is_live(fa) && realm.is_frozen(fa));
+        assert!(realm.is_live(f) && realm.is_live(proto));
+        // The function's prototype is still the same object, with `constructor`
+        // pointing back at the (live) function.
+        assert_eq!(realm.function_prototype(fid), proto);
+        let ctor = realm
+            .get_property(proto, "constructor")
+            .and_then(|v| v.as_handle());
+        assert_eq!(ctor, Some(f.to_raw()));
+        // The symbol is still resolvable by id and the symbol-keyed property reads.
+        assert!(realm.is_live(sym));
+        assert_eq!(realm.symbol_for_id(sid), Some(sym));
+        assert_eq!(
+            realm.get_property(host, &symkey),
+            Some(NanBox::number(99.0))
+        );
+
+        // The dead entries were pruned: only the live ones remain.
+        let [aux, protos, ctors, syms, frozen, sealed, nonext] = realm.side_table_lens();
+        assert_eq!(aux, 1, "only the rooted array's aux entry remains");
+        assert_eq!(protos, 1);
+        assert_eq!(ctors, 1);
+        assert_eq!(syms, 1, "only the in-use symbol remains");
+        assert_eq!(frozen, 1);
+        assert_eq!(sealed, 1);
+        assert_eq!(nonext, 1);
+    }
+
+    #[test]
+    fn ephemeron_value_can_keep_another_entrys_key_alive() {
+        // Entry A: aux_props[arr_a] = aux object whose property points at arr_b.
+        // Entry B: aux_props[arr_b] = aux object with a tag.
+        // While arr_a is rooted, A's value keeps arr_b reachable, so B must
+        // survive (the ephemeron fixpoint), even though arr_b is not a direct root.
+        let mut realm = Realm::new();
+        let arr_a = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        let arr_b = realm.new_array(alloc::vec![NanBox::number(2.0)]);
+        // A.value -> arr_b (a handle property on A's aux object).
+        realm.set_property(arr_a, "next", NanBox::handle(arr_b.to_raw()));
+        // B has its own aux entry.
+        realm.set_property(arr_b, "tag", NanBox::number(99.0));
+
+        // Only arr_a is rooted; arr_b is reachable solely through A's aux value.
+        realm.collect(&[arr_a]);
+
+        assert!(realm.is_live(arr_a), "rooted key A survives");
+        assert!(
+            realm.is_live(arr_b),
+            "A's aux value keeps B's key alive (ephemeron fixpoint)",
+        );
+        // Both aux entries survived, with B's tag still readable.
+        assert_eq!(realm.get_property(arr_b, "tag"), Some(NanBox::number(99.0)));
+        assert_eq!(
+            realm
+                .get_property(arr_a, "next")
+                .and_then(|v| v.as_handle()),
+            Some(arr_b.to_raw()),
+        );
+    }
+
+    #[test]
+    fn compaction_prunes_dead_weak_keys_and_keeps_live_ones() {
+        let mut realm = Realm::new();
+        // A rooted frozen array with an aux property, plus dead side-table state.
+        let _g = realm.new_string("garbage");
+        let arr = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        realm.set_property(arr, "tag", NanBox::number(5.0));
+        realm.freeze_object(arr);
+        populate_side_tables(&mut realm, 20); // all dead
+
+        let mut roots = [arr];
+        realm.compact(&mut roots);
+        let arr2 = roots[0];
+
+        // The live array's weak-key state followed it to its new handle; the dead
+        // entries were pruned (not relocated).
+        assert!(realm.is_frozen(arr2));
+        assert_eq!(realm.get_property(arr2, "tag"), Some(NanBox::number(5.0)));
+        let [aux, _p, _c, _s, frozen, sealed, nonext] = realm.side_table_lens();
+        assert_eq!(
+            aux, 1,
+            "only the live array's aux entry survived compaction"
+        );
+        assert_eq!((frozen, sealed, nonext), (1, 1, 1));
+    }
+
+    #[test]
+    fn minor_collection_does_not_free_live_side_table_values() {
+        // A minor collection must not prune the weak-key tables, but it must also
+        // not free the values they point at (it roots them all).
+        let mut realm = Realm::new();
+        let arr = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        realm.set_property(arr, "tag", NanBox::number(3.0));
+        // The aux entry exists.
+        assert!(realm.side_table_lens()[0] >= 1);
+        // A minor collection keeps the aux object alive even though `arr` is the
+        // only thing referencing it and we pass it as a root.
+        realm.collect_minor(&[arr]);
+        assert!(realm.is_live(arr));
+        assert_eq!(realm.get_property(arr, "tag"), Some(NanBox::number(3.0)));
     }
 }
