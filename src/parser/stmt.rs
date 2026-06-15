@@ -248,21 +248,47 @@ impl<'src> Parser<'src> {
     }
 
     /// Whether the cursor begins a `using` declaration **in a `for` head**. This
-    /// is the same as [`at_using_decl`], except the binding name may not be `of`:
-    /// per the explicit-resource-management grammar, `for (using of …)` is always
-    /// interpreted as the identifier `using` being the for-of left-hand side (the
-    /// `of` after it being the `for-of` keyword), never as a `using` declaration
-    /// binding `of`. Excluding `of` here lets the head fall through to ordinary
-    /// expression parsing.
+    /// is the same as [`at_using_decl`], except a binding named `of` is treated
+    /// specially.
+    ///
+    /// In the `for-of`/`for-await-of` head, the explicit-resource-management
+    /// grammar excludes a `using ForBinding` whose name is `of`, so
+    /// `for (using of <iterable>)` is interpreted as the identifier `using` being
+    /// the for-of left-hand side (the following `of` being the `for-of` keyword);
+    /// likewise `for (using of of x)` reads as `using` (LHS) `of` (keyword)
+    /// `of[/x]` (iterable). That exclusion only applies to the `for-of` form.
+    ///
+    /// In a *classic* `for( ; ; )` statement there is no such restriction: a
+    /// `using` declaration may bind `of`, handled like `for (let of = null;;)`.
+    /// We detect the classic case by the token following the binding `of`: a
+    /// `=`/`;`/`,` can only continue a classic-for declarator, never a for-of
+    /// head (whose binding would be immediately followed by the `of` keyword).
     fn at_for_using_decl(&self) -> bool {
-        self.at_using_decl() && !self.nth_is_named(1, "of")
+        if !self.at_using_decl() {
+            return false;
+        }
+        if self.nth_is_named(1, "of") {
+            // `using of` — a declaration binding `of` only in the classic-for
+            // form (`using of = … ;` / `using of ; …` / `using of , …`).
+            return matches!(
+                self.nth_kind(2),
+                TokenKind::Eq | TokenKind::Semicolon | TokenKind::Comma
+            );
+        }
+        true
     }
 
-    /// Whether the cursor begins an `await using` declaration in a `for` head;
-    /// like [`at_await_using_decl`] but the binding name may not be `of`
-    /// (see [`at_for_using_decl`]).
+    /// Whether the cursor begins an `await using` declaration in a `for` head.
+    ///
+    /// Unlike plain `using` (see [`at_for_using_decl`]), the binding name *may*
+    /// be `of`: `for (await using of of x)` is interpreted as an `await using`
+    /// declaration binding `of`, iterating over `x` (the second `of` is the
+    /// `for-of` keyword). The `of`-exclusion exists for plain `using` only
+    /// because `for (using of …)` is otherwise ambiguous with `using` being an
+    /// ordinary LHS identifier — `await using` has no such ambiguity, since
+    /// `await using` can only begin a declaration here.
     fn at_for_await_using_decl(&self) -> bool {
-        self.at_await_using_decl() && !self.nth_is_named(2, "of")
+        self.at_await_using_decl()
     }
 
     /// Whether the token `n` ahead is an identifier (or contextual keyword)
@@ -616,7 +642,7 @@ impl<'src> Parser<'src> {
         let is_await = self.eat(TokenKind::Keyword(Kw::Await));
         self.expect(TokenKind::LParen)?;
         // The header is parsed with the `in`-as-operator restriction in force.
-        let head = self.with_no_in(Self::parse_for_head)?;
+        let head = self.with_no_in(|p| p.parse_for_head(is_await))?;
         match head {
             ForHead::Empty => self.finish_for_classic(start, None),
             ForHead::Classic(init) => self.finish_for_classic(start, init),
@@ -624,17 +650,21 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_for_head(&mut self) -> Result<ForHead> {
+    fn parse_for_head(&mut self, is_await: bool) -> Result<ForHead> {
         if self.eat(TokenKind::Semicolon) {
             return Ok(ForHead::Empty);
         }
 
-        // The `for-of` head forbids a left-hand side beginning with the tokens
-        // `async of` (`for ( [lookahead ∉ { let, async of }] LeftHandSideExpr of
-        // … )`): `for (async of …)` is a Syntax Error (use `for ((async) of …)`
-        // to iterate into the variable `async`). A bare `async` followed by `of`
-        // can only be this forbidden form, so reject it eagerly.
-        if self.peek_tok().text(self.source) == "async" && self.nth_is_named(1, "of") {
+        // The plain (`[~Await]`) `for-of` head forbids a left-hand side beginning
+        // with the tokens `async of` (`for ( [lookahead ∉ { let, async of }]
+        // LeftHandSideExpr of … )`): `for (async of …)` is a Syntax Error (use
+        // `for ((async) of …)` to iterate into the variable `async`). This
+        // lookahead restriction does *not* apply to the `for await` (`[+Await]`)
+        // production, whose head only excludes a leading `let`; there `async` is a
+        // valid LHS identifier (`for await (async of x)`). A bare `async` followed
+        // by `of` can only be the forbidden form, so reject it eagerly — but only
+        // outside `for await`.
+        if !is_await && self.peek_tok().text(self.source) == "async" && self.nth_is_named(1, "of") {
             return Err(self.err("`async` may not be the left-hand side of a `for-of` loop"));
         }
 

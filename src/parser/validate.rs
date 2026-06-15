@@ -434,7 +434,9 @@ impl Validator {
                 // The body of a `with` is a `Statement`; unlike an `if` branch,
                 // Annex B does not allow a (sloppy) `FunctionDeclaration` here, so
                 // a bare or labelled function declaration is rejected.
-                self.reject_decl_substatement(body, ctx, /* allow_sloppy_fn */ false)?;
+                self.reject_decl_substatement(
+                    body, ctx, /* allow_sloppy_fn */ false, /* allow_labelled_fn */ false,
+                )?;
                 self.stmt(body, ctx)
             }
             Stmt::Function(f) => self.function(f, ctx),
@@ -448,14 +450,24 @@ impl Validator {
     /// (Annex B); a `let`/`const`/class/generator/async-function is never
     /// permitted, and a plain `function` is also forbidden in strict mode.
     fn check_substatement(&self, body: &Stmt, ctx: &Ctx) -> Result<()> {
-        self.reject_decl_substatement(body, ctx, /* allow_sloppy_fn */ true)
+        // An `if`/`else` branch permits a bare sloppy `FunctionDeclaration`
+        // (Annex B.3.4) but never a *labelled* one: `if (x) L: function f(){}`
+        // is a Syntax Error in all modes (`IsLabelledFunction` early error).
+        self.reject_decl_substatement(
+            body, ctx, /* allow_sloppy_fn */ true, /* allow_labelled_fn */ false,
+        )
     }
 
     /// The body of a `for`/`while`/`do-while` loop may not be *any* declaration
     /// — not even a plain `function` (Annex B does not apply to loop bodies).
     fn check_loop_body(&self, body: &Stmt) -> Result<()> {
         // Loop bodies forbid even sloppy function declarations.
-        self.reject_decl_substatement(body, &Ctx::top(true), /* allow_sloppy_fn */ false)
+        self.reject_decl_substatement(
+            body,
+            &Ctx::top(true),
+            /* allow_sloppy_fn */ false,
+            /* allow_labelled_fn */ false,
+        )
     }
 
     /// The body of a labeled statement may not be a `let`/`const`/class
@@ -463,16 +475,29 @@ impl Validator {
     /// declaration is allowed in sloppy mode only (Annex B).
     fn check_labeled_body(&self, body: &Stmt, ctx: &Ctx) -> Result<()> {
         // `LabelledItem : FunctionDeclaration` is allowed only for a non-async,
-        // non-generator function in sloppy mode.
-        self.reject_decl_substatement(body, ctx, /* allow_sloppy_fn */ true)
+        // non-generator function in sloppy mode. Because a labelled statement at
+        // a `StatementListItem` position may nest further labels around such a
+        // function (`label1: label2: function f(){}`, Annex B.3.1), a nested
+        // labelled function is permitted here in sloppy mode.
+        self.reject_decl_substatement(
+            body, ctx, /* allow_sloppy_fn */ true, /* allow_labelled_fn */ true,
+        )
     }
 
     /// Shared core: rejects a declaration found in single-statement position.
+    ///
+    /// `allow_sloppy_fn` permits a bare `FunctionDeclaration` in sloppy mode
+    /// (Annex B). `allow_labelled_fn` additionally permits a *labelled*
+    /// `FunctionDeclaration` in sloppy mode — true only for the body of a
+    /// labelled statement that is itself at a `StatementListItem` position, never
+    /// for an `if`/loop/`with` body (where `IsLabelledFunction` is an early
+    /// error regardless of language mode).
     fn reject_decl_substatement(
         &self,
         body: &Stmt,
         ctx: &Ctx,
         allow_sloppy_fn: bool,
+        allow_labelled_fn: bool,
     ) -> Result<()> {
         match body {
             Stmt::Var(decl) if decl.kind != VarDeclKind::Var => Err(self.err(
@@ -497,12 +522,17 @@ impl Validator {
             }
             // A `LabelledStatement` is itself a `Statement`, so it is syntactically
             // valid in single-statement position — but its (possibly nested)
-            // `LabelledItem` may not be a `FunctionDeclaration`. The Annex B
-            // allowance for a sloppy labelled function applies only at a
-            // `StatementListItem` position (top of a block/script/function body),
-            // not as the body of an `if`/loop/`with`/labelled substatement.
+            // `LabelledItem` may not be a `FunctionDeclaration` unless the Annex B
+            // sloppy allowance applies. That allowance applies only at a
+            // `StatementListItem` position (here surfaced via `allow_labelled_fn`),
+            // not as the body of an `if`/loop/`with` substatement, where a labelled
+            // function is an early error in all language modes.
             Stmt::Labeled { body, .. } => {
-                if labels_a_function(body) {
+                if allow_labelled_fn && !ctx.strict {
+                    // Recurse so a nested labelled function is checked under the
+                    // same rules (and a non-function labelled body is unaffected).
+                    self.reject_decl_substatement(body, ctx, allow_sloppy_fn, allow_labelled_fn)
+                } else if labels_a_function(body) {
                     Err(self.err(
                         body.span(),
                         "a labelled function declaration may not appear in \
