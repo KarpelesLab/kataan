@@ -10979,7 +10979,8 @@ impl<'a> Interp<'a> {
                     // UTF-16-indexed: the unit at `i` as a one-unit string,
                     // preserving a lone surrogate (stored via WTF-8). A negative
                     // index is out of range (`NaN`/no-arg → 0).
-                    let out = match str_char_index(self.realm.to_number(arg(0))) {
+                    let idx = self.coerce_to_integer_or_infinity(arg(0))?;
+                    let out = match str_char_index(idx) {
                         Some(i) => crate::wtf8::utf16_index(&bytes, i)
                             .map(|u| crate::wtf8::from_utf16(&[u]))
                             .unwrap_or_default(),
@@ -10994,7 +10995,7 @@ impl<'a> Interp<'a> {
                             "String.prototype.includes argument must not be a regular expression",
                         ));
                     }
-                    let needle = self.arg_string_bytes(arg(0));
+                    let needle = self.arg_string_bytes_fallible(arg(0))?;
                     let units = crate::wtf8::utf16_len(&bytes);
                     let pos = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
@@ -11004,7 +11005,7 @@ impl<'a> Interp<'a> {
                     Some(NanBox::boolean(index_of_units(&bytes, &needle, pos) >= 0.0))
                 }
                 "indexOf" => {
-                    let needle = self.arg_string_bytes(arg(0));
+                    let needle = self.arg_string_bytes_fallible(arg(0))?;
                     // An optional `fromIndex` (UTF-16 unit offset) starts the search.
                     let units = crate::wtf8::utf16_len(&bytes);
                     let from = if matches!(arg(1).unpack(), Unpacked::Undefined) {
@@ -11038,7 +11039,7 @@ impl<'a> Interp<'a> {
                             "String.prototype.startsWith argument must not be a regular expression",
                         ));
                     }
-                    let needle = self.arg_string_bytes(arg(0));
+                    let needle = self.arg_string_bytes_fallible(arg(0))?;
                     let units = crate::wtf8::utf16_len(&bytes);
                     let pos = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
@@ -11057,7 +11058,7 @@ impl<'a> Interp<'a> {
                             "String.prototype.endsWith argument must not be a regular expression",
                         ));
                     }
-                    let needle = self.arg_string_bytes(arg(0));
+                    let needle = self.arg_string_bytes_fallible(arg(0))?;
                     let units = crate::wtf8::utf16_len(&bytes);
                     // `endPosition` defaults to the full length.
                     let end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
@@ -11201,7 +11202,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 "at" => {
-                    let i = self.realm.to_number(arg(0));
+                    let i = self.coerce_to_integer_or_infinity(arg(0))?;
                     // UTF-16-indexed with negative-from-end support.
                     let units = crate::wtf8::utf16_len(&bytes);
                     let idx = if i < 0.0 { units as f64 + i } else { i };
@@ -11264,13 +11265,15 @@ impl<'a> Interp<'a> {
                 // out of range); a surrogate half reads as that 16-bit value.
                 "charCodeAt" => {
                     // A negative or out-of-range index is `NaN` (`NaN`/no-arg → 0).
-                    let unit = str_char_index(self.realm.to_number(arg(0)))
-                        .and_then(|i| crate::wtf8::utf16_index(&bytes, i));
+                    let idx = self.coerce_to_integer_or_infinity(arg(0))?;
+                    let unit =
+                        str_char_index(idx).and_then(|i| crate::wtf8::utf16_index(&bytes, i));
                     Some(unit.map_or(NanBox::number(f64::NAN), |u| NanBox::number(f64::from(u))))
                 }
                 // `codePointAt(i)` combines a surrogate pair at UTF-16 index `i`.
                 "codePointAt" => {
-                    let Some(i) = str_char_index(self.realm.to_number(arg(0))) else {
+                    let idx = self.coerce_to_integer_or_infinity(arg(0))?;
+                    let Some(i) = str_char_index(idx) else {
                         return Ok(Some(NanBox::undefined()));
                     };
                     Some(match crate::wtf8::utf16_index(&bytes, i) {
@@ -11290,28 +11293,33 @@ impl<'a> Interp<'a> {
                     })
                 }
                 "padStart" => {
-                    let target = self.pad_target(self.realm.to_number(arg(0)))?;
+                    // Spec order: ToLength(maxLength) then ToString(fillString).
+                    let tn = self.coerce_to_integer_or_infinity(arg(0))?;
+                    let target = self.pad_target(tn)?;
                     let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         alloc::vec![b' ']
                     } else {
-                        self.arg_string_bytes(arg(1))
+                        self.arg_string_bytes_fallible(arg(1))?
                     };
                     Some(self.new_str_bytes(pad_units(&bytes, target, &pad, true)))
                 }
                 "padEnd" => {
-                    let target = self.pad_target(self.realm.to_number(arg(0)))?;
+                    let tn = self.coerce_to_integer_or_infinity(arg(0))?;
+                    let target = self.pad_target(tn)?;
                     let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         alloc::vec![b' ']
                     } else {
-                        self.arg_string_bytes(arg(1))
+                        self.arg_string_bytes_fallible(arg(1))?
                     };
                     Some(self.new_str_bytes(pad_units(&bytes, target, &pad, false)))
                 }
                 "lastIndexOf" => {
-                    let needle = self.arg_string_bytes(arg(0));
+                    let needle = self.arg_string_bytes_fallible(arg(0))?;
                     // `fromIndex` (a UTF-16 unit index): the match may *start* at or
                     // before it; `undefined`/`NaN` mean +Infinity (whole string).
-                    let n = self.realm.to_number(arg(1));
+                    // ToNumber (a Symbol throws); NaN → whole string.
+                    let pos_num = self.coerce_to_number(arg(1))?;
+                    let n = self.realm.to_number(pos_num);
                     let from = if n.is_nan() {
                         usize::MAX
                     } else {
@@ -13031,6 +13039,27 @@ impl<'a> Interp<'a> {
             return b;
         }
         self.realm.to_display_string(v).into_bytes()
+    }
+
+    /// `ToString(v)` as WTF-8 bytes, fallibly: an object runs ToPrimitive(string)
+    /// (its `@@toPrimitive`/`toString`/`valueOf`, which may throw); a Symbol is a
+    /// TypeError. A surrogate-bearing string value is preserved losslessly.
+    fn arg_string_bytes_fallible(&mut self, v: NanBox) -> Result<alloc::vec::Vec<u8>, ExecError> {
+        if let Some(raw) = v.as_handle()
+            && let Some(b) = self.realm.string_bytes(Handle::from_raw(raw))
+        {
+            return Ok(b);
+        }
+        let prim = self.coerce_primitive(v, "string")?;
+        if let Some(h) = prim.as_handle().map(Handle::from_raw) {
+            if self.realm.symbol_at(h).is_some() {
+                return Err(self.type_error("Cannot convert a Symbol value to a string"));
+            }
+            if let Some(b) = self.realm.string_bytes(h) {
+                return Ok(b);
+            }
+        }
+        Ok(self.realm.to_display_string(prim).into_bytes())
     }
 
     /// Sorts `elems` with a JS comparator (a negative result orders `a` before
