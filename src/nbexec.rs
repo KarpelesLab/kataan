@@ -627,6 +627,11 @@ const N_ARRAY_PROTO_FN: u16 = 206;
 /// so `ArrayBuffer.prototype.slice.call(nonBuffer)` rejects per spec rather than
 /// being silently treated as a generic array-like.
 const N_AB_PROTO_FN: u16 = 233;
+/// A first-class `BigInt.prototype.<method>` (`toString`/`valueOf`/
+/// `toLocaleString`). Like [`N_ARRAY_PROTO_FN`] but applies `thisBigIntValue`:
+/// the call's `this` must be a BigInt or a BigInt wrapper object, else a
+/// `TypeError` (so `BigInt.prototype.valueOf.call({})` rejects per spec).
+const N_BIGINT_PROTO_FN: u16 = 240;
 /// The `Array.prototype` methods exposed as first-class values (each re-dispatched
 /// through `call_method`).
 const ARRAY_PROTO_METHODS: &[&str] = &[
@@ -785,7 +790,8 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "toArray" => 0,
         // Two-argument methods.
         "slice" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
-        | "replaceAll" | "padStart" | "padEnd" | "with" | "setInt8" | "setUint8" => 2,
+        | "replaceAll" | "padStart" | "padEnd" | "with" | "setInt8" | "setUint8" | "asIntN"
+        | "asUintN" => 2,
         // Three-argument typed-array helpers (none currently bound) → fall through.
         // Everything else (map/filter/forEach/reduce/indexOf/slice/at/push/…)
         // declares a single required parameter.
@@ -827,6 +833,58 @@ fn builtin_native_arity(id: u16) -> u32 {
         // statics, …) — one declared parameter.
         _ => 1,
     }
+}
+
+/// Whether a built-in identified by its native dispatch `id` has a `[[Construct]]`
+/// (i.e. `new id(...)` and using it as a `Reflect.construct` newTarget is allowed).
+/// This is the set of ids the `construct` method accepts; everything else — global
+/// functions (`parseInt`, `eval`, `Symbol`, `BigInt`), `Math`/`JSON` methods, and
+/// the `Object`/`Reflect`/`Number`/… statics — is callable but not a constructor.
+/// (`Object` and `Array` are matched by identity, not id, so are handled separately.)
+#[must_use]
+fn is_native_constructor(id: u16) -> bool {
+    if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id) {
+        return true;
+    }
+    if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
+        return true;
+    }
+    matches!(
+        id,
+        N_STRING
+            | N_NUMBER
+            | N_BOOLEAN
+            // `Symbol`/`BigInt` have a `[[Construct]]` (so `IsConstructor` is true)
+            // even though invoking it always throws a TypeError.
+            | N_SYMBOL
+            | N_BIGINT
+            | N_MAP
+            | N_SET
+            | N_WEAKMAP
+            | N_WEAKSET
+            | N_WEAKREF
+            | N_FINALIZATION_REGISTRY
+            | N_PROMISE
+            | N_PROXY
+            | N_DATE
+            | N_REGEXP
+            | N_FUNCTION
+            | N_ARRAY_BUFFER
+            | N_DATA_VIEW
+            | N_WASM_MODULE
+            | N_WASM_INSTANCE
+            | N_WASM_GLOBAL
+            | N_WASM_MEMORY
+            | N_WASM_TABLE
+            | N_INTL_NUMBER_FORMAT
+            | N_INTL_DATETIME_FORMAT
+            | N_INTL_COLLATOR
+            | N_INTL_PLURAL_RULES
+            | N_INTL_LIST_FORMAT
+            | N_INTL_REL_TIME
+            | N_INTL_DISPLAY_NAMES
+            | N_INTL_SEGMENTER
+    )
 }
 
 /// Bound native: the `revoke` function from `Proxy.revocable` (carries the proxy).
@@ -1069,6 +1127,13 @@ impl<'a> Interp<'a> {
     /// — so `Ctor.prototype.method.call(thisArg, …)` works. Methods are
     /// non-enumerable; `proto.constructor` links back to the constructor.
     fn setup_first_class_prototype(&mut self, ctor_name: &str, methods: &[&str]) {
+        self.setup_first_class_prototype_id(ctor_name, methods, N_ARRAY_PROTO_FN);
+    }
+
+    /// As [`Self::setup_first_class_prototype`] but binds each method to the given
+    /// native id (so a prototype with a `this`-validating dispatch arm — e.g.
+    /// `N_BIGINT_PROTO_FN` — can route `.call`/`.apply` through it).
+    fn setup_first_class_prototype_id(&mut self, ctor_name: &str, methods: &[&str], native_id: u16) {
         let Some(ns) = self
             .current
             .get(ctor_name)
@@ -1080,7 +1145,7 @@ impl<'a> Interp<'a> {
         let proto = self.realm.new_object();
         for &name in methods {
             let name_h = self.realm.new_string(name);
-            let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
+            let f = self.realm.new_bound_native(native_id, name_h);
             self.install_fn_name_length(f, name, builtin_method_arity(name));
             self.realm
                 .set_property(proto, name, NanBox::handle(f.to_raw()));
@@ -1623,7 +1688,7 @@ impl<'a> Interp<'a> {
         self.setup_first_class_prototype("String", STRING_PROTO_METHODS);
         self.setup_first_class_prototype("Number", NUMBER_PROTO_METHODS);
         self.setup_first_class_prototype("Boolean", BOOLEAN_PROTO_METHODS);
-        self.setup_first_class_prototype("BigInt", BIGINT_PROTO_METHODS);
+        self.setup_first_class_prototype_id("BigInt", BIGINT_PROTO_METHODS, N_BIGINT_PROTO_FN);
         // `BigInt.prototype[Symbol.toStringTag]` is the string "BigInt", an own data
         // property `{writable:false, enumerable:false, configurable:true}`. Being
         // configurable, it can be redefined (e.g. tests overwrite it with a non-string
@@ -1839,32 +1904,44 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_symbol(&desc).to_raw())
             }
             N_BIGINT => {
-                // From a number (truncated) or a numeric string.
+                // `BigInt(value)`: ToPrimitive(value, number); if the resulting
+                // primitive is a Number, apply NumberToBigInt (a RangeError for a
+                // non-integer or non-finite value); otherwise apply ToBigInt.
                 let v = arg(0);
-                let n = if let Some(raw) = v.as_handle() {
-                    let h = Handle::from_raw(raw);
-                    if let Some(s) = self.realm.string_value(h) {
-                        // `from_str_radix` is O(n²); a huge digit string is a CPU
-                        // sink (`BigInt("9".repeat(1e7))`). Cap the input length to
-                        // the same size budget as `**`/`<<` (MAX_BIGINT_BITS bits ≈
-                        // that many binary digits — a generous decimal bound).
-                        if s.trim().len() as u64 > self.realm.limits.max_bigint_bits {
-                            let m = self.new_str("Maximum BigInt size exceeded");
+                let prim = self.coerce_primitive(v, "number")?;
+                let n = match prim.unpack() {
+                    Unpacked::Number(num) => {
+                        // NumberToBigInt: only an exact integer converts; a
+                        // fractional or non-finite value is a `RangeError`.
+                        if !num.is_finite() || num != num.trunc() {
+                            let m = self.new_str("The number is not a safe integer");
                             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                         }
-                        parse_bigint(s.trim())
-                    } else {
-                        self.realm.bigint_at(h).unwrap_or_default()
+                        if num.abs() < 1.7e38 {
+                            crate::bignum::BigInt::from_i128(num as i128)
+                        } else {
+                            // Exact integers beyond i128's range are reconstructed
+                            // from their decimal text (Rust prints integer-valued
+                            // f64 exactly with the default formatter).
+                            parse_bigint(&alloc::format!("{num}"))
+                        }
                     }
-                } else {
-                    // From a number: only an exact integer converts; a fractional
-                    // or non-finite value is a `RangeError` (`BigInt(1.5)` throws).
-                    let num = self.realm.to_number(v);
-                    if !num.is_finite() || num != (num as i128) as f64 {
-                        let m = self.new_str("The number is not a safe integer");
-                        return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                    _ => {
+                        // ToBigInt on the primitive (string/boolean/bigint/etc.).
+                        // Guard the O(n²) string parse against pathological input.
+                        if let Some(raw) = prim.as_handle() {
+                            let h = Handle::from_raw(raw);
+                            if let Some(s) = self.realm.string_value(h)
+                                && s.trim().len() as u64 > self.realm.limits.max_bigint_bits
+                            {
+                                let m = self.new_str("Maximum BigInt size exceeded");
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_RANGE_ERROR, Some(m)),
+                                ));
+                            }
+                        }
+                        self.coerce_to_bigint(prim)?
                     }
-                    crate::bignum::BigInt::from_i128(num as i128)
                 };
                 NanBox::handle(self.realm.new_bigint(n).to_raw())
             }
@@ -2377,9 +2454,19 @@ impl<'a> Interp<'a> {
                         .unwrap_or_default(),
                     None => Vec::new(),
                 };
+                // `target` must be a constructor.
+                if !self.is_constructor(arg(0)) {
+                    let m = self.new_str("Reflect.construct target is not a constructor");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 // An explicit `newTarget` (3rd arg) becomes `new.target` inside the
-                // constructor (else it is the target itself).
+                // constructor (else it is the target itself); it too must be a
+                // constructor.
                 if args.len() > 2 && !matches!(arg(2).unpack(), Unpacked::Undefined) {
+                    if !self.is_constructor(arg(2)) {
+                        let m = self.new_str("Reflect.construct newTarget is not a constructor");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
                     self.reflect_new_target = Some(arg(2));
                 }
                 return self.construct(arg(0), &list);
@@ -5604,6 +5691,48 @@ impl<'a> Interp<'a> {
                 .is_some_and(|(t, _)| self.is_callable(t))
     }
 
+    /// `IsConstructor(value)`: whether `value` has a `[[Construct]]`. User classes
+    /// and ordinary (non-arrow/generator/async) functions qualify; bound functions
+    /// and proxies inherit it from their target; built-in *constructors* (matched
+    /// by native id) qualify, but built-in *methods* (bound natives such as static
+    /// or prototype methods) and arrow/generator/async functions do not.
+    fn is_constructor(&self, value: NanBox) -> bool {
+        let Some(handle) = value.as_handle().map(Handle::from_raw) else {
+            return false;
+        };
+        if self.realm.class_at(handle).is_some() {
+            return true;
+        }
+        if let Some((func_id, _)) = self.realm.function_at(handle) {
+            let def = self.functions[func_id as usize];
+            return !(def.is_arrow || def.is_generator || def.is_async);
+        }
+        if let Some(target) = self.realm.get_property(handle, BOUND_TARGET) {
+            return self.is_constructor(target);
+        }
+        if let Some((t, _)) = self.realm.proxy_at(handle) {
+            return self.is_constructor(NanBox::handle(t.to_raw()));
+        }
+        // A bound native (static/prototype method) is callable but not a
+        // constructor.
+        if self.realm.bound_native_at(handle).is_some() {
+            return false;
+        }
+        // `Object` and `Array` are namespace objects matched by identity (no native
+        // id), but are constructors.
+        for ctor in ["Object", "Array"] {
+            if self.current.get(ctor).and_then(|v| v.as_handle()) == value.as_handle() {
+                return true;
+            }
+        }
+        // A plain native id is a built-in constructor unless it is a non-construct
+        // intrinsic (a global function such as `parseInt`, `eval`, or `Symbol`).
+        if let Some(id) = self.realm.native_at(handle) {
+            return is_native_constructor(id);
+        }
+        false
+    }
+
     /// Builds a bound function (`Function.prototype.bind`): an object recording
     /// the target, the bound `this`, and the leading bound arguments under
     /// reserved hidden keys. Calling it forwards to the target.
@@ -5712,6 +5841,22 @@ impl<'a> Interp<'a> {
                 }
                 return Ok(self
                     .call_method(this_val, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
+            // A first-class `BigInt.prototype.<method>`: `thisBigIntValue(this)`
+            // must yield a BigInt (the `this` is a BigInt or a BigInt wrapper
+            // object), else a `TypeError`.
+            if id == N_BIGINT_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let big = self.this_bigint_value(this_val);
+                let Some(big) = big else {
+                    return Err(self.type_error(&alloc::format!(
+                        "BigInt.prototype.{name} requires that 'this' be a BigInt"
+                    )));
+                };
+                let prim = NanBox::handle(self.realm.new_bigint(big).to_raw());
+                return Ok(self
+                    .call_method(prim, &name, args)?
                     .unwrap_or(NanBox::undefined()));
             }
             // A first-class `Iterator.prototype.<helper>` (map/filter/take/…) run
@@ -9137,7 +9282,10 @@ impl<'a> Interp<'a> {
         if self.realm.native_at(handle) == Some(N_BIGINT) && matches!(method, "asUintN" | "asIntN")
         {
             use crate::bignum::BigInt;
-            let bits = self.realm.to_number(arg(0)).max(0.0) as u64;
+            // Spec order: ToIndex(bits) first (which may throw a RangeError or run
+            // user coercion), then ToBigInt(bigint).
+            let bits = self.coerce_to_index(arg(0))?;
+            let x = self.coerce_to_bigint(arg(1))?;
             // `2^bits` is the modulus; an attacker-supplied `bits` (e.g.
             // `BigInt.asUintN(1e18, 0n)`) would otherwise build a ~10^17-byte
             // BigInt and OOM/abort. Cap `bits` to the same size budget as the
@@ -9147,11 +9295,6 @@ impl<'a> Interp<'a> {
                 let m = self.new_str("Maximum BigInt size exceeded");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
-            let x = arg(1)
-                .as_handle()
-                .map(Handle::from_raw)
-                .and_then(|h| self.realm.bigint_at(h))
-                .unwrap_or_else(BigInt::zero);
             // `try_pow` re-checks the projected size as defense in depth: even if
             // the cap above were ever loosened, no oversized allocation occurs.
             let Some(modulus) = BigInt::from_i128(2).try_pow(bits, max_bigint_bits) else {
@@ -9294,7 +9437,14 @@ impl<'a> Interp<'a> {
                     let radix = if matches!(arg(0).unpack(), Unpacked::Undefined) {
                         10
                     } else {
-                        self.realm.to_number(arg(0)) as u32
+                        // ToIntegerOrInfinity (TypeError for Symbol/BigInt radix),
+                        // then a RangeError unless it is in [2, 36].
+                        let r = self.coerce_to_integer_or_infinity(arg(0))?;
+                        if !(2.0..=36.0).contains(&r) {
+                            let m = self.new_str("toString() radix must be between 2 and 36");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
+                        r as u32
                     };
                     return Ok(Some(self.new_str(&bigint_to_radix(&big, radix))));
                 }
@@ -13676,6 +13826,23 @@ impl<'a> Interp<'a> {
     /// taken through ToPrimitive(number) and re-coerced. A **Number**, Symbol,
     /// `undefined`, or `null` is a `TypeError` (notably: assigning a Number to a
     /// BigInt typed-array element throws).
+    /// `thisBigIntValue(value)`: the BigInt of `value` if it is a BigInt or a
+    /// BigInt wrapper object (`Object(1n)`), else `None` (the caller throws a
+    /// TypeError). A BigInt wrapper carries its primitive in `PRIM_WRAP` with a
+    /// `PRIM_WRAP_TYPE` of `N_BIGINT`.
+    fn this_bigint_value(&self, value: NanBox) -> Option<crate::bignum::BigInt> {
+        let h = Handle::from_raw(value.as_handle()?);
+        if let Some(big) = self.realm.bigint_at(h) {
+            return Some(big);
+        }
+        let ty = self.realm.get_property(h, PRIM_WRAP_TYPE)?;
+        if ty.as_number() == Some(f64::from(N_BIGINT)) {
+            let prim = self.realm.get_property(h, PRIM_WRAP)?;
+            return self.realm.bigint_at(Handle::from_raw(prim.as_handle()?));
+        }
+        None
+    }
+
     fn coerce_to_bigint(&mut self, v: NanBox) -> Result<crate::bignum::BigInt, ExecError> {
         match v.unpack() {
             Unpacked::Bool(b) => Ok(if b {
@@ -13721,6 +13888,13 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("Cannot convert a Symbol value to a BigInt");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
+                // An array's ToPrimitive(number) is its `toString` (its `valueOf`
+                // returns the array itself), i.e. the joined string.
+                if self.realm.is_array(h) {
+                    let s = self.realm.to_display_string(v);
+                    let str_val = self.new_str(&s);
+                    return self.coerce_to_bigint(str_val);
+                }
                 // An object: ToPrimitive(number), then ToBigInt on the primitive
                 // (which is no longer an object, so the recursion terminates).
                 let prim = self.coerce_primitive(v, "number")?;
@@ -13759,15 +13933,38 @@ impl<'a> Interp<'a> {
     /// e.g. coercing an array-like object's elements during typed-array construction.
     fn coerce_to_number(&mut self, value: NanBox) -> Result<NanBox, ExecError> {
         let prim = self.coerce_primitive(value, "number")?;
-        if prim
-            .as_handle()
-            .map(Handle::from_raw)
-            .is_some_and(|h| self.realm.symbol_at(h).is_some())
-        {
-            let m = self.new_str("Cannot convert a Symbol value to a number");
-            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        if let Some(h) = prim.as_handle().map(Handle::from_raw) {
+            if self.realm.symbol_at(h).is_some() {
+                let m = self.new_str("Cannot convert a Symbol value to a number");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            // ToNumber on a BigInt throws a TypeError (no implicit conversion).
+            if self.realm.bigint_at(h).is_some() {
+                let m = self.new_str("Cannot convert a BigInt value to a number");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
         }
         Ok(NanBox::number(self.realm.to_number(prim)))
+    }
+
+    /// `ToIntegerOrInfinity(value)`: ToNumber then truncate toward zero, mapping
+    /// `NaN` to `0` and preserving `±Infinity`. Propagates the TypeError that
+    /// ToNumber raises for a Symbol or BigInt.
+    fn coerce_to_integer_or_infinity(&mut self, value: NanBox) -> Result<f64, ExecError> {
+        let num = self.coerce_to_number(value)?;
+        let n = self.realm.to_number(num);
+        Ok(if n.is_nan() { 0.0 } else { n.trunc() })
+    }
+
+    /// `ToIndex(value)`: ToIntegerOrInfinity, then a `RangeError` unless the
+    /// result is an integer in `[0, 2^53 − 1]`. Returns the index as `u64`.
+    fn coerce_to_index(&mut self, value: NanBox) -> Result<u64, ExecError> {
+        let n = self.coerce_to_integer_or_infinity(value)?;
+        if !(0.0..=9_007_199_254_740_991.0).contains(&n) {
+            let m = self.new_str("Invalid index");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok(n as u64)
     }
 
     fn coerce_object(&mut self, v: NanBox, hint: &str) -> Result<NanBox, ExecError> {
