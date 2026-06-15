@@ -839,11 +839,22 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "toLocaleString" | "valueOf" | "flat" | "clear" | "trim" | "trimStart" | "trimEnd"
         | "toUpperCase" | "toLowerCase" | "toLocaleUpperCase" | "toLocaleLowerCase"
         | "toReversed" | "toSorted" | "isWellFormed" | "toWellFormed" | "getInt8" | "getUint8"
-        | "toArray" => 0,
+        | "toArray"
+        // `Date.prototype` getters / serializers (length 0).
+        | "getTime" | "getFullYear" | "getUTCFullYear" | "getMonth" | "getUTCMonth"
+        | "getDate" | "getUTCDate" | "getDay" | "getUTCDay" | "getHours" | "getUTCHours"
+        | "getMinutes" | "getUTCMinutes" | "getSeconds" | "getUTCSeconds"
+        | "getMilliseconds" | "getUTCMilliseconds" | "getTimezoneOffset"
+        | "toISOString" | "toDateString" | "toTimeString" | "toUTCString"
+        | "toLocaleDateString" | "toLocaleTimeString" => 0,
         // Two-argument methods.
         "slice" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
         | "replaceAll" | "padStart" | "padEnd" | "with" | "setInt8" | "setUint8" | "asIntN"
-        | "asUintN" => 2,
+        | "asUintN" | "setMonth" | "setUTCMonth" | "setSeconds" | "setUTCSeconds" => 2,
+        // Three-argument `Date` setters.
+        "setFullYear" | "setUTCFullYear" | "setMinutes" | "setUTCMinutes" => 3,
+        // Four-argument `Date` setters.
+        "setHours" | "setUTCHours" => 4,
         // Three-argument typed-array helpers (none currently bound) → fall through.
         // Everything else (map/filter/forEach/reduce/indexOf/slice/at/push/…)
         // declares a single required parameter.
@@ -9981,6 +9992,34 @@ impl<'a> Interp<'a> {
         }
         // --- Date instance methods ---
         if let Some(ms) = self.realm.date_at(handle) {
+            // An invalid (NaN) date: every numeric getter is `NaN` (the field
+            // decomposition below would otherwise read garbage from `0`).
+            if !ms.is_finite()
+                && matches!(
+                    method,
+                    "getTime"
+                        | "valueOf"
+                        | "getFullYear"
+                        | "getUTCFullYear"
+                        | "getMonth"
+                        | "getUTCMonth"
+                        | "getDate"
+                        | "getUTCDate"
+                        | "getDay"
+                        | "getUTCDay"
+                        | "getHours"
+                        | "getUTCHours"
+                        | "getMinutes"
+                        | "getUTCMinutes"
+                        | "getSeconds"
+                        | "getUTCSeconds"
+                        | "getMilliseconds"
+                        | "getUTCMilliseconds"
+                        | "getTimezoneOffset"
+                )
+            {
+                return Ok(Some(NanBox::number(f64::NAN)));
+            }
             let t = ms as i64;
             let day = t.div_euclid(86_400_000);
             let tod = t.rem_euclid(86_400_000);
