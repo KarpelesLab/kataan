@@ -873,6 +873,14 @@ impl<'src> Parser<'src> {
                 self.bump(); // `async`
                 self.parse_function_expr(true, tok.span)
             }
+            // `let` is only reserved as the leading token of a
+            // `LexicalDeclaration`; everywhere else (notably in single-statement
+            // position, where a declaration is not permitted) it is an ordinary
+            // identifier. The statement dispatcher routes such a `let` here.
+            TokenKind::Keyword(Kw::Let) => {
+                self.bump();
+                Ok(Expr::Ident(Ident::new(Kw::Let.as_str(), tok.span)))
+            }
             TokenKind::Keyword(kw) if kw.is_contextual() => {
                 self.bump();
                 Ok(Expr::Ident(Ident::new(kw.as_str(), tok.span)))

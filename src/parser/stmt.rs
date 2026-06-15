@@ -55,23 +55,57 @@ impl<'src> Parser<'src> {
         Ok(program)
     }
 
-    /// Parses statements until `terminator` (or `Eof`).
+    /// Parses statements until `terminator` (or `Eof`). Items in a statement
+    /// list are `StatementListItem`s, so declarations (`let`/`const`/`class`/…)
+    /// are permitted here.
     fn parse_statement_list(&mut self, terminator: TokenKind) -> Result<Vec<Stmt>> {
         let mut body = Vec::new();
         while !self.at(terminator) && !self.at(TokenKind::Eof) {
-            body.push(self.parse_statement()?);
+            body.push(self.parse_statement_item()?);
         }
         Ok(body)
     }
 
-    /// Parses a single statement, dispatching on the leading token.
-    pub(crate) fn parse_statement(&mut self) -> Result<Stmt> {
+    /// Parses a `StatementListItem` — a statement *or* a declaration. Used at
+    /// every position where the grammar admits a declaration (program body,
+    /// block, function body, `switch` case clauses, …).
+    pub(crate) fn parse_statement_item(&mut self) -> Result<Stmt> {
         let guard = self.enter_recursion()?;
-        guard.parser.parse_statement_inner()
+        guard.parser.parse_statement_inner(true)
     }
 
-    /// The body of [`Self::parse_statement`], run inside the recursion guard.
-    fn parse_statement_inner(&mut self) -> Result<Stmt> {
+    /// Parses a single `Statement` in *single-statement position* — the body of
+    /// an `if`/`else`, a loop, a `with`, or a labeled statement. A declaration
+    /// is **not** a `Statement`, so at such a position a leading `let` is the
+    /// identifier `let` (an `ExpressionStatement`), not a `LexicalDeclaration`.
+    pub(crate) fn parse_statement(&mut self) -> Result<Stmt> {
+        let guard = self.enter_recursion()?;
+        guard.parser.parse_statement_inner(false)
+    }
+
+    /// The body of the statement dispatchers, run inside the recursion guard.
+    /// `decl_ok` is true at `StatementListItem` positions (declarations allowed)
+    /// and false in single-statement position.
+    fn parse_statement_inner(&mut self, decl_ok: bool) -> Result<Stmt> {
+        // A leading `let` only introduces a `LexicalDeclaration` at a
+        // `StatementListItem` position. In single-statement position a
+        // declaration is not a `Statement`, so `let` is the ordinary identifier
+        // `let` and the construct is an `ExpressionStatement` (e.g.
+        // `if (x) let\nx = 1;` is `let; x = 1;` via ASI).
+        //
+        // The one exception is the `ExpressionStatement` lookahead restriction
+        // `[lookahead ∉ { … let [ }]`: a `let` immediately followed by `[` can
+        // begin neither an `ExpressionStatement` nor (here) a declaration, so it
+        // is a `SyntaxError`. The restriction is on the token pair `let` `[`; an
+        // intervening line terminator does not lift it.
+        if !decl_ok && self.at(TokenKind::Keyword(Kw::Let)) {
+            if self.nth_kind(1) == TokenKind::LBracket {
+                return Err(
+                    self.err("`let [` may not begin a statement in single-statement position")
+                );
+            }
+            return self.parse_expression_statement();
+        }
         match self.peek() {
             TokenKind::LBrace => self.parse_block(),
             TokenKind::Semicolon => {
@@ -646,7 +680,7 @@ impl<'src> Parser<'src> {
             self.peek(),
             TokenKind::Keyword(Kw::Case | Kw::Default) | TokenKind::RBrace | TokenKind::Eof
         ) {
-            body.push(self.parse_statement()?);
+            body.push(self.parse_statement_item()?);
         }
         Ok(body)
     }
