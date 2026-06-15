@@ -2157,7 +2157,7 @@ impl<'a> Interp<'a> {
                     Unpacked::Number(num) => {
                         // NumberToBigInt: only an exact integer converts; a
                         // fractional or non-finite value is a `RangeError`.
-                        if !num.is_finite() || num != num.trunc() {
+                        if !num.is_finite() || num != trunc_toward_zero(num) {
                             let m = self.new_str("The number is not a safe integer");
                             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                         }
@@ -3228,17 +3228,21 @@ impl<'a> Interp<'a> {
             }
             #[cfg(not(feature = "std"))]
             N_MATH_F16ROUND => return Err(ExecError::Unsupported("Math.f16round needs std")),
-            // `Math.clz32(x)` — count leading zeros of the ToUint32 value.
+            // `Math.clz32(x)` — count leading zeros of the ToUint32 value. ToUint32
+            // maps a non-finite/NaN value to 0 (so `clz32(Infinity)` is 32). The
+            // `as i64 as u32` cast performs trunc-toward-zero mod 2^32 without the
+            // `f64::trunc` intrinsic (so this stays available in `no_std`).
             N_MATH_CLZ32 => {
-                // ToUint32 maps a non-finite/NaN value to 0 (so `clz32(Infinity)`
-                // is `clz32(0)` = 32).
-                let u = self.realm.to_uint32(arg(0));
+                let n = self.realm.to_number(arg(0));
+                let u = if n.is_finite() { n as i64 as u32 } else { 0 };
                 NanBox::number(u.leading_zeros() as f64)
             }
             // `Math.imul(a, b)` — 32-bit integer multiplication.
             N_MATH_IMUL => {
-                let a = self.realm.to_int32(arg(0));
-                let b = self.realm.to_int32(arg(1));
+                let an = self.realm.to_number(arg(0));
+                let bn = self.realm.to_number(arg(1));
+                let a = if an.is_finite() { an as i64 as i32 } else { 0 };
+                let b = if bn.is_finite() { bn as i64 as i32 } else { 0 };
                 NanBox::number(a.wrapping_mul(b) as f64)
             }
             #[cfg(not(feature = "std"))]
@@ -9955,7 +9959,10 @@ impl<'a> Interp<'a> {
                 for a in args {
                     let num = self.coerce_to_number(*a)?;
                     let n = self.realm.to_number(num);
-                    if !n.is_finite() || n != n.trunc() || !(0.0..=0x10_FFFF as f64).contains(&n) {
+                    if !n.is_finite()
+                        || n != trunc_toward_zero(n)
+                        || !(0.0..=0x10_FFFF as f64).contains(&n)
+                    {
                         let m = self.new_str("Invalid code point");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
@@ -11135,7 +11142,14 @@ impl<'a> Interp<'a> {
                     let limit = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         u32::MAX
                     } else {
-                        self.realm.to_uint32(arg(1))
+                        // ToUint32 without the std-only `trunc` (so `no_std` builds):
+                        // truncate toward zero into i64, then take the low 32 bits.
+                        let n = self.realm.to_number(arg(1));
+                        if n.is_finite() {
+                            (n as i64).rem_euclid(4_294_967_296) as u32
+                        } else {
+                            0
+                        }
                     } as usize;
                     if limit == 0 {
                         return Ok(Some(NanBox::handle(
@@ -14606,7 +14620,11 @@ impl<'a> Interp<'a> {
     fn coerce_to_integer_or_infinity(&mut self, value: NanBox) -> Result<f64, ExecError> {
         let num = self.coerce_to_number(value)?;
         let n = self.realm.to_number(num);
-        Ok(if n.is_nan() { 0.0 } else { n.trunc() })
+        Ok(if n.is_nan() {
+            0.0
+        } else {
+            trunc_toward_zero(n)
+        })
     }
 
     /// `ToIndex(value)`: ToIntegerOrInfinity, then a `RangeError` unless the
@@ -18616,6 +18634,17 @@ fn format_date_year(y: i64) -> String {
     }
 }
 
+/// Truncates `n` toward zero without the std-only `f64::trunc` intrinsic (kept
+/// available in `no_std`). `NaN`/`±Infinity` and magnitudes beyond `i64` range
+/// (already integral) pass through unchanged.
+fn trunc_toward_zero(n: f64) -> f64 {
+    if !n.is_finite() || n.abs() >= 9_223_372_036_854_775_808.0 {
+        n
+    } else {
+        n as i64 as f64
+    }
+}
+
 /// `TimeClip(t)`: `NaN` for a non-finite value or a magnitude beyond the maximum
 /// representable time (8.64e15 ms ≈ ±100,000,000 days), otherwise the integer
 /// part (truncated toward zero, normalizing `-0` to `+0`).
@@ -18623,7 +18652,7 @@ fn time_clip(t: f64) -> f64 {
     if !t.is_finite() || t.abs() > 8.64e15 {
         return f64::NAN;
     }
-    let truncated = t.trunc();
+    let truncated = trunc_toward_zero(t);
     if truncated == 0.0 { 0.0 } else { truncated }
 }
 
