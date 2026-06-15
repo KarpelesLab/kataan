@@ -838,7 +838,7 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "toLocaleString" | "valueOf" | "flat" | "clear" | "trim" | "trimStart" | "trimEnd"
         | "toUpperCase" | "toLowerCase" | "toLocaleUpperCase" | "toLocaleLowerCase"
         | "toReversed" | "toSorted" | "isWellFormed" | "toWellFormed" | "getInt8" | "getUint8"
-        | "toArray"
+        | "toArray" | "normalize"
         // `Date.prototype` getters / serializers (length 0).
         | "getTime" | "getFullYear" | "getUTCFullYear" | "getMonth" | "getUTCMonth"
         | "getDate" | "getUTCDate" | "getDay" | "getUTCDay" | "getHours" | "getUTCHours"
@@ -11341,7 +11341,14 @@ impl<'a> Interp<'a> {
                 // `search(str)` — index of the first match (string needle).
                 "search" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    let needle = self.realm.to_display_string(arg(0));
+                    // A non-RegExp argument is ToString'd (running a user `toString`,
+                    // which may throw) and matched literally.
+                    let needle_bytes = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                        Vec::new()
+                    } else {
+                        self.arg_string_bytes_fallible(arg(0))?
+                    };
+                    let needle = crate::wtf8::to_string_lossy(&needle_bytes);
                     // The result is a UTF-16 unit index.
                     let idx = s
                         .find(&needle)
@@ -11358,7 +11365,9 @@ impl<'a> Interp<'a> {
                     let form = if matches!(arg(0).unpack(), Unpacked::Undefined) {
                         String::from("NFC")
                     } else {
-                        self.realm.to_display_string(arg(0))
+                        // ToString the form (a Symbol throws a TypeError) *before*
+                        // validating it against the allowed set.
+                        self.coerce_to_string(arg(0))?
                     };
                     #[cfg(feature = "intl")]
                     {
