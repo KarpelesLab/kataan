@@ -455,6 +455,18 @@ const N_INTL_DISPLAY_NAMES_OF: u16 = 226;
 const N_INTL_SEGMENTER: u16 = 227;
 /// `Intl.Segmenter.prototype.segment`.
 const N_INTL_SEGMENTER_SEGMENT: u16 = 228;
+/// The shared abstract `%TypedArray%` intrinsic constructor — the value
+/// `Object.getPrototypeOf(Int8Array)` returns. Calling or `new`-ing it directly
+/// throws a `TypeError`; it carries the generic `from`/`of`/`get [Symbol.species]`
+/// statics that every concrete typed-array constructor inherits.
+const N_TYPED_ARRAY_ABSTRACT: u16 = 229;
+/// `%TypedArray%.from(source, mapFn?, thisArg?)` — builds an instance of the
+/// `this` constructor from an array-like / iterable.
+const N_TYPED_ARRAY_FROM: u16 = 230;
+/// `%TypedArray%.of(...items)` — builds an instance of the `this` constructor.
+const N_TYPED_ARRAY_OF: u16 = 231;
+/// `get %TypedArray%[Symbol.species]` — returns `this` (the receiver constructor).
+const N_TYPED_ARRAY_SPECIES: u16 = 232;
 /// The typed-array constructors occupy `[BASE, BASE + KINDS.len())`; the id minus
 /// the base indexes [`TYPED_ARRAY_KINDS`].
 const N_TYPED_ARRAY_BASE: u16 = 168;
@@ -938,6 +950,118 @@ impl<'a> Interp<'a> {
             .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
     }
 
+    /// Installs the shared abstract `%TypedArray%` intrinsic constructor and wires
+    /// the concrete typed-array constructors (`Int8Array`, …) into its hierarchy:
+    ///
+    /// - `Object.getPrototypeOf(Int8Array) === %TypedArray%` (every kind shares it),
+    /// - `Object.getPrototypeOf(%TypedArray%) === Function.prototype`,
+    /// - `%TypedArray%.prototype` is a real object (proto `Object.prototype`) and
+    ///   `Object.getPrototypeOf(Int8Array.prototype) === %TypedArray%.prototype`,
+    /// - the generic `from`/`of` statics and the `get [Symbol.species]` accessor
+    ///   live on `%TypedArray%` and are inherited by every concrete constructor,
+    /// - `%TypedArray%` is abstract: calling/`new`-ing it throws a `TypeError`,
+    ///   `%TypedArray%.name === "TypedArray"`, `%TypedArray%.length === 0`.
+    ///
+    /// `obj_proto` is the realm's `Object.prototype`.
+    fn setup_typed_array_intrinsic(&mut self, obj_proto: Handle) {
+        // The abstract constructor itself (a native; abstract behavior is enforced
+        // in `dispatch_native`).
+        let ta = self.new_named_native("TypedArray", N_TYPED_ARRAY_ABSTRACT);
+        self.realm
+            .set_hidden_property(ta, "length", NanBox::number(0.0));
+        self.realm.set_typed_array_intrinsic(ta);
+        // Its `[[Prototype]]` is `Function.prototype`.
+        if let Some(func_proto) = self
+            .current
+            .get("Function")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|f| self.realm.get_property(f, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_native_proto(ta, func_proto);
+        }
+        // `%TypedArray%.prototype`: a real object inheriting `Object.prototype`,
+        // with a back-link to the constructor. Concrete-kind prototypes inherit it.
+        let ta_proto = self.realm.new_object_with_proto(Some(obj_proto));
+        self.realm
+            .set_hidden_property(ta_proto, "constructor", NanBox::handle(ta.to_raw()));
+        self.realm
+            .set_property(ta, "prototype", NanBox::handle(ta_proto.to_raw()));
+        self.realm.mark_hidden(ta, "prototype");
+        // Generic statics `from` (length 1) and `of` (length 0).
+        let from_fn = self.new_named_native("from", N_TYPED_ARRAY_FROM);
+        self.realm
+            .set_hidden_property(from_fn, "length", NanBox::number(1.0));
+        self.realm
+            .set_property(ta, "from", NanBox::handle(from_fn.to_raw()));
+        self.realm.mark_hidden(ta, "from");
+        let of_fn = self.new_named_native("of", N_TYPED_ARRAY_OF);
+        self.realm
+            .set_hidden_property(of_fn, "length", NanBox::number(0.0));
+        self.realm
+            .set_property(ta, "of", NanBox::handle(of_fn.to_raw()));
+        self.realm.mark_hidden(ta, "of");
+        // `get %TypedArray%[Symbol.species]` (returns `this`).
+        let species_sym = self.well_known_symbol("species");
+        let species_key = self.member_key(species_sym);
+        let species_get = self.new_named_native("get [Symbol.species]", N_TYPED_ARRAY_SPECIES);
+        self.realm.define_accessor(
+            ta,
+            &species_key,
+            NanBox::handle(species_get.to_raw()),
+            NanBox::undefined(),
+        );
+        // Wire every concrete typed-array constructor: its `[[Prototype]]` is
+        // `%TypedArray%`, and its `.prototype` is a real object inheriting
+        // `%TypedArray%.prototype` with a back-link to the concrete constructor.
+        for (i, (name, _)) in TYPED_ARRAY_KINDS.iter().enumerate() {
+            let Some(ctor) = self
+                .current
+                .get(name)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+            else {
+                continue;
+            };
+            self.realm.set_native_proto(ctor, ta);
+            let kind_proto = self.realm.new_object_with_proto(Some(ta_proto));
+            self.realm.set_hidden_property(
+                kind_proto,
+                "constructor",
+                NanBox::handle(ctor.to_raw()),
+            );
+            self.realm
+                .set_property(ctor, "prototype", NanBox::handle(kind_proto.to_raw()));
+            self.realm.mark_hidden(ctor, "prototype");
+            // `<TypedArray>.BYTES_PER_ELEMENT` is also exposed on each kind's
+            // prototype (spec); the constructor static is handled in `read_member`.
+            let _ = i;
+        }
+        // `ArrayBuffer.prototype` / `DataView.prototype`: real objects (inheriting
+        // `Object.prototype`) with a `constructor` back-link, so feature probes like
+        // the Test262 harness's `if (ArrayBuffer.prototype.resize)` read `undefined`
+        // rather than null-dereferencing on a missing `.prototype`. The actual
+        // ArrayBuffer/DataView methods continue to dispatch via `call_method`.
+        for name in ["ArrayBuffer", "DataView"] {
+            let Some(ctor) = self
+                .current
+                .get(name)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+            else {
+                continue;
+            };
+            let proto = self.realm.new_object_with_proto(Some(obj_proto));
+            self.realm
+                .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
+            self.realm
+                .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
+            self.realm.mark_hidden(ctor, "prototype");
+        }
+    }
+
     /// A readable bound native for a call-only method `name` (dispatched in `call_method`),
     /// so `typeof obj.method === "function"` and a detached `obj.method.call(obj, …)` work.
     fn readable_native_method(&mut self, name: &str) -> NanBox {
@@ -1287,6 +1411,10 @@ impl<'a> Interp<'a> {
         self.setup_first_class_prototype("Function", FUNCTION_PROTO_METHODS);
         self.setup_first_class_prototype("Set", SET_PROTO_METHODS);
         self.setup_first_class_prototype("Map", MAP_PROTO_METHODS);
+        // The shared abstract `%TypedArray%` intrinsic constructor and the
+        // constructor-side hierarchy that hangs the concrete TA constructors off
+        // it (so `Object.getPrototypeOf(Int8Array) === %TypedArray%`).
+        self.setup_typed_array_intrinsic(obj_proto);
         // Static methods that are otherwise call-only (readable for feature detection).
         self.setup_static_methods(
             "Promise",
@@ -2251,6 +2379,70 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_array(items).to_raw())
             }
             N_ARRAY_OF => NanBox::handle(self.realm.new_array(args.to_vec()).to_raw()),
+            // The abstract `%TypedArray%` intrinsic is not callable directly.
+            N_TYPED_ARRAY_ABSTRACT => {
+                let m = self.new_str("Abstract class TypedArray not directly constructable");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            // `%TypedArray%.from(source, mapFn?, thisArg?)` — generic over the
+            // `this` constructor (`Int8Array.from(...)` builds an `Int8Array`).
+            N_TYPED_ARRAY_FROM => {
+                let ctor = self.this_val;
+                let items = match self.iterate_values(arg(0)) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let mut out = Vec::new();
+                        if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
+                            let len = self
+                                .realm
+                                .get_property(h, "length")
+                                .map(|v| self.realm.to_number(v))
+                                .unwrap_or(0.0)
+                                .max(0.0) as usize;
+                            for i in 0..len {
+                                let k = alloc::format!("{i}");
+                                out.push(
+                                    self.realm
+                                        .get_property(h, &k)
+                                        .unwrap_or(NanBox::undefined()),
+                                );
+                            }
+                        }
+                        out
+                    }
+                };
+                let items = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                    items
+                } else {
+                    let f = arg(1);
+                    let this_arg = arg(2);
+                    let mut out = Vec::with_capacity(items.len());
+                    for (i, e) in items.iter().enumerate() {
+                        out.push(self.call_with_this(
+                            f,
+                            this_arg,
+                            &[*e, NanBox::number(i as f64)],
+                        )?);
+                    }
+                    out
+                };
+                let view = self.construct(ctor, &[NanBox::number(items.len() as f64)])?;
+                if let Some(vh) = view.as_handle().map(Handle::from_raw) {
+                    self.realm.typed_set_from_numbers(vh, 0, &items);
+                }
+                view
+            }
+            // `%TypedArray%.of(...items)` — generic over the `this` constructor.
+            N_TYPED_ARRAY_OF => {
+                let ctor = self.this_val;
+                let view = self.construct(ctor, &[NanBox::number(args.len() as f64)])?;
+                if let Some(vh) = view.as_handle().map(Handle::from_raw) {
+                    self.realm.typed_set_from_numbers(vh, 0, args);
+                }
+                view
+            }
+            // `get %TypedArray%[Symbol.species]` — returns the receiver constructor.
+            N_TYPED_ARRAY_SPECIES => self.this_val,
             N_OBJECT_FROM_ENTRIES => {
                 let obj = self.realm.new_object();
                 // Accepts any iterable of `[key, value]` pairs (arrays, a Map, …).
@@ -5078,6 +5270,11 @@ impl<'a> Interp<'a> {
             .realm
             .native_at(handle)
             .ok_or(ExecError::Unsupported("new on this value"))?;
+        // The abstract `%TypedArray%` intrinsic cannot be constructed directly.
+        if id == N_TYPED_ARRAY_ABSTRACT {
+            let m = self.new_str("Abstract class TypedArray not directly constructable");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
         // `new WebAssembly.Module(bytes)` — decode/validate, keep the bytes so a
         // later `new WebAssembly.Instance(module)` can instantiate it.
         if id == N_WASM_MODULE {

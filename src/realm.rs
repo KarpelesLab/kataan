@@ -90,6 +90,14 @@ pub struct Realm {
     /// [`new_object`](Realm::new_object) once the global environment is set up. A
     /// `None`-proto object (`Object.create(null)`) opts out explicitly.
     default_object_proto: Option<Handle>,
+    /// Explicit `[[Prototype]]` links for callable cells that have no inline
+    /// object part (natives, bound natives) — e.g. each typed-array constructor's
+    /// prototype is the shared `%TypedArray%` intrinsic. Keyed by handle; same
+    /// non-GC-root, GC-quiescent caveat as `aux_props`.
+    native_protos: alloc::collections::BTreeMap<u64, Handle>,
+    /// The shared abstract `%TypedArray%` intrinsic constructor (the value
+    /// `Object.getPrototypeOf(Int8Array)` returns), installed at global setup.
+    typed_array_intrinsic: Option<Handle>,
     /// Tunable resource limits for work driven in this realm. Defaults to
     /// [`crate::limits::Limits::default`]; override with [`Realm::with_limits`].
     pub limits: crate::limits::Limits,
@@ -125,8 +133,30 @@ impl Realm {
             sealed_arrays: alloc::collections::BTreeSet::new(),
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
             default_object_proto: None,
+            native_protos: alloc::collections::BTreeMap::new(),
+            typed_array_intrinsic: None,
             limits,
         }
+    }
+
+    /// Records an explicit `[[Prototype]]` for a callable cell (native / bound
+    /// native) that has no inline object part. Read back by
+    /// [`object_proto`](Realm::object_proto) so `Object.getPrototypeOf` resolves
+    /// the constructor-side chain (e.g. `getPrototypeOf(Int8Array)` →
+    /// `%TypedArray%`).
+    pub fn set_native_proto(&mut self, handle: Handle, proto: Handle) {
+        self.native_protos.insert(handle.to_raw(), proto);
+    }
+
+    /// Records the shared abstract `%TypedArray%` intrinsic constructor handle.
+    pub fn set_typed_array_intrinsic(&mut self, handle: Handle) {
+        self.typed_array_intrinsic = Some(handle);
+    }
+
+    /// The shared abstract `%TypedArray%` intrinsic constructor, if installed.
+    #[must_use]
+    pub fn typed_array_intrinsic(&self) -> Option<Handle> {
+        self.typed_array_intrinsic
     }
 
     /// Every live typed-array view whose backing bytes cell is `bytes_handle`.
@@ -1163,10 +1193,17 @@ impl Realm {
         None
     }
 
-    /// The `[[Prototype]]` handle of the object at `handle`, if any.
+    /// The `[[Prototype]]` handle of the object at `handle`, if any. For a
+    /// callable cell with no inline object part (a native / bound native), this
+    /// is the explicit link recorded by [`set_native_proto`](Realm::set_native_proto)
+    /// — so `Object.getPrototypeOf(Int8Array)` resolves to the shared
+    /// `%TypedArray%` intrinsic rather than `null`.
     #[must_use]
     pub fn object_proto(&self, handle: Handle) -> Option<Handle> {
-        self.heap.get(handle)?.as_object()?.proto()
+        if let Some(obj) = self.heap.get(handle).and_then(Cell::as_object) {
+            return obj.proto();
+        }
+        self.native_protos.get(&handle.to_raw()).copied()
     }
 
     /// Sets the `[[Prototype]]` of the object at `handle`.
@@ -1534,17 +1571,25 @@ impl Realm {
                 return true;
             }
         }
-        // A non-object cell: check its auxiliary props.
+        // A non-object cell: check its auxiliary props (data or accessor).
         self.aux_props
             .get(&handle.to_raw())
             .and_then(|aux| self.heap.get(*aux))
             .and_then(Cell::as_object)
-            .is_some_and(|o| o.contains(key))
+            .is_some_and(|o| o.contains(key) || o.accessor(key).is_some())
     }
 
     /// Defines an accessor (getter/setter) property on the object at `handle`.
+    /// For a callable cell with no inline object part (a native, e.g. the
+    /// `%TypedArray%` intrinsic), the accessor is recorded on its auxiliary
+    /// object so a prototype-chain `get`/`set` still resolves it.
     pub fn define_accessor(&mut self, handle: Handle, key: &str, getter: NanBox, setter: NanBox) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.define_accessor(key, getter, setter);
+            return;
+        }
+        let aux = self.aux_object(handle);
+        if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
             o.define_accessor(key, getter, setter);
         }
     }
@@ -1557,10 +1602,17 @@ impl Realm {
         }
     }
 
-    /// The `(getter, setter)` of accessor `key` on `handle`, if defined.
+    /// The `(getter, setter)` of accessor `key` on `handle`, if defined. Consults
+    /// a callable cell's auxiliary object (see [`define_accessor`](Realm::define_accessor))
+    /// so accessors installed on a native (e.g. `%TypedArray%`'s `get [Symbol.species]`)
+    /// resolve.
     #[must_use]
     pub fn accessor(&self, handle: Handle, key: &str) -> Option<(NanBox, NanBox)> {
-        self.heap.get(handle)?.as_object()?.accessor(key)
+        if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
+            return o.accessor(key);
+        }
+        let aux = self.aux_props.get(&handle.to_raw())?;
+        self.heap.get(*aux)?.as_object()?.accessor(key)
     }
 
     /// Sets own property `key` to `value` on the object at `handle`. Returns
