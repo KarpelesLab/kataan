@@ -1211,7 +1211,12 @@ impl<'a> Interp<'a> {
     /// As [`Self::setup_first_class_prototype`] but binds each method to the given
     /// native id (so a prototype with a `this`-validating dispatch arm — e.g.
     /// `N_BIGINT_PROTO_FN` — can route `.call`/`.apply` through it).
-    fn setup_first_class_prototype_id(&mut self, ctor_name: &str, methods: &[&str], native_id: u16) {
+    fn setup_first_class_prototype_id(
+        &mut self,
+        ctor_name: &str,
+        methods: &[&str],
+        native_id: u16,
+    ) {
         let Some(ns) = self
             .current
             .get(ctor_name)
@@ -1799,7 +1804,8 @@ impl<'a> Interp<'a> {
                 ("NaN", f64::NAN),
             ];
             for &(name, value) in consts {
-                self.realm.set_property(num_ctor, name, NanBox::number(value));
+                self.realm
+                    .set_property(num_ctor, name, NanBox::number(value));
                 self.realm.mark_hidden(num_ctor, name);
                 self.realm.set_readonly_property(num_ctor, name);
                 self.realm.set_non_configurable_property(num_ctor, name);
@@ -1825,9 +1831,16 @@ impl<'a> Interp<'a> {
                 .map(Handle::from_raw)
             {
                 self.realm.set_hidden_property(proto, PRIM_WRAP, prim);
-                let id = if ctor == "Number" { N_NUMBER } else { N_BOOLEAN };
-                self.realm
-                    .set_hidden_property(proto, PRIM_WRAP_TYPE, NanBox::number(f64::from(id)));
+                let id = if ctor == "Number" {
+                    N_NUMBER
+                } else {
+                    N_BOOLEAN
+                };
+                self.realm.set_hidden_property(
+                    proto,
+                    PRIM_WRAP_TYPE,
+                    NanBox::number(f64::from(id)),
+                );
             }
         }
         self.setup_first_class_prototype_id("BigInt", BIGINT_PROTO_METHODS, N_BIGINT_PROTO_FN);
@@ -2019,7 +2032,9 @@ impl<'a> Interp<'a> {
             N_DATE_TO_PRIMITIVE => {
                 let this = self.this_val;
                 if !self.is_object_value(this) {
-                    return Err(self.type_error("Date.prototype[Symbol.toPrimitive] called on non-object"));
+                    return Err(
+                        self.type_error("Date.prototype[Symbol.toPrimitive] called on non-object")
+                    );
                 }
                 let hint = self.realm.to_display_string(arg(0));
                 let try_hint = match hint.as_str() {
@@ -6795,14 +6810,17 @@ impl<'a> Interp<'a> {
                 } else {
                     // A two-digit year (0..=99) maps to 1900+year.
                     let yi = year_n as i64;
-                    let year = if (0..=99).contains(&yi) { 1900 + yi } else { yi };
+                    let year = if (0..=99).contains(&yi) {
+                        1900 + yi
+                    } else {
+                        yi
+                    };
                     let total_months = year * 12 + month as i64;
                     let y = total_months.div_euclid(12);
                     let mo = total_months.rem_euclid(12) as u32 + 1; // 1..=12
                     // Measure the day as an offset from the 1st so an out-of-range
                     // (incl. negative) day rolls over via integer arithmetic.
-                    let days =
-                        crate::realm::days_from_civil(y, mo, 1) + (day as i64 - 1);
+                    let days = crate::realm::days_from_civil(y, mo, 1) + (day as i64 - 1);
                     time_clip(
                         (days * 86_400_000
                             + hours as i64 * 3_600_000
@@ -6815,8 +6833,10 @@ impl<'a> Interp<'a> {
                 match args.first().copied() {
                     Some(a) => {
                         // A Date argument copies its time value directly.
-                        if let Some(existing) =
-                            a.as_handle().map(Handle::from_raw).and_then(|h| self.realm.date_at(h))
+                        if let Some(existing) = a
+                            .as_handle()
+                            .map(Handle::from_raw)
+                            .and_then(|h| self.realm.date_at(h))
                         {
                             time_clip(existing)
                         } else {
@@ -9183,8 +9203,7 @@ impl<'a> Interp<'a> {
                         Some(a) if !matches!(a.unpack(), Unpacked::Undefined) => {
                             let r = self.coerce_to_integer_or_infinity(*a)?;
                             if !(2.0..=36.0).contains(&r) {
-                                let m =
-                                    self.new_str("toString() radix must be between 2 and 36");
+                                let m = self.new_str("toString() radix must be between 2 and 36");
                                 return Err(ExecError::Throw(
                                     self.make_error(N_RANGE_ERROR, Some(m)),
                                 ));
@@ -9778,7 +9797,11 @@ impl<'a> Interp<'a> {
             }
             // A two-digit year (0..=99) maps to 1900+year.
             let yi = year_n as i64;
-            let year = if (0..=99).contains(&yi) { 1900 + yi } else { yi };
+            let year = if (0..=99).contains(&yi) {
+                1900 + yi
+            } else {
+                yi
+            };
             let total_months = year * 12 + month as i64;
             let y = total_months.div_euclid(12);
             let mo = total_months.rem_euclid(12) as u32 + 1;
@@ -10411,11 +10434,8 @@ impl<'a> Interp<'a> {
                     let mo1 = (mo0.rem_euclid(12) + 1) as u32;
                     let base_days = crate::realm::days_from_civil(yy2, mo1, 1) + (dd - 1);
                     let nms = time_clip(
-                        (base_days * 86_400_000
-                            + hh * 3_600_000
-                            + mi * 60_000
-                            + ss * 1000
-                            + mss) as f64,
+                        (base_days * 86_400_000 + hh * 3_600_000 + mi * 60_000 + ss * 1000 + mss)
+                            as f64,
                     );
                     self.realm.set_date_ms(handle, nms);
                     NanBox::number(nms)
@@ -11118,7 +11138,9 @@ impl<'a> Interp<'a> {
                         self.realm.to_uint32(arg(1))
                     } as usize;
                     if limit == 0 {
-                        return Ok(Some(NanBox::handle(self.realm.new_array(Vec::new()).to_raw())));
+                        return Ok(Some(NanBox::handle(
+                            self.realm.new_array(Vec::new()).to_raw(),
+                        )));
                     }
                     // An `undefined` separator returns the whole string as the sole
                     // element.

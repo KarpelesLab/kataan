@@ -3278,9 +3278,7 @@ fn parse_human_date(s: &str) -> Option<f64> {
     let toks: alloc::vec::Vec<&str> = rest.split_whitespace().collect();
     // Two layouts: `Mon DD YYYY [time…]` (toString) or `DD Mon YYYY [time…]`
     // (toUTCString).
-    let (mon_str, day_str, year_str, time_idx) = if toks.len() >= 3
-        && MONTHS.contains(&toks[0])
-    {
+    let (mon_str, day_str, year_str, time_idx) = if toks.len() >= 3 && MONTHS.contains(&toks[0]) {
         (toks[0], toks[1], toks[2], 3)
     } else if toks.len() >= 3 && MONTHS.contains(&toks[1]) {
         (toks[1], toks[0], toks[2], 3)
