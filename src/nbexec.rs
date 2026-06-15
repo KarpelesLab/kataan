@@ -4608,9 +4608,9 @@ impl<'a> Interp<'a> {
                     match it.next() {
                         Some(v) => v,
                         None => {
-                            return Err(self.type_error(
-                                "Reduce of empty iterator with no initial value",
-                            ));
+                            return Err(
+                                self.type_error("Reduce of empty iterator with no initial value")
+                            );
                         }
                     }
                 };
@@ -13203,9 +13203,7 @@ impl<'a> Interp<'a> {
                 // `[a, b] = infiniteIterator` terminates and `return()` runs.
                 // (Mirrors the declaration path in `bind_pattern`.) Built-in
                 // iterables (arrays/strings/Sets/generators) take the eager path.
-                let items = if !has_rest
-                    && let Some(ih) = self.for_of_get_iterator(value)?
-                {
+                let items = if !has_rest && let Some(ih) = self.for_of_get_iterator(value)? {
                     if self.realm.get_property(ih, GEN_BUF).is_some() {
                         self.iterate_values(NanBox::handle(ih.to_raw()))?
                     } else {

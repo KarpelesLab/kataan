@@ -1625,16 +1625,16 @@ fn run_frame(
                 // A spread of any built-in iterable (array / typed array / string
                 // / Map / Set); a user iterable faults to the tree-walker, which
                 // drives the full iterator protocol.
-                let elems = vm_iterable_values(ctx, regs[*src as usize])
-                    .ok_or(VmError::NotAnObject)?;
+                let elems =
+                    vm_iterable_values(ctx, regs[*src as usize]).ok_or(VmError::NotAnObject)?;
                 let start = ctx.realm.array_length(handle).unwrap_or(0);
                 for (i, e) in elems.into_iter().enumerate() {
                     ctx.realm.set_element(handle, start + i, e);
                 }
             }
             Op::IterValues { dst, src } => {
-                let elems = vm_iterable_values(ctx, regs[*src as usize])
-                    .ok_or(VmError::NotAnObject)?;
+                let elems =
+                    vm_iterable_values(ctx, regs[*src as usize]).ok_or(VmError::NotAnObject)?;
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(elems).to_raw());
             }
             Op::ObjectRest { dst, src, exclude } => {
