@@ -1081,6 +1081,8 @@ const N_MATH_FROUND: u16 = 155;
 const N_MATH_CLZ32: u16 = 156;
 const N_MATH_IMUL: u16 = 157;
 const N_MATH_F16ROUND: u16 = 241;
+/// `Date.prototype[Symbol.toPrimitive]` (a named native, length 1).
+const N_DATE_TO_PRIMITIVE: u16 = 243;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib,
@@ -1818,6 +1820,27 @@ impl<'a> Interp<'a> {
         }
         self.setup_first_class_prototype_id("BigInt", BIGINT_PROTO_METHODS, N_BIGINT_PROTO_FN);
         self.setup_first_class_prototype_id("Date", DATE_PROTO_METHODS, N_DATE_PROTO_FN);
+        // `Date.prototype[Symbol.toPrimitive]` — a method (length 1) keyed by the
+        // well-known symbol, `{ writable: false, enumerable: false,
+        // configurable: true }`.
+        if let Some(date_proto) = self
+            .current
+            .get("Date")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            let f = self.new_named_native("[Symbol.toPrimitive]", N_DATE_TO_PRIMITIVE);
+            self.install_fn_name_length(f, "[Symbol.toPrimitive]", 1);
+            let sym = self.well_known_symbol("toPrimitive");
+            let key = self.member_key(sym);
+            self.realm
+                .set_property(date_proto, &key, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(date_proto, &key);
+            self.realm.set_readonly_property(date_proto, &key);
+        }
         // `BigInt.prototype[Symbol.toStringTag]` is the string "BigInt", an own data
         // property `{writable:false, enumerable:false, configurable:true}`. Being
         // configurable, it can be redefined (e.g. tests overwrite it with a non-string
@@ -1971,6 +1994,23 @@ impl<'a> Interp<'a> {
     fn call_native(&mut self, id: u16, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
         Ok(match id {
+            // `Date.prototype[Symbol.toPrimitive](hint)`: requires an object `this`,
+            // maps the hint to a preferred type, then runs OrdinaryToPrimitive.
+            N_DATE_TO_PRIMITIVE => {
+                let this = self.this_val;
+                if !self.is_object_value(this) {
+                    return Err(self.type_error("Date.prototype[Symbol.toPrimitive] called on non-object"));
+                }
+                let hint = self.realm.to_display_string(arg(0));
+                let try_hint = match hint.as_str() {
+                    "string" | "default" => "string",
+                    "number" => "number",
+                    _ => {
+                        return Err(self.type_error("invalid hint for Symbol.toPrimitive"));
+                    }
+                };
+                return self.ordinary_to_primitive(this, try_hint);
+            }
             N_MATH_MAX => {
                 // ToNumber every argument first (in order, propagating any abrupt
                 // completion), then reduce — so each element's `valueOf` runs even
@@ -14325,6 +14365,37 @@ impl<'a> Interp<'a> {
     /// ToPrimitive for a plain object with the given hint: `[Symbol.toPrimitive]`
     /// first, then `valueOf`/`toString` (order depends on the hint), accepting
     /// the first non-object result. Non-objects (and strings/arrays) pass through.
+    /// `OrdinaryToPrimitive(O, hint)`: tries `valueOf`/`toString` in the order set
+    /// by `hint` (`"string"` → toString first; otherwise valueOf first), returning
+    /// the first call that yields a primitive, else a TypeError. Unlike
+    /// [`Self::coerce_primitive`] this does NOT consult `@@toPrimitive` (it is the
+    /// fallback those callers reach), so it is safe to invoke from a
+    /// `@@toPrimitive` method without infinite recursion.
+    fn ordinary_to_primitive(&mut self, v: NanBox, hint: &str) -> Result<NanBox, ExecError> {
+        let Some(raw) = v.as_handle() else {
+            return Ok(v);
+        };
+        let h = Handle::from_raw(raw);
+        let order = if hint == "string" {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for method in order {
+            let m = self.read_member(h, method)?;
+            if m.as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                let r = self.call_with_this(m, v, &[])?;
+                if !self.is_object_value(r) {
+                    return Ok(r);
+                }
+            }
+        }
+        let m = self.new_str("Cannot convert object to primitive value");
+        Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
+    }
+
     fn coerce_primitive(&mut self, v: NanBox, hint: &str) -> Result<NanBox, ExecError> {
         let Some(raw) = v.as_handle() else {
             return Ok(v);
