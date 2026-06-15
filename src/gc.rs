@@ -59,6 +59,13 @@ fn mark<T: Trace>(heap: &Heap<T>, roots: impl IntoIterator<Item = Handle>) -> BT
             work.push(root);
         }
     }
+    drain(heap, &mut marked, &mut work);
+    marked
+}
+
+/// Drains the grey `work` list into `marked`, following each object's outgoing
+/// edges. Shared by [`mark`] and the ephemeron fixpoint.
+fn drain<T: Trace>(heap: &Heap<T>, marked: &mut BTreeSet<Handle>, work: &mut Vec<Handle>) {
     while let Some(handle) = work.pop() {
         let mut edges: Vec<Handle> = Vec::new();
         if let Some(obj) = heap.get(handle) {
@@ -71,6 +78,57 @@ fn mark<T: Trace>(heap: &Heap<T>, roots: impl IntoIterator<Item = Handle>) -> BT
                 work.push(edge);
             }
         }
+    }
+}
+
+/// Marks everything reachable from `roots`, then applies **ephemeron** (weak-key)
+/// expansion to a fixpoint and returns the marked set.
+///
+/// An ephemeron — a weak-key-map entry — keeps its *value* alive **only if its
+/// *key* is independently reachable**; an entry must never keep its own key
+/// alive. This is exactly the rule a realm's value-reachable side-tables need:
+/// `key → value` survives iff `key` is live, and a surviving entry's `value`
+/// (e.g. a function's lazily-built `.prototype`) is then itself a root.
+///
+/// Because a value kept alive by a live key may *itself* be the key of another
+/// entry, one pass is not enough — `expand` is re-run until the marked set
+/// reaches a fixpoint. `expand(heap, &marked, &mut extra)` must push, into
+/// `extra`, the value handles of every entry whose key is currently in `marked`
+/// (it is handed `heap` so it can inspect live objects, e.g. to find symbols
+/// still referenced as property keys); the collector marks those (transitively)
+/// and repeats. Keys are *never* added by `expand`, so a dead key stays dead and
+/// its entry can be pruned afterward.
+pub fn mark_with_ephemerons<T: Trace>(
+    heap: &Heap<T>,
+    roots: impl IntoIterator<Item = Handle>,
+    mut expand: impl FnMut(&Heap<T>, &BTreeSet<Handle>, &mut Vec<Handle>),
+) -> BTreeSet<Handle> {
+    let mut marked: BTreeSet<Handle> = BTreeSet::new();
+    let mut work: Vec<Handle> = Vec::new();
+    for root in roots {
+        if heap.is_live(root) && marked.insert(root) {
+            work.push(root);
+        }
+    }
+    drain(heap, &mut marked, &mut work);
+
+    // Ephemeron fixpoint: surface the values of entries whose keys are now live,
+    // mark them transitively, and repeat until nothing new is marked.
+    let mut extra: Vec<Handle> = Vec::new();
+    loop {
+        extra.clear();
+        expand(heap, &marked, &mut extra);
+        let mut grew = false;
+        for h in extra.drain(..) {
+            if heap.is_live(h) && marked.insert(h) {
+                work.push(h);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+        drain(heap, &mut marked, &mut work);
     }
     marked
 }
@@ -94,6 +152,33 @@ pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
     // A full collection re-establishes the generation boundary from scratch.
     heap.clear_remembered();
 
+    Stats {
+        marked: marked.len(),
+        swept,
+    }
+}
+
+/// The **full sweep** half of a major collection, applied to an already-computed
+/// `marked` set (see [`mark_with_ephemerons`]): frees every live object the mark
+/// phase did not reach, promotes the survivors one generation, clears the
+/// remembered set, and returns the [`Stats`].
+///
+/// Exposed separately from [`collect`] so a caller can interpose between marking
+/// and sweeping — e.g. to prune its own weak-key side-tables against the marked
+/// set — without forcing two overlapping mutable borrows. Pruning a dead key
+/// before this runs does not change the sweep set (the key is already unmarked);
+/// it only stops the table from holding a now-dangling handle.
+pub fn sweep_full<T: Trace>(heap: &mut Heap<T>, marked: &BTreeSet<Handle>) -> Stats {
+    let mut swept = 0;
+    for handle in heap.live_handles() {
+        if marked.contains(&handle) {
+            heap.tenure(handle);
+        } else {
+            heap.free(handle);
+            swept += 1;
+        }
+    }
+    heap.clear_remembered();
     Stats {
         marked: marked.len(),
         swept,
@@ -592,6 +677,60 @@ mod tests {
         assert_eq!(b.get(b2).unwrap().tag, 12);
         // And the relocated handles genuinely differ from the originals.
         assert_ne!(b0, n0);
+    }
+
+    #[test]
+    fn ephemeron_drops_dead_key_entries_but_keeps_live_ones() {
+        // Two weak-key entries: key0 -> val0, key1 -> val1. key0 is a real root,
+        // key1 is not. After ephemeron marking, val0 is kept (live key) and
+        // key1/val1 are not marked (dead key — must be prunable).
+        let mut heap: Heap<Node> = Heap::new();
+        let key0 = heap.alloc(Node::new(0));
+        let val0 = heap.alloc(Node::new(10));
+        let key1 = heap.alloc(Node::new(1));
+        let val1 = heap.alloc(Node::new(11));
+        let table = [(key0, val0), (key1, val1)];
+
+        let marked = mark_with_ephemerons(&heap, [key0], |_heap, marked, extra| {
+            for (k, v) in &table {
+                if marked.contains(k) {
+                    extra.push(*v);
+                }
+            }
+        });
+        assert!(marked.contains(&key0) && marked.contains(&val0));
+        assert!(
+            !marked.contains(&key1) && !marked.contains(&val1),
+            "a dead key and its value must stay unmarked",
+        );
+    }
+
+    #[test]
+    fn ephemeron_reaches_a_fixpoint_through_chained_entries() {
+        // entry A: keyA -> valA, where valA points at keyB.
+        // entry B: keyB -> valB. Only keyA is a root, so valA keeps keyB alive,
+        // which must in turn keep valB alive (the fixpoint).
+        let mut heap: Heap<Node> = Heap::new();
+        let val_b = heap.alloc(Node::new(22));
+        let key_b = heap.alloc(Node::new(2));
+        let mut va = Node::new(21);
+        va.edges.push(key_b); // valA -> keyB
+        let val_a = heap.alloc(va);
+        let key_a = heap.alloc(Node::new(1));
+        let table = [(key_a, val_a), (key_b, val_b)];
+
+        let marked = mark_with_ephemerons(&heap, [key_a], |_heap, marked, extra| {
+            for (k, v) in &table {
+                if marked.contains(k) {
+                    extra.push(*v);
+                }
+            }
+        });
+        assert!(marked.contains(&key_a) && marked.contains(&val_a));
+        assert!(
+            marked.contains(&key_b) && marked.contains(&val_b),
+            "A's value keeps B's key live, so B's value survives (fixpoint)",
+        );
     }
 
     #[test]
