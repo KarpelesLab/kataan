@@ -152,8 +152,10 @@ impl<'src> Parser<'src> {
             }));
         }
 
-        // `export <declaration>` — var/let/const/function/class.
-        let declaration = self.parse_statement()?;
+        // `export <declaration>` — var/let/const/function/class. This is a
+        // declaration position, so a leading `let` is a `LexicalDeclaration`
+        // (parse it as a `StatementListItem`, not a single `Statement`).
+        let declaration = self.parse_statement_item()?;
         Ok(Stmt::Export(ExportDecl::Decl {
             span: start.to(declaration.span()),
             declaration: Box::new(declaration),
