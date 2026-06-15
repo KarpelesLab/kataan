@@ -86,6 +86,12 @@ pub struct Realm {
     /// Handles of non-extensible arrays (`Object.preventExtensions`/`seal`/`freeze`)
     /// — element writes past the end are rejected. Same caveat.
     non_extensible_arrays: alloc::collections::BTreeSet<u64>,
+    /// Handles of arrays whose `length` property was made non-writable
+    /// (`Object.defineProperty(arr, "length", {writable:false})`). An array's
+    /// `length` is writable by default; this records the explicit demotion so the
+    /// descriptor reports it and a later `length` redefine is validated. Same
+    /// non-GC-root caveat as `frozen_arrays`.
+    nonwritable_array_lengths: alloc::collections::BTreeSet<u64>,
     /// The default prototype (`Object.prototype`) installed on objects created by
     /// [`new_object`](Realm::new_object) once the global environment is set up. A
     /// `None`-proto object (`Object.create(null)`) opts out explicitly.
@@ -132,6 +138,7 @@ impl Realm {
             frozen_arrays: alloc::collections::BTreeSet::new(),
             sealed_arrays: alloc::collections::BTreeSet::new(),
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
+            nonwritable_array_lengths: alloc::collections::BTreeSet::new(),
             default_object_proto: None,
             native_protos: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
@@ -829,6 +836,20 @@ impl Realm {
             || (a.as_number().is_some_and(f64::is_nan) && b.as_number().is_some_and(f64::is_nan))
     }
 
+    /// `SameValue(a, b)` — like `===` but `NaN` equals `NaN` and `+0`/`-0` differ.
+    /// This is the equality `ValidateAndApplyPropertyDescriptor` uses to decide
+    /// whether a non-configurable data property's value actually changed.
+    #[must_use]
+    pub fn same_value(&self, a: NanBox, b: NanBox) -> bool {
+        match (a.as_number(), b.as_number()) {
+            (Some(x), Some(y)) => {
+                (x == y && (x != 0.0 || x.is_sign_positive() == y.is_sign_positive()))
+                    || (x.is_nan() && y.is_nan())
+            }
+            _ => self.strict_equals(a, b),
+        }
+    }
+
     /// Sets `key → value` in the collection at `handle` (inserting or updating,
     /// by `SameValueZero` key match). Returns `false` if not a collection.
     pub fn collection_set(&mut self, handle: Handle, key: NanBox, value: NanBox) -> bool {
@@ -1290,6 +1311,25 @@ impl Realm {
             .is_some_and(crate::object::Object::is_frozen)
     }
 
+    /// Whether the `length` of the array at `handle` was made non-writable via
+    /// `Object.defineProperty(arr, "length", {writable:false})`. An array's
+    /// `length` is writable by default.
+    #[must_use]
+    pub fn array_length_is_readonly(&self, handle: Handle) -> bool {
+        // A frozen array's `length` is non-writable too (freeze implies it).
+        self.nonwritable_array_lengths.contains(&handle.to_raw())
+            || self.frozen_arrays.contains(&handle.to_raw())
+    }
+
+    /// Records (or clears) the non-writable flag for an array's `length`.
+    pub fn set_array_length_readonly(&mut self, handle: Handle, readonly: bool) {
+        if readonly {
+            self.nonwritable_array_lengths.insert(handle.to_raw());
+        } else {
+            self.nonwritable_array_lengths.remove(&handle.to_raw());
+        }
+    }
+
     /// The length of the array (or typed-array view) at `handle`, or `None` if it
     /// is neither.
     #[must_use]
@@ -1660,6 +1700,23 @@ impl Realm {
     pub fn clear_accessor(&mut self, handle: Handle, key: &str) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.clear_accessor(key);
+        }
+    }
+
+    /// Removes the stored data slot for `key` on `handle` (without the
+    /// non-configurable guard of [`delete_property`](Realm::delete_property)) — used
+    /// when `defineProperty` converts an existing data property into an accessor and
+    /// the old value must be discarded. Leaves any accessor side-list entry intact.
+    pub fn delete_data_slot(&mut self, handle: Handle, key: &str) {
+        let root = Rc::clone(&self.root_shape);
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.delete_data(root, key);
+            return;
+        }
+        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+            && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+        {
+            o.delete_data(root, key);
         }
     }
 
@@ -2356,8 +2413,28 @@ impl Realm {
                     parts.join(",")
                 }
                 Some(Cell::Object(_)) => "[object Object]".into(),
-                Some(Cell::Function { .. } | Cell::Native(_) | Cell::Class { .. }) => {
-                    "function () { … }".into()
+                // A callable stringifies as `Function.prototype.toString` would —
+                // `function name() { [native code] }` (the engine retains no source)
+                // — and a class as `class Name { }`. The name is read from the own
+                // `name` property when materialized (else empty). This keeps `"" + fn`
+                // / `String(fn)` consistent with `fn.toString()`.
+                Some(Cell::Function { .. } | Cell::Native(_)) => {
+                    let h = Handle::from_raw(raw);
+                    let name = self
+                        .get_property(h, "name")
+                        .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                        .map(|v| self.to_display_string_seen(v, seen))
+                        .unwrap_or_default();
+                    alloc::format!("function {name}() {{ [native code] }}")
+                }
+                Some(Cell::Class { .. }) => {
+                    let h = Handle::from_raw(raw);
+                    let name = self
+                        .get_property(h, "name")
+                        .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                        .map(|v| self.to_display_string_seen(v, seen))
+                        .unwrap_or_default();
+                    alloc::format!("class {name} {{ }}")
                 }
                 Some(Cell::Collection { is_set, .. }) => {
                     if *is_set {
@@ -2366,7 +2443,15 @@ impl Realm {
                         "[object Map]".into()
                     }
                 }
-                Some(Cell::BoundNative { .. }) => "function () { … }".into(),
+                Some(Cell::BoundNative { .. }) => {
+                    let h = Handle::from_raw(raw);
+                    let name = self
+                        .get_property(h, "name")
+                        .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                        .map(|v| self.to_display_string_seen(v, seen))
+                        .unwrap_or_default();
+                    alloc::format!("function {name}() {{ [native code] }}")
+                }
                 Some(Cell::Promise(_)) => "[object Promise]".into(),
                 Some(Cell::Date(ms)) => {
                     if ms.is_finite() {

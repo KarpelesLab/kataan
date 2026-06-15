@@ -553,6 +553,41 @@ impl Object {
         self.accessors.retain(|(k, _, _)| k.as_ref() != key);
     }
 
+    /// Deletes only the *data slot* for `key`, rebuilding the shape/slots from
+    /// `root` without it, and leaving any same-named accessor untouched. Used when
+    /// `defineProperty` converts a data property into an accessor.
+    pub fn delete_data(&mut self, root: Rc<Shape>, key: &str) {
+        match &mut self.data {
+            ObjectData::Shaped { shape, slots } => {
+                if !shape.contains(key) {
+                    return;
+                }
+                let kept: Vec<(alloc::string::String, NanBox)> = shape
+                    .keys()
+                    .into_iter()
+                    .filter(|k| *k != key)
+                    .map(|k| {
+                        let slot = shape.lookup(k).expect("shape key resolves");
+                        (alloc::string::String::from(k), slots[slot as usize])
+                    })
+                    .collect();
+                let mut new_shape = root;
+                let mut new_slots = Vec::with_capacity(kept.len());
+                for (k, v) in kept {
+                    new_shape = new_shape.transition(&k);
+                    new_slots.push(v);
+                }
+                *shape = new_shape;
+                *slots = new_slots;
+            }
+            ObjectData::Dict { order, map } => {
+                if map.remove(key).is_some() {
+                    order.retain(|k| k.as_ref() != key);
+                }
+            }
+        }
+    }
+
     /// Deletes own property `key`, rebuilding the shape/slots from `root` without
     /// it (also drops a same-named accessor). Returns whether anything was
     /// removed.

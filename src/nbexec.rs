@@ -2004,20 +2004,31 @@ impl<'a> Interp<'a> {
             // descriptor sets the property; a `get`/`set` descriptor defines an
             // accessor.
             N_OBJECT_DEFINE_PROP => {
-                if let Some(oraw) = arg(0).as_handle()
-                    && let Some(draw) = arg(2).as_handle()
-                {
-                    let obj = Handle::from_raw(oraw);
-                    let key = self.member_key(arg(1));
-                    self.apply_descriptor(obj, &key, Handle::from_raw(draw), false)?;
-                }
+                // `Object.defineProperty` requires an Object target (ECMA-262 step 1):
+                // a primitive (incl. `undefined`/`null`) is a TypeError.
+                let Some(oraw) = arg(0).as_handle().filter(|_| self.is_object_value(arg(0))) else {
+                    let m = self.new_str("Object.defineProperty called on non-object");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                };
+                // The descriptor must be an object (`ToPropertyDescriptor` of a
+                // primitive is a TypeError).
+                let Some(draw) = arg(2).as_handle().filter(|_| self.is_object_value(arg(2))) else {
+                    let m = self.new_str("Property description must be an object");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                };
+                let obj = Handle::from_raw(oraw);
+                let key = self.member_key(arg(1));
+                self.apply_descriptor(obj, &key, Handle::from_raw(draw), false)?;
                 arg(0)
             }
             // `Object.defineProperties(obj, { k: descriptor, … })`.
             N_OBJECT_DEFINE_PROPS => {
-                if let Some(oraw) = arg(0).as_handle()
-                    && let Some(draw) = arg(1).as_handle()
-                {
+                // `Object.defineProperties` requires an Object target.
+                let Some(oraw) = arg(0).as_handle().filter(|_| self.is_object_value(arg(0))) else {
+                    let m = self.new_str("Object.defineProperties called on non-object");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                };
+                if let Some(draw) = arg(1).as_handle() {
                     let obj = Handle::from_raw(oraw);
                     let descs = Handle::from_raw(draw);
                     for key in self.realm.object_keys(descs).unwrap_or_default() {
@@ -3511,7 +3522,13 @@ impl<'a> Interp<'a> {
                 }
                 err
             }
-            _ => return Err(ExecError::NotCallable),
+            // An unrecognized native dispatch id: the value is not a callable the
+            // engine can invoke. Surface a catchable JS `TypeError` rather than an
+            // internal error so user `try/catch` can handle it.
+            _ => {
+                let m = self.new_str("is not a function");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
         })
     }
 
@@ -4695,26 +4712,30 @@ impl<'a> Interp<'a> {
     /// Builds the property descriptor object for own property `key` of `obj`
     /// (accessor or data), or `None` if `key` is not an own property.
     fn build_descriptor(&mut self, obj: Handle, key: &str) -> Option<NanBox> {
-        let t = NanBox::boolean(true);
         // An array index / `length` is a data property (not stored as a named slot):
         // an in-range index is writable, enumerable, configurable; `length` is
         // writable but non-enumerable and non-configurable.
         if let Some(len) = self.realm.array_length(obj) {
-            let (value, enumerable, configurable) = if key == "length" {
-                (Some(NanBox::number(len as f64)), false, false)
+            // `length`: non-enumerable, non-configurable, writable unless demoted via
+            // `defineProperty(arr,"length",{writable:false})`. An in-range index:
+            // writable, enumerable, configurable.
+            let (value, writable, enumerable, configurable) = if key == "length" {
+                let writable = !self.realm.array_length_is_readonly(obj);
+                (Some(NanBox::number(len as f64)), writable, false, false)
             } else if let Ok(i) = key.parse::<usize>() {
                 if i < len && alloc::format!("{i}") == key {
-                    (Some(self.realm.get_element(obj, i)), true, true)
+                    (Some(self.realm.get_element(obj, i)), true, true, true)
                 } else {
-                    (None, false, false)
+                    (None, false, false, false)
                 }
             } else {
-                (None, false, false)
+                (None, false, false, false)
             };
             if let Some(v) = value {
                 let d = self.realm.new_object();
                 self.realm.set_property(d, "value", v);
-                self.realm.set_property(d, "writable", t);
+                self.realm
+                    .set_property(d, "writable", NanBox::boolean(writable));
                 self.realm
                     .set_property(d, "enumerable", NanBox::boolean(enumerable));
                 self.realm
@@ -4749,10 +4770,12 @@ impl<'a> Interp<'a> {
         }
         let configurable = NanBox::boolean(!self.realm.property_is_non_configurable(obj, key));
         if let Some((g, s)) = self.realm.accessor(obj, key) {
+            let enumerable = self.realm.property_is_enumerable(obj, key);
             let d = self.realm.new_object();
             self.realm.set_property(d, "get", g);
             self.realm.set_property(d, "set", s);
-            self.realm.set_property(d, "enumerable", t);
+            self.realm
+                .set_property(d, "enumerable", NanBox::boolean(enumerable));
             self.realm.set_property(d, "configurable", configurable);
             Some(NanBox::handle(d.to_raw()))
         } else if self.realm.has_own(obj, key) {
@@ -4870,87 +4893,60 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    /// Whether redefining own property `key` with descriptor `desc` would change
-    /// nothing — every field the descriptor *specifies* already matches the current
-    /// property. Such a no-op redefine is permitted even on a non-configurable property.
-    fn redefine_is_noop(
-        &mut self,
-        obj: Handle,
-        key: &str,
-        desc: Handle,
-        is_accessor: bool,
-        writable: bool,
-    ) -> Result<bool, ExecError> {
-        let truthy_field = |this: &mut Self, name: &str| {
-            this.realm
-                .get_property(desc, name)
-                .is_some_and(|v| this.realm.truthy(v))
-        };
-        // Switching kind (data <-> accessor) is a change.
-        let wants_accessor = self.realm.has_own(desc, "get") || self.realm.has_own(desc, "set");
-        if wants_accessor != is_accessor {
-            return Ok(false);
-        }
-        // Making a non-configurable property configurable is a change.
-        if self.realm.has_own(desc, "configurable") && truthy_field(self, "configurable") {
-            return Ok(false);
-        }
-        if self.realm.has_own(desc, "enumerable")
-            && truthy_field(self, "enumerable") != self.realm.property_is_enumerable(obj, key)
-        {
-            return Ok(false);
-        }
-        if is_accessor {
-            let (cur_get, cur_set) = self
-                .realm
-                .accessor(obj, key)
-                .unwrap_or((NanBox::undefined(), NanBox::undefined()));
-            if self.realm.has_own(desc, "get") {
-                let g = self
-                    .realm
-                    .get_property(desc, "get")
-                    .unwrap_or(NanBox::undefined());
-                if !self.realm.strict_equals(g, cur_get) {
-                    return Ok(false);
-                }
-            }
-            if self.realm.has_own(desc, "set") {
-                let s = self
-                    .realm
-                    .get_property(desc, "set")
-                    .unwrap_or(NanBox::undefined());
-                if !self.realm.strict_equals(s, cur_set) {
-                    return Ok(false);
-                }
-            }
-            return Ok(true);
-        }
-        // A data property: a writable flip, or (for a non-writable one) a value change.
-        if self.realm.has_own(desc, "writable") && truthy_field(self, "writable") != writable {
-            return Ok(false);
-        }
-        if !writable && self.realm.has_own(desc, "value") {
-            let new_val = self
-                .realm
-                .get_property(desc, "value")
-                .unwrap_or(NanBox::undefined());
-            let cur_val = self
-                .realm
-                .get_property(obj, key)
-                .unwrap_or(NanBox::undefined());
-            // SameValue (distinguishes NaN and ±0 from `===`).
-            let same = match (new_val.as_number(), cur_val.as_number()) {
-                (Some(x), Some(y)) => {
-                    (x == y && (x != 0.0 || x.is_sign_positive() == y.is_sign_positive()))
-                        || (x.is_nan() && y.is_nan())
-                }
-                _ => self.realm.strict_equals(new_val, cur_val),
+    /// `HasProperty(obj, key)` — whether `key` is present on `obj` or anywhere on
+    /// its prototype chain (own data/accessor property, or an in-range array index /
+    /// `length`). Mirrors the `in` operator / `Reflect.has`.
+    fn has_property(&mut self, obj: Handle, key: &str) -> bool {
+        let mut cur = Some(obj);
+        while let Some(c) = cur {
+            let here = if let Some(len) = self.realm.array_length(c) {
+                key == "length"
+                    || key.parse::<usize>().is_ok_and(|i| i < len)
+                    || self.realm.has_own(c, key)
+            } else {
+                self.realm.has_own(c, key)
             };
-            if !same {
-                return Ok(false);
+            if here {
+                return true;
+            }
+            cur = self.realm.object_proto(c);
+        }
+        false
+    }
+
+    /// ToPropertyDescriptor (ECMA-262 6.2.6.5): normalizes a user-supplied
+    /// descriptor object into a fresh plain object whose own data properties are
+    /// exactly the descriptor fields present (via `HasProperty`, prototype-chain
+    /// aware), each read with `Get` (invoking inherited getters). Coerces
+    /// `enumerable`/`configurable`/`writable` to booleans. Throws a `TypeError` if a
+    /// supplied `get`/`set` is neither callable nor `undefined`.
+    fn normalize_property_descriptor(&mut self, desc: Handle) -> Result<Handle, ExecError> {
+        let out = self.realm.new_object();
+        for field in ["enumerable", "configurable", "writable"] {
+            if self.has_property(desc, field) {
+                let v = self.read_member(desc, field)?;
+                self.realm
+                    .set_property(out, field, NanBox::boolean(self.realm.truthy(v)));
             }
         }
-        Ok(true)
+        if self.has_property(desc, "value") {
+            let v = self.read_member(desc, "value")?;
+            self.realm.set_property(out, "value", v);
+        }
+        for field in ["get", "set"] {
+            if self.has_property(desc, field) {
+                let v = self.read_member(desc, field)?;
+                let ok = matches!(v.unpack(), Unpacked::Undefined)
+                    || v.as_handle()
+                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
+                if !ok {
+                    let m = self.new_str("Getter/setter must be a function or undefined");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                self.realm.set_property(out, field, v);
+            }
+        }
+        Ok(out)
     }
 
     /// Applies a property descriptor (the shared `Object.defineProperty` / `Reflect
@@ -4991,6 +4987,14 @@ impl<'a> Interp<'a> {
             }
             return self.apply_descriptor(target, key, desc, reflect);
         }
+        // ToPropertyDescriptor (ECMA-262 6.2.6.5): a descriptor's attributes are
+        // read by `HasProperty` (which walks the prototype chain) and `Get` (which
+        // invokes inherited getters), not by own-property inspection. Normalize the
+        // user descriptor into a fresh plain object whose own data properties are
+        // exactly the fields the descriptor *has* (anywhere on its chain), each set
+        // to its `Get` value. The remainder of this routine then inspects that
+        // normalized object with own-only `has_own`/`get_property`.
+        let desc = self.normalize_property_descriptor(desc)?;
         // A descriptor may not mix accessor fields (`get`/`set`) with data fields
         // (`value`/`writable`) — that is an invalid descriptor (ToPropertyDescriptor).
         let has_accessor_field = self.realm.has_own(desc, "get") || self.realm.has_own(desc, "set");
@@ -5001,6 +5005,14 @@ impl<'a> Interp<'a> {
                 "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
             );
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        // An array's `length` is an exotic own data property governed by
+        // ArraySetLength (ECMA-262 10.4.3.1): it is `{enumerable:false,
+        // configurable:false}`, writable by default, and its "value" resizes the
+        // array. Route it through a dedicated validator rather than the generic
+        // ordinary-object path (which would store a shadowing aux slot).
+        if self.realm.is_array(obj) && key == "length" {
+            return self.apply_array_length_descriptor(obj, desc, reflect);
         }
         // A callable's `length` and `name` are own properties per spec
         // (`{writable:false, enumerable:false, configurable:true}`), but they are
@@ -5023,14 +5035,41 @@ impl<'a> Interp<'a> {
             let m = self.new_str("Cannot define property: object is not extensible");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
-        // Redefining a non-configurable property is a TypeError — except a
-        // non-configurable *writable data* property, whose value may still change.
+        // The *shape* of the incoming descriptor (ToPropertyDescriptor semantics):
+        // a field counts only when it is an OWN field of the descriptor object. A
+        // descriptor with neither accessor (`get`/`set`) nor data (`value`/
+        // `writable`) field is "generic" and, on a redefine, preserves the current
+        // property's kind.
+        let desc_is_accessor = has_accessor_field;
+        let desc_is_data = has_data_field;
+        // The existing property's kind and attributes (only meaningful when
+        // `is_own`). An intrinsic callable `length`/`name` is a data property.
+        let existing_is_accessor = self.realm.accessor(obj, key).is_some();
+        // The resulting property kind: an accessor descriptor makes it an accessor,
+        // a data descriptor makes it data, and a generic redefine keeps the current
+        // kind (a generic *new* property defaults to a data property).
+        let result_is_accessor = if desc_is_accessor {
+            true
+        } else if desc_is_data {
+            false
+        } else {
+            is_own && existing_is_accessor
+        };
+
+        // ValidateAndApplyPropertyDescriptor — a non-configurable property allows
+        // only a restricted set of changes; anything else is a rejection (a
+        // TypeError for `Object.defineProperty`, `false` for `Reflect`).
         if is_own && self.realm.property_is_non_configurable(obj, key) {
-            let is_accessor = self.realm.accessor(obj, key).is_some();
             let writable = !self.realm.property_is_readonly(obj, key);
-            if (is_accessor || !writable)
-                && !self.redefine_is_noop(obj, key, desc, is_accessor, writable)?
-            {
+            let allowed = self.redefine_allowed_on_non_configurable(
+                obj,
+                key,
+                desc,
+                existing_is_accessor,
+                result_is_accessor,
+                writable,
+            )?;
+            if !allowed {
                 if reflect {
                     return Ok(false);
                 }
@@ -5038,6 +5077,7 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
         }
+
         // Per `ValidateAndApplyPropertyDescriptor`, redefining an existing own
         // property MERGES over its current attributes: an attribute field the
         // descriptor omits keeps the property's existing value. For a *new*
@@ -5046,9 +5086,9 @@ impl<'a> Interp<'a> {
         // preserved existing value on a redefine, else the default `false`).
         let resolve = |this: &Self, field: &str, existing: bool| -> bool {
             match this.realm.get_property(desc, field) {
-                Some(v) => this.realm.truthy(v),
-                None if is_own => existing,
-                None => false,
+                Some(v) if this.realm.has_own(desc, field) => this.realm.truthy(v),
+                _ if is_own => existing,
+                _ => false,
             }
         };
         let want_enum = resolve(
@@ -5061,15 +5101,40 @@ impl<'a> Interp<'a> {
             "configurable",
             is_own && !self.realm.property_is_non_configurable(obj, key),
         );
-        let getter = self.realm.get_property(desc, "get");
-        let setter = self.realm.get_property(desc, "set");
-        if getter.is_some() || setter.is_some() {
-            self.realm.define_accessor(
-                obj,
-                key,
-                getter.unwrap_or(NanBox::undefined()),
-                setter.unwrap_or(NanBox::undefined()),
-            );
+        if result_is_accessor {
+            // Merge omitted accessor fields with the existing accessor's get/set so
+            // a redefine that touches only enumerable/configurable keeps the
+            // current getter and setter. When converting from a data property the
+            // omitted side defaults to `undefined`.
+            let (cur_get, cur_set) = if existing_is_accessor {
+                self.realm
+                    .accessor(obj, key)
+                    .unwrap_or((NanBox::undefined(), NanBox::undefined()))
+            } else {
+                (NanBox::undefined(), NanBox::undefined())
+            };
+            let getter = if self.realm.has_own(desc, "get") {
+                self.realm
+                    .get_property(desc, "get")
+                    .unwrap_or(NanBox::undefined())
+            } else {
+                cur_get
+            };
+            let setter = if self.realm.has_own(desc, "set") {
+                self.realm
+                    .get_property(desc, "set")
+                    .unwrap_or(NanBox::undefined())
+            } else {
+                cur_set
+            };
+            // Converting a data property to an accessor: drop the stored value and
+            // its writable mark. `define_accessor` only overwrites get/set when the
+            // supplied value is defined, so seed a clean accessor first to allow a
+            // getter/setter to be reset to `undefined`.
+            self.realm.clear_accessor(obj, key);
+            self.realm.delete_data_slot(obj, key);
+            self.realm.clear_readonly_property(obj, key);
+            self.realm.define_accessor(obj, key, getter, setter);
             // Enumerable: explicit field, else preserved on redefine, else default false.
             if want_enum {
                 self.realm.clear_hidden_property(obj, key);
@@ -5080,8 +5145,10 @@ impl<'a> Interp<'a> {
             // An intrinsic callable `length`/`name` is non-writable by default; its
             // lazy form isn't yet flagged readonly in the aux object, so seed the
             // spec value explicitly.
-            let existing_writable =
-                !is_intrinsic_callable_prop && !self.realm.property_is_readonly(obj, key);
+            let existing_writable = is_own
+                && !is_intrinsic_callable_prop
+                && !existing_is_accessor
+                && !self.realm.property_is_readonly(obj, key);
             let want_writable = resolve(self, "writable", existing_writable);
             // Redefining as a data property removes any prior accessor.
             self.realm.clear_accessor(obj, key);
@@ -5090,10 +5157,15 @@ impl<'a> Interp<'a> {
             self.realm.clear_readonly_property(obj, key);
             // Only overwrite the stored value when the descriptor supplies one (a
             // bare `{writable:...}` redefine keeps the existing value); a fresh
-            // define with no `value` field uses `undefined`.
-            if let Some(value) = self.realm.get_property(desc, "value") {
+            // define with no `value` field, or a conversion from an accessor, uses
+            // `undefined`.
+            if self.realm.has_own(desc, "value") {
+                let value = self
+                    .realm
+                    .get_property(desc, "value")
+                    .unwrap_or(NanBox::undefined());
                 self.realm.set_property(obj, key, value);
-            } else if !is_own {
+            } else if !is_own || existing_is_accessor {
                 self.realm.set_property(obj, key, NanBox::undefined());
             }
             // Writable: explicit field, else preserved on redefine, else default false.
@@ -5112,6 +5184,178 @@ impl<'a> Interp<'a> {
             self.realm.clear_non_configurable_property(obj, key);
         } else {
             self.realm.set_non_configurable_property(obj, key);
+        }
+        Ok(true)
+    }
+
+    /// `Object.defineProperty(arr, "length", desc)` — the ArraySetLength exotic
+    /// (ECMA-262 10.4.3.1). The array's `length` is `{enumerable:false,
+    /// configurable:false}`, writable unless explicitly demoted. A length descriptor
+    /// may change the value (resizing the array) and may turn writability off, but
+    /// once non-writable it cannot be made writable again nor have its value changed.
+    fn apply_array_length_descriptor(
+        &mut self,
+        obj: Handle,
+        desc: Handle,
+        reflect: bool,
+    ) -> Result<bool, ExecError> {
+        let reject = |this: &mut Self| -> Result<bool, ExecError> {
+            if reflect {
+                return Ok(false);
+            }
+            let m = this.new_str("Cannot redefine property: length");
+            Err(ExecError::Throw(this.make_error(N_TYPE_ERROR, Some(m))))
+        };
+        // `length` is non-configurable and non-enumerable: reject any descriptor
+        // that asks to make it configurable or enumerable.
+        if self.realm.has_own(desc, "configurable")
+            && self
+                .realm
+                .get_property(desc, "configurable")
+                .is_some_and(|v| self.realm.truthy(v))
+        {
+            return reject(self);
+        }
+        if self.realm.has_own(desc, "enumerable")
+            && self
+                .realm
+                .get_property(desc, "enumerable")
+                .is_some_and(|v| self.realm.truthy(v))
+        {
+            return reject(self);
+        }
+        // A `length` descriptor is a data descriptor; accessor fields are invalid.
+        if self.realm.has_own(desc, "get") || self.realm.has_own(desc, "set") {
+            return reject(self);
+        }
+        let cur_writable = !self.realm.array_length_is_readonly(obj);
+        let new_writable = if self.realm.has_own(desc, "writable") {
+            self.realm
+                .get_property(desc, "writable")
+                .is_some_and(|v| self.realm.truthy(v))
+        } else {
+            cur_writable
+        };
+        // A non-writable `length` cannot be made writable again.
+        if !cur_writable && new_writable {
+            return reject(self);
+        }
+        if self.realm.has_own(desc, "value") {
+            let value = self
+                .realm
+                .get_property(desc, "value")
+                .unwrap_or(NanBox::undefined());
+            // ToUint32 / ToNumber must agree (a fractional or out-of-range length is
+            // a RangeError), per ArraySetLength.
+            let num = self.realm.to_number(value);
+            let len = num as u32;
+            if !(num.is_finite() && f64::from(len) == num) {
+                let m = self.new_str("Invalid array length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            let cur_len = self.realm.array_length(obj).unwrap_or(0);
+            // A non-writable `length` rejects a value change (a same-value "change"
+            // is allowed).
+            if !cur_writable && len as usize != cur_len {
+                return reject(self);
+            }
+            self.set_array_length_checked(obj, len as usize)?;
+        }
+        // Apply the (possibly lowered) writability last.
+        self.realm.set_array_length_readonly(obj, !new_writable);
+        Ok(true)
+    }
+
+    /// ValidateAndApplyPropertyDescriptor's non-configurable guard: whether
+    /// redefining the existing **non-configurable** own property `key` of `obj` with
+    /// `desc` is permitted. A non-configurable property forbids: becoming
+    /// configurable, an enumerable toggle, a data<->accessor switch, an accessor
+    /// get/set change, making a non-writable data property writable, and changing a
+    /// non-writable data property's value (a same-value redefine is always allowed).
+    fn redefine_allowed_on_non_configurable(
+        &mut self,
+        obj: Handle,
+        key: &str,
+        desc: Handle,
+        existing_is_accessor: bool,
+        result_is_accessor: bool,
+        writable: bool,
+    ) -> Result<bool, ExecError> {
+        // Becoming configurable is never allowed.
+        if self.realm.has_own(desc, "configurable")
+            && self
+                .realm
+                .get_property(desc, "configurable")
+                .is_some_and(|v| self.realm.truthy(v))
+        {
+            return Ok(false);
+        }
+        // An enumerable toggle is not allowed.
+        if self.realm.has_own(desc, "enumerable")
+            && self
+                .realm
+                .get_property(desc, "enumerable")
+                .is_some_and(|v| self.realm.truthy(v))
+                != self.realm.property_is_enumerable(obj, key)
+        {
+            return Ok(false);
+        }
+        // Switching kind (data <-> accessor) is not allowed.
+        if result_is_accessor != existing_is_accessor {
+            return Ok(false);
+        }
+        if existing_is_accessor {
+            // An accessor's get/set cannot change.
+            let (cur_get, cur_set) = self
+                .realm
+                .accessor(obj, key)
+                .unwrap_or((NanBox::undefined(), NanBox::undefined()));
+            if self.realm.has_own(desc, "get") {
+                let g = self
+                    .realm
+                    .get_property(desc, "get")
+                    .unwrap_or(NanBox::undefined());
+                if !self.realm.same_value(g, cur_get) {
+                    return Ok(false);
+                }
+            }
+            if self.realm.has_own(desc, "set") {
+                let s = self
+                    .realm
+                    .get_property(desc, "set")
+                    .unwrap_or(NanBox::undefined());
+                if !self.realm.same_value(s, cur_set) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        // A writable data property may change its value and writability freely.
+        if writable {
+            return Ok(true);
+        }
+        // A non-writable data property: cannot be made writable, and cannot change
+        // its value.
+        if self.realm.has_own(desc, "writable")
+            && self
+                .realm
+                .get_property(desc, "writable")
+                .is_some_and(|v| self.realm.truthy(v))
+        {
+            return Ok(false);
+        }
+        if self.realm.has_own(desc, "value") {
+            let new_val = self
+                .realm
+                .get_property(desc, "value")
+                .unwrap_or(NanBox::undefined());
+            let cur_val = self
+                .realm
+                .get_property(obj, key)
+                .unwrap_or(NanBox::undefined());
+            if !self.realm.same_value(new_val, cur_val) {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -5156,7 +5400,11 @@ impl<'a> Interp<'a> {
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
         let Some(raw) = callee.as_handle() else {
-            return Err(ExecError::NotCallable);
+            // Calling a non-object (a primitive `undefined`/`null`/number/…) is a
+            // JS `TypeError` — catchable by user `try/catch` — not an internal
+            // engine error.
+            let m = self.new_str("is not a function");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         };
         let handle = Handle::from_raw(raw);
         // `Array(...)` without `new` behaves like `new Array(...)`.
@@ -5440,7 +5688,10 @@ impl<'a> Interp<'a> {
             return Ok(NanBox::undefined());
         }
         let Some((func_id, captured)) = self.realm.function_at(handle) else {
-            return Err(ExecError::NotCallable);
+            // A handle that is not any kind of callable (an ordinary object, an
+            // array, …): calling it is a catchable JS `TypeError`.
+            let m = self.new_str("is not a function");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         };
         let def = self.functions[func_id as usize];
         // An object-literal concise method carries its `[[HomeObject]]`; bind it for
@@ -5586,7 +5837,9 @@ impl<'a> Interp<'a> {
     /// (optionally seeded from an iterable argument).
     fn construct(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let Some(raw) = callee.as_handle() else {
-            return Err(ExecError::NotCallable);
+            // `new` on a primitive is a catchable JS `TypeError`.
+            let m = self.new_str("is not a constructor");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         };
         let handle = Handle::from_raw(raw);
         // `new someProxy(...)`: route through the `construct` trap, or construct
@@ -5698,10 +5951,14 @@ impl<'a> Interp<'a> {
             };
             return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
         }
-        let id = self
-            .realm
-            .native_at(handle)
-            .ok_or(ExecError::Unsupported("new on this value"))?;
+        let Some(id) = self.realm.native_at(handle) else {
+            // A callable that is not a constructor — e.g. a built-in method such as
+            // `Function.prototype.apply`/`call` (a first-class bound native), or any
+            // value reaching here without a `[[Construct]]`. `new` on it is a
+            // TypeError (catchable), not an internal "unsupported".
+            let m = self.new_str("is not a constructor");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        };
         // The abstract `%TypedArray%` intrinsic cannot be constructed directly.
         if id == N_TYPED_ARRAY_ABSTRACT {
             let m = self.new_str("Abstract class TypedArray not directly constructable");
@@ -13249,9 +13506,11 @@ impl<'a> Interp<'a> {
                     if let Some(result) = self.call_method(recv, name, &args)? {
                         return Ok(result);
                     }
-                    // Fall back to a property-valued tag function.
+                    // Fall back to a property-valued tag function. A primitive
+                    // receiver has no callable tag here — a catchable TypeError.
                     let Some(raw) = recv.as_handle() else {
-                        return Err(ExecError::NotCallable);
+                        let m = self.new_str("is not a function");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     };
                     let f = self.member(Handle::from_raw(raw), property)?;
                     return self.call_with_this(f, recv, &args);
@@ -13569,7 +13828,18 @@ impl<'a> Interp<'a> {
                         if *call_optional {
                             return Err(ExecError::OptShortCircuit);
                         }
-                        return Err(ExecError::NotCallable);
+                        // The receiver is a primitive. For `null`/`undefined`,
+                        // accessing any member is a catchable TypeError ("cannot read
+                        // property"); for other primitives, the member is not a
+                        // callable here — also a catchable TypeError. Either way,
+                        // surface a JS error rather than an internal `NotCallable`.
+                        let msg = if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                            "cannot read property of null or undefined"
+                        } else {
+                            "is not a function"
+                        };
+                        let m = self.new_str(msg);
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     };
                     let f = self.member(Handle::from_raw(raw), property)?;
                     // `f?.()` short-circuits when `f` is nullish.
@@ -13765,6 +14035,18 @@ impl<'a> Interp<'a> {
             } => {
                 // `super.name` reads a super getter/method (not via `this`).
                 if matches!(&**object, Expr::Super(_)) {
+                    // `super[expr]` — a computed super member. Outside any method
+                    // (no `[[HomeObject]]`), `super` is a SyntaxError and the key
+                    // expression must NOT be evaluated; throw before evaluating.
+                    if let PropertyKey::Computed(key_expr) = property {
+                        if self.current_home.is_none() && self.current_home_object.is_none() {
+                            let m = self.new_str("'super' keyword unexpected here");
+                            return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
+                        }
+                        let key = self.eval(key_expr)?;
+                        let name = self.realm.to_display_string(key);
+                        return self.resolve_super_member(&name);
+                    }
                     let (PropertyKey::Ident(name) | PropertyKey::Str(name)) = property else {
                         return Err(ExecError::Unsupported("computed super member"));
                     };
@@ -18097,9 +18379,12 @@ mod tests {
 
     #[test]
     fn calling_a_non_function_errors() {
+        // Calling a non-callable is a *catchable* JS `TypeError` (an
+        // `ExecError::Throw`), not an internal `NotCallable` — so user `try/catch`
+        // can handle it (per ECMA-262 Call, step 2).
         let program = Parser::parse_program("let x = 5; x()").unwrap();
         let mut interp = Interp::new();
-        assert_eq!(interp.run(&program), Err(ExecError::NotCallable));
+        assert!(matches!(interp.run(&program), Err(ExecError::Throw(_))));
     }
 
     #[test]
