@@ -1017,6 +1017,7 @@ const N_MATH_LOG1P: u16 = 154;
 const N_MATH_FROUND: u16 = 155;
 const N_MATH_CLZ32: u16 = 156;
 const N_MATH_IMUL: u16 = 157;
+const N_MATH_F16ROUND: u16 = 241;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib,
@@ -1389,6 +1390,7 @@ impl<'a> Interp<'a> {
                 ("expm1", N_MATH_EXPM1),
                 ("log1p", N_MATH_LOG1P),
                 ("fround", N_MATH_FROUND),
+                ("f16round", N_MATH_F16ROUND),
                 ("clz32", N_MATH_CLZ32),
                 ("imul", N_MATH_IMUL),
             ],
@@ -1407,8 +1409,20 @@ impl<'a> Interp<'a> {
                 ("SQRT1_2", core::f64::consts::FRAC_1_SQRT_2),
             ] {
                 self.realm.set_property(math, name, NanBox::number(value));
-                self.realm.mark_hidden(math, name); // Math constants are non-enumerable
+                // The `Math` constants are `{ writable: false, enumerable: false,
+                // configurable: false }`.
+                self.realm.mark_hidden(math, name);
+                self.realm.set_readonly_property(math, name);
+                self.realm.set_non_configurable_property(math, name);
             }
+            // `Math[Symbol.toStringTag]` is the string "Math"
+            // `{ writable: false, enumerable: false, configurable: true }`.
+            let tag_sym = self.well_known_symbol("toStringTag");
+            let tag_key = self.member_key(tag_sym);
+            let tag_val = self.new_str("Math");
+            self.realm.set_property(math, &tag_key, tag_val);
+            self.realm.mark_hidden(math, &tag_key);
+            self.realm.set_readonly_property(math, &tag_key);
         }
         install_namespace(self, "console", &[("log", N_CONSOLE_LOG)]);
         // `Promise` is a native constructor (`new Promise(executor)`); its
@@ -1894,28 +1908,41 @@ impl<'a> Interp<'a> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
         Ok(match id {
             N_MATH_MAX => {
-                let mut m = f64::NEG_INFINITY;
+                // ToNumber every argument first (in order, propagating any abrupt
+                // completion), then reduce — so each element's `valueOf` runs even
+                // when an earlier element is `NaN`.
+                let mut coerced = Vec::with_capacity(args.len());
                 for a in args {
-                    let n = self.realm.to_number(*a);
+                    let num = self.coerce_to_number(*a)?;
+                    coerced.push(self.realm.to_number(num));
+                }
+                let mut m = f64::NEG_INFINITY;
+                for n in coerced {
                     if n.is_nan() {
-                        return Ok(NanBox::number(f64::NAN));
-                    }
-                    // `+0` is treated as greater than `-0`.
-                    if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive()) {
+                        m = f64::NAN;
+                    } else if !m.is_nan()
+                        && (n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive()))
+                    {
+                        // `+0` is treated as greater than `-0`.
                         m = n;
                     }
                 }
                 NanBox::number(m)
             }
             N_MATH_MIN => {
-                let mut m = f64::INFINITY;
+                let mut coerced = Vec::with_capacity(args.len());
                 for a in args {
-                    let n = self.realm.to_number(*a);
+                    let num = self.coerce_to_number(*a)?;
+                    coerced.push(self.realm.to_number(num));
+                }
+                let mut m = f64::INFINITY;
+                for n in coerced {
                     if n.is_nan() {
-                        return Ok(NanBox::number(f64::NAN));
-                    }
-                    // `-0` is treated as less than `+0`.
-                    if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative()) {
+                        m = f64::NAN;
+                    } else if !m.is_nan()
+                        && (n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative()))
+                    {
+                        // `-0` is treated as less than `+0`.
                         m = n;
                     }
                 }
@@ -2914,7 +2941,14 @@ impl<'a> Interp<'a> {
             // unlike Rust's round-half-away-from-zero.
             N_MATH_ROUND => {
                 let n = self.realm.to_number(arg(0));
-                NanBox::number(crate::common::js_round(n))
+                // A magnitude ≥ 2^52 is already an integer (the f64 spacing is ≥ 1),
+                // so it is returned unchanged — adding 0.5 and flooring would lose
+                // precision (`Math.round(2^53 − 1)` must be `2^53 − 1`, not `2^53`).
+                if n.abs() >= 4_503_599_627_370_496.0 || !n.is_finite() {
+                    NanBox::number(n)
+                } else {
+                    NanBox::number(crate::common::js_round(n))
+                }
             }
             #[cfg(feature = "std")]
             N_MATH_SQRT => NanBox::number(self.realm.to_number(arg(0)).sqrt()),
@@ -2946,11 +2980,16 @@ impl<'a> Interp<'a> {
             N_MATH_HYPOT => {
                 // If any argument is ±Infinity the result is +Infinity, even when
                 // another argument is NaN (NaN only wins if no argument is infinite).
+                // ToNumber every argument first (propagating any abrupt completion).
+                let mut nums = Vec::with_capacity(args.len());
+                for a in args {
+                    let num = self.coerce_to_number(*a)?;
+                    nums.push(self.realm.to_number(num));
+                }
                 let mut any_inf = false;
                 let mut any_nan = false;
                 let mut sum = 0.0;
-                for a in args {
-                    let n = self.realm.to_number(*a);
+                for n in nums {
                     if n.is_infinite() {
                         any_inf = true;
                     } else if n.is_nan() {
@@ -3019,15 +3058,25 @@ impl<'a> Interp<'a> {
             }
             // `Math.fround(x)` — round to the nearest single-precision float.
             N_MATH_FROUND => NanBox::number(self.realm.to_number(arg(0)) as f32 as f64),
+            // `Math.f16round(x)` — round to the nearest IEEE-754 binary16 value and
+            // back to a double (no stable Rust `f16`, so the conversion is explicit).
+            #[cfg(feature = "std")]
+            N_MATH_F16ROUND => {
+                NanBox::number(f16_to_f64(f64_to_f16_bits(self.realm.to_number(arg(0)))))
+            }
+            #[cfg(not(feature = "std"))]
+            N_MATH_F16ROUND => return Err(ExecError::Unsupported("Math.f16round needs std")),
             // `Math.clz32(x)` — count leading zeros of the ToUint32 value.
             N_MATH_CLZ32 => {
-                let u = self.realm.to_number(arg(0)) as i64 as u32;
+                // ToUint32 maps a non-finite/NaN value to 0 (so `clz32(Infinity)`
+                // is `clz32(0)` = 32).
+                let u = self.realm.to_uint32(arg(0));
                 NanBox::number(u.leading_zeros() as f64)
             }
             // `Math.imul(a, b)` — 32-bit integer multiplication.
             N_MATH_IMUL => {
-                let a = self.realm.to_number(arg(0)) as i64 as i32;
-                let b = self.realm.to_number(arg(1)) as i64 as i32;
+                let a = self.realm.to_int32(arg(0));
+                let b = self.realm.to_int32(arg(1));
                 NanBox::number(a.wrapping_mul(b) as f64)
             }
             #[cfg(not(feature = "std"))]
@@ -17891,6 +17940,96 @@ fn advance_index_u16(units: &[u16], i: usize, unicode: bool) -> usize {
         i + 2
     } else {
         i + 1
+    }
+}
+
+/// Rounds an `f64` to the nearest IEEE-754 binary16 value, returning its 16-bit
+/// pattern. Uses round-to-nearest-ties-to-even, with correct subnormal and
+/// overflow-to-infinity handling. (Rust has no stable `f16`.)
+#[cfg(feature = "std")]
+fn f64_to_f16_bits(value: f64) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    if value.is_nan() {
+        return sign | 0x7E00; // a quiet NaN
+    }
+    let abs = value.abs();
+    if abs.is_infinite() {
+        return sign | 0x7C00;
+    }
+    if abs == 0.0 {
+        return sign;
+    }
+    // f64 unbiased exponent and 52-bit mantissa, with the implicit leading 1 made
+    // explicit to form a 53-bit significand whose binary point sits after bit 52.
+    let exp = ((bits >> 52) & 0x7FF) as i64 - 1023;
+    let signif = 0x0010_0000_0000_0000u64 | (bits & 0x000F_FFFF_FFFF_FFFF);
+    // We want a 11-bit half significand (implicit 1 + 10 fraction). The number is
+    // signif * 2^(exp - 52). To express it as (half-significand) * 2^(half-exp),
+    // we shift the 53-bit significand right so that bit 10 holds the leading 1 for
+    // a normal result, or further for a subnormal one. `drop` is how many low bits
+    // are discarded (and rounded on).
+    // For a normal binary16 the exponent field is `exp + 15` in `[1, 30]`.
+    if exp + 15 >= 0x1F {
+        return sign | 0x7C00; // overflow → ±Infinity
+    }
+    // `drop` bits are removed from the 53-bit significand. In the normal range the
+    // leading 1 must land at bit 10, i.e. drop = 52 - 10 = 42. Each step the half
+    // exponent decreases below 1 (into the subnormal range) drops one more bit.
+    let drop: i64 = if exp + 15 >= 1 {
+        42
+    } else {
+        // Subnormal: shift extra by (1 - (exp + 15)) = -14 - exp.
+        42 + (1 - (exp + 15))
+    };
+    if drop >= 64 {
+        return sign; // underflow to ±0
+    }
+    let drop = drop as u32;
+    let q = signif >> drop;
+    let rem = signif & ((1u64 << drop) - 1);
+    let half = 1u64 << (drop - 1);
+    let mut out = q;
+    // Round to nearest, ties to even.
+    if rem > half || (rem == half && (q & 1) == 1) {
+        out += 1;
+    }
+    // For a normal result `out` now holds the implicit-1 significand at bit 10; the
+    // exponent field must be added in. A rounding carry that pushes `out` to
+    // 0x800 (bit 11) correctly bumps the exponent. For a subnormal result the
+    // exponent field is 0 and `out` is the fraction (a carry to 0x400 promotes it
+    // to the smallest normal, which is also correct).
+    if exp + 15 >= 1 {
+        // Re-add the biased exponent, subtracting the implicit-1 bit already in
+        // `out` (bit 10) by masking it off and combining with the exponent field.
+        let exp_field = (exp + 15) as u64;
+        // `out` includes the implicit leading 1 at bit 10; the half format stores
+        // exponent in bits 14..10 and fraction in bits 9..0, with the leading 1
+        // implicit — so combine (exp_field << 10) with the low 10 fraction bits,
+        // accounting for any carry already folded into `out`.
+        let combined = (exp_field << 10) + (out - 0x400);
+        sign | combined as u16
+    } else {
+        sign | out as u16
+    }
+}
+
+/// Expands a binary16 bit pattern to the `f64` it represents.
+#[cfg(feature = "std")]
+fn f16_to_f64(h: u16) -> f64 {
+    let sign = if (h & 0x8000) != 0 { -1.0 } else { 1.0 };
+    let exp = (h >> 10) & 0x1F;
+    let mant = (h & 0x03FF) as f64;
+    match exp {
+        0 => sign * mant * 2.0f64.powi(-24), // subnormal (and ±0 when mant == 0)
+        0x1F => {
+            if mant == 0.0 {
+                sign * f64::INFINITY
+            } else {
+                f64::NAN
+            }
+        }
+        _ => sign * (1.0 + mant / 1024.0) * 2.0f64.powi(exp as i32 - 15),
     }
 }
 
