@@ -416,6 +416,9 @@ impl Validator {
                 if !is_valid_assign_target(e) {
                     return Err(self.err(e.span(), "invalid for-in/of assignment target"));
                 }
+                if ctx.strict {
+                    self.check_not_eval_arguments(e)?;
+                }
                 self.expr(e, ctx)
             }
         }
@@ -851,6 +854,10 @@ impl Validator {
                 Ok(())
             }
             Expr::Template(t) => {
+                // NB: an *untagged* template literal with an invalid escape is a
+                // spec parse error, but this engine surfaces it at runtime (a
+                // curated conformance test pins that behavior), so it is not
+                // enforced here.
                 for x in &t.expressions {
                     self.expr(x, ctx)?;
                 }
@@ -1296,16 +1303,45 @@ fn is_simple_update_target(e: &Expr) -> bool {
 fn is_valid_assign_target(e: &Expr) -> bool {
     match e {
         Expr::Ident(_) | Expr::Member { .. } => true,
-        Expr::Array { elements, .. } => elements.iter().all(|el| match el {
-            crate::ast::ArrayElement::Hole => true,
-            crate::ast::ArrayElement::Item(x) => is_pattern_element(x),
-            crate::ast::ArrayElement::Spread(x) => is_valid_assign_target(x),
-        }),
-        Expr::Object { members, .. } => members.iter().all(|m| match m {
-            ObjectMember::Property { value, .. } => is_pattern_element(value),
-            ObjectMember::Spread { value, .. } => is_valid_assign_target(value),
-            ObjectMember::Accessor { .. } => false,
-        }),
+        Expr::Array { elements, .. } => {
+            for (i, el) in elements.iter().enumerate() {
+                match el {
+                    crate::ast::ArrayElement::Hole => {}
+                    crate::ast::ArrayElement::Item(x) => {
+                        if !is_pattern_element(x) {
+                            return false;
+                        }
+                    }
+                    crate::ast::ArrayElement::Spread(x) => {
+                        // A rest element must be the final element, target a plain
+                        // reference (no default), and not be followed by elision.
+                        if i + 1 != elements.len() || !is_valid_assign_target(x) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        }
+        Expr::Object { members, .. } => {
+            for (i, m) in members.iter().enumerate() {
+                match m {
+                    ObjectMember::Property { value, .. } => {
+                        if !is_pattern_element(value) {
+                            return false;
+                        }
+                    }
+                    ObjectMember::Spread { value, .. } => {
+                        // An object rest must be last and a plain reference.
+                        if i + 1 != members.len() || !is_valid_assign_target(value) {
+                            return false;
+                        }
+                    }
+                    ObjectMember::Accessor { .. } => return false,
+                }
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -1324,18 +1360,46 @@ fn is_pattern_element(e: &Expr) -> bool {
 }
 
 impl Validator {
-    /// In strict mode, the assignment / update targets `eval` and `arguments`
-    /// are forbidden.
+    /// In strict mode, no `eval` / `arguments` identifier may appear as an
+    /// assignment / update target — including nested inside a destructuring
+    /// assignment pattern.
     fn check_not_eval_arguments(&self, target: &Expr) -> Result<()> {
-        if let Expr::Ident(id) = target
-            && (&*id.name == "eval" || &*id.name == "arguments")
-        {
-            return Err(self.err(
+        match target {
+            Expr::Ident(id) if &*id.name == "eval" || &*id.name == "arguments" => Err(self.err(
                 id.span,
                 "`eval` and `arguments` may not be assigned in strict mode",
-            ));
+            )),
+            Expr::Array { elements, .. } => {
+                for el in elements {
+                    match el {
+                        crate::ast::ArrayElement::Hole => {}
+                        crate::ast::ArrayElement::Item(x) | crate::ast::ArrayElement::Spread(x) => {
+                            self.check_not_eval_arguments(x)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Expr::Object { members, .. } => {
+                for m in members {
+                    match m {
+                        ObjectMember::Property { value, .. }
+                        | ObjectMember::Spread { value, .. } => {
+                            self.check_not_eval_arguments(value)?;
+                        }
+                        ObjectMember::Accessor { .. } => {}
+                    }
+                }
+                Ok(())
+            }
+            // A `= default` inside a pattern: check the target side.
+            Expr::Assign {
+                op: crate::ast::AssignOp::Assign,
+                target,
+                ..
+            } => self.check_not_eval_arguments(target),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
