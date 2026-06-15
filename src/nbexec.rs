@@ -6668,7 +6668,10 @@ impl<'a> Interp<'a> {
                     let total_months = year * 12 + month as i64;
                     let y = total_months.div_euclid(12);
                     let mo = total_months.rem_euclid(12) as u32 + 1; // 1..=12
-                    let days = crate::realm::days_from_civil(y, mo, day as i64 as u32);
+                    // Measure the day as an offset from the 1st so an out-of-range
+                    // (incl. negative) day rolls over via integer arithmetic.
+                    let days =
+                        crate::realm::days_from_civil(y, mo, 1) + (day as i64 - 1);
                     time_clip(
                         (days * 86_400_000
                             + hours as i64 * 3_600_000
@@ -6703,6 +6706,20 @@ impl<'a> Interp<'a> {
                 }
             };
             let d = self.realm.new_date(ms);
+            // Register the instance's `[[Prototype]]` as `Date.prototype` so
+            // `Object.getPrototypeOf(date)`, `instanceof`, and
+            // `Date.prototype.isPrototypeOf(date)` resolve correctly.
+            if let Some(proto) = self
+                .current
+                .get("Date")
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|c| self.realm.get_property(c, "prototype"))
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw)
+            {
+                self.realm.set_native_proto(d, proto);
+            }
             return Ok(NanBox::handle(d.to_raw()));
         }
         // `new RegExp(pattern, flags)`.
@@ -9605,19 +9622,42 @@ impl<'a> Interp<'a> {
         }
         // --- `Date.UTC(year, month, day?, h?, m?, s?, ms?)` → epoch ms ---
         if self.realm.native_at(handle) == Some(N_DATE) && method == "UTC" {
-            let num = |i: usize, dflt: f64| args.get(i).map_or(dflt, |a| self.realm.to_number(*a));
-            let year = num(0, 1970.0) as i64;
-            let month = num(1, 0.0) as i64;
-            let day = num(2, 1.0) as i64;
-            let total_months = year * 12 + month;
+            // ToNumber every supplied argument, in order, with abrupt propagation
+            // (a Symbol or throwing `valueOf` raises). `Date.UTC()` with no year is
+            // NaN.
+            let mut nums = Vec::with_capacity(args.len());
+            for a in args {
+                let v = self.coerce_to_number(*a)?;
+                nums.push(self.realm.to_number(v));
+            }
+            let getn = |i: usize, dflt: f64| nums.get(i).copied().unwrap_or(dflt);
+            let year_n = getn(0, f64::NAN);
+            let month = getn(1, 0.0);
+            let day = getn(2, 1.0);
+            let hours = getn(3, 0.0);
+            let mins = getn(4, 0.0);
+            let secs = getn(5, 0.0);
+            let millis = getn(6, 0.0);
+            if [year_n, month, day, hours, mins, secs, millis]
+                .iter()
+                .any(|v| v.is_nan() || !v.is_finite())
+            {
+                return Ok(Some(NanBox::number(f64::NAN)));
+            }
+            // A two-digit year (0..=99) maps to 1900+year.
+            let yi = year_n as i64;
+            let year = if (0..=99).contains(&yi) { 1900 + yi } else { yi };
+            let total_months = year * 12 + month as i64;
             let y = total_months.div_euclid(12);
             let mo = total_months.rem_euclid(12) as u32 + 1;
-            let days = crate::realm::days_from_civil(y, mo, day as u32);
-            let ms = (days * 86_400_000
-                + (num(3, 0.0) as i64) * 3_600_000
-                + (num(4, 0.0) as i64) * 60_000
-                + (num(5, 0.0) as i64) * 1_000
-                + num(6, 0.0) as i64) as f64;
+            let days = crate::realm::days_from_civil(y, mo, 1) + (day as i64 - 1);
+            let ms = time_clip(
+                (days * 86_400_000
+                    + hours as i64 * 3_600_000
+                    + mins as i64 * 60_000
+                    + secs as i64 * 1_000
+                    + millis as i64) as f64,
+            );
             return Ok(Some(NanBox::number(ms)));
         }
         // --- `Proxy.revocable(target, handler)` → `{ proxy, revoke }` ---
@@ -10064,7 +10104,10 @@ impl<'a> Interp<'a> {
                     let wd = WEEKDAYS[((day.rem_euclid(7) + 4).rem_euclid(7)) as usize];
                     let mn = MONTHS[(mo - 1) as usize];
                     let (hh, mi, ss) = (tod / 3_600_000, tod / 60_000 % 60, tod / 1000 % 60);
-                    let date_str = alloc::format!("{wd} {mn} {d:02} {y}");
+                    // The year is zero-padded to at least 4 digits, with a leading
+                    // sign for negative years (`-0001`, `-123456`).
+                    let yr = format_date_year(y);
+                    let date_str = alloc::format!("{wd} {mn} {d:02} {yr}");
                     let time_str = alloc::format!(
                         "{hh:02}:{mi:02}:{ss:02} GMT+0000 (Coordinated Universal Time)"
                     );
@@ -10072,7 +10115,7 @@ impl<'a> Interp<'a> {
                         "toDateString" => date_str,
                         "toTimeString" => time_str,
                         "toUTCString" => {
-                            alloc::format!("{wd}, {d:02} {mn} {y} {hh:02}:{mi:02}:{ss:02} GMT")
+                            alloc::format!("{wd}, {d:02} {mn} {yr} {hh:02}:{mi:02}:{ss:02} GMT")
                         }
                         "toLocaleDateString" => alloc::format!("{mo}/{d}/{y}"),
                         "toLocaleTimeString" => alloc::format!("{hh:02}:{mi:02}:{ss:02}"),
@@ -18199,6 +18242,18 @@ fn f16_to_f64(h: u16) -> f64 {
             }
         }
         _ => sign * (1.0 + mant / 1024.0) * 2.0f64.powi(exp as i32 - 15),
+    }
+}
+
+/// Formats a calendar year for `toDateString`/`toUTCString`/`toString`: a
+/// non-negative year is zero-padded to at least 4 digits (`0020`, `2020`); a
+/// negative year prints a `-` then its magnitude zero-padded to at least 4
+/// digits (`-0001`, `-123456`).
+fn format_date_year(y: i64) -> String {
+    if y < 0 {
+        alloc::format!("-{:04}", -y)
+    } else {
+        alloc::format!("{y:04}")
     }
 }
 

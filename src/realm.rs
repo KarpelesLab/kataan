@@ -3169,8 +3169,17 @@ pub fn parse_iso_date(s: &str) -> Option<f64> {
         Some((d, t)) => (d, Some(t)),
         None => (s, None),
     };
-    let mut dp = date.split('-');
-    let y: i64 = dp.next()?.parse().ok()?;
+    // An expanded year has a leading sign (`+YYYYYY` / `-YYYYYY`); preserve it so
+    // the year split below doesn't treat a leading `-` as an empty field.
+    let (year_sign, date_body): (i64, &str) = if let Some(rest) = date.strip_prefix('-') {
+        (-1, rest)
+    } else if let Some(rest) = date.strip_prefix('+') {
+        (1, rest)
+    } else {
+        (1, date)
+    };
+    let mut dp = date_body.split('-');
+    let y: i64 = year_sign * dp.next()?.parse::<i64>().ok()?;
     // Month and day are optional: `YYYY` and `YYYY-MM` are valid ISO date forms
     // (defaulting the omitted fields to 1), per Date Time String Format.
     let mo: u32 = match dp.next() {
@@ -3250,7 +3259,16 @@ pub(crate) fn date_to_iso(ms: f64) -> alloc::string::String {
         (tod / 1000) % 60,
         tod % 1000,
     );
-    alloc::format!("{y:04}-{mo:02}-{d:02}T{h:02}:{min:02}:{s:02}.{milli:03}Z")
+    // Years outside 0..=9999 use the expanded `±YYYYYY` form (6 digits, signed);
+    // otherwise the 4-digit form.
+    let year = if (0..=9999).contains(&y) {
+        alloc::format!("{y:04}")
+    } else if y < 0 {
+        alloc::format!("-{:06}", -y)
+    } else {
+        alloc::format!("+{y:06}")
+    };
+    alloc::format!("{year}-{mo:02}-{d:02}T{h:02}:{min:02}:{s:02}.{milli:03}Z")
 }
 
 #[cfg(test)]
