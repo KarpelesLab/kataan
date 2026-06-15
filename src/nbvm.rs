@@ -27,6 +27,7 @@
 //! Pure, safe `alloc`-only Rust.
 
 use crate::heap::Handle;
+use crate::ic::PropertyCache;
 use crate::nanbox::NanBox;
 use crate::realm::Realm;
 use alloc::boxed::Box;
@@ -976,6 +977,17 @@ fn run_frame(
     // Active exception handlers: `(catch_pc, catch_reg)`, innermost last.
     let mut handlers: Vec<(usize, Reg)> = Vec::new();
 
+    // Per-frame monomorphic inline caches, one slot per instruction index, keyed
+    // by pc. A `GetProp`/`SetProp` site that runs repeatedly in a hot loop within
+    // this activation resolves its property by a shape-pointer compare plus a slot
+    // load instead of an O(depth) name walk every iteration (see `crate::ic`).
+    // Built lazily so non-property-heavy frames pay nothing; entries for other
+    // opcodes stay cold and unused. The cache keys on `Rc<Shape>` pointer
+    // identity, so any object of a different shape (or a dictionary-mode object,
+    // whose sentinel shape resolves no key) simply misses and re-resolves —
+    // always consistent, never stale across a shape change or property delete.
+    let mut ic: Vec<PropertyCache> = Vec::new();
+
     let num = |v: NanBox| v.as_number().ok_or(VmError::NotANumber);
     // A register holding an object: recover its heap handle from the boxed value
     // (no side table — the handle *is* the value's payload).
@@ -1002,8 +1014,22 @@ fn run_frame(
         };
     }
 
+    // The inline cache for the current site, sizing the per-frame vector on first
+    // use. One `PropertyCache` per instruction index keyed by pc.
+    macro_rules! site_cache {
+        ($site:expr) => {{
+            if ic.len() <= $site {
+                ic.resize_with(program.len(), PropertyCache::new);
+            }
+            &mut ic[$site]
+        }};
+    }
+
     while pc < program.len() {
         let op = &program[pc];
+        // The instruction index of this op, used to key its inline cache; `pc`
+        // itself advances before the op runs (and may be redirected by jumps).
+        let site = pc;
         pc += 1;
         match op {
             Op::LoadConst { dst, value } => regs[*dst as usize] = *value,
@@ -1552,7 +1578,16 @@ fn run_frame(
                         }
                     }
                     _ => {
-                        ctx.realm.set_property(handle, key, regs[*src as usize]);
+                        let value = regs[*src as usize];
+                        // Inline-cache fast path: an in-place write to an existing
+                        // own data property on the receiver's shape (no transition,
+                        // so the cache stays valid). A new property, a dictionary
+                        // object, or a frozen/read-only target misses and falls to
+                        // `set_property`, which adds/transitions as needed.
+                        let cache = site_cache!(site);
+                        if !ctx.realm.object_cached_set(handle, key, value, cache) {
+                            ctx.realm.set_property(handle, key, value);
+                        }
                     }
                 }
             }
@@ -1656,9 +1691,18 @@ fn run_frame(
                                     }
                                 }
                                 _ => {
+                                    // Inline-cache fast path: a plain own data
+                                    // property on the receiver's shape resolves
+                                    // via a shape-pointer compare + slot load. A
+                                    // miss (different/dictionary shape, absent or
+                                    // inherited property, or a non-plain cell)
+                                    // returns `None` and we fall to the identical
+                                    // slow path used before this cache existed.
+                                    let cache = site_cache!(site);
                                     regs[*dst as usize] = ctx
                                         .realm
-                                        .get_property(handle, key)
+                                        .object_cached_get(handle, key, cache)
+                                        .or_else(|| ctx.realm.get_property(handle, key))
                                         .unwrap_or(NanBox::undefined());
                                 }
                             }
@@ -6609,6 +6653,159 @@ mod tests {
         assert_eq!(
             bc("let o = {a:{}}; let r; try { r = o.a?.zzz.qqq; } catch (e) { r = 'threw'; } r"),
             "threw"
+        );
+    }
+
+    // --- Inline-cache (H1) wiring: `GetProp`/`SetProp` over a per-frame
+    // monomorphic shape→slot cache. Every case runs through `bc()`, which forces
+    // the pure bytecode VM (no tree-walker fallback), so the cache path is the one
+    // under test. ---
+
+    /// A hot `obj.x` read loop: the same shape every iteration, so after the cold
+    /// miss every later read is a cache hit. The sum must still be exact.
+    #[test]
+    fn ic_hot_read_loop_is_correct() {
+        // o.x == 7 for all 100 iterations → 700. Reading through the cache must
+        // return the live slot value, not a stale or wrong one.
+        assert_eq!(
+            bc("let o = { x: 7, y: 1 }; \
+                let t = 0; \
+                for (let i = 0; i < 100; i = i + 1) { t = t + o.x; } \
+                t"),
+            "700"
+        );
+        // A write through the same site then a read: the in-place `SetProp` fast
+        // path updates the slot, and the subsequent reads see the new value.
+        assert_eq!(
+            bc("let o = { x: 0 }; \
+                for (let i = 0; i < 50; i = i + 1) { o.x = o.x + 2; } \
+                o.x"),
+            "100"
+        );
+    }
+
+    /// A polymorphic read site — two different shapes alternating through one
+    /// `GetProp` instruction. The monomorphic cache must re-resolve on the shape
+    /// it does not currently hold (a miss), never returning the other object's
+    /// slot.
+    #[test]
+    fn ic_polymorphic_site_stays_correct() {
+        // `a` is {p}; `b` is {q, p} — `p` lives in slot 0 of `a` but slot 1 of
+        // `b`. Reading `.p` from each in turn must yield each one's own value, so
+        // a cache armed on `a`'s shape must miss for `b` and vice versa.
+        assert_eq!(
+            bc("let a = { p: 10 }; \
+                let b = { q: 99, p: 20 }; \
+                let arr = [a, b]; \
+                let t = 0; \
+                for (let i = 0; i < 20; i = i + 1) { t = t + arr[i % 2].p; } \
+                t"),
+            // 10 reads of a.p (=10) + 10 reads of b.p (=20) = 100 + 200 = 300.
+            "300"
+        );
+    }
+
+    /// Adding a property (a shape *transition*) after the site has warmed, then
+    /// reading it, must see the new property — the transition produces a new shape
+    /// pointer that misses the cache, so no stale slot is returned.
+    #[test]
+    fn ic_shape_transition_then_read_is_correct() {
+        assert_eq!(
+            bc("let o = { a: 1 }; \
+                let r = o.a; \
+                o.b = 2; \
+                r = r + o.b; \
+                o.c = 3; \
+                r + o.c"),
+            "6"
+        );
+        // Warm a read site on the original shape, then transition and re-read the
+        // *same* property name through the warmed site: still correct.
+        assert_eq!(
+            bc("let o = { a: 5 }; \
+                let s = 0; \
+                for (let i = 0; i < 3; i = i + 1) { s = s + o.a; } \
+                o.z = 1; \
+                for (let i = 0; i < 3; i = i + 1) { s = s + o.a; } \
+                s"),
+            "30"
+        );
+    }
+
+    /// Deleting a property then reading it returns `undefined` — the delete
+    /// rebuilds the object on a fresh shape, so the warmed cache misses and the
+    /// slow path reports the property absent.
+    #[test]
+    fn ic_delete_then_read_is_undefined() {
+        assert_eq!(
+            bc("let o = { a: 1, b: 2 }; \
+                let r = o.a; \
+                delete o.a; \
+                r + ':' + o.a"),
+            "1:undefined"
+        );
+    }
+
+    /// An accessor (getter/setter) must still invoke the function, never the IC
+    /// data fast path — accessors live outside the slot layout and are resolved
+    /// before the cache is consulted.
+    #[test]
+    fn ic_accessors_still_invoke_getter_setter() {
+        // A getter computes a value; reading the property repeatedly must call it
+        // each time (here it reads a backing field), not a cached slot.
+        assert_eq!(
+            bc("let o = { _v: 3, get x() { return this._v * 10; } }; \
+                let t = 0; \
+                for (let i = 0; i < 4; i = i + 1) { t = t + o.x; } \
+                t"),
+            "120"
+        );
+        // A setter routes writes through the function; the IC's `cached_set` must
+        // not short-circuit it.
+        assert_eq!(
+            bc("let o = { _v: 0, set x(n) { this._v = n + 1; } }; \
+                o.x = 5; \
+                o.x = 9; \
+                o._v"),
+            "10"
+        );
+    }
+
+    /// A dictionary-mode object (more own properties than the realm's
+    /// `object_dictionary_threshold`) reads and writes correctly through the
+    /// non-cached path — its empty sentinel shape never produces a cache hit.
+    #[test]
+    fn ic_dictionary_object_bypasses_cache() {
+        // Build an object with > 128 own properties (the default dict threshold),
+        // converting it to dictionary mode, then read/write a few keys in a loop.
+        let src = "let o = {}; \
+             for (let i = 0; i < 200; i = i + 1) { o['k' + i] = i; } \
+             let t = 0; \
+             for (let i = 0; i < 50; i = i + 1) { t = t + o.k10; } \
+             o.k10 = 1000; \
+             t + ':' + o.k10 + ':' + o.k199";
+        // 50 reads of k10 (=10) = 500; then k10 set to 1000; k199 == 199.
+        assert_eq!(bc(src), "500:1000:199");
+    }
+
+    /// A prototype-inherited member still resolves: the IC only fast-paths an
+    /// *own* data slot on the receiver, so an inherited member misses the cache
+    /// and falls to the slow path (which walks the prototype chain). Uses a class
+    /// — whose methods live on the prototype — so it compiles to pure bytecode
+    /// (no `Object.create` global, which is tree-walker-only).
+    #[test]
+    fn ic_prototype_inherited_property_resolves() {
+        assert_eq!(
+            bc(
+                "class P { constructor() { this.own = 1; } shared() { return 42; } } \
+                let o = new P(); \
+                let t = 0; \
+                for (let i = 0; i < 10; i = i + 1) { t = t + o.shared() + o.own; } \
+                t"
+            ),
+            // (42 + 1) * 10 = 430. `o.own` is an own data slot (IC fast path),
+            // `o.shared` is inherited from the prototype (IC miss → slow path).
+            "430"
         );
     }
 
