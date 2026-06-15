@@ -586,6 +586,21 @@ const N_OBJECT_GROUP_BY: u16 = 138;
 const N_OBJECT_GET_OWN_DESCS: u16 = 130;
 const N_WEAKREF: u16 = 131;
 const N_FINALIZATION_REGISTRY: u16 = 132;
+// The `%Iterator%` abstract constructor and its `Iterator.from` static.
+const N_ITERATOR: u16 = 236;
+const N_ITERATOR_FROM: u16 = 237;
+// `%IteratorPrototype%[Symbol.iterator]` — returns its `this` receiver.
+const N_ITERATOR_PROTO_SELF: u16 = 238;
+// A first-class `Iterator.prototype.<helper>` (map/filter/take/…) bound native:
+// the method name rides in the bound target, the receiver is `this`.
+const N_ITERATOR_PROTO_FN: u16 = 239;
+
+/// The ES2025 `Iterator.prototype` helper method names installed on
+/// `%IteratorPrototype%` as first-class functions.
+const ITERATOR_PROTO_METHODS: &[&str] = &[
+    "map", "filter", "take", "drop", "flatMap", "reduce", "toArray", "forEach", "some", "every",
+    "find",
+];
 const N_OBJECT_DEFINE_PROPS: u16 = 124;
 const N_WEAKSET: u16 = 113;
 const N_REFLECT_GET: u16 = 114;
@@ -764,7 +779,8 @@ fn builtin_method_arity(name: &str) -> u32 {
         "pop" | "shift" | "reverse" | "keys" | "values" | "entries" | "toString"
         | "toLocaleString" | "valueOf" | "flat" | "clear" | "trim" | "trimStart" | "trimEnd"
         | "toUpperCase" | "toLowerCase" | "toLocaleUpperCase" | "toLocaleLowerCase"
-        | "toReversed" | "toSorted" | "isWellFormed" | "toWellFormed" | "getInt8" | "getUint8" => 0,
+        | "toReversed" | "toSorted" | "isWellFormed" | "toWellFormed" | "getInt8" | "getUint8"
+        | "toArray" => 0,
         // Two-argument methods.
         "slice" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
         | "replaceAll" | "padStart" | "padEnd" | "with" | "setInt8" | "setUint8" => 2,
@@ -1481,6 +1497,46 @@ impl<'a> Interp<'a> {
             }
             self.current.declare(name, NanBox::handle(f.to_raw()));
         }
+        // The `Iterator` global — the `%Iterator%` abstract constructor. Direct
+        // `new Iterator()` / `Iterator()` throw (abstract); `Iterator.from(x)`
+        // wraps any iterable for the ES2025 helper methods. Its `prototype`
+        // (`%IteratorPrototype%`) carries `[Symbol.iterator]()` returning `this`,
+        // so an object inheriting it is itself iterable.
+        let iterator_ctor = self.new_named_native("Iterator", N_ITERATOR);
+        let from_fn = self.new_named_native("from", N_ITERATOR_FROM);
+        self.realm
+            .set_hidden_property(iterator_ctor, "from", NanBox::handle(from_fn.to_raw()));
+        let iter_proto = self.realm.new_object();
+        // `%IteratorPrototype%[Symbol.iterator]` returns `this` (a native bound to
+        // the receiver at call time).
+        let self_iter = self.realm.new_native(N_ITERATOR_PROTO_SELF);
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
+        self.realm
+            .set_hidden_property(iter_proto, &iter_key, NanBox::handle(self_iter.to_raw()));
+        // The ES2025 helper methods as first-class functions on `%IteratorPrototype%`
+        // (so `Iterator.prototype.map`, `it.map(...)` resolve through the chain).
+        for &name in ITERATOR_PROTO_METHODS {
+            let name_h = self.realm.new_string(name);
+            let f = self.realm.new_bound_native(N_ITERATOR_PROTO_FN, name_h);
+            self.install_fn_name_length(f, name, builtin_method_arity(name));
+            self.realm
+                .set_property(iter_proto, name, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(iter_proto, name);
+        }
+        self.realm.set_hidden_property(
+            iter_proto,
+            "constructor",
+            NanBox::handle(iterator_ctor.to_raw()),
+        );
+        self.realm.set_hidden_property(
+            iterator_ctor,
+            "prototype",
+            NanBox::handle(iter_proto.to_raw()),
+        );
+        self.realm.mark_hidden(iterator_ctor, "prototype");
+        self.current
+            .declare("Iterator", NanBox::handle(iterator_ctor.to_raw()));
         // The `WebAssembly` namespace, backed by the in-house WASM engine
         // (`wasm_rt`). `validate(bytes)` decodes a module and reports whether it
         // is well-formed.
@@ -2575,6 +2631,32 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_array(items).to_raw())
             }
             N_ARRAY_OF => NanBox::handle(self.realm.new_array(args.to_vec()).to_raw()),
+            // `%IteratorPrototype%[Symbol.iterator]()` — an iterator is its own
+            // iterable: return the receiver.
+            N_ITERATOR_PROTO_SELF => self.this_val,
+            // The abstract `%Iterator%` constructor is not callable as a plain
+            // function (and `new Iterator()` is a TypeError too — handled in
+            // `construct`).
+            N_ITERATOR => {
+                let m = self.new_str("Abstract class Iterator not directly constructable");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            // `Iterator.from(obj)` — wrap an iterable (or an iterator) so the
+            // ES2025 iterator-helper methods (`map`/`filter`/`take`/…) are
+            // available. An object that is already an iterator (has a `next`
+            // method) is driven through its protocol; any other iterable is
+            // gathered via the standard iteration. The result is a generator-
+            // backed iterator, which carries the helper methods and `next()`.
+            N_ITERATOR_FROM => {
+                let src = arg(0);
+                // RequireObjectCoercible-ish: a null/undefined source is a TypeError.
+                if matches!(src.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    let m = self.new_str("Iterator.from called on null or undefined");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                let values = self.iterate_values(src)?;
+                self.make_generator(values)
+            }
             // The abstract `%TypedArray%` intrinsic is not callable directly.
             N_TYPED_ARRAY_ABSTRACT => {
                 let m = self.new_str("Abstract class TypedArray not directly constructable");
@@ -4427,6 +4509,119 @@ impl<'a> Interp<'a> {
         self.make_generator_with_return(values, NanBox::undefined())
     }
 
+    /// Runs an ES2025 `Iterator.prototype` helper (`map`/`filter`/`take`/`drop`/
+    /// `flatMap`/`reduce`/`toArray`/`forEach`/`some`/`every`/`find`) on the
+    /// receiver iterator `this_val`. The receiver is drained through the iterator
+    /// protocol (`iterate_values`); the lazy/element-returning helpers return a
+    /// fresh generator-backed iterator, the rest a direct value. A non-iterator
+    /// `this` is a TypeError (`requires that 'this' be an Iterator`).
+    fn iterator_proto_helper(
+        &mut self,
+        method: &str,
+        this_val: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let values = self.iterate_values(this_val).map_err(|_| {
+            self.type_error(&alloc::format!(
+                "Iterator.prototype.{method} requires that 'this' be an Iterator"
+            ))
+        })?;
+        let f = args.first().copied().unwrap_or(NanBox::undefined());
+        // The callback-taking helpers require a callable first argument.
+        let needs_fn = matches!(
+            method,
+            "map" | "filter" | "flatMap" | "reduce" | "forEach" | "some" | "every" | "find"
+        );
+        if needs_fn
+            && !f
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            return Err(self.type_error(&alloc::format!(
+                "Iterator.prototype.{method} called with a non-callable argument"
+            )));
+        }
+        Ok(match method {
+            "toArray" => NanBox::handle(self.realm.new_array(values).to_raw()),
+            "map" => {
+                let mut out = Vec::with_capacity(values.len());
+                for (i, v) in values.into_iter().enumerate() {
+                    out.push(self.call(f, &[v, NanBox::number(i as f64)])?);
+                }
+                self.make_generator(out)
+            }
+            "filter" => {
+                let mut out = Vec::new();
+                for (i, v) in values.into_iter().enumerate() {
+                    let keep = self.call(f, &[v, NanBox::number(i as f64)])?;
+                    if self.realm.truthy(keep) {
+                        out.push(v);
+                    }
+                }
+                self.make_generator(out)
+            }
+            "flatMap" => {
+                let mut out = Vec::new();
+                for (i, v) in values.into_iter().enumerate() {
+                    let r = self.call(f, &[v, NanBox::number(i as f64)])?;
+                    out.extend(self.iterate_values(r).unwrap_or_else(|_| alloc::vec![r]));
+                }
+                self.make_generator(out)
+            }
+            "take" => {
+                let n = self.realm.to_number(f).max(0.0) as usize;
+                self.make_generator(values.into_iter().take(n).collect())
+            }
+            "drop" => {
+                let n = self.realm.to_number(f).max(0.0) as usize;
+                self.make_generator(values.into_iter().skip(n).collect())
+            }
+            "forEach" => {
+                for (i, v) in values.into_iter().enumerate() {
+                    self.call(f, &[v, NanBox::number(i as f64)])?;
+                }
+                NanBox::undefined()
+            }
+            "some" | "every" | "find" => {
+                for (i, v) in values.into_iter().enumerate() {
+                    let r = self.call(f, &[v, NanBox::number(i as f64)])?;
+                    let t = self.realm.truthy(r);
+                    match method {
+                        "every" if !t => return Ok(NanBox::boolean(false)),
+                        "some" if t => return Ok(NanBox::boolean(true)),
+                        "find" if t => return Ok(v),
+                        _ => {}
+                    }
+                }
+                match method {
+                    "every" => NanBox::boolean(true),
+                    "some" => NanBox::boolean(false),
+                    _ => NanBox::undefined(), // find → undefined
+                }
+            }
+            // reduce
+            _ => {
+                let mut it = values.into_iter();
+                let mut acc = if args.len() >= 2 {
+                    args[1]
+                } else {
+                    match it.next() {
+                        Some(v) => v,
+                        None => {
+                            return Err(self.type_error(
+                                "Reduce of empty iterator with no initial value",
+                            ));
+                        }
+                    }
+                };
+                for v in it {
+                    acc = self.call(f, &[acc, v])?;
+                }
+                acc
+            }
+        })
+    }
+
     /// Like [`make_generator`], but with the generator's `return` value (surfaced
     /// once, with `done: true`, after the yields are exhausted).
     fn make_generator_with_return(&mut self, values: Vec<NanBox>, ret: NanBox) -> NanBox {
@@ -5495,6 +5690,12 @@ impl<'a> Interp<'a> {
                 return Ok(self
                     .call_method(this_val, &name, args)?
                     .unwrap_or(NanBox::undefined()));
+            }
+            // A first-class `Iterator.prototype.<helper>` (map/filter/take/…) run
+            // on the call's `this` iterator.
+            if id == N_ITERATOR_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                return self.iterator_proto_helper(&name, this_val, args);
             }
             // A first-class `Array.prototype.<method>`: run that array method on the
             // call's `this` (e.g. `Array.prototype.slice.call(arguments)`).

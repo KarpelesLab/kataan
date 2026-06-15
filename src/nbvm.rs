@@ -327,6 +327,7 @@ const KNOWN_GLOBALS: &[&str] = &[
     "BigInt64Array",
     "BigUint64Array",
     "globalThis",
+    "Iterator",
     "Error",
     "TypeError",
     "RangeError",
