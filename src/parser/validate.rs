@@ -802,12 +802,6 @@ impl Validator {
         self.binding_target(&p.target, ctx)
     }
 
-    /// Parameter-list early errors:
-    /// - a name may not repeat in a strict-mode function or in any function with
-    ///   a non-simple parameter list (defaults, destructuring, or a rest
-    ///   element);
-    /// - a function whose parameter list is non-simple may not contain a
-    ///   `"use strict"` directive in its body.
     /// A getter must declare no parameters; a setter must declare exactly one,
     /// which may not be a rest parameter.
     fn check_accessor_arity(&self, is_getter: bool, f: &Function) -> Result<()> {
@@ -824,6 +818,12 @@ impl Validator {
         Ok(())
     }
 
+    /// Parameter-list early errors:
+    /// - a name may not repeat in a strict-mode function, a method/arrow
+    ///   (`unique_required`), or any function with a non-simple parameter list
+    ///   (defaults, destructuring, or a rest element);
+    /// - a function whose parameter list is non-simple may not contain a
+    ///   `"use strict"` directive in its body.
     fn check_params(
         &self,
         params: &[Param],
