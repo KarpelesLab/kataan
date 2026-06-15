@@ -113,13 +113,26 @@ pub(crate) type GroupNames = Vec<(usize, alloc::string::String)>;
 /// Parses `pattern` into an AST plus the number of capturing groups and the
 /// `(group index, name)` pairs of any named groups (`(?<name>…)`).
 pub(crate) fn parse(pattern: &str, unicode: bool) -> Result<(Node, usize, GroupNames), RegexError> {
+    let chars: Vec<char> = pattern.chars().collect();
+    // Whether the pattern contains `(?<name>…)` group syntax anywhere. Under the
+    // `u` flag a `\k` is always a named backreference; without it, `\k<…>` is a
+    // named backreference only when the pattern declares a named group (else it
+    // is the Annex B identity escape `k`, with `<name>` matched literally).
+    let has_named = unicode || scan_has_named_group(&chars);
     let mut p = Parser {
-        chars: pattern.chars().collect(),
+        chars,
         pos: 0,
         group_count: 0,
         group_names: Vec::new(),
         depth: 0,
         unicode,
+        branch_path: Vec::new(),
+        next_alt_id: 0,
+        decl_paths: Vec::new(),
+        named_refs: Vec::new(),
+        numeric_refs: Vec::new(),
+        saw_named_group: false,
+        pattern_has_named_groups: has_named,
     };
     let node = p.parse_alt()?;
     if p.pos != p.chars.len() {
@@ -127,6 +140,27 @@ pub(crate) fn parse(pattern: &str, unicode: bool) -> Result<(Node, usize, GroupN
             "unexpected `{}`",
             p.chars[p.pos]
         )));
+    }
+    // Every `\k<name>` must reference a declared group name (ES2018+). A pattern
+    // with no named groups at all treats `\k` as a literal (Annex B), handled in
+    // `parse_escape`, so any entry here means named-group syntax *was* present.
+    for r in &p.named_refs {
+        if !p.group_names.iter().any(|(_, n)| n == r) {
+            return Err(RegexError::new(alloc::format!(
+                "named backreference to undefined group `{r}`"
+            )));
+        }
+    }
+    // Under the `u` flag a numeric backreference must name an existing group; an
+    // out-of-range `\n` is a Syntax Error (no Annex B legacy-octal fallback).
+    if unicode {
+        for &n in &p.numeric_refs {
+            if n > p.group_count {
+                return Err(RegexError::new(alloc::format!(
+                    "backreference to nonexistent group \\{n}"
+                )));
+            }
+        }
     }
     Ok((node, p.group_count, p.group_names))
 }
@@ -141,6 +175,77 @@ struct Parser {
     /// Whether the `u` (unicode) flag is set: enables `\u` surrogate-pair
     /// combination so a pattern like `😀` parses as one astral char.
     unicode: bool,
+    /// The current alternation path: `(alt_id, branch_index)` for each enclosing
+    /// `Disjunction`. Two named groups may share a name only when they are in
+    /// mutually-exclusive alternatives — i.e. some common `alt_id` selects a
+    /// different branch for each (ES2025 duplicate named groups). Used to reject
+    /// a duplicate within the *same* alternative (`(?<a>x)(?<a>y)`).
+    branch_path: Vec<(u32, u32)>,
+    /// Monotonic id handed to each `Disjunction` so distinct disjunctions never
+    /// collide in `branch_path`.
+    next_alt_id: u32,
+    /// `(name, branch_path)` recorded at each `(?<name>…)` declaration, for the
+    /// mutual-exclusion duplicate-name check.
+    decl_paths: Vec<(alloc::string::String, Vec<(u32, u32)>)>,
+    /// Every `\k<name>` reference, validated against declared names after parsing
+    /// (a name may be referenced before it is declared).
+    named_refs: Vec<alloc::string::String>,
+    /// Every numeric backreference `\1`…`\n`, validated against the final group
+    /// count after parsing (a backref may precede its group). Only enforced under
+    /// the `u` flag; without it, an out-of-range escape is an Annex B legacy
+    /// octal/literal and is left to the existing relaxed handling.
+    numeric_refs: Vec<usize>,
+    /// Whether any `(?<name>…)` group syntax appeared; controls the Annex B
+    /// reading of a bare `\k` when no named groups exist.
+    saw_named_group: bool,
+    /// Whether the whole pattern contains named-group syntax (pre-scanned), or
+    /// the `u` flag is set. Drives the `\k<…>` named-backreference vs. Annex B
+    /// identity-escape decision.
+    pattern_has_named_groups: bool,
+}
+
+/// Pre-scans for `(?<name>…)` group syntax (a `(?<` not immediately followed by
+/// `=` or `!`, which would be a lookbehind). Determines whether `\k<…>` is a
+/// named backreference (Annex B: only when a named group is present).
+fn scan_has_named_group(chars: &[char]) -> bool {
+    let mut i = 0;
+    let mut in_class = false;
+    while i < chars.len() {
+        match chars[i] {
+            // Skip an escaped char so an escaped paren/bracket is not misread.
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '(' if !in_class
+                && chars.get(i + 1) == Some(&'?')
+                && chars.get(i + 2) == Some(&'<')
+                && !matches!(chars.get(i + 3), Some('=') | Some('!')) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether `a` and `b` alternation paths are mutually exclusive: some common
+/// disjunction (`alt_id`) selects a different branch in each. Two named groups on
+/// mutually-exclusive paths can never both participate, so they may share a name
+/// (ES2025 duplicate named groups); otherwise a shared name is a Syntax Error.
+fn paths_mutually_exclusive(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+    for &(aid, abr) in a {
+        if let Some(&(_, bbr)) = b.iter().find(|&&(bid, _)| bid == aid)
+            && abr != bbr
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl Parser {
@@ -164,11 +269,22 @@ impl Parser {
     }
 
     /// `alt := concat ('|' concat)*`
+    ///
+    /// Each disjunction gets a fresh `alt_id`; the current branch index is pushed
+    /// onto `branch_path` while parsing each branch so named-group declarations
+    /// can be checked for mutual exclusivity (duplicate-name rule).
     fn parse_alt(&mut self) -> Result<Node, RegexError> {
+        let alt_id = self.next_alt_id;
+        self.next_alt_id += 1;
+        self.branch_path.push((alt_id, 0));
         let mut branches = alloc::vec![self.parse_concat()?];
         while self.eat('|') {
+            if let Some(last) = self.branch_path.last_mut() {
+                last.1 += 1;
+            }
             branches.push(self.parse_concat()?);
         }
+        self.branch_path.pop();
         Ok(if branches.len() == 1 {
             branches.pop().unwrap()
         } else {
@@ -210,7 +326,12 @@ impl Parser {
             }
             Some('{') => match self.try_parse_brace()? {
                 Some(bounds) => bounds,
-                None => return Ok(atom), // a literal `{` not forming a quantifier
+                // A `{` not forming a quantifier: a literal `{` under Annex B, but
+                // a Syntax Error under the `u` flag (strict grammar).
+                None if self.unicode => {
+                    return Err(RegexError::new("lone `{` quantifier"));
+                }
+                None => return Ok(atom),
             },
             _ => return Ok(atom),
         };
@@ -316,6 +437,14 @@ impl Parser {
             Some(c @ ('*' | '+' | '?')) => Err(RegexError::new(alloc::format!(
                 "nothing to repeat before `{c}`"
             ))),
+            // Under the `u` flag a bare `}`, `]`, or `{` is a Syntax Error (the
+            // strict grammar admits them only when escaped or as class/quantifier
+            // delimiters). Without `u`, Annex B treats them as literal
+            // PatternCharacters. A bare `{` is consumed here only when it did not
+            // open a quantifier (`parse_quantified` handled that case).
+            Some(c @ ('}' | ']' | '{')) if self.unicode => Err(RegexError::new(
+                alloc::format!("lone `{c}` is not allowed in unicode mode"),
+            )),
             Some(c) => {
                 self.pos += 1;
                 Ok(Node::Char(c as u32))
@@ -374,17 +503,19 @@ impl Parser {
             } else if self.chars.get(self.pos + 1) == Some(&'<') {
                 // `(?<name> … )` — a capturing group with a name.
                 self.pos += 2; // `?<`
-                let mut name = alloc::string::String::new();
-                while let Some(&c) = self.chars.get(self.pos) {
-                    if c == '>' {
-                        break;
+                let name = self.parse_group_name()?;
+                // Duplicate names are allowed only across mutually-exclusive
+                // alternatives (ES2025); a duplicate reachable in the same
+                // alternative as a prior declaration is a Syntax Error.
+                for (prev, path) in &self.decl_paths {
+                    if *prev == name && !paths_mutually_exclusive(path, &self.branch_path) {
+                        return Err(RegexError::new(alloc::format!(
+                            "duplicate capture group name `{name}`"
+                        )));
                     }
-                    name.push(c);
-                    self.pos += 1;
                 }
-                if !self.eat('>') {
-                    return Err(RegexError::new("unterminated group name `(?<`"));
-                }
+                self.saw_named_group = true;
+                self.decl_paths.push((name.clone(), self.branch_path.clone()));
                 self.group_count += 1;
                 self.group_names.push((self.group_count, name));
                 Some(self.group_count)
@@ -405,6 +536,50 @@ impl Parser {
         })
     }
 
+    /// Parses a `GroupName` body (the leading `<` already consumed) up to and
+    /// including the closing `>`, returning the decoded name. The name must be a
+    /// non-empty `RegExpIdentifierName`: a `RegExpIdentifierStart` followed by
+    /// `RegExpIdentifierPart`s, where a `\u` escape contributes its code point.
+    /// An empty name, an invalid start/part character, or a missing `>` is a
+    /// Syntax Error.
+    fn parse_group_name(&mut self) -> Result<alloc::string::String, RegexError> {
+        let mut name = alloc::string::String::new();
+        let mut first = true;
+        loop {
+            let ch = match self.peek() {
+                Some('>') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some('\\') if self.chars.get(self.pos + 1) == Some(&'u') => {
+                    self.pos += 2; // `\u`
+                    let cp = self.parse_unicode_escape()?;
+                    char::from_u32(cp)
+                        .ok_or_else(|| RegexError::new("invalid code point in group name"))?
+                }
+                Some(c) => {
+                    self.pos += 1;
+                    c
+                }
+                None => return Err(RegexError::new("unterminated group name")),
+            };
+            let ok = if first {
+                is_regexp_id_start(ch)
+            } else {
+                is_regexp_id_part(ch)
+            };
+            if !ok {
+                return Err(RegexError::new("invalid character in capture group name"));
+            }
+            name.push(ch);
+            first = false;
+        }
+        if name.is_empty() {
+            return Err(RegexError::new("empty capture group name"));
+        }
+        Ok(name)
+    }
+
     fn parse_escape(&mut self) -> Result<Node, RegexError> {
         self.pos += 1; // `\`
         let Some(c) = self.bump() else {
@@ -419,23 +594,33 @@ impl Parser {
             'S' => class_shorthand(Shorthand::NotSpace),
             'b' => Node::WordBoundary { neg: false },
             'B' => Node::WordBoundary { neg: true },
-            // `\1`…`\9` — a backreference to a capture group.
-            d if d.is_ascii_digit() && d != '0' => Node::Backref((d as u8 - b'0') as usize),
-            // `\k<name>` — a named backreference (resolved at compile time). A bare
-            // `\k` not followed by `<` is the literal character `k` (Annex B).
-            'k' if self.chars.get(self.pos) == Some(&'<') => {
-                self.eat('<');
-                let mut name = alloc::string::String::new();
-                while let Some(&c) = self.chars.get(self.pos) {
-                    if c == '>' {
-                        break;
+            // `\1`…`\n` — a (possibly multi-digit) backreference to a capture
+            // group. Validated against the group count after parsing under the
+            // `u` flag; without it, an out-of-range reference falls back to Annex
+            // B legacy-octal/literal handling (see `decimal_escape_fallback`).
+            d if d.is_ascii_digit() && d != '0' => {
+                let mut n = (d as u8 - b'0') as usize;
+                // Multi-digit references are read whole only under `u` (where the
+                // grammar has no Annex B legacy-octal ambiguity); in non-`u` mode
+                // a single digit is kept to preserve the historical behavior.
+                if self.unicode {
+                    while let Some(nd) = self.peek().and_then(|c| c.to_digit(10)) {
+                        n = n.saturating_mul(10).saturating_add(nd as usize);
+                        self.pos += 1;
                     }
-                    name.push(c);
-                    self.pos += 1;
                 }
-                if !self.eat('>') {
-                    return Err(RegexError::new("unterminated `\\k<` group name"));
-                }
+                self.numeric_refs.push(n);
+                Node::Backref(n)
+            }
+            // `\k<name>` — a named backreference (resolved at compile time), but
+            // only when the pattern contains named-group syntax (or the `u` flag
+            // is set). Otherwise (Annex B) `\k` is the identity escape `k` and the
+            // following `<name>` is matched literally. A bare `\k` not followed by
+            // `<` is always the literal character `k`.
+            'k' if self.pattern_has_named_groups && self.chars.get(self.pos) == Some(&'<') => {
+                self.eat('<');
+                let name = self.parse_group_name()?;
+                self.named_refs.push(name.clone());
                 Node::NamedBackref(name)
             }
             'u' => Node::Char(self.parse_unicode_escape()?),
@@ -448,7 +633,35 @@ impl Parser {
             'P' if self.unicode => {
                 class_shorthand(Shorthand::Property(self.parse_property()?, true))
             }
-            other => Node::Char(escape_char(other) as u32),
+            // `\cX` — a control escape (`X` an ASCII letter → U+0001..=U+001A).
+            // Under `u`, anything else after `\c` is a Syntax Error; without it
+            // Annex B treats `\c` not followed by a letter as the literal `\`
+            // followed by `c` (handled by the identity fallback below).
+            'c' if self.peek().is_some_and(|c| c.is_ascii_alphabetic()) => {
+                let letter = self.bump().unwrap();
+                Node::Char((letter.to_ascii_uppercase() as u32 - 'A' as u32) + 1)
+            }
+            'c' if self.unicode => {
+                return Err(RegexError::new("invalid `\\c` control escape"));
+            }
+            // A control-letter-less `\c` (non-`u`): Annex B identity escape → `\`.
+            'c' => Node::Char('\\' as u32),
+            // ControlEscapes (`\f \n \r \t \v`) — valid CharacterEscapes in every
+            // mode. (`\0` is handled below as a NUL escape.)
+            'f' | 'n' | 'r' | 't' | 'v' => Node::Char(escape_char(c) as u32),
+            // `\0` — the NUL character, provided it is not the start of a longer
+            // legacy-octal/decimal sequence (a following digit would be one).
+            '0' if !self.peek().is_some_and(|c| c.is_ascii_digit()) => Node::Char(0),
+            // Any other escaped character is an IdentityEscape. Under `u` only the
+            // SyntaxCharacters and `/` may be escaped this way; an arbitrary
+            // `\letter` (e.g. `\M`) is a Syntax Error. Without `u`, Annex B allows
+            // escaping any source character (the literal character).
+            other => {
+                if self.unicode && !is_u_identity_escape(other) {
+                    return Err(RegexError::new("invalid identity escape in unicode mode"));
+                }
+                Node::Char(escape_char(other) as u32)
+            }
         })
     }
 
@@ -650,6 +863,59 @@ fn class_shorthand(s: Shorthand) -> Node {
         neg: false,
         items: alloc::vec![ClassItem::Shorthand(s)],
     }
+}
+
+/// Whether `ch` may *start* a `RegExpIdentifierName` (a capture group name):
+/// `UnicodeIDStart`, `$`, or `_`. Mirrors `IdentifierName` start.
+fn is_regexp_id_start(ch: char) -> bool {
+    ch == '$' || ch == '_' || crate::lexer::is_identifier_start_char(ch)
+}
+
+/// Whether `ch` may *continue* a `RegExpIdentifierName`: `UnicodeIDContinue`,
+/// `$`, `_`, ZWNJ, or ZWJ.
+fn is_regexp_id_part(ch: char) -> bool {
+    ch == '$'
+        || ch == '_'
+        || ch == '\u{200C}'
+        || ch == '\u{200D}'
+        || is_id_continue(ch)
+}
+
+/// `ID_Continue` (letters, marks, decimal digits, connector punctuation, and
+/// letter-numbers). With the `intl` feature this uses the Unicode property
+/// tables; otherwise a pragmatic `is_alphanumeric` approximation. ASCII is
+/// classified directly. Kept local to the regex crate so capture-group-name
+/// validation does not depend on lexer internals.
+fn is_id_continue(ch: char) -> bool {
+    if ch.is_ascii() {
+        return ch.is_ascii_alphanumeric() || ch == '_';
+    }
+    #[cfg(feature = "intl")]
+    {
+        use intl::unicode::category::GeneralCategory as Gc;
+        let gc = intl::unicode::general_category(ch);
+        gc.is_letter()
+            || gc.is_mark()
+            || matches!(
+                gc,
+                Gc::LetterNumber | Gc::DecimalNumber | Gc::ConnectorPunctuation
+            )
+    }
+    #[cfg(not(feature = "intl"))]
+    {
+        ch.is_alphanumeric()
+    }
+}
+
+/// Whether `c` is a permitted `IdentityEscape` target under the `u` flag: a
+/// `SyntaxCharacter` (`^ $ \ . * + ? ( ) [ ] { } |`) or `/`. Any other escaped
+/// character is a Syntax Error in unicode mode (Annex B's "escape anything" rule
+/// does not apply).
+fn is_u_identity_escape(c: char) -> bool {
+    matches!(
+        c,
+        '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '/'
+    )
 }
 
 /// Resolves a single-character escape body to its literal character.

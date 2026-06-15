@@ -375,3 +375,94 @@ fn lazy_scalar_prog_reused_is_consistent() {
     let dot = re(".", "");
     assert_eq!(dot.find_from("😀x", 0), Some((0, 1)));
 }
+
+#[test]
+fn positive_lookahead_captures_propagate() {
+    // A positive lookahead contributes the groups its sub-match captured.
+    let units = u16s("123");
+    let caps = re(r"(?=(\d+))", "").captures_in_u16(&units, 0).unwrap();
+    assert_eq!(caps.whole(), (0, 0)); // zero-width
+    assert_eq!(caps.group(1), Some((0, 3))); // captured "123"
+
+    // The captured group is usable by a later backreference.
+    let units = u16s("abcabc");
+    assert!(re(r"(?=(\w{3}))\1", "").find_in_u16(&units, 0).is_some());
+
+    // A negative lookahead contributes nothing.
+    let units = u16s("ac");
+    let caps = re(r"a(?!(b))", "").captures_in_u16(&units, 0).unwrap();
+    assert_eq!(caps.group(1), None);
+}
+
+#[test]
+fn positive_lookbehind_captures_propagate() {
+    // A positive lookbehind reports the groups of the matched substring.
+    let units = u16s("foobar");
+    let caps = re(r"(?<=(o)(o))bar", "").captures_in_u16(&units, 0).unwrap();
+    assert_eq!(caps.group(1), Some((1, 2)));
+    assert_eq!(caps.group(2), Some((2, 3)));
+
+    // A negative lookbehind contributes nothing.
+    let units = u16s("za");
+    let caps = re(r"(?<!(x))a", "").captures_in_u16(&units, 0).unwrap();
+    assert_eq!(caps.group(1), None);
+}
+
+#[test]
+fn group_name_validation() {
+    // Valid identifier-name groups compile.
+    assert!(Regex::new(r"(?<a>x)", "").is_ok());
+    assert!(Regex::new(r"(?<$_>x)", "").is_ok());
+    assert!(Regex::new(r"(?<A>x)", "").is_ok());
+    // Invalid group names are a Syntax Error.
+    assert!(Regex::new(r"(?<1a>x)", "").is_err()); // digit start
+    assert!(Regex::new(r"(?<a b>x)", "").is_err()); // space
+    assert!(Regex::new(r"(?<>x)", "").is_err()); // empty
+}
+
+#[test]
+fn duplicate_group_names() {
+    // Same alternative → Syntax Error.
+    assert!(Regex::new(r"(?<a>x)(?<a>y)", "").is_err());
+    // Different (mutually exclusive) alternatives → allowed (ES2025).
+    assert!(Regex::new(r"(?<a>x)|(?<a>y)", "").is_ok());
+    assert!(Regex::new(r"(?:(?<a>x)|(?<a>y))", "").is_ok());
+    // Nested in the same alternative → Syntax Error.
+    assert!(Regex::new(r"(?<a>(?<a>y))", "").is_err());
+}
+
+#[test]
+fn named_backreference_validation() {
+    // A reference to a declared name is fine (even forward).
+    assert!(Regex::new(r"(?<a>x)\k<a>", "").is_ok());
+    assert!(Regex::new(r"\k<a>(?<a>x)", "").is_ok());
+    // A reference to an undefined name (when named groups exist) is an error.
+    assert!(Regex::new(r"(?<a>x)\k<b>", "").is_err());
+    // In `u` mode any `\k<…>` requires a matching group.
+    assert!(Regex::new(r"\k<a>", "u").is_err());
+    // Annex B: with no named groups (non-`u`), `\k<a>` is the literal `k<a>`.
+    let r = re(r"\k<a>", "");
+    assert!(r.is_match("k<a>"));
+    assert!(!r.is_match("xyz"));
+}
+
+#[test]
+fn unicode_mode_strict_syntax() {
+    // Out-of-range / legacy numeric escapes are errors under `u`.
+    assert!(Regex::new(r"\1", "u").is_err());
+    assert!(Regex::new(r"\8", "u").is_err());
+    assert!(Regex::new(r"(a)\1", "u").is_ok());
+    // Invalid identity escapes are errors under `u`, fine under Annex B.
+    assert!(Regex::new(r"\M", "u").is_err());
+    assert!(re(r"\M", "").is_match("M"));
+    // Lone `{`, `}`, `]` are errors under `u`, literal under Annex B.
+    assert!(Regex::new(r"{", "u").is_err());
+    assert!(Regex::new(r"}", "u").is_err());
+    assert!(Regex::new(r"]", "u").is_err());
+    assert!(re(r"}", "").is_match("}"));
+    // Control and character escapes remain valid under `u`.
+    assert!(Regex::new(r"\cA", "u").is_ok());
+    assert!(Regex::new(r"\n\t\r\f\v\0", "u").is_ok());
+    // SyntaxCharacter identity escapes are valid under `u`.
+    assert!(Regex::new(r"\.\*\+\?\(\)\[\]\{\}\|\^\$\\\/", "u").is_ok());
+}

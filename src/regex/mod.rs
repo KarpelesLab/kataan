@@ -179,12 +179,14 @@ impl Regex {
     /// build a fresh copy here, but only the first adapter call pays for it.
     fn scalar_prog(&self) -> &[vm::Inst] {
         self.scalar_prog.get_or_init(|| {
-            // Re-parse/compile in unicode mode. The pattern compiled cleanly in
-            // `new` (otherwise this `Regex` would not exist), and the only
-            // difference here is `unicode = true`, which never introduces a new
-            // failure for a pattern that already parsed — so fall back to an empty
-            // program in the impossible error case rather than panicking.
-            let Ok((ast, _, gn)) = parser::parse(&self.source, true) else {
+            // Parse in the regex's *own* unicode mode (so a pattern accepted in
+            // `new` re-parses identically — the `u`-flag syntax strictness must
+            // not turn a valid non-`u` pattern into a parse error here), then
+            // compile with `unicode = true` for scalar-atomic (code-point) reads,
+            // which is what the `&str`/`&[char]` adapters require. The pattern
+            // compiled cleanly in `new`, so this cannot fail; fall back to an
+            // empty program in the impossible error case rather than panicking.
+            let Ok((ast, _, gn)) = parser::parse(&self.source, self.flags.unicode) else {
                 return Vec::new();
             };
             compile::compile(&ast, &gn, true)
