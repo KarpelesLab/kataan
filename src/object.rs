@@ -461,6 +461,12 @@ impl Object {
         self.hidden.iter().any(|k| k.as_ref() == key)
     }
 
+    /// Clears the non-enumerable mark for `key` (a `defineProperty` redefining a
+    /// configurable property to `enumerable: true`).
+    pub fn clear_hidden(&mut self, key: &str) {
+        self.hidden.retain(|k| k.as_ref() != key);
+    }
+
     /// Marks own property `key` non-writable (idempotent).
     pub fn set_readonly(&mut self, key: &str) {
         if !self.is_readonly(key) {
@@ -491,6 +497,12 @@ impl Object {
     #[must_use]
     pub fn is_non_configurable(&self, key: &str) -> bool {
         self.non_configurable.iter().any(|k| k.as_ref() == key)
+    }
+
+    /// Clears the non-configurable mark for `key` (a `defineProperty` redefining a
+    /// configurable property whose new descriptor keeps it configurable).
+    pub fn clear_non_configurable(&mut self, key: &str) {
+        self.non_configurable.retain(|k| k.as_ref() != key);
     }
 
     /// Whether `key` is an own property (data slot or accessor).

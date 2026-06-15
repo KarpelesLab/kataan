@@ -4796,7 +4796,19 @@ impl<'a> Interp<'a> {
             );
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
-        let is_own = self.realm.has_own(obj, key) || self.realm.accessor(obj, key).is_some();
+        // A callable's `length` and `name` are own properties per spec
+        // (`{writable:false, enumerable:false, configurable:true}`), but they are
+        // synthesized lazily and may not be materialized in the cell's aux object
+        // yet — so `has_own` would miss them. Treat them as existing own data
+        // properties with their intrinsic attributes so a redefine merges over the
+        // spec defaults (and the second redefine sees them as configurable).
+        let is_intrinsic_callable_prop = (key == "length" || key == "name")
+            && self.realm.is_callable_cell(obj)
+            && !self.realm.has_own(obj, key)
+            && self.realm.accessor(obj, key).is_none();
+        let is_own = self.realm.has_own(obj, key)
+            || self.realm.accessor(obj, key).is_some()
+            || is_intrinsic_callable_prop;
         // Adding a *new* property to a non-extensible object fails.
         if !is_own && !self.realm.is_extensible(obj) {
             if reflect {
@@ -4820,6 +4832,25 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
         }
+        // Per `ValidateAndApplyPropertyDescriptor`, redefining an existing own
+        // property MERGES over its current attributes: an attribute field the
+        // descriptor omits keeps the property's existing value. For a *new*
+        // property each omitted attribute takes its ECMAScript default (`false`).
+        // Resolve each effective attribute up front (explicit field, else the
+        // preserved existing value on a redefine, else the default `false`).
+        let resolve = |this: &Self, field: &str, existing: bool| -> bool {
+            match this.realm.get_property(desc, field) {
+                Some(v) => this.realm.truthy(v),
+                None if is_own => existing,
+                None => false,
+            }
+        };
+        let want_enum = resolve(self, "enumerable", self.realm.property_is_enumerable(obj, key));
+        let want_configurable = resolve(
+            self,
+            "configurable",
+            is_own && !self.realm.property_is_non_configurable(obj, key),
+        );
         let getter = self.realm.get_property(desc, "get");
         let setter = self.realm.get_property(desc, "set");
         if getter.is_some() || setter.is_some() {
@@ -4829,49 +4860,47 @@ impl<'a> Interp<'a> {
                 getter.unwrap_or(NanBox::undefined()),
                 setter.unwrap_or(NanBox::undefined()),
             );
-            // An accessor descriptor is non-enumerable unless `enumerable: true`.
-            let enumerable = self
-                .realm
-                .get_property(desc, "enumerable")
-                .is_some_and(|v| self.realm.truthy(v));
-            if !enumerable {
+            // Enumerable: explicit field, else preserved on redefine, else default false.
+            if want_enum {
+                self.realm.clear_hidden_property(obj, key);
+            } else {
                 self.realm.mark_hidden(obj, key);
             }
         } else {
+            // An intrinsic callable `length`/`name` is non-writable by default; its
+            // lazy form isn't yet flagged readonly in the aux object, so seed the
+            // spec value explicitly.
+            let existing_writable =
+                !is_intrinsic_callable_prop && !self.realm.property_is_readonly(obj, key);
+            let want_writable = resolve(self, "writable", existing_writable);
             // Redefining as a data property removes any prior accessor.
             self.realm.clear_accessor(obj, key);
-            let value = self
-                .realm
-                .get_property(desc, "value")
-                .unwrap_or(NanBox::undefined());
             // A `defineProperty` redefines attributes from scratch: drop any prior
             // non-writable mark so the new value takes effect, then set it.
             self.realm.clear_readonly_property(obj, key);
-            self.realm.set_property(obj, key, value);
-            // A data descriptor defaults to non-writable unless `writable: true`.
-            let writable = self
-                .realm
-                .get_property(desc, "writable")
-                .is_some_and(|v| self.realm.truthy(v));
-            if !writable {
+            // Only overwrite the stored value when the descriptor supplies one (a
+            // bare `{writable:...}` redefine keeps the existing value); a fresh
+            // define with no `value` field uses `undefined`.
+            if let Some(value) = self.realm.get_property(desc, "value") {
+                self.realm.set_property(obj, key, value);
+            } else if !is_own {
+                self.realm.set_property(obj, key, NanBox::undefined());
+            }
+            // Writable: explicit field, else preserved on redefine, else default false.
+            if !want_writable {
                 self.realm.set_readonly_property(obj, key);
             }
-            // A descriptor defaults to non-enumerable unless `enumerable: true`.
-            let enumerable = self
-                .realm
-                .get_property(desc, "enumerable")
-                .is_some_and(|v| self.realm.truthy(v));
-            if !enumerable {
+            // Enumerable: explicit field, else preserved on redefine, else default false.
+            if want_enum {
+                self.realm.clear_hidden_property(obj, key);
+            } else {
                 self.realm.mark_hidden(obj, key);
             }
         }
-        // A descriptor defaults to non-configurable unless `configurable: true`
-        // (so the property cannot be deleted).
-        let configurable = self
-            .realm
-            .get_property(desc, "configurable")
-            .is_some_and(|v| self.realm.truthy(v));
-        if !configurable {
+        // Configurable: explicit field, else preserved on redefine, else default false.
+        if want_configurable {
+            self.realm.clear_non_configurable_property(obj, key);
+        } else {
             self.realm.set_non_configurable_property(obj, key);
         }
         Ok(true)

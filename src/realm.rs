@@ -1597,6 +1597,21 @@ impl Realm {
             .is_some_and(Object::is_sealed)
     }
 
+    /// Whether the cell at `handle` is a callable (any flavour of function): a
+    /// user function/class, a native, or a bound native.
+    #[must_use]
+    pub fn is_callable_cell(&self, handle: Handle) -> bool {
+        matches!(
+            self.heap.get(handle),
+            Some(
+                Cell::Function { .. }
+                    | Cell::Class { .. }
+                    | Cell::Native(_)
+                    | Cell::BoundNative { .. }
+            )
+        )
+    }
+
     /// Whether the object at `handle` has an own property `key` (including
     /// accessors) — the `in` operator.
     #[must_use]
@@ -1739,6 +1754,34 @@ impl Realm {
             && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
         {
             o.clear_readonly(key);
+        }
+    }
+
+    /// Clears the non-configurable mark for `key` (used when `defineProperty`
+    /// redefines a configurable property that stays configurable).
+    pub fn clear_non_configurable_property(&mut self, handle: Handle, key: &str) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.clear_non_configurable(key);
+            return;
+        }
+        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+            && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+        {
+            o.clear_non_configurable(key);
+        }
+    }
+
+    /// Clears the non-enumerable mark for `key` (used when `defineProperty`
+    /// redefines a configurable property to be enumerable).
+    pub fn clear_hidden_property(&mut self, handle: Handle, key: &str) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.clear_hidden(key);
+            return;
+        }
+        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+            && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+        {
+            o.clear_hidden(key);
         }
     }
 
