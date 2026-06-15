@@ -230,6 +230,78 @@ impl Object {
         }
     }
 
+    /// Reads slot `slot` directly, without a name lookup — the inline-cache fast
+    /// path. Returns `None` if the object is in dictionary mode (which has no slot
+    /// vector) or the index is out of range. The caller must have obtained `slot`
+    /// from a cache armed on *this object's current shape* (see
+    /// [`cached_get`](Object::cached_get)); a slot from a stale shape would read a
+    /// different property.
+    #[must_use]
+    pub fn slot(&self, slot: u32) -> Option<NanBox> {
+        match &self.data {
+            ObjectData::Shaped { slots, .. } => slots.get(slot as usize).copied(),
+            ObjectData::Dict { .. } => None,
+        }
+    }
+
+    /// Reads own data property `key`, consulting `cache` so a repeat access on the
+    /// same shape skips the name lookup (a shape-pointer compare plus a slot
+    /// load). Returns `None` if the property is absent (a cache miss).
+    ///
+    /// This is the bytecode VM's `GetProp` fast path for a plain shaped object. A
+    /// dictionary-mode object resolves through its empty sentinel shape, so the
+    /// cache always misses and this falls back to a normal lookup — never binding
+    /// a dictionary to the cache. Accessors live outside the slot layout and are
+    /// the caller's responsibility (checked before this is reached), so a hit here
+    /// is always a genuine own data slot.
+    pub fn cached_get(&self, key: &str, cache: &mut crate::ic::PropertyCache) -> Option<NanBox> {
+        match &self.data {
+            ObjectData::Shaped { shape, slots } => {
+                let slot = cache.lookup(shape, key)?;
+                slots.get(slot as usize).copied()
+            }
+            // Dictionary mode carries an empty sentinel shape; route around the
+            // cache entirely so it never binds (and never goes stale on a later
+            // dictionary mutation that does not change the sentinel pointer).
+            ObjectData::Dict { map, .. } => map.get(key).copied(),
+        }
+    }
+
+    /// Writes `value` to own data property `key` *in place*, consulting `cache`,
+    /// and reports whether the write happened. Returns `false` when `key` is not
+    /// an existing own data property (a new property is a shape transition and must
+    /// go through [`set`](Object::set)'s slow path), when the object is in
+    /// dictionary mode, or when the property is frozen/read-only — in every such
+    /// case the caller falls back to the slow path.
+    ///
+    /// This only ever rewrites a slot that already exists on the current shape, so
+    /// it performs no transition and the cache stays valid; a transition would
+    /// produce a new shape pointer that simply misses next time.
+    pub fn cached_set(
+        &mut self,
+        key: &str,
+        value: NanBox,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> bool {
+        if self.frozen || self.is_readonly(key) {
+            return false;
+        }
+        match &mut self.data {
+            ObjectData::Shaped { shape, slots } => match cache.lookup(shape, key) {
+                Some(slot) => match slots.get_mut(slot as usize) {
+                    Some(cell) => {
+                        *cell = value;
+                        true
+                    }
+                    None => false,
+                },
+                // Absent: a new property (transition) — let the slow path add it.
+                None => false,
+            },
+            ObjectData::Dict { .. } => false,
+        }
+    }
+
     /// Whether the object has own property `key`.
     #[must_use]
     pub fn contains(&self, key: &str) -> bool {

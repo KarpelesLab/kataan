@@ -1379,6 +1379,55 @@ impl Realm {
         self.heap.get(*aux)?.as_object()?.get(key)
     }
 
+    /// The inline-cache fast path for a plain object's `GetProp`: reads own data
+    /// property `key` on the object at `handle`, consulting `cache` so a repeat
+    /// access on the same shape skips the name lookup (a shape-pointer compare
+    /// plus a slot load).
+    ///
+    /// Returns `None` — signalling the bytecode VM to take its slow path — when
+    /// the cell at `handle` is *not* a plain shaped object (arrays, functions,
+    /// strings, etc. carry no shape), or when the property is absent. A
+    /// dictionary-mode object reads correctly through this method but never binds
+    /// the cache (its sentinel shape resolves no key); see
+    /// [`Object::cached_get`]. Accessors and special keys are the VM's
+    /// responsibility and are filtered out before this is reached.
+    pub fn object_cached_get(
+        &self,
+        handle: Handle,
+        key: &str,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> Option<NanBox> {
+        self.heap.get(handle)?.as_object()?.cached_get(key, cache)
+    }
+
+    /// The inline-cache fast path for a plain object's `SetProp`: writes `value`
+    /// to an *existing* own data property `key` on the object at `handle`,
+    /// consulting `cache`, and reports whether the in-place write happened.
+    ///
+    /// Returns `false` — signalling the bytecode VM to take its slow path — when
+    /// the cell is not a plain shaped object, when `key` is not already an own
+    /// data property (a new property is a shape transition, handled by
+    /// [`set_property`](Realm::set_property)), when the object is in dictionary
+    /// mode, or when the property is frozen/read-only. On a `true` result the
+    /// write barrier is applied, matching the slow path.
+    pub fn object_cached_set(
+        &mut self,
+        handle: Handle,
+        key: &str,
+        value: NanBox,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> bool {
+        let wrote = self
+            .heap
+            .get_mut(handle)
+            .and_then(Cell::as_object_mut)
+            .is_some_and(|o| o.cached_set(key, value, cache));
+        if wrote {
+            self.write_barrier(handle, value);
+        }
+        wrote
+    }
+
     /// Tags the object at `handle` with the class it was constructed from.
     pub fn set_class_tag(&mut self, handle: Handle, class_id: u32) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
