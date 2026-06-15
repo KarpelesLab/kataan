@@ -9910,28 +9910,42 @@ impl<'a> Interp<'a> {
                 // sequence is decoded to WTF-8, so an adjacent high/low surrogate
                 // pair combines into one astral code point and a **lone surrogate
                 // is preserved** (DOMString semantics).
-                let units: Vec<u16> = args
-                    .iter()
-                    .map(|a| {
-                        let n = self.realm.to_number(*a);
-                        if n.is_finite() {
-                            // ToUint16: truncate toward zero, then take mod 2^16.
-                            (n as i64).rem_euclid(65536) as u16
-                        } else {
-                            0
-                        }
-                    })
-                    .collect();
+                let mut units: Vec<u16> = Vec::with_capacity(args.len());
+                for a in args {
+                    // ToNumber each argument (Symbol → TypeError), then ToUint16:
+                    // truncate toward zero, mod 2^16.
+                    let num = self.coerce_to_number(*a)?;
+                    let n = self.realm.to_number(num);
+                    units.push(if n.is_finite() {
+                        (n as i64).rem_euclid(65536) as u16
+                    } else {
+                        0
+                    });
+                }
                 return Ok(Some(self.new_str_bytes(crate::wtf8::from_utf16(&units))));
             }
             // `String.fromCodePoint(...cps)` — each argument is a full Unicode
-            // code point (may be astral).
+            // code point (may be astral). A non-integer or out-of-range value is a
+            // RangeError; a Symbol is a TypeError.
             Some(N_STRING) if method == "fromCodePoint" => {
-                let s: String = args
-                    .iter()
-                    .filter_map(|a| char::from_u32(self.realm.to_number(*a) as u32))
-                    .collect();
-                return Ok(Some(self.new_str(&s)));
+                let mut out: Vec<u16> = Vec::new();
+                for a in args {
+                    let num = self.coerce_to_number(*a)?;
+                    let n = self.realm.to_number(num);
+                    if !n.is_finite() || n != n.trunc() || !(0.0..=0x10_FFFF as f64).contains(&n) {
+                        let m = self.new_str("Invalid code point");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
+                    let cp = n as u32;
+                    if cp <= 0xFFFF {
+                        out.push(cp as u16);
+                    } else {
+                        let c = cp - 0x10000;
+                        out.push(0xD800 + (c >> 10) as u16);
+                        out.push(0xDC00 + (c & 0x3FF) as u16);
+                    }
+                }
+                return Ok(Some(self.new_str_bytes(crate::wtf8::from_utf16(&out))));
             }
             // `String.raw(strings, ...subs)` — interleave `strings.raw[i]` with
             // each substitution (the cooked-escape-free template form).
@@ -10996,7 +11010,7 @@ impl<'a> Interp<'a> {
                     let from = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
-                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(units)
+                        (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
                     Some(NanBox::number(index_of_units(&bytes, &needle, from)))
                 }
@@ -11057,10 +11071,25 @@ impl<'a> Interp<'a> {
                     Some(NanBox::boolean(matched))
                 }
                 "slice" => {
-                    // UTF-16-unit range, surrogate-boundary correct.
+                    // UTF-16-unit range, surrogate-boundary correct. Both indices are
+                    // ToIntegerOrInfinity (each runs `valueOf`, propagating throws).
                     let units = crate::wtf8::utf16_len(&bytes);
-                    let (a, b) =
-                        slice_bounds(self.realm.to_number(arg(0)), arg(1), &self.realm, units);
+                    let start = self.coerce_to_integer_or_infinity(arg(0))?;
+                    let end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        units as f64
+                    } else {
+                        self.coerce_to_integer_or_infinity(arg(1))?
+                    };
+                    let idx = |n: f64| -> usize {
+                        if n < 0.0 {
+                            (units as f64 + n).max(0.0) as usize
+                        } else {
+                            (n as usize).min(units)
+                        }
+                    };
+                    let a = idx(start);
+                    let b = idx(end);
+                    let (a, b) = if a < b { (a, b) } else { (a, a) };
                     Some(self.new_str_bytes(crate::wtf8::slice_utf16(&bytes, a, b)))
                 }
                 "split" => {
@@ -11186,11 +11215,11 @@ impl<'a> Interp<'a> {
                 "substring" => {
                     let len = crate::wtf8::utf16_len(&bytes);
                     let clamp = |n: f64| (n.max(0.0) as usize).min(len);
-                    let mut a = clamp(self.realm.to_number(arg(0)));
+                    let mut a = clamp(self.coerce_to_integer_or_infinity(arg(0))?);
                     let mut b = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         len
                     } else {
-                        clamp(self.realm.to_number(arg(1)))
+                        clamp(self.coerce_to_integer_or_infinity(arg(1))?)
                     };
                     if a > b {
                         core::mem::swap(&mut a, &mut b);
@@ -11200,7 +11229,7 @@ impl<'a> Interp<'a> {
                 "substr" => {
                     let len = crate::wtf8::utf16_len(&bytes);
                     let lenf = len as f64;
-                    let start = self.realm.to_number(arg(0));
+                    let start = self.coerce_to_integer_or_infinity(arg(0))?;
                     let start = if start < 0.0 {
                         (lenf + start).max(0.0)
                     } else {
@@ -11209,7 +11238,8 @@ impl<'a> Interp<'a> {
                     let count = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         len - start
                     } else {
-                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(len - start)
+                        (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize)
+                            .min(len - start)
                     };
                     Some(self.new_str_bytes(crate::wtf8::slice_utf16(&bytes, start, start + count)))
                 }
