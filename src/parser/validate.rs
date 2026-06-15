@@ -57,6 +57,7 @@ pub(crate) fn validate_program(program: &Program) -> Result<()> {
         private_scopes: Vec::new(),
         labels: Vec::new(),
         is_module: program.source_type == SourceType::Module,
+        in_assign_target: false,
     };
     let ctx = Ctx::top(strict);
     v.check_top_level_scope(&program.body, strict)?;
@@ -168,6 +169,13 @@ struct Validator {
     /// Whether the program's goal symbol is Module (vs Script). `import.meta`
     /// is valid only in a module.
     is_module: bool,
+    /// Whether the object/array literal currently being walked is in a
+    /// destructuring-assignment-target position (the LHS of `=`, a `for-in/of`
+    /// target). In that position a `CoverInitializedName` (`{ a = 1 }`) is a
+    /// valid pattern element; everywhere else it is an early Syntax Error. The
+    /// flag is consumed (reset to `false`) on entry to each value sub-expression
+    /// so that a nested object in a property *default* is treated as a value.
+    in_assign_target: bool,
 }
 
 /// What a private member declaration is, for duplicate detection.
@@ -326,6 +334,7 @@ impl Validator {
                     self.check_lexical_scope(&h.body, ctx.strict)?;
                     if let Some(p) = &h.param {
                         self.binding_target(p, ctx)?;
+                        self.check_catch_param(p, &h.body)?;
                     }
                     for s in &h.body {
                         self.stmt(s, ctx)?;
@@ -513,6 +522,9 @@ impl Validator {
                 if ctx.strict {
                     self.check_not_eval_arguments(e)?;
                 }
+                // A `for-in`/`for-of` target may be a destructuring pattern, where
+                // a `CoverInitializedName` is valid.
+                self.in_assign_target = true;
                 self.expr(e, ctx)
             }
         }
@@ -652,7 +664,9 @@ impl Validator {
             self.check_binding_ident_name(&id.name, id.span)?;
         }
         self.check_param_yield_await(&f.params, f.is_generator, f.is_async)?;
-        self.check_params(&f.params, strict, &f.body)?;
+        // A `FunctionDeclaration`/`FunctionExpression` (incl. generator/async)
+        // uses `FormalParameters` — duplicates allowed in sloppy simple lists.
+        self.check_params(&f.params, strict, /* unique_required */ false, &f.body)?;
         // A regular function establishes its own `arguments`/`super` bindings and
         // a fresh label/jump environment.
         let c = Ctx::function_boundary(strict, false, false);
@@ -661,6 +675,7 @@ impl Validator {
             self.param(p, &c)?;
         }
         self.check_top_level_scope(&f.body, strict)?;
+        self.check_params_vs_body_lexical(&f.params, &f.body)?;
         for s in &f.body {
             self.stmt(s, &c)?;
         }
@@ -676,13 +691,16 @@ impl Validator {
     ) -> Result<()> {
         let strict = parent.strict || body_is_strict(&f.body);
         self.check_param_yield_await(&f.params, f.is_generator, f.is_async)?;
-        self.check_params(&f.params, strict, &f.body)?;
+        // A `MethodDefinition` uses `UniqueFormalParameters`: duplicate parameter
+        // names are always a Syntax Error.
+        self.check_params(&f.params, strict, /* unique_required */ true, &f.body)?;
         let c = Ctx::function_boundary(strict, allow_super_call, false);
         let saved_labels = core::mem::take(&mut self.labels);
         for p in &f.params {
             self.param(p, &c)?;
         }
         self.check_top_level_scope(&f.body, strict)?;
+        self.check_params_vs_body_lexical(&f.params, &f.body)?;
         for s in &f.body {
             self.stmt(s, &c)?;
         }
@@ -703,7 +721,11 @@ impl Validator {
         // An async arrow's parameters are in an `[+Await]` context: an `await`
         // expression there is a Syntax Error. (An arrow is never a generator.)
         self.check_param_yield_await(&a.params, false, a.is_async)?;
-        self.check_params(&a.params, strict, body_slice)?;
+        // An `ArrowFunction` uses `UniqueFormalParameters` (`CoverParenthesized…`
+        // has no duplicates): duplicate parameter names are always a Syntax Error.
+        self.check_params(
+            &a.params, strict, /* unique_required */ true, body_slice,
+        )?;
         // An arrow inherits `super`, `this`, and `arguments` (and thus the
         // field-initializer restrictions) from its enclosing scope, but is a
         // function boundary for `return` and the label/jump environment.
@@ -726,6 +748,7 @@ impl Validator {
         match &a.body {
             ArrowBody::Block(body) => {
                 self.check_top_level_scope(body, strict)?;
+                self.check_params_vs_body_lexical(&a.params, body)?;
                 for s in body {
                     self.stmt(s, &c)?;
                 }
@@ -782,7 +805,13 @@ impl Validator {
     ///   element);
     /// - a function whose parameter list is non-simple may not contain a
     ///   `"use strict"` directive in its body.
-    fn check_params(&self, params: &[Param], strict: bool, body: &[Stmt]) -> Result<()> {
+    fn check_params(
+        &self,
+        params: &[Param],
+        strict: bool,
+        unique_required: bool,
+        body: &[Stmt],
+    ) -> Result<()> {
         let simple = params
             .iter()
             .all(|p| !p.rest && p.default.is_none() && matches!(p.target, BindingTarget::Ident(_)));
@@ -794,7 +823,11 @@ impl Validator {
                 "a `\"use strict\"` directive is not allowed in a function with a non-simple parameter list",
             ));
         }
-        if simple && !strict {
+        // A method or arrow has `UniqueFormalParameters`, so duplicate names are
+        // a Syntax Error regardless of strictness or parameter simplicity. A
+        // plain function/generator/async-function uses `FormalParameters`, which
+        // only forbids duplicates when strict or non-simple.
+        if simple && !strict && !unique_required {
             return Ok(());
         }
         let mut names: Vec<(String, Span)> = Vec::new();
@@ -1004,6 +1037,11 @@ impl Validator {
     // --- expressions ----------------------------------------------------
 
     fn expr(&mut self, e: &Expr, ctx: &Ctx) -> Result<()> {
+        // The destructuring-target flag applies only to the object/array literal
+        // it was set for. Consume it here so that — by default — any expression
+        // is validated as a value. The `Object`/`Array` arms read it (via
+        // `take_assign_target`) and re-propagate it to their sub-*patterns* only.
+        let in_assign_target = core::mem::take(&mut self.in_assign_target);
         match e {
             Expr::Number {
                 legacy_octal: true,
@@ -1085,6 +1123,9 @@ impl Validator {
                     match el {
                         crate::ast::ArrayElement::Hole => {}
                         crate::ast::ArrayElement::Item(x) | crate::ast::ArrayElement::Spread(x) => {
+                            // In a destructuring target each element is itself a
+                            // sub-pattern, so the flag propagates inward.
+                            self.in_assign_target = in_assign_target;
                             self.expr(x, ctx)?
                         }
                     }
@@ -1092,15 +1133,85 @@ impl Validator {
                 Ok(())
             }
             Expr::Object { members, .. } => {
+                // It is a Syntax Error if an object literal (used as an
+                // expression, not a pattern) has more than one `__proto__` *data*
+                // property — a plain `__proto__: value` (or `'__proto__': value`),
+                // not a shorthand, computed key, method, or accessor.
+                //
+                // NB: after parsing, an object method `__proto__(){}` is
+                // indistinguishable from a data property `__proto__: function(){}`
+                // (both are `Property { value: Function }`), so a property whose
+                // value is a function/arrow is conservatively *not* counted —
+                // this avoids wrongly rejecting `{ __proto__(){}, __proto__(){} }`
+                // at the cost of not flagging the (rare) duplicate
+                // `__proto__: function(){}` data form.
+                if !in_assign_target {
+                    let mut proto_data = 0u32;
+                    for m in members {
+                        if let ObjectMember::Property {
+                            key,
+                            value,
+                            shorthand: false,
+                            span,
+                        } = m
+                            && !matches!(key, PropertyKey::Computed(_))
+                            && !matches!(&**value, Expr::Function(_) | Expr::Arrow(_))
+                            && key_is_named(key, "__proto__")
+                        {
+                            proto_data += 1;
+                            if proto_data > 1 {
+                                return Err(self.err(
+                                    *span,
+                                    "an object literal may not have more than one \
+                                     `__proto__` property",
+                                ));
+                            }
+                        }
+                    }
+                }
                 for m in members {
                     match m {
-                        ObjectMember::Property { key, value, .. } => {
+                        ObjectMember::Property {
+                            key,
+                            value,
+                            shorthand,
+                            span,
+                        } => {
                             if let PropertyKey::Computed(k) = key {
                                 self.expr(k, ctx)?;
                             }
+                            // A `CoverInitializedName` (`{ a = 1 }`): a shorthand
+                            // property whose value is a simple-assignment default.
+                            // Valid only when this object is a destructuring
+                            // target; otherwise an early Syntax Error.
+                            let is_cover = *shorthand
+                                && matches!(
+                                    &**value,
+                                    Expr::Assign {
+                                        op: crate::ast::AssignOp::Assign,
+                                        ..
+                                    }
+                                );
+                            if is_cover && !in_assign_target {
+                                return Err(self.err(
+                                    *span,
+                                    "a shorthand property with an initializer (`{ a = … }`) is \
+                                     only valid as a destructuring assignment target",
+                                ));
+                            }
+                            // A property *value* is a sub-pattern in a
+                            // destructuring target (`{ a: { b = 1 } } = x`), but a
+                            // cover-name's value is the *default* (a value), so the
+                            // flag is not propagated through it.
+                            if in_assign_target && !is_cover {
+                                self.in_assign_target = true;
+                            }
                             self.expr(value, ctx)?;
                         }
-                        ObjectMember::Spread { value, .. } => self.expr(value, ctx)?,
+                        ObjectMember::Spread { value, .. } => {
+                            self.in_assign_target = in_assign_target;
+                            self.expr(value, ctx)?
+                        }
                         ObjectMember::Accessor { key, value, .. } => {
                             if let PropertyKey::Computed(k) = key {
                                 self.expr(k, ctx)?;
@@ -1226,7 +1337,8 @@ impl Validator {
             } => {
                 // A simple assignment `=` may target a destructuring pattern; a
                 // compound assignment (`+=`, …) requires a simple reference.
-                if matches!(op, crate::ast::AssignOp::Assign) {
+                let simple_assign = matches!(op, crate::ast::AssignOp::Assign);
+                if simple_assign {
                     if !is_valid_assign_target(target) {
                         return Err(self.err(target.span(), "invalid assignment target"));
                     }
@@ -1236,6 +1348,9 @@ impl Validator {
                 if ctx.strict {
                     self.check_not_eval_arguments(target)?;
                 }
+                // A simple assignment may target an object/array destructuring
+                // pattern, where a `CoverInitializedName` is valid.
+                self.in_assign_target = simple_assign;
                 self.expr(target, ctx)?;
                 self.expr(value, ctx)
             }
@@ -1273,6 +1388,105 @@ impl Validator {
     fn check_top_level_scope(&self, body: &[Stmt], strict: bool) -> Result<()> {
         let refs: Vec<&Stmt> = body.iter().collect();
         self.check_lexical_scope_refs(&refs, true, strict)
+    }
+
+    /// It is a Syntax Error if any element of the `LexicallyDeclaredNames` of a
+    /// function body also occurs in the `BoundNames` of its parameters (a `let`,
+    /// `const`, or `class` in the body may not shadow a parameter — e.g.
+    /// `function f(a) { let a; }`). `var` bindings are exempt: they share the
+    /// parameter scope.
+    fn check_params_vs_body_lexical(&self, params: &[Param], body: &[Stmt]) -> Result<()> {
+        // Collect the body's top-level lexical names (let/const/class, plus
+        // top-level function declarations, which are not var-hoisted out of a
+        // function-parameter scope for this check).
+        let mut lexical: Vec<(Box<str>, Span, bool)> = Vec::new();
+        let mut vars: Vec<Box<str>> = Vec::new();
+        for stmt in body {
+            collect_top_level_decls(stmt, &mut lexical, &mut vars, true);
+        }
+        if lexical.is_empty() {
+            return Ok(());
+        }
+        let mut param_names = Vec::new();
+        for p in params {
+            collect_bound_names(&p.target, &mut param_names);
+        }
+        for (name, span, is_function) in &lexical {
+            // A top-level `FunctionDeclaration` in a function body is var-scoped,
+            // so it may shadow a parameter (`function f(a){ function a(){} }`).
+            if *is_function {
+                continue;
+            }
+            if param_names.iter().any(|(n, _)| n.as_str() == name.as_ref()) {
+                return Err(self.err(
+                    *span,
+                    "a lexical declaration conflicts with a parameter of the same name",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Catch-clause early errors (14.15.1, with Annex B.3.4):
+    /// - The `CatchParameter` BoundNames must be distinct (`catch ([x, x])`).
+    /// - They must not occur in the body's VarDeclaredNames — *except* a simple
+    ///   `catch (e)` binding may be redeclared by a `var` (Annex B), but never by
+    ///   a block-level `FunctionDeclaration`. (The lexical-name conflict is
+    ///   already enforced by `check_lexical_scope`.)
+    fn check_catch_param(&self, param: &BindingTarget, body: &[Stmt]) -> Result<()> {
+        let mut bound = Vec::new();
+        collect_bound_names(param, &mut bound);
+        self.check_no_dup_catch_names(&bound)?;
+
+        let simple = matches!(param, BindingTarget::Ident(_));
+
+        // Block-level function declarations in the catch body always conflict
+        // with a catch binding of the same name.
+        let mut lexical: Vec<(Box<str>, Span, bool)> = Vec::new();
+        let mut sink = Vec::new();
+        for stmt in body {
+            collect_top_level_decls(stmt, &mut lexical, &mut sink, false);
+        }
+        for (name, span, is_function) in &lexical {
+            if *is_function && bound.iter().any(|(n, _)| n.as_str() == name.as_ref()) {
+                return Err(self.err(
+                    *span,
+                    "a function declaration in a `catch` body may not redeclare the \
+                     catch parameter",
+                ));
+            }
+        }
+
+        // A non-simple (destructuring) catch binding additionally forbids any
+        // `var` redeclaration of its names.
+        if !simple {
+            let mut vars = Vec::new();
+            for stmt in body {
+                collect_vars_only(stmt, &mut vars);
+            }
+            for (name, span) in &bound {
+                if vars.iter().any(|v| v.as_ref() == name.as_str()) {
+                    return Err(self.err(
+                        *span,
+                        "a destructuring `catch` binding may not be redeclared by a `var`",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The `CatchParameter` BoundNames must not contain duplicates.
+    fn check_no_dup_catch_names(&self, bound: &[(String, Span)]) -> Result<()> {
+        for (i, (name, _)) in bound.iter().enumerate() {
+            if bound[..i].iter().any(|(n, _)| n == name) {
+                return Err(self.err(
+                    bound[i].1,
+                    "a `catch` binding list may not contain a duplicate name",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Enforces that a scope's lexically-declared names are unique and do not
