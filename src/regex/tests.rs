@@ -398,7 +398,9 @@ fn positive_lookahead_captures_propagate() {
 fn positive_lookbehind_captures_propagate() {
     // A positive lookbehind reports the groups of the matched substring.
     let units = u16s("foobar");
-    let caps = re(r"(?<=(o)(o))bar", "").captures_in_u16(&units, 0).unwrap();
+    let caps = re(r"(?<=(o)(o))bar", "")
+        .captures_in_u16(&units, 0)
+        .unwrap();
     assert_eq!(caps.group(1), Some((1, 2)));
     assert_eq!(caps.group(2), Some((2, 3)));
 

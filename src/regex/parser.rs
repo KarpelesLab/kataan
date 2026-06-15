@@ -131,7 +131,6 @@ pub(crate) fn parse(pattern: &str, unicode: bool) -> Result<(Node, usize, GroupN
         decl_paths: Vec::new(),
         named_refs: Vec::new(),
         numeric_refs: Vec::new(),
-        saw_named_group: false,
         pattern_has_named_groups: has_named,
     };
     let node = p.parse_alt()?;
@@ -195,9 +194,6 @@ struct Parser {
     /// the `u` flag; without it, an out-of-range escape is an Annex B legacy
     /// octal/literal and is left to the existing relaxed handling.
     numeric_refs: Vec<usize>,
-    /// Whether any `(?<name>…)` group syntax appeared; controls the Annex B
-    /// reading of a bare `\k` when no named groups exist.
-    saw_named_group: bool,
     /// Whether the whole pattern contains named-group syntax (pre-scanned), or
     /// the `u` flag is set. Drives the `\k<…>` named-backreference vs. Annex B
     /// identity-escape decision.
@@ -442,9 +438,9 @@ impl Parser {
             // delimiters). Without `u`, Annex B treats them as literal
             // PatternCharacters. A bare `{` is consumed here only when it did not
             // open a quantifier (`parse_quantified` handled that case).
-            Some(c @ ('}' | ']' | '{')) if self.unicode => Err(RegexError::new(
-                alloc::format!("lone `{c}` is not allowed in unicode mode"),
-            )),
+            Some(c @ ('}' | ']' | '{')) if self.unicode => Err(RegexError::new(alloc::format!(
+                "lone `{c}` is not allowed in unicode mode"
+            ))),
             Some(c) => {
                 self.pos += 1;
                 Ok(Node::Char(c as u32))
@@ -514,8 +510,8 @@ impl Parser {
                         )));
                     }
                 }
-                self.saw_named_group = true;
-                self.decl_paths.push((name.clone(), self.branch_path.clone()));
+                self.decl_paths
+                    .push((name.clone(), self.branch_path.clone()));
                 self.group_count += 1;
                 self.group_names.push((self.group_count, name));
                 Some(self.group_count)
@@ -874,11 +870,7 @@ fn is_regexp_id_start(ch: char) -> bool {
 /// Whether `ch` may *continue* a `RegExpIdentifierName`: `UnicodeIDContinue`,
 /// `$`, `_`, ZWNJ, or ZWJ.
 fn is_regexp_id_part(ch: char) -> bool {
-    ch == '$'
-        || ch == '_'
-        || ch == '\u{200C}'
-        || ch == '\u{200D}'
-        || is_id_continue(ch)
+    ch == '$' || ch == '_' || ch == '\u{200C}' || ch == '\u{200D}' || is_id_continue(ch)
 }
 
 /// `ID_Continue` (letters, marks, decimal digits, connector punctuation, and
