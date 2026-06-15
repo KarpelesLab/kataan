@@ -11108,7 +11108,24 @@ impl<'a> Interp<'a> {
                     Some(self.new_str_bytes(crate::wtf8::slice_utf16(&bytes, a, b)))
                 }
                 "split" => {
-                    let sep = self.arg_string_bytes(arg(0));
+                    // `limit` is ToUint32 (undefined → 2^32-1). A limit of 0 yields
+                    // an empty array.
+                    let limit = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        u32::MAX
+                    } else {
+                        self.realm.to_uint32(arg(1))
+                    } as usize;
+                    if limit == 0 {
+                        return Ok(Some(NanBox::handle(self.realm.new_array(Vec::new()).to_raw())));
+                    }
+                    // An `undefined` separator returns the whole string as the sole
+                    // element.
+                    if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                        let whole = self.new_str_bytes(bytes.clone());
+                        let arr = self.realm.new_array(alloc::vec![whole]);
+                        return Ok(Some(NanBox::handle(arr.to_raw())));
+                    }
+                    let sep = self.arg_string_bytes_fallible(arg(0))?;
                     let mut parts: Vec<NanBox> = if sep.is_empty() {
                         // Empty separator → one entry per UTF-16 code unit (a lone
                         // surrogate is its own one-unit entry).
@@ -11123,13 +11140,7 @@ impl<'a> Interp<'a> {
                             .map(|b| self.new_str_bytes(b))
                             .collect()
                     };
-                    // An optional limit caps the number of returned segments.
-                    if !matches!(arg(1).unpack(), Unpacked::Undefined) {
-                        let limit = self.realm.to_number(arg(1));
-                        if limit >= 0.0 {
-                            parts.truncate(limit as usize);
-                        }
-                    }
+                    parts.truncate(limit);
                     Some(NanBox::handle(self.realm.new_array(parts).to_raw()))
                 }
                 "replace" => {
