@@ -684,6 +684,12 @@ impl<'src> Parser<'src> {
                     };
                 }
                 TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead if allow_call => {
+                    // A tagged template may not appear in the tail of an optional
+                    // chain (`a?.b`…`` ` is a SyntaxError); parentheses break the
+                    // chain and make it legal again.
+                    if saw_optional {
+                        return Err(self.err("tagged template is not allowed in an optional chain"));
+                    }
                     let quasi = self.parse_template_literal()?;
                     let span = expr.span().to(quasi.span);
                     expr = Expr::TaggedTemplate {

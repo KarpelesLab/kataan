@@ -93,6 +93,10 @@ struct Ctx {
     in_field_init: bool,
     /// Whether we are inside a function body (so `return` is allowed).
     in_function: bool,
+    /// Whether `new.target` is permitted — true inside any function/method body,
+    /// class field initializer, or static block; false at top-level script /
+    /// module code.
+    allow_new_target: bool,
     /// Whether an unlabeled `break` has a target (inside a loop or `switch`).
     in_breakable: bool,
     /// Whether an unlabeled `continue` has a target (inside a loop).
@@ -107,19 +111,22 @@ impl Ctx {
             allow_super_call: false,
             in_field_init: false,
             in_function: false,
+            allow_new_target: false,
             in_breakable: false,
             in_iteration: false,
         }
     }
 
     /// A fresh context at a function boundary (the jump/`return` state resets;
-    /// `super`/field-init are passed in by the caller).
+    /// `super`/field-init are passed in by the caller). `new.target` is always
+    /// available inside a function-like body.
     fn function_boundary(strict: bool, allow_super_call: bool, in_field_init: bool) -> Self {
         Ctx {
             strict,
             allow_super_call,
             in_field_init,
             in_function: true,
+            allow_new_target: true,
             in_breakable: false,
             in_iteration: false,
         }
@@ -571,6 +578,10 @@ impl Validator {
             allow_super_call: ctx.allow_super_call,
             in_field_init: ctx.in_field_init,
             in_function: true,
+            // `new.target` is inherited from the enclosing scope: an arrow has no
+            // `new.target` of its own, so it is only valid if the surrounding
+            // function provides one.
+            allow_new_target: ctx.allow_new_target,
             in_breakable: false,
             in_iteration: false,
         };
@@ -825,8 +836,13 @@ impl Validator {
             | Expr::BigInt { .. }
             | Expr::Str { .. }
             | Expr::Regex { .. }
-            | Expr::This(_)
-            | Expr::NewTarget(_) => Ok(()),
+            | Expr::This(_) => Ok(()),
+            Expr::NewTarget(span) => {
+                if !ctx.allow_new_target {
+                    return Err(self.err(*span, "`new.target` is only valid inside a function"));
+                }
+                Ok(())
+            }
             Expr::Ident(id) => {
                 // A class field initializer / static block has no `arguments`.
                 if ctx.in_field_init && &*id.name == "arguments" {
