@@ -660,7 +660,6 @@ const DATE_PROTO_METHODS: &[&str] = &[
     "getUTCMilliseconds",
     "getTimezoneOffset",
     "toISOString",
-    "toJSON",
     "toDateString",
     "toTimeString",
     "toString",
@@ -855,6 +854,8 @@ fn builtin_method_arity(name: &str) -> u32 {
         "setFullYear" | "setUTCFullYear" | "setMinutes" | "setUTCMinutes" => 3,
         // Four-argument `Date` setters.
         "setHours" | "setUTCHours" => 4,
+        // `Date.UTC(year, month, …, ms)` — 7 declared parameters.
+        "UTC" => 7,
         // Three-argument typed-array helpers (none currently bound) → fall through.
         // Everything else (map/filter/forEach/reduce/indexOf/slice/at/push/…)
         // declares a single required parameter.
@@ -891,6 +892,8 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_MATH_IMUL => 2,
         // Length 3.
         N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP => 3,
+        // `Date` constructor: `Date(year, month, …, ms)` — 7 declared parameters.
+        N_DATE => 7,
         // Default (String, Number, Boolean, Array, Object, Error family, RegExp,
         // Promise, Map, Set, Symbol, parseFloat, the single-arg Object/Reflect
         // statics, …) — one declared parameter.
@@ -1083,6 +1086,8 @@ const N_MATH_IMUL: u16 = 157;
 const N_MATH_F16ROUND: u16 = 241;
 /// `Date.prototype[Symbol.toPrimitive]` (a named native, length 1).
 const N_DATE_TO_PRIMITIVE: u16 = 243;
+/// `Date.prototype.toJSON` — a generic method (length 1) callable on any object.
+const N_DATE_TO_JSON: u16 = 244;
 
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib,
@@ -1840,6 +1845,14 @@ impl<'a> Interp<'a> {
                 .set_property(date_proto, &key, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(date_proto, &key);
             self.realm.set_readonly_property(date_proto, &key);
+            // `Date.prototype.toJSON` is a *generic* method (callable on any
+            // object), so it is a plain named native rather than a Date-validating
+            // first-class prototype method.
+            let to_json = self.new_named_native("toJSON", N_DATE_TO_JSON);
+            self.install_fn_name_length(to_json, "toJSON", 1);
+            self.realm
+                .set_property(date_proto, "toJSON", NanBox::handle(to_json.to_raw()));
+            self.realm.mark_hidden(date_proto, "toJSON");
         }
         // `BigInt.prototype[Symbol.toStringTag]` is the string "BigInt", an own data
         // property `{writable:false, enumerable:false, configurable:true}`. Being
@@ -2010,6 +2023,29 @@ impl<'a> Interp<'a> {
                     }
                 };
                 return self.ordinary_to_primitive(this, try_hint);
+            }
+            // `Date.prototype.toJSON(key)` — generic: ToPrimitive(this, number); a
+            // non-finite Number result is `null`; otherwise call `this.toISOString()`.
+            N_DATE_TO_JSON => {
+                let this = self.this_val;
+                let obj = self.coerce_to_object(this);
+                let tv = self.coerce_primitive(obj, "number")?;
+                if let Some(n) = tv.as_number()
+                    && !n.is_finite()
+                {
+                    return Ok(NanBox::null());
+                }
+                let Some(oh) = obj.as_handle().map(Handle::from_raw) else {
+                    return Err(self.type_error("Date.prototype.toJSON called on non-object"));
+                };
+                let iso = self.read_member(oh, "toISOString")?;
+                if !iso
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Err(self.type_error("toISOString is not callable"));
+                }
+                return self.call_with_this(iso, obj, &[]);
             }
             N_MATH_MAX => {
                 // ToNumber every argument first (in order, propagating any abrupt
@@ -10190,9 +10226,12 @@ impl<'a> Interp<'a> {
                     // coercing the arguments.
                     let is_full_year = matches!(method, "setFullYear" | "setUTCFullYear");
                     let date_is_nan = !ms.is_finite();
-                    // Coerce each *provided* argument exactly once, in order — even
-                    // when the date is NaN (a later abrupt completion still throws).
-                    let take = max_components.min(args.len());
+                    // The primary component is always ToNumber'd (an absent argument
+                    // is `undefined` → NaN); the trailing optional components only
+                    // when actually supplied. Coercion is in order, exactly once
+                    // each, even when the date is NaN (a later abrupt completion
+                    // still throws). `setHours()` with no args therefore yields NaN.
+                    let take = max_components.min(args.len().max(1));
                     let mut comps = Vec::with_capacity(take);
                     for i in 0..take {
                         let num = self.coerce_to_number(arg(i))?;
