@@ -138,15 +138,63 @@ fn lookaround_backref_named() {
 
 #[test]
 fn unicode_property_escapes() {
-    assert!(re("\\p{L}", "").is_match("a"));
-    assert!(!re("\\p{L}", "").is_match("5"));
-    assert!(re("\\p{L}", "").is_match("Ω")); // Unicode-aware, not just ASCII
-    assert!(re("^\\p{N}+$", "").is_match("123"));
-    assert!(re("\\p{Lu}", "").is_match("A"));
-    assert!(!re("\\p{Lu}", "").is_match("a"));
-    assert!(re("\\P{L}", "").is_match("5")); // negated
-    assert!(re("^[\\p{L}\\p{N}]+$", "").is_match("abc123")); // in a class
-    assert!(Regex::new("\\p{Nonsense}", "").is_err()); // unknown property
+    // Property escapes require the `u` flag. The `&str`/`&[char]` adapters always
+    // run the scalar (unicode-mode) program, so these match as property escapes.
+    assert!(re("\\p{L}", "u").is_match("a"));
+    assert!(!re("\\p{L}", "u").is_match("5"));
+    assert!(re("\\p{L}", "u").is_match("Ω")); // Unicode-aware, not just ASCII
+    assert!(re("^\\p{N}+$", "u").is_match("123"));
+    assert!(re("\\p{Lu}", "u").is_match("A"));
+    assert!(!re("\\p{Lu}", "u").is_match("a"));
+    assert!(re("\\P{L}", "u").is_match("5")); // negated
+    assert!(re("^[\\p{L}\\p{N}]+$", "u").is_match("abc123")); // in a class
+
+    // `Property=Value` forms: General_Category, Script, Script_Extensions, with
+    // canonical names, aliases (`gc`/`sc`/`scx`), and ISO 15924 short codes.
+    assert!(re("^\\p{General_Category=Letter}$", "u").is_match("a"));
+    assert!(re("^\\p{gc=L}$", "u").is_match("a"));
+    assert!(re("^\\p{Script=Greek}+$", "u").is_match("αβ"));
+    assert!(re("^\\p{sc=Latn}$", "u").is_match("a"));
+    assert!(!re("^\\p{Script=Greek}$", "u").is_match("a"));
+    assert!(re("^\\p{Script_Extensions=Latin}$", "u").is_match("a"));
+    // Synthetic GC values: `LC`/`Cased_Letter` and POSIX-style aliases.
+    assert!(re("^\\p{LC}$", "u").is_match("A"));
+    assert!(re("^\\p{gc=digit}$", "u").is_match("7"));
+    // Closed-form binary properties.
+    assert!(re("^\\p{ASCII}$", "u").is_match("a"));
+    assert!(!re("^\\p{ASCII}$", "u").is_match("é"));
+    assert!(re("^\\p{ASCII_Hex_Digit}+$", "u").is_match("0aF"));
+    assert!(re("^\\p{White_Space}$", "u").is_match(" "));
+    assert!(re("^\\p{Alphabetic}$", "u").is_match("a"));
+
+    // --- Validation (→ SyntaxError at compile) ---
+    // Unknown property / value names must be rejected.
+    assert!(Regex::new("\\p{Nonsense}", "u").is_err());
+    assert!(Regex::new("\\p{Script=Nonsense}", "u").is_err());
+    // A non-binary property used as a lone name must be rejected.
+    assert!(Regex::new("\\p{General_Category}", "u").is_err());
+    assert!(Regex::new("\\p{Script}", "u").is_err());
+    // A binary property with an explicit value must be rejected.
+    assert!(Regex::new("\\p{ASCII=Invalid}", "u").is_err());
+    assert!(Regex::new("\\p{Alphabetic=Yes}", "u").is_err());
+    // Malformed grammar.
+    assert!(Regex::new("\\p{}", "u").is_err());
+    assert!(Regex::new("\\p{=}", "u").is_err());
+    assert!(Regex::new("\\p{=L}", "u").is_err());
+    assert!(Regex::new("\\p{^L}", "u").is_err());
+    assert!(Regex::new("\\p{ L }", "u").is_err()); // no whitespace folding
+    assert!(Regex::new("\\pL", "u").is_err()); // braces required under `u`
+    assert!(Regex::new("\\p", "u").is_err());
+    assert!(Regex::new("\\p{", "u").is_err());
+    // Valid binary property names with no local data still parse (no SyntaxError).
+    assert!(Regex::new("\\p{Emoji}", "u").is_ok());
+    assert!(Regex::new("\\p{ID_Start}", "u").is_ok());
+
+    // Without the `u` flag, `\p`/`\P` are an Annex B IdentityEscape: the literal
+    // `p`/`P`, so any "property name" text is just literal characters and never a
+    // SyntaxError. (Compiled in non-unicode mode via the native program.)
+    assert!(Regex::new("\\p{Nonsense}", "").is_ok());
+    assert!(Regex::new("\\pL", "").is_ok());
 }
 
 #[test]

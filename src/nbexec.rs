@@ -19565,16 +19565,17 @@ mod tests {
 
     #[test]
     fn regex_unicode_property_categories() {
-        // Robust across the intl / no-intl matchers.
-        assert_eq!(run(r#"'Hello World'.match(/\p{Lu}/g).join('')"#), "HW");
-        assert_eq!(run(r#"'Hello'.match(/\p{Ll}/g).join('')"#), "ello");
-        assert_eq!(run(r#"'abc123'.match(/\p{N}/g).join('')"#), "123");
-        assert_eq!(run(r#"'a.b!c'.match(/\p{P}/g).join('')"#), ".!");
-        assert_eq!(run(r#"'中文字'.match(/\p{Lo}/g).length"#), "3");
-        assert_eq!(run(r#"'a1b2'.match(/\P{N}/g).join('')"#), "ab");
+        // Robust across the intl / no-intl matchers. Property escapes require the
+        // `u` flag (without it `\p` is the literal `p`, per Annex B).
+        assert_eq!(run(r#"'Hello World'.match(/\p{Lu}/gu).join('')"#), "HW");
+        assert_eq!(run(r#"'Hello'.match(/\p{Ll}/gu).join('')"#), "ello");
+        assert_eq!(run(r#"'abc123'.match(/\p{N}/gu).join('')"#), "123");
+        assert_eq!(run(r#"'a.b!c'.match(/\p{P}/gu).join('')"#), ".!");
+        assert_eq!(run(r#"'中文字'.match(/\p{Lo}/gu).length"#), "3");
+        assert_eq!(run(r#"'a1b2'.match(/\P{N}/gu).join('')"#), "ab");
         // The full subcategory set compiles (matching may need Unicode tables).
         assert_eq!(
-            run(r#"'x'.match(/\p{Sm}|\p{Sc}|\p{Mn}|\p{Pd}/g)===null"#),
+            run(r#"'x'.match(/\p{Sm}|\p{Sc}|\p{Mn}|\p{Pd}/gu)===null"#),
             "true"
         );
     }
@@ -19582,10 +19583,10 @@ mod tests {
     #[cfg(feature = "intl")]
     #[test]
     fn regex_unicode_property_precise_with_intl() {
-        assert_eq!(run(r#"'3+5'.match(/\p{Sm}/)[0]"#), "+");
-        assert_eq!(run(r#"'$5'.match(/\p{Sc}/)[0]"#), "$");
-        assert_eq!(run(r#"'(a)'.match(/\p{Ps}/)[0]"#), "(");
-        assert_eq!(run(r#"'a-b'.match(/\p{Pd}/)[0]"#), "-");
+        assert_eq!(run(r#"'3+5'.match(/\p{Sm}/u)[0]"#), "+");
+        assert_eq!(run(r#"'$5'.match(/\p{Sc}/u)[0]"#), "$");
+        assert_eq!(run(r#"'(a)'.match(/\p{Ps}/u)[0]"#), "(");
+        assert_eq!(run(r#"'a-b'.match(/\p{Pd}/u)[0]"#), "-");
     }
 
     #[test]

@@ -11,16 +11,24 @@
 //! capturing `( )`, non-capturing `(?: )` and named `(?<name> )` groups,
 //! alternation `|`, the quantifiers `* + ? {n} {n,} {n,m}` (greedy and lazy),
 //! backreferences `\1`, lookahead `(?= )`/`(?! )`, lookbehind `(?<= )`/`(?<! )`,
-//! the Unicode property escapes `\p{…}`/`\P{…}` over the full general-category
-//! set — the seven groups (`L M N P S Z C`) and all thirty two-letter
-//! subcategories (`Lu`, `Ll`, `Lt`, …), plus their long-form aliases — and the
+//! the Unicode property escapes `\p{…}`/`\P{…}` (under the `u` flag), and the
 //! `i` (case-insensitive), `m` (multiline), `s` (dotall), and `y` (sticky) flags.
 //! Positions are Unicode scalar (`char`) indices.
 //!
-//! General-category matching is exact when the `intl` feature is on (it consults
-//! the Unicode tables); without it, the common groups and cased/letter/number
-//! subcategories fall back to `char`-method approximations and the finer
-//! categories match nothing.
+//! Property escapes (see the `props` module) follow the ECMAScript grammar: a lone binary
+//! property (`\p{Alphabetic}`, `\p{ASCII}`, …), a lone `General_Category` value
+//! (`\p{Lu}`, `\p{Letter}`), or a `name=value` form for the non-binary
+//! properties `General_Category`/`gc`, `Script`/`sc`, and `Script_Extensions`/
+//! `scx` — with canonical names, the standard aliases, and ISO 15924 script
+//! short codes. Names/values are validated exactly (an unknown one is a
+//! `SyntaxError`). Matching is exact for `General_Category`, `Script`,
+//! `Script_Extensions`, and the binary properties expressible from the `intl`
+//! tables or a closed form; a handful of binary properties whose UCD tables this
+//! crate's `intl` feature set does not include (the emoji family, the
+//! `ID`/`Grapheme`/`Ideographic`/… group) are recognised as valid names but
+//! match no code point. Without the `intl` feature only the categories/properties
+//! expressible via `char` methods resolve. Without the `u` flag, `\p`/`\P` are an
+//! Annex B IdentityEscape (the literal `p`/`P`), never a property escape.
 //!
 //! # Subject model
 //!
@@ -40,6 +48,7 @@
 
 mod compile;
 mod parser;
+mod props;
 mod vm;
 
 #[cfg(test)]

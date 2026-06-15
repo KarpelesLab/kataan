@@ -102,79 +102,9 @@ pub(crate) enum Shorthand {
     NotWord,
     Space,
     NotSpace,
-    /// A Unicode property escape `\p{…}` (or negated `\P{…}`).
-    Property(PropKind, bool),
-}
-
-/// The Unicode general categories / binary properties supported by `\p{…}`,
-/// matched via pure-Rust `char` methods (no Unicode tables of our own).
-#[derive(Clone, Copy)]
-pub(crate) enum PropKind {
-    /// `L` / `Letter` / `Alphabetic`.
-    Letter,
-    /// `Lu` / `Uppercase`.
-    Upper,
-    /// `Ll` / `Lowercase`.
-    Lower,
-    /// `N` / `Nd` / `Number`.
-    Number,
-    /// `White_Space` / `space`.
-    White,
-    /// `Alphabetic` plus `Number` (`\w`-ish, but Unicode-aware).
-    Alnum,
-    /// A general category by its code: a single-letter group (`[b'L', 0]`) or a
-    /// two-letter subcategory (`[b'L', b'u']`). Matched precisely via the `intl`
-    /// Unicode tables when available, else by a `char`-method approximation.
-    Gc([u8; 2]),
-}
-
-/// Maps a `\p{…}` property name (a 1–2 letter category code, or a long alias) to
-/// its general-category code, or `None` if unrecognized.
-pub(crate) fn general_category_code(name: &str) -> Option<[u8; 2]> {
-    // Long-form aliases → their canonical code.
-    let code = match name {
-        "Mark" => "M",
-        "Punctuation" => "P",
-        "Symbol" => "S",
-        "Separator" => "Z",
-        "Titlecase_Letter" => "Lt",
-        "Modifier_Letter" => "Lm",
-        "Other_Letter" => "Lo",
-        "Nonspacing_Mark" => "Mn",
-        "Spacing_Mark" => "Mc",
-        "Enclosing_Mark" => "Me",
-        "Letter_Number" => "Nl",
-        "Other_Number" => "No",
-        "Connector_Punctuation" => "Pc",
-        "Dash_Punctuation" => "Pd",
-        "Open_Punctuation" => "Ps",
-        "Close_Punctuation" => "Pe",
-        "Initial_Punctuation" => "Pi",
-        "Final_Punctuation" => "Pf",
-        "Other_Punctuation" => "Po",
-        "Math_Symbol" => "Sm",
-        "Currency_Symbol" => "Sc",
-        "Modifier_Symbol" => "Sk",
-        "Other_Symbol" => "So",
-        "Space_Separator" => "Zs",
-        "Line_Separator" => "Zl",
-        "Paragraph_Separator" => "Zp",
-        "Control" | "cntrl" => "Cc",
-        "Format" => "Cf",
-        "Private_Use" => "Co",
-        "Unassigned" => "Cn",
-        other => other,
-    };
-    const SUBCATS: [&str; 30] = [
-        "Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me", "Nd", "Nl", "No", "Pc", "Pd", "Ps", "Pe",
-        "Pi", "Pf", "Po", "Sm", "Sc", "Sk", "So", "Zs", "Zl", "Zp", "Cc", "Cf", "Cs", "Co", "Cn",
-    ];
-    let b = code.as_bytes();
-    match code {
-        "L" | "M" | "N" | "P" | "S" | "Z" | "C" => Some([b[0], 0]),
-        _ if SUBCATS.contains(&code) => Some([b[0], b[1]]),
-        _ => None,
-    }
+    /// A Unicode property escape `\p{…}` (or negated `\P{…}`). The boolean is the
+    /// negation flag (`\P`).
+    Property(super::props::PropEscape, bool),
 }
 
 /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -510,42 +440,62 @@ impl Parser {
             }
             'u' => Node::Char(self.parse_unicode_escape()?),
             'x' => Node::Char(self.parse_hex_escape(2)?),
-            'p' => class_shorthand(Shorthand::Property(self.parse_property()?, false)),
-            'P' => class_shorthand(Shorthand::Property(self.parse_property()?, true)),
+            // `\p` / `\P` are Unicode property escapes only under the `u` flag.
+            // Without it they are an IdentityEscape (Annex B): the literal `p`/`P`.
+            'p' if self.unicode => {
+                class_shorthand(Shorthand::Property(self.parse_property()?, false))
+            }
+            'P' if self.unicode => {
+                class_shorthand(Shorthand::Property(self.parse_property()?, true))
+            }
             other => Node::Char(escape_char(other) as u32),
         })
     }
 
-    /// Parses a `\p{Name}` body (the `\p`/`\P` already consumed) into a
-    /// `PropKind`. Unknown property names are rejected.
-    fn parse_property(&mut self) -> Result<PropKind, RegexError> {
+    /// Parses a `\p{…}` body (the `\p`/`\P` already consumed) into a resolved
+    /// [`PropEscape`](super::props::PropEscape). Handles both the lone-name form
+    /// (`\p{Alphabetic}`, `\p{Lu}`) and the `name=value` form
+    /// (`\p{Script=Greek}`). An unrecognised property/value, a malformed body, or
+    /// an empty name/value is rejected with a `RegexError` so the caller raises a
+    /// `SyntaxError` — the corpus's negative parse tests rely on this.
+    fn parse_property(&mut self) -> Result<super::props::PropEscape, RegexError> {
         if !self.eat('{') {
             return Err(RegexError::new("expected `{` after `\\p`"));
         }
         let mut name = alloc::string::String::new();
+        let mut value: Option<alloc::string::String> = None;
         loop {
             match self.bump() {
                 Some('}') => break,
-                Some(c) => name.push(c),
+                // The first `=` separates the property name from its value; a
+                // second `=` is part of the (then invalid) value text.
+                Some('=') if value.is_none() => value = Some(alloc::string::String::new()),
+                Some(c) => match &mut value {
+                    Some(v) => v.push(c),
+                    None => name.push(c),
+                },
                 None => return Err(RegexError::new("unterminated `\\p{…}`")),
             }
         }
-        Ok(match name.as_str() {
-            "L" | "Letter" | "Alphabetic" => PropKind::Letter,
-            "Lu" | "Uppercase" | "Uppercase_Letter" => PropKind::Upper,
-            "Ll" | "Lowercase" | "Lowercase_Letter" => PropKind::Lower,
-            "N" | "Nd" | "Number" | "Decimal_Number" => PropKind::Number,
-            "White_Space" | "space" => PropKind::White,
-            "Alnum" => PropKind::Alnum,
-            other => match general_category_code(other) {
-                Some(code) => PropKind::Gc(code),
-                None => {
-                    return Err(RegexError::new(alloc::format!(
-                        "unsupported \\p property `{other}`"
-                    )));
+        let resolved = match value {
+            // `name=value` — both sides must be non-empty and resolve.
+            Some(value) => {
+                if name.is_empty() || value.is_empty() {
+                    None
+                } else {
+                    super::props::resolve_pair(&name, &value)
                 }
-            },
-        })
+            }
+            // Lone `name` — a binary property or a General_Category value.
+            None => {
+                if name.is_empty() {
+                    None
+                } else {
+                    super::props::resolve_lone(&name)
+                }
+            }
+        };
+        resolved.ok_or_else(|| RegexError::new("unsupported `\\p{…}` property escape"))
     }
 
     /// Parses a `\uHHHH` or `\u{H…}` escape body (the `\u` already consumed),
@@ -642,14 +592,14 @@ impl Parser {
                         'W' => items.push(ClassItem::Shorthand(Shorthand::NotWord)),
                         's' => items.push(ClassItem::Shorthand(Shorthand::Space)),
                         'S' => items.push(ClassItem::Shorthand(Shorthand::NotSpace)),
-                        'p' => items.push(ClassItem::Shorthand(Shorthand::Property(
-                            self.parse_property()?,
-                            false,
-                        ))),
-                        'P' => items.push(ClassItem::Shorthand(Shorthand::Property(
-                            self.parse_property()?,
-                            true,
-                        ))),
+                        // `\p`/`\P` are property escapes only under `u`; otherwise
+                        // they are the literal `p`/`P` (Annex B IdentityEscape).
+                        'p' if self.unicode => items.push(ClassItem::Shorthand(
+                            Shorthand::Property(self.parse_property()?, false),
+                        )),
+                        'P' if self.unicode => items.push(ClassItem::Shorthand(
+                            Shorthand::Property(self.parse_property()?, true),
+                        )),
                         'u' => {
                             let ch = self.parse_unicode_escape()?;
                             self.push_class_member(&mut items, ch);
