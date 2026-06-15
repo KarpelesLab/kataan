@@ -3487,11 +3487,35 @@ pub fn execute_typed(
     }
 }
 
+/// Whether `program` references the dynamic-code intrinsics `eval` or `Function`
+/// (the `Function` constructor). The bytecode VM has no live tree-walk scope to
+/// support direct `eval`'s scope access, and dynamic code is comparatively rare,
+/// so any program touching these is routed wholesale to the reference
+/// tree-walker (`crate::nbexec`), which implements them with full semantics. The
+/// scan reuses the free-variable collector, so it sees references at any nesting
+/// (including inside nested functions and arrows).
+fn uses_dynamic_code(program: &Program) -> bool {
+    let mut direct = BTreeSet::new();
+    let mut nested = BTreeSet::new();
+    for s in &program.body {
+        refs_stmt(s, &mut direct, &mut nested);
+    }
+    ["eval", "Function"]
+        .iter()
+        .any(|name| direct.contains(*name) || nested.contains(*name))
+}
+
 /// Compiles `program` to a function table (function 0 is the top-level body).
 ///
 /// # Errors
 /// Returns [`CompileError`] for unsupported constructs.
 pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> {
+    // Dynamic code (`eval` / `Function`) needs the tree-walker (it accesses the
+    // live lexical scope and parses source at runtime). Bail before any codegen
+    // so the whole program runs on the reference engine with no partial output.
+    if uses_dynamic_code(program) {
+        return Err(CompileError::Unsupported("dynamic code (eval/Function)"));
+    }
     let decls: Vec<&crate::ast::Function> = program
         .body
         .iter()

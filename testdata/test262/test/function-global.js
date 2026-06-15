@@ -16,7 +16,10 @@ assert.sameValue(({}) instanceof Function, false, "object");
 assert.sameValue([] instanceof Function, false, "array");
 assert.sameValue((5) instanceof Function, false, "number");
 
-// The dynamic Function constructor (runtime code) throws rather than evaluating.
-var threw = false;
-try { Function("return 1"); } catch (e) { threw = e instanceof TypeError; }
-assert.sameValue(threw, true, "dynamic Function() throws TypeError");
+// The dynamic Function constructor builds a callable from runtime source.
+var add = Function("a", "b", "return a + b");
+assert.sameValue(typeof add, "function", "Function() returns a function");
+assert.sameValue(add(2, 3), 5, "Function()-built function runs");
+assert.sameValue(add instanceof Function, true, "result is a Function instance");
+assert.sameValue(add.name, "anonymous", "Function()-built function is named 'anonymous'");
+assert.sameValue(add.length, 2, "length reflects the formal parameter count");

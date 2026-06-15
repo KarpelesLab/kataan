@@ -343,6 +343,19 @@ pub struct Interp<'a> {
     global_this: NanBox,
     /// Captured `console.log` output (a line per call).
     output: String,
+    /// The global (root) lexical scope, captured once at construction. Indirect
+    /// `eval` and the `Function` constructor run against a fresh child of this,
+    /// regardless of the caller's current nesting.
+    global_scope: Scope,
+    /// Programs parsed at runtime by `eval` / the `Function` constructor, keyed by
+    /// source string. The interpreter's function/AST tables hold `&'a` references
+    /// into the running program; a dynamically-parsed `Program` must therefore
+    /// outlive the borrow. Each distinct source is parsed once, boxed, and leaked
+    /// to a `&'static Program` (which coerces to `&'a`); the cache dedupes so a
+    /// loop calling `eval` on the same string (or repeated `Function` bodies) does
+    /// not re-leak. The leak is bounded by the number of *distinct* eval/Function
+    /// sources a program produces.
+    eval_programs: alloc::collections::BTreeMap<String, &'static Program>,
 }
 
 /// A queued promise reaction: run `handler` with `value`, then settle `result`
@@ -968,7 +981,13 @@ impl<'a> Interp<'a> {
             strict: false,
             global_this: NanBox::undefined(),
             output: String::new(),
+            global_scope: Scope::root(),
+            eval_programs: alloc::collections::BTreeMap::new(),
         };
+        // The constructor's `current` IS the root scope; capture it as the global
+        // scope before `install_globals` populates it, so indirect eval can run
+        // against it later.
+        interp.global_scope = interp.current.clone();
         interp.install_globals();
         interp
     }
@@ -1758,23 +1777,25 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_bigint(n).to_raw())
             }
             N_FUNCTION => {
-                // The dynamic `Function(...)` / `new Function(...)` constructor
-                // compiles a string of source at runtime — unsupported here.
-                let m = self.new_str("Function constructor (dynamic code) is not supported");
-                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                // `Function(args…, body)` called as a plain function behaves the
+                // same as `new Function(…)`: it builds and returns a fresh
+                // anonymous function from the supplied parameter/body source.
+                return self.build_function_constructor(args);
             }
             N_EVAL => {
-                // `eval(x)` returns `x` unchanged when it isn't a string (per spec);
-                // a string would require compiling source at runtime — unsupported, so
-                // it throws a catchable EvalError rather than leaving `eval` undefined.
+                // Reaching `eval` through `call_native` means an *indirect* eval
+                // (the callee wasn't the literal identifier `eval` — e.g.
+                // `(0, eval)(s)`, `var e = eval; e(s)`, `globalThis.eval(s)`). A
+                // direct eval is intercepted at the call site (see `Expr::Call`).
+                // `eval(x)` returns `x` unchanged when it isn't a string.
                 let v = arg(0);
-                if v.as_handle()
-                    .is_some_and(|raw| self.realm.string_value(Handle::from_raw(raw)).is_some())
-                {
-                    let m = self.new_str("eval (dynamic code) is not supported");
-                    return Err(ExecError::Throw(self.make_error(N_EVAL_ERROR, Some(m))));
-                }
-                return Ok(v);
+                let Some(source) = v
+                    .as_handle()
+                    .and_then(|raw| self.realm.string_value(Handle::from_raw(raw)))
+                else {
+                    return Ok(v);
+                };
+                return self.eval_string(&source, false);
             }
             N_PARSE_INT => {
                 let s = self.realm.to_display_string(arg(0));
@@ -4083,6 +4104,191 @@ impl<'a> Interp<'a> {
         Ok(last)
     }
 
+    // --- dynamic code (`eval` / `Function`) ---
+
+    /// Parses `source` as a Script and returns a `&'a` reference to the resulting
+    /// `Program`. A parse failure throws a `SyntaxError` (catchable). The parsed
+    /// program is owned by the interpreter for the rest of the run: it is boxed,
+    /// leaked once to a `&'static Program` (which coerces to `&'a`), and cached by
+    /// source so repeated `eval`/`Function` of the same string parse only once.
+    fn parse_eval_program(&mut self, source: &str) -> Result<&'a Program, ExecError> {
+        if let Some(p) = self.eval_programs.get(source) {
+            return Ok(p);
+        }
+        match crate::parser::Parser::parse_program(source) {
+            Ok(program) => {
+                // The AST is fully owned (no borrow of `source`); leaking the box
+                // yields a `'static` reference that coerces to `'a`.
+                let leaked: &'static Program =
+                    alloc::boxed::Box::leak(alloc::boxed::Box::new(program));
+                self.eval_programs.insert(String::from(source), leaked);
+                Ok(leaked)
+            }
+            Err(e) => {
+                let m = self.new_str(&alloc::format!("{e}"));
+                Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))))
+            }
+        }
+    }
+
+    /// Executes a parsed eval `program`'s statements in the current scope,
+    /// returning the completion value (the value of the last value-producing
+    /// statement, else `undefined`). Strict-mode and scope setup are the caller's
+    /// responsibility; this is the shared statement loop. Unlike `run`, it does
+    /// NOT drain the event loop — eval runs synchronously within the surrounding
+    /// execution, which drains microtasks at its own top level.
+    fn run_eval_body(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
+        self.hoist_with(&program.body, true)?;
+        let mut last = NanBox::undefined();
+        for stmt in &program.body {
+            match self.exec(stmt)? {
+                Flow::Normal(v) => last = v,
+                // A `return` is a SyntaxError at parse time at the top level, so
+                // it cannot reach here; `break`/`continue` likewise. Treat any
+                // such residue as completing normally.
+                Flow::Return(v) => return Ok(v),
+                Flow::Break(_) | Flow::Continue(_) => {}
+            }
+        }
+        Ok(last)
+    }
+
+    /// The `eval(source)` operation. `direct` is true for a direct eval call
+    /// (`eval(s)` by that exact name), false for an indirect one (`(0,eval)(s)`,
+    /// `var e = eval; e(s)`, `globalThis.eval(s)`).
+    ///
+    /// Scoping:
+    /// - **Indirect** eval runs in a fresh child of the GLOBAL scope, sloppy
+    ///   unless the eval code self-declares `"use strict"`.
+    /// - **Direct sloppy** eval (caller not strict and code not strict) runs in
+    ///   the CURRENT scope, so its `var`/function declarations hoist into the
+    ///   surrounding variable environment and it can read/modify locals.
+    /// - **Direct strict** eval (caller strict OR code `"use strict"`) gets its
+    ///   own child scope for its lexical + var declarations, but still reads the
+    ///   surrounding scope.
+    fn eval_string(&mut self, source: &str, direct: bool) -> Result<NanBox, ExecError> {
+        let program = self.parse_eval_program(source)?;
+        let code_strict = has_use_strict(&program.body);
+
+        // Recursion guard shared with the tree-walk budget.
+        if self.eval_depth >= self.realm.limits.max_eval_depth {
+            let msg = self.new_str("Maximum call stack size exceeded");
+            return Err(ExecError::Throw(
+                self.make_error(N_ERROR_BASE + 2, Some(msg)),
+            ));
+        }
+
+        let saved_strict = self.strict;
+        let saved_scope = self.current.clone();
+        let (saved_this, saved_new_target) = (self.this_val, self.new_target);
+
+        if !direct {
+            // Indirect eval: runs against the GLOBAL environment with global
+            // `this`, sloppy unless the code self-declares `"use strict"`. Its
+            // `var`/function declarations hoist into the global variable
+            // environment, so a sloppy indirect eval runs directly in the global
+            // scope (mirroring sloppy direct eval, which runs in the caller's
+            // scope). Strict eval gets its own child env so its declarations don't
+            // leak globally.
+            self.strict = code_strict;
+            self.current = if code_strict {
+                self.global_scope.child()
+            } else {
+                self.global_scope.clone()
+            };
+            self.this_val = self.global_this;
+            self.new_target = NanBox::undefined();
+        } else {
+            // Direct eval inherits the caller's strictness; the code may add its own.
+            self.strict = saved_strict || code_strict;
+            // Strict eval (caller-strict or code-strict) gets its own variable
+            // environment so its declarations don't leak into the caller. Sloppy
+            // direct eval runs directly in the caller's scope so `var`/function
+            // declarations hoist outward (spec sloppy-mode behaviour).
+            if self.strict {
+                self.current = saved_scope.child();
+            }
+            // `this`/`new.target` are inherited from the caller (unchanged).
+        }
+
+        self.eval_depth += 1;
+        let result = self.run_eval_body(program);
+        self.eval_depth -= 1;
+
+        self.current = saved_scope;
+        self.strict = saved_strict;
+        self.this_val = saved_this;
+        self.new_target = saved_new_target;
+        result
+    }
+
+    /// The dynamic `Function(p1, p2, …, body)` / `new Function(…)` constructor.
+    /// The trailing argument is the function body; all preceding arguments form
+    /// the (comma-joined) formal parameter list. The pieces are assembled into
+    /// `(function anonymous(<params>\n) {\n<body>\n})`, parsed, and the resulting
+    /// function object is returned. The function is created in the GLOBAL scope
+    /// (so it closes over globals only), sloppy unless the body self-declares
+    /// `"use strict"`. A parse failure (bad params or body) throws a SyntaxError.
+    fn build_function_constructor(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        // Coerce arguments to strings (ToString). Last is the body; the rest are
+        // the parameter-list pieces, joined with commas.
+        let (params, body) = match args.split_last() {
+            Some((last, rest)) => {
+                let parts: Vec<String> = rest
+                    .iter()
+                    .map(|a| self.realm.to_display_string(*a))
+                    .collect();
+                (parts.join(","), self.realm.to_display_string(*last))
+            }
+            // `Function()` with no arguments → an empty-body anonymous function.
+            None => (String::new(), String::new()),
+        };
+        let source = alloc::format!("(function anonymous({params}\n) {{\n{body}\n}})");
+
+        let program = self.parse_eval_program(&source)?;
+        // The wrapper parses to a single parenthesized function-expression
+        // statement; pull the `Function` node back out.
+        let func = program.body.iter().find_map(|s| match s {
+            Stmt::Expr { expression, .. } => match &**expression {
+                Expr::Function(f) => Some(f),
+                _ => None,
+            },
+            _ => None,
+        });
+        let Some(func) = func else {
+            let m = self.new_str("Function constructor produced invalid source");
+            return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
+        };
+
+        // Build the closure in the GLOBAL scope (not the caller's), sloppy unless
+        // the body opts into strict mode.
+        let saved_scope = core::mem::replace(&mut self.current, self.global_scope.clone());
+        let saved_strict = self.strict;
+        self.strict = has_use_strict(&func.body);
+        let f = self.make_function(
+            &func.params,
+            Body::Block(&func.body),
+            func.is_async,
+            func.is_generator,
+        );
+        self.strict = saved_strict;
+        self.current = saved_scope;
+
+        // `Function`-created functions are named "anonymous".
+        self.set_fn_name(f, "anonymous");
+        if let Some(h) = f.as_handle().map(Handle::from_raw) {
+            // Surface `name`/`length` as own data properties with the spec
+            // attributes, matching other built-in functions.
+            let len = func
+                .params
+                .iter()
+                .take_while(|p| !p.rest && p.default.is_none())
+                .count();
+            self.install_fn_name_length(h, "anonymous", len as u32);
+        }
+        Ok(f)
+    }
+
     // --- functions ---
 
     /// Pre-declares hoisted `function` declarations in the current scope, so a
@@ -4845,7 +5051,11 @@ impl<'a> Interp<'a> {
                 None => false,
             }
         };
-        let want_enum = resolve(self, "enumerable", self.realm.property_is_enumerable(obj, key));
+        let want_enum = resolve(
+            self,
+            "enumerable",
+            self.realm.property_is_enumerable(obj, key),
+        );
         let want_configurable = resolve(
             self,
             "configurable",
@@ -5972,11 +6182,10 @@ impl<'a> Interp<'a> {
             };
             return Ok(self.make_primitive_wrapper(prim, id));
         }
-        // `new Function(...)` — dynamic code generation is unsupported, but it fails
-        // with a catchable TypeError (matching `Function(...)`), not an engine abort.
+        // `new Function(...)` builds an anonymous function from runtime source —
+        // identical to calling `Function(...)` as a plain function.
         if id == N_FUNCTION {
-            let m = self.new_str("Function constructor (dynamic code) is not supported");
-            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            return self.build_function_constructor(args);
         }
         // `WeakMap`/`WeakSet` reuse the collection cell (no true weak refs here).
         let is_set = match id {
@@ -13376,6 +13585,28 @@ impl<'a> Interp<'a> {
                     return Err(ExecError::OptShortCircuit);
                 }
                 let args = self.eval_args(arguments)?;
+                // Direct eval: the callee is the literal identifier `eval` and it
+                // still resolves to the built-in `eval`. Such a call runs in the
+                // caller's scope (so it can read/modify locals and hoist `var`s),
+                // inheriting the caller's strictness — unlike an indirect eval,
+                // which `call`/`call_native` route through the global scope.
+                if let Expr::Ident(id) = &**callee
+                    && id.name.as_ref() == "eval"
+                    && f.as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.native_at(h))
+                        == Some(N_EVAL)
+                {
+                    let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
+                    let Some(source) = arg0
+                        .as_handle()
+                        .and_then(|raw| self.realm.string_value(Handle::from_raw(raw)))
+                    else {
+                        // A non-string argument is returned unchanged (per spec).
+                        return Ok(arg0);
+                    };
+                    return self.eval_string(&source, true);
+                }
                 self.call(f, &args)
             }
             // The optional-chain boundary: a `?.` short-circuit inside becomes
