@@ -9,13 +9,20 @@ impl<'a> Interp<'a> {
     /// `JSON.stringify`, `.length`, and array methods all behave), with `index` /
     /// `input` / `groups` as enumerable own properties. `.index` is a code-unit
     /// index; the `input` argument carries the original subject string.
+    /// Builds the match-result Array, optionally attaching an `indices` property
+    /// (the ES2022 `d`-flag `MakeIndicesArray`) when `has_indices` is true:
+    /// `indices[i]` is `[start, end]` (code-unit offsets) of capture group `i`, or
+    /// `undefined` if it did not participate, and `indices.groups` maps each named
+    /// group to its `[start, end]` pair (a null-prototype object, or `undefined`
+    /// when there are no named groups).
     #[cfg(feature = "regex")]
-    pub(crate) fn regex_match_object_u16(
+    pub(crate) fn regex_match_object_u16_indices(
         &mut self,
         units: &[u16],
         input: NanBox,
         caps: &crate::regex::Captures,
         group_names: &[(usize, String)],
+        has_indices: bool,
     ) -> NanBox {
         let elems: Vec<NanBox> = caps
             .groups
@@ -45,6 +52,36 @@ impl<'a> Interp<'a> {
             NanBox::handle(g.to_raw())
         };
         self.realm.set_property(obj, "groups", groups);
+        if has_indices {
+            // `indices[i]` = `[start, end]` per group (undefined when absent).
+            let pair = |this: &mut Self, span: Option<(usize, usize)>| -> NanBox {
+                match span {
+                    Some((s, e)) => {
+                        let a = this.realm.new_array(alloc::vec![
+                            NanBox::number(s as f64),
+                            NanBox::number(e as f64),
+                        ]);
+                        NanBox::handle(a.to_raw())
+                    }
+                    None => NanBox::undefined(),
+                }
+            };
+            let idx_elems: Vec<NanBox> = caps.groups.iter().map(|g| pair(self, *g)).collect();
+            let indices = self.realm.new_array(idx_elems);
+            let idx_groups = if group_names.is_empty() {
+                NanBox::undefined()
+            } else {
+                let g = self.realm.new_object_with_proto(None);
+                for (idx, name) in group_names {
+                    let v = pair(self, caps.groups.get(*idx).copied().flatten());
+                    self.realm.set_property(g, name, v);
+                }
+                NanBox::handle(g.to_raw())
+            };
+            self.realm.set_property(indices, "groups", idx_groups);
+            self.realm
+                .set_property(obj, "indices", NanBox::handle(indices.to_raw()));
+        }
         NanBox::handle(obj.to_raw())
     }
 
@@ -466,7 +503,14 @@ impl<'a> Interp<'a> {
                 if global || sticky {
                     self.set_last_index(h, c.whole().1)?;
                 }
-                Ok(self.regex_match_object_u16(&units, input, &c, re.group_names()))
+                let has_indices = flags.contains('d');
+                Ok(self.regex_match_object_u16_indices(
+                    &units,
+                    input,
+                    &c,
+                    re.group_names(),
+                    has_indices,
+                ))
             }
         }
     }
