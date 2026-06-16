@@ -93,20 +93,29 @@ impl<'a> Interp<'a> {
         self.realm.set_element(handle, i, value);
     }
 
-    /// Relative-index clamp shared by the typed-array bulk mutators
-    /// (`fill`/`copyWithin`): `undefined` yields `default`; otherwise ToNumber the
-    /// argument, treat a negative value as counting from `len`, and clamp the
-    /// result into `0..=len`.
-    pub(crate) fn typed_clamp_index(&mut self, v: NanBox, default: usize, len: usize) -> usize {
+    /// Spec-faithful relative-index clamp for typed-array mutators/readers:
+    /// `undefined` yields
+    /// `default`; otherwise `ToIntegerOrInfinity` (which **throws** for a Symbol
+    /// or BigInt and propagates an abrupt `valueOf`/`toString`), then a negative
+    /// counts from `len` and the result is clamped into `0..=len`. Used by the
+    /// typed-array bulk mutators/readers whose relative indices must surface
+    /// coercion errors (`fill`/`copyWithin`/`slice`/`indexOf`/…).
+    pub(crate) fn typed_clamp_index_checked(
+        &mut self,
+        v: NanBox,
+        default: usize,
+        len: usize,
+    ) -> Result<usize, ExecError> {
         if matches!(v.unpack(), Unpacked::Undefined) {
-            return default;
+            return Ok(default);
         }
-        let n = self.realm.to_number(v);
-        if n < 0.0 {
+        let n = self.coerce_to_integer_or_infinity(v)?;
+        Ok(if n < 0.0 {
             (len as f64 + n).max(0.0) as usize
         } else {
-            (n as usize).min(len)
-        }
+            // `+Infinity` saturates to `len` (the clamp below caps it).
+            if n >= len as f64 { len } else { n as usize }
+        })
     }
 
     /// C1: a user-facing array element write (`arr[i] = v`). Like

@@ -1584,12 +1584,9 @@ impl<'a> Interp<'a> {
             }
             return Ok(NanBox::number(self.realm.bytes_len(bh).unwrap_or(0) as f64));
         }
-        // `DataView.prototype` get*/set* accessors, exposed as readable methods.
-        if DATA_VIEW_METHODS.contains(&name)
-            && self.realm.get_property(handle, DATA_VIEW_BUF).is_some()
-        {
-            return Ok(self.readable_native_method(name));
-        }
+        // `DataView.prototype` get*/set* methods are installed as real first-class
+        // own properties on the prototype (with proper name/length), so a read of
+        // `dv.getInt8` resolves them through the prototype chain — no special case.
         // `DataView.byteLength` / `.buffer` / `.byteOffset`.
         if matches!(name, "byteLength" | "buffer" | "byteOffset")
             && let Some(buf) = self.realm.get_property(handle, DATA_VIEW_BUF)

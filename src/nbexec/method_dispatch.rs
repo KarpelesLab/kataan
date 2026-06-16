@@ -953,7 +953,40 @@ impl<'a> Interp<'a> {
         if let Some(bufv) = self.realm.get_property(handle, DATA_VIEW_BUF)
             && let Some((is_set, size, signed, is_float, is_bigint)) = dataview_method(method)
         {
-            // Accessing through a DataView whose buffer was detached is a TypeError.
+            // GetViewValue / SetViewValue spec order:
+            //   1. ToIndex(requestIndex)            (abrupt-propagating)
+            //   2. ToBoolean(isLittleEndian)
+            //   3. (set) ToBigInt/ToNumber(value)   (abrupt-propagating)
+            //   4. IsDetachedBuffer → TypeError
+            //   5. bounds check → RangeError
+            //   6. read/write
+            // ToIndex first: a negative/non-integer/over-2^53 offset is a
+            // RangeError, a Symbol/BigInt offset a TypeError — *before* any
+            // detached/bounds check or value coercion.
+            let requested = self.coerce_to_index(arg(0))?;
+            let le = self.realm.truthy(arg(if is_set { 2 } else { 1 }));
+            // (set) coerce the value next (its side effects/throw run before the
+            // detached and bounds checks).
+            let set_bits: Option<u64> = if is_set {
+                Some(if is_bigint {
+                    let big = self.coerce_to_bigint(arg(1))?;
+                    big.to_u64_wrapping()
+                } else if is_float {
+                    let num = self.coerce_to_number(arg(1))?;
+                    let value = self.realm.to_number(num);
+                    match size {
+                        2 => u64::from(f64_to_f16_bits(value)),
+                        4 => u64::from((value as f32).to_bits()),
+                        _ => value.to_bits(),
+                    }
+                } else {
+                    let num = self.coerce_to_number(arg(1))?;
+                    self.realm.to_number(num) as i64 as u64
+                })
+            } else {
+                None
+            };
+            // IsDetachedBuffer: a detached buffer is a TypeError.
             if let Some(buf_h) = bufv.as_handle().map(Handle::from_raw) {
                 self.guard_detached_buffer(buf_h)?;
             }
@@ -970,10 +1003,6 @@ impl<'a> Interp<'a> {
                 .get_property(handle, DATA_VIEW_OFF)
                 .and_then(|n| n.as_number())
                 .unwrap_or(0.0) as usize;
-            // Bounds-check the access against the view's byte length (an explicit
-            // `DATA_VIEW_LEN`, else the rest of the buffer). A negative/too-large offset
-            // or an access running past the end is a RangeError — never an out-of-bounds
-            // read (returning 0) or a write that silently grows the buffer.
             let total = self.realm.bytes_len(bh).unwrap_or(0);
             // M1: clamp the recorded view length to what the *live* buffer can back
             // (a resizable buffer may have shrunk under the view), so the access can
@@ -984,11 +1013,9 @@ impl<'a> Interp<'a> {
                 .and_then(|n| n.as_number())
                 .map_or(total.saturating_sub(base), |n| n as usize)
                 .min(total.saturating_sub(base));
-            let requested = self.realm.to_number(arg(0)) as i64; // ToIndex: truncates; NaN -> 0
-            // Checked arithmetic: a saturated `requested` must not wrap past the
-            // bound check (M2-style overflow). Validate against both the view length
-            // and the live buffer.
-            let in_bounds = requested >= 0 && {
+            // Bounds: getIndex + size must be <= the view's byte length, with
+            // checked arithmetic (a huge offset must not wrap past the bound).
+            let in_bounds = usize::try_from(requested).is_ok() && {
                 let r = requested as usize;
                 r.checked_add(size).is_some_and(|end| end <= view_len)
                     && base
@@ -1001,23 +1028,7 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
             let abs = base + requested as usize;
-            if is_set {
-                let le = self.realm.truthy(arg(2));
-                let bits = if is_bigint {
-                    // `setBigInt64`/`setBigUint64`: ToBigInt the value (a Number
-                    // throws TypeError), then store its low 64 bits.
-                    let big = self.coerce_to_bigint(arg(1))?;
-                    big.to_u64_wrapping()
-                } else if is_float {
-                    let value = self.realm.to_number(arg(1));
-                    if size == 4 {
-                        u64::from((value as f32).to_bits())
-                    } else {
-                        value.to_bits()
-                    }
-                } else {
-                    self.realm.to_number(arg(1)) as i64 as u64
-                };
+            if let Some(bits) = set_bits {
                 if let Some(bytes) = self.realm.bytes_at_mut(bh) {
                     for i in 0..size {
                         let shift = if le { i } else { size - 1 - i };
@@ -1031,7 +1042,6 @@ impl<'a> Interp<'a> {
                 // write with no propagation step.
                 return Ok(Some(NanBox::undefined()));
             }
-            let le = self.realm.truthy(arg(1));
             let mut bits: u64 = 0;
             for i in 0..size {
                 let b = self
@@ -1054,10 +1064,10 @@ impl<'a> Interp<'a> {
                 return Ok(Some(NanBox::handle(self.realm.new_bigint(big).to_raw())));
             }
             let value = if is_float {
-                if size == 4 {
-                    f64::from(f32::from_bits(bits as u32))
-                } else {
-                    f64::from_bits(bits)
+                match size {
+                    2 => f16_to_f64(bits as u16),
+                    4 => f64::from(f32::from_bits(bits as u32)),
+                    _ => f64::from_bits(bits),
                 }
             } else if signed && size < 8 && bits & (1 << (8 * size - 1)) != 0 {
                 (bits as i64 - (1i64 << (8 * size))) as f64
@@ -2420,23 +2430,41 @@ impl<'a> Interp<'a> {
         if let Some(tlen) = self.realm.typed_len(handle) {
             match method {
                 // `fill(value, start?, end?)` — mutate in place, return the view.
-                // `start`/`end` default to `0`/`len`; negatives count from the end.
+                // Spec order: ToNumber/ToBigInt(value) once, then
+                // ToIntegerOrInfinity(start)/(end). `start`/`end` default to
+                // `0`/`len`; negatives count from the end. Each coercion can throw
+                // (a Symbol/abrupt valueOf), propagated here.
                 "fill" => {
-                    // A BigInt-element fill ToBigInt-coerces the value once (a
-                    // Number throws TypeError); otherwise the value passes through.
-                    let value = self.coerce_typed_array_write(handle, arg(0))?;
-                    let start = self.typed_clamp_index(arg(1), 0, tlen);
-                    let end = self.typed_clamp_index(arg(2), tlen, tlen);
+                    // For a non-BigInt view a Number fill still goes through
+                    // ToNumber (a Symbol value throws); `coerce_typed_array_write`
+                    // handles the BigInt case. Coerce the value to a Number for a
+                    // numeric view so a Symbol/BigInt value throws per spec.
+                    let value = if self.realm.typed_kind(handle).is_some_and(is_bigint_kind) {
+                        self.coerce_typed_array_write(handle, arg(0))?
+                    } else {
+                        self.coerce_to_number(arg(0))?
+                    };
+                    let start = self.typed_clamp_index_checked(arg(1), 0, tlen)?;
+                    let end = self.typed_clamp_index_checked(arg(2), tlen, tlen)?;
+                    // A coercion may have detached/shrunk the buffer; re-read the
+                    // live length and clamp so the write never runs past it.
+                    let live = self.realm.typed_len(handle).unwrap_or(0);
+                    let (start, end) = (start.min(live), end.min(live));
                     self.realm.typed_fill_range(handle, value, start, end);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 // `copyWithin(target, start, end?)` — copy a slice within the view
                 // in place (raw same-width byte move); negatives count from the end.
+                // Each relative index is ToIntegerOrInfinity (abrupt-propagating).
                 "copyWithin" => {
-                    let target = self.typed_clamp_index(arg(0), 0, tlen);
-                    let start = self.typed_clamp_index(arg(1), 0, tlen);
-                    let end = self.typed_clamp_index(arg(2), tlen, tlen);
-                    let count = end.saturating_sub(start);
+                    let target = self.typed_clamp_index_checked(arg(0), 0, tlen)?;
+                    let start = self.typed_clamp_index_checked(arg(1), 0, tlen)?;
+                    let end = self.typed_clamp_index_checked(arg(2), tlen, tlen)?;
+                    // A coercion may have shrunk a resizable buffer; clamp to the
+                    // live length so the copy stays in bounds.
+                    let live = self.realm.typed_len(handle).unwrap_or(0);
+                    let (target, start, end) = (target.min(live), start.min(live), end.min(live));
+                    let count = end.saturating_sub(start).min(live.saturating_sub(target));
                     self.realm.typed_copy_within(handle, target, start, count);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }

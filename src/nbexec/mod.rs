@@ -503,6 +503,22 @@ const N_TYPED_ARRAY_TO_STRING_TAG: u16 = 241;
 /// `byteOffset`/`length`). A bound native whose target string names the accessor;
 /// rejects a `this` lacking a `[[TypedArrayName]]` slot with a TypeError.
 const N_TYPED_ARRAY_ACCESSOR: u16 = 247;
+/// A `get DataView.prototype.<accessor>` getter (`buffer`/`byteLength`/
+/// `byteOffset`). A bound native whose target string names the accessor; rejects
+/// a `this` lacking a `[[DataView]]` internal slot with a TypeError. (New-id
+/// block at 300+ to avoid sibling collisions.)
+const N_DATA_VIEW_ACCESSOR: u16 = 300;
+/// A `get ArrayBuffer.prototype.<accessor>` getter (`byteLength`/`maxByteLength`/
+/// `resizable`/`detached`). A bound native whose target string names the
+/// accessor; rejects a `this` lacking an `[[ArrayBufferData]]` slot with a
+/// TypeError.
+const N_AB_ACCESSOR: u16 = 301;
+/// A first-class `DataView.prototype.<method>` (`getInt8`/`setFloat64`/…): a
+/// bound native carrying the method name. Calling it requires the call's `this`
+/// to have a `[[DataView]]` internal slot (else a TypeError), then re-dispatches
+/// through `call_method` so `DataView.prototype.getInt8.call(dv, 0)` and a direct
+/// `dv.getInt8(0)` share one implementation.
+const N_DATA_VIEW_PROTO_FN: u16 = 302;
 /// The `%TypedArray%.prototype` methods exposed as first-class own properties,
 /// each paired with its spec `length` (own `length` data property). Dispatched
 /// through [`N_TYPED_ARRAY_PROTO_FN`].
@@ -884,6 +900,7 @@ const DATA_VIEW_METHODS: &[&str] = &[
     "getUint16",
     "getInt32",
     "getUint32",
+    "getFloat16",
     "getFloat32",
     "getFloat64",
     "getBigInt64",
@@ -894,6 +911,7 @@ const DATA_VIEW_METHODS: &[&str] = &[
     "setUint16",
     "setInt32",
     "setUint32",
+    "setFloat16",
     "setFloat32",
     "setFloat64",
     "setBigInt64",
@@ -975,6 +993,13 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_MATH_IMUL => 2,
         // Length 3.
         N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP | N_REFLECT_APPLY => 3,
+        // A concrete TypedArray constructor (`Int8Array`, …) has `length` 3
+        // (`new T(buffer, byteOffset, length)`).
+        id if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
+            .contains(&id) =>
+        {
+            3
+        }
         // `Date` constructor: `Date(year, month, …, ms)` — 7 declared parameters.
         N_DATE => 7,
         // Default (String, Number, Boolean, Array, Object, Error family, RegExp,
@@ -1589,6 +1614,8 @@ impl<'a> Interp<'a> {
                 NanBox::handle(getter.to_raw()),
                 NanBox::undefined(),
             );
+            // Spec accessor properties are non-enumerable.
+            self.realm.mark_hidden(ta_proto, accessor);
         }
         // Wire every concrete typed-array constructor: its `[[Prototype]]` is
         // `%TypedArray%`, and its `.prototype` is a real object inheriting
@@ -1611,10 +1638,26 @@ impl<'a> Interp<'a> {
             );
             self.realm
                 .set_property(ctor, "prototype", NanBox::handle(kind_proto.to_raw()));
+            // A TypedArray constructor's `prototype` is `{ writable: false,
+            // enumerable: false, configurable: false }`.
             self.realm.mark_hidden(ctor, "prototype");
-            // `<TypedArray>.BYTES_PER_ELEMENT` is also exposed on each kind's
-            // prototype (spec); the constructor static is handled in `read_member`.
-            let _ = i;
+            self.realm.set_readonly_property(ctor, "prototype");
+            self.realm.set_non_configurable_property(ctor, "prototype");
+            // (`length` of 3 comes from `builtin_native_arity` via the
+            // `new_named_native` constructor creation above.)
+            // `<TypedArray>.BYTES_PER_ELEMENT` and
+            // `<TypedArray>.prototype.BYTES_PER_ELEMENT` are real own data
+            // properties `{ writable: false, enumerable: false,
+            // configurable: false }` whose value is the element size.
+            let bpe = f64::from(TYPED_ARRAY_KINDS[i].1);
+            for target in [ctor, kind_proto] {
+                self.realm
+                    .set_property(target, "BYTES_PER_ELEMENT", NanBox::number(bpe));
+                self.realm.mark_hidden(target, "BYTES_PER_ELEMENT");
+                self.realm.set_readonly_property(target, "BYTES_PER_ELEMENT");
+                self.realm
+                    .set_non_configurable_property(target, "BYTES_PER_ELEMENT");
+            }
         }
         // `ArrayBuffer.prototype` / `DataView.prototype`: real objects (inheriting
         // `Object.prototype`) with a `constructor` back-link, so feature probes like
@@ -1643,9 +1686,66 @@ impl<'a> Interp<'a> {
             };
             self.realm
                 .set_hidden_property(proto, brand, NanBox::boolean(true));
+            // Install the spec accessor properties (`get`-only) as real
+            // getter/setter descriptors on the prototype, so
+            // `Object.getOwnPropertyDescriptor(DataView.prototype, "buffer").get`
+            // is the getter function and `getter.call(badThis)` throws a
+            // TypeError (RequireInternalSlot). Each getter is a bound native
+            // carrying its accessor name; a real instance read still takes the
+            // fast special-cased path in `read_member` (its slot is present).
+            let (accessor_id, accessors): (u16, &[&str]) = if name == "ArrayBuffer" {
+                (
+                    N_AB_ACCESSOR,
+                    &["byteLength", "maxByteLength", "resizable", "detached"],
+                )
+            } else {
+                (N_DATA_VIEW_ACCESSOR, &["buffer", "byteLength", "byteOffset"])
+            };
+            for accessor in accessors {
+                let name_h = self.realm.new_string(accessor);
+                let getter = self.realm.new_bound_native(accessor_id, name_h);
+                self.install_fn_name_length(getter, &alloc::format!("get {accessor}"), 0);
+                self.realm.define_accessor(
+                    proto,
+                    accessor,
+                    NanBox::handle(getter.to_raw()),
+                    NanBox::undefined(),
+                );
+                // Spec accessor properties are non-enumerable.
+                self.realm.mark_hidden(proto, accessor);
+            }
+            // `DataView.prototype` get*/set* methods as first-class own data
+            // properties (each a bound native re-dispatched through `call_method`
+            // with a `[[DataView]]`-validated `this`), so `typeof dv.getInt8 ===
+            // "function"`, the method's own `name`/`length`
+            // (`getXxx`.length === 1, `setXxx`.length === 2), and
+            // `DataView.prototype.getInt8.call(dv, 0)` all behave per spec.
+            if name == "DataView" {
+                for &m in DATA_VIEW_METHODS {
+                    let m_h = self.realm.new_string(m);
+                    let f = self.realm.new_bound_native(N_DATA_VIEW_PROTO_FN, m_h);
+                    let arity = if m.starts_with("set") { 2 } else { 1 };
+                    self.install_fn_name_length(f, m, arity);
+                    self.realm.set_property(proto, m, NanBox::handle(f.to_raw()));
+                    self.realm.mark_hidden(proto, m);
+                }
+                // `DataView.prototype[Symbol.toStringTag]` is "DataView"
+                // `{ writable: false, enumerable: false, configurable: true }`.
+                let tag_sym = self.well_known_symbol("toStringTag");
+                let tag_key = self.member_key(tag_sym);
+                let tag_val = self.realm.new_string("DataView");
+                self.realm
+                    .set_property(proto, &tag_key, NanBox::handle(tag_val.to_raw()));
+                self.realm.mark_hidden(proto, &tag_key);
+                self.realm.set_readonly_property(proto, &tag_key);
+            }
             self.realm
                 .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
+            // A constructor's `prototype` is `{ writable: false, enumerable: false,
+            // configurable: false }`.
             self.realm.mark_hidden(ctor, "prototype");
+            self.realm.set_readonly_property(ctor, "prototype");
+            self.realm.set_non_configurable_property(ctor, "prototype");
         }
     }
 
@@ -1928,7 +2028,10 @@ impl<'a> Interp<'a> {
             self.current.declare(name, NanBox::handle(f.to_raw()));
         }
         for (name, id) in [("ArrayBuffer", N_ARRAY_BUFFER), ("DataView", N_DATA_VIEW)] {
-            let f = self.realm.new_native(id);
+            // `new_named_native` installs the constructor's `name`/`length`
+            // (`DataView.name === "DataView"`, `.length === 1`), each
+            // `{ writable: false, enumerable: false, configurable: true }`.
+            let f = self.new_named_native(name, id);
             // `ArrayBuffer.isView(x)` — true for a typed array or a DataView.
             if id == N_ARRAY_BUFFER {
                 let isview = self.realm.new_native(N_ARRAY_BUFFER_IS_VIEW);
@@ -2362,65 +2465,32 @@ impl<'a> Interp<'a> {
         self.realm.set_default_object_proto(obj_proto);
         // `globalThis`: an object mirroring the global bindings, referencing
         // itself. Reads like `globalThis.Math` and `globalThis.globalThis` work.
+        // Every standard global (constructors, namespaces, functions) is a
+        // *non-enumerable*, writable, configurable own property of the global
+        // object (per spec — `Object.getOwnPropertyDescriptor(globalThis, "Array")`
+        // is `{ writable, configurable, enumerable: false }`), so the mirror is
+        // built from the live root-scope bindings and each is marked hidden.
         let global = self.realm.new_object();
-        for n in [
-            "Math",
-            "JSON",
-            "Object",
-            "Array",
-            "Reflect",
-            "String",
-            "Number",
-            "Boolean",
-            "parseInt",
-            "parseFloat",
-            "isNaN",
-            "isFinite",
-            "Map",
-            "Set",
-            "Symbol",
-            "BigInt",
-            "Proxy",
-            "WeakMap",
-            "WeakSet",
-            "WeakRef",
-            "FinalizationRegistry",
-            "Promise",
-            "Date",
-            "console",
-            "Error",
-            "TypeError",
-            "RangeError",
-            "SyntaxError",
-            "ReferenceError",
-            "AggregateError",
-            "encodeURIComponent",
-            "decodeURIComponent",
-            "encodeURI",
-            "decodeURI",
-            "structuredClone",
-            "btoa",
-            "atob",
-            "Intl",
-            "eval",
+        let bindings = self.global_scope.local_bindings();
+        for (name, value, _is_const) in &bindings {
+            self.realm.set_property(global, name, *value);
+            self.realm.mark_hidden(global, name);
+        }
+        // `NaN`, `Infinity`, `undefined` are `{ writable: false, enumerable: false,
+        // configurable: false }` value properties of the global object.
+        for (name, value) in [
+            ("NaN", NanBox::number(f64::NAN)),
+            ("Infinity", NanBox::number(f64::INFINITY)),
+            ("undefined", NanBox::undefined()),
         ] {
-            if let Some(v) = self.current.get(n) {
-                self.realm.set_property(global, n, v);
-            }
+            self.realm.set_property(global, name, value);
+            self.realm.mark_hidden(global, name);
+            self.realm.set_readonly_property(global, name);
+            self.realm.set_non_configurable_property(global, name);
         }
-        for (name, _) in TYPED_ARRAY_KINDS {
-            if let Some(v) = self.current.get(name) {
-                self.realm.set_property(global, name, v);
-            }
-        }
-        self.realm
-            .set_property(global, "NaN", NanBox::number(f64::NAN));
-        self.realm
-            .set_property(global, "Infinity", NanBox::number(f64::INFINITY));
-        self.realm
-            .set_property(global, "undefined", NanBox::undefined());
         let gbox = NanBox::handle(global.to_raw());
         self.realm.set_property(global, "globalThis", gbox);
+        self.realm.mark_hidden(global, "globalThis");
         self.current.declare("globalThis", gbox);
         self.global_this = gbox;
     }
@@ -3457,6 +3527,7 @@ fn dataview_method(method: &str) -> Option<(bool, usize, bool, bool, bool)> {
         "Uint16" => (2, false, false, false),
         "Int32" => (4, true, false, false),
         "Uint32" => (4, false, false, false),
+        "Float16" => (2, false, true, false),
         "Float32" => (4, false, true, false),
         "Float64" => (8, false, true, false),
         "BigInt64" => (8, true, false, true),

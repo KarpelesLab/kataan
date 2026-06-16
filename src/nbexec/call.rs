@@ -318,6 +318,124 @@ impl<'a> Interp<'a> {
                     _ => NanBox::number(self.realm.typed_len(h).unwrap_or(0) as f64),
                 });
             }
+            // A `get DataView.prototype.<accessor>` getter (buffer/byteLength/
+            // byteOffset): the `this` must have a `[[DataView]]` internal slot,
+            // else a TypeError (RequireInternalSlot). A view over a detached
+            // buffer reports `byteLength`/`byteOffset` 0 only after the detach
+            // throw — here a detached buffer is a TypeError for byteLength.
+            if id == N_DATA_VIEW_ACCESSOR {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let Some(h) = this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|h| self.realm.get_property(*h, DATA_VIEW_BUF).is_some())
+                else {
+                    return Err(self.type_error(&alloc::format!(
+                        "get DataView.prototype.{name} called on a non-DataView object"
+                    )));
+                };
+                let buf = self.realm.get_property(h, DATA_VIEW_BUF).unwrap();
+                let buf_h = buf.as_handle().map(Handle::from_raw);
+                // A detached buffer makes byteLength/byteOffset a TypeError.
+                if let Some(bh) = buf_h {
+                    self.guard_detached_buffer(bh)?;
+                }
+                return Ok(match name.as_str() {
+                    "buffer" => buf,
+                    "byteOffset" => self
+                        .realm
+                        .get_property(h, DATA_VIEW_OFF)
+                        .unwrap_or(NanBox::number(0.0)),
+                    _ => {
+                        // byteLength: an explicit recorded length, else the rest of
+                        // the (live) buffer past the view's byte offset.
+                        if let Some(len) = self
+                            .realm
+                            .get_property(h, DATA_VIEW_LEN)
+                            .and_then(|n| n.as_number())
+                        {
+                            NanBox::number(len)
+                        } else {
+                            let total = buf_h
+                                .and_then(|bh| self.array_buffer_bytes(bh))
+                                .and_then(|bh| self.realm.bytes_len(bh))
+                                .unwrap_or(0);
+                            let off = self
+                                .realm
+                                .get_property(h, DATA_VIEW_OFF)
+                                .and_then(|n| n.as_number())
+                                .unwrap_or(0.0) as usize;
+                            NanBox::number(total.saturating_sub(off) as f64)
+                        }
+                    }
+                });
+            }
+            // A first-class `DataView.prototype.<method>` (getInt8/setFloat64/…):
+            // the `this` must have a `[[DataView]]` internal slot, else a
+            // TypeError; then dispatch through `call_method`.
+            if id == N_DATA_VIEW_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let ok = this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| self.realm.get_property(h, DATA_VIEW_BUF).is_some());
+                if !ok {
+                    return Err(self.type_error(&alloc::format!(
+                        "DataView.prototype.{name} called on a non-DataView object"
+                    )));
+                }
+                return Ok(self
+                    .call_method(this_val, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
+            // A `get ArrayBuffer.prototype.<accessor>` getter (byteLength/
+            // maxByteLength/resizable/detached): the `this` must have an
+            // `[[ArrayBufferData]]` internal slot, else a TypeError.
+            if id == N_AB_ACCESSOR {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let Some(h) = this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|h| self.realm.get_property(*h, ARRAY_BUFFER_BYTES).is_some())
+                else {
+                    return Err(self.type_error(&alloc::format!(
+                        "get ArrayBuffer.prototype.{name} called on a non-ArrayBuffer object"
+                    )));
+                };
+                let detached = self.realm.get_property(h, ARRAY_BUFFER_DETACHED).is_some();
+                let max = self.realm.get_property(h, ARRAY_BUFFER_MAXLEN);
+                return Ok(match name.as_str() {
+                    "detached" => NanBox::boolean(detached),
+                    "resizable" => NanBox::boolean(max.is_some()),
+                    "byteLength" => {
+                        if detached {
+                            NanBox::number(0.0)
+                        } else {
+                            let len = self
+                                .array_buffer_bytes(h)
+                                .and_then(|bh| self.realm.bytes_len(bh))
+                                .unwrap_or(0);
+                            NanBox::number(len as f64)
+                        }
+                    }
+                    // maxByteLength: the recorded max for a resizable buffer; else
+                    // the current byteLength (0 once detached).
+                    _ => match max {
+                        Some(m) => m,
+                        None => {
+                            if detached {
+                                NanBox::number(0.0)
+                            } else {
+                                let len = self
+                                    .array_buffer_bytes(h)
+                                    .and_then(|bh| self.realm.bytes_len(bh))
+                                    .unwrap_or(0);
+                                NanBox::number(len as f64)
+                            }
+                        }
+                    },
+                });
+            }
             // A first-class `%TypedArray%.prototype.<method>`: reject a `this`
             // without a `[[TypedArrayName]]` internal slot, then dispatch directly
             // (no plain-Array conversion — the typed-array method returns a
@@ -1304,7 +1422,18 @@ impl<'a> Interp<'a> {
         }
         // `new DataView(buffer, byteOffset?)` — a view onto an ArrayBuffer.
         if id == N_DATA_VIEW {
-            let obj = self.realm.new_object();
+            // The instance's `[[Prototype]]` is `DataView.prototype`, so inherited
+            // members (the get*/set* methods, the accessors, `Symbol.toStringTag`)
+            // resolve through the chain.
+            let dv_proto = self
+                .current
+                .get("DataView")
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|c| self.realm.get_property(c, "prototype"))
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw);
+            let obj = self.realm.new_object_with_proto(dv_proto);
             let buf = args.first().copied().unwrap_or(NanBox::undefined());
             let mut buf_len = 0usize;
             if let Some(bh) = buf.as_handle().map(Handle::from_raw) {
