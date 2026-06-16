@@ -4559,6 +4559,18 @@ fn format_thrown(interp: &Interp, thrown: NanBox) -> String {
             alloc::format!("{name}: {message}")
         };
     }
+    // An error-shaped throw lacking a `name` property (e.g. Test262Error, which
+    // carries only `message` and a custom `toString`): surface its `message` so
+    // uncaught throws remain diagnosable rather than rendering `[object Object]`.
+    if let Some(raw) = thrown.as_handle() {
+        let h = Handle::from_raw(raw);
+        if let Some(m) = interp.realm().get_property(h, "message") {
+            let s = interp.realm().to_display_string(m);
+            if !s.is_empty() {
+                return alloc::format!("Test262Error: {s}");
+            }
+        }
+    }
     interp.display(thrown)
 }
 
@@ -4775,10 +4787,20 @@ fn static_key(key: &PropertyKey) -> Result<String, ExecError> {
     match key {
         PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(String::from(&**s)),
         PropertyKey::Number(n) => Ok(alloc::format!("{n}")),
-        // A private field name (`#x`) maps to a `#`-prefixed storage key.
-        PropertyKey::Private(s) => Ok(alloc::format!("#{s}")),
+        // A private field name (`#x`) maps to an internal storage key.
+        PropertyKey::Private(s) => Ok(private_storage_key(s)),
         PropertyKey::Computed(_) => Err(ExecError::Unsupported("computed key")),
     }
+}
+
+/// The internal storage key for a private element `#name`. Prefixed with `\0` so
+/// it is a true *internal slot*: filtered from every reflection surface
+/// (`Object.keys`, `getOwnPropertyNames`, `for-in`, `JSON`, …) like other
+/// engine internals, and — crucially — invisible to `hasOwnProperty("#name")` /
+/// `getOwnPropertyDescriptor`, since a user string can never equal it. (Storing
+/// under the bare `#name` would collide with a real `obj["#name"]` string key.)
+pub(crate) fn private_storage_key(name: &str) -> String {
+    alloc::format!("\u{0}#{name}")
 }
 
 #[cfg(test)]

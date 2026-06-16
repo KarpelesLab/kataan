@@ -4505,6 +4505,16 @@ fn scan_class<'a>(
     if !fields.is_empty() && super_name.is_some() {
         return Err(CompileError::Unsupported("fields with extends"));
     }
+    // A constructor with an explicit `return <expr>` has subtle completion
+    // semantics the bytecode `CallCtor` does not model: a returned *object*
+    // overrides the new instance, and a derived constructor returning a
+    // non-`undefined` non-object throws a `TypeError`. Route such classes to the
+    // tree-walker, which implements the full rule.
+    if let Some(m) = ctor_member
+        && stmts_return_value(&m.value.body)
+    {
+        return Err(CompileError::Unsupported("constructor returns a value"));
+    }
     // A constructor job (synthetic when only fields are present) runs the field
     // initializers, then the declared constructor body.
     if ctor_member.is_some() || !fields.is_empty() {
@@ -4524,6 +4534,49 @@ fn scan_class<'a>(
         });
     }
     Ok(info)
+}
+
+/// Whether any statement in `body` is a `return <expr>;` belonging to *this*
+/// function (control-flow is descended; nested functions/arrows/classes are
+/// not, since their `return` belongs to a different frame).
+fn stmts_return_value(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_returns_value)
+}
+
+fn stmt_returns_value(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return {
+            argument: Some(_), ..
+        } => true,
+        Stmt::Block { body, .. } => stmts_return_value(body),
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            stmt_returns_value(consequent)
+                || alternate.as_ref().is_some_and(|a| stmt_returns_value(a))
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => stmt_returns_value(body),
+        Stmt::For { body, .. } | Stmt::ForOf { body, .. } | Stmt::ForIn { body, .. } => {
+            stmt_returns_value(body)
+        }
+        Stmt::Labeled { body, .. } => stmt_returns_value(body),
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            stmts_return_value(block)
+                || handler
+                    .as_ref()
+                    .is_some_and(|h| stmts_return_value(&h.body))
+                || finalizer.as_ref().is_some_and(|f| stmts_return_value(f))
+        }
+        Stmt::Switch { cases, .. } => cases.iter().any(|c| stmts_return_value(&c.body)),
+        _ => false,
+    }
 }
 
 /// A class member queued for compilation: its reserved function id, signature,

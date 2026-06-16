@@ -19,6 +19,10 @@ impl<'a> Interp<'a> {
             } else {
                 alloc::format!("[{desc}]")
             }
+        } else if let Some(rest) = key.strip_prefix('\u{0}') {
+            // A private element's internal storage key is `\0#name`; its spec
+            // `name` is the visible `#name`.
+            String::from(rest)
         } else {
             String::from(key)
         };
@@ -209,9 +213,14 @@ impl<'a> Interp<'a> {
             .cloned()
             .collect();
         for (k, v) in static_keys {
-            // `name`/`length` are already installed with their own attributes.
-            if k == "name" || k == "length" {
-                continue;
+            // An explicit static member named `name`/`length` *overrides* the
+            // default constructor `name`/`length` installed above (e.g.
+            // `class { static name() {} }` makes `C.name` that method, writable
+            // and non-enumerable — not the read-only default). Replace the
+            // placeholder so it carries the member's own attributes.
+            let is_name_len = k == "name" || k == "length";
+            if is_name_len {
+                self.realm.delete_property(handle, &k);
             }
             self.realm.set_property(handle, &k, v);
             if !field_keys.contains(&k) {
@@ -227,11 +236,19 @@ impl<'a> Interp<'a> {
             self.class_static_set[class_id as usize].clone();
         for (k, getter) in getters {
             let setter = setters.get(&k).copied().unwrap_or(NanBox::undefined());
+            // A static accessor named `name`/`length` overrides the default data
+            // property installed above; drop the data slot so the getter wins.
+            if k == "name" || k == "length" {
+                self.realm.delete_data_slot(handle, &k);
+            }
             self.realm.define_accessor(handle, &k, getter, setter);
             self.realm.mark_hidden(handle, &k);
         }
         for (k, setter) in &setters {
             if !self.class_static_get[class_id as usize].contains_key(k) {
+                if k == "name" || k == "length" {
+                    self.realm.delete_data_slot(handle, k);
+                }
                 self.realm
                     .define_accessor(handle, k, NanBox::undefined(), *setter);
                 self.realm.mark_hidden(handle, k);
@@ -396,19 +413,31 @@ impl<'a> Interp<'a> {
         self.new_target = saved_target;
         let ret = result?;
         // A constructor that `return`s an *object* makes `new` yield that object
-        // instead of the freshly-built instance; a primitive return is ignored.
-        match ret {
-            Some(v)
-                if v.as_handle().map(Handle::from_raw).is_some_and(|h| {
-                    self.realm.string_value(h).is_none()
-                        && self.realm.bigint_at(h).is_none()
-                        && self.realm.symbol_at(h).is_none()
-                }) =>
-            {
-                Ok(v)
-            }
-            _ => Ok(this_val),
+        // instead of the freshly-built instance.
+        let returned_object = match ret {
+            Some(v) => v.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                self.realm.string_value(h).is_none()
+                    && self.realm.bigint_at(h).is_none()
+                    && self.realm.symbol_at(h).is_none()
+            }),
+            None => false,
+        };
+        if returned_object {
+            return Ok(ret.unwrap());
         }
+        // For a *derived* class, a constructor returning a non-`undefined` value
+        // that is not an Object is a TypeError (ECMA-262 — derived constructors
+        // must return an Object or undefined). A *base* class ignores a
+        // primitive return and yields the new instance.
+        let is_derived = self.classes[class_id as usize].super_class.is_some();
+        if is_derived
+            && let Some(v) = ret
+            && !matches!(v.unpack(), Unpacked::Undefined)
+        {
+            let m = self.new_str("Derived constructors may only return object or undefined");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        Ok(this_val)
     }
 
     /// Materializes (and caches) the `.prototype` object for a class, populated

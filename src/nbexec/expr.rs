@@ -468,10 +468,10 @@ impl<'a> Interp<'a> {
                     && let Expr::PrivateName(name, _) = &**left
                 {
                     let obj = self.eval(right)?;
-                    let present = obj
-                        .as_handle()
-                        .map(Handle::from_raw)
-                        .is_some_and(|h| self.realm.has_own(h, &alloc::format!("#{name}")));
+                    let key = crate::nbexec::private_storage_key(name);
+                    let present = obj.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                        self.realm.has_own(h, &key) || self.realm.accessor(h, &key).is_some()
+                    });
                     return Ok(NanBox::boolean(present));
                 }
                 let a = self.eval(left)?;
@@ -1024,7 +1024,7 @@ impl<'a> Interp<'a> {
                 // element (field or method) or a private accessor. A *class* receiver
                 // (`Class.#static`) is resolved by read_member's separate per-class storage,
                 // so it is not brand-checked here.
-                let key = alloc::format!("#{s}");
+                let key = crate::nbexec::private_storage_key(s);
                 if !self.is_callable(handle)
                     && self.realm.class_at(handle).is_none()
                     && !self.realm.has_own(handle, &key)
@@ -2043,7 +2043,7 @@ impl<'a> Interp<'a> {
         // (`set #x() {…}`) is stored under the `#`-prefixed key, so resolve that.
         let setter_key: Option<alloc::string::String> = match property {
             PropertyKey::Ident(s) | PropertyKey::Str(s) => Some(String::from(&**s)),
-            PropertyKey::Private(s) => Some(alloc::format!("#{s}")),
+            PropertyKey::Private(s) => Some(crate::nbexec::private_storage_key(s)),
             _ => None,
         };
         if let Some(skey) = setter_key {
@@ -2114,7 +2114,7 @@ impl<'a> Interp<'a> {
                 // (Field initialization writes via `set_property` directly, not this path,
                 // so the initial creation of a field is exempt; a class receiver, for
                 // static privates, is resolved via separate per-class storage.)
-                let key = alloc::format!("#{s}");
+                let key = crate::nbexec::private_storage_key(s);
                 if !self.is_callable(handle)
                     && self.realm.class_at(handle).is_none()
                     && !self.realm.has_own(handle, &key)
