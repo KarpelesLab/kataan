@@ -1881,7 +1881,17 @@ impl<'a> Interp<'a> {
             self.assign_super_member(&name, new)?;
             return Ok(new);
         }
+        // For `name = class {}`, hand the LHS name to `make_class` so an anonymous
+        // class's `name` is set before its static initializers run.
+        if op == AssignOp::Assign
+            && let Expr::Ident(id) = target
+            && let Expr::Class(c) = value
+            && c.id.is_none()
+        {
+            self.pending_class_name = Some(&id.name);
+        }
         let rhs = self.eval(value)?;
+        self.pending_class_name = None;
         // Destructuring assignment: `[a, b] = …` / `({ x } = …)`.
         if op == AssignOp::Assign && matches!(target, Expr::Array { .. } | Expr::Object { .. }) {
             self.assign_destructure(target, rhs)?;

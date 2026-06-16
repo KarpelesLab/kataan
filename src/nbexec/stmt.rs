@@ -305,10 +305,19 @@ impl<'a> Interp<'a> {
             if is_var && d.init.is_none() {
                 continue;
             }
+            // For `const C = class {}`, hand the binding name to `make_class` so the
+            // anonymous class's `name` is set before its static initializers run.
+            if let (Some(Expr::Class(c)), BindingTarget::Ident(Ident { name, .. })) =
+                (&d.init, &d.target)
+                && c.id.is_none()
+            {
+                self.pending_class_name = Some(name);
+            }
             let value = match &d.init {
                 Some(e) => self.eval(e)?,
                 None => NanBox::undefined(),
             };
+            self.pending_class_name = None;
             // An anonymous function/class assigned to a name takes that name
             // (`const f = function(){}` → `f.name === "f"`).
             if let (Some(init), BindingTarget::Ident(Ident { name, .. })) = (&d.init, &d.target)

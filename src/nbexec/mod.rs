@@ -260,6 +260,11 @@ pub struct Interp<'a> {
     /// evaluation and shared by every instance (so `c1.#m === c2.#m`), so it is
     /// created lazily on first instantiation and reused thereafter.
     private_method_cache: alloc::collections::BTreeMap<(u32, String), NanBox>,
+    /// One-shot binding name for NamedEvaluation of an anonymous class
+    /// expression (`var C = class {}`, `x = class {}`): the name the class will
+    /// receive. `make_class` consumes it so the class's `name` is set *before*
+    /// static initializers run (which may read `this.name` / the class name).
+    pending_class_name: Option<&'a str>,
     /// Active `with (obj) …` object environment records, innermost last. A bare
     /// identifier first consults these objects (respecting `@@unscopables`) before
     /// the lexical scope chain.
@@ -1328,6 +1333,7 @@ impl<'a> Interp<'a> {
             class_fn_super: Vec::new(),
             class_handles: Vec::new(),
             private_method_cache: alloc::collections::BTreeMap::new(),
+            pending_class_name: None,
             with_stack: Vec::new(),
             call_depth: 0,
             eval_depth: 0,

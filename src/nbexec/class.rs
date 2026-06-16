@@ -198,12 +198,20 @@ impl<'a> Interp<'a> {
                 _ => None,
             })
             .unwrap_or(0);
-        let class_name = class.id.as_ref().map(|id| String::from(&*id.name));
+        // An anonymous class expression undergoing NamedEvaluation (`var C = class
+        // {}`) receives the binding name *now*, before static initializers run (so
+        // `static x = this.name` sees it). A declared id always wins.
+        let pending_name = self.pending_class_name.take();
+        let class_name = class
+            .id
+            .as_ref()
+            .map(|id| String::from(&*id.name))
+            .or_else(|| pending_name.map(String::from));
         self.install_fn_name_length(handle, class_name.as_deref().unwrap_or(""), ctor_len);
         if class_name.is_none() {
-            // Anonymous: `name` becomes own only via NamedEvaluation (`let C = class
-            // {}`); remove the placeholder so `set_fn_name` can set it later, but
-            // keep `length` (always own).
+            // Still anonymous (no id, no binding name): `name` becomes own only via
+            // a later NamedEvaluation; drop the placeholder so `set_fn_name` can set
+            // it, but keep `length` (always own).
             self.realm.delete_property(handle, "name");
         }
         // Mirror static members as real own properties of the constructor so
