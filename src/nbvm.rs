@@ -6880,6 +6880,18 @@ impl Compiler {
             key: String::from("\u{0}vmfn"),
             src: fn_tag,
         });
+        // The class's `name`: its own declared identifier (`class D {}` → `"D"`),
+        // else the binding it is being assigned to (`var C = class {}` → `"C"`).
+        let class_name = class
+            .id
+            .as_ref()
+            .map_or_else(|| String::from(name), |i| String::from(&*i.name));
+        let name_reg = self.constant_str(&class_name);
+        self.ops.push(Op::SetHidden {
+            obj: cobj,
+            key: String::from("name"),
+            src: name_reg,
+        });
         for (sname, sid) in &info.statics {
             let f = self.alloc();
             self.ops.push(Op::LoadFunc { dst: f, func: *sid });
