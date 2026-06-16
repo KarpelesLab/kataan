@@ -529,6 +529,12 @@ impl<'a> Interp<'a> {
                         self.apply_native_super(nid, Handle::from_raw(raw), &args);
                         return Ok(NanBox::undefined());
                     }
+                    // `super(...)` reaching an ordinary-function superclass
+                    // (`extends fn`): call it with `this` = the new instance.
+                    if let Some(fnp) = self.pending_super_fn {
+                        self.call_with_this(fnp, self.this_val, &args)?;
+                        return Ok(NanBox::undefined());
+                    }
                     return Err(ExecError::Unsupported(
                         "super outside a derived constructor",
                     ));

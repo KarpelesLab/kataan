@@ -247,6 +247,10 @@ pub struct Interp<'a> {
     /// Per-class native-constructor superclass id (`class X extends Error`),
     /// parallel to `classes`; `None` when the parent is a class or absent.
     class_native_super: Vec<Option<u16>>,
+    /// Per-class ordinary-function superclass handle (`class X extends fn {}`
+    /// where `fn` is a plain user function, not a class or native), parallel to
+    /// `classes`; `None` otherwise.
+    class_fn_super: Vec<Option<NanBox>>,
     /// Per-class constructor handle (the class value), parallel to `classes`, so
     /// the lazily-materialized `.prototype` can install a `constructor` back-link
     /// and link a derived prototype to its base's prototype.
@@ -325,6 +329,8 @@ pub struct Interp<'a> {
     pending_super: Option<(u32, Scope)>,
     /// The native-constructor superclass for `super(...)` (e.g. extending Error).
     pending_super_native: Option<u16>,
+    /// The ordinary-function superclass for `super(...)` (`extends fn`).
+    pending_super_fn: Option<NanBox>,
     /// The class of the currently-running method (for `super.method()`).
     current_home: Option<u32>,
     /// The `[[HomeObject]]` of the currently-running object-literal method — the
@@ -1241,6 +1247,7 @@ impl<'a> Interp<'a> {
             class_static_set: Vec::new(),
             class_envs: Vec::new(),
             class_native_super: Vec::new(),
+            class_fn_super: Vec::new(),
             class_handles: Vec::new(),
             with_stack: Vec::new(),
             call_depth: 0,
@@ -1263,6 +1270,7 @@ impl<'a> Interp<'a> {
             method_name_intern: alloc::collections::BTreeMap::new(),
             pending_super: None,
             pending_super_native: None,
+            pending_super_fn: None,
             current_home: None,
             current_home_object: None,
             current_home_static: false,

@@ -67,6 +67,7 @@ impl<'a> Interp<'a> {
             .push(alloc::collections::BTreeMap::new());
         self.class_envs.push(class_env.clone());
         self.class_native_super.push(None);
+        self.class_fn_super.push(None);
         self.class_handles.push(class_val);
         // Build the static members (`static foo() {}` / `static x = …`).
         let mut statics = alloc::collections::BTreeMap::new();
@@ -137,21 +138,36 @@ impl<'a> Interp<'a> {
         self.class_static_fields[class_id as usize] = static_fields;
         self.class_static_get[class_id as usize] = static_getters;
         self.class_static_set[class_id as usize] = static_setters;
-        // Record a native-constructor superclass (`extends Error`), if any, so
-        // construction and `instanceof` can reach it (it has no class id).
-        let native_super = if let Some(expr) = &class.super_class {
-            self.eval(expr).ok().and_then(|v| {
-                let h = Handle::from_raw(v.as_handle()?);
-                if self.realm.class_at(h).is_some() {
-                    None
-                } else {
-                    self.realm.native_at(h)
+        // Record a native-constructor superclass (`extends Error`) or an ordinary
+        // user-function superclass (`extends fn`), so construction, `super(...)`,
+        // the prototype chain, and `instanceof` can reach it (neither has a class
+        // id). A class superclass is handled via `resolve_super`'s class chain.
+        let (native_super, fn_super) = if let Some(expr) = &class.super_class {
+            match self
+                .eval(expr)
+                .ok()
+                .and_then(|v| v.as_handle().map(|r| (v, Handle::from_raw(r))))
+            {
+                Some((_, h)) if self.realm.class_at(h).is_some() => (None, None),
+                Some((_, h)) if self.realm.native_at(h).is_some() => {
+                    (self.realm.native_at(h), None)
                 }
-            })
+                // A callable ordinary function used as a superclass.
+                Some((v, h)) if self.is_callable(h) => (None, Some(v)),
+                _ => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
         self.class_native_super[class_id as usize] = native_super;
+        self.class_fn_super[class_id as usize] = fn_super;
+        // `class D extends fn {}` makes `Object.getPrototypeOf(D) === fn` (the
+        // constructor inherits static members from its function superclass).
+        if let Some(fnp) = fn_super
+            && let Some(sh) = fnp.as_handle().map(Handle::from_raw)
+        {
+            self.realm.set_native_proto(handle, sh);
+        }
         // Install the constructor's own `length` (its declared param count up to
         // the first default/rest; 0 with no explicit constructor) and, for a named
         // class, its own `name` — both `{ w:false, e:false, c:true }` per spec.
@@ -269,15 +285,21 @@ impl<'a> Interp<'a> {
         let saved = core::mem::replace(&mut self.current, env.clone());
         let value = self.eval(expr);
         self.current = saved;
-        let raw = value?
+        let resolved = value?;
+        // `extends null` is valid (a base class with a null prototype).
+        if matches!(resolved.unpack(), Unpacked::Null) {
+            return Ok(None);
+        }
+        let raw = resolved
             .as_handle()
             .ok_or(ExecError::Unsupported("extends a non-class"))?;
         let h = Handle::from_raw(raw);
         if let Some(parent) = self.realm.class_at(h) {
             Ok(Some(parent))
-        } else if self.realm.native_at(h).is_some() {
-            // A native superclass (e.g. `extends Error`) has no class chain;
-            // it is tracked separately in `class_native_super`.
+        } else if self.realm.native_at(h).is_some() || self.is_callable(h) {
+            // A native superclass (`extends Error`) or an ordinary-function
+            // superclass (`extends fn`) has no class chain; both are tracked
+            // separately (`class_native_super` / `class_fn_super`).
             Ok(None)
         } else {
             Err(ExecError::Unsupported("extends a non-class"))
@@ -408,11 +430,21 @@ impl<'a> Interp<'a> {
         self.realm.set_class_prototype(class_id, proto);
 
         let env = self.class_envs[class_id as usize].clone();
-        // Link to the superclass prototype (class chain or native superclass).
+        // Link to the superclass prototype (class chain or function superclass).
         let class = self.classes[class_id as usize];
         if let Ok(Some((super_id, _))) = self.resolve_super(class, &env) {
             let super_proto = self.class_prototype_by_id(super_id);
             self.realm.set_object_proto(proto, Some(super_proto));
+        } else if let Some(fn_super) = self.class_fn_super[class_id as usize]
+            && let Some(sh) = fn_super.as_handle().map(Handle::from_raw)
+        {
+            // `class D extends fn {}`: `D.prototype.[[Prototype]]` is
+            // `fn.prototype` (an object — created on demand).
+            if let Ok(sp) = self.read_member(sh, "prototype")
+                && let Some(spp) = sp.as_handle().map(Handle::from_raw)
+            {
+                self.realm.set_object_proto(proto, Some(spp));
+            }
         }
 
         // Install this class's own instance methods/accessors.
@@ -531,6 +563,8 @@ impl<'a> Interp<'a> {
         let saved_super = core::mem::replace(&mut self.pending_super, parent.clone());
         let native_parent = self.class_native_super[class_id as usize];
         let saved_super_native = core::mem::replace(&mut self.pending_super_native, native_parent);
+        let fn_parent = self.class_fn_super[class_id as usize];
+        let saved_super_fn = core::mem::replace(&mut self.pending_super_fn, fn_parent);
         let saved_scope = core::mem::replace(&mut self.current, env.child());
         let result = (|| {
             let ctor = class.body.iter().find_map(|m| match m {
@@ -595,6 +629,10 @@ impl<'a> Interp<'a> {
                     // error message is forwarded.
                     if let Some(nid) = native_parent {
                         self.apply_native_super(nid, instance, args);
+                    } else if let Some(fnp) = fn_parent {
+                        // Constructor-less class extending a function: implicit
+                        // `super(...args)` calls the function with `this` = instance.
+                        self.call_with_this(fnp, NanBox::handle(instance.to_raw()), args)?;
                     }
                     self.init_instance_fields(class_id, instance)?;
                     Ok(None)
@@ -604,6 +642,7 @@ impl<'a> Interp<'a> {
         self.current = saved_scope;
         self.pending_super = saved_super;
         self.pending_super_native = saved_super_native;
+        self.pending_super_fn = saved_super_fn;
         result
     }
 
@@ -655,7 +694,35 @@ impl<'a> Interp<'a> {
                     return Ok(f);
                 }
             }
+            // A function superclass (`extends fn`) is not in the class chain;
+            // resolve `super.m` through `fn.prototype` (and its chain).
+            if let Some(fn_super) = self.class_fn_super[pid as usize]
+                && let Some(sh) = fn_super.as_handle().map(Handle::from_raw)
+                && let Ok(sp) = self.read_member(sh, "prototype")
+                && let Some(spp) = sp.as_handle().map(Handle::from_raw)
+            {
+                let f = self.read_member(spp, name)?;
+                if f.as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Ok(f);
+                }
+            }
             cur = self.resolve_super(class, &penv)?;
+        }
+        // The home class itself may directly extend a function (no intermediate
+        // class level), so check its function super's prototype too.
+        if let Some(fn_super) = self.class_fn_super[home as usize]
+            && let Some(sh) = fn_super.as_handle().map(Handle::from_raw)
+            && let Ok(sp) = self.read_member(sh, "prototype")
+            && let Some(spp) = sp.as_handle().map(Handle::from_raw)
+        {
+            let f = self.read_member(spp, name)?;
+            if f.as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                return Ok(f);
+            }
         }
         Err(ExecError::Throw(
             self.new_str(&alloc::format!("super method {name} not found")),
@@ -769,8 +836,56 @@ impl<'a> Interp<'a> {
                     };
                 }
             }
+            // A function superclass at this level: read `super.x` through
+            // `fn.prototype` (a data property or inherited method/getter), with
+            // `this` = the current receiver for any getter.
+            if let Some(v) = self.fn_super_member(pid, name)? {
+                return Ok(v);
+            }
             cur = self.resolve_super(class, &penv)?;
         }
+        // The home class may directly extend a function (no class parent level).
+        if let Some(v) = self.fn_super_member(home, name)? {
+            return Ok(v);
+        }
         Ok(NanBox::undefined())
+    }
+
+    /// Reads `super.name` through class `cid`'s function superclass prototype
+    /// (`class C extends fn {}`): a data property is returned directly; a getter
+    /// is invoked with the current `this`. `None` if `cid` has no function super
+    /// or the prototype lacks the name.
+    fn fn_super_member(&mut self, cid: u32, name: &str) -> Result<Option<NanBox>, ExecError> {
+        let Some(fn_super) = self.class_fn_super[cid as usize] else {
+            return Ok(None);
+        };
+        let Some(sh) = fn_super.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        let Ok(sp) = self.read_member(sh, "prototype") else {
+            return Ok(None);
+        };
+        let Some(spp) = sp.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        if !self.has_property(spp, name) {
+            return Ok(None);
+        }
+        // An accessor anywhere on the prototype chain is invoked with the current
+        // `this`; otherwise the data property is read directly.
+        let mut cur = Some(spp);
+        while let Some(h) = cur {
+            if let Some((getter, _)) = self.realm.accessor(h, name) {
+                if matches!(getter.unpack(), Unpacked::Undefined) {
+                    return Ok(Some(NanBox::undefined()));
+                }
+                return Ok(Some(self.call_with_this(getter, self.this_val, &[])?));
+            }
+            if self.realm.has_own(h, name) {
+                break;
+            }
+            cur = self.realm.object_proto(h);
+        }
+        Ok(Some(self.read_member(spp, name)?))
     }
 }
