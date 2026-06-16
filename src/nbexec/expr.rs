@@ -931,6 +931,22 @@ impl<'a> Interp<'a> {
                     .count() as u32;
                 self.install_fn_name_length(handle, name, len);
             }
+            return;
+        }
+        // NamedEvaluation of an anonymous class: `let C = class {}` gives the
+        // class constructor an own `name` of `"C"` (its `length` was already
+        // installed at class creation). A class with a declared id keeps it.
+        if let Some(raw) = value.as_handle() {
+            let handle = Handle::from_raw(raw);
+            if let Some((cid, _)) = self.realm.class_at(handle)
+                && self.classes[cid as usize].id.is_none()
+                && !self.realm.has_own(handle, "name")
+            {
+                let name_v = self.new_str(name);
+                self.realm.set_property(handle, "name", name_v);
+                self.realm.mark_hidden(handle, "name");
+                self.realm.set_readonly_property(handle, "name");
+            }
         }
     }
 
@@ -1274,13 +1290,18 @@ impl<'a> Interp<'a> {
                 None => NanBox::null(),
             });
         }
-        // A class's `name` is its declared identifier (`class C {}` → `"C"`).
+        // A class's `name` is its declared identifier (`class C {}` → `"C"`), or
+        // the name bound by NamedEvaluation (`let C = class {}`), which is stored
+        // as an own property — so an own `name` takes precedence over the (empty)
+        // declared id of an anonymous class.
         if name == "name"
-            && let Some((cid, _)) = self.realm.class_at(handle)
+            && self.realm.class_at(handle).is_some()
+            && !self.realm.has_own(handle, "name")
         {
-            let cname = self.classes[cid as usize]
-                .id
-                .as_ref()
+            let cname = self
+                .realm
+                .class_at(handle)
+                .and_then(|(cid, _)| self.classes[cid as usize].id.as_ref())
                 .map_or("", |i| &i.name);
             return Ok(self.new_str(cname));
         }
@@ -1352,21 +1373,44 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
-        // A class static — walking the `extends` chain for inherited statics.
+        // A class static — walking the `extends` chain for inherited statics. The
+        // own level is mirrored as a real own property (so `delete`/`defineProperty`
+        // take effect); only fall through to the side tables for *inherited*
+        // statics, which live on the superclass and are not mirrored on `handle`.
         if let Some((cid, _)) = self.realm.class_at(handle) {
-            let mut cur = Some(cid);
-            while let Some(c) = cur {
-                if let Some(v) = self.class_statics[c as usize].get(name) {
-                    return Ok(*v);
+            // The own level is mirrored as a real own property of the constructor.
+            // An own accessor falls through to the generic accessor path below
+            // (invoked with `this` = the class); an own data property is
+            // authoritative here (so `delete`/`defineProperty` are honored). Only
+            // when the name is *not* an own property do we walk the superclass
+            // chain via the side tables for an inherited static.
+            let has_own_accessor = self.realm.accessor(handle, name).is_some_and(|(g, _)| {
+                g.as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            });
+            if !has_own_accessor {
+                if self.realm.has_own(handle, name) {
+                    if let Some(v) = self.realm.get_property(handle, name) {
+                        return Ok(v);
+                    }
+                } else {
+                    // Inherited statics: walk the superclass chain.
+                    let class = self.classes[cid as usize];
+                    let env = self.class_envs[cid as usize].clone();
+                    let mut cur = self.resolve_super(class, &env)?.map(|(pid, _)| pid);
+                    while let Some(c) = cur {
+                        if let Some(v) = self.class_statics[c as usize].get(name) {
+                            return Ok(*v);
+                        }
+                        if let Some(getter) = self.class_static_get[c as usize].get(name).copied() {
+                            let this = NanBox::handle(handle.to_raw());
+                            return self.call_with_this(getter, this, &[]);
+                        }
+                        let class = self.classes[c as usize];
+                        let env = self.class_envs[c as usize].clone();
+                        cur = self.resolve_super(class, &env)?.map(|(pid, _)| pid);
+                    }
                 }
-                // A static getter is called with `this` = the class.
-                if let Some(getter) = self.class_static_get[c as usize].get(name).copied() {
-                    let this = NanBox::handle(handle.to_raw());
-                    return self.call_with_this(getter, this, &[]);
-                }
-                let class = self.classes[c as usize];
-                let env = self.class_envs[c as usize].clone();
-                cur = self.resolve_super(class, &env)?.map(|(pid, _)| pid);
             }
         }
         if let Some((getter, _)) = self.realm.accessor(handle, name) {
@@ -1843,16 +1887,47 @@ impl<'a> Interp<'a> {
             }
             return Ok(());
         }
-        // Writing a static on a class (`C.field = v`, `++C.field`): call a static
-        // setter if one is defined, else update the class's static table.
+        // Writing a static on a class (`C.field = v`, `++C.field`). Statics are
+        // mirrored as real own properties on the constructor, so an own accessor is
+        // invoked through that mirror and an own data write lands on the mirror —
+        // keeping reflection and the fast read path (which now reads the mirror)
+        // in sync. An *inherited* static setter (on a superclass) is still
+        // dispatched via the side tables.
         if let Some((cid, _)) = self.realm.class_at(handle) {
             let key = self.eval_prop_key(property)?;
-            if let Some(setter) = self.class_static_set[cid as usize].get(&key).copied() {
-                let this = NanBox::handle(handle.to_raw());
-                self.call_with_this(setter, this, &[new])?;
-            } else {
-                self.class_statics[cid as usize].insert(key, new);
+            // Own accessor (getter/setter installed on this constructor's mirror).
+            if let Some((_, setter)) = self.realm.accessor(handle, &key) {
+                if !matches!(setter.unpack(), Unpacked::Undefined) {
+                    let this = NanBox::handle(handle.to_raw());
+                    self.call_with_this(setter, this, &[new])?;
+                }
+                // A getter-only own accessor: the write is silently ignored
+                // (non-strict) — matching ordinary accessor semantics.
+                return Ok(());
             }
+            // Inherited static setter (walk the superclass chain).
+            let class = self.classes[cid as usize];
+            let env = self.class_envs[cid as usize].clone();
+            let mut cur = self.resolve_super(class, &env)?.map(|(pid, _)| pid);
+            while let Some(c) = cur {
+                if let Some(setter) = self.class_static_set[c as usize].get(&key).copied() {
+                    let this = NanBox::handle(handle.to_raw());
+                    self.call_with_this(setter, this, &[new])?;
+                    return Ok(());
+                }
+                if self.class_static_get[c as usize].contains_key(&key) {
+                    // Inherited getter-only: write ignored (non-strict).
+                    return Ok(());
+                }
+                let class = self.classes[c as usize];
+                let env = self.class_envs[c as usize].clone();
+                cur = self.resolve_super(class, &env)?.map(|(pid, _)| pid);
+            }
+            // Plain own data static: update both the mirror (authoritative for
+            // reflection/reads) and the side table (kept consistent for any
+            // remaining side-table consumer).
+            self.realm.set_property(handle, &key, new);
+            self.class_statics[cid as usize].insert(key, new);
             return Ok(());
         }
         // Proxy `set` trap (or forward the write to the target).

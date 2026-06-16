@@ -1941,6 +1941,7 @@ impl Realm {
                 || c.as_function().is_some()
                 || c.as_native().is_some()
                 || c.as_bound_native().is_some()
+                || c.as_class().is_some()
                 || matches!(c, Cell::TypedArray { .. })
         })
     }

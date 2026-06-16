@@ -1,6 +1,52 @@
 use super::*;
 
 impl<'a> Interp<'a> {
+    /// The spec `name` of a method/accessor whose property key (already evaluated
+    /// to its storage form) is `key`, given the accessor `kind`. A string/number
+    /// key yields itself; a symbol key (stored as `"\0sym:<id>"`) yields
+    /// `[description]`; getters/setters are prefixed with `get `/`set `. Returns
+    /// `None` for a symbol whose description cannot be recovered (rare), so the
+    /// caller leaves the name unset rather than storing the internal key.
+    pub(crate) fn method_display_name(&self, key: &str, kind: MethodKind) -> Option<String> {
+        let base = if let Some(rest) = key.strip_prefix("\u{0}sym:") {
+            let id: u64 = rest.parse().ok()?;
+            let h = self.realm.symbol_for_id(id)?;
+            let (desc, _) = self.realm.symbol_at(h)?;
+            // A symbol with no description (`Symbol()`) names the method `""`;
+            // a described symbol names it `[description]`.
+            if desc == SYMBOL_NO_DESC {
+                String::new()
+            } else {
+                alloc::format!("[{desc}]")
+            }
+        } else {
+            String::from(key)
+        };
+        Some(match kind {
+            MethodKind::Get => alloc::format!("get {base}"),
+            MethodKind::Set => alloc::format!("set {base}"),
+            _ => base,
+        })
+    }
+
+    /// The spec `name` of a private method/accessor — `#name` (with `get `/`set `
+    /// prefix for accessors). Returns `None` for a non-private key.
+    pub(crate) fn private_method_display_name(
+        &self,
+        key: &PropertyKey,
+        kind: MethodKind,
+    ) -> Option<String> {
+        let PropertyKey::Private(name) = key else {
+            return None;
+        };
+        let base = alloc::format!("#{name}");
+        Some(match kind {
+            MethodKind::Get => alloc::format!("get {base}"),
+            MethodKind::Set => alloc::format!("set {base}"),
+            _ => base,
+        })
+    }
+
     /// Registers a class and allocates a class value capturing the current scope.
     pub(crate) fn make_class(&mut self, class: &'a Class) -> Result<NanBox, ExecError> {
         let class_id = self.classes.len() as u32;
@@ -26,6 +72,9 @@ impl<'a> Interp<'a> {
                         Some(class_id),
                         true,
                     );
+                    if let Some(n) = self.method_display_name(&key, MethodKind::Method) {
+                        self.install_method_meta(f, &n, &m.value.params);
+                    }
                     statics.insert(key, f);
                 }
                 ClassMember::Field(field) if field.is_static => {
@@ -53,6 +102,9 @@ impl<'a> Interp<'a> {
                         Some(class_id),
                         true,
                     );
+                    if let Some(n) = self.method_display_name(&key, m.kind) {
+                        self.install_method_meta(f, &n, &m.value.params);
+                    }
                     if m.kind == MethodKind::Get {
                         static_getters.insert(key, f);
                     } else {
@@ -88,6 +140,75 @@ impl<'a> Interp<'a> {
         let handle = self.realm.new_class(class_id, class_env.clone());
         let class_val = NanBox::handle(handle.to_raw());
         self.class_handles.push(class_val);
+        // Install the constructor's own `length` (its declared param count up to
+        // the first default/rest; 0 with no explicit constructor) and, for a named
+        // class, its own `name` — both `{ w:false, e:false, c:true }` per spec.
+        let ctor_len = class
+            .body
+            .iter()
+            .find_map(|m| match m {
+                ClassMember::Method(m) if m.kind == MethodKind::Constructor => Some(
+                    m.value
+                        .params
+                        .iter()
+                        .take_while(|p| p.default.is_none() && !p.rest)
+                        .count() as u32,
+                ),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let class_name = class.id.as_ref().map(|id| String::from(&*id.name));
+        self.install_fn_name_length(handle, class_name.as_deref().unwrap_or(""), ctor_len);
+        if class_name.is_none() {
+            // Anonymous: `name` becomes own only via NamedEvaluation (`let C = class
+            // {}`); remove the placeholder so `set_fn_name` can set it later, but
+            // keep `length` (always own).
+            self.realm.delete_property(handle, "name");
+        }
+        // Mirror static members as real own properties of the constructor so
+        // reflection (`hasOwnProperty`, `getOwnPropertyDescriptor`, `Object.keys`,
+        // `verifyProperty`) sees them. The side tables above still drive the fast
+        // read path and `super`-static resolution. Static methods are
+        // `{ w:true, e:false, c:true }`; static fields are `{ w:true, e:true,
+        // c:true }`; accessors install a getter/setter pair (`e:false, c:true`).
+        let static_keys: Vec<(String, NanBox)> = self.class_statics[class_id as usize]
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let field_keys: alloc::collections::BTreeSet<String> = self.class_static_fields
+            [class_id as usize]
+            .iter()
+            .cloned()
+            .collect();
+        for (k, v) in static_keys {
+            // `name`/`length` are already installed with their own attributes.
+            if k == "name" || k == "length" {
+                continue;
+            }
+            self.realm.set_property(handle, &k, v);
+            if !field_keys.contains(&k) {
+                // A static method is non-enumerable; a static field is enumerable.
+                self.realm.mark_hidden(handle, &k);
+            }
+        }
+        let getters: Vec<(String, NanBox)> = self.class_static_get[class_id as usize]
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let setters: alloc::collections::BTreeMap<String, NanBox> =
+            self.class_static_set[class_id as usize].clone();
+        for (k, getter) in getters {
+            let setter = setters.get(&k).copied().unwrap_or(NanBox::undefined());
+            self.realm.define_accessor(handle, &k, getter, setter);
+            self.realm.mark_hidden(handle, &k);
+        }
+        for (k, setter) in &setters {
+            if !self.class_static_get[class_id as usize].contains_key(k) {
+                self.realm
+                    .define_accessor(handle, k, NanBox::undefined(), *setter);
+                self.realm.mark_hidden(handle, k);
+            }
+        }
         // Bind the class's own name in its methods' scope (a named class
         // expression sees itself; the binding is read-only in spec but not
         // enforced here).
@@ -205,6 +326,9 @@ impl<'a> Interp<'a> {
                     false,
                 );
                 self.current = saved;
+                if let Some(n) = self.private_method_display_name(&m.key, m.kind) {
+                    self.install_method_meta(f, &n, &m.value.params);
+                }
                 match m.kind {
                     MethodKind::Method => {
                         self.realm.set_hidden_property(instance, &key, f);
@@ -304,6 +428,9 @@ impl<'a> Interp<'a> {
             );
             self.current = saved;
             let Ok(key) = key else { continue };
+            if let Some(n) = self.method_display_name(&key, m.kind) {
+                self.install_method_meta(f, &n, &m.value.params);
+            }
             match m.kind {
                 MethodKind::Method => {
                     self.realm.set_hidden_property(proto, &key, f);

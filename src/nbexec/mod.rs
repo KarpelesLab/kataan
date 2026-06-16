@@ -318,6 +318,9 @@ pub struct Interp<'a> {
     /// uses.
     #[cfg(feature = "intl")]
     intl_intern: alloc::collections::BTreeMap<String, &'static str>,
+    /// Leak-once cache interning method names (derived from runtime property keys
+    /// or accessor prefixes) to `&'a str` for storage as `FnDef::name`.
+    method_name_intern: alloc::collections::BTreeMap<String, &'static str>,
     /// The superclass to invoke for `super(...)` inside the running constructor.
     pending_super: Option<(u32, Scope)>,
     /// The native-constructor superclass for `super(...)` (e.g. extending Error).
@@ -1257,6 +1260,7 @@ impl<'a> Interp<'a> {
             tagged_template_cache: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "intl")]
             intl_intern: alloc::collections::BTreeMap::new(),
+            method_name_intern: alloc::collections::BTreeMap::new(),
             pending_super: None,
             pending_super_native: None,
             current_home: None,
@@ -1310,6 +1314,45 @@ impl<'a> Interp<'a> {
         self.realm.set_property(f, "name", name_v);
         self.realm.mark_hidden(f, "name");
         self.realm.set_readonly_property(f, "name");
+    }
+
+    /// Installs the own `name`/`length` data properties on a freshly created
+    /// user method/accessor `f` (a class member or object-literal method). Per
+    /// spec these are `{ writable: false, enumerable: false, configurable: true }`
+    /// own properties — exactly what Test262's `verifyProperty` checks. `length`
+    /// is the count of parameters before the first one with a default or rest;
+    /// `name` is the property key (prefixed with `get `/`set ` for accessors).
+    fn install_method_meta(&mut self, f: NanBox, name: &str, params: &'a [Param]) {
+        let Some(raw) = f.as_handle() else { return };
+        let handle = Handle::from_raw(raw);
+        // Record the name on the FnDef too (so `fn.name` reads / inference align),
+        // but only if the function does not already carry one.
+        if let Some((func_id, _)) = self.realm.function_at(handle)
+            && self.functions[func_id as usize].name.is_empty()
+        {
+            self.functions[func_id as usize].name = self.intern_method_name(name);
+        }
+        if self.realm.has_own(handle, "name") {
+            return;
+        }
+        let len = params
+            .iter()
+            .take_while(|p| p.default.is_none() && !p.rest)
+            .count() as u32;
+        self.install_fn_name_length(handle, name, len);
+    }
+
+    /// Interns `s` to a `&'a str` for storing as a `FnDef::name`. Method names are
+    /// derived from runtime property keys (computed keys, accessor prefixes), so
+    /// they are not always borrowable from the source; leak-once dedup keeps the
+    /// `'a` lifetime sound without `unsafe`.
+    fn intern_method_name(&mut self, s: &str) -> &'a str {
+        if let Some(&v) = self.method_name_intern.get(s) {
+            return v;
+        }
+        let leaked: &'static str = alloc::boxed::Box::leak(String::from(s).into_boxed_str());
+        self.method_name_intern.insert(String::from(s), leaked);
+        leaked
     }
 
     /// Creates a native function carrying its own `name`/`length` data properties,

@@ -319,15 +319,11 @@ impl<'a> Interp<'a> {
                     if let Some(named) = self.realm.object_keys(h) {
                         keys.extend(named);
                     } else {
-                        // An array/function/native keeps named properties in its
-                        // auxiliary object (e.g. `arr.custom`, a match result's
-                        // `index`/`input`).
+                        // An array/function/native/class keeps named properties in
+                        // its auxiliary object (e.g. `arr.custom`, a match result's
+                        // `index`/`input`, a class's enumerable static fields —
+                        // static methods/accessors are non-enumerable and excluded).
                         keys.extend(self.realm.aux_named_keys(h));
-                    }
-                    // A class constructor's enumerable own keys are its static
-                    // fields (static methods/accessors are non-enumerable).
-                    if let Some((cid, _)) = self.realm.class_at(h) {
-                        keys.extend(self.class_static_fields[cid as usize].iter().cloned());
                     }
                 }
                 let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_str(k)).collect();
@@ -838,13 +834,8 @@ impl<'a> Interp<'a> {
                                 .unwrap_or(NanBox::undefined()),
                         );
                     }
-                    // A class constructor's static fields are its enumerable values.
-                    if let Some((cid, _)) = self.realm.class_at(h) {
-                        let fields = self.class_static_fields[cid as usize].clone();
-                        for k in fields {
-                            vals.push(self.read_member(h, &k)?);
-                        }
-                    }
+                    // A class constructor's enumerable static fields are already
+                    // mirrored as own enumerable aux properties (covered by `named`).
                 }
                 NanBox::handle(self.realm.new_array(vals).to_raw())
             }
@@ -954,14 +945,8 @@ impl<'a> Interp<'a> {
                             .unwrap_or(NanBox::undefined());
                         entries.push((k, v));
                     }
-                    // A class constructor's static fields are its enumerable entries.
-                    if let Some((cid, _)) = self.realm.class_at(h) {
-                        let fields = self.class_static_fields[cid as usize].clone();
-                        for k in fields {
-                            let v = self.read_member(h, &k)?;
-                            entries.push((k, v));
-                        }
-                    }
+                    // A class constructor's enumerable static fields are already
+                    // mirrored as own enumerable aux properties (covered by `named`).
                 }
                 let pairs: Vec<NanBox> = entries
                     .into_iter()
@@ -2036,16 +2021,16 @@ impl<'a> Interp<'a> {
             }
             N_OBJ_PROTO_PROPISENUM => {
                 let key = self.member_key(arg(0));
+                // An own *and* enumerable property. `property_is_enumerable` works
+                // for inline objects *and* aux-backed cells (arrays/functions/
+                // classes), where `object_keys` returns `None` and would wrongly
+                // report every aux property non-enumerable.
                 let enumerable = self
                     .this_val
                     .as_handle()
                     .map(Handle::from_raw)
                     .is_some_and(|h| {
-                        self.realm.has_own(h, &key)
-                            && self
-                                .realm
-                                .object_keys(h)
-                                .is_some_and(|ks| ks.contains(&key))
+                        self.realm.has_own(h, &key) && self.realm.property_is_enumerable(h, &key)
                     });
                 NanBox::boolean(enumerable)
             }
