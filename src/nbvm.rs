@@ -3898,6 +3898,16 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
             _ => None,
         };
         if let Some((name, class)) = named {
+            // A class extending an identifier that is not itself a class declared
+            // earlier in this program may resolve to a non-constructor (an arrow /
+            // generator / async function, or a plain object), which must throw a
+            // TypeError at definition. The bytecode path cannot do that check, so
+            // route such a class to the tree-walker (which validates the super).
+            if let Some(crate::ast::Expr::Ident(sid)) = class.super_class.as_deref()
+                && !class_map.contains_key(&*sid.name)
+            {
+                return Err(CompileError::Unsupported("extends a non-class binding"));
+            }
             let info = scan_class(class, class_id, &mut next_id, &mut class_jobs)?;
             class_id += 1;
             class_map.insert(name, info);

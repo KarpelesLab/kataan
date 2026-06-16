@@ -147,18 +147,28 @@ impl<'a> Interp<'a> {
         // the prototype chain, and `instanceof` can reach it (neither has a class
         // id). A class superclass is handled via `resolve_super`'s class chain.
         let (native_super, fn_super) = if let Some(expr) = &class.super_class {
-            match self
-                .eval(expr)
-                .ok()
-                .and_then(|v| v.as_handle().map(|r| (v, Handle::from_raw(r))))
-            {
-                Some((_, h)) if self.realm.class_at(h).is_some() => (None, None),
-                Some((_, h)) if self.realm.native_at(h).is_some() => {
-                    (self.realm.native_at(h), None)
+            let sval = self.eval(expr)?;
+            // `extends null` makes a base-ish class with a null prototype; any other
+            // non-object, or a non-constructor object (arrow/generator/async fn,
+            // a plain object), is a TypeError (the superclass must be a constructor).
+            if matches!(sval.unpack(), Unpacked::Null) {
+                (None, None)
+            } else {
+                match sval.as_handle().map(|r| (sval, Handle::from_raw(r))) {
+                    Some((_, h)) if self.realm.class_at(h).is_some() => (None, None),
+                    Some((_, h)) if self.realm.native_at(h).is_some() => {
+                        (self.realm.native_at(h), None)
+                    }
+                    // A callable ordinary function used as a superclass — only if it
+                    // is actually a constructor.
+                    Some((v, h)) if self.is_callable(h) && self.is_constructor_value(v) => {
+                        (None, Some(v))
+                    }
+                    _ => {
+                        let m = self.new_str("Class extends value is not a constructor or null");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
                 }
-                // A callable ordinary function used as a superclass.
-                Some((v, h)) if self.is_callable(h) => (None, Some(v)),
-                _ => (None, None),
             }
         } else {
             (None, None)
