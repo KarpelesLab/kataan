@@ -16215,6 +16215,18 @@ impl<'a> Interp<'a> {
             && self.functions[func_id as usize].name.is_empty()
         {
             self.functions[func_id as usize].name = name;
+            // Materialize `name`/`length` as own, non-enumerable, non-writable,
+            // configurable data properties so `f.hasOwnProperty("name")`,
+            // `getOwnPropertyDescriptor`, and `verifyProperty` behave per spec.
+            let handle = Handle::from_raw(raw);
+            if !self.realm.has_own(handle, "name") {
+                let len = self.functions[func_id as usize]
+                    .params
+                    .iter()
+                    .take_while(|p| p.default.is_none() && !p.rest)
+                    .count() as u32;
+                self.install_fn_name_length(handle, name, len);
+            }
         }
     }
 

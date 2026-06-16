@@ -769,6 +769,21 @@ fn make_error(realm: &mut Realm, name: &str, message: &str) -> NanBox {
     NanBox::handle(obj.to_raw())
 }
 
+/// Installs `name` and `length` as own, non-enumerable, non-writable,
+/// configurable data properties on a freshly-created VM closure (so
+/// `f.hasOwnProperty("name")`, `Object.getOwnPropertyDescriptor(f, "length")`,
+/// and Test262's `verifyProperty` behave per spec). `f.length` continues to be
+/// read via `Op::ArrayLen` from the proto; this just makes the reflective own
+/// property exist with the right attributes.
+fn install_fn_name_length(realm: &mut Realm, f: Handle, proto: Option<&FnProto>) {
+    let Some(p) = proto else { return };
+    realm.set_hidden_property(f, "length", NanBox::number(p.length as f64));
+    realm.set_readonly_property(f, "length");
+    let name = NanBox::handle(realm.new_string(&p.name).to_raw());
+    realm.set_hidden_property(f, "name", name);
+    realm.set_readonly_property(f, "name");
+}
+
 /// ToBigInt-coerces `value` for a write to element of `target` **iff** `target`
 /// is a `BigInt64Array`/`BigUint64Array`; otherwise returns `value` unchanged.
 /// Mirrors the tree-walker's `Interp::coerce_to_bigint` for the
@@ -2005,6 +2020,7 @@ fn run_frame(
                     .new_array(alloc::vec![NanBox::number(*func as f64)]);
                 ctx.realm
                     .set_hidden_property(handle, "\u{0}vmfn", NanBox::boolean(true));
+                install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::MakeClosure {
@@ -2019,6 +2035,7 @@ fn run_frame(
                 let handle = ctx.realm.new_array(elems);
                 ctx.realm
                     .set_hidden_property(handle, "\u{0}vmfn", NanBox::boolean(true));
+                install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::CallValue { dst, callee, args } => {
