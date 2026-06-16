@@ -251,6 +251,10 @@ pub struct Interp<'a> {
     /// the lazily-materialized `.prototype` can install a `constructor` back-link
     /// and link a derived prototype to its base's prototype.
     class_handles: Vec<NanBox>,
+    /// Active `with (obj) …` object environment records, innermost last. A bare
+    /// identifier first consults these objects (respecting `@@unscopables`) before
+    /// the lexical scope chain.
+    with_stack: Vec<NanBox>,
     /// Current function-call nesting depth (recursion guard).
     call_depth: usize,
     /// C2: current *tree-walk* recursion depth — `eval`/`exec` descend on the
@@ -1175,6 +1179,7 @@ impl<'a> Interp<'a> {
             class_envs: Vec::new(),
             class_native_super: Vec::new(),
             class_handles: Vec::new(),
+            with_stack: Vec::new(),
             call_depth: 0,
             eval_depth: 0,
             rng_state: math_random_seed(),
@@ -13880,6 +13885,24 @@ impl<'a> Interp<'a> {
                 let v = self.eval(argument)?;
                 Err(ExecError::Throw(v))
             }
+            Stmt::With { object, body, .. } => {
+                let obj = self.eval(object)?;
+                // ToObject: `null`/`undefined` throws; a primitive is boxed to its
+                // wrapper object.
+                if matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    let m = self.new_str("Cannot convert undefined or null to object");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                let obj = if obj.as_handle().is_some() {
+                    obj
+                } else {
+                    self.coerce_to_object(obj)
+                };
+                self.with_stack.push(obj);
+                let r = self.exec(body);
+                self.with_stack.pop();
+                r
+            }
             Stmt::Try {
                 block,
                 handler,
@@ -14578,7 +14601,14 @@ impl<'a> Interp<'a> {
     /// Reads the current value of an assignment target (identifier or member).
     fn read_target(&mut self, target: &'a Expr) -> Result<NanBox, ExecError> {
         match target {
-            Expr::Ident(id) => Ok(self.current.get(&id.name).unwrap_or(NanBox::undefined())),
+            Expr::Ident(id) => {
+                // A bare identifier inside `with (obj)` first resolves against the
+                // with-object's properties (via `[[Get]]`, so accessors fire).
+                if let Some(h) = self.with_binding(&id.name) {
+                    return self.read_member(h, &id.name);
+                }
+                Ok(self.current.get(&id.name).unwrap_or(NanBox::undefined()))
+            }
             Expr::Member {
                 object, property, ..
             } => {
@@ -14734,9 +14764,63 @@ impl<'a> Interp<'a> {
     }
 
     /// Assigns `value` to an existing target (an identifier or member).
+    /// Finds the innermost active `with` object whose environment record provides
+    /// `name` — i.e. it `HasProperty(name)` and `name` is not blocked by the
+    /// object's `@@unscopables`. Returns the object handle, or `None` to fall back
+    /// to the lexical scope chain.
+    fn with_binding(&mut self, name: &str) -> Option<Handle> {
+        if self.with_stack.is_empty() {
+            return None;
+        }
+        for obj in self.with_stack.clone().into_iter().rev() {
+            let Some(h) = obj.as_handle().map(Handle::from_raw) else {
+                continue;
+            };
+            if !self.has_property_chain(h, name) {
+                continue;
+            }
+            // `@@unscopables`: a truthy entry blocks the binding (the lexical scope
+            // shows through instead).
+            let unscopables_sym = self.well_known_symbol("unscopables");
+            let unscopables_key = self.member_key(unscopables_sym);
+            let unscopables = self
+                .read_member(h, &unscopables_key)
+                .ok()
+                .and_then(|v| v.as_handle().map(Handle::from_raw));
+            if let Some(u) = unscopables
+                && let Ok(blocked) = self.read_member(u, name)
+                && self.realm.truthy(blocked)
+            {
+                continue;
+            }
+            return Some(h);
+        }
+        None
+    }
+
+    /// Whether `handle` has `name` as an own or inherited property (walks the
+    /// prototype chain; includes accessors).
+    fn has_property_chain(&self, handle: Handle, name: &str) -> bool {
+        let mut cur = Some(handle);
+        while let Some(c) = cur {
+            if self.realm.has_own(c, name) || self.realm.accessor(c, name).is_some() {
+                return true;
+            }
+            cur = self.realm.object_proto(c);
+        }
+        false
+    }
+
     fn assign_to(&mut self, target: &'a Expr, value: NanBox) -> Result<(), ExecError> {
         match target {
             Expr::Ident(id) => {
+                // A bare identifier inside `with (obj)` assigns to the with-object's
+                // property (via `[[Set]]`, so setters fire) when it provides the name.
+                if let Some(h) = self.with_binding(&id.name) {
+                    let key = self.new_str(&id.name);
+                    self.assign_member_value(h, key, value)?;
+                    return Ok(());
+                }
                 // Reassigning a `const` binding is a TypeError.
                 if self.current.is_const(&id.name) {
                     let m = self.new_str("Assignment to constant variable.");
@@ -15385,16 +15469,23 @@ impl<'a> Interp<'a> {
                 "undefined" => Ok(NanBox::undefined()),
                 "NaN" => Ok(NanBox::number(f64::NAN)),
                 "Infinity" => Ok(NanBox::number(f64::INFINITY)),
-                name => match self.current.get(name) {
-                    Some(v) => Ok(v),
-                    // An unresolved reference throws a catchable ReferenceError.
-                    None => {
-                        let msg = self.new_str(&alloc::format!("{name} is not defined"));
-                        Err(ExecError::Throw(
-                            self.make_error(N_REFERENCE_ERROR, Some(msg)),
-                        ))
+                name => {
+                    // A bare identifier inside `with (obj)` first resolves against
+                    // the with-object's properties (via `[[Get]]`, so accessors fire).
+                    if let Some(h) = self.with_binding(name) {
+                        return self.read_member(h, name);
                     }
-                },
+                    match self.current.get(name) {
+                        Some(v) => Ok(v),
+                        // An unresolved reference throws a catchable ReferenceError.
+                        None => {
+                            let msg = self.new_str(&alloc::format!("{name} is not defined"));
+                            Err(ExecError::Throw(
+                                self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                            ))
+                        }
+                    }
+                }
             },
             Expr::Regex { pattern, flags, .. } => Ok(NanBox::handle(
                 self.realm.new_regexp(pattern, flags).to_raw(),
@@ -15629,6 +15720,7 @@ impl<'a> Interp<'a> {
                     UnaryOp::Typeof => {
                         if let Expr::Ident(id) = &**argument
                             && self.current.get(&id.name).is_none()
+                            && self.with_binding(&id.name).is_none()
                             && !matches!(&*id.name, "undefined" | "NaN" | "Infinity")
                         {
                             return Ok(self.new_str("undefined"));
@@ -17005,6 +17097,20 @@ impl<'a> Interp<'a> {
         match target {
             Expr::Ident(id) => {
                 let name = &*id.name;
+                // A bare identifier inside `with (obj)` reads/writes the with-object's
+                // property when it provides the name (so `with(o){ x op= v }` and
+                // setters/getters work).
+                if let Some(h) = self.with_binding(name) {
+                    let new = if op == AssignOp::Assign {
+                        rhs
+                    } else {
+                        let current = self.read_member(h, name)?;
+                        self.binary(compound_op(op)?, current, rhs)?
+                    };
+                    let key = self.new_str(name);
+                    self.assign_member_value(h, key, new)?;
+                    return Ok(new);
+                }
                 // Reassigning a `const` binding is a TypeError.
                 if self.current.is_const(name) {
                     let m = self.new_str("Assignment to constant variable.");
