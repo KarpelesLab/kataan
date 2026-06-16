@@ -476,10 +476,10 @@ impl<'a> Interp<'a> {
                     if let Some(h) = src {
                         for k in self.realm.object_keys(h).unwrap_or_default() {
                             if !used.contains(&k) {
-                                let pv = self
-                                    .realm
-                                    .get_property(h, &k)
-                                    .unwrap_or(NanBox::undefined());
+                                // Read through `read_member` so an own getter fires
+                                // (exactly once); the rest object always gets a plain
+                                // enumerable, writable, configurable data property.
+                                let pv = self.read_member(h, &k)?;
                                 self.realm.set_property(obj, &k, pv);
                             }
                         }
@@ -739,10 +739,9 @@ impl<'a> Interp<'a> {
                             if let Some(h) = src {
                                 for k in self.realm.object_keys(h).unwrap_or_default() {
                                     if !used.contains(&k) {
-                                        let pv = self
-                                            .realm
-                                            .get_property(h, &k)
-                                            .unwrap_or(NanBox::undefined());
+                                        // `read_member` fires an own getter (once);
+                                        // the rest object gets a plain data property.
+                                        let pv = self.read_member(h, &k)?;
                                         self.realm.set_property(obj, &k, pv);
                                     }
                                 }
