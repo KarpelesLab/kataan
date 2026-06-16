@@ -1102,6 +1102,28 @@ impl Realm {
         })
     }
 
+    /// Recompiles the `RegExp` at `handle` in place (`RegExp.prototype.compile`):
+    /// replaces its source/flags, drops the cached compiled program, and resets
+    /// `lastIndex` to 0. A no-op if `handle` is not a RegExp.
+    pub fn recompile_regexp(&mut self, handle: Handle, source: &str, flags: &str) {
+        if let Some(Cell::RegExp {
+            source: s,
+            flags: f,
+            last_index,
+            #[cfg(feature = "regex")]
+            compiled,
+        }) = self.heap.get_mut(handle)
+        {
+            *s = alloc::boxed::Box::from(source);
+            *f = alloc::boxed::Box::from(flags);
+            *last_index = 0;
+            #[cfg(feature = "regex")]
+            {
+                *compiled.borrow_mut() = None;
+            }
+        }
+    }
+
     /// The compiled program for the `RegExp` at `handle`, compiled+cached on first
     /// use (RE-P1) and returned as a cheap `Rc` clone thereafter. Returns `None`
     /// if `handle` is not a `RegExp` or its pattern fails to compile (callers then
@@ -1729,7 +1751,10 @@ impl Realm {
     pub fn prevent_extensions(&mut self, handle: Handle) {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.non_extensible_arrays.insert(handle.to_raw());
-        } else if matches!(self.heap.get(handle), Some(Cell::TypedArray { .. })) {
+        } else if matches!(
+            self.heap.get(handle),
+            Some(Cell::TypedArray { .. } | Cell::RegExp { .. })
+        ) {
             let aux = self.aux_object(handle);
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
                 o.prevent_extensions();
@@ -1744,7 +1769,10 @@ impl Realm {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.sealed_arrays.insert(handle.to_raw());
             self.non_extensible_arrays.insert(handle.to_raw());
-        } else if matches!(self.heap.get(handle), Some(Cell::TypedArray { .. })) {
+        } else if matches!(
+            self.heap.get(handle),
+            Some(Cell::TypedArray { .. } | Cell::RegExp { .. })
+        ) {
             let aux = self.aux_object(handle);
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
                 o.seal();
@@ -1765,9 +1793,12 @@ impl Realm {
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
             return o.is_extensible();
         }
-        // A typed array is extensible by default; `preventExtensions`/`seal`/
-        // `freeze` records the flag on its auxiliary object.
-        if matches!(self.heap.get(handle), Some(Cell::TypedArray { .. })) {
+        // A typed array / RegExp is extensible by default; `preventExtensions`/
+        // `seal`/`freeze` records the flag on its auxiliary object.
+        if matches!(
+            self.heap.get(handle),
+            Some(Cell::TypedArray { .. } | Cell::RegExp { .. })
+        ) {
             return self
                 .aux_props
                 .get(&handle.to_raw())
@@ -1943,6 +1974,11 @@ impl Realm {
                 || c.as_bound_native().is_some()
                 || c.as_class().is_some()
                 || matches!(c, Cell::TypedArray { .. })
+                // A RegExp instance carries no inline object part, but a script may
+                // set own properties on it (`re.exec = fn`, a custom `lastIndex`
+                // descriptor) — and the Symbol.* methods read a user `exec`
+                // override — so it stores named props in an auxiliary object.
+                || matches!(c, Cell::RegExp { .. })
         })
     }
 

@@ -1349,55 +1349,12 @@ impl<'a> Interp<'a> {
                 _ => return Ok(None),
             }));
         }
-        // --- RegExp instance methods (`test`/`exec`) ---
-        if let Some((_source, flags)) = self.realm.regexp_at(handle) {
-            let _ = &flags;
-            #[cfg(feature = "regex")]
-            {
-                let text = self.realm.to_display_string(arg(0));
-                // Use the RegExp cell's compiled-program cache (RE-P1): a reused
-                // regex compiles once, not per call. The `Rc` is cloned out, so
-                // no heap borrow is held during match work.
-                let re = self.realm.regex_compiled(handle);
-                if matches!(method, "test" | "exec")
-                    && let Some(re) = re
-                {
-                    // `g`/`y` regexes are stateful: search resumes at `lastIndex`
-                    // and is updated to the match end (or reset to 0 on no match).
-                    // `lastIndex` is a **code-unit** index, matching the engine's
-                    // native UTF-16 subject model.
-                    let stateful = flags.contains('g') || flags.contains('y');
-                    let start = if stateful {
-                        self.realm.regex_last_index(handle)
-                    } else {
-                        0
-                    };
-                    // Collect the subject to UTF-16 code units ONCE (RE-7); match
-                    // spans are code-unit indices into this buffer. `text` is the
-                    // lossy form (for `.input`); the units come from the lossless
-                    // WTF-8 bytes so a surrogate-bearing subject matches correctly.
-                    let subject_bytes = self.arg_string_bytes(arg(0));
-                    let units: Vec<u16> = crate::wtf8::utf16_units(&subject_bytes).collect();
-                    let caps = re.captures_in_u16(&units, start);
-                    if stateful {
-                        let next = caps.as_ref().map_or(0, |c| c.whole().1);
-                        self.realm.set_regex_last_index(handle, next);
-                    }
-                    return Ok(Some(match (method, caps) {
-                        ("test", c) => NanBox::boolean(c.is_some()),
-                        (_, Some(c)) => {
-                            let input = self.new_str(&text);
-                            self.regex_match_object_u16(&units, input, &c, re.group_names())
-                        }
-                        (_, None) => NanBox::null(),
-                    }));
-                }
-            }
-            #[cfg(not(feature = "regex"))]
-            if matches!(method, "test" | "exec") {
-                return Err(ExecError::Unsupported("RegExp needs the regex feature"));
-            }
-        }
+        // --- RegExp instance methods (`exec`/`test`/`compile`/`toString`) ---
+        // These now resolve as first-class `RegExp.prototype` methods (so a user
+        // `re.exec` override and the Get/Set `lastIndex` semantics are honored),
+        // so `call_method` does NOT intercept them — it returns `None` and the
+        // caller reads the inherited prototype method and invokes it. We only keep
+        // the symbol-method delegation below for `str.match(re)` etc.
         // `Map.groupBy(items, cb)` — like `Object.groupBy` but a Map (keys are
         // the callback's return value as-is, so objects work as group keys).
         if self.realm.native_at(handle) == Some(N_MAP) && method == "groupBy" {
@@ -1623,7 +1580,9 @@ impl<'a> Interp<'a> {
         // A custom matcher/replacer: when the argument defines the matching
         // well-known symbol method (`Symbol.match`/`replace`/`search`/`split`/
         // `matchAll`), `str.method(obj)` delegates to `obj[@@method](str, …rest)`.
-        if let Some(s) = self.realm.string_value(handle)
+        // (A RegExp argument now resolves its `@@method` through `RegExp.prototype`,
+        // so this is the spec path for `"…".match(/re/)` etc.)
+        if self.realm.string_value(handle).is_some()
             && let Some(sym_name) = match method {
                 "match" => Some("match"),
                 "matchAll" => Some("matchAll"),
@@ -1634,293 +1593,69 @@ impl<'a> Interp<'a> {
             }
             && let Some(argh) = arg(0).as_handle().map(Handle::from_raw)
         {
+            // `replaceAll`/`matchAll` first require that a RegExp `searchValue`/
+            // `regexp` be global (`IsRegExp` + `Get(flags)` not containing "g" →
+            // TypeError), checked *before* dispatching the symbol method.
+            if matches!(method, "replaceAll" | "matchAll") && self.is_regexp_arg(arg(0)) {
+                let flags_v = self.read_member(argh, "flags")?;
+                if matches!(flags_v.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    return Err(self.type_error(&alloc::format!(
+                        "String.prototype.{method} called with a non-global RegExp argument"
+                    )));
+                }
+                let flags_s = self.coerce_to_string(flags_v)?;
+                if !flags_s.contains('g') {
+                    return Err(self.type_error(&alloc::format!(
+                        "String.prototype.{method} called with a non-global RegExp argument"
+                    )));
+                }
+            }
             let sym = self.well_known_symbol(sym_name);
             let key = self.member_key(sym);
             let m = self.read_member(argh, &key)?;
             if m.as_handle()
                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
             {
-                let this_str = self.new_str(&s);
+                // Pass the receiver string value itself (a String already), so a
+                // surrogate-bearing subject reaches the symbol method losslessly
+                // (`new_str(&string_value)` would replacement-char a lone surrogate).
+                let this_str = NanBox::handle(handle.to_raw());
                 let mut call_args = alloc::vec![this_str];
                 call_args.extend_from_slice(&args[1.min(args.len())..]);
                 return Ok(Some(self.call_with_this(m, arg(0), &call_args)?));
             }
         }
 
-        // A plain (non-RegExp, non-`Symbol.match`) string/number argument to
-        // `match`/`matchAll`/`search` is coerced to a RegExp pattern (`matchAll` needs
-        // the global flag). `split`/`replace` keep treating a string argument literally.
-        #[cfg(feature = "regex")]
-        let string_pat: Option<(String, String)> =
-            if matches!(method, "match" | "matchAll" | "search")
-                && self.realm.string_value(handle).is_some()
-                && arg(0)
-                    .as_handle()
-                    .and_then(|raw| self.realm.regexp_at(Handle::from_raw(raw)))
-                    .is_none()
-                && !matches!(arg(0).unpack(), Unpacked::Undefined | Unpacked::Null)
-            {
-                let flags = if method == "matchAll" {
-                    String::from("g")
-                } else {
-                    String::new()
-                };
-                // ToString the pattern argument, honoring a user `toString`/
-                // `@@toPrimitive` (which may throw).
-                Some((self.coerce_to_string(arg(0))?, flags))
-            } else {
-                None
-            };
-
-        // --- regex-backed String methods (when the argument is a RegExp) ---
-        // When the argument is a RegExp object, compile via its cell cache (RE-P1)
-        // so a reused regex compiles once. A string-coerced pattern (`string_pat`,
-        // no backing cell) still compiles fresh into an `Rc` for type uniformity.
-        #[cfg(feature = "regex")]
-        let arg_regexp_handle = arg(0)
-            .as_handle()
-            .map(Handle::from_raw)
-            .filter(|&raw| self.realm.regexp_at(raw).is_some());
-        #[cfg(feature = "regex")]
-        if let Some(s) = self.realm.string_value(handle)
-            && matches!(
-                method,
-                "match" | "matchAll" | "search" | "replace" | "replaceAll" | "split"
-            )
-            && let Some((_src, flags)) = arg_regexp_handle
-                .and_then(|raw| self.realm.regexp_at(raw))
-                .or(string_pat)
-            && let Some(re) = match arg_regexp_handle {
-                Some(rh) => self.realm.regex_compiled(rh),
-                None => crate::regex::Regex::new(&_src, &flags)
-                    .ok()
-                    .map(alloc::rc::Rc::new),
+        // `String.prototype.{match,matchAll,search}` with a non-RegExp argument
+        // (incl. `undefined`/`null`/a string/number) constructs `RegExp(arg, flags)`
+        // (matchAll forces the global flag) and delegates to its `@@method`, per
+        // spec — so `"abc".match()` matches the empty pattern and a coerced
+        // `toString` is honored. (`replace`/`replaceAll`/`split` keep treating a
+        // non-RegExp argument literally, handled in the string-methods block below.)
+        if self.realm.string_value(handle).is_some()
+            && let Some(sym_name) = match method {
+                "match" => Some("match"),
+                "matchAll" => Some("matchAll"),
+                "search" => Some("search"),
+                _ => None,
             }
         {
-            let global = flags.contains('g');
-            // `matchAll`/`replaceAll` require a global RegExp.
-            if !global && matches!(method, "matchAll" | "replaceAll") {
-                let m = self.new_str(&alloc::format!(
-                    "{method} must be called with a global RegExp"
-                ));
-                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-            }
-            // Collect the subject to UTF-16 code units ONCE (RE-7); every
-            // per-match scan below reuses this `&[u16]` via the native
-            // `*_in_u16` API and `u16_slice*` helpers, so a dense global
-            // match/replace/split stays O(n) instead of O(n²). All match,
-            // capture, `.index`, and split positions are **code-unit** indices.
-            // The subject's lossless WTF-8 bytes feed the unit buffer so a
-            // surrogate-bearing subject matches correctly. The `u`-flag drives
-            // empty-match advancement (a whole code point vs one code unit).
-            let unicode = flags.contains('u');
-            let subject_bytes = self.realm.string_bytes(handle).unwrap_or_default();
-            let units: Vec<u16> = crate::wtf8::utf16_units(&subject_bytes).collect();
-            let len = units.len();
-            match method {
-                "search" => {
-                    let idx = re.find_in_u16(&units, 0).map_or(-1.0, |(st, _)| st as f64);
-                    return Ok(Some(NanBox::number(idx)));
-                }
-                "match" if !global => {
-                    return Ok(Some(match re.captures_in_u16(&units, 0) {
-                        Some(caps) => {
-                            let input = self.new_str(&s);
-                            self.regex_match_object_u16(&units, input, &caps, re.group_names())
-                        }
-                        None => NanBox::null(),
-                    }));
-                }
-                "match" => {
-                    // Global: an array of all whole matches (or null).
-                    let mut out = Vec::new();
-                    let mut at = 0;
-                    while let Some((st, en)) = re.find_in_u16(&units, at) {
-                        out.push(self.new_str_bytes(u16_slice(&units, st, en)));
-                        at = if en > st {
-                            en
-                        } else {
-                            advance_index_u16(&units, en, unicode)
-                        };
-                    }
-                    return Ok(Some(if out.is_empty() {
-                        NanBox::null()
-                    } else {
-                        NanBox::handle(self.realm.new_array(out).to_raw())
-                    }));
-                }
-                // `matchAll` — an iterator of match-result arrays `[full, g1, …]`.
-                "matchAll" => {
-                    let mut out = Vec::new();
-                    let mut at = 0;
-                    while let Some(caps) = re.captures_in_u16(&units, at) {
-                        let Some((st, en)) = caps.groups[0] else {
-                            break;
-                        };
-                        // A full match-result object (indexed groups + `.groups`
-                        // named captures + `.index`/`.input`).
-                        let input = self.new_str(&s);
-                        out.push(self.regex_match_object_u16(
-                            &units,
-                            input,
-                            &caps,
-                            re.group_names(),
-                        ));
-                        at = if en > st {
-                            en
-                        } else {
-                            advance_index_u16(&units, en, unicode)
-                        };
-                        if at > len {
-                            break;
-                        }
-                    }
-                    return Ok(Some(self.make_generator(out)));
-                }
-                "split" => {
-                    // An optional limit caps the number of result segments.
-                    let limit = match args.get(1) {
-                        Some(a) if !matches!(a.unpack(), Unpacked::Undefined) => {
-                            let n = self.realm.to_number(*a);
-                            if n >= 0.0 { Some(n as usize) } else { None }
-                        }
-                        _ => None,
-                    };
-                    let mut parts = Vec::new();
-                    // `seg_start` begins the current segment; `search` is where the
-                    // next match is sought (advanced past zero-width matches so a
-                    // lookahead split doesn't drop a character). All are code-unit
-                    // indices.
-                    let mut seg_start = 0;
-                    let mut search = 0;
-                    // Match positions are `< len` (the spec's `q < size`); the tail
-                    // after the last split is appended once, below.
-                    while search < len && limit.is_none_or(|l| parts.len() < l) {
-                        let Some(caps) = re.captures_in_u16(&units, search) else {
-                            break;
-                        };
-                        let Some((st, en)) = caps.groups[0] else {
-                            break;
-                        };
-                        // A zero-width match at the segment start: not a split;
-                        // step the search past one code unit (or code point under
-                        // the `u`-flag) and retry.
-                        if en == seg_start {
-                            let next = search.max(st);
-                            if next < len {
-                                search = advance_index_u16(&units, next, unicode);
-                                continue;
-                            }
-                            break;
-                        }
-                        parts.push(self.new_str_bytes(u16_slice(&units, seg_start, st)));
-                        // The separator's capture groups are spliced into the
-                        // result (`"a1b".split(/(\d)/)` → `["a","1","b"]`).
-                        for g in &caps.groups[1..] {
-                            match g {
-                                Some((gs, ge)) => {
-                                    parts.push(self.new_str_bytes(u16_slice(&units, *gs, *ge)))
-                                }
-                                None => parts.push(NanBox::undefined()),
-                            }
-                        }
-                        seg_start = en;
-                        search = if en > st {
-                            en
-                        } else {
-                            advance_index_u16(&units, en, unicode)
-                        };
-                    }
-                    if limit.is_none_or(|l| parts.len() < l) {
-                        parts.push(self.new_str_bytes(u16_slice_from(&units, seg_start)));
-                    }
-                    if let Some(l) = limit {
-                        parts.truncate(l);
-                    }
-                    return Ok(Some(NanBox::handle(self.realm.new_array(parts).to_raw())));
-                }
-                // replace / replaceAll. The replacement is either a function
-                // (called with `match, g1.., offset, whole`) or a template string
-                // (`$1`..`$9` / `$&`).
-                _ => {
-                    let replacer = arg(1);
-                    let is_fn = replacer
-                        .as_handle()
-                        .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)));
-                    let templ = if is_fn {
-                        String::new()
-                    } else {
-                        self.realm.to_display_string(replacer)
-                    };
-                    // The result is built as WTF-8 bytes so astral characters and
-                    // lone surrogates in the subject / replacement survive.
-                    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                    let mut at = 0;
-                    while let Some(caps) = re.captures_in_u16(&units, at) {
-                        let (st, en) = caps.groups[0].unwrap_or((at, at));
-                        out.extend_from_slice(&u16_slice(&units, at, st));
-                        if is_fn {
-                            let mut call_args =
-                                alloc::vec![self.new_str_bytes(u16_slice(&units, st, en))];
-                            for g in caps.groups.iter().skip(1) {
-                                call_args.push(match g {
-                                    Some((gs, ge)) => {
-                                        self.new_str_bytes(u16_slice(&units, *gs, *ge))
-                                    }
-                                    None => NanBox::undefined(),
-                                });
-                            }
-                            // `offset` is a code-unit index.
-                            call_args.push(NanBox::number(st as f64));
-                            call_args.push(self.new_str(&s));
-                            // With named groups, the final argument is a `groups`
-                            // object mapping each name to its captured substring.
-                            let group_names = re.group_names();
-                            if !group_names.is_empty() {
-                                let go = self.realm.new_object();
-                                for (idx, name) in group_names {
-                                    let v = match caps.groups.get(*idx).copied().flatten() {
-                                        Some((gs, ge)) => {
-                                            self.new_str_bytes(u16_slice(&units, gs, ge))
-                                        }
-                                        None => NanBox::undefined(),
-                                    };
-                                    self.realm.set_property(go, name, v);
-                                }
-                                call_args.push(NanBox::handle(go.to_raw()));
-                            }
-                            let r = self.call(replacer, &call_args)?;
-                            let rep = self.arg_string_bytes(r);
-                            out.extend_from_slice(&rep);
-                        } else {
-                            out.extend_from_slice(&expand_replacement_u16(
-                                &templ,
-                                &units,
-                                &caps,
-                                re.group_names(),
-                            ));
-                        }
-                        if en > st {
-                            at = en;
-                        } else {
-                            // Empty match: keep the code unit(s) at `en` and step
-                            // one code unit (or, under the `u`-flag, one whole code
-                            // point) past it.
-                            if en >= len {
-                                break;
-                            }
-                            let next = advance_index_u16(&units, en, unicode);
-                            out.extend_from_slice(&u16_slice(&units, en, next));
-                            at = next;
-                        }
-                        if !global {
-                            break;
-                        }
-                    }
-                    out.extend_from_slice(&u16_slice_from(&units, at));
-                    return Ok(Some(self.new_str_bytes(out)));
-                }
-            }
+            let regexp_ctor = self.current.get("RegExp").unwrap_or(NanBox::undefined());
+            let ctor_args: alloc::vec::Vec<NanBox> = if method == "matchAll" {
+                alloc::vec![arg(0), self.new_str("g")]
+            } else {
+                alloc::vec![arg(0)]
+            };
+            let rx = self.construct(regexp_ctor, &ctor_args)?;
+            let Some(rxh) = rx.as_handle().map(Handle::from_raw) else {
+                return Ok(Some(NanBox::null()));
+            };
+            let sym = self.well_known_symbol(sym_name);
+            let key = self.member_key(sym);
+            let m = self.read_member(rxh, &key)?;
+            // The receiver string value itself (lossless).
+            let this_str = NanBox::handle(handle.to_raw());
+            return Ok(Some(self.call_with_this(m, rx, &[this_str])?));
         }
 
         // --- string methods ---

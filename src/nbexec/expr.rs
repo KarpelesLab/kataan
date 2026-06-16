@@ -181,7 +181,7 @@ impl<'a> Interp<'a> {
                 }
             },
             Expr::Regex { pattern, flags, .. } => Ok(NanBox::handle(
-                self.realm.new_regexp(pattern, flags).to_raw(),
+                self.new_regexp_instance(pattern, flags).to_raw(),
             )),
             // A template literal: interleave cooked quasis with interpolations.
             // Built as WTF-8 bytes so a surrogate-bearing quasi (`` `\uD800` ``)
@@ -1119,11 +1119,10 @@ impl<'a> Interp<'a> {
         if name == "length" && self.realm.typed_len(handle).is_some() {
             return Ok(());
         }
-        // `regex.lastIndex = n` updates the RegExp's stateful search position.
+        // `regex.lastIndex = n` updates the RegExp's stateful search position
+        // (honoring a non-writable descriptor installed via `defineProperty`).
         if name == "lastIndex" && self.realm.regexp_at(handle).is_some() {
-            let n = self.realm.to_number(new).max(0.0) as usize;
-            self.realm.set_regex_last_index(handle, n);
-            return Ok(());
+            return self.regex_write_last_index(handle, new);
         }
         // An own accessor setter takes precedence.
         if let Some((_, setter)) = self.realm.accessor(handle, &name) {
@@ -1464,24 +1463,19 @@ impl<'a> Interp<'a> {
             let this = NanBox::handle(handle.to_raw());
             return self.call_with_this(getter, this, &[]);
         }
-        // RegExp introspection properties. (`constructor` falls through to the
-        // built-in-constructor fallback below.)
-        if name != "constructor"
-            && let Some((source, flags)) = self.realm.regexp_at(handle)
+        // `RegExp.prototype.lastIndex` — a real own *data* property of every
+        // RegExp instance, stored in the cell (not in the shape), so it is read
+        // here directly. Unless overridden by an own aux slot (a user
+        // `Object.defineProperty(re,"lastIndex",…)` would land in aux), the cell
+        // value is authoritative. `source`/`flags`/the flag getters are spec
+        // *accessor* properties on `RegExp.prototype` and resolve through the
+        // prototype walk below (so they escape the source, validate the brand, and
+        // honor a subclass override).
+        if name == "lastIndex"
+            && self.realm.regexp_at(handle).is_some()
+            && !self.realm.has_own(handle, "lastIndex")
         {
-            return Ok(match name {
-                "source" => self.new_str(&source),
-                "flags" => self.new_str(&flags),
-                "global" => NanBox::boolean(flags.contains('g')),
-                "ignoreCase" => NanBox::boolean(flags.contains('i')),
-                "multiline" => NanBox::boolean(flags.contains('m')),
-                "sticky" => NanBox::boolean(flags.contains('y')),
-                "dotAll" => NanBox::boolean(flags.contains('s')),
-                "unicode" => NanBox::boolean(flags.contains('u')),
-                "hasIndices" => NanBox::boolean(flags.contains('d')),
-                "lastIndex" => NanBox::number(self.realm.regex_last_index(handle) as f64),
-                _ => self.member_value(handle, name),
-            });
+            return Ok(NanBox::number(self.realm.regex_last_index(handle) as f64));
         }
         // Branded-prototype accessors. `ArrayBuffer.prototype.byteLength`,
         // `DataView.prototype.buffer`, `%TypedArray%.prototype.buffer`, … are spec
@@ -1956,14 +1950,13 @@ impl<'a> Interp<'a> {
         property: &'a PropertyKey,
         new: NanBox,
     ) -> Result<(), ExecError> {
-        // `regex.lastIndex = n` updates the RegExp's stateful search position.
+        // `regex.lastIndex = n` updates the RegExp's stateful search position
+        // (honoring a non-writable descriptor installed via `defineProperty`).
         if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property
             && &**s == "lastIndex"
             && self.realm.regexp_at(handle).is_some()
         {
-            let n = self.realm.to_number(new).max(0.0) as usize;
-            self.realm.set_regex_last_index(handle, n);
-            return Ok(());
+            return self.regex_write_last_index(handle, new);
         }
         // `obj.__proto__ = proto` updates the prototype link (like
         // `Object.setPrototypeOf`); a non-object, non-null value is ignored.

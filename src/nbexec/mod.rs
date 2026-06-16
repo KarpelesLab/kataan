@@ -317,6 +317,9 @@ pub struct Interp<'a> {
     /// The frozen template-strings object for each tagged-template site (keyed by the
     /// AST node's address), so the same array is passed to the tag on every evaluation.
     tagged_template_cache: alloc::collections::BTreeMap<usize, NanBox>,
+    /// `RegExp.prototype`, recorded at setup so RegExp instances can link their
+    /// `[[Prototype]]` to it (and species lookups resolve cheaply).
+    regexp_proto: Option<Handle>,
     /// Leak-once cache interning `Intl.NumberFormat` currency/unit codes to `&'static str`
     /// (the `intl` crate's options take `'static`); bounded by the distinct codes a program
     /// uses.
@@ -768,6 +771,46 @@ const DATE_PROTO_METHODS: &[&str] = &[
 /// and never applies the plain-`Array` result conversion — so e.g.
 /// `Int8Array.prototype.map.call(ta, fn)` returns a same-kind typed array.
 const N_TYPED_ARRAY_PROTO_FN: u16 = 246;
+/// A first-class `RegExp.prototype.<method>` (`exec`/`test`/`compile`/`toString`
+/// and the `@@match`/`@@matchAll`/`@@replace`/`@@search`/`@@split` symbol
+/// methods). A bound native carrying the method name; calling it brand-validates
+/// the call's `this` inside the handler (most methods only require an Object —
+/// they read `exec`, `global`, … off it — while `exec`/`compile` require an
+/// actual RegExp). The new ids start at 280 to avoid sibling collisions.
+const N_REGEXP_PROTO_FN: u16 = 280;
+/// A `get RegExp.prototype.<accessor>` getter (`source`/`flags`/`global`/
+/// `ignoreCase`/`multiline`/`dotAll`/`sticky`/`unicode`/`unicodeSets`/
+/// `hasIndices`). A bound native carrying the accessor name; calling it validates
+/// the receiver is a RegExp (or the `RegExp.prototype` sentinel) and returns the
+/// flag/source/flags value, else a `TypeError`.
+const N_REGEXP_ACCESSOR: u16 = 281;
+/// `get RegExp[Symbol.species]` — a bound native (target: the `RegExp`
+/// constructor) whose getter returns its `this` receiver.
+const N_REGEXP_SPECIES: u16 = 282;
+/// The `RegExp.prototype` methods exposed as first-class string-keyed values.
+const REGEXP_PROTO_METHODS: &[&str] = &["exec", "test", "compile", "toString"];
+/// The `RegExp.prototype` `get` accessors (string keys).
+const REGEXP_ACCESSORS: &[&str] = &[
+    "source",
+    "flags",
+    "global",
+    "ignoreCase",
+    "multiline",
+    "dotAll",
+    "sticky",
+    "unicode",
+    "unicodeSets",
+    "hasIndices",
+];
+/// The `RegExp.prototype` well-known-symbol methods (`@@match`, …) and the method
+/// name `call_method` dispatches each to.
+const REGEXP_SYMBOL_METHODS: &[(&str, &str)] = &[
+    ("match", "match"),
+    ("matchAll", "matchAll"),
+    ("replace", "replace"),
+    ("search", "search"),
+    ("split", "split"),
+];
 /// The `Array.prototype` methods exposed as first-class values (each re-dispatched
 /// through `call_method`).
 const ARRAY_PROTO_METHODS: &[&str] = &[
@@ -1156,6 +1199,11 @@ const DATA_VIEW_LEN: &str = "\u{0}dvlen";
 const ARRAY_BUFFER_PROTO_BRAND: &str = "\u{0}abproto";
 const DATA_VIEW_PROTO_BRAND: &str = "\u{0}dvproto";
 const TYPED_ARRAY_PROTO_BRAND: &str = "\u{0}taproto";
+/// Marks the `RegExp.prototype` object so its accessor getters (`source`/`flags`/
+/// flag getters) recognise it as the sentinel receiver — `source` → `"(?:)"`,
+/// `flags` → `""`, and each flag getter → `undefined` — rather than throwing the
+/// non-RegExp `TypeError`.
+const REGEXP_PROTO_BRAND: &str = "\u{0}reproto";
 const BOUND_TARGET: &str = "\u{0}bnd_t";
 const BOUND_THIS: &str = "\u{0}bnd_this";
 const BOUND_ARGS: &str = "\u{0}bnd_args";
@@ -1290,6 +1338,7 @@ impl<'a> Interp<'a> {
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
             tagged_template_cache: alloc::collections::BTreeMap::new(),
+            regexp_proto: None,
             #[cfg(feature = "intl")]
             intl_intern: alloc::collections::BTreeMap::new(),
             method_name_intern: alloc::collections::BTreeMap::new(),
@@ -2321,6 +2370,7 @@ impl<'a> Interp<'a> {
             self.realm.mark_hidden(bi_proto, &tag_key);
             self.realm.set_readonly_property(bi_proto, &tag_key);
         }
+        self.setup_regexp_prototype();
         self.setup_first_class_prototype("Function", FUNCTION_PROTO_METHODS);
         self.setup_first_class_prototype_id("Set", SET_PROTO_METHODS, N_SET_PROTO_FN);
         self.setup_first_class_prototype_id("Map", MAP_PROTO_METHODS, N_MAP_PROTO_FN);
@@ -4453,87 +4503,6 @@ fn parse_float_prefix(s: &str) -> f64 {
         end += 1;
     }
     s[..end].parse::<f64>().unwrap_or(f64::NAN)
-}
-
-/// Expands a `replace` template against `caps`: `$&` (whole match), `` $` ``
-/// (prefix), `$'` (suffix), `$1`..`$9` (numbered groups), `$<name>` (named
-/// groups), and `$$` (literal `$`). The subject is the pre-collected `&[u16]`
-/// (the native UTF-16 regex subject) and capture spans are **code-unit**
-/// indices. Substituted slices are re-encoded to WTF-8 so astral characters and
-/// lone surrogates survive, and the returned bytes are concatenated WTF-8.
-#[cfg(feature = "regex")]
-fn expand_replacement_u16(
-    templ: &str,
-    subj: &[u16],
-    caps: &crate::regex::Captures,
-    group_names: &[(usize, String)],
-) -> alloc::vec::Vec<u8> {
-    let group = |i: usize| -> alloc::vec::Vec<u8> {
-        caps.groups
-            .get(i)
-            .and_then(|g| *g)
-            .map(|(s, e)| u16_slice(subj, s, e))
-            .unwrap_or_default()
-    };
-    let (m_start, m_end) = caps.groups.first().and_then(|g| *g).unwrap_or((0, 0));
-    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    let mut tc = templ.chars().peekable();
-    while let Some(c) = tc.next() {
-        // `$<name>` — a named-group backreference.
-        if c == '$' && tc.peek() == Some(&'<') {
-            tc.next(); // `<`
-            let mut name = String::new();
-            while let Some(&ch) = tc.peek() {
-                tc.next();
-                if ch == '>' {
-                    break;
-                }
-                name.push(ch);
-            }
-            if let Some((idx, _)) = group_names.iter().find(|(_, n)| *n == name) {
-                out.extend_from_slice(&group(*idx));
-            }
-            continue;
-        }
-        if c != '$' {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            continue;
-        }
-        match tc.peek() {
-            Some('$') => {
-                out.push(b'$');
-                tc.next();
-            }
-            Some('&') => {
-                out.extend_from_slice(&group(0));
-                tc.next();
-            }
-            // `` $` `` is the portion before the match; `$'` the portion after.
-            Some('`') => {
-                out.extend_from_slice(&u16_slice(subj, 0, m_start));
-                tc.next();
-            }
-            Some('\'') => {
-                out.extend_from_slice(&u16_slice_from(subj, m_end));
-                tc.next();
-            }
-            // `$n` for an in-range group → the capture (empty if unmatched);
-            // out-of-range `$n` is left literal.
-            Some(d)
-                if d.is_ascii_digit() && {
-                    let n = (*d as u8 - b'0') as usize;
-                    n >= 1 && n < caps.groups.len()
-                } =>
-            {
-                let n = (*d as u8 - b'0') as usize;
-                tc.next();
-                out.extend_from_slice(&group(n));
-            }
-            _ => out.push(b'$'),
-        }
-    }
-    out
 }
 
 /// Advances `pos` past JSON whitespace.

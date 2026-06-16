@@ -306,6 +306,22 @@ impl<'a> Interp<'a> {
                 let name = self.realm.string_value(target).unwrap_or_default();
                 return self.iterator_proto_helper(&name, this_val, args);
             }
+            // A first-class `RegExp.prototype.<method>` (`exec`/`test`/`compile`/
+            // `toString` or a `@@match`/… symbol method): brand-validation is per
+            // method inside the dispatcher.
+            if id == N_REGEXP_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                return self.regexp_proto_dispatch(&name, this_val, args);
+            }
+            // A `get RegExp.prototype.<accessor>` getter (source/flags/flag getters).
+            if id == N_REGEXP_ACCESSOR {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                return self.regexp_accessor_dispatch(&name, this_val);
+            }
+            // `get RegExp[Symbol.species]` — returns the `this` receiver.
+            if id == N_REGEXP_SPECIES {
+                return Ok(this_val);
+            }
             // A `get %TypedArray%.prototype.<accessor>` getter: compute the
             // buffer/byteLength/byteOffset/length of the `this` typed array (or a
             // TypeError if `this` is not a typed array).
@@ -1296,14 +1312,46 @@ impl<'a> Interp<'a> {
             }
             return Ok(NanBox::handle(d.to_raw()));
         }
-        // `new RegExp(pattern, flags)`.
+        // `new RegExp(pattern, flags)` / `RegExp(pattern, flags)`.
         if id == N_REGEXP {
-            let pat = self
-                .realm
-                .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
-            let flags = match args.get(1) {
-                Some(f) => self.realm.to_display_string(*f),
-                None => String::new(),
+            let pattern = args.first().copied().unwrap_or(NanBox::undefined());
+            let flags_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
+            // If `pattern` is a RegExp instance, copy its source and (absent an
+            // explicit `flags` argument) its flags too — `new RegExp(/x/i)` clones
+            // `/x/i`, while `new RegExp(/x/i, "g")` keeps the source but uses "g".
+            let pat_h = pattern.as_handle().map(Handle::from_raw);
+            let (pat, flags) = if let Some((src, fl)) = pat_h.and_then(|h| self.realm.regexp_at(h))
+            {
+                let flags = if matches!(flags_arg.unpack(), Unpacked::Undefined) {
+                    fl
+                } else {
+                    self.coerce_to_string(flags_arg)?
+                };
+                (src, flags)
+            } else if let Some(ph) = pat_h.filter(|_| self.is_regexp_arg(pattern)) {
+                // A non-RegExp object with a truthy `@@match` (IsRegExp): use its
+                // `.source`/`.flags` when no flags argument is supplied.
+                let src_v = self.read_member(ph, "source")?;
+                let src = self.coerce_to_string(src_v)?;
+                let flags = if matches!(flags_arg.unpack(), Unpacked::Undefined) {
+                    let fv = self.read_member(ph, "flags")?;
+                    self.coerce_to_string(fv)?
+                } else {
+                    self.coerce_to_string(flags_arg)?
+                };
+                (src, flags)
+            } else {
+                let pat = if matches!(pattern.unpack(), Unpacked::Undefined) {
+                    String::new()
+                } else {
+                    self.coerce_to_string(pattern)?
+                };
+                let flags = if matches!(flags_arg.unpack(), Unpacked::Undefined) {
+                    String::new()
+                } else {
+                    self.coerce_to_string(flags_arg)?
+                };
+                (pat, flags)
             };
             // Validate the pattern/flags up front: an invalid regular expression is
             // a `SyntaxError` at construction, not a silent broken object.
@@ -1312,9 +1360,9 @@ impl<'a> Interp<'a> {
                 let m = self.new_str(&alloc::format!(
                     "Invalid regular expression: /{pat}/{flags}"
                 ));
-                return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 3, Some(m))));
+                return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
             }
-            let r = self.realm.new_regexp(&pat, &flags);
+            let r = self.new_regexp_instance(&pat, &flags);
             return Ok(NanBox::handle(r.to_raw()));
         }
         // `new Error(message, { cause })` and friends → `{ name, message }` plus

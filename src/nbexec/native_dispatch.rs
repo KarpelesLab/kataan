@@ -115,6 +115,29 @@ impl<'a> Interp<'a> {
                 }
             }
             N_BOOLEAN => NanBox::boolean(self.realm.truthy(arg(0))),
+            // `RegExp(pattern, flags)` called as a *function* behaves like
+            // `new RegExp(...)` here (the spec's species/this-is-RegExp short-circuit
+            // returns the same `pattern` only when it is a RegExp whose
+            // `.constructor` is `RegExp` and `flags` is undefined; for that case we
+            // also return `pattern` unchanged).
+            N_REGEXP => {
+                let pattern = arg(0);
+                let flags_arg = arg(1);
+                // `RegExp(re)` (no flags) where `re` is a RegExp with the default
+                // constructor returns `re` itself.
+                if matches!(flags_arg.unpack(), Unpacked::Undefined)
+                    && let Some(ph) = pattern.as_handle().map(Handle::from_raw)
+                    && self.realm.regexp_at(ph).is_some()
+                {
+                    let ctor = self.current.get("RegExp").unwrap_or(NanBox::undefined());
+                    let ctor_of = self.read_member(ph, "constructor")?;
+                    if self.realm.same_value(ctor, ctor_of) {
+                        return Ok(pattern);
+                    }
+                }
+                let regexp_ctor = self.current.get("RegExp").unwrap_or(NanBox::undefined());
+                return self.construct(regexp_ctor, args);
+            }
             N_SYMBOL => {
                 // A no-argument `Symbol()` has an `undefined` description, marked
                 // with a reserved sentinel (distinct from `Symbol("")`).
