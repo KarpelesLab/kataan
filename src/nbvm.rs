@@ -3898,15 +3898,17 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
             _ => None,
         };
         if let Some((name, class)) = named {
-            // A class extending an identifier that is not itself a class declared
-            // earlier in this program may resolve to a non-constructor (an arrow /
-            // generator / async function, or a plain object), which must throw a
-            // TypeError at definition. The bytecode path cannot do that check, so
-            // route such a class to the tree-walker (which validates the super).
-            if let Some(crate::ast::Expr::Ident(sid)) = class.super_class.as_deref()
-                && !class_map.contains_key(&*sid.name)
-            {
-                return Err(CompileError::Unsupported("extends a non-class binding"));
+            // A class with an `extends` clause that is not a simple identifier
+            // bound to a class declared earlier in this program may resolve to a
+            // non-constructor (a primitive, a non-constructor function, a plain
+            // object), which must throw a TypeError at definition. The bytecode
+            // path cannot perform that check, so route such a class to the
+            // tree-walker (which validates the superclass).
+            if let Some(sup) = class.super_class.as_deref() {
+                let known_class = matches!(sup, crate::ast::Expr::Ident(sid) if class_map.contains_key(&*sid.name));
+                if !known_class {
+                    return Err(CompileError::Unsupported("extends a non-class binding"));
+                }
             }
             let info = scan_class(class, class_id, &mut next_id, &mut class_jobs)?;
             class_id += 1;
@@ -5207,6 +5209,16 @@ impl Compiler {
             // class's *static* side as a value object bound to the class name, so
             // `ClassName.staticMethod()` / `ClassName.staticField` work.
             Stmt::Class(class) => {
+                // A class with an `extends` clause that is not a known compiled
+                // class must validate the superclass is a constructor/null at
+                // definition (a TypeError otherwise) — the tree-walker handles it.
+                if let Some(sup) = class.super_class.as_deref() {
+                    let known =
+                        matches!(sup, Expr::Ident(sid) if self.classes.contains_key(&*sid.name));
+                    if !known {
+                        return Err(CompileError::Unsupported("extends a non-class binding"));
+                    }
+                }
                 if let Some(cid) = &class.id {
                     self.materialize_class(&cid.name, class)?;
                 }
