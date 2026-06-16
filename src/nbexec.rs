@@ -9342,8 +9342,17 @@ impl<'a> Interp<'a> {
         let instance = self.realm.new_object();
         let this_val = NanBox::handle(instance.to_raw());
 
-        // Walk the chain derived→base, then install methods base-first so a
-        // derived method overrides an inherited one.
+        // Link the instance to the class's `.prototype` object (which carries the
+        // public methods/accessors of the whole `extends` chain), so methods are
+        // *inherited* — `instance.m === C.prototype.m`, `instance` has no own `m`,
+        // and the prototype chain resolves derived-over-base.
+        let proto = self.class_prototype_by_id(class_id);
+        self.realm.set_object_proto(instance, Some(proto));
+
+        // *Private* methods/accessors (`#m`) are not public prototype members:
+        // they brand the instance directly, so install them as own (hidden)
+        // private-keyed members over the whole chain (base-first so a derived
+        // private overrides — though shadowing across the chain is rare).
         let mut chain: Vec<(u32, Scope)> = Vec::new();
         let mut cur = Some((class_id, env.clone()));
         while let Some((cid, cenv)) = cur {
@@ -9359,9 +9368,12 @@ impl<'a> Interp<'a> {
                 if m.is_static {
                     continue;
                 }
+                // Only private members are installed on the instance; public ones
+                // live on the prototype.
+                if !matches!(&m.key, PropertyKey::Private(_)) {
+                    continue;
+                }
                 let saved = core::mem::replace(&mut self.current, cenv.clone());
-                // Resolve the key in the class scope (so `[computed]` names see
-                // the enclosing bindings).
                 let key = self.eval_prop_key(&m.key)?;
                 let f = self.make_method(
                     &m.value.params,
@@ -9374,13 +9386,12 @@ impl<'a> Interp<'a> {
                 self.current = saved;
                 match m.kind {
                     MethodKind::Method => {
-                        // Methods are callable but non-enumerable.
                         self.realm.set_hidden_property(instance, &key, f);
                     }
                     MethodKind::Get => {
                         self.realm
                             .define_accessor(instance, &key, f, NanBox::undefined());
-                        self.realm.mark_hidden(instance, &key); // class accessors are non-enumerable
+                        self.realm.mark_hidden(instance, &key);
                     }
                     MethodKind::Set => {
                         self.realm
@@ -9453,6 +9464,11 @@ impl<'a> Interp<'a> {
                 continue;
             };
             if m.is_static || m.kind == MethodKind::Constructor {
+                continue;
+            }
+            // Private methods/accessors are not public prototype members; they
+            // brand the instance directly (installed in `instantiate`).
+            if matches!(&m.key, PropertyKey::Private(_)) {
                 continue;
             }
             let saved = core::mem::replace(&mut self.current, env.clone());

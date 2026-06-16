@@ -170,6 +170,9 @@ pub enum Op {
     /// `obj[key] = src` as a *non-enumerable* own property (e.g. a class's
     /// `prototype`/`constructor` back-links).
     SetHidden { obj: Reg, key: String, src: Reg },
+    /// Sets the `[[Prototype]]` link of the object in `obj` to the object in
+    /// `proto` (used to link a class instance to its `.prototype`).
+    SetProto { obj: Reg, proto: Reg },
     /// `dst = obj[key]` (`undefined` if absent).
     GetProp { dst: Reg, obj: Reg, key: String },
     /// `dst = func(args…)` — call function `func` (an index into the program's
@@ -1754,14 +1757,40 @@ fn run_frame(
                     ctx.realm.set_array_length(handle, n);
                     continue;
                 }
-                // A setter accessor takes precedence over a data slot.
-                match ctx.realm.accessor(handle, key) {
-                    Some((_, setter)) if setter.as_handle().is_some() => {
+                // A setter accessor (own or inherited) takes precedence over a
+                // data slot. An *inherited* accessor only applies when the receiver
+                // has no own property of that name (an own data property shadows).
+                let own_accessor = ctx.realm.accessor(handle, key);
+                let chain_accessor = if own_accessor.is_some() || ctx.realm.has_own(handle, key) {
+                    own_accessor
+                } else {
+                    let mut acc = None;
+                    let mut cur = ctx.realm.object_proto(handle);
+                    while let Some(p) = cur {
+                        if let Some(a) = ctx.realm.accessor(p, key) {
+                            acc = Some(a);
+                            break;
+                        }
+                        if ctx.realm.has_own(p, key) {
+                            break; // an inherited data property — ordinary set on receiver
+                        }
+                        cur = ctx.realm.object_proto(p);
+                    }
+                    acc
+                };
+                match chain_accessor {
+                    Some((getter, setter)) if setter.as_handle().is_some() => {
                         if let Err(e) =
                             call_closure(ctx, funcs, setter, &[regs[*src as usize]], recv)
                         {
                             handle_throw!(e);
                         }
+                        // A getter-only accessor (setter present case handled above).
+                        let _ = getter;
+                    }
+                    Some((getter, _)) if getter.as_handle().is_some() => {
+                        // Accessor with a getter but no setter: the write is a no-op
+                        // (sloppy) — do not create a shadowing data property.
                     }
                     _ => {
                         let value = regs[*src as usize];
@@ -1781,6 +1810,12 @@ fn run_frame(
                 if let Some(handle) = regs[*obj as usize].as_handle().map(Handle::from_raw) {
                     ctx.realm
                         .set_hidden_property(handle, key, regs[*src as usize]);
+                }
+            }
+            Op::SetProto { obj, proto } => {
+                if let Some(handle) = regs[*obj as usize].as_handle().map(Handle::from_raw) {
+                    let p = regs[*proto as usize].as_handle().map(Handle::from_raw);
+                    ctx.realm.set_object_proto(handle, p);
                 }
             }
             Op::GetProp { dst, obj, key } => {
@@ -1891,29 +1926,55 @@ fn run_frame(
                             done = false;
                         }
                         if !done {
-                            // A getter accessor takes precedence over a data slot.
-                            match ctx.realm.accessor(handle, key) {
-                                Some((getter, _)) if getter.as_handle().is_some() => {
-                                    match call_closure(ctx, funcs, getter, &[], recv) {
-                                        Ok(v) => regs[*dst as usize] = v,
-                                        Err(e) => handle_throw!(e),
+                            // Inline-cache fast path: a plain own data property on
+                            // the receiver's shape resolves via a shape-pointer
+                            // compare + slot load.
+                            let cache = site_cache!(site);
+                            if let Some(v) = ctx.realm.object_cached_get(handle, key, cache) {
+                                regs[*dst as usize] = v;
+                            } else if let Some((getter, _)) = ctx.realm.accessor(handle, key)
+                                && getter.as_handle().is_some()
+                            {
+                                // An own getter accessor takes precedence over a
+                                // data slot.
+                                match call_closure(ctx, funcs, getter, &[], recv) {
+                                    Ok(v) => regs[*dst as usize] = v,
+                                    Err(e) => handle_throw!(e),
+                                }
+                            } else if ctx.realm.has_own(handle, key) {
+                                regs[*dst as usize] = ctx
+                                    .realm
+                                    .get_property(handle, key)
+                                    .unwrap_or(NanBox::undefined());
+                            } else {
+                                // Walk the `[[Prototype]]` chain for an inherited
+                                // accessor or data property (receiver stays `recv`).
+                                let mut found = NanBox::undefined();
+                                let mut cur = ctx.realm.object_proto(handle);
+                                let mut threw = None;
+                                while let Some(p) = cur {
+                                    if let Some((getter, _)) = ctx.realm.accessor(p, key) {
+                                        if getter.as_handle().is_some() {
+                                            match call_closure(ctx, funcs, getter, &[], recv) {
+                                                Ok(v) => found = v,
+                                                Err(e) => threw = Some(e),
+                                            }
+                                        }
+                                        break;
                                     }
+                                    if ctx.realm.has_own(p, key) {
+                                        found = ctx
+                                            .realm
+                                            .get_property(p, key)
+                                            .unwrap_or(NanBox::undefined());
+                                        break;
+                                    }
+                                    cur = ctx.realm.object_proto(p);
                                 }
-                                _ => {
-                                    // Inline-cache fast path: a plain own data
-                                    // property on the receiver's shape resolves
-                                    // via a shape-pointer compare + slot load. A
-                                    // miss (different/dictionary shape, absent or
-                                    // inherited property, or a non-plain cell)
-                                    // returns `None` and we fall to the identical
-                                    // slow path used before this cache existed.
-                                    let cache = site_cache!(site);
-                                    regs[*dst as usize] = ctx
-                                        .realm
-                                        .object_cached_get(handle, key, cache)
-                                        .or_else(|| ctx.realm.get_property(handle, key))
-                                        .unwrap_or(NanBox::undefined());
+                                if let Some(e) = threw {
+                                    handle_throw!(e);
                                 }
+                                regs[*dst as usize] = found;
                             }
                         }
                     }
@@ -1997,13 +2058,36 @@ fn run_frame(
             } => {
                 let recv_val = regs[*recv as usize];
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                // A user method is a closure property on an object; otherwise try
-                // a built-in `Array`/`String` method on the fast path.
-                let user_method = recv_val
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .and_then(|h| ctx.realm.get_property(h, key))
-                    .filter(|p| p.as_handle().is_some());
+                // A user method is a callable property reached on the receiver or
+                // anywhere along its `[[Prototype]]` chain (an inherited accessor is
+                // invoked with the receiver as `this`); otherwise try a built-in
+                // `Array`/`String` method on the fast path.
+                let mut accessor_err = None;
+                let user_method = recv_val.as_handle().map(Handle::from_raw).and_then(|h| {
+                    let mut cur = Some(h);
+                    while let Some(c) = cur {
+                        if let Some((getter, _)) = ctx.realm.accessor(c, key) {
+                            if getter.as_handle().is_some() {
+                                match call_closure(ctx, funcs, getter, &[], recv_val) {
+                                    Ok(v) => return v.as_handle().map(|_| v),
+                                    Err(e) => {
+                                        accessor_err = Some(e);
+                                        return None;
+                                    }
+                                }
+                            }
+                            return None;
+                        }
+                        if let Some(v) = ctx.realm.get_property(c, key) {
+                            return v.as_handle().map(|_| v);
+                        }
+                        cur = ctx.realm.object_proto(c);
+                    }
+                    None
+                });
+                if let Some(e) = accessor_err {
+                    handle_throw!(e);
+                }
                 let outcome = match user_method {
                     Some(closure) => call_closure(ctx, funcs, closure, &argv, recv_val),
                     None => match builtin_method(ctx, funcs, recv_val, key, &argv) {
@@ -6254,8 +6338,25 @@ impl Compiler {
                     obj: instance,
                     class_id: info.class_id,
                 });
+                // Link the instance to the class's `.prototype` (built in
+                // `materialize_class`), so public methods/accessors are inherited
+                // (`instance.m === C.prototype.m`, no own `m`) rather than copied.
+                if let Some(cb) = self.lookup(&id.name) {
+                    let cval = self.read_var(cb);
+                    let proto = self.alloc();
+                    self.ops.push(Op::GetProp {
+                        dst: proto,
+                        obj: cval,
+                        key: String::from("prototype"),
+                    });
+                    self.ops.push(Op::SetProto {
+                        obj: instance,
+                        proto,
+                    });
+                }
                 // Walk the `extends` chain root→derived and install each class's
-                // methods, so a derived method overrides an inherited one.
+                // *private* methods/accessors on the instance (they brand the
+                // instance directly; public ones live on the prototype).
                 let mut chain: Vec<String> = Vec::new();
                 let mut cur = Some(String::from(&*id.name));
                 while let Some(name) = cur {
@@ -6273,16 +6374,22 @@ impl Compiler {
                     let methods = cls.methods.clone();
                     let accessors = cls.accessors.clone();
                     for (mname, mid) in &methods {
+                        if !mname.starts_with('#') {
+                            continue;
+                        }
                         let m = self.alloc();
                         self.ops.push(Op::LoadFunc { dst: m, func: *mid });
-                        self.ops.push(Op::SetProp {
+                        self.ops.push(Op::SetHidden {
                             obj: instance,
                             key: mname.clone(),
                             src: m,
                         });
                     }
-                    // Install getter/setter accessors.
+                    // Install private getter/setter accessors.
                     for (aname, getter_id, setter_id) in &accessors {
+                        if !aname.starts_with('#') {
+                            continue;
+                        }
                         let load = |this: &mut Self, id: Option<u32>| match id {
                             Some(fid) => {
                                 let r = this.alloc();

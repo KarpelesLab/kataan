@@ -386,6 +386,10 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*obj)?;
             reg(*src)
         }
+        Op::SetProto { obj, proto } => {
+            reg(*obj)?;
+            reg(*proto)
+        }
         Op::SetClassTag { obj, .. } => reg(*obj),
         Op::NewCollection { dst, seed, .. } => {
             reg(*dst)?;
@@ -770,6 +774,11 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_str(key, out);
             w_reg(*src, out);
         }
+        Op::SetProto { obj, proto } => {
+            w_u8(57, out);
+            w_reg(*obj, out);
+            w_reg(*proto, out);
+        }
         Op::GetProp { dst, obj, key } => {
             w_u8(41, out);
             w_reg(*dst, out);
@@ -1047,6 +1056,10 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             obj: r.reg()?,
             key: r.string()?,
             src: r.reg()?,
+        },
+        57 => Op::SetProto {
+            obj: r.reg()?,
+            proto: r.reg()?,
         },
         41 => Op::GetProp {
             dst: r.reg()?,
