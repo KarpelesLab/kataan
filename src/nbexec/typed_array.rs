@@ -115,6 +115,58 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// `subarray`'s TypedArraySpeciesCreate(O, « buffer, beginByteOffset,
+    /// newLength »). Returns `Some(view)` when a *custom* `Symbol.species`
+    /// constructor is used (constructing `new species(buffer, off, len)`);
+    /// returns `None` when the default constructor applies, so the caller takes
+    /// the fast intrinsic-view path. Errors propagate a non-object `constructor`,
+    /// a non-constructor species, or a result that is not a typed array.
+    pub(crate) fn typed_subarray_species(
+        &mut self,
+        recv: Handle,
+        buffer: Handle,
+        byte_offset: usize,
+        new_len: usize,
+    ) -> Result<Option<NanBox>, ExecError> {
+        let ctor = self.read_member(recv, "constructor")?;
+        let Some(ch) = ctor.as_handle().map(Handle::from_raw) else {
+            if matches!(ctor.unpack(), Unpacked::Undefined) {
+                return Ok(None);
+            }
+            return Err(self.type_error("constructor property is not an object"));
+        };
+        // Default concrete TypedArray constructor → fast path.
+        if self.realm.native_at(ch).is_some_and(|id| {
+            (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id)
+        }) {
+            return Ok(None);
+        }
+        let species_sym = self.well_known_symbol("species");
+        let species_key = self.member_key(species_sym);
+        let species = self.read_member(ch, &species_key)?;
+        if matches!(species.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Ok(None);
+        }
+        if !self.is_constructor_value(species) {
+            return Err(self.type_error("Symbol.species is not a constructor"));
+        }
+        let args = [
+            NanBox::handle(buffer.to_raw()),
+            NanBox::number(byte_offset as f64),
+            NanBox::number(new_len as f64),
+        ];
+        let result = self.construct(species, &args)?;
+        if result
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.typed_len(h))
+            .is_none()
+        {
+            return Err(self.type_error("Symbol.species did not return a TypedArray"));
+        }
+        Ok(Some(result))
+    }
+
     /// Spec-faithful relative-index clamp for typed-array mutators/readers:
     /// `undefined` yields
     /// `default`; otherwise `ToIntegerOrInfinity` (which **throws** for a Symbol

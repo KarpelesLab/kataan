@@ -2469,88 +2469,120 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 // `TypedArray.prototype.set(source, offset?)`: copy a source's
-                // elements into this view at `offset`, coercing each. A same-kind
-                // typed-array source takes the raw byte-copy fast path (S8).
+                // elements into this view at `offset`, coercing each.
+                // Spec order: ToIntegerOrInfinity(offset) (negative → RangeError),
+                // then the typed-source or array-like-source branch.
                 "set" => {
-                    let offset_f = if matches!(arg(1).unpack(), Unpacked::Undefined) {
-                        0.0
-                    } else {
-                        self.realm.to_number(arg(1)).max(0.0)
-                    };
-                    if let Some(src) = arg(0).as_handle().map(Handle::from_raw) {
-                        // M2/T2: reject a saturated/non-finite/out-of-range `offset`
-                        // up front (it must not wrap into the byte math).
-                        let offset = if offset_f.is_finite() && offset_f <= tlen as f64 {
-                            offset_f as usize
-                        } else {
-                            let m = self.new_str("offset is out of bounds");
-                            return Err(ExecError::Throw(
-                                self.make_error(N_ERROR_BASE + 2, Some(m)),
-                            ));
-                        };
-                        // Source length comes from a view or an array (the read path
-                        // `elements_vec` actually backs); an arbitrary object source
-                        // is a no-op, as before.
-                        let src_len = self
-                            .realm
-                            .typed_len(src)
-                            .or_else(|| self.realm.array_length(src));
-                        if let Some(src_len) = src_len {
-                            // `offset + src_len > len` is a RangeError, per spec.
-                            if offset.checked_add(src_len).is_none_or(|e| e > tlen) {
+                    let target_is_bigint =
+                        self.realm.typed_kind(handle).is_some_and(is_bigint_kind);
+                    // Step 4-5: targetOffset = ToIntegerOrInfinity(offset); a
+                    // negative offset is a RangeError. (Abrupt-propagating.)
+                    let offset_n = self.coerce_to_integer_or_infinity(arg(1))?;
+                    if offset_n < 0.0 {
+                        let m = self.new_str("offset is out of bounds");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
+                    let src_box = arg(0);
+                    if let Some(src) = src_box.as_handle().map(Handle::from_raw) {
+                        // A typed-array source: same-kind → raw byte copy; otherwise
+                        // element copy with per-element coercion. `offset + srcLen`
+                        // must fit the (live) target length.
+                        if let Some(src_len) = self.realm.typed_len(src) {
+                            let tlen_live = self.realm.typed_len(handle).unwrap_or(tlen);
+                            let offset = if offset_n.is_finite() && offset_n <= tlen_live as f64 {
+                                offset_n as usize
+                            } else {
+                                tlen_live + 1 // forces the bounds RangeError below
+                            };
+                            if offset.checked_add(src_len).is_none_or(|e| e > tlen_live) {
                                 let m = self.new_str("offset is out of bounds");
                                 return Err(ExecError::Throw(
-                                    self.make_error(N_ERROR_BASE + 2, Some(m)),
+                                    self.make_error(N_RANGE_ERROR, Some(m)),
                                 ));
                             }
-                            // S8 fast path: same-kind typed source → raw byte copy.
+                            // A BigInt/Number element-kind mismatch between source and
+                            // target is a TypeError (no implicit Number↔BigInt).
+                            let src_is_bigint =
+                                self.realm.typed_kind(src).is_some_and(is_bigint_kind);
+                            if src_is_bigint != target_is_bigint {
+                                return Err(self.type_error(
+                                    "cannot mix BigInt and non-BigInt typed arrays in set",
+                                ));
+                            }
                             if self.realm.typed_set_same_kind(handle, src, offset) {
                                 return Ok(Some(NanBox::undefined()));
                             }
-                        }
-                        // Materialize the source's elements and bulk-write (coercing).
-                        if let Some(src_elems) = self.realm.elements_vec(src) {
-                            // For a BigInt destination, ToBigInt every source value
-                            // up front (a Number element throws TypeError).
                             let src_elems =
-                                if self.realm.typed_kind(handle).is_some_and(is_bigint_kind) {
-                                    let mut coerced = Vec::with_capacity(src_elems.len());
-                                    for v in src_elems {
-                                        coerced.push(self.coerce_typed_array_write(handle, v)?);
-                                    }
-                                    coerced
-                                } else {
-                                    src_elems
-                                };
+                                self.realm.elements_vec(src).unwrap_or_default();
                             self.realm
                                 .typed_set_from_numbers(handle, offset, &src_elems);
+                            return Ok(Some(NanBox::undefined()));
+                        }
+                    }
+                    // Array-like source: ToObject(source), then ToLength(src.length),
+                    // bounds-check, then per-element Get + coerce + write (so each
+                    // value's ToNumber/ToBigInt side effects and throws run in order,
+                    // and values are not cached).
+                    let src_obj = self.coerce_to_object(src_box);
+                    let Some(src) = src_obj.as_handle().map(Handle::from_raw) else {
+                        return Ok(Some(NanBox::undefined()));
+                    };
+                    let len_val = self.read_member(src, "length")?;
+                    // ToLength: ToIntegerOrInfinity, clamped to [0, 2^53-1].
+                    let len_n = self.coerce_to_integer_or_infinity(len_val)?;
+                    let src_len = len_n.clamp(0.0, 9_007_199_254_740_991.0) as usize;
+                    let tlen_live = self.realm.typed_len(handle).unwrap_or(tlen);
+                    let offset = if offset_n.is_finite() && offset_n <= tlen_live as f64 {
+                        offset_n as usize
+                    } else {
+                        tlen_live + 1
+                    };
+                    if offset.checked_add(src_len).is_none_or(|e| e > tlen_live) {
+                        let m = self.new_str("offset is out of bounds");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
+                    for i in 0..src_len {
+                        let v = self.read_member(src, &alloc::format!("{i}"))?;
+                        // Coerce per the target's element kind (BigInt target throws
+                        // for a Number value; numeric target throws for a Symbol).
+                        let coerced = if target_is_bigint {
+                            self.coerce_typed_array_write(handle, v)?
+                        } else {
+                            self.coerce_to_number(v)?
+                        };
+                        // Re-read the live length each iteration (a value's valueOf
+                        // may have resized the buffer); an out-of-range write is a
+                        // spec no-op.
+                        if offset + i < self.realm.typed_len(handle).unwrap_or(0) {
+                            self.realm.set_element(handle, offset + i, coerced);
                         }
                     }
                     return Ok(Some(NanBox::undefined()));
                 }
                 // `subarray(begin, end)` — a new same-kind view sharing the parent's
                 // backing bytes at the parent's byte offset plus `begin * size`.
+                // begin/end go through ToIntegerOrInfinity (abrupt-propagating); the
+                // result is allocated via TypedArraySpeciesCreate(O, buffer, off, len).
                 "subarray" => {
-                    let len = tlen as i64;
-                    let norm = |v: NanBox, default: i64, this: &mut Self| -> usize {
-                        if matches!(v.unpack(), Unpacked::Undefined) {
-                            return default as usize;
-                        }
-                        let n = this.realm.to_number(v) as i64;
-                        usize::try_from(if n < 0 { (len + n).max(0) } else { n.min(len) })
-                            .unwrap_or(0)
-                    };
-                    let start = norm(arg(0), 0, self);
-                    let end = norm(arg(1), len, self).max(start);
+                    let len = tlen;
+                    let start = self.typed_clamp_index_checked(arg(0), 0, len)?;
+                    let end = self.typed_clamp_index_checked(arg(1), len, len)?;
+                    let new_len = end.saturating_sub(start);
                     let kind = self.realm.typed_kind(handle).unwrap_or(0);
                     let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
-                    let bytes_h = self.realm.typed_buffer(handle).unwrap();
                     let abuf = self.realm.typed_array_object(handle).unwrap();
                     let parent_off = self.realm.typed_byte_offset(handle).unwrap_or(0);
                     let sub_off = parent_off + start * elem_size;
-                    let view =
-                        self.realm
-                            .new_typed_array(bytes_h, abuf, sub_off, end - start, kind);
+                    // TypedArraySpeciesCreate(O, « buffer, beginByteOffset, newLength »).
+                    if let Some(view) =
+                        self.typed_subarray_species(handle, abuf, sub_off, new_len)?
+                    {
+                        return Ok(Some(view));
+                    }
+                    let bytes_h = self.realm.typed_buffer(handle).unwrap();
+                    let view = self
+                        .realm
+                        .new_typed_array(bytes_h, abuf, sub_off, new_len, kind);
                     return Ok(Some(NanBox::handle(view.to_raw())));
                 }
                 _ => {}
