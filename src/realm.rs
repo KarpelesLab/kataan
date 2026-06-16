@@ -2043,7 +2043,9 @@ impl Realm {
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
             return !o.is_hidden(key);
         }
-        // An array's in-range indices are enumerable; `length` is not.
+        // An array's in-range indices are enumerable by default; `length` is not.
+        // A per-index `enumerable: false` set via `Object.defineProperty` is
+        // recorded as a hidden flag in the auxiliary object, so consult that first.
         if let Some(a) = self.heap.get(handle).and_then(Cell::as_array) {
             if key == "length" {
                 return false;
@@ -2052,7 +2054,13 @@ impl Realm {
                 && i < a.len()
                 && alloc::format!("{i}") == key
             {
-                return true;
+                let hidden = self
+                    .aux_props
+                    .get(&handle.to_raw())
+                    .and_then(|aux| self.heap.get(*aux))
+                    .and_then(Cell::as_object)
+                    .is_some_and(|o| o.is_hidden(key));
+                return !hidden;
             }
         }
         // A named aux property (e.g. a custom property on an array/function) follows

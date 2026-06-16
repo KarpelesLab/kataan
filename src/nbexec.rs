@@ -667,6 +667,10 @@ const N_REFLECT_GET_PROTO: u16 = 137;
 /// returning a boolean success flag.
 const N_REFLECT_SET_PROTO: u16 = 204;
 const N_REFLECT_PREVENT_EXT: u16 = 205;
+/// `Reflect.isExtensible(target)` — like `Object.isExtensible` but the target
+/// MUST be an Object (a primitive throws a TypeError, where `Object.isExtensible`
+/// returns `false`), so it has its own dispatch id.
+const N_REFLECT_IS_EXTENSIBLE: u16 = 252;
 /// A first-class `Array.prototype.<method>` value: a bound native carrying the
 /// method name; calling it (via `.call`/`.apply`) dispatches that array method on
 /// the supplied `this` (so `Array.prototype.slice.call(arguments)` works).
@@ -854,6 +858,12 @@ const SET_PROTO_METHODS: &[&str] = &[
 const MAP_PROTO_METHODS: &[&str] = &[
     "set", "get", "has", "delete", "clear", "forEach", "keys", "values", "entries",
 ];
+/// `WeakMap.prototype` methods exposed as first-class values.
+const WEAKMAP_PROTO_METHODS: &[&str] = &["set", "get", "has", "delete"];
+/// `WeakSet.prototype` methods exposed as first-class values.
+const WEAKSET_PROTO_METHODS: &[&str] = &["add", "has", "delete"];
+/// `Promise.prototype` methods exposed as first-class values.
+const PROMISE_PROTO_METHODS: &[&str] = &["then", "catch", "finally"];
 /// `Function.prototype` methods exposed as first-class values.
 const FUNCTION_PROTO_METHODS: &[&str] = &["call", "apply", "bind", "toString"];
 /// `DataView.prototype` accessor methods — dispatched in `call_method`, exposed here as
@@ -907,7 +917,9 @@ fn builtin_method_arity(name: &str) -> u32 {
         // Two-argument methods.
         "slice" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
         | "replaceAll" | "padStart" | "padEnd" | "with" | "setInt8" | "setUint8" | "asIntN"
-        | "asUintN" | "setMonth" | "setUTCMonth" | "setSeconds" | "setUTCSeconds" | "subarray" => 2,
+        | "asUintN" | "setMonth" | "setUTCMonth" | "setSeconds" | "setUTCSeconds" | "subarray"
+        // `Function.prototype.apply(thisArg, argArray)`.
+        | "apply" => 2,
         // Three-argument `Date` setters.
         "setFullYear" | "setUTCFullYear" | "setMinutes" | "setUTCMinutes" => 3,
         // Four-argument `Date` setters.
@@ -943,7 +955,7 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_REFLECT_GET_OWN_DESC
         | N_REFLECT_SET_PROTO
         | N_REFLECT_DELETE
-        | N_REFLECT_APPLY
+        | N_REFLECT_CONSTRUCT
         | N_PARSE_INT
         | N_OBJECT_GET_OWN_DESC
         | N_MATH_MAX
@@ -953,7 +965,7 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_MATH_HYPOT
         | N_MATH_IMUL => 2,
         // Length 3.
-        N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP => 3,
+        N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP | N_REFLECT_APPLY => 3,
         // `Date` constructor: `Date(year, month, …, ms)` — 7 declared parameters.
         N_DATE => 7,
         // Default (String, Number, Boolean, Array, Object, Error family, RegExp,
@@ -1156,6 +1168,38 @@ const N_DATE_TO_JSON: u16 = 244;
 /// identity methods `toString`/`valueOf` instead require a String value.
 const N_STRING_PROTO_FN: u16 = 245;
 
+/// A first-class `Number.prototype.<method>`: `thisNumberValue(this)` must yield
+/// a Number (the `this` is a Number primitive or a Number wrapper object), else a
+/// `TypeError` (so `Number.prototype.valueOf.call({})` rejects per spec).
+const N_NUMBER_PROTO_FN: u16 = 249;
+
+/// A first-class `Boolean.prototype.<method>`: `thisBooleanValue(this)` must
+/// yield a Boolean (the `this` is a Boolean primitive or a Boolean wrapper
+/// object), else a `TypeError`.
+const N_BOOLEAN_PROTO_FN: u16 = 250;
+
+/// `Error.prototype.toString` — its receiver must be an Object (else a
+/// `TypeError`); reads the receiver's `name`/`message` (each ToString'd) and
+/// renders `"name: message"` (or just one part when the other is empty).
+const N_ERROR_PROTO_TOSTRING: u16 = 251;
+
+/// A first-class `Set.prototype.<method>`: the receiver must have a `[[SetData]]`
+/// internal slot (a non-weak Set), else a `TypeError` (so
+/// `Set.prototype.add.call(new Map(), …)` rejects).
+const N_SET_PROTO_FN: u16 = 253;
+
+/// A first-class `Map.prototype.<method>`: the receiver must have a `[[MapData]]`
+/// internal slot (a non-weak Map), else a `TypeError`.
+const N_MAP_PROTO_FN: u16 = 254;
+
+/// A first-class `WeakMap.prototype.<method>`: the receiver must be a WeakMap
+/// (`[[WeakMapData]]`), else a `TypeError`.
+const N_WEAKMAP_PROTO_FN: u16 = 255;
+
+/// A first-class `WeakSet.prototype.<method>`: the receiver must be a WeakSet
+/// (`[[WeakSetData]]`), else a `TypeError`.
+const N_WEAKSET_PROTO_FN: u16 = 256;
+
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib,
     /// using default [`Limits`](crate::limits::Limits).
@@ -1270,6 +1314,50 @@ impl<'a> Interp<'a> {
         self.setup_first_class_prototype_id(ctor_name, methods, N_ARRAY_PROTO_FN);
     }
 
+    /// Installs `obj[Symbol.toStringTag] = tag` as a data property with the
+    /// built-in attributes `{ writable: false, enumerable: false,
+    /// configurable: true }` — used for `Set.prototype`, `Map.prototype`,
+    /// `Promise.prototype`, the `Reflect`/`JSON`/`Math` namespaces, etc. (so
+    /// `Object.prototype.toString.call(new Set())` is `"[object Set]"` and
+    /// `Ctor.prototype[Symbol.toStringTag]` is introspectable).
+    fn install_to_string_tag(&mut self, obj: Handle, tag: &str) {
+        let sym = self.well_known_symbol("toStringTag");
+        let key = self.member_key(sym);
+        let val = self.new_str(tag);
+        self.realm.set_property(obj, &key, val);
+        self.realm.mark_hidden(obj, &key);
+        self.realm.set_readonly_property(obj, &key);
+    }
+
+    /// Installs `Ctor.prototype[Symbol.toStringTag] = tag` for a named global
+    /// constructor (no-op if the constructor / its prototype is absent).
+    fn install_proto_to_string_tag(&mut self, ctor_name: &str, tag: &str) {
+        if let Some(proto) = self
+            .current
+            .get(ctor_name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.install_to_string_tag(proto, tag);
+        }
+    }
+
+    /// The realm's `Object.prototype` handle (the root of the ordinary prototype
+    /// chain), resolved from the `Object` global's `prototype` property. Returns
+    /// `None` only before `Object.prototype` has been installed.
+    fn object_prototype(&self) -> Option<Handle> {
+        self.current
+            .get("Object")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+    }
+
     /// As [`Self::setup_first_class_prototype`] but binds each method to the given
     /// native id (so a prototype with a `this`-validating dispatch arm — e.g.
     /// `N_BIGINT_PROTO_FN` — can route `.call`/`.apply` through it).
@@ -1287,7 +1375,12 @@ impl<'a> Interp<'a> {
         else {
             return;
         };
-        let proto = self.realm.new_object();
+        // The prototype object inherits `Object.prototype` (so inherited methods
+        // like `hasOwnProperty`/`isPrototypeOf`/`propertyIsEnumerable` and a
+        // `toString`/`valueOf` fallback resolve through the chain — e.g.
+        // `Number.prototype.hasOwnProperty("constructor")`).
+        let obj_proto = self.object_prototype();
+        let proto = self.realm.new_object_with_proto(obj_proto);
         for &name in methods {
             let name_h = self.realm.new_string(name);
             let f = self.realm.new_bound_native(native_id, name_h);
@@ -1298,8 +1391,12 @@ impl<'a> Interp<'a> {
         }
         self.realm
             .set_property(ns, "prototype", NanBox::handle(proto.to_raw()));
-        // A constructor's `prototype` is non-enumerable (out of `Object.keys`).
+        // A built-in constructor's `prototype` is `{ writable: false,
+        // enumerable: false, configurable: false }` (ECMA-262 — every built-in
+        // constructor object).
         self.realm.mark_hidden(ns, "prototype");
+        self.realm.set_readonly_property(ns, "prototype");
+        self.realm.set_non_configurable_property(ns, "prototype");
         self.realm
             .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
     }
@@ -1698,7 +1795,7 @@ impl<'a> Interp<'a> {
                 ("deleteProperty", N_REFLECT_DELETE),
                 ("apply", N_REFLECT_APPLY),
                 ("construct", N_REFLECT_CONSTRUCT),
-                ("isExtensible", N_OBJECT_IS_EXTENSIBLE),
+                ("isExtensible", N_REFLECT_IS_EXTENSIBLE),
                 ("preventExtensions", N_REFLECT_PREVENT_EXT),
             ],
         );
@@ -1937,7 +2034,7 @@ impl<'a> Interp<'a> {
             self.realm.set_readonly_property(arr_proto, &key);
         }
         self.setup_first_class_prototype_id("String", STRING_PROTO_METHODS, N_STRING_PROTO_FN);
-        self.setup_first_class_prototype("Number", NUMBER_PROTO_METHODS);
+        self.setup_first_class_prototype_id("Number", NUMBER_PROTO_METHODS, N_NUMBER_PROTO_FN);
         // The `Number` numeric constants are own data properties of the
         // constructor with the built-in attributes `{ writable: false,
         // enumerable: false, configurable: false }` (so `hasOwnProperty` and
@@ -1966,7 +2063,7 @@ impl<'a> Interp<'a> {
                 self.realm.set_non_configurable_property(num_ctor, name);
             }
         }
-        self.setup_first_class_prototype("Boolean", BOOLEAN_PROTO_METHODS);
+        self.setup_first_class_prototype_id("Boolean", BOOLEAN_PROTO_METHODS, N_BOOLEAN_PROTO_FN);
         // `Number.prototype`/`Boolean.prototype`/`String.prototype` are themselves
         // wrapper objects with a default `[[NumberData]]`/`[[BooleanData]]`/
         // `[[StringData]]` (`+0`, `false`, `""`). They carry the matching
@@ -2050,8 +2147,33 @@ impl<'a> Interp<'a> {
             self.realm.set_readonly_property(bi_proto, &tag_key);
         }
         self.setup_first_class_prototype("Function", FUNCTION_PROTO_METHODS);
-        self.setup_first_class_prototype("Set", SET_PROTO_METHODS);
-        self.setup_first_class_prototype("Map", MAP_PROTO_METHODS);
+        self.setup_first_class_prototype_id("Set", SET_PROTO_METHODS, N_SET_PROTO_FN);
+        self.setup_first_class_prototype_id("Map", MAP_PROTO_METHODS, N_MAP_PROTO_FN);
+        self.setup_first_class_prototype_id("WeakMap", WEAKMAP_PROTO_METHODS, N_WEAKMAP_PROTO_FN);
+        self.setup_first_class_prototype_id("WeakSet", WEAKSET_PROTO_METHODS, N_WEAKSET_PROTO_FN);
+        // `Promise.prototype` (then/catch/finally) — so `Promise.prototype.then`
+        // is readable / detachable and `Promise.prototype[Symbol.toStringTag]`
+        // exists. Promise instances link to it below.
+        self.setup_first_class_prototype("Promise", PROMISE_PROTO_METHODS);
+        // `Ctor.prototype[Symbol.toStringTag]` — a non-enumerable, non-writable,
+        // configurable string. (`Object.prototype.toString` reads it.)
+        self.install_proto_to_string_tag("Set", "Set");
+        self.install_proto_to_string_tag("Map", "Map");
+        self.install_proto_to_string_tag("WeakMap", "WeakMap");
+        self.install_proto_to_string_tag("WeakSet", "WeakSet");
+        self.install_proto_to_string_tag("Promise", "Promise");
+        // Namespace objects carry their own `[Symbol.toStringTag]` value (not on a
+        // prototype): `Reflect`/`JSON`/`Math` → `[object Reflect|JSON|Math]`.
+        for (ns_name, tag) in [("Reflect", "Reflect"), ("JSON", "JSON"), ("Math", "Math")] {
+            if let Some(ns) = self
+                .current
+                .get(ns_name)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+            {
+                self.install_to_string_tag(ns, tag);
+            }
+        }
         // `<ErrorCtor>.prototype` as a real object so `Error.prototype` /
         // `TypeError.prototype` are introspectable (e.g.
         // `Object.create(Error.prototype)`). `Error.prototype` inherits
@@ -2073,6 +2195,15 @@ impl<'a> Interp<'a> {
                 let msg = self.new_str("");
                 self.realm.set_property(proto, "message", msg);
                 self.realm.mark_hidden(proto, "message");
+                // `Error.prototype.toString` — its own (non-enumerable) method,
+                // distinct from `Object.prototype.toString`: it requires an Object
+                // receiver and renders `"name: message"`. Subclass prototypes
+                // inherit it through `Error.prototype`.
+                let ts = self.new_named_native("toString", N_ERROR_PROTO_TOSTRING);
+                self.install_fn_name_length(ts, "toString", 0);
+                self.realm
+                    .set_property(proto, "toString", NanBox::handle(ts.to_raw()));
+                self.realm.mark_hidden(proto, "toString");
                 self.realm
                     .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
                 self.realm.mark_hidden(ctor, "prototype");
@@ -2632,7 +2763,12 @@ impl<'a> Interp<'a> {
                 }
                 if let Some(raw) = arg(0).as_handle() {
                     let proto = arg(1).as_handle().map(Handle::from_raw);
-                    self.set_proto_of(Handle::from_raw(raw), proto)?;
+                    // A failed [[SetPrototypeOf]] (a non-extensible object) throws.
+                    if !self.set_proto_of(Handle::from_raw(raw), proto)? {
+                        return Err(self.type_error(
+                            "Object.setPrototypeOf: cannot set prototype of a non-extensible object",
+                        ));
+                    }
                 }
                 arg(0)
             }
@@ -2727,35 +2863,32 @@ impl<'a> Interp<'a> {
             }
             // --- Reflect.* ---
             N_REFLECT_GET => {
-                if let Some(raw) = arg(0).as_handle() {
-                    let h = Handle::from_raw(raw);
-                    let key = self.coerce_property_key(arg(1))?;
-                    // With an explicit `receiver` (3rd arg), a getter found on the
-                    // prototype chain runs with `receiver` as its `this` (a data
-                    // property ignores the receiver — handled by `read_member`).
-                    if args.len() > 2 {
-                        let receiver = arg(2);
-                        let mut cur = Some(h);
-                        while let Some(c) = cur {
-                            if let Some((getter, _)) = self.realm.accessor(c, &key) {
-                                if matches!(getter.unpack(), Unpacked::Undefined) {
-                                    return Ok(NanBox::undefined());
-                                }
-                                return self.call_with_this(getter, receiver, &[]);
+                let h = self.reflect_object_target(arg(0), "get")?;
+                let key = self.coerce_property_key(arg(1))?;
+                // With an explicit `receiver` (3rd arg), a getter found on the
+                // prototype chain runs with `receiver` as its `this` (a data
+                // property ignores the receiver — handled by `read_member`).
+                if args.len() > 2 {
+                    let receiver = arg(2);
+                    let mut cur = Some(h);
+                    while let Some(c) = cur {
+                        if let Some((getter, _)) = self.realm.accessor(c, &key) {
+                            if matches!(getter.unpack(), Unpacked::Undefined) {
+                                return Ok(NanBox::undefined());
                             }
-                            if self.realm.has_own(c, &key) {
-                                break;
-                            }
-                            cur = self.realm.object_proto(c);
+                            return self.call_with_this(getter, receiver, &[]);
                         }
+                        if self.realm.has_own(c, &key) {
+                            break;
+                        }
+                        cur = self.realm.object_proto(c);
                     }
-                    return self.read_member(h, &key);
                 }
-                NanBox::undefined()
+                return self.read_member(h, &key);
             }
             N_REFLECT_SET => {
-                if let Some(raw) = arg(0).as_handle() {
-                    let h = Handle::from_raw(raw);
+                {
+                    let h = self.reflect_object_target(arg(0), "set")?;
                     let key = self.coerce_property_key(arg(1))?;
                     let value = arg(2);
                     // The receiver defaults to the target; an explicit one (4th arg)
@@ -2798,9 +2931,10 @@ impl<'a> Interp<'a> {
             N_REFLECT_HAS => {
                 // Like the `in` operator: own property or anywhere on the
                 // prototype chain (array indices bounds-checked).
+                let target = self.reflect_object_target(arg(0), "has")?;
                 let key = self.coerce_property_key(arg(1))?;
                 let mut present = false;
-                let mut cur = arg(0).as_handle().map(Handle::from_raw);
+                let mut cur = Some(target);
                 while let Some(c) = cur {
                     let here = if let Some(len) = self.realm.array_length(c) {
                         key == "length"
@@ -2819,20 +2953,17 @@ impl<'a> Interp<'a> {
             }
             N_REFLECT_DELETE => {
                 // Returns the [[Delete]] result: false for a non-configurable property.
-                let ok = if let Some(raw) = arg(0).as_handle() {
-                    let key = self.coerce_property_key(arg(1))?;
-                    self.realm.delete_property(Handle::from_raw(raw), &key)
-                } else {
-                    false
-                };
+                let target = self.reflect_object_target(arg(0), "deleteProperty")?;
+                let key = self.coerce_property_key(arg(1))?;
+                let ok = self.realm.delete_property(target, &key);
                 NanBox::boolean(ok)
             }
             N_REFLECT_OWN_KEYS => {
                 // String keys (integer-indexed then insertion order), then own
                 // symbol keys — matching `[[OwnPropertyKeys]]`.
+                let h = self.reflect_object_target(arg(0), "ownKeys")?;
                 let mut boxed = Vec::new();
-                if let Some(raw) = arg(0).as_handle() {
-                    let h = Handle::from_raw(raw);
+                {
                     for k in self.realm.own_property_names(h).unwrap_or_default() {
                         boxed.push(self.new_str(&k));
                     }
@@ -2850,49 +2981,56 @@ impl<'a> Interp<'a> {
             }
             // `Reflect.defineProperty(obj, key, desc)` → bool.
             N_REFLECT_DEFINE_PROP => {
-                let done = if let (Some(obj), Some(desc)) = (
-                    arg(0).as_handle().map(Handle::from_raw),
-                    arg(2).as_handle().map(Handle::from_raw),
-                ) {
-                    let key = self.coerce_property_key(arg(1))?;
-                    // Reflect.defineProperty returns the boolean result (false on a failed
-                    // definition) rather than throwing.
-                    self.apply_descriptor(obj, &key, desc, true)?
-                } else {
-                    false
+                let obj = self.reflect_object_target(arg(0), "defineProperty")?;
+                // The key is ToPropertyKey'd (may throw) before the descriptor; the
+                // attributes argument must be an Object (ToPropertyDescriptor — a
+                // primitive is a TypeError).
+                let key = self.coerce_property_key(arg(1))?;
+                let Some(desc) = arg(2)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|_| self.is_object_value(arg(2)))
+                else {
+                    return Err(self.type_error("Property description must be an object"));
                 };
+                // Reflect.defineProperty returns the boolean result (false on a failed
+                // definition) rather than throwing.
+                let done = self.apply_descriptor(obj, &key, desc, true)?;
                 NanBox::boolean(done)
             }
             // `Reflect.getOwnPropertyDescriptor(obj, key)`.
-            N_REFLECT_GET_OWN_DESC => match arg(0).as_handle().map(Handle::from_raw) {
-                Some(obj) => {
-                    let key = self.coerce_property_key(arg(1))?;
-                    self.descriptor_of(obj, &key)?
-                }
-                None => NanBox::undefined(),
-            },
+            N_REFLECT_GET_OWN_DESC => {
+                let obj = self.reflect_object_target(arg(0), "getOwnPropertyDescriptor")?;
+                let key = self.coerce_property_key(arg(1))?;
+                self.descriptor_of(obj, &key)?
+            }
             // `Reflect.getPrototypeOf(obj)` (honors a proxy `getPrototypeOf` trap).
-            N_REFLECT_GET_PROTO => match arg(0).as_handle() {
-                Some(raw) => self.get_proto_of(Handle::from_raw(raw))?,
-                None => NanBox::null(),
-            },
+            N_REFLECT_GET_PROTO => {
+                let obj = self.reflect_object_target(arg(0), "getPrototypeOf")?;
+                self.get_proto_of(obj)?
+            }
             // `Reflect.setPrototypeOf(target, proto)` → boolean success.
             N_REFLECT_SET_PROTO => {
-                if let Some(raw) = arg(0).as_handle() {
-                    let proto = arg(1).as_handle().map(Handle::from_raw);
-                    self.set_proto_of(Handle::from_raw(raw), proto)?;
-                    NanBox::boolean(true)
-                } else {
-                    NanBox::boolean(false)
+                let obj = self.reflect_object_target(arg(0), "setPrototypeOf")?;
+                // The proto must be an Object or `null`, else a TypeError.
+                if !matches!(arg(1).unpack(), Unpacked::Null) && !self.is_object_value(arg(1)) {
+                    return Err(self.type_error("Object prototype may only be an Object or null"));
                 }
+                let proto = arg(1).as_handle().map(Handle::from_raw);
+                // Returns the boolean [[SetPrototypeOf]] result (false on a
+                // non-extensible target whose prototype would change).
+                NanBox::boolean(self.set_proto_of(obj, proto)?)
             }
             // `Reflect.preventExtensions(target)` → boolean success.
             N_REFLECT_PREVENT_EXT => {
-                let ok = arg(0).as_handle().is_some_and(|raw| {
-                    self.realm.prevent_extensions(Handle::from_raw(raw));
-                    true
-                });
-                NanBox::boolean(ok)
+                let obj = self.reflect_object_target(arg(0), "preventExtensions")?;
+                self.realm.prevent_extensions(obj);
+                NanBox::boolean(true)
+            }
+            // `Reflect.isExtensible(target)` → boolean (target must be an Object).
+            N_REFLECT_IS_EXTENSIBLE => {
+                let obj = self.reflect_object_target(arg(0), "isExtensible")?;
+                self.is_extensible_of(obj)?
             }
             N_REFLECT_APPLY => {
                 let list = match arg(2).as_handle().map(Handle::from_raw) {
@@ -4051,7 +4189,7 @@ impl<'a> Interp<'a> {
             // `queueMicrotask(cb)` — schedules `cb()` on the microtask queue.
             N_QUEUE_MICROTASK => {
                 let callback = arg(0);
-                let result = self.realm.new_promise();
+                let result = self.fresh_promise();
                 self.microtasks.push(Job {
                     handler: callback,
                     value: NanBox::undefined(),
@@ -4133,7 +4271,7 @@ impl<'a> Interp<'a> {
                         Some(bytes) => bytes,
                         None => arg(0),
                     };
-                let p = self.realm.new_promise();
+                let p = self.fresh_promise();
                 match self.build_wasm_instance(source, arg(1)) {
                     Ok(instance) => {
                         let resolved = if given_module {
@@ -4166,7 +4304,7 @@ impl<'a> Interp<'a> {
             // `WebAssembly.compile(bytes)` → `Promise<Module>` (rejected, not thrown,
             // on a bad module).
             N_WASM_COMPILE => {
-                let p = self.realm.new_promise();
+                let p = self.fresh_promise();
                 match self.make_wasm_module(arg(0)) {
                     Ok(module) => self.settle(p, module, true),
                     Err(ExecError::Throw(err)) => self.settle(p, err, false),
@@ -4192,6 +4330,40 @@ impl<'a> Interp<'a> {
                 self.new_str(&s)
             }
             N_OBJ_PROTO_VALUEOF => self.this_val,
+            // `Error.prototype.toString` — the receiver must be an Object (a
+            // string/symbol/bigint primitive or null/undefined is a TypeError);
+            // reads `name`/`message` (each ToString'd, defaulting to `"Error"`/`""`)
+            // and renders `"name: message"` (or one part when the other is empty).
+            N_ERROR_PROTO_TOSTRING => {
+                let this = self.this_val;
+                let Some(h) = this.as_handle().map(Handle::from_raw) else {
+                    return Err(self.type_error("Error.prototype.toString called on non-object"));
+                };
+                // A boxed primitive (string/symbol/bigint) is not an ordinary Object.
+                if !self.is_object_value(this) {
+                    return Err(self.type_error("Error.prototype.toString called on non-object"));
+                }
+                let name_v = self.read_member(h, "name")?;
+                let name = if matches!(name_v.unpack(), Unpacked::Undefined) {
+                    String::from("Error")
+                } else {
+                    self.coerce_to_string(name_v)?
+                };
+                let msg_v = self.read_member(h, "message")?;
+                let msg = if matches!(msg_v.unpack(), Unpacked::Undefined) {
+                    String::new()
+                } else {
+                    self.coerce_to_string(msg_v)?
+                };
+                let s = if name.is_empty() {
+                    msg
+                } else if msg.is_empty() {
+                    name
+                } else {
+                    alloc::format!("{name}: {msg}")
+                };
+                self.new_str(&s)
+            }
             N_OBJ_PROTO_HASOWN => {
                 let key = self.member_key(arg(0));
                 match self.this_val.as_handle().map(Handle::from_raw) {
@@ -4860,6 +5032,12 @@ impl<'a> Interp<'a> {
     /// statement (or `undefined`).
     pub fn run(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
         self.strict = self.strict || has_use_strict(&program.body);
+        // Script-level `this` is the global object (the realm's `globalThis`),
+        // regardless of strictness — so a top-level `this.x = …` (sloppy globals)
+        // and `this === globalThis` behave per spec.
+        if matches!(self.this_val.unpack(), Unpacked::Undefined) {
+            self.this_val = self.global_this;
+        }
         self.hoist_with(&program.body, true)?;
         let mut last = NanBox::undefined();
         for stmt in &program.body {
@@ -5383,7 +5561,7 @@ impl<'a> Interp<'a> {
         finally: bool,
     ) -> Handle {
         use crate::cell::PromiseStatus::{Fulfilled, Pending};
-        let result = self.realm.new_promise();
+        let result = self.fresh_promise();
         let state = self.realm.promise_state(handle).expect("a promise");
         let settled = {
             let s = state.borrow();
@@ -5554,6 +5732,26 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Resolves a proxy `handler[trap]` (`GetMethod`): `Ok(Some(fn))` when present
+    /// and callable, `Ok(None)` when absent (`undefined`/`null`, so the operation
+    /// forwards to the target), and a `TypeError` when present but not callable.
+    fn proxy_trap(&mut self, handler: Handle, name: &str) -> Result<Option<NanBox>, ExecError> {
+        let trap = self
+            .realm
+            .get_property(handler, name)
+            .unwrap_or(NanBox::undefined());
+        if matches!(trap.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Ok(None);
+        }
+        if trap
+            .as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            return Ok(Some(trap));
+        }
+        Err(self.type_error(&alloc::format!("proxy '{name}' trap is not a function")))
+    }
+
     /// `Array.isArray` semantics: follow a chain of proxies to the underlying target and
     /// report whether it is a (non-function) array. A revoked proxy in the chain throws.
     fn is_array_unwrap_proxy(&mut self, v: NanBox) -> Result<bool, ExecError> {
@@ -5593,7 +5791,19 @@ impl<'a> Interp<'a> {
                 (Some(NanBox::number(len as f64)), writable, false, false)
             } else if let Ok(i) = key.parse::<usize>() {
                 if i < len && alloc::format!("{i}") == key {
-                    (Some(self.realm.get_element(obj, i)), true, true, true)
+                    // An in-range index is writable/enumerable/configurable by
+                    // default, but `Object.defineProperty(arr, i, …)` can demote
+                    // any of those attributes (recorded in the element-flag maps);
+                    // reflect the actual recorded flags rather than the defaults.
+                    let writable = !self.realm.property_is_readonly(obj, key);
+                    let enumerable = self.realm.property_is_enumerable(obj, key);
+                    let configurable = !self.realm.property_is_non_configurable(obj, key);
+                    (
+                        Some(self.realm.get_element(obj, i)),
+                        writable,
+                        enumerable,
+                        configurable,
+                    )
                 } else {
                     (None, false, false, false)
                 }
@@ -5673,14 +5883,7 @@ impl<'a> Interp<'a> {
     fn descriptor_of(&mut self, obj: Handle, key: &str) -> Result<NanBox, ExecError> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
-            let trap = self
-                .realm
-                .get_property(handler, "getOwnPropertyDescriptor")
-                .unwrap_or(NanBox::undefined());
-            if trap
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
+            if let Some(trap) = self.proxy_trap(handler, "getOwnPropertyDescriptor")? {
                 let key_v = self.new_str(key);
                 return self.call(trap, &[NanBox::handle(target.to_raw()), key_v]);
             }
@@ -5696,14 +5899,7 @@ impl<'a> Interp<'a> {
     fn is_extensible_of(&mut self, obj: Handle) -> Result<NanBox, ExecError> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
-            let trap = self
-                .realm
-                .get_property(handler, "isExtensible")
-                .unwrap_or(NanBox::undefined());
-            if trap
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
+            if let Some(trap) = self.proxy_trap(handler, "isExtensible")? {
                 let r = self.call(trap, &[NanBox::handle(target.to_raw())])?;
                 return Ok(NanBox::boolean(self.realm.truthy(r)));
             }
@@ -5719,20 +5915,19 @@ impl<'a> Interp<'a> {
     fn get_proto_of(&mut self, obj: Handle) -> Result<NanBox, ExecError> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
-            let trap = self
-                .realm
-                .get_property(handler, "getPrototypeOf")
-                .unwrap_or(NanBox::undefined());
-            if trap
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
-                return self.call(trap, &[NanBox::handle(target.to_raw())]);
+            if let Some(trap) = self.proxy_trap(handler, "getPrototypeOf")? {
+                let r = self.call(trap, &[NanBox::handle(target.to_raw())])?;
+                // The trap result must be an Object or null (ECMA-262 step 7).
+                if !matches!(r.unpack(), Unpacked::Null) && !self.is_object_value(r) {
+                    return Err(
+                        self.type_error("proxy getPrototypeOf trap must return an object or null")
+                    );
+                }
+                return Ok(r);
             }
-            return Ok(self
-                .realm
-                .object_proto(target)
-                .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())));
+            // An absent trap forwards to the target's `[[GetPrototypeOf]]` —
+            // recursing so a target that is itself a proxy runs its own trap.
+            return self.get_proto_of(target);
         }
         Ok(self
             .realm
@@ -5740,26 +5935,33 @@ impl<'a> Interp<'a> {
             .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())))
     }
 
-    fn set_proto_of(&mut self, obj: Handle, proto: Option<Handle>) -> Result<(), ExecError> {
+    /// `OrdinarySetPrototypeOf` (and the proxy `setPrototypeOf` trap). Returns the
+    /// boolean success: `Object.setPrototypeOf` throws when it is `false`, while
+    /// `Reflect.setPrototypeOf` surfaces it. A non-extensible object rejects any
+    /// change to a *different* prototype (setting the same prototype is a no-op
+    /// that still succeeds).
+    fn set_proto_of(&mut self, obj: Handle, proto: Option<Handle>) -> Result<bool, ExecError> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
-            let trap = self
-                .realm
-                .get_property(handler, "setPrototypeOf")
-                .unwrap_or(NanBox::undefined());
-            if trap
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
+            if let Some(trap) = self.proxy_trap(handler, "setPrototypeOf")? {
                 let proto_box = proto.map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
-                self.call(trap, &[NanBox::handle(target.to_raw()), proto_box])?;
-                return Ok(());
+                let r = self.call(trap, &[NanBox::handle(target.to_raw()), proto_box])?;
+                return Ok(self.realm.truthy(r));
             }
-            self.realm.set_object_proto(target, proto);
-            return Ok(());
+            return self.set_proto_of(target, proto);
+        }
+        // A non-extensible object's prototype is fixed: a change to a different
+        // [[Prototype]] fails (returns false); setting the current value is a no-op
+        // that succeeds.
+        let current = self.realm.object_proto(obj);
+        if current == proto {
+            return Ok(true);
+        }
+        if !self.realm.is_extensible(obj) {
+            return Ok(false);
         }
         self.realm.set_object_proto(obj, proto);
-        Ok(())
+        Ok(true)
     }
 
     /// `HasProperty(obj, key)` — whether `key` is present on `obj` or anywhere on
@@ -5835,16 +6037,9 @@ impl<'a> Interp<'a> {
         // (called `trap(target, key, descriptor)`), or forwards to the target.
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
-            let trap = self
-                .realm
-                .get_property(handler, "defineProperty")
-                .unwrap_or(NanBox::undefined());
-            if trap
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
+            if let Some(trap) = self.proxy_trap(handler, "defineProperty")? {
                 let key_v = self.new_str(key);
-                self.call(
+                let r = self.call(
                     trap,
                     &[
                         NanBox::handle(target.to_raw()),
@@ -5852,6 +6047,17 @@ impl<'a> Interp<'a> {
                         NanBox::handle(desc.to_raw()),
                     ],
                 )?;
+                // A falsy trap result is a failed [[DefineOwnProperty]]:
+                // `Object.defineProperty` throws, `Reflect.defineProperty` returns
+                // false.
+                if !self.realm.truthy(r) {
+                    if reflect {
+                        return Ok(false);
+                    }
+                    return Err(self.type_error(&alloc::format!(
+                        "proxy 'defineProperty' trap returned falsish for property '{key}'"
+                    )));
+                }
                 return Ok(true);
             }
             return self.apply_descriptor(target, key, desc, reflect);
@@ -6378,10 +6584,14 @@ impl<'a> Interp<'a> {
                 .realm
                 .get_property(handler, "apply")
                 .unwrap_or(NanBox::undefined());
-            if trap
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
+            // A present but non-callable `apply` trap is a TypeError.
+            if !matches!(trap.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                if !trap
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Err(self.type_error("proxy apply trap is not a function"));
+                }
                 let arr = self.realm.new_array(args.to_vec());
                 return self.call(
                     trap,
@@ -6435,6 +6645,35 @@ impl<'a> Interp<'a> {
                 let prim = NanBox::handle(self.realm.new_bigint(big).to_raw());
                 return Ok(self
                     .call_method(prim, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
+            // A first-class `Number.prototype.<method>`: `thisNumberValue(this)`
+            // must yield a Number (a Number primitive or a Number wrapper), else a
+            // `TypeError`. The recovered primitive is then dispatched, so
+            // `Number.prototype.toString.call(255, 16)` is `"ff"`.
+            if id == N_NUMBER_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let Some(n) = self.this_number_value(this_val) else {
+                    return Err(self.type_error(&alloc::format!(
+                        "Number.prototype.{name} requires that 'this' be a Number"
+                    )));
+                };
+                return Ok(self
+                    .call_method(NanBox::number(n), &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
+            // A first-class `Boolean.prototype.<method>`: `thisBooleanValue(this)`
+            // must yield a Boolean (a Boolean primitive or a Boolean wrapper), else
+            // a `TypeError`.
+            if id == N_BOOLEAN_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let Some(b) = self.this_boolean_value(this_val) else {
+                    return Err(self.type_error(&alloc::format!(
+                        "Boolean.prototype.{name} requires that 'this' be a Boolean"
+                    )));
+                };
+                return Ok(self
+                    .call_method(NanBox::boolean(b), &name, args)?
                     .unwrap_or(NanBox::undefined()));
             }
             // A first-class `String.prototype.<method>`: RequireObjectCoercible +
@@ -6544,6 +6783,75 @@ impl<'a> Interp<'a> {
                 if !ok {
                     return Err(self.type_error(&alloc::format!(
                         "TypedArray.prototype.{name} called on a non-TypedArray object"
+                    )));
+                }
+                return Ok(self
+                    .call_method(this_val, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
+            // A first-class `Set.prototype.<method>`: the receiver must be a
+            // non-weak Set (`[[SetData]]`), else a TypeError — so
+            // `Set.prototype.add.call(new Map(), …)` / `.call({})` reject.
+            if id == N_SET_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let ok = this_val.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    self.realm.collection_is_set(h) == Some(true)
+                        && !self.realm.collection_is_weak(h)
+                });
+                if !ok {
+                    return Err(self.type_error(&alloc::format!(
+                        "Set.prototype.{name} requires that 'this' be a Set"
+                    )));
+                }
+                return Ok(self
+                    .call_method(this_val, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
+            // A first-class `Map.prototype.<method>`: the receiver must be a
+            // non-weak Map (`[[MapData]]`), else a TypeError.
+            if id == N_MAP_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let ok = this_val.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    self.realm.collection_is_set(h) == Some(false)
+                        && !self.realm.collection_is_weak(h)
+                });
+                if !ok {
+                    return Err(self.type_error(&alloc::format!(
+                        "Map.prototype.{name} requires that 'this' be a Map"
+                    )));
+                }
+                return Ok(self
+                    .call_method(this_val, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
+            // A first-class `WeakMap.prototype.<method>`: the receiver must be a
+            // WeakMap, else a TypeError.
+            if id == N_WEAKMAP_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let ok = this_val.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    self.realm.collection_is_set(h) == Some(false)
+                        && self.realm.collection_is_weak(h)
+                });
+                if !ok {
+                    return Err(self.type_error(&alloc::format!(
+                        "WeakMap.prototype.{name} requires that 'this' be a WeakMap"
+                    )));
+                }
+                return Ok(self
+                    .call_method(this_val, &name, args)?
+                    .unwrap_or(NanBox::undefined()));
+            }
+            // A first-class `WeakSet.prototype.<method>`: the receiver must be a
+            // WeakSet, else a TypeError.
+            if id == N_WEAKSET_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let ok = this_val.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    self.realm.collection_is_set(h) == Some(true)
+                        && self.realm.collection_is_weak(h)
+                });
+                if !ok {
+                    return Err(self.type_error(&alloc::format!(
+                        "WeakSet.prototype.{name} requires that 'this' be a WeakSet"
                     )));
                 }
                 return Ok(self
@@ -6899,7 +7207,7 @@ impl<'a> Interp<'a> {
         }
         // An `async` function returns a promise of its result (rejected on throw).
         if def.is_async {
-            let promise = self.realm.new_promise();
+            let promise = self.fresh_promise();
             match result {
                 Ok(v) => self.resolve_with(promise, v),
                 Err(ExecError::Throw(e)) => self.settle(promise, e, false),
@@ -6927,13 +7235,23 @@ impl<'a> Interp<'a> {
                 .realm
                 .get_property(handler, "construct")
                 .unwrap_or(NanBox::undefined());
-            if trap
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
+            // A present but non-callable `construct` trap is a TypeError.
+            if !matches!(trap.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                if !trap
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Err(self.type_error("proxy construct trap is not a function"));
+                }
                 let arr = self.realm.new_array(args.to_vec());
                 let target_box = NanBox::handle(target.to_raw());
-                return self.call(trap, &[target_box, NanBox::handle(arr.to_raw()), callee]);
+                let result =
+                    self.call(trap, &[target_box, NanBox::handle(arr.to_raw()), callee])?;
+                // The `construct` trap must return an Object (ECMA-262 step 9).
+                if !self.is_object_value(result) {
+                    return Err(self.type_error("proxy [[Construct]] must return an object"));
+                }
+                return Ok(result);
             }
             return self.construct(NanBox::handle(target.to_raw()), args);
         }
@@ -7102,7 +7420,12 @@ impl<'a> Interp<'a> {
         if id == N_PROXY {
             let target = args.first().copied().unwrap_or(NanBox::undefined());
             let h = args.get(1).copied().unwrap_or(NanBox::undefined());
-            let (Some(tr), Some(hr)) = (target.as_handle(), h.as_handle()) else {
+            // Both the target and the handler must be Objects (a string/symbol/
+            // bigint primitive or an immediate is a TypeError).
+            let (Some(tr), Some(hr)) = (
+                target.as_handle().filter(|_| self.is_object_value(target)),
+                h.as_handle().filter(|_| self.is_object_value(h)),
+            ) else {
                 let msg = self.new_str("Cannot create proxy with a non-object target or handler");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(msg))));
             };
@@ -7143,7 +7466,7 @@ impl<'a> Interp<'a> {
         }
         // `new Promise(executor)`: run executor(resolve, reject).
         if id == N_PROMISE {
-            let promise = self.realm.new_promise();
+            let promise = self.fresh_promise();
             let resolve = self.realm.new_bound_native(N_RESOLVE, promise);
             let reject = self.realm.new_bound_native(N_REJECT, promise);
             let executor = args.first().copied().unwrap_or(NanBox::undefined());
@@ -7664,6 +7987,29 @@ impl<'a> Interp<'a> {
             }
         };
         let handle = self.realm.new_collection(is_set);
+        // Link the instance to its constructor's `.prototype` so
+        // `Object.getPrototypeOf(new Map) === Map.prototype`, `instanceof`, and
+        // inherited `Symbol.toStringTag`/`constructor` lookups resolve.
+        let ctor_name = match id {
+            N_MAP => "Map",
+            N_SET => "Set",
+            N_WEAKMAP => "WeakMap",
+            N_WEAKSET => "WeakSet",
+            _ => "",
+        };
+        if let Some(proto) = self
+            .current
+            .get(ctor_name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            // A collection is a non-object cell: its `[[Prototype]]` link is kept
+            // in the realm's native-proto table (read by `object_proto`).
+            self.realm.set_native_proto(handle, proto);
+        }
         // A weak collection rejects primitive keys (its keys must be objects/symbols).
         if matches!(id, N_WEAKMAP | N_WEAKSET) {
             self.realm.set_collection_weak(handle);
@@ -9081,16 +9427,9 @@ impl<'a> Interp<'a> {
         let Some((target, handler)) = self.realm.proxy_at(proxy) else {
             return Ok(None);
         };
-        let own_trap = self
-            .realm
-            .get_property(handler, "ownKeys")
-            .unwrap_or(NanBox::undefined());
-        if !own_trap
-            .as_handle()
-            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-        {
+        let Some(own_trap) = self.proxy_trap(handler, "ownKeys")? else {
             return Ok(None);
-        }
+        };
         let target_box = NanBox::handle(target.to_raw());
         let keys = self.call(own_trap, &[target_box])?;
         let keys = self.iterate_values(keys)?;
@@ -9966,7 +10305,22 @@ impl<'a> Interp<'a> {
                 }
                 "apply" => {
                     let this = arg(0);
-                    let list = if let Some(h) = arg(1).as_handle().map(Handle::from_raw) {
+                    // CreateListFromArrayLike(argArray): `null`/`undefined` is an
+                    // empty list; an Object is read via its `length`/indices; any
+                    // other value (a number/boolean/string/symbol/bigint) is a
+                    // TypeError ("CreateListFromArrayLike called on non-object").
+                    let arg_array = arg(1);
+                    let list = if matches!(arg_array.unpack(), Unpacked::Undefined | Unpacked::Null)
+                    {
+                        Vec::new()
+                    } else if let Some(h) =
+                        arg_array.as_handle().map(Handle::from_raw).filter(|_| {
+                            self.is_object_value(arg_array)
+                                || self
+                                    .realm
+                                    .is_array_like(Handle::from_raw(arg_array.as_handle().unwrap()))
+                        })
+                    {
                         if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
                             elems
                         } else {
@@ -9982,7 +10336,7 @@ impl<'a> Interp<'a> {
                             v
                         }
                     } else {
-                        Vec::new()
+                        return Err(self.type_error("CreateListFromArrayLike called on non-object"));
                     };
                     return self.call_with_this(recv, this, &list).map(Some);
                 }
@@ -10319,7 +10673,10 @@ impl<'a> Interp<'a> {
         }
         // --- `Proxy.revocable(target, handler)` → `{ proxy, revoke }` ---
         if self.realm.native_at(handle) == Some(N_PROXY) && method == "revocable" {
-            let (Some(tr), Some(hr)) = (arg(0).as_handle(), arg(1).as_handle()) else {
+            let (Some(tr), Some(hr)) = (
+                arg(0).as_handle().filter(|_| self.is_object_value(arg(0))),
+                arg(1).as_handle().filter(|_| self.is_object_value(arg(1))),
+            ) else {
                 let m = self.new_str("Cannot create proxy with a non-object target or handler");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             };
@@ -11034,18 +11391,18 @@ impl<'a> Interp<'a> {
                     {
                         return Ok(Some(arg(0)));
                     }
-                    let p = self.realm.new_promise();
+                    let p = self.fresh_promise();
                     self.resolve_with(p, arg(0));
                     return Ok(Some(NanBox::handle(p.to_raw())));
                 }
                 "reject" => {
-                    let p = self.realm.new_promise();
+                    let p = self.fresh_promise();
                     self.settle(p, arg(0), false);
                     return Ok(Some(NanBox::handle(p.to_raw())));
                 }
                 // `Promise.withResolvers()` → `{ promise, resolve, reject }`.
                 "withResolvers" => {
-                    let p = self.realm.new_promise();
+                    let p = self.fresh_promise();
                     let resolve = self.realm.new_bound_native(N_RESOLVE, p);
                     let reject = self.realm.new_bound_native(N_REJECT, p);
                     let obj = self.realm.new_object();
@@ -11060,8 +11417,19 @@ impl<'a> Interp<'a> {
                 // `Promise.all(iterable)`: resolve with the array of awaited
                 // values, or reject with the first rejection (eager model).
                 "all" => {
-                    let items = self.iterate_values(arg(0))?;
-                    let p = self.realm.new_promise();
+                    let p = self.fresh_promise();
+                    // GetIterator / iteration sit inside IfAbruptRejectPromise: an
+                    // abrupt completion (a non-iterable argument, a throwing
+                    // `Symbol.iterator`/`next`) rejects the result promise rather
+                    // than throwing out of `Promise.all`.
+                    let items = match self.iterate_values(arg(0)) {
+                        Ok(v) => v,
+                        Err(ExecError::Throw(e)) => {
+                            self.settle(p, e, false);
+                            return Ok(Some(NanBox::handle(p.to_raw())));
+                        }
+                        Err(other) => return Err(other),
+                    };
                     let mut results = Vec::with_capacity(items.len());
                     for item in items {
                         match self.await_value(item) {
@@ -11082,8 +11450,15 @@ impl<'a> Interp<'a> {
                 // timer-backed promise that settles first wins (ties in a single step
                 // broken by list order).
                 "race" => {
-                    let items = self.iterate_values(arg(0))?;
-                    let p = self.realm.new_promise();
+                    let p = self.fresh_promise();
+                    let items = match self.iterate_values(arg(0)) {
+                        Ok(v) => v,
+                        Err(ExecError::Throw(e)) => {
+                            self.settle(p, e, false);
+                            return Ok(Some(NanBox::handle(p.to_raw())));
+                        }
+                        Err(other) => return Err(other),
+                    };
                     'race: loop {
                         for item in &items {
                             match self.settled_state(*item) {
@@ -11114,7 +11489,15 @@ impl<'a> Interp<'a> {
                 // `Promise.allSettled(iterable)`: never rejects; each entry is
                 // `{status, value}` or `{status, reason}`.
                 "allSettled" => {
-                    let items = self.iterate_values(arg(0))?;
+                    let p = self.fresh_promise();
+                    let items = match self.iterate_values(arg(0)) {
+                        Ok(v) => v,
+                        Err(ExecError::Throw(e)) => {
+                            self.settle(p, e, false);
+                            return Ok(Some(NanBox::handle(p.to_raw())));
+                        }
+                        Err(other) => return Err(other),
+                    };
                     let mut results = Vec::with_capacity(items.len());
                     for item in items {
                         let obj = self.realm.new_object();
@@ -11133,7 +11516,6 @@ impl<'a> Interp<'a> {
                         }
                         results.push(NanBox::handle(obj.to_raw()));
                     }
-                    let p = self.realm.new_promise();
                     let arr = self.realm.new_array(results);
                     self.resolve_with(p, NanBox::handle(arr.to_raw()));
                     return Ok(Some(NanBox::handle(p.to_raw())));
@@ -11141,8 +11523,15 @@ impl<'a> Interp<'a> {
                 // `Promise.any(iterable)`: fulfills with the first input to
                 // fulfill; rejects with an `AggregateError` if all reject.
                 "any" => {
-                    let items = self.iterate_values(arg(0))?;
-                    let p = self.realm.new_promise();
+                    let p = self.fresh_promise();
+                    let items = match self.iterate_values(arg(0)) {
+                        Ok(v) => v,
+                        Err(ExecError::Throw(e)) => {
+                            self.settle(p, e, false);
+                            return Ok(Some(NanBox::handle(p.to_raw())));
+                        }
+                        Err(other) => return Err(other),
+                    };
                     let mut errors = Vec::new();
                     for item in items {
                         match self.await_value(item) {
@@ -12780,6 +13169,8 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::undefined()));
                 }
                 "keys" => {
+                    // A real iterator object (with `.next`/`[Symbol.iterator]`), so
+                    // `m.keys().next()` works — not just `for-of`.
                     let keys: Vec<NanBox> = self
                         .realm
                         .collection_entries(handle)
@@ -12787,7 +13178,7 @@ impl<'a> Interp<'a> {
                         .into_iter()
                         .map(|(k, _)| k)
                         .collect();
-                    return Ok(Some(NanBox::handle(self.realm.new_array(keys).to_raw())));
+                    return Ok(Some(self.make_generator(keys)));
                 }
                 "values" => {
                     // A Set yields its elements; a Map yields its values.
@@ -12799,7 +13190,7 @@ impl<'a> Interp<'a> {
                         .into_iter()
                         .map(|(k, v)| if is_set { k } else { v })
                         .collect();
-                    return Ok(Some(NanBox::handle(self.realm.new_array(vals).to_raw())));
+                    return Ok(Some(self.make_generator(vals)));
                 }
                 "entries" => {
                     let pairs = self.realm.collection_entries(handle).unwrap_or_default();
@@ -12809,7 +13200,7 @@ impl<'a> Interp<'a> {
                             NanBox::handle(self.realm.new_array(alloc::vec![k, v]).to_raw())
                         })
                         .collect();
-                    return Ok(Some(NanBox::handle(self.realm.new_array(arr).to_raw())));
+                    return Ok(Some(self.make_generator(arr)));
                 }
                 // ES2025 Set composition. The argument is treated as a set-like
                 // (any iterable supplies its elements).
@@ -13623,6 +14014,25 @@ impl<'a> Interp<'a> {
     /// Allocates a heap string and returns its boxed handle.
     fn new_str(&mut self, s: &str) -> NanBox {
         NanBox::handle(self.realm.new_string(s).to_raw())
+    }
+
+    /// Allocates a fresh pending promise whose `[[Prototype]]` is the realm's
+    /// `Promise.prototype` (so `getPrototypeOf(p) === Promise.prototype`,
+    /// `p instanceof Promise`, and the inherited `Symbol.toStringTag` resolve).
+    fn fresh_promise(&mut self) -> Handle {
+        let p = self.realm.new_promise();
+        if let Some(proto) = self
+            .current
+            .get("Promise")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_native_proto(p, proto);
+        }
+        p
     }
 
     /// Allocates a heap string from raw **WTF-8 bytes** (lone surrogates
@@ -15090,6 +15500,19 @@ impl<'a> Interp<'a> {
     /// of `Object.create`/`Object.defineProperties`). An object passes through; a
     /// primitive wrapper boxes; `null`/`undefined` throw using `site` in the
     /// message.
+    /// The `Reflect.*` target requirement: `v` must be an Object (ECMA-262 — the
+    /// first step of every `Reflect` operation is `if Type(target) is not Object,
+    /// throw a TypeError`). A string/symbol/bigint primitive or an immediate
+    /// (number/boolean/null/undefined) is rejected. Returns the target handle.
+    fn reflect_object_target(&mut self, v: NanBox, op: &str) -> Result<Handle, ExecError> {
+        if self.is_object_value(v)
+            && let Some(raw) = v.as_handle()
+        {
+            return Ok(Handle::from_raw(raw));
+        }
+        Err(self.type_error(&alloc::format!("Reflect.{op} called on non-object")))
+    }
+
     fn require_object_coercible_to_object(
         &mut self,
         v: NanBox,
@@ -15161,6 +15584,42 @@ impl<'a> Interp<'a> {
         if ty.as_number() == Some(f64::from(N_BIGINT)) {
             let prim = self.realm.get_property(h, PRIM_WRAP)?;
             return self.realm.bigint_at(Handle::from_raw(prim.as_handle()?));
+        }
+        None
+    }
+
+    /// `thisNumberValue(value)`: the Number primitive `value` *is* (an immediate
+    /// number), or the `[[NumberData]]` of a Number wrapper object. `None` for any
+    /// other value (the caller then throws a `TypeError`).
+    fn this_number_value(&self, value: NanBox) -> Option<f64> {
+        if let Some(n) = value.as_number() {
+            return Some(n);
+        }
+        let h = Handle::from_raw(value.as_handle()?);
+        let ty = self.realm.get_property(h, PRIM_WRAP_TYPE)?;
+        if ty.as_number() == Some(f64::from(N_NUMBER)) {
+            return self
+                .realm
+                .get_property(h, PRIM_WRAP)
+                .and_then(|p| p.as_number());
+        }
+        None
+    }
+
+    /// `thisBooleanValue(value)`: the Boolean primitive `value` *is*, or the
+    /// `[[BooleanData]]` of a Boolean wrapper object. `None` otherwise (the caller
+    /// then throws a `TypeError`).
+    fn this_boolean_value(&self, value: NanBox) -> Option<bool> {
+        if let Unpacked::Bool(b) = value.unpack() {
+            return Some(b);
+        }
+        let h = Handle::from_raw(value.as_handle()?);
+        let ty = self.realm.get_property(h, PRIM_WRAP_TYPE)?;
+        if ty.as_number() == Some(f64::from(N_BOOLEAN)) {
+            return match self.realm.get_property(h, PRIM_WRAP)?.unpack() {
+                Unpacked::Bool(b) => Some(b),
+                _ => None,
+            };
         }
         None
     }
@@ -15670,19 +16129,15 @@ impl<'a> Interp<'a> {
                                     // Proxy `deleteProperty` trap, or forward.
                                     if let Some((target, handler)) = self.realm.proxy_at(h) {
                                         self.guard_revoked(h)?;
-                                        let trap = self
-                                            .realm
-                                            .get_property(handler, "deleteProperty")
-                                            .unwrap_or(NanBox::undefined());
-                                        if trap
-                                            .as_handle()
-                                            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                                        if let Some(trap) =
+                                            self.proxy_trap(handler, "deleteProperty")?
                                         {
                                             let kb = self.new_str(&name);
-                                            self.call(
+                                            let r = self.call(
                                                 trap,
                                                 &[NanBox::handle(target.to_raw()), kb],
                                             )?;
+                                            result = self.realm.truthy(r);
                                         } else {
                                             self.realm.delete_property(target, &name);
                                         }
@@ -15863,6 +16318,29 @@ impl<'a> Interp<'a> {
                         return Err(ExecError::OptShortCircuit);
                     }
                     let args = self.eval_args(arguments)?;
+                    // The built-in name-based dispatch (`call_method`) is an
+                    // optimization for *unshadowed* built-in methods. If the
+                    // receiver carries an *own* property of this name (e.g.
+                    // `s.valueOf = Number.prototype.valueOf`), that property is the
+                    // method to invoke — resolving and calling the function value
+                    // preserves its own `this`-validation (so a cross-type
+                    // `Number.prototype.valueOf` call on a String wrapper throws),
+                    // rather than the receiver's built-in behavior.
+                    if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property
+                        && recv
+                            .as_handle()
+                            .map(Handle::from_raw)
+                            .is_some_and(|h| self.realm.has_own(h, name))
+                    {
+                        let rh = recv.as_handle().map(Handle::from_raw).unwrap();
+                        let f = self.read_member(rh, name)?;
+                        if f.as_handle()
+                            .map(Handle::from_raw)
+                            .is_some_and(|fh| self.is_callable(fh))
+                        {
+                            return self.call_with_this(f, recv, &args);
+                        }
+                    }
                     if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property
                         && let Some(result) = self.call_method(recv, name, &args)?
                     {
@@ -16307,14 +16785,7 @@ impl<'a> Interp<'a> {
         // Proxy `set` trap (or forward to the target).
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
-            let trap = self
-                .realm
-                .get_property(handler, "set")
-                .unwrap_or(NanBox::undefined());
-            if trap
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
+            if let Some(trap) = self.proxy_trap(handler, "set")? {
                 let name = self.member_key(key);
                 let key_box = self.new_str(&name);
                 let recv = NanBox::handle(handle.to_raw());
@@ -16482,14 +16953,7 @@ impl<'a> Interp<'a> {
         // Proxy `get` trap (or forward the read to the target).
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
-            let trap = self
-                .realm
-                .get_property(handler, "get")
-                .unwrap_or(NanBox::undefined());
-            if trap
-                .as_handle()
-                .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
-            {
+            if let Some(trap) = self.proxy_trap(handler, "get")? {
                 let key = self.new_str(name);
                 let recv = NanBox::handle(handle.to_raw());
                 return self.call(trap, &[NanBox::handle(target.to_raw()), key, recv]);
@@ -17271,14 +17735,7 @@ impl<'a> Interp<'a> {
         // Proxy `set` trap (or forward the write to the target).
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
-            let trap = self
-                .realm
-                .get_property(handler, "set")
-                .unwrap_or(NanBox::undefined());
-            if trap
-                .as_handle()
-                .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
-            {
+            if let Some(trap) = self.proxy_trap(handler, "set")? {
                 let key = self.eval_prop_key(property)?;
                 let key_box = self.new_str(&key);
                 let recv = NanBox::handle(handle.to_raw());
@@ -17744,14 +18201,7 @@ impl<'a> Interp<'a> {
                     Some(h) if self.realm.proxy_at(h).is_some() => {
                         let (target, handler) = self.realm.proxy_at(h).unwrap();
                         self.guard_revoked(h)?;
-                        let trap = self
-                            .realm
-                            .get_property(handler, "has")
-                            .unwrap_or(NanBox::undefined());
-                        if trap
-                            .as_handle()
-                            .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
-                        {
+                        if let Some(trap) = self.proxy_trap(handler, "has")? {
                             let kb = self.new_str(&key);
                             let r = self.call(trap, &[NanBox::handle(target.to_raw()), kb])?;
                             self.realm.truthy(r)
@@ -24634,7 +25084,17 @@ mod tests {
             run("[...new Map([['a',1],['b',2]]).values()].join(',')"),
             "1,2"
         );
-        assert_eq!(run("new Map([['a',1],['b',2]]).entries().length"), "2");
+        // `entries()` is a real iterator object (with `.next`), not an array.
+        assert_eq!(
+            run(
+                "let e=new Map([['a',1],['b',2]]).entries(); let r=e.next(); r.value.join(':')+'/'+r.done"
+            ),
+            "a:1/false"
+        );
+        assert_eq!(
+            run("[...new Map([['a',1],['b',2]]).entries()].map(p=>p.join(':')).join(',')"),
+            "a:1,b:2"
+        );
         // Set values/keys are its elements.
         assert_eq!(run("[...new Set([1,2,3,2]).values()].join(',')"), "1,2,3");
         assert_eq!(run("[...new Set([5,6]).keys()].join(',')"), "5,6");
