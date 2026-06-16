@@ -2639,11 +2639,13 @@ impl<'a> Interp<'a> {
                 }
                 // `arr.toString()` joins with a comma (like `join()`).
                 "join" | "toString" => {
+                    // The separator goes through ToString (a Symbol throws a
+                    // TypeError); `undefined` (or `toString`) defaults to ",".
                     let sep =
                         if method == "toString" || matches!(arg(0).unpack(), Unpacked::Undefined) {
                             String::from(",")
                         } else {
-                            self.realm.to_display_string(arg(0))
+                            self.coerce_to_string(arg(0))?
                         };
                     // `null`/`undefined` render empty; an object element is run
                     // through ToString (so a custom `toString` is honored). The
@@ -2692,7 +2694,7 @@ impl<'a> Interp<'a> {
                 }
                 "includes" => {
                     let target = arg(0);
-                    let from = array_from_index(&self.realm, arg(1), elems.len());
+                    let from = self.array_from_index_checked(arg(1), elems.len())?;
                     // SameValueZero: like `===` but `NaN` matches `NaN`.
                     let t_nan = target.as_number().is_some_and(f64::is_nan);
                     let found = elems[from..].iter().any(|e| {
@@ -2709,7 +2711,9 @@ impl<'a> Interp<'a> {
                 }
                 "with" => {
                     let len = elems.len() as i64;
-                    let i = self.realm.to_number(arg(0)) as i64;
+                    // ToIntegerOrInfinity (abrupt-propagating). For a typed array
+                    // the value is also coerced (Number/BigInt) per spec.
+                    let i = self.coerce_to_integer_or_infinity(arg(0))? as i64;
                     let idx = if i < 0 { len + i } else { i };
                     // An out-of-range index is a RangeError.
                     if idx < 0 || idx >= len {
@@ -2727,7 +2731,7 @@ impl<'a> Interp<'a> {
                 }
                 "indexOf" => {
                     let target = arg(0);
-                    let from = array_from_index(&self.realm, arg(1), elems.len());
+                    let from = self.array_from_index_checked(arg(1), elems.len())?;
                     let idx = elems[from..]
                         .iter()
                         .position(|e| self.realm.strict_equals(*e, target))
@@ -2983,9 +2987,10 @@ impl<'a> Interp<'a> {
                     let h = self.realm.new_array(out);
                     return Ok(Some(NanBox::handle(h.to_raw())));
                 }
-                // `at` with negative-from-end indexing.
+                // `at` with negative-from-end indexing. The index is
+                // ToIntegerOrInfinity (a Symbol/abrupt valueOf throws).
                 "at" => {
-                    let i = self.realm.to_number(arg(0));
+                    let i = self.coerce_to_integer_or_infinity(arg(0))?;
                     let idx = if i < 0.0 { elems.len() as f64 + i } else { i };
                     return Ok(Some(
                         as_index(idx)
@@ -3001,8 +3006,9 @@ impl<'a> Interp<'a> {
                         return Ok(Some(NanBox::number(-1.0)));
                     }
                     // Optional `fromIndex` (default last; negative counts back).
+                    // ToIntegerOrInfinity (abrupt-propagating).
                     let from = if args.len() >= 2 {
-                        let n = self.realm.to_number(arg(1));
+                        let n = self.coerce_to_integer_or_infinity(arg(1))?;
                         let n = if n < 0.0 { len as f64 + n } else { n };
                         if n < 0.0 {
                             return Ok(Some(NanBox::number(-1.0)));

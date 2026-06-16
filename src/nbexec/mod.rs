@@ -4754,18 +4754,6 @@ fn str_char_index(n: f64) -> Option<usize> {
     (n >= 0.0).then_some(n as usize)
 }
 
-fn array_from_index(realm: &Realm, arg: NanBox, len: usize) -> usize {
-    if matches!(arg.unpack(), Unpacked::Undefined) {
-        return 0;
-    }
-    let n = realm.to_number(arg);
-    if n < 0.0 {
-        (len as f64 + n).max(0.0) as usize
-    } else {
-        (n as usize).min(len)
-    }
-}
-
 /// A non-negative integer array index, if `n` is one.
 fn as_index(n: f64) -> Option<usize> {
     if n >= 0.0 && n <= u32::MAX as f64 && (n as u64) as f64 == n {

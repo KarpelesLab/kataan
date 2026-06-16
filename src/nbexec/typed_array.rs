@@ -93,6 +93,28 @@ impl<'a> Interp<'a> {
         self.realm.set_element(handle, i, value);
     }
 
+    /// `fromIndex` coercion for `indexOf`/`includes` (forward search): a missing
+    /// argument is `0`; otherwise `ToIntegerOrInfinity` (abrupt-propagating — a
+    /// Symbol/BigInt or an abrupt `valueOf` throws), then a negative counts from
+    /// `len` (floored at 0) and the result is clamped to `len`.
+    pub(crate) fn array_from_index_checked(
+        &mut self,
+        v: NanBox,
+        len: usize,
+    ) -> Result<usize, ExecError> {
+        if matches!(v.unpack(), Unpacked::Undefined) {
+            return Ok(0);
+        }
+        let n = self.coerce_to_integer_or_infinity(v)?;
+        Ok(if n < 0.0 {
+            (len as f64 + n).max(0.0) as usize
+        } else if n >= len as f64 {
+            len
+        } else {
+            n as usize
+        })
+    }
+
     /// Spec-faithful relative-index clamp for typed-array mutators/readers:
     /// `undefined` yields
     /// `default`; otherwise `ToIntegerOrInfinity` (which **throws** for a Symbol
