@@ -76,6 +76,10 @@ pub struct Realm {
     /// `Foo.prototype.constructor === Foo` (and thus `instance.constructor`). Same
     /// id-keyed, GC-quiescent caveat as `fn_protos`.
     fn_ctor: alloc::collections::BTreeMap<u32, Handle>,
+    /// Lazily-materialized `.prototype` objects for class declarations/expressions,
+    /// keyed by the class-table id. Populated on first access with the class's
+    /// instance methods/accessors and a non-enumerable `constructor` back-link.
+    class_protos: alloc::collections::BTreeMap<u32, Handle>,
     /// Auxiliary named-property objects for non-object cells (arrays, functions),
     /// which have no inline object part. Keyed by the cell's handle. Not a GC root
     /// and not relocated on a moving collection — sound only because collection is
@@ -145,6 +149,7 @@ impl Realm {
             symbols_by_id: alloc::collections::BTreeMap::new(),
             fn_protos: alloc::collections::BTreeMap::new(),
             fn_ctor: alloc::collections::BTreeMap::new(),
+            class_protos: alloc::collections::BTreeMap::new(),
             aux_props: alloc::collections::BTreeMap::new(),
             frozen_arrays: alloc::collections::BTreeSet::new(),
             sealed_arrays: alloc::collections::BTreeSet::new(),
@@ -893,6 +898,20 @@ impl Realm {
     /// Allocates a class value (a class-table index plus its captured scope).
     pub fn new_class(&mut self, class_id: u32, env: crate::env::Scope) -> Handle {
         self.heap.alloc(Cell::Class { class_id, env })
+    }
+
+    /// The cached `.prototype` object for the class with id `class_id`, if it has
+    /// already been materialized.
+    #[must_use]
+    pub fn class_prototype_cached(&self, class_id: u32) -> Option<Handle> {
+        self.class_protos.get(&class_id).copied()
+    }
+
+    /// Registers a freshly-created `.prototype` object for the class with id
+    /// `class_id` (so repeated `C.prototype` reads return the same object and the
+    /// constructor's instances can share it).
+    pub fn set_class_prototype(&mut self, class_id: u32, proto: Handle) {
+        self.class_protos.insert(class_id, proto);
     }
 
     /// The `(class_id, captured env)` of the class at `handle`, or `None`.

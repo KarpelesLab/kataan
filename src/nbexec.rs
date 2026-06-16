@@ -247,6 +247,10 @@ pub struct Interp<'a> {
     /// Per-class native-constructor superclass id (`class X extends Error`),
     /// parallel to `classes`; `None` when the parent is a class or absent.
     class_native_super: Vec<Option<u16>>,
+    /// Per-class constructor handle (the class value), parallel to `classes`, so
+    /// the lazily-materialized `.prototype` can install a `constructor` back-link
+    /// and link a derived prototype to its base's prototype.
+    class_handles: Vec<NanBox>,
     /// Current function-call nesting depth (recursion guard).
     call_depth: usize,
     /// C2: current *tree-walk* recursion depth — `eval`/`exec` descend on the
@@ -1170,6 +1174,7 @@ impl<'a> Interp<'a> {
             class_static_set: Vec::new(),
             class_envs: Vec::new(),
             class_native_super: Vec::new(),
+            class_handles: Vec::new(),
             call_depth: 0,
             eval_depth: 0,
             rng_state: math_random_seed(),
@@ -9261,6 +9266,7 @@ impl<'a> Interp<'a> {
         self.class_native_super.push(native_super);
         let handle = self.realm.new_class(class_id, class_env.clone());
         let class_val = NanBox::handle(handle.to_raw());
+        self.class_handles.push(class_val);
         // Bind the class's own name in its methods' scope (a named class
         // expression sees itself; the binding is read-only in spec but not
         // enforced here).
@@ -9412,6 +9418,95 @@ impl<'a> Interp<'a> {
                 Ok(v)
             }
             _ => Ok(this_val),
+        }
+    }
+
+    /// Materializes (and caches) the `.prototype` object for a class, populated
+    /// with the class's instance methods/accessors over the whole `extends` chain
+    /// (derived overriding base), a non-enumerable `constructor` back-link to the
+    /// class handle, and a prototype link to the superclass's `.prototype` so that
+    /// `Object.getPrototypeOf(C.prototype) === Base.prototype`.
+    ///
+    /// This mirrors the per-instance method installation in [`Self::instantiate`];
+    /// the engine copies methods directly onto instances at `new` time, but a real
+    /// prototype object is still required for `C.prototype.m`, `C.prototype[k]`,
+    /// accessor reads, and prototype-chain reflection.
+    fn class_prototype(&mut self, class_id: u32, class_handle: Handle) -> Handle {
+        if let Some(p) = self.realm.class_prototype_cached(class_id) {
+            return p;
+        }
+        let proto = self.realm.new_object();
+        // Cache immediately so a self-referential computed key cannot recurse.
+        self.realm.set_class_prototype(class_id, proto);
+
+        let env = self.class_envs[class_id as usize].clone();
+        // Link to the superclass prototype (class chain or native superclass).
+        let class = self.classes[class_id as usize];
+        if let Ok(Some((super_id, _))) = self.resolve_super(class, &env) {
+            let super_proto = self.class_prototype_by_id(super_id);
+            self.realm.set_object_proto(proto, Some(super_proto));
+        }
+
+        // Install this class's own instance methods/accessors.
+        for member in &class.body {
+            let ClassMember::Method(m) = member else {
+                continue;
+            };
+            if m.is_static || m.kind == MethodKind::Constructor {
+                continue;
+            }
+            let saved = core::mem::replace(&mut self.current, env.clone());
+            let key = self.eval_prop_key(&m.key);
+            let f = self.make_method(
+                &m.value.params,
+                Body::Block(&m.value.body),
+                false,
+                m.value.is_generator,
+                Some(class_id),
+                false,
+            );
+            self.current = saved;
+            let Ok(key) = key else { continue };
+            match m.kind {
+                MethodKind::Method => {
+                    self.realm.set_hidden_property(proto, &key, f);
+                }
+                MethodKind::Get => {
+                    self.realm
+                        .define_accessor(proto, &key, f, NanBox::undefined());
+                    self.realm.mark_hidden(proto, &key);
+                }
+                MethodKind::Set => {
+                    self.realm
+                        .define_accessor(proto, &key, NanBox::undefined(), f);
+                    self.realm.mark_hidden(proto, &key);
+                }
+                MethodKind::Constructor => {}
+            }
+        }
+        // Non-enumerable `constructor` back-link.
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(class_handle.to_raw()));
+        proto
+    }
+
+    /// Materializes a class's prototype by id, recovering its constructor handle
+    /// from `class_handles`.
+    fn class_prototype_by_id(&mut self, class_id: u32) -> Handle {
+        if let Some(p) = self.realm.class_prototype_cached(class_id) {
+            return p;
+        }
+        let handle = self
+            .class_handles
+            .get(class_id as usize)
+            .and_then(|v| v.as_handle().map(Handle::from_raw));
+        match handle {
+            Some(handle) => self.class_prototype(class_id, handle),
+            None => {
+                let proto = self.realm.new_object();
+                self.realm.set_class_prototype(class_id, proto);
+                proto
+            }
         }
     }
 
@@ -16327,6 +16422,14 @@ impl<'a> Interp<'a> {
             && let Some((func_id, _)) = self.realm.function_at(handle)
         {
             let proto = self.realm.function_prototype(func_id);
+            return Ok(NanBox::handle(proto.to_raw()));
+        }
+        // A class's `.prototype` (lazily materialized with its instance
+        // methods/accessors and a `constructor` back-link).
+        if name == "prototype"
+            && let Some((class_id, _)) = self.realm.class_at(handle)
+        {
+            let proto = self.class_prototype(class_id, handle);
             return Ok(NanBox::handle(proto.to_raw()));
         }
         // A bound function's `name` is `"bound " + target.name` (recursing so a

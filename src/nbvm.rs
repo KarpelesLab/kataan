@@ -167,6 +167,9 @@ pub enum Op {
     NewObject { dst: Reg },
     /// `obj[key] = src` (own property set through the object's shape).
     SetProp { obj: Reg, key: String, src: Reg },
+    /// `obj[key] = src` as a *non-enumerable* own property (e.g. a class's
+    /// `prototype`/`constructor` back-links).
+    SetHidden { obj: Reg, key: String, src: Reg },
     /// `dst = obj[key]` (`undefined` if absent).
     GetProp { dst: Reg, obj: Reg, key: String },
     /// `dst = func(args…)` — call function `func` (an index into the program's
@@ -1452,11 +1455,12 @@ fn run_frame(
                 }
             }
             Op::GetKey { dst, obj, key } => {
+                let recv_key = regs[*obj as usize];
                 let handle = object_handle(regs[*obj as usize])?;
                 let k = regs[*key as usize];
-                regs[*dst as usize] = match k.as_number() {
+                match k.as_number() {
                     Some(n) if ctx.realm.is_array(handle) && (n as u64) < u64::from(u32::MAX) => {
-                        ctx.realm.get_element(handle, n as usize)
+                        regs[*dst as usize] = ctx.realm.get_element(handle, n as usize);
                     }
                     _ => {
                         // ToPropertyKey: an object key uses its `toString`.
@@ -1470,7 +1474,7 @@ fn run_frame(
                             && alloc::format!("{i}") == ks
                             && (i as u64) < u64::from(u32::MAX)
                         {
-                            ctx.realm.get_element(handle, i)
+                            regs[*dst as usize] = ctx.realm.get_element(handle, i);
                         } else if ks == "length"
                             && let Some(len) = ctx.realm.array_length(handle).or_else(|| {
                                 // String length counts UTF-16 code units (astral
@@ -1481,11 +1485,21 @@ fn run_frame(
                             })
                         {
                             // Computed `arr["length"]` / `str["length"]`.
-                            NanBox::number(len as f64)
+                            regs[*dst as usize] = NanBox::number(len as f64);
+                        } else if let Some((getter, _)) = ctx.realm.accessor(handle, &ks)
+                            && getter.as_handle().is_some()
+                        {
+                            // A getter accessor under a (possibly numeric) string
+                            // key — invoke it with the receiver as `this`.
+                            match call_closure(ctx, funcs, getter, &[], recv_key) {
+                                Ok(v) => regs[*dst as usize] = v,
+                                Err(e) => handle_throw!(e),
+                            }
                         } else {
-                            ctx.realm
+                            regs[*dst as usize] = ctx
+                                .realm
                                 .get_property(handle, &ks)
-                                .unwrap_or(NanBox::undefined())
+                                .unwrap_or(NanBox::undefined());
                         }
                     }
                 };
@@ -1763,6 +1777,12 @@ fn run_frame(
                     }
                 }
             }
+            Op::SetHidden { obj, key, src } => {
+                if let Some(handle) = regs[*obj as usize].as_handle().map(Handle::from_raw) {
+                    ctx.realm
+                        .set_hidden_property(handle, key, regs[*src as usize]);
+                }
+            }
             Op::GetProp { dst, obj, key } => {
                 let recv = regs[*obj as usize];
                 match recv.as_handle().map(Handle::from_raw) {
@@ -1804,6 +1824,23 @@ fn run_frame(
                                 .map_or("", |p| p.name.as_str());
                             let s = ctx.realm.new_string(nm);
                             regs[*dst as usize] = NanBox::handle(s.to_raw());
+                            continue;
+                        }
+                        // A VM function's `.prototype` is a lazily-created object
+                        // (keyed by function id, with a `constructor` back-link),
+                        // so `F.prototype`, `F.prototype.m = …`, and `typeof
+                        // F.prototype === "object"` all work.
+                        if key.as_str() == "prototype"
+                            && ctx.realm.is_vm_function(handle)
+                            && !ctx.realm.has_own(handle, "prototype")
+                            && let Some(func_id) = ctx
+                                .realm
+                                .get_element(handle, 0)
+                                .as_number()
+                                .map(|f| f as u32)
+                        {
+                            let proto = ctx.realm.function_prototype(func_id);
+                            regs[*dst as usize] = NanBox::handle(proto.to_raw());
                             continue;
                         }
                         // RegExp introspection properties. The (allocating)
@@ -6746,6 +6783,71 @@ impl Compiler {
                 });
             }
         }
+        // Build a real `.prototype` object carrying the class's instance
+        // methods/accessors over the whole `extends` chain (base-first so a
+        // derived method overrides an inherited one) and a `constructor`
+        // back-link, so `C.prototype`, `C.prototype.m`, accessor reads, and
+        // `instance.constructor` reflection all work on the bytecode path.
+        let proto = self.alloc();
+        self.ops.push(Op::NewObject { dst: proto });
+        let mut chain: Vec<String> = Vec::new();
+        let mut cur = Some(String::from(name));
+        while let Some(n) = cur {
+            cur = self.classes.get(&n).and_then(|c| c.super_name.clone());
+            chain.push(n);
+        }
+        for cname in chain.iter().rev() {
+            let Some(cls) = self.classes.get(cname) else {
+                continue;
+            };
+            let methods = cls.methods.clone();
+            let accessors = cls.accessors.clone();
+            for (mname, mid) in &methods {
+                let m = self.alloc();
+                self.ops.push(Op::LoadFunc { dst: m, func: *mid });
+                self.ops.push(Op::SetProp {
+                    obj: proto,
+                    key: mname.clone(),
+                    src: m,
+                });
+            }
+            for (aname, getter_id, setter_id) in &accessors {
+                let g = match getter_id {
+                    Some(fid) => {
+                        let r = self.alloc();
+                        self.ops.push(Op::LoadFunc { dst: r, func: *fid });
+                        r
+                    }
+                    None => self.constant(NanBox::undefined())?,
+                };
+                let s = match setter_id {
+                    Some(fid) => {
+                        let r = self.alloc();
+                        self.ops.push(Op::LoadFunc { dst: r, func: *fid });
+                        r
+                    }
+                    None => self.constant(NanBox::undefined())?,
+                };
+                self.ops.push(Op::DefineAccessor {
+                    obj: proto,
+                    key: aname.clone(),
+                    getter: g,
+                    setter: s,
+                });
+            }
+        }
+        // `proto.constructor === C` (non-enumerable) and `C.prototype === proto`
+        // (non-enumerable).
+        self.ops.push(Op::SetHidden {
+            obj: proto,
+            key: String::from("constructor"),
+            src: cobj,
+        });
+        self.ops.push(Op::SetHidden {
+            obj: cobj,
+            key: String::from("prototype"),
+            src: proto,
+        });
         let b = self.declare(name);
         self.write_var(b, cobj);
         Ok(())

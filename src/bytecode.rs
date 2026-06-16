@@ -382,7 +382,7 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*a)?;
             reg(*b)
         }
-        Op::SetProp { obj, src, .. } => {
+        Op::SetProp { obj, src, .. } | Op::SetHidden { obj, src, .. } => {
             reg(*obj)?;
             reg(*src)
         }
@@ -764,6 +764,12 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_str(key, out);
             w_reg(*src, out);
         }
+        Op::SetHidden { obj, key, src } => {
+            w_u8(56, out);
+            w_reg(*obj, out);
+            w_str(key, out);
+            w_reg(*src, out);
+        }
         Op::GetProp { dst, obj, key } => {
             w_u8(41, out);
             w_reg(*dst, out);
@@ -1033,6 +1039,11 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         },
         39 => Op::NewObject { dst: r.reg()? },
         40 => Op::SetProp {
+            obj: r.reg()?,
+            key: r.string()?,
+            src: r.reg()?,
+        },
+        56 => Op::SetHidden {
             obj: r.reg()?,
             key: r.string()?,
             src: r.reg()?,
