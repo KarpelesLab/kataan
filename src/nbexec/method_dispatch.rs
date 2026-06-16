@@ -2512,8 +2512,7 @@ impl<'a> Interp<'a> {
                             if self.realm.typed_set_same_kind(handle, src, offset) {
                                 return Ok(Some(NanBox::undefined()));
                             }
-                            let src_elems =
-                                self.realm.elements_vec(src).unwrap_or_default();
+                            let src_elems = self.realm.elements_vec(src).unwrap_or_default();
                             self.realm
                                 .typed_set_from_numbers(handle, offset, &src_elems);
                             return Ok(Some(NanBox::undefined()));
@@ -2877,7 +2876,11 @@ impl<'a> Interp<'a> {
                         let len = elems.len();
                         let a = self.typed_clamp_index_checked(arg(0), 0, len)?;
                         let b = self.typed_clamp_index_checked(arg(1), len, len)?;
-                        let sub = if a < b { elems[a..b].to_vec() } else { Vec::new() };
+                        let sub = if a < b {
+                            elems[a..b].to_vec()
+                        } else {
+                            Vec::new()
+                        };
                         return Ok(Some(self.typed_like_species(handle, sub)?));
                     }
                     let (a, b) = slice_bounds(

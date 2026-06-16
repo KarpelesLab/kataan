@@ -303,6 +303,7 @@ impl<'a> Interp<'a> {
     ///   2. `A = ? TypedArrayCreate(C, « len »)` — `Construct(C, [len])`, then
     ///      ValidateTypedArray (the result must be a typed array of length ≥ len).
     ///   3. write `elems` into `A` (coercing per its element kind).
+    ///
     /// When `exemplar.constructor`/species resolve to the built-in default, this
     /// degenerates to [`Self::typed_like`] (a same-kind view). A plain-array
     /// receiver just builds an ordinary array (Array species is handled elsewhere).

@@ -1654,7 +1654,8 @@ impl<'a> Interp<'a> {
                 self.realm
                     .set_property(target, "BYTES_PER_ELEMENT", NanBox::number(bpe));
                 self.realm.mark_hidden(target, "BYTES_PER_ELEMENT");
-                self.realm.set_readonly_property(target, "BYTES_PER_ELEMENT");
+                self.realm
+                    .set_readonly_property(target, "BYTES_PER_ELEMENT");
                 self.realm
                     .set_non_configurable_property(target, "BYTES_PER_ELEMENT");
             }
@@ -1699,7 +1700,10 @@ impl<'a> Interp<'a> {
                     &["byteLength", "maxByteLength", "resizable", "detached"],
                 )
             } else {
-                (N_DATA_VIEW_ACCESSOR, &["buffer", "byteLength", "byteOffset"])
+                (
+                    N_DATA_VIEW_ACCESSOR,
+                    &["buffer", "byteLength", "byteOffset"],
+                )
             };
             for accessor in accessors {
                 let name_h = self.realm.new_string(accessor);
@@ -1726,7 +1730,8 @@ impl<'a> Interp<'a> {
                     let f = self.realm.new_bound_native(N_DATA_VIEW_PROTO_FN, m_h);
                     let arity = if m.starts_with("set") { 2 } else { 1 };
                     self.install_fn_name_length(f, m, arity);
-                    self.realm.set_property(proto, m, NanBox::handle(f.to_raw()));
+                    self.realm
+                        .set_property(proto, m, NanBox::handle(f.to_raw()));
                     self.realm.mark_hidden(proto, m);
                 }
                 // `DataView.prototype[Symbol.toStringTag]` is "DataView"
@@ -4134,15 +4139,16 @@ fn advance_index_u16(units: &[u16], i: usize, unicode: bool) -> usize {
 
 /// Rounds an `f64` to the nearest IEEE-754 binary16 value, returning its 16-bit
 /// pattern. Uses round-to-nearest-ties-to-even, with correct subnormal and
-/// overflow-to-infinity handling. (Rust has no stable `f16`.)
-#[cfg(feature = "std")]
+/// overflow-to-infinity handling. (Rust has no stable `f16`.) Pure bit math, so
+/// it is `core`-friendly (no `std` float intrinsics).
 fn f64_to_f16_bits(value: f64) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 48) & 0x8000) as u16;
     if value.is_nan() {
         return sign | 0x7E00; // a quiet NaN
     }
-    let abs = value.abs();
+    // `abs` via clearing the sign bit (std `f64::abs` is unavailable under no_std).
+    let abs = f64::from_bits(bits & 0x7FFF_FFFF_FFFF_FFFF);
     if abs.is_infinite() {
         return sign | 0x7C00;
     }
@@ -4203,14 +4209,19 @@ fn f64_to_f16_bits(value: f64) -> u16 {
     }
 }
 
-/// Expands a binary16 bit pattern to the `f64` it represents.
-#[cfg(feature = "std")]
+/// Expands a binary16 bit pattern to the `f64` it represents. `core`-friendly:
+/// powers of two are built directly from the IEEE-754 exponent field rather than
+/// via the std-only `f64::powi`.
 fn f16_to_f64(h: u16) -> f64 {
+    // 2^n for n in the binary16 range, by constructing the f64 exponent field.
+    fn pow2(n: i32) -> f64 {
+        f64::from_bits(((1023 + n) as u64) << 52)
+    }
     let sign = if (h & 0x8000) != 0 { -1.0 } else { 1.0 };
     let exp = (h >> 10) & 0x1F;
     let mant = (h & 0x03FF) as f64;
     match exp {
-        0 => sign * mant * 2.0f64.powi(-24), // subnormal (and ±0 when mant == 0)
+        0 => sign * mant * pow2(-24), // subnormal (and ±0 when mant == 0)
         0x1F => {
             if mant == 0.0 {
                 sign * f64::INFINITY
@@ -4218,7 +4229,7 @@ fn f16_to_f64(h: u16) -> f64 {
                 f64::NAN
             }
         }
-        _ => sign * (1.0 + mant / 1024.0) * 2.0f64.powi(exp as i32 - 15),
+        _ => sign * (1.0 + mant / 1024.0) * pow2(exp as i32 - 15),
     }
 }
 
