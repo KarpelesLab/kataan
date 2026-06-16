@@ -625,13 +625,19 @@ impl<'a> Interp<'a> {
         };
         let def = self.functions[func_id as usize];
         // An object-literal concise method carries its `[[HomeObject]]`; bind it for
-        // the duration of the call so `super.x` in the body resolves through it.
-        let home_obj = self
-            .realm
-            .get_property(handle, HOME_OBJECT)
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw);
-        let saved_home_obj = core::mem::replace(&mut self.current_home_object, home_obj);
+        // the duration of the call so `super.x` in the body resolves through it. An
+        // arrow has no own home object — it inherits the enclosing one (so an arrow
+        // inside a concise method can use `super`), matching its lexical `this`.
+        let saved_home_obj = if def.is_arrow {
+            self.current_home_object
+        } else {
+            let home_obj = self
+                .realm
+                .get_property(handle, HOME_OBJECT)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw);
+            core::mem::replace(&mut self.current_home_object, home_obj)
+        };
         let r = self.invoke(def, captured, this_val, args);
         self.current_home_object = saved_home_obj;
         r
@@ -687,8 +693,18 @@ impl<'a> Interp<'a> {
             };
             core::mem::replace(&mut self.this_val, bound)
         };
-        let saved_home = core::mem::replace(&mut self.current_home, def.home_class);
-        let saved_home_static = core::mem::replace(&mut self.current_home_static, def.home_static);
+        // An arrow has no own home: like `this`, it inherits the enclosing
+        // method's `super` binding (home class/static and object-literal home),
+        // so `() => super.m()` inside a method works. A non-arrow establishes its
+        // own home from its `FnDef`.
+        let (saved_home, saved_home_static) = if def.is_arrow {
+            (self.current_home, self.current_home_static)
+        } else {
+            (
+                core::mem::replace(&mut self.current_home, def.home_class),
+                core::mem::replace(&mut self.current_home_static, def.home_static),
+            )
+        };
         // A non-arrow invocation establishes its own `new.target`: the constructor
         // when reached via `new` (passed through the one-shot `pending_new_target`),
         // else `undefined`. An arrow inherits the enclosing `new.target`.
