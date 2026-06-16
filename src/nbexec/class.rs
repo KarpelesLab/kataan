@@ -376,20 +376,37 @@ impl<'a> Interp<'a> {
                 if !matches!(&m.key, PropertyKey::Private(_)) {
                     continue;
                 }
-                let saved = core::mem::replace(&mut self.current, cenv.clone());
-                let key = self.eval_prop_key(&m.key)?;
-                let f = self.make_method(
-                    &m.value.params,
-                    Body::Block(&m.value.body),
-                    false,
-                    m.value.is_generator,
-                    Some(*cid),
-                    false,
+                let key = {
+                    let saved = core::mem::replace(&mut self.current, cenv.clone());
+                    let k = self.eval_prop_key(&m.key);
+                    self.current = saved;
+                    k?
+                };
+                // A private method/accessor is defined once per class and shared by
+                // every instance (`c1.#m === c2.#m`); cache by (class, kind, key).
+                let cache_key = (
+                    *cid,
+                    alloc::format!("{}\u{0}{key}", method_kind_tag(m.kind)),
                 );
-                self.current = saved;
-                if let Some(n) = self.private_method_display_name(&m.key, m.kind) {
-                    self.install_method_meta(f, &n, &m.value.params);
-                }
+                let f = if let Some(f) = self.private_method_cache.get(&cache_key) {
+                    *f
+                } else {
+                    let saved = core::mem::replace(&mut self.current, cenv.clone());
+                    let f = self.make_method(
+                        &m.value.params,
+                        Body::Block(&m.value.body),
+                        false,
+                        m.value.is_generator,
+                        Some(*cid),
+                        false,
+                    );
+                    self.current = saved;
+                    if let Some(n) = self.private_method_display_name(&m.key, m.kind) {
+                        self.install_method_meta(f, &n, &m.value.params);
+                    }
+                    self.private_method_cache.insert(cache_key, f);
+                    f
+                };
                 match m.kind {
                     MethodKind::Method => {
                         self.realm.set_hidden_property(instance, &key, f);
@@ -929,5 +946,17 @@ impl<'a> Interp<'a> {
             cur = self.realm.object_proto(h);
         }
         Ok(Some(self.read_member(spp, name)?))
+    }
+}
+
+/// A short tag distinguishing a method kind, used to key the private-method cache
+/// (a getter and setter can share a storage key, so the kind must be part of the
+/// cache identity).
+fn method_kind_tag(kind: MethodKind) -> &'static str {
+    match kind {
+        MethodKind::Get => "g",
+        MethodKind::Set => "s",
+        MethodKind::Method => "m",
+        MethodKind::Constructor => "c",
     }
 }

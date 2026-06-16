@@ -255,6 +255,11 @@ pub struct Interp<'a> {
     /// the lazily-materialized `.prototype` can install a `constructor` back-link
     /// and link a derived prototype to its base's prototype.
     class_handles: Vec<NanBox>,
+    /// Cache of a class's private *method/accessor* function values, keyed by
+    /// `(class_id, storage_key)`. A private method is defined once per class
+    /// evaluation and shared by every instance (so `c1.#m === c2.#m`), so it is
+    /// created lazily on first instantiation and reused thereafter.
+    private_method_cache: alloc::collections::BTreeMap<(u32, String), NanBox>,
     /// Active `with (obj) …` object environment records, innermost last. A bare
     /// identifier first consults these objects (respecting `@@unscopables`) before
     /// the lexical scope chain.
@@ -1322,6 +1327,7 @@ impl<'a> Interp<'a> {
             class_native_super: Vec::new(),
             class_fn_super: Vec::new(),
             class_handles: Vec::new(),
+            private_method_cache: alloc::collections::BTreeMap::new(),
             with_stack: Vec::new(),
             call_depth: 0,
             eval_depth: 0,
