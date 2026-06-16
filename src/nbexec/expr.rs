@@ -780,9 +780,9 @@ impl<'a> Interp<'a> {
                                         };
                                         if let Some(name) =
                                             self.method_display_name(&k, MethodKind::Method)
-                                            && v.as_handle().map(Handle::from_raw).is_some_and(
-                                                |h| !self.realm.has_own(h, "name"),
-                                            )
+                                            && v.as_handle()
+                                                .map(Handle::from_raw)
+                                                .is_some_and(|h| !self.realm.has_own(h, "name"))
                                         {
                                             self.install_method_meta(v, &name, params);
                                         }
@@ -1055,6 +1055,16 @@ impl<'a> Interp<'a> {
                 {
                     let m = self.new_str(&alloc::format!(
                         "Cannot read private member #{s} from an object whose class did not declare it"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                // Reading a private accessor declared with only a setter
+                // (`set #g(v) {}`) is a TypeError — there is no getter.
+                if let Some((getter, _)) = self.realm.accessor(handle, &key)
+                    && matches!(getter.unpack(), Unpacked::Undefined)
+                {
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot read private member #{s} which has only a setter"
                     ));
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
@@ -2076,8 +2086,10 @@ impl<'a> Interp<'a> {
                     if !matches!(setter.unpack(), Unpacked::Undefined) {
                         let this = NanBox::handle(handle.to_raw());
                         self.call_with_this(setter, this, &[new])?;
-                    } else if self.strict {
-                        // Strict mode: writing a getter-only accessor is a TypeError.
+                    } else if self.strict || matches!(property, PropertyKey::Private(_)) {
+                        // Writing a getter-only accessor is a TypeError in strict
+                        // mode; for a *private* accessor it always throws (there is
+                        // no silent-failure path for private references).
                         let m = self.new_str(&alloc::format!(
                             "Cannot set property {skey} which has only a getter"
                         ));
