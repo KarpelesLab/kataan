@@ -761,7 +761,7 @@ impl<'src> Parser<'src> {
                     if saw_optional {
                         return Err(self.err("tagged template is not allowed in an optional chain"));
                     }
-                    let quasi = self.parse_template_literal()?;
+                    let quasi = self.parse_template_literal(true)?;
                     let span = expr.span().to(quasi.span);
                     expr = Expr::TaggedTemplate {
                         tag: Box::new(expr),
@@ -904,7 +904,7 @@ impl<'src> Parser<'src> {
                 })
             }
             TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead => {
-                Ok(Expr::Template(self.parse_template_literal()?))
+                Ok(Expr::Template(self.parse_template_literal(false)?))
             }
             TokenKind::Keyword(Kw::True) => {
                 self.bump();
@@ -1332,14 +1332,21 @@ impl<'src> Parser<'src> {
 
     /// Parses a template literal starting at a `NoSubstitutionTemplate` or
     /// `TemplateHead` token (the substitutions are full expressions).
-    fn parse_template_literal(&mut self) -> Result<TemplateLiteral> {
+    ///
+    /// `tagged` selects the early-error policy for escape sequences: an
+    /// *untagged* template with an invalid escape (`` `\x0` ``, `` `\u` ``,
+    /// `` `\8` ``, `` `\00` ``, …) is a Syntax Error, whereas a *tagged*
+    /// template tolerates such escapes (the cooked value becomes `undefined`,
+    /// only the `raw` strings are observable). See
+    /// `cook::validate_template_escapes`.
+    fn parse_template_literal(&mut self, tagged: bool) -> Result<TemplateLiteral> {
         let start = self.cur_span();
         let mut quasis = Vec::new();
         let mut expressions = Vec::new();
 
         let head = self.bump();
         if head.kind == TokenKind::NoSubstitutionTemplate {
-            quasis.push(self.template_element(head, TemplatePart::NoSub));
+            quasis.push(self.template_element(head, TemplatePart::NoSub, tagged)?);
             return Ok(TemplateLiteral {
                 quasis,
                 expressions,
@@ -1347,16 +1354,16 @@ impl<'src> Parser<'src> {
             });
         }
         // TemplateHead.
-        quasis.push(self.template_element(head, TemplatePart::Head));
+        quasis.push(self.template_element(head, TemplatePart::Head, tagged)?);
         loop {
             expressions.push(self.without_no_in(Self::parse_expression)?);
             let part = self.bump();
             match part.kind {
                 TokenKind::TemplateMiddle => {
-                    quasis.push(self.template_element(part, TemplatePart::Middle));
+                    quasis.push(self.template_element(part, TemplatePart::Middle, tagged)?);
                 }
                 TokenKind::TemplateTail => {
-                    quasis.push(self.template_element(part, TemplatePart::Tail));
+                    quasis.push(self.template_element(part, TemplatePart::Tail, tagged)?);
                     return Ok(TemplateLiteral {
                         quasis,
                         expressions,
@@ -1375,7 +1382,16 @@ impl<'src> Parser<'src> {
 
     /// Extracts the raw and cooked text of one template segment, stripping the
     /// surrounding delimiters according to which part it is.
-    fn template_element(&self, tok: Token, part: TemplatePart) -> TemplateElement {
+    ///
+    /// For an *untagged* template (`tagged == false`) an invalid escape in the
+    /// segment is an early Syntax Error; a *tagged* template tolerates it and
+    /// records `cooked: None`.
+    fn template_element(
+        &self,
+        tok: Token,
+        part: TemplatePart,
+        tagged: bool,
+    ) -> Result<TemplateElement> {
         let text = tok.text(self.source);
         let inner = match part {
             // `` `…` ``  and  `}…` ``  drop one delimiter each side / end.
@@ -1383,12 +1399,15 @@ impl<'src> Parser<'src> {
             // `` `…${ ``  and  `}…${ ``  drop one leading and the trailing `${`.
             TemplatePart::Head | TemplatePart::Middle => &text[1..text.len() - 2],
         };
+        if !tagged {
+            cook::validate_template_escapes(inner, tok.span)?;
+        }
         let cooked = cook::decode_escapes(inner, tok.span).ok().map(Into::into);
-        TemplateElement {
+        Ok(TemplateElement {
             raw: inner.into(),
             cooked,
             span: tok.span,
-        }
+        })
     }
 
     // --- helpers --------------------------------------------------------

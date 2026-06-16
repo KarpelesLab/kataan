@@ -120,7 +120,7 @@ impl<'src> Lexer<'src> {
         if self.pos == 0 && self.peek() == Some(b'#') && self.peek_at(1) == Some(b'!') {
             self.skip_line_comment(); // consumes `#!` and the rest of the line
         }
-        let newline_before = self.skip_trivia();
+        let newline_before = self.skip_trivia()?;
         let start = self.pos;
 
         let Some(c) = self.peek() else {
@@ -204,11 +204,13 @@ impl<'src> Lexer<'src> {
     // --- trivia ---------------------------------------------------------
 
     /// Skips whitespace and comments. Returns whether at least one line
-    /// terminator was crossed.
-    fn skip_trivia(&mut self) -> bool {
+    /// terminator was crossed. Errors only on an unterminated block comment.
+    fn skip_trivia(&mut self) -> Result<bool> {
         let mut newline = false;
         loop {
-            let Some(c) = self.peek() else { return newline };
+            let Some(c) = self.peek() else {
+                return Ok(newline);
+            };
             match c {
                 // ASCII whitespace.
                 b' ' | b'\t' | 0x0b | 0x0c => self.advance(),
@@ -226,8 +228,8 @@ impl<'src> Lexer<'src> {
                 }
                 b'/' => match self.peek_at(1) {
                     Some(b'/') => self.skip_line_comment(),
-                    Some(b'*') => newline |= self.skip_block_comment(),
-                    _ => return newline,
+                    Some(b'*') => newline |= self.skip_block_comment()?,
+                    _ => return Ok(newline),
                 },
                 // Non-ASCII whitespace / line terminators (NBSP, BOM, U+2028,
                 // U+2029, the Zs category…). Decode one char to classify.
@@ -239,10 +241,10 @@ impl<'src> Lexer<'src> {
                     } else if is_unicode_whitespace(ch) {
                         self.advance_char(ch);
                     } else {
-                        return newline;
+                        return Ok(newline);
                     }
                 }
-                _ => return newline,
+                _ => return Ok(newline),
             }
         }
     }
@@ -268,8 +270,10 @@ impl<'src> Lexer<'src> {
     }
 
     /// Skips a `/* … */` comment. Returns whether it contained a line
-    /// terminator (which, per spec, makes it act as one for ASI).
-    fn skip_block_comment(&mut self) -> bool {
+    /// terminator (which, per spec, makes it act as one for ASI). An EOF reached
+    /// before the closing `*/` is an unterminated comment — a Syntax Error.
+    fn skip_block_comment(&mut self) -> Result<bool> {
+        let start = self.pos;
         self.advance();
         self.advance();
         let mut newline = false;
@@ -277,7 +281,7 @@ impl<'src> Lexer<'src> {
             if c == b'*' && self.peek_at(1) == Some(b'/') {
                 self.advance();
                 self.advance();
-                return newline;
+                return Ok(newline);
             }
             if c == b'\n' || c == b'\r' {
                 newline = true;
@@ -292,7 +296,10 @@ impl<'src> Lexer<'src> {
                 self.advance();
             }
         }
-        newline
+        Err(Error::syntax(
+            "unterminated block comment",
+            Span::new(start as u32, self.pos as u32),
+        ))
     }
 
     // --- multi-character punctuators ------------------------------------

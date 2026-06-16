@@ -218,6 +218,119 @@ pub(super) fn decode_escapes(body: &str, span: Span) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Validates the escape sequences of an *untagged* template segment, returning
+/// a Syntax Error for any `NotEscapeSequence` (a `\` followed by something that
+/// is not a legal `TemplateEscapeSequence`).
+///
+/// Per the grammar (`sec-template-literal-lexical-components`), a template
+/// segment admits only:
+///   - `CharacterEscapeSequence` (`\n`, `\\`, `\` + any non-escape char, line
+///     continuations) — always valid,
+///   - `\0` provided it is **not** followed by a decimal digit,
+///   - `HexEscapeSequence` `\xHH` with exactly two hex digits,
+///   - `UnicodeEscapeSequence` `\uHHHH` or `\u{ CodePoint }` (≤ U+10FFFF, no
+///     numeric separators).
+///
+/// In particular — and unlike a sloppy-mode string, where Annex B allows them —
+/// a legacy octal escape (`\1`–`\7`, `\00`, …) and `\8` / `\9` are *never* legal
+/// in a template and so are rejected here regardless of strict mode. (Tagged
+/// templates skip this check: their cooked value is simply `undefined`.)
+pub(super) fn validate_template_escapes(body: &str, span: Span) -> Result<()> {
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            continue;
+        }
+        let Some(esc) = chars.next() else {
+            // A trailing `\` cannot occur: the lexer requires the closing
+            // delimiter, so a `\` is always followed by at least one char.
+            return Err(Error::syntax("invalid template escape sequence", span));
+        };
+        match esc {
+            // `\0` is only an escape when not followed by a decimal digit; a
+            // following digit makes it a legacy octal escape (`\00`), which is
+            // not a TemplateEscapeSequence.
+            '0' => {
+                if chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    return Err(Error::syntax(
+                        "octal escape sequences are not allowed in template literals",
+                        span,
+                    ));
+                }
+            }
+            // Legacy octal (`\1`–`\7`) and the non-octal decimals `\8` / `\9`.
+            '1'..='9' => {
+                return Err(Error::syntax(
+                    "octal escape sequences are not allowed in template literals",
+                    span,
+                ));
+            }
+            'x' => {
+                if !next_is_hex(&mut chars) || !next_is_hex(&mut chars) {
+                    return Err(Error::syntax(
+                        "invalid hexadecimal escape sequence in template literal",
+                        span,
+                    ));
+                }
+            }
+            'u' => validate_template_unicode_escape(&mut chars, span)?,
+            // Any other escaped char (incl. line continuations) is valid.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Validates a `\u` escape body in a template (the `u` already consumed):
+/// either `\uHHHH` or `\u{ CodePoint }` with `CodePoint` ≤ U+10FFFF and no
+/// numeric separators.
+fn validate_template_unicode_escape(
+    chars: &mut core::iter::Peekable<core::str::Chars<'_>>,
+    span: Span,
+) -> Result<()> {
+    let invalid = || Error::syntax("invalid Unicode escape sequence in template literal", span);
+    if chars.peek() == Some(&'{') {
+        chars.next(); // `{`
+        let mut value: u32 = 0;
+        let mut any = false;
+        loop {
+            match chars.peek() {
+                Some('}') => break,
+                Some(&d) if d.is_ascii_hexdigit() => {
+                    any = true;
+                    value = value
+                        .saturating_mul(16)
+                        .saturating_add(d.to_digit(16).unwrap_or(0));
+                    chars.next();
+                }
+                // A numeric separator (`_`) or any other char is invalid.
+                _ => return Err(invalid()),
+            }
+        }
+        chars.next(); // `}`
+        if !any || value > 0x10_FFFF {
+            return Err(invalid());
+        }
+    } else {
+        for _ in 0..4 {
+            if !next_is_hex(chars) {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Consumes one char if it is an ASCII hex digit, reporting whether it was.
+fn next_is_hex(chars: &mut core::iter::Peekable<core::str::Chars<'_>>) -> bool {
+    if chars.peek().is_some_and(char::is_ascii_hexdigit) {
+        chars.next();
+        true
+    } else {
+        false
+    }
+}
+
 /// Appends a scalar `char`'s UTF-8 bytes to `out`. (A `char` is never a
 /// surrogate, so this is plain UTF-8; surrogates only enter via `\u` escapes,
 /// handled by [`decode_unicode_escape`].)
@@ -326,6 +439,46 @@ mod tests {
         assert_eq!(bigint("123n"), "123");
         assert_eq!(bigint("1_000n"), "1000");
         assert_eq!(bigint("0xFFn"), "0xFF");
+    }
+
+    #[test]
+    fn template_escape_validation() {
+        // Valid TemplateEscapeSequences.
+        for ok in [
+            "",
+            "abc",
+            r"\n\t\\",
+            r"\x41",
+            r"A",
+            r"\u{1F600}",
+            r"\u{D800}",
+            r"\0",
+            r"\w",
+        ] {
+            assert!(
+                validate_template_escapes(ok, sp()).is_ok(),
+                "should accept: {ok:?}"
+            );
+        }
+        // NotEscapeSequences — early errors in an untagged template.
+        for bad in [
+            r"\x0",        // truncated \x
+            r"\xZZ",       // non-hex \x
+            r"\u0",        // truncated \u
+            r"\u",         // \u with no digits
+            r"\u{}",       // empty code point
+            r"\u{110000}", // out of range
+            r"\u{1F_639}", // separator in \u{}
+            r"\00",        // legacy octal
+            r"\1",         // legacy octal
+            r"\8",         // \8
+            r"\9",         // \9
+        ] {
+            assert!(
+                validate_template_escapes(bad, sp()).is_err(),
+                "should reject: {bad:?}"
+            );
+        }
     }
 
     #[test]

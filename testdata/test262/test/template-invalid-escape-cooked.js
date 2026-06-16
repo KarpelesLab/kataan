@@ -29,9 +29,10 @@ var s5 = tag`ok${1}\u{110000}`;
 assert.sameValue(s5[0], "ok", "first quasi cooks");
 assert.sameValue(s5[1], undefined, "out-of-range code point -> undefined cooked");
 
-// In an UNTAGGED template, an invalid escape is a SyntaxError (raised on evaluation here).
-function throwsSyntax(fn) { try { fn(); return false; } catch (e) { return e instanceof SyntaxError; } }
-assert.sameValue(throwsSyntax(function () { return `\unicode`; }), true, "untagged invalid escape -> SyntaxError");
+// In an UNTAGGED template, an invalid escape is an early (parse-phase) SyntaxError.
+// We observe it via eval(), whose parse error surfaces at runtime as a SyntaxError.
+function throwsSyntax(src) { try { eval(src); return false; } catch (e) { return e instanceof SyntaxError; } }
+assert.sameValue(throwsSyntax("`\\unicode`"), true, "untagged invalid escape -> SyntaxError");
 
 // A valid untagged template is unaffected.
 var x = 5;

@@ -1305,3 +1305,70 @@ fn using_declarations_parse() {
     assert!(Parser::parse_program("{ using x; }").is_err()); // initializer required
     assert!(Parser::parse_program("using x = 1;").is_err()); // not at script top level
 }
+
+#[test]
+fn untagged_template_invalid_escape_is_early_error() {
+    // An *untagged* template literal with an invalid escape is a parse error.
+    assert!(Parser::parse_program("`\\x0`;").is_err()); // truncated \x
+    assert!(Parser::parse_program("`\\u0`;").is_err()); // truncated \u
+    assert!(Parser::parse_program("`\\u`;").is_err()); // \u with no digits
+    assert!(Parser::parse_program("`\\u{}`;").is_err()); // empty code point
+    assert!(Parser::parse_program("`\\u{110000}`;").is_err()); // code point > 0x10FFFF
+    assert!(Parser::parse_program("`\\u{1F_639}`;").is_err()); // separator in \u{}
+    assert!(Parser::parse_program("`\\00`;").is_err()); // legacy octal
+    assert!(Parser::parse_program("`\\8`;").is_err()); // \8
+    assert!(Parser::parse_program("`\\9`;").is_err()); // \9
+    assert!(Parser::parse_program("`a${1}\\x0`;").is_err()); // bad escape in tail segment
+
+    // Valid untagged templates are unaffected.
+    assert!(Parser::parse_program("`\\x41`;").is_ok());
+    assert!(Parser::parse_program("`\\u{1F600}`;").is_ok());
+    assert!(Parser::parse_program("`\\u{D800}`;").is_ok()); // lone surrogate is legal
+    assert!(Parser::parse_program("`\\0`;").is_ok()); // \0 not followed by a digit
+    assert!(Parser::parse_program("`\\n\\t\\\\`;").is_ok());
+    assert!(Parser::parse_program("`a${1}b`;").is_ok());
+
+    // A *tagged* template tolerates every otherwise-invalid escape (the cooked
+    // value becomes `undefined`; only `.raw` is observable).
+    assert!(Parser::parse_program("tag`\\x0`;").is_ok());
+    assert!(Parser::parse_program("tag`\\u`;").is_ok());
+    assert!(Parser::parse_program("tag`\\8`;").is_ok());
+    assert!(Parser::parse_program("tag`\\00`;").is_ok());
+    assert!(Parser::parse_program("tag`\\u{110000}`;").is_ok());
+    assert!(Parser::parse_program("tag`a${1}\\x0`;").is_ok());
+}
+
+#[test]
+fn unterminated_block_comment_is_error() {
+    assert!(Parser::parse_program("/*CHECK#1/").is_err());
+    assert!(Parser::parse_program("/* never closed").is_err());
+    assert!(Parser::parse_program("var x = 1; /* trailing").is_err());
+    // A `/*/` is an *unterminated* comment, not a closed one (`/` then EOF).
+    assert!(Parser::parse_program("/*/").is_err());
+    // Properly closed comments still parse.
+    assert!(Parser::parse_program("/* ok */ var x = 1;").is_ok());
+    assert!(Parser::parse_program("/**/").is_ok());
+    assert!(Parser::parse_program("/*/ */").is_ok()); // `/` inside, then closed
+}
+
+#[test]
+fn private_name_only_valid_as_in_lhs() {
+    // The `#x in obj` brand check is the only legal bare-private-name position.
+    assert!(Parser::parse_program("class C { #x; m(o){ return #x in o; } }").is_ok());
+    assert!(
+        Parser::parse_program("class C { #a; #b; m(o){ return #a in o && #b in o; } }").is_ok()
+    );
+    assert!(Parser::parse_program("class C { #a; m(o){ return (#a in o) in {}; } }").is_ok());
+    assert!(Parser::parse_program("class C { #x = 1; m(){ return this.#x; } }").is_ok());
+
+    // `#a in #b in this` parses as `(#a in #b) in this`: the inner `#b` is the
+    // right operand of `in`, where a bare private name is illegal.
+    assert!(
+        Parser::parse_program("class C { #field; constructor(){ #field in #field in this; } }")
+            .is_err()
+    );
+    // A standalone private-name reference is illegal.
+    assert!(Parser::parse_program("class C { #x; m(){ return #x; } }").is_err());
+    // An undeclared private name in the (otherwise legal) `in` LHS still errors.
+    assert!(Parser::parse_program("class C { m(o){ return #nope in o; } }").is_err());
+}

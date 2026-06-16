@@ -1161,17 +1161,22 @@ impl Validator {
                 let _ = ctx;
                 Ok(())
             }
-            Expr::PrivateName(name, span) => {
-                if !self.private_in_scope(name) {
-                    return Err(self.err(*span, "reference to undeclared private name"));
-                }
-                Ok(())
+            Expr::PrivateName(_, span) => {
+                // A bare private-name reference is only legal as the immediate
+                // left operand of an `in` (the `#x in obj` brand check), which is
+                // handled in the `Binary` arm below. Reaching it anywhere else —
+                // as a standalone value, or as the *right* operand of `in`
+                // (`#a in #b`) — is an early Syntax Error.
+                Err(self.err(
+                    *span,
+                    "a private name is only allowed as the left operand of `in`",
+                ))
             }
             Expr::Template(t) => {
-                // NB: an *untagged* template literal with an invalid escape is a
-                // spec parse error, but this engine surfaces it at runtime (a
-                // curated conformance test pins that behavior), so it is not
-                // enforced here.
+                // An *untagged* template literal with an invalid escape is an
+                // early Syntax Error; that check runs in the parser
+                // (`cook::validate_template_escapes`, gated on the untagged
+                // position), so nothing extra is needed here.
                 for x in &t.expressions {
                     self.expr(x, ctx)?;
                 }
@@ -1416,6 +1421,24 @@ impl Validator {
                 let mut node = e;
                 loop {
                     match node {
+                        // The private-in brand check `#x in obj`: the left operand
+                        // is the only position where a bare private name is legal.
+                        // Validate its declaration here and continue with the
+                        // right operand, bypassing the generic `PrivateName` arm
+                        // (which rejects every other position).
+                        Expr::Binary {
+                            op: crate::ast::BinaryOp::In,
+                            left,
+                            right,
+                            ..
+                        } if matches!(&**left, Expr::PrivateName(..)) => {
+                            if let Expr::PrivateName(name, span) = &**left
+                                && !self.private_in_scope(name)
+                            {
+                                return Err(self.err(*span, "reference to undeclared private name"));
+                            }
+                            break self.expr(right, ctx);
+                        }
                         Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
                             self.expr(right, ctx)?;
                             node = left;
