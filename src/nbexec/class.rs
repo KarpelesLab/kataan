@@ -100,16 +100,15 @@ impl<'a> Interp<'a> {
                     statics.insert(key, f);
                 }
                 ClassMember::Field(field) if field.is_static => {
+                    // A static field is installed as an enumerable own key, but its
+                    // initializer is evaluated *later* (in source order with static
+                    // blocks, after the constructor object — with its name/methods —
+                    // exists), with `this` = the class. Install a placeholder now.
                     let key = self.eval_prop_key(&field.key)?;
-                    let v = match &field.value {
-                        Some(e) => self.eval(e).unwrap_or(NanBox::undefined()),
-                        None => NanBox::undefined(),
-                    };
-                    // Static fields are enumerable own keys of the constructor.
                     if !static_fields.contains(&key) {
                         static_fields.push(key.clone());
                     }
-                    statics.insert(key, v);
+                    statics.insert(key, NanBox::undefined());
                 }
                 // `static get x() {}` / `static set x(v) {}` — accessors.
                 ClassMember::Method(m)
@@ -270,31 +269,49 @@ impl<'a> Interp<'a> {
         if let Some(id) = &class.id {
             class_env.declare(&id.name, class_val);
         }
-        // Run `static { … }` initialization blocks with `this` = the class and the
-        // class name bound (so the block can reference the class and its statics).
-        if class
-            .body
-            .iter()
-            .any(|m| matches!(m, ClassMember::StaticBlock { .. }))
-        {
+        // Run static initialization — `static field = …` initializers and
+        // `static { … }` blocks — in source order, *after* the constructor object
+        // (with its name and methods) exists, with `this` = the class and the class
+        // name bound (so an initializer/block can reference the class, its name,
+        // and its other statics). Class bodies are strict code.
+        let has_static_init = class.body.iter().any(|m| {
+            matches!(m, ClassMember::StaticBlock { .. })
+                || matches!(m, ClassMember::Field(f) if f.is_static && f.value.is_some())
+        });
+        if has_static_init {
             let scope = self.current.child();
             if let Some(id) = &class.id {
                 scope.declare(&id.name, class_val);
             }
             let saved = core::mem::replace(&mut self.current, scope);
             let saved_this = core::mem::replace(&mut self.this_val, class_val);
+            let saved_strict = core::mem::replace(&mut self.strict, true);
             let r = (|| {
                 for member in &class.body {
-                    if let ClassMember::StaticBlock { body, .. } = member {
-                        for stmt in body {
-                            self.exec(stmt)?;
+                    match member {
+                        ClassMember::StaticBlock { body, .. } => {
+                            for stmt in body {
+                                self.exec(stmt)?;
+                            }
                         }
+                        ClassMember::Field(field) if field.is_static => {
+                            let key = self.eval_prop_key(&field.key)?;
+                            let v = match &field.value {
+                                Some(e) => self.eval(e)?,
+                                None => continue,
+                            };
+                            if let Some(h) = class_val.as_handle().map(Handle::from_raw) {
+                                self.realm.set_property(h, &key, v);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Ok(())
             })();
             self.current = saved;
             self.this_val = saved_this;
+            self.strict = saved_strict;
             r?;
         }
         Ok(class_val)
