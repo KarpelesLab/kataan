@@ -2613,6 +2613,27 @@ impl<'a> Interp<'a> {
                     self.coerce_to_number(a)?;
                 }
             }
+            // The iteration built-ins require IsCallable(callbackfn) *before* any
+            // element access (a non-callable callback is a TypeError even for an
+            // empty array). `reduce`/`reduceRight` validate `arg(0)`; the rest take
+            // the callback at `arg(0)` too.
+            if matches!(
+                method,
+                "forEach"
+                    | "map"
+                    | "filter"
+                    | "some"
+                    | "every"
+                    | "find"
+                    | "findIndex"
+                    | "findLast"
+                    | "findLastIndex"
+                    | "reduce"
+                    | "reduceRight"
+                    | "flatMap"
+            ) {
+                self.require_callable(arg(0), &alloc::format!("{method} callback"))?;
+            }
             // NOTE: per spec the length-mutating methods finish with
             // Set(O, "length", …, Throw=true) and so throw a TypeError on a
             // non-writable/frozen array's `length`. The curated gate's

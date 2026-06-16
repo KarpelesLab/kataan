@@ -14,6 +14,24 @@ impl<'a> Interp<'a> {
                 .is_some_and(|(t, _)| self.is_callable(t))
     }
 
+    /// `IsCallable(v)` for a [`NanBox`] value: true iff `v` is a callable object.
+    pub(crate) fn is_callable_value(&self, v: NanBox) -> bool {
+        v.as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| self.is_callable(h))
+    }
+
+    /// Throws a `TypeError("<what> is not a function")` unless `v` is callable;
+    /// the upfront IsCallable guard the iteration built-ins (`forEach`/`map`/
+    /// `reduce`/`find`/…) apply to their callback before any element processing.
+    pub(crate) fn require_callable(&mut self, v: NanBox, what: &str) -> Result<(), ExecError> {
+        if self.is_callable_value(v) {
+            Ok(())
+        } else {
+            Err(self.type_error(&alloc::format!("{what} is not a function")))
+        }
+    }
+
     /// The abstract operation `IsConstructor(value)` — whether `value` has a
     /// `[[Construct]]` internal method (i.e. `new value` / `Reflect.construct`
     /// would dispatch rather than throw "is not a constructor"). Mirrors the
