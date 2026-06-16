@@ -1820,6 +1820,13 @@ impl<'a> Interp<'a> {
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
                 let new = if op == AssignOp::Assign {
+                    // NamedEvaluation: `x = function(){}` / `x = () => {}` /
+                    // `x = class {}` names the anonymous definition after the LHS
+                    // identifier (only for a plain `=`, and only when the RHS is an
+                    // anonymous function/arrow/class).
+                    if matches!(value, Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_)) {
+                        self.set_fn_name(rhs, name);
+                    }
                     rhs
                 } else {
                     let current = self
