@@ -1294,12 +1294,11 @@ impl<'a> Interp<'a> {
             N_MATH_FROUND => NanBox::number(self.realm.to_number(arg(0)) as f32 as f64),
             // `Math.f16round(x)` — round to the nearest IEEE-754 binary16 value and
             // back to a double (no stable Rust `f16`, so the conversion is explicit).
-            #[cfg(feature = "std")]
+            // The binary16 round-trip is pure bit manipulation (no std float
+            // intrinsics), so it is available in the no_std core too.
             N_MATH_F16ROUND => {
                 NanBox::number(f16_to_f64(f64_to_f16_bits(self.realm.to_number(arg(0)))))
             }
-            #[cfg(not(feature = "std"))]
-            N_MATH_F16ROUND => return Err(ExecError::Unsupported("Math.f16round needs std")),
             // `Math.clz32(x)` — count leading zeros of the ToUint32 value. ToUint32
             // maps a non-finite/NaN value to 0 (so `clz32(Infinity)` is 32). The
             // `as i64 as u32` cast performs trunc-toward-zero mod 2^32 without the
