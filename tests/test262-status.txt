@@ -35,7 +35,7 @@ annexB/built-ins/RegExp/RegExp-decimal-escape-not-capturing.js  # [sloppy] expec
 annexB/built-ins/RegExp/RegExp-invalid-control-escape-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/RegExp/RegExp-leading-escape-BMP.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/RegExp/RegExp-trailing-escape-BMP.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/incomplete_hex_unicode_escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+annexB/built-ins/RegExp/incomplete_hex_unicode_escape.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/RegExp/legacy-accessors/index/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 annexB/built-ins/RegExp/legacy-accessors/index/this-not-regexp-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 annexB/built-ins/RegExp/legacy-accessors/index/this-subclass-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -54,30 +54,10 @@ annexB/built-ins/RegExp/legacy-accessors/leftContext/this-subclass-constructor.j
 annexB/built-ins/RegExp/legacy-accessors/rightContext/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 annexB/built-ins/RegExp/legacy-accessors/rightContext/this-not-regexp-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 annexB/built-ins/RegExp/legacy-accessors/rightContext/this-subclass-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/prototype/Symbol.split/Symbol.match-getter-recompiles-source.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-annexB/built-ins/RegExp/prototype/Symbol.split/toint32-limit-recompiles-source.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/RegExp/prototype/compile/duplicate-named-capturing-groups-syntax.js  # [sloppy] expected pass, Runtime [object Object]: 
+annexB/built-ins/RegExp/prototype/Symbol.split/Symbol.match-getter-recompiles-source.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/RegExp/prototype/compile/flags-string-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/prototype/compile/flags-to-string-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/prototype/compile/flags-to-string.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/RegExp/prototype/compile/flags-undefined.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/RegExp/prototype/compile/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/prototype/compile/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/prototype/compile/pattern-regexp-distinct.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/RegExp/prototype/compile/pattern-regexp-flags-defined.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/prototype/compile/pattern-regexp-immutable-lastindex.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-annexB/built-ins/RegExp/prototype/compile/pattern-regexp-props.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-annexB/built-ins/RegExp/prototype/compile/pattern-regexp-same.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/RegExp/prototype/compile/pattern-string-invalid-u.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/prototype/compile/pattern-string-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/prototype/compile/pattern-string-u.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/RegExp/prototype/compile/pattern-string.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/RegExp/prototype/compile/pattern-to-string-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/prototype/compile/pattern-undefined.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/RegExp/prototype/compile/this-not-object.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/prototype/compile/this-obj-not-regexp.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/prototype/flags/order-after-compile.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+annexB/built-ins/RegExp/prototype/compile/length.js  # [sloppy] expected pass, Runtime [object Object]: 
+annexB/built-ins/RegExp/prototype/compile/pattern-regexp-immutable-lastindex.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/String/prototype/anchor/B.2.3.2.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 annexB/built-ins/String/prototype/anchor/attr-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/String/prototype/anchor/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
@@ -2649,7 +2629,6 @@ built-ins/Function/prototype/toString/private-static-method-class-statement.js  
 built-ins/Function/prototype/toString/proxy-bound-function.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Function/prototype/toString/proxy-class.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Function/prototype/toString/proxy-non-callable-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Function/prototype/toString/symbol-named-builtins.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/GeneratorFunction/extensibility.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/GeneratorFunction/has-instance.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/GeneratorFunction/instance-construct-throws.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
@@ -3301,19 +3280,14 @@ built-ins/Object/bigint.js  # [sloppy] expected pass, Runtime TypeError: Cannot 
 built-ins/Object/create/15.2.3.5-0-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-11.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
 built-ins/Object/create/15.2.3.5-4-118.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/create/15.2.3.5-4-119.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/create/15.2.3.5-4-12.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
+built-ins/Object/create/15.2.3.5-4-12.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-14.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-15.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-171.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/create/15.2.3.5-4-172.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-197.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/create/15.2.3.5-4-198.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-249.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/create/15.2.3.5-4-250.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-28.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-285.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/create/15.2.3.5-4-286.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-29.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-34.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-35.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3321,34 +3295,28 @@ built-ins/Object/create/15.2.3.5-4-38.js  # [sloppy] expected pass, Runtime [obj
 built-ins/Object/create/15.2.3.5-4-5.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-6.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-65.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/create/15.2.3.5-4-66.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/properties-arg-to-object-non-empty-string.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-2-10.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-2-12.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/Object/defineProperties/15.2.3.7-2-13.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
+built-ins/Object/defineProperties/15.2.3.7-2-13.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-2-15.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-2-16.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-2-9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-a-13.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/Object/defineProperties/15.2.3.7-5-a-14.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
+built-ins/Object/defineProperties/15.2.3.7-5-a-14.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-a-17.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-a-7.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-a-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-b-131.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-5-b-132.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-b-157.js  # [strict] expected pass, Runtime TypeError: Cannot add property 'writable', object is not extensible
-built-ins/Object/defineProperties/15.2.3.7-5-b-158.js  # [strict] expected pass, Runtime TypeError: Cannot add property 'writable', object is not extensible
 built-ins/Object/defineProperties/15.2.3.7-5-b-210.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-5-b-211.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-b-239.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-b-240.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-b-245.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-b-246.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-b-249.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-b-25.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-5-b-26.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-5-b-78.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-5-b-79.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-112.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-113.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-120.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3381,7 +3349,6 @@ built-ins/Object/defineProperties/15.2.3.7-6-a-181.js  # [sloppy] expected pass,
 built-ins/Object/defineProperties/15.2.3.7-6-a-182.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-184.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-185.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-6-a-19.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
 built-ins/Object/defineProperties/15.2.3.7-6-a-190.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-191.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-192.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3475,8 +3442,6 @@ built-ins/Object/defineProperty/15.2.3.6-3-139-1.js  # [sloppy] expected pass, R
 built-ins/Object/defineProperty/15.2.3.6-3-140-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-144-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-145.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-3-146-1.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/Object/defineProperty/15.2.3.6-3-146.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-147-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-148-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-149-1.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3484,8 +3449,6 @@ built-ins/Object/defineProperty/15.2.3.6-3-165-1.js  # [sloppy] expected pass, R
 built-ins/Object/defineProperty/15.2.3.6-3-166-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-170-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-171.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-3-172-1.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/Object/defineProperty/15.2.3.6-3-172.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-173-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-174-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-175-1.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3493,8 +3456,6 @@ built-ins/Object/defineProperty/15.2.3.6-3-218-1.js  # [sloppy] expected pass, R
 built-ins/Object/defineProperty/15.2.3.6-3-219-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-223-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-224.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-3-225-1.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/Object/defineProperty/15.2.3.6-3-225.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-226-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-227-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-228-1.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3502,8 +3463,6 @@ built-ins/Object/defineProperty/15.2.3.6-3-248-1.js  # [sloppy] expected pass, R
 built-ins/Object/defineProperty/15.2.3.6-3-249-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-253-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-254.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-3-255-1.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/Object/defineProperty/15.2.3.6-3-255.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-256-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-257-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-258-1.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3511,8 +3470,6 @@ built-ins/Object/defineProperty/15.2.3.6-3-33-1.js  # [sloppy] expected pass, Ru
 built-ins/Object/defineProperty/15.2.3.6-3-34-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-38-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-39.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-3-40-1.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/Object/defineProperty/15.2.3.6-3-40.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-41-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-42-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-43-1.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3520,8 +3477,6 @@ built-ins/Object/defineProperty/15.2.3.6-3-86-1.js  # [sloppy] expected pass, Ru
 built-ins/Object/defineProperty/15.2.3.6-3-87-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-91-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-92.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-3-93-1.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/Object/defineProperty/15.2.3.6-3-93.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-94-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-95-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-3-96-1.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3675,10 +3630,8 @@ built-ins/Object/defineProperty/15.2.3.6-4-354-6.js  # [sloppy] expected pass, R
 built-ins/Object/defineProperty/15.2.3.6-4-360-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-360-6.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-39.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/Object/defineProperty/15.2.3.6-4-40.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
 built-ins/Object/defineProperty/15.2.3.6-4-407.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-408.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-4-409.js  # [sloppy] expected pass, Runtime TypeError: Object.defineProperty called on non-object
 built-ins/Object/defineProperty/15.2.3.6-4-410.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-415.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-417.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3699,7 +3652,6 @@ built-ins/Object/defineProperty/15.2.3.6-4-547-1.js  # [sloppy] expected pass, R
 built-ins/Object/defineProperty/15.2.3.6-4-547-4.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-579.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-583.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-4-585.js  # [sloppy] expected pass, Runtime TypeError: Object.defineProperty called on non-object
 built-ins/Object/defineProperty/15.2.3.6-4-586.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-593.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-594.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3748,19 +3700,10 @@ built-ins/Object/fromEntries/supports-symbols.js  # [sloppy] expected pass, Runt
 built-ins/Object/fromEntries/to-property-key.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/fromEntries/uses-keys-not-iterator.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-3-14.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-163.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-165.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-166.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-167.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-170.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-175.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-182.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-192.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-211.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-212.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-213.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-214.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-215.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-216.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-217.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-218.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3771,7 +3714,7 @@ built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-222.js  # [sloppy] expected
 built-ins/Object/getOwnPropertyDescriptor/primitive-string.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Object/getOwnPropertyDescriptors/exception-not-object-coercible.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getOwnPropertyDescriptors/observable-operations.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/getOwnPropertyDescriptors/order-after-define-property.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
+built-ins/Object/getOwnPropertyDescriptors/order-after-define-property.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getOwnPropertyDescriptors/primitive-strings.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getOwnPropertyDescriptors/proxy-no-ownkeys-returned-keys-order.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getOwnPropertyDescriptors/proxy-undefined-descriptor.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3803,7 +3746,6 @@ built-ins/Object/getPrototypeOf/15.2.3.2-2-17.js  # [sloppy] expected pass, Runt
 built-ins/Object/getPrototypeOf/15.2.3.2-2-18.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getPrototypeOf/15.2.3.2-2-20.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getPrototypeOf/15.2.3.2-2-21.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/getPrototypeOf/15.2.3.2-2-26.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getPrototypeOf/15.2.3.2-2-27.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getPrototypeOf/15.2.3.2-2-28.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/getPrototypeOf/15.2.3.2-2-3.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3822,13 +3764,10 @@ built-ins/Object/hasOwn/symbol_property_toPrimitive.js  # [sloppy] expected pass
 built-ins/Object/hasOwn/symbol_property_toString.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/hasOwn/symbol_property_valueOf.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/is-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/isExtensible/15.2.3.13-2-20.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/isFrozen/15.2.3.12-2-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/isFrozen/15.2.3.12-2-2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/isFrozen/15.2.3.12-3-18.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/isFrozen/15.2.3.12-3-28.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/isFrozen/proxy-no-ownkeys-returned-keys-order.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/isSealed/15.2.3.11-4-18.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/isSealed/proxy-no-ownkeys-returned-keys-order.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/keys/15.2.3.14-5-13.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/keys/15.2.3.14-5-15.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3842,11 +3781,9 @@ built-ins/Object/keys/proxy-non-enumerable-prop-invariant-2.js  # [sloppy] expec
 built-ins/Object/preventExtensions/15.2.3.10-3-13.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/preventExtensions/15.2.3.10-3-14.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/preventExtensions/15.2.3.10-3-18.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/preventExtensions/15.2.3.10-3-19.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/preventExtensions/15.2.3.10-3-21.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/preventExtensions/15.2.3.10-3-3.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/preventExtensions/15.2.3.10-3-8.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/preventExtensions/15.2.3.10-3-9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/preventExtensions/abrupt-completion.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/preventExtensions/symbol-object-contains-symbol-properties-strict.js  # [strict] expected pass, Runtime [object Object]: 
 built-ins/Object/preventExtensions/throws-when-false.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3979,7 +3916,6 @@ built-ins/Object/seal/object-seal-o-is-a-function-object.js  # [sloppy] expected
 built-ins/Object/seal/object-seal-o-is-a-reg-exp-object.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/seal/object-seal-p-is-own-property-of-a-date-object-that-uses-object-s-get-own-property.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/seal/object-seal-p-is-own-property-of-a-function-object-that-uses-object-s-get-own-property.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/seal/object-seal-p-is-own-property-of-a-reg-exp-object-that-uses-object-s-get-own-property.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/seal/object-seal-p-is-own-property-of-an-arguments-object-which-implements-its-own-get-own-property.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/seal/object-seal-p-is-own-property-of-an-array-object-that-uses-object-s-get-own-property.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/seal/proxy-no-ownkeys-returned-keys-order.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -4449,7 +4385,6 @@ built-ins/Proxy/defineProperty/targetdesc-not-configurable-writable-desc-not-wri
 built-ins/Proxy/defineProperty/targetdesc-undefined-not-configurable-descriptor.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/defineProperty/targetdesc-undefined-target-is-not-extensible.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/defineProperty/trap-is-missing-target-is-proxy.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Proxy/defineProperty/trap-is-null-target-is-proxy.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/deleteProperty/boolean-trap-result-boolean-false.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/deleteProperty/call-parameters.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/deleteProperty/return-false-strict.js  # [strict] expected pass, Runtime [object Object]: 
@@ -4465,7 +4400,6 @@ built-ins/Proxy/function-prototype.js  # [sloppy] expected pass, Runtime [object
 built-ins/Proxy/get/accessor-get-is-undefined-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/get/call-parameters.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/get/not-same-value-configurable-false-writable-false-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Proxy/get/trap-is-missing-target-is-proxy.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Proxy/get/trap-is-null-target-is-proxy.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/get/trap-is-undefined-receiver.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/getOwnPropertyDescriptor/call-parameters.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -4585,18 +4519,14 @@ built-ins/Reflect/set/different-property-descriptors.js  # [sloppy] expected pas
 built-ins/Reflect/setPrototypeOf/return-false-if-target-and-proto-are-the-same.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Reflect/setPrototypeOf/return-false-if-target-is-prototype-of-proto.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/15.10.2.15-6-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/CharacterClassEscapes/character-class-digit-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-digit-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-non-digit-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-non-digit-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-non-word-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-non-word-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-word-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/CharacterClassEscapes/character-class-word-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/CharacterClassEscapes/character-class-digit-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/CharacterClassEscapes/character-class-non-digit-class-escape-positive-cases.js  # crash or timeout (native abort / hang)
+built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-positive-cases.js  # crash or timeout (native abort / hang)
+built-ins/RegExp/CharacterClassEscapes/character-class-non-word-class-escape-positive-cases.js  # crash or timeout (native abort / hang)
+built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/CharacterClassEscapes/character-class-word-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.1_A1_T13.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.1_A1_T14.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.1_A1_T15.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -4651,72 +4581,16 @@ built-ins/RegExp/S15.10.2.15_A1_T8.js  # [sloppy] expected pass, Runtime [object
 built-ins/RegExp/S15.10.2.15_A1_T9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.2.5_A1_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.2.8_A3_T17.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/S15.10.3.1_A1_T1.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/S15.10.3.1_A1_T2.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/S15.10.3.1_A1_T3.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/S15.10.3.1_A1_T4.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/S15.10.3.1_A1_T5.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/S15.10.3.1_A2_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/S15.10.3.1_A2_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/S15.10.3.1_A3_T1.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/S15.10.3.1_A3_T2.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/S15.10.4.1_A1_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/S15.10.4.1_A1_T2.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: //\t/m/undefined
-built-ins/RegExp/S15.10.4.1_A1_T3.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: //[a-b]/g/undefined
-built-ins/RegExp/S15.10.4.1_A1_T4.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: //undefined//undefined
-built-ins/RegExp/S15.10.4.1_A1_T5.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/S15.10.4.1_A4_T1.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /null/undefined
-built-ins/RegExp/S15.10.4.1_A4_T2.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /undefined/undefined
-built-ins/RegExp/S15.10.4.1_A4_T3.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /undefined/undefined
-built-ins/RegExp/S15.10.4.1_A4_T4.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /null/undefined
-built-ins/RegExp/S15.10.4.1_A4_T5.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: //undefined
 built-ins/RegExp/S15.10.4.1_A5_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/S15.10.4.1_A6_T1.js  # [strict] expected pass, Runtime TypeError: Cannot add property 'toString', object is not extensible
-built-ins/RegExp/S15.10.4.1_A7_T1.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/RegExp/S15.10.4.1_A7_T2.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/S15.10.4.1_A8_T12.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/S15.10.4.1_A8_T13.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/S15.10.4.1_A8_T4.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /[object Object]/[object Object]
-built-ins/RegExp/S15.10.4.1_A8_T5.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /[object Object]/[object Object]
-built-ins/RegExp/S15.10.4.1_A8_T6.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/S15.10.4.1_A8_T7.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/S15.10.4.1_A8_T8.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/S15.10.4.1_A8_T9.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /1/[object Object]
+built-ins/RegExp/S15.10.4.1_A8_T11.js  # [sloppy] expected pass, Runtime TypeError: Cannot convert object to primitive value
 built-ins/RegExp/S15.10.4.1_A9_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.4.1_A9_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.5_A1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.5_A2_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/Symbol.species/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/Symbol.species/return-value.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/Symbol.species/symbol-species-name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/Symbol.species/symbol-species.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/call_with_non_regexp_same_constructor.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/call_with_regexp_match_falsy.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/call_with_regexp_not_same_constructor.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/call_with_non_regexp_same_constructor.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /undefined/undefined
+built-ins/RegExp/call_with_regexp_match_falsy.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/character-class-escape-non-whitespace.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/duplicate-flags.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-code-point-repeat-i-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-code-point-repeat-i-2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-arbitrary.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-combining-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-combining-m.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-combining-s.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-d.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-g.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-non-display-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-non-display-2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-non-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-u.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-uppercase-I.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-y.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-zwj.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-zwnbsp.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-other-code-point-zwnj.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-should-not-case-fold-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-should-not-case-fold-m.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-should-not-case-fold-s.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-should-not-unicode-case-fold-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/early-err-modifiers-should-not-unicode-case-fold-s.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/escape/escaped-control-characters.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/RegExp/escape/escaped-lineterminator.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/RegExp/escape/escaped-otherpunctuators.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -4736,33 +4610,19 @@ built-ins/RegExp/escape/not-a-constructor.js  # [sloppy] expected pass, Runtime 
 built-ins/RegExp/escape/not-escaped-underscore.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/RegExp/escape/not-escaped.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/RegExp/escape/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/from-regexp-like-flag-override.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/from-regexp-like-get-ctor-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/from-regexp-like-get-flags-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/from-regexp-like-get-source-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/from-regexp-like-short-circuit.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/from-regexp-like.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/from-regexp-like-short-circuit.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /undefined/undefined
 built-ins/RegExp/lastIndex.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/lookBehind/back-references-to-captures.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/lookBehind/captures.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/lookBehind/greedy-loop.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/lookBehind/mutual-recursive.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/lookahead-quantifier-match-groups.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/match-indices/indices-array-element.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/match-indices/indices-array-matched.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/match-indices/indices-array-non-unicode-match.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/match-indices/indices-array-properties.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/match-indices/indices-array-unicode-match.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/match-indices/indices-array-unicode-property-names.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/match-indices/indices-array-unmatched.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/match-indices/indices-array.js  # [sloppy] expected pass, Runtime TypeError: Object.getPrototypeOf called on null or undefined
-built-ins/RegExp/match-indices/indices-groups-object-undefined.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/match-indices/indices-groups-object-unmatched.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/match-indices/indices-groups-object.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/match-indices/indices-groups-properties.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/match-indices/indices-property.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/match-indices/indices-array-element.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/match-indices/indices-array-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/match-indices/indices-array.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/named-groups/duplicate-names-exec.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/named-groups/duplicate-names-match-indices.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/RegExp/named-groups/duplicate-names-match-indices.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/named-groups/duplicate-names-match.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/named-groups/duplicate-names-replace.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/named-groups/duplicate-names-replaceall.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -4770,13 +4630,8 @@ built-ins/RegExp/named-groups/groups-object-subclass-sans.js  # [sloppy] expecte
 built-ins/RegExp/named-groups/groups-object-subclass.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/named-groups/groups-object-undefined.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/named-groups/groups-object-unmatched.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/named-groups/groups-object.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/named-groups/lookbehind.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/named-groups/non-unicode-property-names-valid.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/named-groups/non-unicode-property-names.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/named-groups/string-replace-nocaptures.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/named-groups/string-replace-unclosed.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/named-groups/unicode-property-names.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/RegExp/nullable-quantifier.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/binary-property-with-value-ASCII_-_F-negated.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/binary-property-with-value-ASCII_-_F.js  # [sloppy] negative: failed at Runtime, expected phase parse
@@ -4806,6 +4661,10 @@ built-ins/RegExp/property-escapes/generated/Emoji_Modifier_Base.js  # [sloppy] e
 built-ins/RegExp/property-escapes/generated/Emoji_Presentation.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Extended_Pictographic.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Extender.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/property-escapes/generated/General_Category_-_Other.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/property-escapes/generated/General_Category_-_Other_Symbol.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/property-escapes/generated/General_Category_-_Surrogate.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/property-escapes/generated/General_Category_-_Symbol.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Grapheme_Base.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Grapheme_Extend.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/IDS_Binary_Operator.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -4817,6 +4676,10 @@ built-ins/RegExp/property-escapes/generated/Logical_Order_Exception.js  # [slopp
 built-ins/RegExp/property-escapes/generated/Pattern_Syntax.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Pattern_White_Space.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Radical.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/property-escapes/generated/Script_-_Common.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/property-escapes/generated/Script_-_Unknown.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Common.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Unknown.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Sentence_Terminal.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Soft_Dotted.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Terminal_Punctuation.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -4826,31 +4689,31 @@ built-ins/RegExp/property-escapes/generated/XID_Start.js  # [sloppy] expected pa
 built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji-negative-CharacterClass.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji-negative-P.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji-negative-u.js  # [sloppy] negative: failed at Runtime, expected phase parse
-built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/strings/Emoji_Keycap_Sequence-negative-CharacterClass.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/Emoji_Keycap_Sequence-negative-P.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/Emoji_Keycap_Sequence-negative-u.js  # [sloppy] negative: failed at Runtime, expected phase parse
-built-ins/RegExp/property-escapes/generated/strings/Emoji_Keycap_Sequence.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/property-escapes/generated/strings/Emoji_Keycap_Sequence.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji-negative-CharacterClass.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji-negative-P.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji-negative-u.js  # [sloppy] negative: failed at Runtime, expected phase parse
-built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Flag_Sequence-negative-CharacterClass.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Flag_Sequence-negative-P.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Flag_Sequence-negative-u.js  # [sloppy] negative: failed at Runtime, expected phase parse
-built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Flag_Sequence.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Flag_Sequence.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Modifier_Sequence-negative-CharacterClass.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Modifier_Sequence-negative-P.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Modifier_Sequence-negative-u.js  # [sloppy] negative: failed at Runtime, expected phase parse
-built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Modifier_Sequence.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Modifier_Sequence.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Tag_Sequence-negative-CharacterClass.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Tag_Sequence-negative-P.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Tag_Sequence-negative-u.js  # [sloppy] negative: failed at Runtime, expected phase parse
-built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Tag_Sequence.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Tag_Sequence.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_ZWJ_Sequence-negative-CharacterClass.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_ZWJ_Sequence-negative-P.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_ZWJ_Sequence-negative-u.js  # [sloppy] negative: failed at Runtime, expected phase parse
-built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_ZWJ_Sequence.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_ZWJ_Sequence.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/grammar-extension-In-prefix-Block-implicit-negated.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/grammar-extension-In-prefix-Block-implicit.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/grammar-extension-In-prefix-Script-implicit-negated.js  # [sloppy] negative: failed at Runtime, expected phase parse
@@ -4975,370 +4838,68 @@ built-ins/RegExp/property-escapes/unsupported-property-Line_Break-negated.js  # 
 built-ins/RegExp/property-escapes/unsupported-property-Line_Break-with-value-negated.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/unsupported-property-Line_Break-with-value.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/unsupported-property-Line_Break.js  # [sloppy] negative: failed at Runtime, expected phase parse
-built-ins/RegExp/prototype/15.10.6.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/S15.10.5.1_A1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/S15.10.5.1_A2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/S15.10.5.1_A3.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/S15.10.5.1_A4.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/S15.10.6.1_A1_T1.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/S15.10.6.1_A1_T2.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/S15.10.6_A1_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/S15.10.6_A1_T2.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.match/builtin-coerce-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/builtin-failure-g-set-lastindex-err.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/builtin-failure-g-set-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/builtin-failure-return-val.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/builtin-failure-y-return-val.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/builtin-failure-y-set-lastindex-err.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/builtin-failure-y-set-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/builtin-infer-unicode.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/builtin-success-g-set-lastindex-err.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/builtin-success-g-set-lastindex.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/builtin-success-return-val-groups.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/builtin-success-return-val.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/builtin-success-u-return-val-groups.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/builtin-success-y-set-lastindex-err.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/builtin-success-y-set-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/prototype/Symbol.match/builtin-infer-unicode.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.match/builtin-y-coerce-lastindex-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.match/coerce-arg-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.match/coerce-arg.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/coerce-global.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/exec-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.match/exec-invocation.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/RegExp/prototype/Symbol.match/exec-return-type-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.match/exec-return-type-valid.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/flags-tostring-error.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/g-coerce-result-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.match/g-get-exec-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.match/g-get-result-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.match/g-init-lastindex-err.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/g-init-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/g-match-empty-advance-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/RegExp/prototype/Symbol.match/g-match-empty-coerce-lastindex-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.match/g-match-empty-set-lastindex-err.js  # [strict] expected pass, Runtime TypeError: Cannot add property 'exec', object is not extensible
-built-ins/RegExp/prototype/Symbol.match/g-match-no-coerce-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/g-match-no-set-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/g-success-return-val.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/g-zero-matches.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/get-exec-err.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/get-flags-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.match/get-global-err.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/get-unicode-error.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.match/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.match/not-a-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.match/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/Symbol.match/this-val-non-regexp.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.match/u-advance-after-empty.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/y-fail-global-return.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/y-fail-lastindex-no-write.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.match/y-fail-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/y-fail-return.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/y-init-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.match/y-set-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.matchAll/isregexp-called-once.js  # [sloppy] expected pass, Runtime TypeError: Object.defineProperty called on non-object
+built-ins/RegExp/prototype/Symbol.matchAll/isregexp-called-once.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.matchAll/isregexp-this-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.matchAll/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.matchAll/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.matchAll/not-a-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.matchAll/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/RegExp/prototype/Symbol.matchAll/regexpcreate-this-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.matchAll/species-constructor-get-constructor-throws.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
+built-ins/RegExp/prototype/Symbol.matchAll/species-constructor-get-constructor-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.matchAll/species-constructor-get-species-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.matchAll/species-constructor-is-not-object-throws.js  # [strict] expected pass, Runtime TypeError: Cannot add property 'constructor', object is not extensible
-built-ins/RegExp/prototype/Symbol.matchAll/species-constructor-is-undefined.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.matchAll/species-constructor-species-is-not-constructor.js  # [strict] expected pass, Runtime TypeError: Cannot add property 'constructor', object is not extensible
-built-ins/RegExp/prototype/Symbol.matchAll/species-constructor-species-is-null-or-undefined.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/prototype/Symbol.matchAll/species-constructor-is-not-object-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.matchAll/species-constructor-species-is-not-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.matchAll/species-constructor-species-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.matchAll/species-constructor.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.matchAll/species-regexp-get-global-throws.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.matchAll/species-regexp-get-unicode-throws.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.matchAll/string-tostring-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.matchAll/string-tostring.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.matchAll/this-get-flags-throws.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.matchAll/this-get-flags.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.matchAll/this-lastindex-cached.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/prototype/Symbol.matchAll/species-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.matchAll/this-lastindex-cached.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.matchAll/this-not-object-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.matchAll/this-tolength-lastindex-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.matchAll/this-tostring-flags-throws.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.matchAll/this-tostring-flags.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.replace/arg-1-coerce-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/arg-1-coerce.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/arg-2-coerce-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/arg-2-coerce.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/coerce-global.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
 built-ins/RegExp/prototype/Symbol.replace/coerce-lastindex-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/coerce-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/coerce-unicode.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.replace/exec-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/exec-invocation.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/flags-tostring-error.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.replace/fn-coerce-replacement-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/fn-coerce-replacement.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/fn-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/fn-invoke-args-empty-result.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/fn-invoke-args.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/fn-invoke-this-no-strict.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/fn-invoke-this-strict.js  # [strict] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/g-init-lastindex-err.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/g-init-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/g-pos-decrement.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/g-pos-increment.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/prototype/Symbol.replace/coerce-lastindex.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.replace/get-exec-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/get-flags-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/get-global-err.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.replace/get-unicode-error.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.replace/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.replace/match-failure.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.replace/named-groups-fn.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/named-groups.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/not-a-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.replace/poisoned-stdlib.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/Symbol.replace/replace-with-trailing.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/replace-without-trailing.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-capture-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-capture.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-groups-err.js  # [strict] expected pass, Runtime TypeError: Cannot add property 'exec', object is not extensible
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-groups-prop-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-groups-prop.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-groups.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-index-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-index-undefined.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-index.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-length-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-length.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-matched-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-matched-global.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/result-coerce-matched.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/result-get-capture-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/result-get-groups-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/result-get-groups-prop-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/result-get-index-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/result-get-length-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/result-get-matched-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.replace/subst-after.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/subst-before.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/subst-capture-idx-1.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/subst-capture-idx-2.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/subst-dollar.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/subst-matched.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/u-advance-after-empty.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/y-fail-global-return.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/y-fail-lastindex-no-write.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/Symbol.replace/y-fail-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/y-fail-return.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/y-init-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.replace/y-set-lastindex.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.search/coerce-string-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.search/coerce-string.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.search/cstm-exec-return-index.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.search/failure-return-val.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.search/get-lastindex-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.search/lastindex-no-restore.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.search/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.search/match-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.search/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.search/not-a-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.search/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
+built-ins/RegExp/prototype/Symbol.replace/result-coerce-groups-err.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.search/cstm-exec-return-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.search/lastindex-no-restore.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.search/set-lastindex-init-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.search/set-lastindex-init-samevalue.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.search/set-lastindex-init.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/RegExp/prototype/Symbol.search/set-lastindex-restore-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.search/set-lastindex-restore-samevalue.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.search/set-lastindex-restore.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.search/success-get-index-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.search/success-return-val.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.search/u-lastindex-advance.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.search/y-fail-return.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.split/coerce-flags-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/coerce-flags.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/coerce-limit-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/coerce-limit.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.split/coerce-string-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/coerce-string.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.split/get-flags-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/last-index-exceeds-str-size.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/limit-0-bail.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/not-a-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
+built-ins/RegExp/prototype/Symbol.search/set-lastindex-restore.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.search/u-lastindex-advance.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.split/coerce-flags.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.split/species-ctor-ctor-get-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/species-ctor-ctor-non-obj.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/species-ctor-ctor-undef.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/prototype/Symbol.split/species-ctor-ctor-non-obj.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.split/species-ctor-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.split/species-ctor-species-get-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/species-ctor-species-non-ctor.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.split/species-ctor-species-undef.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.split/species-ctor-y.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/species-ctor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/str-adv-thru-empty-match.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/prototype/Symbol.split/species-ctor-species-non-ctor.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.split/species-ctor-y.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.split/species-ctor.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.split/str-coerce-lastindex-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/str-coerce-lastindex.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/RegExp/prototype/Symbol.split/str-coerce-lastindex.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.split/str-empty-match-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/str-empty-match.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.split/str-empty-no-match.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/RegExp/prototype/Symbol.split/str-get-lastindex-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/str-limit-capturing.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.split/str-limit.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/RegExp/prototype/Symbol.split/str-match-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.split/str-result-coerce-length-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/str-result-coerce-length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/RegExp/prototype/Symbol.split/str-result-coerce-length.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.split/str-result-get-capture-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.split/str-result-get-length-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/Symbol.split/str-set-lastindex-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/Symbol.split/str-set-lastindex-match.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/str-set-lastindex-no-match.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/Symbol.split/str-trailing-chars.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.split/u-lastindex-adv-thru-failure.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/Symbol.split/u-lastindex-adv-thru-match.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/prototype/dotAll/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/dotAll/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/dotAll/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/dotAll/this-val-invalid-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/dotAll/this-val-non-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/dotAll/this-val-regexp-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A10.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A11.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T11.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T12.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T14.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T15.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T5.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.split/str-set-lastindex-match.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.split/str-set-lastindex-no-match.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/Symbol.split/this-val-non-obj.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T6.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T7.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T8.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A2_T1.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A2_T10.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A2_T2.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A2_T3.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A2_T4.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A2_T5.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A2_T6.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A2_T7.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A2_T8.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A2_T9.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/RegExp/prototype/exec/S15.10.6.2_A4_T10.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/S15.10.6.2_A4_T11.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/S15.10.6.2_A4_T12.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/S15.10.6.2_A6.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A7.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A8.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/S15.10.6.2_A9.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/RegExp/prototype/exec/duplicate-named-groups-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/duplicate-named-indices-groups-properties.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/RegExp/prototype/exec/duplicate-named-indices-groups-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/failure-g-lastindex-reset.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/failure-lastindex-access.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/not-a-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/exec/regexp-builtin-exec-v-u-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/prototype/exec/failure-lastindex-set.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/exec/regexp-builtin-exec-v-u-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/success-g-lastindex-no-access.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/success-lastindex-access.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/u-lastindex-adv.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/y-fail-lastindex-no-write.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/flags/coercion-dotall.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/coercion-global.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/coercion-hasIndices.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/coercion-ignoreCase.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/coercion-multiline.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/coercion-sticky.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/coercion-unicode.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/get-order.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/rethrow.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/return-order.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/flags/this-val-non-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/flags/this-val-regexp-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/global/15.10.7.2-2.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/global/S15.10.7.2_A10.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/global/S15.10.7.2_A8.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/global/S15.10.7.2_A9.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/global/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/global/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/global/this-val-invalid-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/global/this-val-non-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/global/this-val-regexp-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/hasIndices/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/hasIndices/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/hasIndices/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/hasIndices/this-val-invalid-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/hasIndices/this-val-non-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/hasIndices/this-val-regexp-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/ignoreCase/15.10.7.3-2.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/ignoreCase/S15.10.7.3_A10.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/ignoreCase/S15.10.7.3_A8.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/ignoreCase/S15.10.7.3_A9.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/ignoreCase/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/ignoreCase/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/ignoreCase/this-val-invalid-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/ignoreCase/this-val-non-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/ignoreCase/this-val-regexp-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/multiline/15.10.7.4-2.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/multiline/S15.10.7.4_A10.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/multiline/S15.10.7.4_A8.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/multiline/S15.10.7.4_A9.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/multiline/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/multiline/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/multiline/this-val-invalid-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/multiline/this-val-non-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/multiline/this-val-regexp-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/source/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/source/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/source/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/source/this-val-invalid-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/source/this-val-non-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/source/this-val-regexp-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/source/value-empty.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/source/value-line-terminator.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: unterminated regular expression literal (line terminator) (at 0..1)
-built-ins/RegExp/prototype/source/value-slash.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/sticky/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/sticky/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/sticky/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/sticky/this-val-invalid-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/sticky/this-val-non-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/sticky/this-val-regexp-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A10.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A11.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A1_T7.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/test/S15.10.6.3_A1_T8.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/test/S15.10.6.3_A2_T1.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A2_T10.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A2_T2.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A2_T3.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A2_T4.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A2_T5.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A2_T6.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A2_T7.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A2_T8.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A2_T9.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A6.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A7.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A8.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/S15.10.6.3_A9.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/not-a-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/test/y-fail-lastindex-no-write.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/RegExp/prototype/toString/S15.10.6.4_A10.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/toString/S15.10.6.4_A11.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/toString/S15.10.6.4_A6.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/toString/S15.10.6.4_A7.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/toString/S15.10.6.4_A8.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/toString/S15.10.6.4_A9.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/toString/called-as-function.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/toString/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/toString/not-a-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/RegExp/prototype/unicode/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicode/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicode/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicode/this-val-invalid-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicode/this-val-non-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicode/this-val-regexp-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
+built-ins/RegExp/prototype/flags/this-val-non-obj.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-01.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-02.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-03.js  # [sloppy] negative: failed at Runtime, expected phase parse
@@ -5367,77 +4928,67 @@ built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-25.js  # [slo
 built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-26.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-27.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-28.js  # [sloppy] negative: failed at Runtime, expected phase parse
-built-ins/RegExp/prototype/unicodeSets/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicodeSets/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicodeSets/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicodeSets/this-val-invalid-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicodeSets/this-val-non-obj.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicodeSets/this-val-regexp-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/RegExp/prototype/unicodeSets/this-val-regexp.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/prototype/unicodeSets/this-val-regexp.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /./v
 built-ins/RegExp/prototype/unicodeSets/uv-flags.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/quantifier-integer-limit.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /b{9007199254740991}/u
-built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-dotAll-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?s:)/
-built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-dotAll.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-backreferences.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-characterClasses.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-characterEscapes.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-b.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-p.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-w.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-b.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-p.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-w.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-dotAll.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-backreferences.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-characterClasses.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-characterEscapes.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-b.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-p.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-w.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-b.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-p.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-ignoreCase-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i:)/
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-ignoreCase.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-ignoreCase.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-multiline-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?m:)/
-built-ins/RegExp/regexp-modifiers/add-multiline.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/add-remove-modifiers.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/changing-dotAll-flag-does-not-affect-dotAll-modifier.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: //(?s:^.$)/s/
-built-ins/RegExp/regexp-modifiers/changing-ignoreCase-flag-does-not-affect-ignoreCase-modifier.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: //(?i:aB)/i/
-built-ins/RegExp/regexp-modifiers/changing-multiline-flag-does-not-affect-multiline-modifier.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: //(?m:es$)/m/
-built-ins/RegExp/regexp-modifiers/nested-add-remove-modifiers.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/nesting-add-dotAll-within-remove-dotAll.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/nesting-add-ignoreCase-within-remove-ignoreCase.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/nesting-add-multiline-within-remove-multiline.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/nesting-dotAll-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/nesting-ignoreCase-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/nesting-multiline-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/nesting-remove-dotAll-within-add-dotAll.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/nesting-remove-ignoreCase-within-add-ignoreCase.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/nesting-remove-multiline-within-add-multiline.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/regexp-modifiers/add-multiline.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/add-remove-modifiers.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/changing-dotAll-flag-does-not-affect-dotAll-modifier.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?s:^.$)/
+built-ins/RegExp/regexp-modifiers/changing-ignoreCase-flag-does-not-affect-ignoreCase-modifier.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i:aB)/
+built-ins/RegExp/regexp-modifiers/changing-multiline-flag-does-not-affect-multiline-modifier.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?m:es$)/
+built-ins/RegExp/regexp-modifiers/nested-add-remove-modifiers.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/nesting-add-dotAll-within-remove-dotAll.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/nesting-add-ignoreCase-within-remove-ignoreCase.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/nesting-add-multiline-within-remove-multiline.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/nesting-dotAll-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/nesting-ignoreCase-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/nesting-multiline-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/nesting-remove-dotAll-within-add-dotAll.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/nesting-remove-ignoreCase-within-add-ignoreCase.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/nesting-remove-multiline-within-add-multiline.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-dotAll-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-s:^.$)/s
-built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-dotAll.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-backreferences.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-characterClasses.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-characterEscapes.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-lower-b.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-lower-p.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-lower-w.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-upper-b.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-upper-p.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-upper-w.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-dotAll.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-backreferences.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-characterClasses.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-characterEscapes.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-lower-p.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-upper-p.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-upper-w.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-ignoreCase-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-i:)/i
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-ignoreCase.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-multiline-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-m:)/m
-built-ins/RegExp/regexp-modifiers/remove-multiline.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/regexp-modifiers/remove-multiline.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/regexp-modifiers/syntax/valid/add-and-remove-modifiers-can-have-empty-remove-modifiers.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i-:)/
 built-ins/RegExp/regexp-modifiers/syntax/valid/add-and-remove-modifiers.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i-s:)/
 built-ins/RegExp/regexp-modifiers/syntax/valid/add-modifiers-when-nested.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i:(?i:))/
@@ -5446,204 +4997,112 @@ built-ins/RegExp/regexp-modifiers/syntax/valid/add-modifiers-when-set-as-flags.j
 built-ins/RegExp/regexp-modifiers/syntax/valid/remove-modifiers-when-nested.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-i:(?-i:))/
 built-ins/RegExp/regexp-modifiers/syntax/valid/remove-modifiers-when-not-set-as-flags.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-i:)/
 built-ins/RegExp/regexp-modifiers/syntax/valid/remove-modifiers-when-set-as-flags.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-i:)/i
-built-ins/RegExp/syntax-err-arithmetic-modifiers-add-remove-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-add-remove-m.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-add-remove-multi-duplicate.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-add-remove-s-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-add-remove-s.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-both-empty.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-code-point-repeat-i-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-code-point-repeat-i-2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-arbitrary.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-combining-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-combining-m.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-combining-s.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-d.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-g.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-non-display-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-non-display-2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-non-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-u.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-uppercase-I.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-y.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-zwj.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-zwnbsp.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-other-code-point-zwnj.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-add-remove-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-add-remove-m.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-add-remove-multi-duplicate.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-add-remove-s-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-add-remove-s.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-code-point-repeat-i-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-code-point-repeat-i-2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-arbitrary.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-combining-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-combining-m.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-combining-s.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-d.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-g.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-non-display-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-non-display-2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-non-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-u.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-uppercase-I.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-y.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-zwj.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-zwnbsp.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-other-code-point-zwnj.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-should-not-case-fold-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-should-not-case-fold-m.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-should-not-case-fold-s.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-should-not-unicode-case-fold-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-reverse-should-not-unicode-case-fold-s.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-should-not-case-fold-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-should-not-case-fold-m.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-should-not-case-fold-s.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-should-not-unicode-case-fold-i.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/syntax-err-arithmetic-modifiers-should-not-unicode-case-fold-s.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-difference-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-difference-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-difference-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-difference-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-difference-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-intersection-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-intersection-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-intersection-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-union-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-union-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-union-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-union-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-class-union-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-difference-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-difference-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-difference-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-difference-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-difference-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-intersection-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-intersection-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-intersection-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-intersection-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-union-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-union-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-union-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-union-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/character-union-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/rgi-emoji-13.1.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/rgi-emoji-14.0.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/rgi-emoji-15.0.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/rgi-emoji-15.1.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/rgi-emoji-16.0.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/rgi-emoji-17.0.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-difference-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-difference-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-intersection-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-intersection-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-union-character-class-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-union-character-class.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-union-character-property-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-union-character.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExp/unicodeSets/generated/string-literal-union-string-literal.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExp/unicodeSets/generated/character-class-difference-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-difference-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-escape-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-intersection-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-class-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-difference-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-difference-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-difference-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-difference-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-intersection-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-property-escape-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/character-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/rgi-emoji-13.1.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/rgi-emoji-14.0.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/rgi-emoji-15.0.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/rgi-emoji-15.1.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/rgi-emoji-16.0.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/rgi-emoji-17.0.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-difference-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-intersection-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-intersection-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/unicodeSets/generated/string-literal-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicode_character_class_backspace_escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicode_restricted_brackets.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicode_restricted_character_class_escape.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicode_restricted_identity_escape.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicode_restricted_identity_escape_alpha.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicode_restricted_identity_escape_c.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicode_restricted_identity_escape_u.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicode_restricted_identity_escape_x.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicode_restricted_incomplete_quantifier.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicode_restricted_octal_escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicode_restricted_quantifiable_assertion.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicode_restricted_quantifier_without_atom.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExpStringIteratorPrototype/Symbol.toStringTag.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/ancestry.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-call-throws.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-get-throws.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-match-get-0-throws.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-match-get-0-tostring-throws.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-match-get-0-tostring.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-not-callable.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/length.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/name.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/next-iteration-global.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/next-iteration.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/next-missing-internal-slots.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/regexp-tolength-lastindex-throws.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/RegExpStringIteratorPrototype/next/this-is-not-object-throws.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/RegExpStringIteratorPrototype/Symbol.toStringTag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-call-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-get-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-match-get-0-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-match-get-0-tostring-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-match-get-0-tostring.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExpStringIteratorPrototype/next/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
+built-ins/RegExpStringIteratorPrototype/next/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
+built-ins/RegExpStringIteratorPrototype/next/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExpStringIteratorPrototype/next/regexp-tolength-lastindex-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Set/Symbol.species/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Set/Symbol.species/return-value.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Set/Symbol.species/symbol-species-name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
@@ -5859,30 +5318,11 @@ built-ins/String/prototype/lastIndexOf/S15.5.4.8_A1_T9.js  # [sloppy] expected p
 built-ins/String/prototype/lastIndexOf/S15.5.4.8_A4_T5.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/localeCompare/15.5.4.9_CE.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/localeCompare/S15.5.4.9_A1_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/match/S15.5.4.10_A1_T4.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/String/prototype/match/S15.5.4.10_A1_T5.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/match/S15.5.4.10_A1_T6.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/String/prototype/match/S15.5.4.10_A1_T7.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/String/prototype/match/S15.5.4.10_A1_T8.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/String/prototype/match/S15.5.4.10_A1_T9.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/String/prototype/match/S15.5.4.10_A1_T9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/match/duplicate-named-groups-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/match/duplicate-named-indices-groups-properties.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/match/invoke-builtin-match.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/match/regexp-prototype-match-v-u-flag.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/matchAll/flags-nonglobal-throws.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/String/prototype/matchAll/flags-undefined-throws.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/String/prototype/matchAll/regexp-get-matchAll-throws.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/String/prototype/matchAll/regexp-is-null.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/matchAll/regexp-is-undefined-or-null-invokes-matchAll.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/String/prototype/matchAll/regexp-is-undefined.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/matchAll/regexp-matchAll-is-undefined-or-null.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/String/prototype/matchAll/regexp-matchAll-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/matchAll/regexp-prototype-get-matchAll-throws.js  # [sloppy] expected pass, Runtime TypeError: Object.defineProperty called on non-object
-built-ins/String/prototype/matchAll/regexp-prototype-has-no-matchAll.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/matchAll/regexp-prototype-matchAll-invocation.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/String/prototype/matchAll/regexp-prototype-matchAll-throws.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/String/prototype/matchAll/regexp-prototype-matchAll-v-u-flag.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/matchAll/toString-this-val.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
+built-ins/String/prototype/match/duplicate-named-indices-groups-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/String/prototype/match/regexp-prototype-match-v-u-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/String/prototype/matchAll/regexp-prototype-matchAll-v-u-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/padEnd/function-length.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/padEnd/normal-operation.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/padStart/function-length.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5890,16 +5330,10 @@ built-ins/String/prototype/padStart/normal-operation.js  # [sloppy] expected pas
 built-ins/String/prototype/repeat/return-abrupt-from-count-as-symbol.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/repeat/return-abrupt-from-count.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replace/S15.5.4.11_A1_T13.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/replace/S15.5.4.11_A1_T16.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/replace/S15.5.4.11_A1_T17.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replace/S15.5.4.11_A1_T9.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/replace/regexp-capture-by-index.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/replace/regexp-prototype-replace-v-u-flag.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/replace/replaceValue-evaluation-order-regexp-object.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/String/prototype/replace/regexp-prototype-replace-v-u-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/String/prototype/replace/replaceValue-evaluation-order-regexp-object.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replace/replaceValue-evaluation-order.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/replaceAll/getSubstitution-0x0024-0x003C.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/String/prototype/replaceAll/getSubstitution-0x0024N.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
-built-ins/String/prototype/replaceAll/getSubstitution-0x0024NN.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
 built-ins/String/prototype/replaceAll/replaceValue-call-matching-empty.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replaceAll/replaceValue-call-tostring-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replaceAll/replaceValue-tostring-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5909,30 +5343,18 @@ built-ins/String/prototype/replaceAll/searchValue-flags-null-undefined-throws.js
 built-ins/String/prototype/replaceAll/searchValue-flags-toString-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replaceAll/searchValue-get-flags-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replaceAll/searchValue-isRegExp-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/replaceAll/searchValue-replacer-RegExp-call-fn.js  # [sloppy] expected pass, Runtime super method  sym:6 not found: 
-built-ins/String/prototype/replaceAll/searchValue-replacer-RegExp-call.js  # [sloppy] expected pass, Runtime super method  sym:6 not found: 
-built-ins/String/prototype/replaceAll/searchValue-replacer-before-tostring.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
+built-ins/String/prototype/replaceAll/searchValue-replacer-RegExp-call-fn.js  # [sloppy] expected pass, Runtime super method  sym:7 not found: 
+built-ins/String/prototype/replaceAll/searchValue-replacer-RegExp-call.js  # [sloppy] expected pass, Runtime super method  sym:7 not found: 
+built-ins/String/prototype/replaceAll/searchValue-replacer-before-tostring.js  # [sloppy] expected pass, Runtime Should not call toString on this/replaceValue: 
 built-ins/String/prototype/replaceAll/searchValue-replacer-call-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/replaceAll/searchValue-replacer-call.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
+built-ins/String/prototype/replaceAll/searchValue-replacer-call.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replaceAll/searchValue-replacer-method-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replaceAll/searchValue-tostring-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/replaceAll/searchValue-tostring-regexp.js  # [sloppy] expected pass, Runtime TypeError: Cannot define property: object is not extensible
+built-ins/String/prototype/replaceAll/searchValue-tostring-regexp.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replaceAll/this-tostring-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/search/invoke-builtin-search-searcher-undef.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/search/invoke-builtin-search.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/search/regexp-prototype-search-v-flag.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/String/prototype/search/regexp-prototype-search-v-u-flag.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/String/prototype/search/regexp-prototype-search-v-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/String/prototype/search/regexp-prototype-search-v-u-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/slice/S15.5.4.13_A1_T5.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/split/argument-is-new-reg-exp-and-instance-is-string-hello.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/split/arguments-are-new-reg-exp-and-1-and-instance-is-string-hello.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/split/arguments-are-new-reg-exp-and-2-and-instance-is-string-hello.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/split/arguments-are-new-reg-exp-and-3-and-instance-is-string-hello.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/split/arguments-are-new-reg-exp-and-4-and-instance-is-string-hello.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/split/arguments-are-new-reg-exp-and-hi-and-instance-is-string-hello.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/split/arguments-are-new-reg-exp-and-undefined-and-instance-is-string-hello.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/split/arguments-are-new-reg-exp-and-void-0-and-instance-is-string-hello.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/split/arguments-are-regexp-l-and-hi-and-instance-is-string-hello.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/split/call-split-new-reg-exp.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/split/checking-by-using-eval.js  # [sloppy] expected pass, Runtime ReferenceError: toString is not defined
 built-ins/String/prototype/split/instance-is-math.js  # [sloppy] expected pass, Runtime TypeError: Cannot convert object to primitive value
 built-ins/String/prototype/split/limit-touint32-error.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5950,17 +5372,12 @@ built-ins/String/prototype/split/valueOf-is-called-for-limit-argument.js  # [slo
 built-ins/String/prototype/startsWith/return-abrupt-from-searchstring-regexp-test.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/substring/S15.5.4.15_A1_T9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/substring/S15.5.4.15_A3_T9.js  # [sloppy] expected pass, Runtime TypeError: Cannot convert object to primitive value
-built-ins/String/prototype/toLocaleLowerCase/S15.5.4.17_A1_T14.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/String/prototype/toLocaleLowerCase/S15.5.4.17_A1_T9.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/toLocaleUpperCase/S15.5.4.19_A1_T14.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/String/prototype/toLocaleUpperCase/S15.5.4.19_A1_T9.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/toLowerCase/S15.5.4.16_A1_T14.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/String/prototype/toLowerCase/S15.5.4.16_A1_T9.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/toUpperCase/S15.5.4.18_A1_T14.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/String/prototype/toUpperCase/S15.5.4.18_A1_T9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/toWellFormed/returns-well-formed-string.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/toWellFormed/to-string-primitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
-built-ins/String/prototype/trim/15.5.4.20-2-49.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/trim/15.5.4.20-2-50.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/trim/15.5.4.20-2-51.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/trim/15.5.4.20-3-2.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -11581,7 +10998,6 @@ language/expressions/template-literal/tv-line-terminator-sequence.js  # [sloppy]
 language/expressions/typeof/bigint.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/typeof/get-value.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/typeof/native-call.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/typeof/null.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/typeof/string.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/typeof/symbol.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/unary-minus/bigint-non-primitive.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -11675,7 +11091,6 @@ language/line-terminators/comment-single-ls.js  # [sloppy] negative: threw [obje
 language/line-terminators/comment-single-ps.js  # [sloppy] negative: threw [object Object], expected Test262Error
 language/line-terminators/invalid-regexp-ls.js  # [sloppy] negative: failed at Runtime, expected phase parse
 language/line-terminators/invalid-regexp-ps.js  # [sloppy] negative: failed at Runtime, expected phase parse
-language/literals/null/S7.8.1_A1_T2.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/literals/numeric/7.8.3-3gs.js  # [strict] expected pass, Runtime [object Object]: 
 language/literals/regexp/S7.8.5_A1.1_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/literals/regexp/S7.8.5_A1.3_T5.js  # [sloppy] expected pass, Runtime [object Object]: 
