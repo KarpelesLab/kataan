@@ -981,12 +981,22 @@ impl<'a> Interp<'a> {
                     Err(_) => {
                         let mut out = Vec::new();
                         if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
-                            let len = self
+                            let len_raw = self
                                 .realm
                                 .get_property(h, "length")
                                 .map(|v| self.realm.to_number(v))
-                                .unwrap_or(0.0)
-                                .max(0.0) as usize;
+                                .unwrap_or(0.0);
+                            // Cap the array-like length against `max_array_len`
+                            // BEFORE allocating, so `from({length: 2**32-1})` throws
+                            // a catchable RangeError instead of attempting a
+                            // multi-gigabyte allocation (an unbounded-memory bug).
+                            if len_raw > self.realm.limits.max_array_len as f64 {
+                                let m = self.new_str("Invalid array length");
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_RANGE_ERROR, Some(m)),
+                                ));
+                            }
+                            let len = len_raw.max(0.0) as usize;
                             for i in 0..len {
                                 let k = alloc::format!("{i}");
                                 out.push(
@@ -1073,12 +1083,22 @@ impl<'a> Interp<'a> {
                     Err(_) => {
                         let mut out = Vec::new();
                         if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
-                            let len = self
+                            let len_raw = self
                                 .realm
                                 .get_property(h, "length")
                                 .map(|v| self.realm.to_number(v))
-                                .unwrap_or(0.0)
-                                .max(0.0) as usize;
+                                .unwrap_or(0.0);
+                            // Cap the array-like length against `max_array_len`
+                            // BEFORE allocating, so `from({length: 2**32-1})` throws
+                            // a catchable RangeError instead of attempting a
+                            // multi-gigabyte allocation (an unbounded-memory bug).
+                            if len_raw > self.realm.limits.max_array_len as f64 {
+                                let m = self.new_str("Invalid array length");
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_RANGE_ERROR, Some(m)),
+                                ));
+                            }
+                            let len = len_raw.max(0.0) as usize;
                             for i in 0..len {
                                 let k = alloc::format!("{i}");
                                 out.push(

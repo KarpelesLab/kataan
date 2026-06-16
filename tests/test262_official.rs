@@ -618,6 +618,13 @@ fn manage_shard(
     // loop or catastrophic backtracking) — the child is killed and the in-flight
     // test recorded as a failure, exactly like a native crash.
     const IDLE_TIMEOUT_SECS: u64 = 20;
+    // Hard per-worker address-space cap (KiB) enforced via `ulimit -v`. A test
+    // with an unbounded allocation (e.g. a typed array / ArrayBuffer / string of
+    // pathological size) hits this ceiling, its allocation is refused, the worker
+    // aborts, and the crash machinery records it as a failure — instead of the
+    // process ballooning and OOM-ing the whole host. 4 GiB is far above any
+    // legitimate single Test262 test yet bounds a runaway.
+    const MAX_ADDRESS_SPACE_KIB: u64 = 4 * 1024 * 1024;
 
     let _ = std::fs::remove_file(outpath);
     let mut start = w;
@@ -627,7 +634,14 @@ fn manage_shard(
         if guard > total + 16 {
             break;
         }
-        let spawn = Command::new(exe)
+        // Launch the worker through `sh` so we can apply `ulimit -v` before exec.
+        let spawn = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -v {MAX_ADDRESS_SPACE_KIB} 2>/dev/null; exec \"$@\""
+            ))
+            .arg("sh") // $0 for the inner shell
+            .arg(exe)
             .args([
                 "--ignored",
                 "--exact",

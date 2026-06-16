@@ -2169,6 +2169,15 @@ fn run_frame(
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),
                     }
+                } else if *native == NB_ARRAY_FROM
+                    && let Some(e) = array_from_alloc_guard(ctx, &argv)
+                {
+                    // Refuse `Array.from(arrayLike)` whose `length` exceeds the array
+                    // cap BEFORE call_native materializes it — otherwise a source
+                    // like `{length: 2**32-1}` triggers a multi-gigabyte allocation
+                    // (an unbounded-memory bug). call_native cannot throw, so the
+                    // guard runs here where the throw machinery is available.
+                    handle_throw!(VmError::Thrown(e));
                 } else {
                     regs[*dst as usize] = call_native(ctx, *native, &argv);
                 }
@@ -3280,6 +3289,30 @@ fn builtin_method(
 
 /// Invokes a built-in by id (`console.log` writes to `ctx.output`; `Math.*`
 /// fold over the numeric arguments).
+/// Guards `Array.from(source)` against an unbounded allocation: if `source` is an
+/// array-like object whose `length` exceeds [`Limits::max_array_len`](crate::limits::Limits::max_array_len),
+/// returns a `RangeError` to throw instead of letting `call_native` build a vector
+/// of that size. Real arrays/strings/collections are sized by their (already
+/// capped) element count, so they are not affected.
+fn array_from_alloc_guard(ctx: &mut Ctx, args: &[NanBox]) -> Option<NanBox> {
+    let h = args.first().copied()?.as_handle().map(Handle::from_raw)?;
+    // Element-backed sources are already bounded by their real length.
+    if ctx.realm.array_elements(h).is_some()
+        || ctx.realm.string_value(h).is_some()
+        || ctx.realm.collection_entries(h).is_some()
+    {
+        return None;
+    }
+    let len = ctx
+        .realm
+        .get_property(h, "length")
+        .map(|v| ctx.realm.to_number(v))?;
+    if len > ctx.realm.limits.max_array_len as f64 {
+        return Some(make_error(ctx.realm, "RangeError", "Invalid array length"));
+    }
+    None
+}
+
 fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
     match native {
         NB_CONSOLE_LOG => {
