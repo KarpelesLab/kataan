@@ -18161,7 +18161,10 @@ fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
                     collect_var_names(core::slice::from_ref(alt), out);
                 }
             }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Labeled { body, .. } => {
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Labeled { body, .. }
+            | Stmt::With { body, .. } => {
                 collect_var_names(core::slice::from_ref(body), out);
             }
             Stmt::For { init, body, .. } => {
