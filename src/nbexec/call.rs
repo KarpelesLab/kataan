@@ -572,7 +572,16 @@ impl<'a> Interp<'a> {
                     "toSorted",
                     "with",
                 ];
-                let this_eff = match this_val.as_handle().map(Handle::from_raw) {
+                // ToObject(this): a primitive `this` (a boolean/number/string/
+                // symbol/bigint, e.g. `Array.prototype.reduce.call("abc", …)`) is
+                // boxed to its wrapper object so its array-like indexed properties
+                // and `length` are read generically.
+                let this_obj = if this_val.as_handle().is_none() {
+                    self.coerce_to_object(this_val)
+                } else {
+                    this_val
+                };
+                let this_eff = match this_obj.as_handle().map(Handle::from_raw) {
                     Some(h)
                         if PLAIN_ARRAY_RESULT.contains(&name.as_str())
                             && self.realm.typed_kind(h).is_some() =>
@@ -580,7 +589,7 @@ impl<'a> Interp<'a> {
                         let elems = self.realm.typed_elements(h).unwrap_or_default();
                         NanBox::handle(self.realm.new_array(elems).to_raw())
                     }
-                    _ => this_val,
+                    _ => this_obj,
                 };
                 return Ok(self
                     .call_method(this_eff, &name, args)?
@@ -1833,10 +1842,12 @@ impl<'a> Interp<'a> {
         cmp: NanBox,
         numeric: bool,
     ) -> Result<Vec<NanBox>, ExecError> {
-        let has_cmp = cmp.as_handle().is_some_and(|raw| {
-            let h = Handle::from_raw(raw);
-            self.realm.native_at(h).is_some() || self.realm.function_at(h).is_some()
-        });
+        // `sort(comparefn)`: a non-undefined comparefn that is not callable is a
+        // TypeError (per spec, observed before any element comparison).
+        if !matches!(cmp.unpack(), Unpacked::Undefined) && !self.is_callable_value(cmp) {
+            return Err(self.type_error("comparefn must be a function"));
+        }
+        let has_cmp = self.is_callable_value(cmp);
         // `undefined` elements always sort to the end and are never passed to the
         // comparator; only defined values are ordered against each other.
         let undefined_count = elems
