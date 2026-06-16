@@ -4701,7 +4701,7 @@ impl Compiler {
             if let (Some(def), BindingTarget::Ident(Ident { name, .. })) = (&p.default, &p.target) {
                 let b = c.lookup(name).expect("a bound param");
                 let cur = c.read_var(b);
-                c.apply_default(cur, Some(def))?;
+                c.apply_default_named(cur, Some(def), Some(&p.target))?;
                 c.write_var(b, cur);
             }
         }
@@ -4944,7 +4944,7 @@ impl Compiler {
                                 arr: value_reg,
                                 index: idx,
                             });
-                            self.apply_default(v, default.as_ref())?;
+                            self.apply_default_named(v, default.as_ref(), Some(target))?;
                             self.bind_pattern(target, v)?;
                         }
                         ArrayPatternElement::Rest { target, .. } => {
@@ -4972,7 +4972,7 @@ impl Compiler {
                         obj: value_reg,
                         key: key.clone(),
                     });
-                    self.apply_default(v, prop.default.as_ref())?;
+                    self.apply_default_named(v, prop.default.as_ref(), Some(&prop.value))?;
                     self.bind_pattern(&prop.value, v)?;
                     named.push(key);
                 }
@@ -4994,6 +4994,18 @@ impl Compiler {
     /// If `reg` holds `undefined` and a `default` exists, overwrites `reg` with
     /// the default's value.
     fn apply_default(&mut self, reg: Reg, default: Option<&Expr>) -> Result<(), CompileError> {
+        self.apply_default_named(reg, default, None)
+    }
+
+    /// Like [`Self::apply_default`], but applies NamedEvaluation when the default
+    /// is an anonymous function/arrow and `target` is a plain identifier
+    /// (`[x = () => {}]` ⇒ `x.name === "x"`).
+    fn apply_default_named(
+        &mut self,
+        reg: Reg,
+        default: Option<&Expr>,
+        target: Option<&BindingTarget>,
+    ) -> Result<(), CompileError> {
         let Some(e) = default else { return Ok(()) };
         let undef = self.constant(NanBox::undefined())?;
         let is_undef = self.alloc();
@@ -5004,7 +5016,10 @@ impl Compiler {
         });
         // Skip the default unless the value is `undefined`.
         let jf = self.emit_jump_if_false(is_undef);
-        let d = self.expr(e)?;
+        let d = match target {
+            Some(t) => self.expr_named(e, t)?,
+            None => self.expr(e)?,
+        };
         self.ops.push(Op::Move { dst: reg, src: d });
         self.patch(jf);
         Ok(())

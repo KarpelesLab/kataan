@@ -6862,6 +6862,7 @@ impl<'a> Interp<'a> {
                         && let Some(d) = &param.default
                     {
                         v = self.eval(d)?;
+                        self.infer_binding_name(&param.target, d, v);
                     }
                     v
                 };
@@ -9592,6 +9593,7 @@ impl<'a> Interp<'a> {
                                     && let Some(d) = &param.default
                                 {
                                     v = self.eval(d)?;
+                                    self.infer_binding_name(&param.target, d, v);
                                 }
                                 v
                             };
@@ -14034,6 +14036,18 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Applies named-evaluation to a destructuring default: when a binding's
+    /// default is an *anonymous* function/arrow/class and the target is a plain
+    /// identifier, the produced function takes the binding name
+    /// (`let [x = () => {}] = []` → `x.name === "x"`).
+    fn infer_binding_name(&mut self, target: &'a BindingTarget, default: &'a Expr, value: NanBox) {
+        if let BindingTarget::Ident(Ident { name, .. }) = target
+            && matches!(default, Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_))
+        {
+            self.set_fn_name(value, name);
+        }
+    }
+
     /// Binds a (possibly destructuring) target to `value`, declaring the names
     /// it introduces in the current scope.
     fn bind_pattern(&mut self, target: &'a BindingTarget, value: NanBox) -> Result<(), ExecError> {
@@ -14102,6 +14116,9 @@ impl<'a> Interp<'a> {
                                 && let Some(d) = default
                             {
                                 v = self.eval(d)?;
+                                // `[x = function(){}]` names the anonymous function
+                                // after the binding target (`x`).
+                                self.infer_binding_name(target, d, v);
                             }
                             self.bind_pattern(target, v)?;
                             i += 1;
@@ -14137,6 +14154,7 @@ impl<'a> Interp<'a> {
                         && let Some(d) = &prop.default
                     {
                         v = self.eval(d)?;
+                        self.infer_binding_name(&prop.value, d, v);
                     }
                     used.push(key);
                     self.bind_pattern(&prop.value, v)?;
