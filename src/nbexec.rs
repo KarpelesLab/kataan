@@ -6852,6 +6852,15 @@ impl<'a> Interp<'a> {
         // not penalised by the depth accumulated in the caller's expressions.
         let saved_eval_depth = core::mem::replace(&mut self.eval_depth, 0);
         let result = (|| {
+            // A non-arrow function gets an `arguments` array-like of its call
+            // arguments. (Arrows inherit the enclosing `arguments`.) Bound *before*
+            // the parameters so a parameter default can reference `arguments`
+            // (`function f(x = arguments[0]) {}`).
+            if !def.is_arrow {
+                let arr = self.realm.new_array(args.to_vec());
+                self.current
+                    .declare("arguments", NanBox::handle(arr.to_raw()));
+            }
             for (i, param) in def.params.iter().enumerate() {
                 let value = if param.rest {
                     let rest = args[i.min(args.len())..].to_vec();
@@ -6867,13 +6876,6 @@ impl<'a> Interp<'a> {
                     v
                 };
                 self.bind_pattern(&param.target, value)?;
-            }
-            // A non-arrow function gets an `arguments` array-like of its call
-            // arguments. (Arrows inherit the enclosing `arguments`.)
-            if !def.is_arrow {
-                let arr = self.realm.new_array(args.to_vec());
-                self.current
-                    .declare("arguments", NanBox::handle(arr.to_raw()));
             }
             self.run_body(def.body)
         })();
@@ -9582,6 +9584,11 @@ impl<'a> Interp<'a> {
                     let scope = self.current.child();
                     let saved = core::mem::replace(&mut self.current, scope);
                     let r: Result<Option<NanBox>, ExecError> = (|| {
+                        // `arguments` is available in the constructor (incl. its
+                        // parameter defaults), bound before the parameters.
+                        let arg_arr = self.realm.new_array(args.to_vec());
+                        self.current
+                            .declare("arguments", NanBox::handle(arg_arr.to_raw()));
                         // Bind parameters (rest/default/destructuring supported).
                         for (i, param) in ctor.value.params.iter().enumerate() {
                             let value = if param.rest {
