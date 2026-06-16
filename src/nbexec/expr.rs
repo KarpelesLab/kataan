@@ -1765,11 +1765,22 @@ impl<'a> Interp<'a> {
         } = target
         {
             let obj = self.eval(object)?;
+            // Spec reference order: evaluate the base, then the key expression,
+            // then (for a plain assignment) the RHS — *before* PutValue's
+            // RequireObjectCoercible. So a `null`/`undefined` base still evaluates
+            // the key and RHS, and only then throws a TypeError (not before).
+            let key = self.eval(key_expr)?;
             let Some(raw) = obj.as_handle() else {
-                return Err(ExecError::Unsupported("member assign to non-object"));
+                // `null`/`undefined` (or a number/boolean) base: a number/boolean
+                // is a primitive whose write is silently ignored in sloppy mode;
+                // `null`/`undefined` throws a TypeError after the RHS is evaluated.
+                let rhs = self.eval(value)?;
+                if matches!(obj.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                    return Err(self.type_error("Cannot set property of null or undefined"));
+                }
+                return Ok(rhs);
             };
             let handle = crate::heap::Handle::from_raw(raw);
-            let key = self.eval(key_expr)?;
             let new = if op == AssignOp::Assign {
                 self.eval(value)?
             } else {
@@ -1848,7 +1859,12 @@ impl<'a> Interp<'a> {
             } => {
                 let obj = self.eval(object)?;
                 let Some(raw) = obj.as_handle() else {
-                    return Err(ExecError::Unsupported("member assign to non-object"));
+                    // A `null`/`undefined` base throws a TypeError; another primitive
+                    // (number/boolean) silently ignores the write in sloppy mode.
+                    if matches!(obj.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                        return Err(self.type_error("Cannot set property of null or undefined"));
+                    }
+                    return Ok(rhs);
                 };
                 let handle = crate::heap::Handle::from_raw(raw);
                 let new = if op == AssignOp::Assign {
