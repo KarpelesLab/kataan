@@ -4916,7 +4916,17 @@ impl Compiler {
             ..
         } = target
         {
-            self.apply_default(value_reg, Some(default))?;
+            // NamedEvaluation: `[x = () => {}] = …` names the anonymous function
+            // after the assignment target `x`.
+            if let Expr::Ident(id) = &**inner {
+                let bt = BindingTarget::Ident(Ident {
+                    name: id.name.clone(),
+                    span: id.span,
+                });
+                self.apply_default_named(value_reg, Some(default), Some(&bt))?;
+            } else {
+                self.apply_default(value_reg, Some(default))?;
+            }
             return self.assign_pattern(inner, value_reg);
         }
         self.assign_pattern(target, value_reg)
