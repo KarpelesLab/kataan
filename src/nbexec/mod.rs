@@ -2934,8 +2934,12 @@ impl<'a> Interp<'a> {
         home_static: bool,
     ) -> NanBox {
         // Strict mode is lexical: inherited from the defining context, or set by
-        // the function body's own `"use strict"` directive prologue.
-        let is_strict = self.strict || matches!(body, Body::Block(stmts) if has_use_strict(stmts));
+        // the function body's own `"use strict"` directive prologue. A *class*
+        // member (it carries a home class) is always strict — all class bodies are
+        // strict code per spec, with no directive required.
+        let is_strict = self.strict
+            || home_class.is_some()
+            || matches!(body, Body::Block(stmts) if has_use_strict(stmts));
         let func_id = self.functions.len() as u32;
         self.functions.push(FnDef {
             params,

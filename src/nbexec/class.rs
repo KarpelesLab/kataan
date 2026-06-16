@@ -605,6 +605,8 @@ impl<'a> Interp<'a> {
         let fn_parent = self.class_fn_super[class_id as usize];
         let saved_super_fn = core::mem::replace(&mut self.pending_super_fn, fn_parent);
         let saved_scope = core::mem::replace(&mut self.current, env.child());
+        // A class constructor body (and its field initializers) is strict code.
+        let saved_strict = core::mem::replace(&mut self.strict, true);
         let result = (|| {
             let ctor = class.body.iter().find_map(|m| match m {
                 ClassMember::Method(m) if m.kind == MethodKind::Constructor => Some(m),
@@ -682,6 +684,7 @@ impl<'a> Interp<'a> {
         self.pending_super = saved_super;
         self.pending_super_native = saved_super_native;
         self.pending_super_fn = saved_super_fn;
+        self.strict = saved_strict;
         result
     }
 

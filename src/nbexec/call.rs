@@ -889,6 +889,14 @@ impl<'a> Interp<'a> {
         // recursion is bounded separately by `call_depth`) so genuine recursion is
         // not penalised by the depth accumulated in the caller's expressions.
         let saved_eval_depth = core::mem::replace(&mut self.eval_depth, 0);
+        // Strict mode is lexical: a strict function (a class member, or one with a
+        // `"use strict"` prologue, or defined in strict code) runs its whole body —
+        // including parameter-default evaluation — in strict mode. An arrow
+        // inherits the enclosing mode (already reflected in its `is_strict`).
+        let saved_strict = self.strict;
+        if def.is_strict {
+            self.strict = true;
+        }
         let result = (|| {
             // A non-arrow function gets an `arguments` array-like of its call
             // arguments. (Arrows inherit the enclosing `arguments`.) Bound *before*
@@ -923,6 +931,7 @@ impl<'a> Interp<'a> {
         self.current_home_static = saved_home_static;
         self.new_target = saved_target;
         self.eval_depth = saved_eval_depth;
+        self.strict = saved_strict;
         // A generator call returns an iterator over the values it yielded.
         if def.is_generator {
             let collected = self.gen_sink.take().unwrap_or_default();
