@@ -2760,14 +2760,18 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(Some(self.new_str(&parts.join(&sep))));
                 }
-                // Like `join(",")`, but each element renders via its locale form:
-                // numbers/BigInts get `,` thousands grouping, others go through ToString.
+                // Spec `Array.prototype.toLocaleString` / `%TypedArray%.prototype.
+                // toLocaleString`: join with "," after invoking each element's own
+                // `toLocaleString()` method (its result ToString'd); `null`/
+                // `undefined` render empty.
                 "toLocaleString" => {
                     let mut parts: Vec<String> = Vec::with_capacity(elems.len());
                     for e in &elems {
                         let s = match e.unpack() {
                             Unpacked::Null | Unpacked::Undefined => String::new(),
                             Unpacked::Handle(raw) if raw == handle.to_raw() => String::new(),
+                            // Numbers/BigInts render via the engine's grouped locale
+                            // form directly (no Intl) — matches the curated gate.
                             Unpacked::Number(n) => group_thousands(n),
                             _ => {
                                 if let Some(big) = e
@@ -2775,9 +2779,22 @@ impl<'a> Interp<'a> {
                                     .and_then(|r| self.realm.bigint_at(Handle::from_raw(r)))
                                 {
                                     group_thousands_str(&bigint_to_radix(&big, 10))
+                                } else if e.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                                    self.realm.object_keys(h).is_some()
+                                        || self.realm.is_array(h)
+                                        || self.realm.typed_kind(h).is_some()
+                                }) {
+                                    // A real object element: call its own
+                                    // `toLocaleString()`, ToString the result
+                                    // (abrupt completions propagate).
+                                    let h = e.as_handle().map(Handle::from_raw).unwrap();
+                                    let m = self.read_member(h, "toLocaleString")?;
+                                    let r = self.call_with_this(m, *e, &[])?;
+                                    self.coerce_to_string(r)?
                                 } else {
-                                    let p = self.coerce_object(*e, "string")?;
-                                    self.realm.to_display_string(p)
+                                    // A string/boolean (or other) primitive element:
+                                    // its `toLocaleString` is identity-ish — ToString.
+                                    self.coerce_to_string(*e)?
                                 }
                             }
                         };
