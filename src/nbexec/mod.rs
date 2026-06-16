@@ -4156,8 +4156,9 @@ fn normalize_wtf8(bytes: &[u8], form: &str) -> alloc::vec::Vec<u8> {
 /// Slices a pre-collected `&[u16]` subject over the **code-unit** range
 /// `[st, en)` and re-encodes it to WTF-8 bytes (lone surrogates preserved). The
 /// native regex subject model is UTF-16 code units, so match/capture spans index
-/// this buffer directly (RE-7: the subject is collected once per operation).
-#[cfg(feature = "regex")]
+/// this buffer directly (RE-7: the subject is collected once per operation). Also
+/// used by the spec-string-method (`@@split`/`@@replace`) builders, which exist
+/// without the `regex` feature, so it is not feature-gated.
 fn u16_slice(units: &[u16], st: usize, en: usize) -> alloc::vec::Vec<u8> {
     let st = st.min(units.len());
     let en = en.min(units.len()).max(st);
@@ -4166,7 +4167,6 @@ fn u16_slice(units: &[u16], st: usize, en: usize) -> alloc::vec::Vec<u8> {
 
 /// Slices a pre-collected `&[u16]` subject from code-unit index `st` to the end,
 /// re-encoded to WTF-8 bytes.
-#[cfg(feature = "regex")]
 fn u16_slice_from(units: &[u16], st: usize) -> alloc::vec::Vec<u8> {
     crate::wtf8::from_utf16(&units[st.min(units.len())..])
 }
@@ -4174,7 +4174,6 @@ fn u16_slice_from(units: &[u16], st: usize) -> alloc::vec::Vec<u8> {
 /// Advances a code-unit position past a just-consumed empty match. Per spec
 /// `AdvanceStringIndex`, a `u`-flag regex steps a whole code point (skipping the
 /// low half of a surrogate pair), while a non-`u` regex steps one code unit.
-#[cfg(feature = "regex")]
 fn advance_index_u16(units: &[u16], i: usize, unicode: bool) -> usize {
     if unicode
         && i + 1 < units.len()

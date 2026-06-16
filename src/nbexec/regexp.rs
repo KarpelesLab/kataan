@@ -583,6 +583,7 @@ impl<'a> Interp<'a> {
     }
 
     /// A catchable `SyntaxError` for an invalid `/pattern/flags`.
+    #[cfg(feature = "regex")]
     fn regexp_syntax_error(&mut self, pat: &str, flags: &str) -> NanBox {
         let m = self.new_str(&alloc::format!(
             "Invalid regular expression: /{pat}/{flags}"
@@ -753,9 +754,23 @@ impl<'a> Interp<'a> {
             u32::MAX as usize
         } else {
             // ToUint32(limit) — ToNumber (may run a user valueOf / throw), then
-            // the modulo-2^32 wrap.
-            let n = self.coerce_to_number(limit)?;
-            self.realm.to_uint32(n) as usize
+            // the modulo-2^32 wrap (computed inline so the no-`std` build, where
+            // `Realm::to_uint32` is unavailable, still compiles).
+            let nv = self.coerce_to_number(limit)?;
+            let n = self.realm.to_number(nv);
+            // ToUint32: a non-finite/NaN value is 0; otherwise truncate toward
+            // zero and reduce modulo 2^32 (the `%` operator is `core`, unlike the
+            // `std`-only `rem_euclid`).
+            let wrapped = if n.is_finite() {
+                let two32 = 4_294_967_296.0_f64;
+                let t = n as i64 as f64; // truncate toward zero
+                let m = t % two32;
+                let m = if m < 0.0 { m + two32 } else { m };
+                m as u32
+            } else {
+                0
+            };
+            wrapped as usize
         };
         let mut parts: Vec<NanBox> = Vec::new();
         if lim == 0 {
