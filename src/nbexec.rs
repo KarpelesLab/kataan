@@ -9199,51 +9199,50 @@ impl<'a> Interp<'a> {
         for member in &class.body {
             match member {
                 ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
-                    if let Ok(key) = self.eval_prop_key(&m.key) {
-                        // A static method's home is this class, entered statically, so
-                        // `super.x` resolves against the superclass's static members.
-                        let f = self.make_method(
-                            &m.value.params,
-                            Body::Block(&m.value.body),
-                            false,
-                            m.value.is_generator,
-                            Some(class_id),
-                            true,
-                        );
-                        statics.insert(key, f);
-                    }
+                    // A computed key is evaluated at class-definition time; a throw
+                    // from it propagates (it does not silently skip the member).
+                    let key = self.eval_prop_key(&m.key)?;
+                    // A static method's home is this class, entered statically, so
+                    // `super.x` resolves against the superclass's static members.
+                    let f = self.make_method(
+                        &m.value.params,
+                        Body::Block(&m.value.body),
+                        false,
+                        m.value.is_generator,
+                        Some(class_id),
+                        true,
+                    );
+                    statics.insert(key, f);
                 }
                 ClassMember::Field(field) if field.is_static => {
-                    if let Ok(key) = self.eval_prop_key(&field.key) {
-                        let v = match &field.value {
-                            Some(e) => self.eval(e).unwrap_or(NanBox::undefined()),
-                            None => NanBox::undefined(),
-                        };
-                        // Static fields are enumerable own keys of the constructor.
-                        if !static_fields.contains(&key) {
-                            static_fields.push(key.clone());
-                        }
-                        statics.insert(key, v);
+                    let key = self.eval_prop_key(&field.key)?;
+                    let v = match &field.value {
+                        Some(e) => self.eval(e).unwrap_or(NanBox::undefined()),
+                        None => NanBox::undefined(),
+                    };
+                    // Static fields are enumerable own keys of the constructor.
+                    if !static_fields.contains(&key) {
+                        static_fields.push(key.clone());
                     }
+                    statics.insert(key, v);
                 }
                 // `static get x() {}` / `static set x(v) {}` — accessors.
                 ClassMember::Method(m)
                     if m.is_static && matches!(m.kind, MethodKind::Get | MethodKind::Set) =>
                 {
-                    if let Ok(key) = self.eval_prop_key(&m.key) {
-                        let f = self.make_method(
-                            &m.value.params,
-                            Body::Block(&m.value.body),
-                            false,
-                            false,
-                            Some(class_id),
-                            true,
-                        );
-                        if m.kind == MethodKind::Get {
-                            static_getters.insert(key, f);
-                        } else {
-                            static_setters.insert(key, f);
-                        }
+                    let key = self.eval_prop_key(&m.key)?;
+                    let f = self.make_method(
+                        &m.value.params,
+                        Body::Block(&m.value.body),
+                        false,
+                        false,
+                        Some(class_id),
+                        true,
+                    );
+                    if m.kind == MethodKind::Get {
+                        static_getters.insert(key, f);
+                    } else {
+                        static_setters.insert(key, f);
                     }
                 }
                 _ => {}
