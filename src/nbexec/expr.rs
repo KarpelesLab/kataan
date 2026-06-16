@@ -761,11 +761,34 @@ impl<'a> Interp<'a> {
                             let k = self.eval_prop_key(key)?;
                             let v = self.eval(value)?;
                             // A method / function-valued property is named after its
-                            // (static) key when otherwise anonymous.
-                            if matches!(&**value, Expr::Function(_) | Expr::Arrow(_))
-                                && let PropertyKey::Ident(s) | PropertyKey::Str(s) = key
-                            {
-                                self.set_fn_name(v, s);
+                            // key when otherwise anonymous. A computed key that is a
+                            // Symbol names the method `[description]` (or `""`); a
+                            // static identifier/string key names it directly.
+                            if matches!(&**value, Expr::Function(_) | Expr::Arrow(_)) {
+                                match key {
+                                    PropertyKey::Ident(s) | PropertyKey::Str(s) => {
+                                        self.set_fn_name(v, s);
+                                    }
+                                    PropertyKey::Computed(_) => {
+                                        // `k` is the storage key (a `\0sym:` key for a
+                                        // Symbol); `method_display_name` renders the
+                                        // spec name. Install it if the function is
+                                        // still anonymous.
+                                        let params: &[Param] = match &**value {
+                                            Expr::Function(f) => &f.params,
+                                            _ => &[],
+                                        };
+                                        if let Some(name) =
+                                            self.method_display_name(&k, MethodKind::Method)
+                                            && v.as_handle().map(Handle::from_raw).is_some_and(
+                                                |h| !self.realm.has_own(h, "name"),
+                                            )
+                                        {
+                                            self.install_method_meta(v, &name, params);
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                             // A concise method (`{ m() {} }`, not an arrow) records
                             // this object as its `[[HomeObject]]`, so `super.x`
