@@ -124,6 +124,15 @@ impl Scope {
         self.0.borrow().parent.clone()
     }
 
+    /// Whether `self` and `other` are the *same* scope record (identity, not
+    /// contents) — used to detect when execution is running directly in the
+    /// global scope (so a `var`/`function` declaration there also publishes a
+    /// property on the global object).
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Scope) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Visits every heap [`Handle`] reachable from this scope chain's bindings
     /// (for GC tracing of a closure's captured values).
     pub fn for_each_handle(&self, visit: &mut dyn FnMut(Handle)) {

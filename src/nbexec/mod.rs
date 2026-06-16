@@ -2440,6 +2440,20 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Mirrors a global `var`/function declaration's binding onto the global
+    /// object, so `var x = 1; this.x` (and `globalThis.x`) see it. Only applies
+    /// when execution is running directly in the global scope (a `var` inside a
+    /// function binds in that function, not on the global object). Per spec a
+    /// global `var` property is writable + enumerable but non-configurable.
+    fn publish_global_var(&mut self, name: &str, value: NanBox) {
+        if !self.current.ptr_eq(&self.global_scope) {
+            return;
+        }
+        if let Some(g) = self.global_this.as_handle().map(Handle::from_raw) {
+            self.realm.set_property(g, name, value);
+        }
+    }
+
     /// Captures the object graph reachable from `roots` (the heap objects among
     /// them — primitives are skipped) and serializes it to portable bytes: a D′
     /// snapshot of live values that can later be reloaded into a fresh interpreter
@@ -2702,9 +2716,20 @@ impl<'a> Interp<'a> {
             // Annex B: a function declared inside a block also var-hoists its name
             // to the enclosing function scope (initially `undefined`).
             collect_block_function_names(stmts, &mut var_names);
+            let at_global = self.current.ptr_eq(&self.global_scope);
             for name in var_names {
                 if !self.current.has_local(name) {
                     self.current.declare(name, NanBox::undefined());
+                }
+                // A global `var` reserves an own property on the global object
+                // (initially `undefined` until the declaration's initializer runs),
+                // so `typeof x` / `this.x` see the hoisted binding. Don't clobber a
+                // pre-existing global property (e.g. a built-in of the same name).
+                if at_global
+                    && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+                    && !self.realm.has_own(g, name)
+                {
+                    self.realm.set_property(g, name, NanBox::undefined());
                 }
             }
         }
@@ -2722,6 +2747,9 @@ impl<'a> Interp<'a> {
                 if hoist_vars {
                     // A function/program top-level declaration binds here.
                     self.current.declare(&id.name, value);
+                    // A global function declaration also publishes on the global
+                    // object (`function f(){}; this.f === f`).
+                    self.publish_global_var(&id.name, value);
                 } else {
                     // A block-level declaration (Annex B) assigns the function-scope
                     // `var` binding hoisted above; if none exists, bind locally.

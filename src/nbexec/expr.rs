@@ -161,8 +161,17 @@ impl<'a> Interp<'a> {
                     }
                     match self.current.get(name) {
                         Some(v) => Ok(v),
-                        // An unresolved reference throws a catchable ReferenceError.
+                        // Not in the lexical scope chain: a property added directly
+                        // to the global object (`this.x = …` / `globalThis.x = …` at
+                        // script level) is a global binding, so fall back to a
+                        // global-object own property before failing.
                         None => {
+                            if let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+                                && self.realm.has_own(g, name)
+                            {
+                                return self.read_member(g, name);
+                            }
+                            // An unresolved reference throws a catchable ReferenceError.
                             let msg = self.new_str(&alloc::format!("{name} is not defined"));
                             Err(ExecError::Throw(
                                 self.make_error(N_REFERENCE_ERROR, Some(msg)),

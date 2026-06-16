@@ -322,6 +322,9 @@ impl<'a> Interp<'a> {
                 if !self.current.set(name, value) {
                     self.current.declare(name, value);
                 }
+                // A global-scope `var x = v` also publishes `x` on the global
+                // object (so `this.x` / `globalThis.x` see it).
+                self.publish_global_var(name, value);
                 continue;
             }
             // A simple `const x = …` binding is tracked so reassignment throws.
