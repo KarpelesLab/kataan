@@ -594,6 +594,14 @@ impl Object {
     pub fn delete(&mut self, root: Rc<Shape>, key: &str) -> bool {
         let had_accessor = self.accessors.iter().any(|(k, _, _)| k.as_ref() == key);
         self.accessors.retain(|(k, _, _)| k.as_ref() != key);
+        // Clear the property's attribute flags so a later re-add of the same key
+        // starts from defaults — otherwise a stale `readonly` flag makes `set` a
+        // silent no-op, and a stale `hidden`/`non_configurable` flag wrongly
+        // carries over to the new property (e.g. re-defining a deleted, formerly
+        // non-writable `name`/`length`, or NamedEvaluation re-installing `name`).
+        self.hidden.retain(|k| k.as_ref() != key);
+        self.readonly.retain(|k| k.as_ref() != key);
+        self.non_configurable.retain(|k| k.as_ref() != key);
         match &mut self.data {
             ObjectData::Shaped { shape, slots } => {
                 if !shape.contains(key) {
