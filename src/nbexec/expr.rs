@@ -1932,7 +1932,8 @@ impl<'a> Interp<'a> {
                             self.make_error(N_REFERENCE_ERROR, Some(m)),
                         ));
                     }
-                    self.current.declare(name, new); // sloppy global
+                    // Sloppy implicit global: bind on the global scope + object.
+                    self.declare_sloppy_global(name, new);
                 }
                 Ok(new)
             }

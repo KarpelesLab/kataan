@@ -842,7 +842,10 @@ impl<'a> Interp<'a> {
                             self.make_error(N_REFERENCE_ERROR, Some(m)),
                         ));
                     }
-                    self.current.declare(&id.name, value);
+                    // Sloppy mode: assigning to an unresolvable reference creates a
+                    // property on the *global* object (not a binding in the current
+                    // scope), so it is visible after a block/loop scope is popped.
+                    self.declare_sloppy_global(&id.name, value);
                 }
                 Ok(())
             }

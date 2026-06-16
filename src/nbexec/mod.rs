@@ -2573,6 +2573,17 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Sloppy-mode assignment to an unresolvable reference (`x = 1` with no
+    /// binding for `x`): creates a property on the *global* object and a binding
+    /// in the global scope — never in the current (function/block) scope, so the
+    /// new global outlives the enclosing frame. (Strict mode throws instead.)
+    pub(crate) fn declare_sloppy_global(&mut self, name: &str, value: NanBox) {
+        self.global_scope.declare(name, value);
+        if let Some(g) = self.global_this.as_handle().map(Handle::from_raw) {
+            self.realm.set_property(g, name, value);
+        }
+    }
+
     /// Mirrors a global `var`/function declaration's binding onto the global
     /// object, so `var x = 1; this.x` (and `globalThis.x`) see it. Only applies
     /// when execution is running directly in the global scope (a `var` inside a
