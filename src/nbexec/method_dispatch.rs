@@ -12,6 +12,25 @@ impl<'a> Interp<'a> {
     ) -> Result<Option<NanBox>, ExecError> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
 
+        // ValidateTypedArray: the data-accessing `%TypedArray%.prototype` methods
+        // throw a TypeError up front if the backing buffer is detached (the view was
+        // length-0'd on detach, so without this they would silently operate on an
+        // empty array). `subarray` (builds a fresh view), the iterator factories
+        // (`values`/`keys`/`entries`), and `toString` (generic) are exempt.
+        if let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.typed_kind(h).is_some()
+            && !matches!(
+                method,
+                "subarray" | "values" | "keys" | "entries" | "toString" | "constructor"
+            )
+            && TYPED_ARRAY_PROTO_METHODS.iter().any(|(n, _)| *n == method)
+            && self.typed_array_detached(h)
+        {
+            return Err(self.type_error(&alloc::format!(
+                "TypedArray.prototype.{method} called on a detached ArrayBuffer"
+            )));
+        }
+
         // A primitive wrapper object (`new Number`/`String`/`Boolean`): `valueOf`
         // recovers the boxed primitive; every other method delegates to it.
         if let Some(h) = recv.as_handle().map(Handle::from_raw)
@@ -927,11 +946,22 @@ impl<'a> Interp<'a> {
             let nb = self.make_array_buffer_from_bytes(sub);
             return Ok(Some(NanBox::handle(nb.to_raw())));
         }
-        // --- ArrayBuffer.prototype.transfer(newLength?) → a new ArrayBuffer; detaches the
-        // original (its byteLength becomes 0 and its views are emptied) ---
-        if method == "transfer"
+        // --- ArrayBuffer.prototype.transfer(newLength?) / transferToFixedLength(newLength?)
+        // → a new ArrayBuffer, detaching the original (its byteLength becomes 0 and its
+        // views are emptied). `transfer` preserves resizability (the new buffer keeps the
+        // original's maxByteLength); `transferToFixedLength` always yields a fixed-length
+        // buffer. (ArrayBufferCopyAndDetach.) ---
+        if (method == "transfer" || method == "transferToFixedLength")
             && let Some(bh) = self.array_buffer_bytes(handle)
         {
+            // `newLength` is ToIndex-coerced first (before the detached check), so a
+            // poisoned `valueOf` / out-of-range length is observed in spec order.
+            let new_len = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                None
+            } else {
+                let raw = self.realm.to_number(arg(0));
+                Some(self.validate_alloc_len(raw, "Invalid ArrayBuffer length")?)
+            };
             if self
                 .realm
                 .get_property(handle, ARRAY_BUFFER_DETACHED)
@@ -945,23 +975,23 @@ impl<'a> Interp<'a> {
                 .bytes_at(bh)
                 .map(<[u8]>::to_vec)
                 .unwrap_or_default();
-            // `transfer()` keeps the size; `transfer(n)` resizes (truncating or
-            // zero-padding). L1: route the requested length through
-            // `validate_alloc_len` so a huge `transfer(1e309)` throws a catchable
-            // `RangeError` instead of attempting a `usize::MAX` allocation that
-            // aborts the process (the ArrayBuffer constructor caps the same way).
-            let new_len = if matches!(arg(0).unpack(), Unpacked::Undefined) {
-                bytes.len()
-            } else {
-                let raw = self.realm.to_number(arg(0));
-                self.validate_alloc_len(raw, "Invalid ArrayBuffer length")?
-            };
+            // `transfer()`/`transferToFixedLength()` keep the size; an explicit length
+            // resizes (truncating or zero-padding the copy).
+            let new_len = new_len.unwrap_or(bytes.len());
             bytes.resize(new_len, 0);
             let nb = self.make_array_buffer_from_bytes(&bytes);
-            // Detach the original: empty every view over it, then flag it.
-            self.realm.detach_buffer_views(bh);
-            self.realm
-                .set_hidden_property(handle, ARRAY_BUFFER_DETACHED, NanBox::boolean(true));
+            // `transfer` carries the original's resizability over (clamping the
+            // preserved maxByteLength to be at least the new length); a non-resizable
+            // source — and `transferToFixedLength` always — yields a fixed buffer.
+            if method == "transfer"
+                && let Some(maxv) = self.realm.get_property(handle, ARRAY_BUFFER_MAXLEN)
+            {
+                let max = (self.realm.to_number(maxv).max(0.0) as usize).max(new_len);
+                self.realm
+                    .set_hidden_property(nb, ARRAY_BUFFER_MAXLEN, NanBox::number(max as f64));
+            }
+            // Detach the original (empty its views, zero its store, flag it).
+            self.detach_array_buffer(handle);
             return Ok(Some(NanBox::handle(nb.to_raw())));
         }
         // --- ArrayBuffer.prototype.resize(newByteLength) (resizable buffers) ---
@@ -1018,7 +1048,26 @@ impl<'a> Interp<'a> {
                     }
                 } else {
                     let num = self.coerce_to_number(arg(1))?;
-                    self.realm.to_number(num) as i64 as u64
+                    let value = self.realm.to_number(num);
+                    // SetValueInBuffer for an integer type takes the bytes of the value
+                    // modulo 2^(8*size): a non-finite value (NaN/±Infinity) maps to 0,
+                    // and a finite value is truncated toward zero then reduced into the
+                    // type's width (e.g. `setUint8(0, 256)` stores 0, `setUint8(0, Infinity)`
+                    // stores 0). Plain `as i64` would saturate Infinity to i64::MAX (0xFF…).
+                    // (Integer DataView types are at most 4 bytes wide, so the truncated
+                    // value fits an `i64` and the low `8*size` bits are the stored bytes;
+                    // `trunc_toward_zero` avoids the std-only `f64::trunc` for `no_std`.)
+                    if value.is_finite() {
+                        let truncated = trunc_toward_zero(value) as i64 as u64;
+                        let mask = if size >= 8 {
+                            u64::MAX
+                        } else {
+                            (1u64 << (8 * size)) - 1
+                        };
+                        truncated & mask
+                    } else {
+                        0
+                    }
                 })
             } else {
                 None

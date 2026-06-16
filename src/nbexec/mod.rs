@@ -532,6 +532,12 @@ const N_AB_ACCESSOR: u16 = 301;
 /// through `call_method` so `DataView.prototype.getInt8.call(dv, 0)` and a direct
 /// `dv.getInt8(0)` share one implementation.
 const N_DATA_VIEW_PROTO_FN: u16 = 302;
+/// `$262_detachArrayBuffer(buffer)` — the Test262 host hook (`$262.detachArrayBuffer`).
+/// Detaches the given `ArrayBuffer`: zero-lengths its backing store, empties every
+/// typed-array view over it, and flags it detached so subsequent operations throw
+/// per spec. Returns `null` (the spec-mandated result of `DetachArrayBuffer`).
+/// New-id block at 360+ per the batch's allocation rule.
+const N_DETACH_ARRAY_BUFFER: u16 = 360;
 /// The `%TypedArray%.prototype` methods exposed as first-class own properties,
 /// each paired with its spec `length` (own `length` data property). Dispatched
 /// through [`N_TYPED_ARRAY_PROTO_FN`].
@@ -946,6 +952,11 @@ const PROMISE_PROTO_METHODS: &[&str] = &["then", "catch", "finally"];
 const FUNCTION_PROTO_METHODS: &[&str] = &["call", "apply", "bind", "toString"];
 /// `DataView.prototype` accessor methods — dispatched in `call_method`, exposed here as
 /// readable bound natives (for `typeof dv.getUint8` and detached `dv.getUint8.call(dv, …)`).
+/// `ArrayBuffer.prototype` methods exposed as first-class own functions (dispatched
+/// through [`N_AB_PROTO_FN`] → `call_method`). `slice`/`resize`/`transfer`/
+/// `transferToFixedLength` each require an `[[ArrayBufferData]]` `this`.
+const AB_PROTO_METHODS: &[&str] = &["slice", "resize", "transfer", "transferToFixedLength"];
+
 const DATA_VIEW_METHODS: &[&str] = &[
     "getInt8",
     "getUint8",
@@ -992,6 +1003,9 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "getMilliseconds" | "getUTCMilliseconds" | "getTimezoneOffset"
         | "toISOString" | "toDateString" | "toTimeString" | "toUTCString"
         | "toLocaleDateString" | "toLocaleTimeString"
+        // `ArrayBuffer.prototype.transfer`/`transferToFixedLength` — `length` 0
+        // (the optional `newLength` is not counted).
+        | "transfer" | "transferToFixedLength"
         // `Date.now()` takes no arguments.
         | "now" => 0,
         // Two-argument methods.
@@ -1805,6 +1819,27 @@ impl<'a> Interp<'a> {
                 self.realm.mark_hidden(proto, &tag_key);
                 self.realm.set_readonly_property(proto, &tag_key);
             }
+            // `ArrayBuffer.prototype` methods as first-class own data properties
+            // (each a bound native re-dispatched through `call_method` with an
+            // `[[ArrayBufferData]]`-validated `this`), so `typeof ab.slice ===
+            // "function"`, each method's own `name`/`length`, and
+            // `ArrayBuffer.prototype.transfer.call(ab)` all behave per spec.
+            if name == "ArrayBuffer" {
+                for &m in AB_PROTO_METHODS {
+                    let f = self.readable_ab_method(m);
+                    self.realm.set_property(proto, m, f);
+                    self.realm.mark_hidden(proto, m);
+                }
+                // `ArrayBuffer.prototype[Symbol.toStringTag]` is "ArrayBuffer"
+                // `{ writable: false, enumerable: false, configurable: true }`.
+                let tag_sym = self.well_known_symbol("toStringTag");
+                let tag_key = self.member_key(tag_sym);
+                let tag_val = self.realm.new_string("ArrayBuffer");
+                self.realm
+                    .set_property(proto, &tag_key, NanBox::handle(tag_val.to_raw()));
+                self.realm.mark_hidden(proto, &tag_key);
+                self.realm.set_readonly_property(proto, &tag_key);
+            }
             self.realm
                 .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
             // A constructor's `prototype` is `{ writable: false, enumerable: false,
@@ -2063,6 +2098,9 @@ impl<'a> Interp<'a> {
             ("URIError", N_URI_ERROR),
             ("EvalError", N_EVAL_ERROR),
             ("eval", N_EVAL),
+            // Test262 host hook: `$262.detachArrayBuffer` is wired (by the runner's
+            // JS prelude) to this global so detach-dependent tests can run.
+            ("$262_detachArrayBuffer", N_DETACH_ARRAY_BUFFER),
         ] {
             let f = self.new_named_native(name, id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
@@ -4779,6 +4817,31 @@ fn as_index(n: f64) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// `CanonicalNumericIndexString(key)` — the Number a string property key denotes
+/// when it is a *canonical* numeric index, else `None`. `"-0"` maps to `-0.0`; any
+/// other string is canonical only if `ToString(ToNumber(key)) === key` (so `"1"`,
+/// `"-1"`, `"1.5"`, `"Infinity"`, `"NaN"` are canonical, but `"01"`, `"1.0"`,
+/// `"0x1"`, `" 1"` are not — those are ordinary named properties). This selects the
+/// keys the integer-indexed-exotic `[[Get]]/[[Set]]/[[Has]]/[[DefineOwnProperty]]/
+/// [[Delete]]` short-circuit on (never consulting the prototype chain).
+fn canonical_numeric_index(key: &str) -> Option<f64> {
+    if key == "-0" {
+        return Some(-0.0);
+    }
+    // ToNumber over a string with no radix/whitespace leniency that would survive
+    // the round-trip: a leading-zero / hex / padded form will not re-`ToString` to
+    // `key`, so a plain `f64` parse (plus the `Infinity` / `NaN` literals) suffices.
+    let n = match key {
+        "Infinity" => f64::INFINITY,
+        "-Infinity" => f64::NEG_INFINITY,
+        "NaN" => f64::NAN,
+        _ => key.parse::<f64>().ok()?,
+    };
+    // `ToString(n) === key` is the canonicality test; reuse the engine's own
+    // Number→String (`js_number_string`) so the round-trip matches JS exactly.
+    (crate::realm::js_number_string(n) == key).then_some(n)
 }
 
 /// A static (non-computed) property key as a string.

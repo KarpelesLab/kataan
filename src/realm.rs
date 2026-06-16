@@ -1351,6 +1351,28 @@ impl Realm {
             }
             return Some(names);
         }
+        // A typed array's own keys are its integer indices `0..length` (ascending),
+        // followed by any aux-stored named properties — matching the integer-indexed
+        // exotic `[[OwnPropertyKeys]]` (10.4.5.6).
+        if let Some(len) = self.typed_len(handle) {
+            let mut names: Vec<alloc::string::String> =
+                (0..len).map(|i| alloc::format!("{i}")).collect();
+            if let Some(aux) = self
+                .aux_props
+                .get(&handle.to_raw())
+                .and_then(|h| self.heap.get(*h))
+                .and_then(Cell::as_object)
+            {
+                for k in aux
+                    .ordered_keys()
+                    .iter()
+                    .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                {
+                    names.push(alloc::string::String::from(*k));
+                }
+            }
+            return Some(names);
+        }
         // A native / bound-native / VM-function cell keeps its own named properties
         // (e.g. a built-in function's `name`/`length`) in its auxiliary object.
         if matches!(
@@ -1863,6 +1885,16 @@ impl Realm {
             {
                 return true;
             }
+        }
+        // A typed array's own properties are exactly its in-bounds canonical integer
+        // indices (`"0".."length-1"`, ascending) — `length`/`buffer`/… are inherited
+        // accessors, not own. A leading-zero / negative / fractional key is not own.
+        if let Some(len) = self.typed_len(handle)
+            && let Ok(i) = key.parse::<usize>()
+            && i < len
+            && alloc::format!("{i}") == key
+        {
+            return true;
         }
         // A non-object cell: check its auxiliary props (data or accessor).
         self.aux_props

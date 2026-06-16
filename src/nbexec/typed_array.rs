@@ -20,6 +20,7 @@ impl<'a> Interp<'a> {
         let store = self.realm.new_bytes(bytes.to_vec());
         self.realm
             .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(store.to_raw()));
+        self.link_array_buffer_proto(obj);
         obj
     }
 
@@ -47,6 +48,7 @@ impl<'a> Interp<'a> {
         let store = unsafe { self.realm.wrap_external_bytes(ptr, len, free) };
         self.realm
             .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(store.to_raw()));
+        self.link_array_buffer_proto(obj);
         obj
     }
 
@@ -431,12 +433,86 @@ impl<'a> Interp<'a> {
         let bytes = self.realm.new_bytes(alloc::vec![0u8; len]);
         self.realm
             .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(bytes.to_raw()));
+        self.link_array_buffer_proto(obj);
         obj
     }
 
     /// An `ArrayBuffer` whose contiguous [`Cell::Bytes`] store is a copy of `bytes`.
     pub(crate) fn make_array_buffer_from_bytes(&mut self, bytes: &[u8]) -> Handle {
         self.array_buffer_from_bytes(bytes)
+    }
+
+    /// `%ArrayBuffer.prototype%`, the `[[Prototype]]` every `ArrayBuffer` object
+    /// inherits (so its methods, accessors, and `Symbol.toStringTag` resolve through
+    /// the chain). `None` only before `install_globals` has run.
+    pub(crate) fn array_buffer_proto(&mut self) -> Option<Handle> {
+        self.current
+            .get("ArrayBuffer")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+    }
+
+    /// Links `buf` to `%ArrayBuffer.prototype%` (no-op if it is not yet installed).
+    fn link_array_buffer_proto(&mut self, buf: Handle) {
+        if let Some(proto) = self.array_buffer_proto() {
+            self.realm.set_object_proto(buf, Some(proto));
+        }
+    }
+
+    /// Links a freshly-built typed-array view's `[[Prototype]]` to the concrete
+    /// constructor's `.prototype` — the *newTarget*'s under `Reflect.construct` /
+    /// `TA.of`/`from` with a subclass, else the kind's own constructor prototype — so
+    /// `result.constructor`, `Object.getPrototypeOf(result)`, and inherited members
+    /// resolve. (Typed-array views are non-object cells, so the proto lives in the
+    /// realm's `native_protos` side table.)
+    pub(crate) fn link_typed_array_proto(&mut self, view: Handle, kind: u8, callee: NanBox) {
+        let proto = self
+            .reflect_new_target
+            .filter(|nt| nt.as_handle() != callee.as_handle())
+            .and_then(|nt| nt.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|nt| self.realm.get_property(nt, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+            .or_else(|| {
+                let kind_name = TYPED_ARRAY_KINDS[kind as usize].0;
+                self.current
+                    .get(kind_name)
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+                    .and_then(|c| self.realm.get_property(c, "prototype"))
+                    .and_then(|p| p.as_handle())
+                    .map(Handle::from_raw)
+            });
+        if let Some(proto) = proto {
+            self.realm.set_native_proto(view, proto);
+        }
+    }
+
+    /// Whether the typed-array view at `handle` is backed by a detached buffer
+    /// (so an integer-indexed `[[Get]]/[[Set]]/[[Has]]/[[Delete]]` reads/writes
+    /// nothing). False for a non-view.
+    pub(crate) fn typed_array_detached(&self, handle: Handle) -> bool {
+        self.realm.typed_array_object(handle).is_some_and(|buf| {
+            self.realm
+                .get_property(buf, ARRAY_BUFFER_DETACHED)
+                .is_some()
+        })
+    }
+
+    /// Performs the abstract `DetachArrayBuffer(buf)`: zero-lengths the backing
+    /// store, empties every typed-array view over it (length 0), and flags the
+    /// buffer detached so subsequent operations throw / read 0. Idempotent.
+    pub(crate) fn detach_array_buffer(&mut self, buf: Handle) {
+        if let Some(bh) = self.array_buffer_bytes(buf) {
+            self.realm.detach_buffer_views(bh);
+            self.realm.bytes_resize(bh, 0);
+        }
+        self.realm
+            .set_hidden_property(buf, ARRAY_BUFFER_DETACHED, NanBox::boolean(true));
     }
 
     /// The contiguous byte store handle of the `ArrayBuffer` object `buf`, if it has one.

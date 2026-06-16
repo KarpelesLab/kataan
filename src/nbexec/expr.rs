@@ -384,6 +384,24 @@ impl<'a> Interp<'a> {
                                         } else {
                                             self.realm.delete_property(target, &name);
                                         }
+                                    } else if self.realm.typed_kind(h).is_some()
+                                        && let Some(n) = canonical_numeric_index(&name)
+                                    {
+                                        // Integer-indexed exotic `[[Delete]]`: deleting a
+                                        // *valid* index fails (`false`); any other
+                                        // canonical numeric index succeeds (`true`), and
+                                        // the prototype chain is never consulted.
+                                        let is_neg_zero = n == 0.0 && n.is_sign_negative();
+                                        let detached = self.typed_array_detached(h);
+                                        let valid = !detached
+                                            && !is_neg_zero
+                                            && n == (n as i64) as f64
+                                            && n >= 0.0
+                                            && self
+                                                .realm
+                                                .typed_len(h)
+                                                .is_some_and(|len| (n as usize) < len);
+                                        result = !valid;
                                     } else if self.realm.is_array(h) && name == "length" {
                                         // An array's `length` is non-configurable.
                                         result = false;
@@ -1121,6 +1139,37 @@ impl<'a> Interp<'a> {
             }
             return self.assign_member_value(target, key, new);
         }
+        // Integer-indexed exotic `[[Set]]`: for a typed array, a *canonical numeric
+        // index* key writes the element (after coercing the value — whose side
+        // effects/throw still run for an out-of-bounds index) and is a no-op when the
+        // index is invalid; it never creates an own property or reaches a prototype
+        // setter. Handles negative / fractional / `-0` / out-of-bounds canonical keys
+        // that the integer-index path below (which only accepts `usize`) would miss.
+        if self.realm.typed_kind(handle).is_some() {
+            let s = self.member_key(key);
+            if let Some(n) = canonical_numeric_index(&s) {
+                // Coerce the value first (a BigInt view ToBigInt-coerces, a numeric
+                // view ToNumber-coerces) so its observable effects run regardless.
+                let coerced = if self.realm.typed_kind(handle).is_some_and(is_bigint_kind) {
+                    self.coerce_typed_array_write(handle, new)?
+                } else {
+                    self.coerce_to_number(new)?
+                };
+                let is_neg_zero = n == 0.0 && n.is_sign_negative();
+                if !is_neg_zero
+                    && n == (n as i64) as f64
+                    && n >= 0.0
+                    && self
+                        .realm
+                        .typed_len(handle)
+                        .is_some_and(|len| (n as usize) < len)
+                    && !self.typed_array_detached(handle)
+                {
+                    self.realm.set_element(handle, n as usize, coerced);
+                }
+                return Ok(());
+            }
+        }
         // A numeric index — a number, or a canonical numeric string ("1", not "01"
         // or "1.0") as produced by `Reflect.set`/`arr["1"]=` — addresses array (or
         // typed-array view) element storage.
@@ -1234,6 +1283,30 @@ impl<'a> Interp<'a> {
             && (i as u64) < u64::from(u32::MAX)
         {
             return Ok(self.realm.get_element(handle, i));
+        }
+        // Integer-indexed exotic `[[Get]]`: when `handle` is a typed array and `name`
+        // is a *canonical numeric index*, the result is the element if the index is
+        // valid (an in-bounds non-negative integer, `-0` excluded, buffer attached),
+        // else `undefined` — and the prototype chain is **never** consulted (so a
+        // throwing getter at `TypedArray.prototype["-1"]` is not invoked).
+        if self.realm.typed_kind(handle).is_some()
+            && let Some(n) = canonical_numeric_index(name)
+        {
+            // IsValidIntegerIndex: a detached buffer, `-0`, a non-integer, or an
+            // out-of-bounds index all read `undefined`.
+            if self.typed_array_detached(handle) {
+                return Ok(NanBox::undefined());
+            }
+            let is_neg_zero = n == 0.0 && n.is_sign_negative();
+            if !is_neg_zero
+                && n == (n as i64) as f64
+                && n >= 0.0
+                && let Some(len) = self.realm.typed_len(handle)
+                && (n as usize) < len
+            {
+                return Ok(self.realm.get_element(handle, n as usize));
+            }
+            return Ok(NanBox::undefined());
         }
         // Proxy `get` trap (or forward the read to the target).
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
@@ -1549,23 +1622,12 @@ impl<'a> Interp<'a> {
                 self.type_error("TypedArray.prototype accessor called on a non-TypedArray object")
             );
         }
-        // `ArrayBuffer.prototype.slice` as a readable method (so `typeof ab.slice ===
-        // "function"` and a detached `ab.slice.call(ab, …)` work; it is dispatched in
-        // `call_method`).
-        if matches!(name, "slice" | "transfer" | "resize")
-            && (self
-                .realm
-                .get_property(handle, ARRAY_BUFFER_BYTES)
-                .is_some()
-                // Also resolve as a method on `ArrayBuffer.prototype` itself, so
-                // `ArrayBuffer.prototype.slice.call(badThis)` reaches dispatch and
-                // throws a TypeError for the bad receiver (rather than failing as a
-                // non-callable read).
-                || self.brand_on_chain(handle, ARRAY_BUFFER_PROTO_BRAND))
-        {
-            // A receiver-validating bound native (rejects a non-ArrayBuffer `this`).
-            return Ok(self.readable_ab_method(name));
-        }
+        // `ArrayBuffer.prototype` methods (`slice`/`resize`/`transfer`/
+        // `transferToFixedLength`) are installed as real first-class own properties on
+        // the prototype (with proper name/length), and every `ArrayBuffer` instance
+        // inherits the prototype — so a read of `ab.slice` resolves them through the
+        // chain (and a user write to `ArrayBuffer.prototype.slice` is honored). No
+        // special case needed here.
         // `ArrayBuffer.prototype.resizable` / `.maxByteLength` (ES2024 resizable buffers).
         if matches!(name, "resizable" | "maxByteLength")
             && self
@@ -1618,6 +1680,16 @@ impl<'a> Interp<'a> {
         if matches!(name, "byteLength" | "buffer" | "byteOffset")
             && let Some(buf) = self.realm.get_property(handle, DATA_VIEW_BUF)
         {
+            // `get DataView.prototype.byteLength`/`.byteOffset` throw a TypeError when
+            // the viewed buffer is detached (`.buffer` does not — it returns it).
+            if matches!(name, "byteLength" | "byteOffset")
+                && let Some(bh) = buf.as_handle().map(Handle::from_raw)
+                && self.realm.get_property(bh, ARRAY_BUFFER_DETACHED).is_some()
+            {
+                return Err(
+                    self.type_error("Cannot perform DataView operation on a detached ArrayBuffer")
+                );
+            }
             return Ok(match name {
                 "buffer" => buf,
                 "byteOffset" => self
@@ -2545,6 +2617,26 @@ impl<'a> Interp<'a> {
                         } else {
                             self.realm.has_own(target, &key) || self.realm.is_array(target)
                         }
+                    }
+                    // Integer-indexed exotic `[[HasProperty]]`: for a typed array, a
+                    // canonical numeric index reports `IsValidIntegerIndex` and the
+                    // prototype chain is **not** consulted; any other key falls through
+                    // to ordinary `[[HasProperty]]` (own + inherited).
+                    Some(h)
+                        if self.realm.typed_kind(h).is_some()
+                            && canonical_numeric_index(&key).is_some() =>
+                    {
+                        let n = canonical_numeric_index(&key).unwrap();
+                        let detached = self.typed_array_detached(h);
+                        let is_neg_zero = n == 0.0 && n.is_sign_negative();
+                        !detached
+                            && !is_neg_zero
+                            && n == (n as i64) as f64
+                            && n >= 0.0
+                            && self
+                                .realm
+                                .typed_len(h)
+                                .is_some_and(|len| (n as usize) < len)
                     }
                     Some(h) => {
                         // `key in obj` is true for an own *or inherited* property

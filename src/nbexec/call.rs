@@ -370,8 +370,11 @@ impl<'a> Interp<'a> {
                 };
                 let buf = self.realm.get_property(h, DATA_VIEW_BUF).unwrap();
                 let buf_h = buf.as_handle().map(Handle::from_raw);
-                // A detached buffer makes byteLength/byteOffset a TypeError.
-                if let Some(bh) = buf_h {
+                // A detached buffer makes `byteLength`/`byteOffset` a TypeError; `buffer`
+                // still returns the (detached) buffer.
+                if name != "buffer"
+                    && let Some(bh) = buf_h
+                {
                     self.guard_detached_buffer(bh)?;
                 }
                 return Ok(match name.as_str() {
@@ -476,15 +479,15 @@ impl<'a> Interp<'a> {
             // same-kind view where the spec requires).
             if id == N_TYPED_ARRAY_PROTO_FN {
                 let name = self.realm.string_value(target).unwrap_or_default();
-                let ok = this_val
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .is_some_and(|h| self.realm.typed_kind(h).is_some());
+                let th = this_val.as_handle().map(Handle::from_raw);
+                let ok = th.is_some_and(|h| self.realm.typed_kind(h).is_some());
                 if !ok {
                     return Err(self.type_error(&alloc::format!(
                         "TypedArray.prototype.{name} called on a non-TypedArray object"
                     )));
                 }
+                // (ValidateTypedArray — the detached-buffer TypeError — is applied
+                // centrally in `call_method` for the data-accessing methods.)
                 return Ok(self
                     .call_method(this_val, &name, args)?
                     .unwrap_or(NanBox::undefined()));
@@ -1648,6 +1651,7 @@ impl<'a> Interp<'a> {
                 let view = self
                     .realm
                     .new_typed_array(bytes_h, bh, byte_off, length, kind);
+                self.link_typed_array_proto(view, kind, callee);
                 return Ok(NanBox::handle(view.to_raw()));
             }
             // Otherwise allocate a fresh backing buffer and view it from offset 0.
@@ -1740,27 +1744,7 @@ impl<'a> Interp<'a> {
             // `.prototype` (the *newTarget*'s under `Reflect.construct` /
             // `TA.of`/`from` with a subclass), so `result.constructor`,
             // `Object.getPrototypeOf(result)`, and inherited members resolve.
-            let proto_ctor = self
-                .reflect_new_target
-                .filter(|nt| nt.as_handle() != callee.as_handle())
-                .and_then(|nt| nt.as_handle())
-                .map(Handle::from_raw)
-                .and_then(|nt| self.realm.get_property(nt, "prototype"))
-                .and_then(|p| p.as_handle())
-                .map(Handle::from_raw)
-                .or_else(|| {
-                    let kind_name = TYPED_ARRAY_KINDS[kind as usize].0;
-                    self.current
-                        .get(kind_name)
-                        .and_then(|v| v.as_handle())
-                        .map(Handle::from_raw)
-                        .and_then(|c| self.realm.get_property(c, "prototype"))
-                        .and_then(|p| p.as_handle())
-                        .map(Handle::from_raw)
-                });
-            if let Some(proto) = proto_ctor {
-                self.realm.set_native_proto(view, proto);
-            }
+            self.link_typed_array_proto(view, kind, callee);
             return Ok(NanBox::handle(view.to_raw()));
         }
         // `new Number(x)` / `new String(x)` / `new Boolean(x)`: a primitive

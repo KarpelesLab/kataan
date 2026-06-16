@@ -1377,6 +1377,21 @@ impl<'a> Interp<'a> {
                 let mut seen: Vec<(u64, NanBox)> = Vec::new();
                 self.structured_clone(arg(0), &mut seen)?
             }
+            // `$262_detachArrayBuffer(buffer)` — the Test262 `$262.detachArrayBuffer`
+            // host hook. Detaches the buffer (empties its store + every view, flags it
+            // detached) and returns `null` per the abstract `DetachArrayBuffer`.
+            N_DETACH_ARRAY_BUFFER => {
+                let buf = arg(0)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|h| self.realm.get_property(*h, ARRAY_BUFFER_BYTES).is_some());
+                let Some(buf) = buf else {
+                    return Err(self
+                        .type_error("$262.detachArrayBuffer called on a non-ArrayBuffer object"));
+                };
+                self.detach_array_buffer(buf);
+                NanBox::null()
+            }
             // `Intl.NumberFormat(...)` / `Intl.DateTimeFormat(...)` called without
             // `new` build the same formatter object.
             N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => self.make_intl_formatter(id, args),

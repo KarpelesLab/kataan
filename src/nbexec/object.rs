@@ -371,6 +371,72 @@ impl<'a> Interp<'a> {
             );
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
+        // Integer-indexed exotic `[[DefineOwnProperty]]` (ECMA-262 10.4.5.3): when
+        // `obj` is a typed array and `key` is a canonical numeric index, the only
+        // legal define is a writable, enumerable, configurable data property at a
+        // valid index — anything else (an invalid index, a non-configurable /
+        // non-enumerable / non-writable field, or an accessor) fails. A success
+        // stores the (coerced) value through the element; a failure throws for
+        // `Object.defineProperty` and returns `false` for `Reflect.defineProperty`.
+        if self.realm.typed_kind(obj).is_some()
+            && let Some(n) = canonical_numeric_index(key)
+        {
+            let fail = |this: &mut Self| -> Result<bool, ExecError> {
+                if reflect {
+                    return Ok(false);
+                }
+                let m = this.new_str(&alloc::format!(
+                    "Cannot define property {key} on a TypedArray with an invalid descriptor or index"
+                ));
+                Err(ExecError::Throw(this.make_error(N_TYPE_ERROR, Some(m))))
+            };
+            // IsValidIntegerIndex: an in-bounds non-negative integer, `-0` excluded,
+            // backing buffer attached.
+            let is_neg_zero = n == 0.0 && n.is_sign_negative();
+            let detached = self.typed_array_detached(obj);
+            let valid = !detached
+                && !is_neg_zero
+                && n == (n as i64) as f64
+                && n >= 0.0
+                && self
+                    .realm
+                    .typed_len(obj)
+                    .is_some_and(|len| (n as usize) < len);
+            if !valid {
+                return fail(self);
+            }
+            // An accessor descriptor, or a data field that is non-configurable /
+            // non-enumerable / non-writable, is rejected.
+            let bad_bool = |this: &Self, field: &str| -> bool {
+                this.realm.has_own(desc, field)
+                    && !this
+                        .realm
+                        .get_property(desc, field)
+                        .is_some_and(|v| this.realm.truthy(v))
+            };
+            if has_accessor_field
+                || bad_bool(self, "configurable")
+                || bad_bool(self, "enumerable")
+                || bad_bool(self, "writable")
+            {
+                return fail(self);
+            }
+            // Store the value (if the descriptor carries one), coercing to the view's
+            // element type (a Number into a BigInt view throws here).
+            if self.realm.has_own(desc, "value") {
+                let v = self
+                    .realm
+                    .get_property(desc, "value")
+                    .unwrap_or(NanBox::undefined());
+                let coerced = if self.realm.typed_kind(obj).is_some_and(is_bigint_kind) {
+                    self.coerce_typed_array_write(obj, v)?
+                } else {
+                    self.coerce_to_number(v)?
+                };
+                self.realm.set_element(obj, n as usize, coerced);
+            }
+            return Ok(true);
+        }
         // An array's `length` is an exotic own data property governed by
         // ArraySetLength (ECMA-262 10.4.3.1): it is `{enumerable:false,
         // configurable:false}`, writable by default, and its "value" resizes the
