@@ -2747,7 +2747,8 @@ impl<'a> Interp<'a> {
                         let cb_args = [*e, NanBox::number(i as f64), arr];
                         out.push(self.call_with_this(f, this_arg, &cb_args)?);
                     }
-                    return Ok(Some(self.typed_like(handle, out)));
+                    // A typed-array `map` allocates via TypedArraySpeciesCreate.
+                    return Ok(Some(self.typed_like_species(handle, out)?));
                 }
                 "filter" => {
                     let f = arg(0);
@@ -2761,7 +2762,8 @@ impl<'a> Interp<'a> {
                             out.push(*e);
                         }
                     }
-                    return Ok(Some(self.typed_like(handle, out)));
+                    // A typed-array `filter` allocates via TypedArraySpeciesCreate.
+                    return Ok(Some(self.typed_like_species(handle, out)?));
                 }
                 "forEach" => {
                     let f = arg(0);
@@ -2814,6 +2816,17 @@ impl<'a> Interp<'a> {
                     return Ok(Some(acc));
                 }
                 "slice" => {
+                    // A typed-array `slice` coerces start/end through
+                    // ToIntegerOrInfinity (abrupt-propagating) and allocates the
+                    // result via TypedArraySpeciesCreate; a plain array keeps the
+                    // existing infallible bound computation + plain-array result.
+                    if self.realm.typed_kind(handle).is_some() {
+                        let len = elems.len();
+                        let a = self.typed_clamp_index_checked(arg(0), 0, len)?;
+                        let b = self.typed_clamp_index_checked(arg(1), len, len)?;
+                        let sub = if a < b { elems[a..b].to_vec() } else { Vec::new() };
+                        return Ok(Some(self.typed_like_species(handle, sub)?));
+                    }
                     let (a, b) = slice_bounds(
                         self.realm.to_number(arg(0)),
                         arg(1),

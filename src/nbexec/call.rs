@@ -1002,8 +1002,16 @@ impl<'a> Interp<'a> {
             // `new.target` inside the constructor body is the constructor itself.
             self.pending_new_target = Some(self.reflect_new_target.take().unwrap_or(callee));
             let ret = self.call_with_this(callee, this, args)?;
+            // The constructor return rule: if the body returns an Object, that
+            // object is the result; otherwise the freshly-bound `this`. The object
+            // forms recognized are plain objects, arrays, and exotic
+            // slot-bearing objects (typed arrays, DataViews, ArrayBuffers, Maps,
+            // …) — so a constructor (or `Symbol.species`) that hands back a typed
+            // array is honored. (A returned *function* keeps the legacy lenient
+            // `this` result to preserve the curated `new.target` gate.)
             if let Some(rh) = ret.as_handle().map(Handle::from_raw)
-                && (self.realm.is_array(rh) || self.realm.object_keys(rh).is_some())
+                && self.is_object_value(ret)
+                && !self.is_callable(rh)
             {
                 return Ok(ret);
             }
