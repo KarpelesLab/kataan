@@ -51,6 +51,23 @@ impl<'a> Interp<'a> {
     pub(crate) fn make_class(&mut self, class: &'a Class) -> Result<NanBox, ExecError> {
         let class_id = self.classes.len() as u32;
         self.classes.push(class);
+        // Reserve this class's per-id side-table slots *before* evaluating any
+        // static member, because a computed key or static field initializer may
+        // itself define a nested class — which would push its own slots and shift
+        // the indices, leaving `class_statics[class_id]` (etc.) misaligned with
+        // `classes[class_id]`. We fill the reserved slots in place below.
+        let class_env = self.current.child();
+        let handle = self.realm.new_class(class_id, class_env.clone());
+        let class_val = NanBox::handle(handle.to_raw());
+        self.class_statics.push(alloc::collections::BTreeMap::new());
+        self.class_static_fields.push(Vec::new());
+        self.class_static_get
+            .push(alloc::collections::BTreeMap::new());
+        self.class_static_set
+            .push(alloc::collections::BTreeMap::new());
+        self.class_envs.push(class_env.clone());
+        self.class_native_super.push(None);
+        self.class_handles.push(class_val);
         // Build the static members (`static foo() {}` / `static x = …`).
         let mut statics = alloc::collections::BTreeMap::new();
         let mut static_fields = Vec::new();
@@ -114,14 +131,12 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
-        self.class_statics.push(statics);
-        self.class_static_fields.push(static_fields);
-        self.class_static_get.push(static_getters);
-        self.class_static_set.push(static_setters);
-        // The methods' captured scope; a named class binds its own name here (so
-        // `class C { m() { return C; } }` can self-reference), filled in below.
-        let class_env = self.current.child();
-        self.class_envs.push(class_env.clone());
+        // Fill the reserved side-table slots (created above, in place so nested
+        // classes defined during member evaluation cannot shift the indices).
+        self.class_statics[class_id as usize] = statics;
+        self.class_static_fields[class_id as usize] = static_fields;
+        self.class_static_get[class_id as usize] = static_getters;
+        self.class_static_set[class_id as usize] = static_setters;
         // Record a native-constructor superclass (`extends Error`), if any, so
         // construction and `instanceof` can reach it (it has no class id).
         let native_super = if let Some(expr) = &class.super_class {
@@ -136,10 +151,7 @@ impl<'a> Interp<'a> {
         } else {
             None
         };
-        self.class_native_super.push(native_super);
-        let handle = self.realm.new_class(class_id, class_env.clone());
-        let class_val = NanBox::handle(handle.to_raw());
-        self.class_handles.push(class_val);
+        self.class_native_super[class_id as usize] = native_super;
         // Install the constructor's own `length` (its declared param count up to
         // the first default/rest; 0 with no explicit constructor) and, for a named
         // class, its own `name` — both `{ w:false, e:false, c:true }` per spec.
