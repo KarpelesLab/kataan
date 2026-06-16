@@ -2458,6 +2458,10 @@ impl<'a> Interp<'a> {
                 array_like = Some(self.realm.new_array(tmp));
             }
         }
+        // For a generic array-like `this`, the callback receives the *original*
+        // object as its 3rd argument (`O`), not the materialized snapshot — so
+        // `(v, i, arr) => arr === O` and `arr instanceof Boolean` hold.
+        let callback_recv = NanBox::handle(handle.to_raw());
         let handle = array_like.unwrap_or(handle);
         // S5/S3/S8: bulk typed-array mutators (`fill`/`copyWithin`/`set`/`subarray`)
         // operate on the backing bytes directly. Handle them up front using the
@@ -2830,7 +2834,7 @@ impl<'a> Interp<'a> {
                 "map" => {
                     let f = arg(0);
                     let this_arg = arg(1);
-                    let arr = NanBox::handle(handle.to_raw());
+                    let arr = callback_recv;
                     let mut out = Vec::with_capacity(elems.len());
                     for (i, e) in elems.iter().enumerate() {
                         let cb_args = [*e, NanBox::number(i as f64), arr];
@@ -2842,7 +2846,7 @@ impl<'a> Interp<'a> {
                 "filter" => {
                     let f = arg(0);
                     let this_arg = arg(1);
-                    let arr = NanBox::handle(handle.to_raw());
+                    let arr = callback_recv;
                     let mut out = Vec::new();
                     for (i, e) in elems.iter().enumerate() {
                         let cb_args = [*e, NanBox::number(i as f64), arr];
@@ -2857,7 +2861,7 @@ impl<'a> Interp<'a> {
                 "forEach" => {
                     let f = arg(0);
                     let this_arg = arg(1);
-                    let arr = NanBox::handle(handle.to_raw());
+                    let arr = callback_recv;
                     for (i, e) in elems.iter().enumerate() {
                         let cb_args = [*e, NanBox::number(i as f64), arr];
                         self.call_with_this(f, this_arg, &cb_args)?;
@@ -2877,7 +2881,7 @@ impl<'a> Interp<'a> {
                         acc = elems[0];
                         start = 1;
                     }
-                    let arr = NanBox::handle(handle.to_raw());
+                    let arr = callback_recv;
                     for (i, e) in elems.iter().enumerate().skip(start) {
                         acc = self.call(f, &[acc, *e, NanBox::number(i as f64), arr])?;
                     }
@@ -2897,7 +2901,7 @@ impl<'a> Interp<'a> {
                         idx -= 1;
                         acc = elems[idx];
                     }
-                    let arr = NanBox::handle(handle.to_raw());
+                    let arr = callback_recv;
                     while idx > 0 {
                         idx -= 1;
                         acc = self.call(f, &[acc, elems[idx], NanBox::number(idx as f64), arr])?;
@@ -3134,11 +3138,7 @@ impl<'a> Interp<'a> {
                         if self.call_truthy_this(
                             f,
                             arg(1),
-                            &[
-                                *e,
-                                NanBox::number(i as f64),
-                                NanBox::handle(handle.to_raw()),
-                            ],
+                            &[*e, NanBox::number(i as f64), callback_recv],
                         )? {
                             return Ok(Some(*e));
                         }
@@ -3151,11 +3151,7 @@ impl<'a> Interp<'a> {
                         if self.call_truthy_this(
                             f,
                             arg(1),
-                            &[
-                                *e,
-                                NanBox::number(i as f64),
-                                NanBox::handle(handle.to_raw()),
-                            ],
+                            &[*e, NanBox::number(i as f64), callback_recv],
                         )? {
                             return Ok(Some(NanBox::number(i as f64)));
                         }
@@ -3169,11 +3165,7 @@ impl<'a> Interp<'a> {
                         if self.call_truthy_this(
                             f,
                             arg(1),
-                            &[
-                                *e,
-                                NanBox::number(i as f64),
-                                NanBox::handle(handle.to_raw()),
-                            ],
+                            &[*e, NanBox::number(i as f64), callback_recv],
                         )? {
                             return Ok(Some(*e));
                         }
@@ -3186,11 +3178,7 @@ impl<'a> Interp<'a> {
                         if self.call_truthy_this(
                             f,
                             arg(1),
-                            &[
-                                *e,
-                                NanBox::number(i as f64),
-                                NanBox::handle(handle.to_raw()),
-                            ],
+                            &[*e, NanBox::number(i as f64), callback_recv],
                         )? {
                             return Ok(Some(NanBox::number(i as f64)));
                         }
@@ -3203,11 +3191,7 @@ impl<'a> Interp<'a> {
                         if self.call_truthy_this(
                             f,
                             arg(1),
-                            &[
-                                *e,
-                                NanBox::number(i as f64),
-                                NanBox::handle(handle.to_raw()),
-                            ],
+                            &[*e, NanBox::number(i as f64), callback_recv],
                         )? {
                             return Ok(Some(NanBox::boolean(true)));
                         }
@@ -3220,11 +3204,7 @@ impl<'a> Interp<'a> {
                         if !self.call_truthy_this(
                             f,
                             arg(1),
-                            &[
-                                *e,
-                                NanBox::number(i as f64),
-                                NanBox::handle(handle.to_raw()),
-                            ],
+                            &[*e, NanBox::number(i as f64), callback_recv],
                         )? {
                             return Ok(Some(NanBox::boolean(false)));
                         }
