@@ -336,6 +336,14 @@ impl<'a> Interp<'a> {
                         } = argument
                         {
                             is_property_delete = true;
+                            // `delete super.prop` / `delete super[expr]` is a runtime
+                            // ReferenceError (a super reference is never deletable).
+                            if matches!(&**object, Expr::Super(_)) {
+                                let m = self.new_str("Cannot delete a super property");
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_REFERENCE_ERROR, Some(m)),
+                                ));
+                            }
                             // A nullish link in the base (`delete a?.b.c` with nullish `a`)
                             // short-circuits the whole `delete` to a no-op returning `true`.
                             let obj = match self.eval(object) {
@@ -532,11 +540,24 @@ impl<'a> Interp<'a> {
                 } = &**callee
                     && matches!(&**object, Expr::Super(_))
                 {
-                    let (PropertyKey::Ident(name) | PropertyKey::Str(name)) = property else {
-                        return Err(ExecError::Unsupported("computed super member"));
+                    // `super.m(args)` and `super[expr](args)` — resolve the method
+                    // name (a computed key is evaluated to a property key) and invoke
+                    // it with the current `this`.
+                    let name = match property {
+                        PropertyKey::Ident(name) | PropertyKey::Str(name) => {
+                            alloc::string::String::from(&**name)
+                        }
+                        PropertyKey::Number(n) => self.realm.to_display_string(NanBox::number(*n)),
+                        PropertyKey::Computed(e) => {
+                            let k = self.eval(e)?;
+                            self.coerce_property_key(k)?
+                        }
+                        PropertyKey::Private(_) => {
+                            return Err(ExecError::Unsupported("private super member"));
+                        }
                     };
                     let args = self.eval_args(arguments)?;
-                    let f = self.resolve_super_method(name)?;
+                    let f = self.resolve_super_method(&name)?;
                     return self.call_with_this(f, self.this_val, &args);
                 }
                 // A `recv.method(args)` call: try a built-in method on the
@@ -839,10 +860,18 @@ impl<'a> Interp<'a> {
                         let name = self.realm.to_display_string(key);
                         return self.resolve_super_member(&name);
                     }
-                    let (PropertyKey::Ident(name) | PropertyKey::Str(name)) = property else {
-                        return Err(ExecError::Unsupported("computed super member"));
+                    let name = match property {
+                        PropertyKey::Ident(name) | PropertyKey::Str(name) => {
+                            alloc::string::String::from(&**name)
+                        }
+                        PropertyKey::Number(n) => self.realm.to_display_string(NanBox::number(*n)),
+                        PropertyKey::Private(_) => {
+                            return Err(ExecError::Unsupported("private super member"));
+                        }
+                        // Computed handled above.
+                        PropertyKey::Computed(_) => unreachable!(),
                     };
-                    return self.resolve_super_member(name);
+                    return self.resolve_super_member(&name);
                 }
                 let obj = self.eval(object)?;
                 if matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
@@ -1757,12 +1786,15 @@ impl<'a> Interp<'a> {
             return Ok(rhs);
         }
         // A computed-member target evaluates the object and key *before* the RHS
-        // (spec order): `arr[i] = i = 1` writes the original `arr[i]`.
+        // (spec order): `arr[i] = i = 1` writes the original `arr[i]`. A computed
+        // `super[expr]` target is excluded here — it has no evaluable base object
+        // and is handled by the `super` assignment arm below.
         if let Expr::Member {
             object,
             property: PropertyKey::Computed(key_expr),
             ..
         } = target
+            && !matches!(&**object, Expr::Super(_))
         {
             let obj = self.eval(object)?;
             // Spec reference order: evaluate the base, then the key expression,
@@ -1789,6 +1821,34 @@ impl<'a> Interp<'a> {
                 self.binary(compound_op(op)?, current, rhs)?
             };
             self.assign_member_value(handle, key, new)?;
+            return Ok(new);
+        }
+        // A computed `super[expr] = …` target: the key expression is evaluated
+        // before the RHS (spec reference order), then the inherited setter is
+        // invoked with the current `this`.
+        if let Expr::Member {
+            object,
+            property: PropertyKey::Computed(key_expr),
+            ..
+        } = target
+            && matches!(&**object, Expr::Super(_))
+        {
+            // Evaluate the key *expression* first; for a plain assignment the RHS
+            // is evaluated before the key is ToPropertyKey-coerced, so
+            // `super[obj] = rhs()` runs `rhs` before `obj.toString` (the spec
+            // defers a super reference's key coercion past the RHS). A compound op
+            // must read `super[key]` first, so it coerces the key up front.
+            let k = self.eval(key_expr)?;
+            let (name, new) = if op == AssignOp::Assign {
+                let rhs = self.eval(value)?;
+                (self.coerce_property_key(k)?, rhs)
+            } else {
+                let name = self.coerce_property_key(k)?;
+                let current = self.resolve_super_member(&name)?;
+                let rhs = self.eval(value)?;
+                (name, self.binary(compound_op(op)?, current, rhs)?)
+            };
+            self.assign_super_member(&name, new)?;
             return Ok(new);
         }
         let rhs = self.eval(value)?;
