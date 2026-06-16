@@ -292,6 +292,23 @@ impl<'a> Interp<'a> {
         self.class_iterator_method(h)
     }
 
+    /// Whether `v` is iterable — a string, array, typed array, or any object with
+    /// a resolvable `[Symbol.iterator]` method. Used to distinguish a genuine
+    /// throw inside the iterator protocol (propagate) from a non-iterable
+    /// array-like source (fall back to index reads).
+    pub(crate) fn value_is_iterable(&mut self, v: NanBox) -> bool {
+        let Some(h) = v.as_handle().map(Handle::from_raw) else {
+            return false;
+        };
+        if self.realm.string_value(h).is_some()
+            || self.realm.is_array(h)
+            || self.realm.typed_kind(h).is_some()
+        {
+            return true;
+        }
+        matches!(self.find_iterator_fn(h), Ok(Some(_)))
+    }
+
     /// The keys iterated by `for-in`: object property names or array indices,
     /// as strings.
     pub(crate) fn iterate_keys(&mut self, v: NanBox) -> Vec<NanBox> {

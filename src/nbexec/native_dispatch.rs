@@ -1114,15 +1114,20 @@ impl<'a> Interp<'a> {
                 let view = self.construct(ctor, &[NanBox::number(items.len() as f64)])?;
                 if let Some(vh) = view.as_handle().map(Handle::from_raw) {
                     self.realm.typed_set_from_numbers(vh, 0, &items);
+                    self.link_view_proto_to_ctor(vh, ctor);
                 }
                 view
             }
             // `%TypedArray%.of(...items)` — generic over the `this` constructor.
             N_TYPED_ARRAY_OF => {
                 let ctor = self.this_val;
+                if !self.is_constructor_value(ctor) {
+                    return Err(self.type_error("TypedArray.of requires a constructor this"));
+                }
                 let view = self.construct(ctor, &[NanBox::number(args.len() as f64)])?;
                 if let Some(vh) = view.as_handle().map(Handle::from_raw) {
                     self.realm.typed_set_from_numbers(vh, 0, args);
+                    self.link_view_proto_to_ctor(vh, ctor);
                 }
                 view
             }

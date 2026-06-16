@@ -1670,6 +1670,31 @@ impl<'a> Interp<'a> {
                 // Bulk write-through: one buffer borrow, no per-element heap lookup.
                 self.realm.typed_set_from_numbers(view, 0, &s);
             }
+            // Link the view's `[[Prototype]]` to the concrete constructor's
+            // `.prototype` (the *newTarget*'s under `Reflect.construct` /
+            // `TA.of`/`from` with a subclass), so `result.constructor`,
+            // `Object.getPrototypeOf(result)`, and inherited members resolve.
+            let proto_ctor = self
+                .reflect_new_target
+                .filter(|nt| nt.as_handle() != callee.as_handle())
+                .and_then(|nt| nt.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|nt| self.realm.get_property(nt, "prototype"))
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw)
+                .or_else(|| {
+                    let kind_name = TYPED_ARRAY_KINDS[kind as usize].0;
+                    self.current
+                        .get(kind_name)
+                        .and_then(|v| v.as_handle())
+                        .map(Handle::from_raw)
+                        .and_then(|c| self.realm.get_property(c, "prototype"))
+                        .and_then(|p| p.as_handle())
+                        .map(Handle::from_raw)
+                });
+            if let Some(proto) = proto_ctor {
+                self.realm.set_native_proto(view, proto);
+            }
             return Ok(NanBox::handle(view.to_raw()));
         }
         // `new Number(x)` / `new String(x)` / `new Boolean(x)`: a primitive

@@ -589,20 +589,53 @@ impl<'a> Interp<'a> {
             && matches!(method, "of" | "from")
         {
             let kind = (id - N_TYPED_ARRAY_BASE) as u8;
+            // `from`'s optional map callback must be callable if present (a
+            // TypeError otherwise), checked before iterating the source.
+            let mapfn = if method == "from" {
+                args.get(1).copied()
+            } else {
+                None
+            };
+            let has_mapfn = mapfn.is_some_and(|m| !matches!(m.unpack(), Unpacked::Undefined));
+            if has_mapfn {
+                self.require_callable(mapfn.unwrap(), "TypedArray.from mapfn")?;
+            }
+            // `from` iterates the source (an iterator error propagates, not
+            // swallowed); a non-iterable array-like is read by index. `of` takes
+            // its variadic args directly.
             let mut items: Vec<NanBox> = if method == "of" {
                 args.to_vec()
             } else {
-                self.iterate_values(arg(0)).unwrap_or_default()
+                match self.iterate_values(arg(0)) {
+                    Ok(v) => v,
+                    Err(ExecError::Throw(t)) => {
+                        // A genuine throw from the iterator protocol propagates; a
+                        // non-iterable source falls back to the array-like path.
+                        if self.value_is_iterable(arg(0)) {
+                            return Err(ExecError::Throw(t));
+                        }
+                        let src = arg(0);
+                        let obj = self.coerce_to_object(src);
+                        let Some(h) = obj.as_handle().map(Handle::from_raw) else {
+                            return Ok(Some(self.typed_like(handle, Vec::new())));
+                        };
+                        let len_val = self.read_member(h, "length")?;
+                        let len_n = self.coerce_to_integer_or_infinity(len_val)?;
+                        let len = len_n.clamp(0.0, 9_007_199_254_740_991.0) as usize;
+                        let mut out = Vec::with_capacity(len.min(1 << 20));
+                        for i in 0..len {
+                            out.push(self.read_member(h, &alloc::format!("{i}"))?);
+                        }
+                        out
+                    }
+                    Err(e) => return Err(e),
+                }
             };
-            // `from`'s optional map callback `(value, index)`.
-            if method == "from"
-                && let Some(mapfn) = args.get(1).copied()
-                && mapfn
-                    .as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
+            if has_mapfn {
+                let mapfn = mapfn.unwrap();
+                let this_arg = args.get(2).copied().unwrap_or(NanBox::undefined());
                 for (i, v) in items.iter_mut().enumerate() {
-                    *v = self.call(mapfn, &[*v, NanBox::number(i as f64)])?;
+                    *v = self.call_with_this(mapfn, this_arg, &[*v, NanBox::number(i as f64)])?;
                 }
             }
             // Allocate a backing buffer and view it; each item is coerced on write.
@@ -614,6 +647,10 @@ impl<'a> Interp<'a> {
                 .new_typed_array(bytes_h, buf, 0, items.len(), kind);
             // Bulk write-through: one buffer borrow, no per-element heap lookup.
             self.realm.typed_set_from_numbers(view, 0, &items);
+            // Link the result's `[[Prototype]]` to the constructor's `.prototype`
+            // (`Int8Array.of(...)`'s result is an `Int8Array` instance), so
+            // `result.constructor`/`getPrototypeOf(result)` resolve.
+            self.link_view_proto_to_ctor(view, NanBox::handle(handle.to_raw()));
             return Ok(Some(NanBox::handle(view.to_raw())));
         }
         // `Date.parse(str)` → epoch ms (or NaN) by ISO parsing.

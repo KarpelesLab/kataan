@@ -115,6 +115,22 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// Links the typed-array `view`'s `[[Prototype]]` to `ctor.prototype` (the
+    /// constructor used by `TypedArray.of`/`from` / `TypedArraySpeciesCreate`), so
+    /// `result.constructor`, `Object.getPrototypeOf(result)`, and inherited
+    /// members resolve to the actual constructor's prototype.
+    pub(crate) fn link_view_proto_to_ctor(&mut self, view: Handle, ctor: NanBox) {
+        if let Some(proto) = ctor
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_native_proto(view, proto);
+        }
+    }
+
     /// `subarray`'s TypedArraySpeciesCreate(O, « buffer, beginByteOffset,
     /// newLength »). Returns `Some(view)` when a *custom* `Symbol.species`
     /// constructor is used (constructing `new species(buffer, off, len)`);
@@ -295,14 +311,12 @@ impl<'a> Interp<'a> {
 
     /// `TypedArraySpeciesCreate(exemplar, « len »)` then fill with `elems`.
     ///
-    /// For a typed-array receiver this honors `Symbol.species`:
-    ///   1. `C = ? SpeciesConstructor(exemplar, %defaultCtor%)` —
-    ///      read `exemplar.constructor` (a non-undefined non-object → TypeError),
-    ///      then its `[Symbol.species]` (null/undefined → default ctor;
-    ///      a non-constructor → TypeError).
-    ///   2. `A = ? TypedArrayCreate(C, « len »)` — `Construct(C, [len])`, then
-    ///      ValidateTypedArray (the result must be a typed array of length ≥ len).
-    ///   3. write `elems` into `A` (coercing per its element kind).
+    /// For a typed-array receiver this honors `Symbol.species`: `SpeciesConstructor`
+    /// reads `exemplar.constructor` (a non-undefined non-object → TypeError) then
+    /// its `[Symbol.species]` (null/undefined → default ctor; a non-constructor →
+    /// TypeError); `TypedArrayCreate` does `Construct(C, [len])` then
+    /// ValidateTypedArray (result must be a typed array of length ≥ len); finally
+    /// `elems` are written in (coercing per its element kind).
     ///
     /// When `exemplar.constructor`/species resolve to the built-in default, this
     /// degenerates to [`Self::typed_like`] (a same-kind view). A plain-array
