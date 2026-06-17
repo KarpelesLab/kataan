@@ -2947,6 +2947,11 @@ impl<'a> Interp<'a> {
         self.global_this = gbox;
     }
 
+    /// The global object (`globalThis`) handle, if the realm is initialized.
+    pub(crate) fn global_object(&self) -> Option<Handle> {
+        self.global_this.as_handle().map(Handle::from_raw)
+    }
+
     /// The underlying realm (e.g. to render a result with `to_display_string`).
     #[must_use]
     pub fn realm(&self) -> &Realm {

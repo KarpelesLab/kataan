@@ -766,12 +766,14 @@ impl<'a> Interp<'a> {
             }
             Expr::Object { members, .. } => {
                 // Object destructuring requires a coercible value: `null`/`undefined`
-                // throw a TypeError (RequireObjectCoercible).
+                // throw a TypeError (RequireObjectCoercible). A primitive RHS is boxed
+                // to its wrapper object so its own properties (e.g. a string's indices
+                // and `length`) participate in the pattern and in a `...rest`.
                 if matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
                     let m = self.new_str("Cannot destructure 'null' or 'undefined' as an object");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
-                let src = value.as_handle().map(Handle::from_raw);
+                let src = self.require_object_coercible_to_object(value, "destructuring")?;
                 let mut used: Vec<String> = Vec::new();
                 for m in members {
                     match m {
@@ -781,23 +783,18 @@ impl<'a> Interp<'a> {
                             let k = self.eval_prop_key(key)?;
                             // Read through `read_member` so accessors fire and
                             // inherited / length properties resolve.
-                            let v = match src {
-                                Some(h) => self.read_member(h, &k)?,
-                                None => NanBox::undefined(),
-                            };
+                            let v = self.read_member(src, &k)?;
                             used.push(k);
                             self.assign_destructure(tgt, v)?;
                         }
                         ObjectMember::Spread { value: tgt, .. } => {
                             let obj = self.realm.new_object();
-                            if let Some(h) = src {
-                                for k in self.realm.object_keys(h).unwrap_or_default() {
-                                    if !used.contains(&k) {
-                                        // `read_member` fires an own getter (once);
-                                        // the rest object gets a plain data property.
-                                        let pv = self.read_member(h, &k)?;
-                                        self.realm.set_property(obj, &k, pv);
-                                    }
+                            for k in self.realm.object_keys(src).unwrap_or_default() {
+                                if !used.contains(&k) {
+                                    // `read_member` fires an own getter (once);
+                                    // the rest object gets a plain data property.
+                                    let pv = self.read_member(src, &k)?;
+                                    self.realm.set_property(obj, &k, pv);
                                 }
                             }
                             self.assign_destructure(tgt, NanBox::handle(obj.to_raw()))?;

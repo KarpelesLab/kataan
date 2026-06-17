@@ -441,12 +441,28 @@ impl<'a> Interp<'a> {
                                     }
                                 }
                             }
-                        } else if let Expr::Ident(id) = argument
-                            && self.current.get(&id.name).is_some()
-                        {
-                            // Deleting a resolvable binding (a declared variable) is a
-                            // no-op that returns `false`; an unresolvable name is `true`.
-                            result = false;
+                        } else if let Expr::Ident(id) = argument {
+                            if self.current.get(&id.name).is_some() {
+                                // Deleting a resolvable lexical/var binding is a no-op
+                                // that returns `false` (bindings are non-deletable).
+                                result = false;
+                            } else if let Some(g) = self.global_object()
+                                && (self.realm.has_own(g, &id.name)
+                                    || self.realm.accessor(g, &id.name).is_some())
+                            {
+                                // `delete name` where `name` resolves to a property of the
+                                // global object: succeeds only if that property is
+                                // configurable (e.g. `delete NaN`/`Infinity`/`undefined`
+                                // — non-configurable — returns `false`).
+                                result = self.realm.delete_property(g, &id.name);
+                                is_property_delete = true;
+                            }
+                            // An unresolvable name (`delete notDefined`) returns `true`.
+                        } else {
+                            // `delete <non-Reference>` (e.g. `delete foo()`): the operand
+                            // is still evaluated for its side effects, then `true` is
+                            // returned (there is no binding/property to remove).
+                            self.eval(argument)?;
                         }
                         // A failed delete of a non-configurable property throws in strict
                         // mode (rather than silently returning `false`).
