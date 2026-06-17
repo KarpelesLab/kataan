@@ -376,11 +376,36 @@ impl<'a> Interp<'a> {
                                             self.proxy_trap(handler, "deleteProperty")?
                                         {
                                             let kb = self.new_str(&name);
-                                            let r = self.call(
+                                            let handler_box = NanBox::handle(handler.to_raw());
+                                            let r = self.call_with_this(
                                                 trap,
+                                                handler_box,
                                                 &[NanBox::handle(target.to_raw()), kb],
                                             )?;
                                             result = self.realm.truthy(r);
+                                            // Invariant (10.5.10): a true result is
+                                            // illegal if the property exists as a
+                                            // non-configurable own property of the
+                                            // target, or the target is non-extensible
+                                            // and the property is present.
+                                            if result {
+                                                let present = self.realm.has_own(target, &name)
+                                                    || self.realm.accessor(target, &name).is_some();
+                                                if present
+                                                    && self
+                                                        .realm
+                                                        .property_is_non_configurable(target, &name)
+                                                {
+                                                    return Err(self.type_error(
+                                                        "proxy 'deleteProperty' trap removed a non-configurable property",
+                                                    ));
+                                                }
+                                                if present && !self.realm.is_extensible(target) {
+                                                    return Err(self.type_error(
+                                                        "proxy 'deleteProperty' trap removed a property of a non-extensible target",
+                                                    ));
+                                                }
+                                            }
                                         } else {
                                             self.realm.delete_property(target, &name);
                                         }
@@ -1126,15 +1151,25 @@ impl<'a> Interp<'a> {
                 let name = self.member_key(key);
                 let key_box = self.new_str(&name);
                 let recv = NanBox::handle(handle.to_raw());
-                let r = self.call(trap, &[NanBox::handle(target.to_raw()), key_box, new, recv])?;
+                let handler_box = NanBox::handle(handler.to_raw());
+                let r = self.call_with_this(
+                    trap,
+                    handler_box,
+                    &[NanBox::handle(target.to_raw()), key_box, new, recv],
+                )?;
                 // A `set` trap returning a falsy value is a failed [[Set]]: a strict-mode
                 // assignment then throws a TypeError (sloppy mode fails silently).
-                if self.strict && !self.realm.truthy(r) {
-                    let m = self.new_str(&alloc::format!(
-                        "'set' on proxy: trap returned falsish for property '{name}'"
-                    ));
-                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                if !self.realm.truthy(r) {
+                    if self.strict {
+                        let m = self.new_str(&alloc::format!(
+                            "'set' on proxy: trap returned falsish for property '{name}'"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    return Ok(());
                 }
+                // A truthy result is subject to the [[Set]] success invariants.
+                self.proxy_set_invariant_check(target, &name, new)?;
                 return Ok(());
             }
             return self.assign_member_value(target, key, new);
@@ -1314,7 +1349,39 @@ impl<'a> Interp<'a> {
             if let Some(trap) = self.proxy_trap(handler, "get")? {
                 let key = self.new_str(name);
                 let recv = NanBox::handle(handle.to_raw());
-                return self.call(trap, &[NanBox::handle(target.to_raw()), key, recv]);
+                let handler_box = NanBox::handle(handler.to_raw());
+                let result = self.call_with_this(
+                    trap,
+                    handler_box,
+                    &[NanBox::handle(target.to_raw()), key, recv],
+                )?;
+                // Invariants (10.5.8): a non-configurable, non-writable data
+                // property of the target must be reported with its actual value; a
+                // non-configurable accessor with no getter must report undefined.
+                if let Some((getter, _)) = self.realm.accessor(target, name) {
+                    if self.realm.property_is_non_configurable(target, name)
+                        && matches!(getter.unpack(), Unpacked::Undefined)
+                        && !matches!(result.unpack(), Unpacked::Undefined)
+                    {
+                        return Err(self.type_error(
+                            "proxy 'get' returned a value for a non-configurable accessor with no getter",
+                        ));
+                    }
+                } else if self.realm.has_own(target, name)
+                    && self.realm.property_is_non_configurable(target, name)
+                    && self.realm.property_is_readonly(target, name)
+                {
+                    let actual = self
+                        .realm
+                        .get_property(target, name)
+                        .unwrap_or(NanBox::undefined());
+                    if !self.realm.strict_equals(result, actual) {
+                        return Err(self.type_error(
+                            "proxy 'get' returned a different value for a non-configurable non-writable property",
+                        ));
+                    }
+                }
+                return Ok(result);
             }
             return self.read_member(target, name);
         }
@@ -1352,6 +1419,8 @@ impl<'a> Interp<'a> {
                     | "search"
                     | "split"
                     | "unscopables"
+                    | "dispose"
+                    | "asyncDispose"
             )
         {
             // The name is the well-known symbol's key.
@@ -1368,6 +1437,8 @@ impl<'a> Interp<'a> {
                 "replace" => "replace",
                 "search" => "search",
                 "split" => "split",
+                "dispose" => "dispose",
+                "asyncDispose" => "asyncDispose",
                 _ => "unscopables",
             };
             return Ok(self.well_known_symbol(key));
@@ -2141,15 +2212,25 @@ impl<'a> Interp<'a> {
                 let key = self.eval_prop_key(property)?;
                 let key_box = self.new_str(&key);
                 let recv = NanBox::handle(handle.to_raw());
-                let r = self.call(trap, &[NanBox::handle(target.to_raw()), key_box, new, recv])?;
+                let handler_box = NanBox::handle(handler.to_raw());
+                let r = self.call_with_this(
+                    trap,
+                    handler_box,
+                    &[NanBox::handle(target.to_raw()), key_box, new, recv],
+                )?;
                 // A `set` trap returning a falsy value is a failed [[Set]]: a strict-mode
                 // assignment then throws a TypeError (sloppy mode fails silently).
-                if self.strict && !self.realm.truthy(r) {
-                    let m = self.new_str(&alloc::format!(
-                        "'set' on proxy: trap returned falsish for property '{key}'"
-                    ));
-                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                if !self.realm.truthy(r) {
+                    if self.strict {
+                        let m = self.new_str(&alloc::format!(
+                            "'set' on proxy: trap returned falsish for property '{key}'"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    return Ok(());
                 }
+                // A truthy result is subject to the [[Set]] success invariants.
+                self.proxy_set_invariant_check(target, &key, new)?;
                 return Ok(());
             }
             return self.assign_member(target, property, new);
@@ -2165,6 +2246,46 @@ impl<'a> Interp<'a> {
         if let Some(skey) = setter_key {
             let mut cur = Some(handle);
             while let Some(c) = cur {
+                // OrdinarySet: a proxy *on the prototype chain* (above the original
+                // receiver) handles the write via its own `[[Set]]` — invoke its
+                // `set` trap with Receiver = the original object, then stop.
+                if c != handle
+                    && let Some((target, p_handler)) = self.realm.proxy_at(c)
+                {
+                    self.guard_revoked(c)?;
+                    if let Some(trap) = self.proxy_trap(p_handler, "set")? {
+                        let key_box = self.new_str(&skey);
+                        let recv = NanBox::handle(handle.to_raw());
+                        let handler_box = NanBox::handle(p_handler.to_raw());
+                        let r = self.call_with_this(
+                            trap,
+                            handler_box,
+                            &[NanBox::handle(target.to_raw()), key_box, new, recv],
+                        )?;
+                        if self.strict && !self.realm.truthy(r) {
+                            let m = self.new_str(&alloc::format!(
+                                "'set' on proxy: trap returned falsish for property '{skey}'"
+                            ));
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
+                        return Ok(());
+                    }
+                    // No `set` trap: the proxy's `[[Set]]` is OrdinarySet on the
+                    // target with the *original* receiver. If the target has an
+                    // inherited accessor it would fire, but the common case is a
+                    // data property (or absent), which creates/updates an OWN data
+                    // property on the original receiver. Stop the prototype walk and
+                    // fall through to the own-property write on `handle` — unless the
+                    // target itself has a *setter* for this key, which must run.
+                    if let Some((_, setter)) = self.realm.accessor(target, &skey)
+                        && !matches!(setter.unpack(), Unpacked::Undefined)
+                    {
+                        let this = NanBox::handle(handle.to_raw());
+                        self.call_with_this(setter, this, &[new])?;
+                        return Ok(());
+                    }
+                    break;
+                }
                 if let Some((_, setter)) = self.realm.accessor(c, &skey) {
                     if !matches!(setter.unpack(), Unpacked::Undefined) {
                         let this = NanBox::handle(handle.to_raw());
@@ -2750,9 +2871,28 @@ impl<'a> Interp<'a> {
             if id == N_DATA_VIEW && self.realm.get_property(oh, DATA_VIEW_BUF).is_some() {
                 return Ok(true);
             }
-            // The `Error` family: match by the object's `name` against the
-            // constructor (the base `Error` matches any error object).
+            // The `Error` family: an error instance now links to its constructor's
+            // `.prototype`, so OrdinaryHasInstance (the prototype-chain walk) is the
+            // authoritative check — robust against `name` being reassigned.
             if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
+                if let Some(proto) = self
+                    .realm
+                    .get_property(ch, "prototype")
+                    .and_then(|p| p.as_handle())
+                    .map(Handle::from_raw)
+                {
+                    let mut cur = oh;
+                    for _ in 0..100_000 {
+                        let next = self.get_proto_of(cur)?;
+                        let Some(p) = next.as_handle().map(Handle::from_raw) else {
+                            break;
+                        };
+                        if p == proto {
+                            return Ok(true);
+                        }
+                        cur = p;
+                    }
+                }
                 let want = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
                 // A user class extending a native error: walk its class chain for
                 // a native error super (so `customErr instanceof Error` holds even
@@ -2788,16 +2928,42 @@ impl<'a> Interp<'a> {
                 }
                 return Ok(want == "Error" || obj_name == want);
             }
-            return Ok(match id {
-                N_REGEXP => self.realm.regexp_at(oh).is_some(),
-                N_MAP | N_SET | N_WEAKMAP | N_WEAKSET => self.realm.collection_is_set(oh).is_some(),
-                N_DATE => self.realm.date_at(oh).is_some(),
-                N_PROMISE => self.realm.promise_state(oh).is_some(),
+            match id {
+                N_REGEXP => return Ok(self.realm.regexp_at(oh).is_some()),
+                N_MAP | N_SET | N_WEAKMAP | N_WEAKSET => {
+                    return Ok(self.realm.collection_is_set(oh).is_some());
+                }
+                N_DATE => return Ok(self.realm.date_at(oh).is_some()),
+                N_PROMISE => return Ok(self.realm.promise_state(oh).is_some()),
                 // Every callable (function, native, bound) and every class is a
                 // `Function`.
-                N_FUNCTION => self.is_callable(oh) || self.realm.class_at(oh).is_some(),
-                _ => false,
-            });
+                N_FUNCTION => {
+                    return Ok(self.is_callable(oh) || self.realm.class_at(oh).is_some());
+                }
+                _ => {}
+            }
+            // OrdinaryHasInstance fallback for any other built-in constructor (e.g.
+            // `%Iterator%`, whose instances are recognized only by their prototype
+            // chain): walk `obj`'s `[[Prototype]]` chain for the ctor's `.prototype`.
+            if let Some(proto) = self
+                .realm
+                .get_property(ch, "prototype")
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw)
+            {
+                let mut cur = oh;
+                for _ in 0..100_000 {
+                    let next = self.get_proto_of(cur)?;
+                    let Some(p) = next.as_handle().map(Handle::from_raw) else {
+                        return Ok(false);
+                    };
+                    if p == proto {
+                        return Ok(true);
+                    }
+                    cur = p;
+                }
+            }
+            return Ok(false);
         }
         // `Array`/`Object` are namespace objects (not natives), matched by the
         // identity of the global binding.

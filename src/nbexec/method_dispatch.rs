@@ -446,112 +446,15 @@ impl<'a> Interp<'a> {
                         .set_hidden_property(handle, GEN_IDX, NanBox::number(len as f64));
                     return Err(ExecError::Throw(arg(0)));
                 }
-                // ES2025 iterator helpers — they consume the remaining yields.
+                // ES2025 iterator helpers — drive the receiver generator lazily
+                // through the shared `iterator_proto_helper` (which reads the
+                // generator's real `next`/`return` methods on demand). This keeps
+                // map/filter/take/drop/flatMap lazy and the consuming helpers
+                // spec-faithful (calling order, closing, infinite iterators).
                 "map" | "filter" | "take" | "drop" | "toArray" | "forEach" | "reduce" | "some"
                 | "every" | "find" | "flatMap" => {
-                    let idx = self
-                        .realm
-                        .get_property(handle, GEN_IDX)
-                        .and_then(|n| n.as_number())
-                        .unwrap_or(0.0) as usize;
-                    let rest: Vec<NanBox> = self
-                        .realm
-                        .array_elements(buf)
-                        .map(|e| e.get(idx..).unwrap_or(&[]).to_vec())
-                        .unwrap_or_default();
-                    // The source iterator is now exhausted.
-                    let len = self.realm.array_elements(buf).map_or(0, <[_]>::len);
-                    self.realm
-                        .set_hidden_property(handle, GEN_IDX, NanBox::number(len as f64));
-                    let f = arg(0);
-                    return Ok(Some(match method {
-                        "toArray" => NanBox::handle(self.realm.new_array(rest).to_raw()),
-                        "map" => {
-                            let mut out = Vec::with_capacity(rest.len());
-                            for v in rest {
-                                out.push(self.call(f, &[v])?);
-                            }
-                            self.make_generator(out)
-                        }
-                        "flatMap" => {
-                            let mut out = Vec::new();
-                            for v in rest {
-                                let r = self.call(f, &[v])?;
-                                out.extend(
-                                    self.iterate_values(r).unwrap_or_else(|_| alloc::vec![r]),
-                                );
-                            }
-                            self.make_generator(out)
-                        }
-                        "filter" => {
-                            let mut out = Vec::new();
-                            for v in rest {
-                                let r = self.call(f, &[v])?;
-                                if self.realm.truthy(r) {
-                                    out.push(v);
-                                }
-                            }
-                            self.make_generator(out)
-                        }
-                        "take" => {
-                            let n = self.realm.to_number(f).max(0.0) as usize;
-                            self.make_generator(rest.into_iter().take(n).collect())
-                        }
-                        "drop" => {
-                            let n = self.realm.to_number(f).max(0.0) as usize;
-                            self.make_generator(rest.into_iter().skip(n).collect())
-                        }
-                        "forEach" => {
-                            for v in rest {
-                                self.call(f, &[v])?;
-                            }
-                            NanBox::undefined()
-                        }
-                        "some" | "every" | "find" => {
-                            let mut found = NanBox::undefined();
-                            let mut hit = false;
-                            for v in rest {
-                                let r = self.call(f, &[v])?;
-                                let t = self.realm.truthy(r);
-                                if method == "every" && !t {
-                                    return Ok(Some(NanBox::boolean(false)));
-                                }
-                                if method != "every" && t {
-                                    found = v;
-                                    hit = true;
-                                    break;
-                                }
-                            }
-                            match method {
-                                "some" => NanBox::boolean(hit),
-                                "every" => NanBox::boolean(true),
-                                _ => found, // find
-                            }
-                        }
-                        // reduce
-                        _ => {
-                            let mut it = rest.into_iter();
-                            let mut acc = if args.len() >= 2 {
-                                arg(1)
-                            } else {
-                                match it.next() {
-                                    Some(v) => v,
-                                    None => {
-                                        let m = self.new_str(
-                                            "Reduce of empty iterator with no initial value",
-                                        );
-                                        return Err(ExecError::Throw(
-                                            self.make_error(N_TYPE_ERROR, Some(m)),
-                                        ));
-                                    }
-                                }
-                            };
-                            for v in it {
-                                acc = self.call(f, &[acc, v])?;
-                            }
-                            acc
-                        }
-                    }));
+                    let this = NanBox::handle(handle.to_raw());
+                    return Ok(Some(self.iterator_proto_helper(method, this, args)?));
                 }
                 _ => {}
             }
@@ -737,6 +640,9 @@ impl<'a> Interp<'a> {
                 .realm
                 .new_proxy(Handle::from_raw(tr), Handle::from_raw(hr));
             let revoke = self.realm.new_bound_native(N_PROXY_REVOKE, proxy);
+            // The revocation function is an anonymous (`name === ""`) length-0
+            // function.
+            self.install_fn_name_length(revoke, "", 0);
             let result = self.realm.new_object();
             self.realm
                 .set_property(result, "proxy", NanBox::handle(proxy.to_raw()));
@@ -2219,6 +2125,10 @@ impl<'a> Interp<'a> {
         if self.realm.array_elements(handle).is_none()
             && self.realm.object_keys(handle).is_some()
             && ARRAY_LIKE_METHODS.contains(&method)
+            // An iterator (a value inheriting `%IteratorPrototype%`, e.g. a lazy
+            // iterator-helper) must run its *own* `map`/`filter`/… helper, not be
+            // treated as an array-like — so skip the array-like coercion for it.
+            && !self.inherits_iterator_proto(handle)
         {
             // ToLength(Get(O, "length")): the length is coerced through a JS
             // `valueOf`/`toString` (so an object length with a custom coercion is

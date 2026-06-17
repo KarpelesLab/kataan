@@ -116,9 +116,26 @@ pub struct Realm {
     /// prototype is the shared `%TypedArray%` intrinsic. Keyed by handle; same
     /// non-GC-root, GC-quiescent caveat as `aux_props`.
     native_protos: alloc::collections::BTreeMap<u64, Handle>,
+    /// Callable cells whose `[[Prototype]]` was explicitly set to `null`
+    /// (`Object.setPrototypeOf(fn, null)`), distinguishing them from the default
+    /// (which resolves to `%Function.prototype%`). Same non-GC-root caveat.
+    callable_null_protos: alloc::collections::BTreeSet<u64>,
     /// The shared abstract `%TypedArray%` intrinsic constructor (the value
     /// `Object.getPrototypeOf(Int8Array)` returns), installed at global setup.
     typed_array_intrinsic: Option<Handle>,
+    /// The realm's `Function.prototype` intrinsic (the default `[[Prototype]]` of
+    /// every ordinary/native callable). Installed at global setup; until then a
+    /// callable's prototype resolves to `None`. A callable's `[[Prototype]]` can
+    /// still be overridden explicitly (`Object.setPrototypeOf(fn, p)`), recorded
+    /// in [`native_protos`](Realm::native_protos).
+    function_proto_intrinsic: Option<Handle>,
+    /// The realm's `Array.prototype` intrinsic (the default `[[Prototype]]` of a
+    /// dense `Cell::Array`, which has no inline object part). So
+    /// `Object.getPrototypeOf([])`, `[] instanceof Array`, and `"push" in []`
+    /// resolve through the chain. An explicit `Object.setPrototypeOf(arr, p)`
+    /// override is recorded in [`native_protos`](Realm::native_protos) /
+    /// [`callable_null_protos`](Realm::callable_null_protos).
+    array_proto_intrinsic: Option<Handle>,
     /// Tunable resource limits for work driven in this realm. Defaults to
     /// [`crate::limits::Limits::default`]; override with [`Realm::with_limits`].
     pub limits: crate::limits::Limits,
@@ -158,7 +175,10 @@ impl Realm {
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
             native_protos: alloc::collections::BTreeMap::new(),
+            callable_null_protos: alloc::collections::BTreeSet::new(),
             typed_array_intrinsic: None,
+            function_proto_intrinsic: None,
+            array_proto_intrinsic: None,
             limits,
         }
     }
@@ -175,6 +195,18 @@ impl Realm {
     /// Records the shared abstract `%TypedArray%` intrinsic constructor handle.
     pub fn set_typed_array_intrinsic(&mut self, handle: Handle) {
         self.typed_array_intrinsic = Some(handle);
+    }
+
+    /// Records the realm's `%Function.prototype%` intrinsic — the default
+    /// `[[Prototype]]` for every ordinary/native callable.
+    pub fn set_function_proto_intrinsic(&mut self, handle: Handle) {
+        self.function_proto_intrinsic = Some(handle);
+    }
+
+    /// Records the realm's `%Array.prototype%` intrinsic — the default
+    /// `[[Prototype]]` for every dense `Cell::Array`.
+    pub fn set_array_proto_intrinsic(&mut self, handle: Handle) {
+        self.array_proto_intrinsic = Some(handle);
     }
 
     /// The shared abstract `%TypedArray%` intrinsic constructor, if installed.
@@ -1417,21 +1449,58 @@ impl Realm {
         if let Some(obj) = self.heap.get(handle).and_then(Cell::as_object) {
             return obj.proto();
         }
-        self.native_protos.get(&handle.to_raw()).copied()
+        if let Some(p) = self.native_protos.get(&handle.to_raw()).copied() {
+            return Some(p);
+        }
+        // An ordinary/native callable with no explicit override and no inline
+        // object part has `[[Prototype]] === %Function.prototype%` (unless it was
+        // explicitly set to `null`).
+        if self.is_callable_cell(handle) {
+            if self.callable_null_protos.contains(&handle.to_raw()) {
+                return None;
+            }
+            return self.function_proto_intrinsic;
+        }
+        // A dense `Cell::Array` with no explicit override and no inline object part
+        // has `[[Prototype]] === %Array.prototype%` (unless set to `null`).
+        if matches!(self.heap.get(handle), Some(Cell::Array(_))) {
+            if self.callable_null_protos.contains(&handle.to_raw()) {
+                return None;
+            }
+            return self.array_proto_intrinsic;
+        }
+        None
     }
 
     /// Sets the `[[Prototype]]` of the object at `handle`.
     pub fn set_object_proto(&mut self, handle: Handle, proto: Option<Handle>) -> bool {
-        match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
-            Some(obj) => {
-                obj.set_proto(proto);
-                if let Some(p) = proto {
+        if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            obj.set_proto(proto);
+            if let Some(p) = proto {
+                self.write_barrier(handle, NanBox::handle(p.to_raw()));
+            }
+            return true;
+        }
+        // A callable cell (function / native / bound native / class) or a dense
+        // array has no inline object part; record its `[[Prototype]]` override in
+        // the side table so `Object.getPrototypeOf` reflects it.
+        if self.is_callable_cell(handle) || matches!(self.heap.get(handle), Some(Cell::Array(_))) {
+            match proto {
+                Some(p) => {
+                    self.native_protos.insert(handle.to_raw(), p);
+                    self.callable_null_protos.remove(&handle.to_raw());
                     self.write_barrier(handle, NanBox::handle(p.to_raw()));
                 }
-                true
+                None => {
+                    // An explicit `null` prototype: a removed `native_protos` entry
+                    // would re-default to `%Function.prototype%`, so track null.
+                    self.native_protos.remove(&handle.to_raw());
+                    self.callable_null_protos.insert(handle.to_raw());
+                }
             }
-            None => false,
+            return true;
         }
+        false
     }
 
     /// Allocates an empty object whose `[[Prototype]]` is `proto` (`Object.create`).
@@ -1815,11 +1884,18 @@ impl Realm {
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
             return o.is_extensible();
         }
-        // A typed array / RegExp is extensible by default; `preventExtensions`/
-        // `seal`/`freeze` records the flag on its auxiliary object.
+        // A typed array / RegExp / Date / Map / Set / Promise is extensible by
+        // default; `preventExtensions`/`seal`/`freeze` records the flag on its
+        // auxiliary object.
         if matches!(
             self.heap.get(handle),
-            Some(Cell::TypedArray { .. } | Cell::RegExp { .. })
+            Some(
+                Cell::TypedArray { .. }
+                    | Cell::RegExp { .. }
+                    | Cell::Date(_)
+                    | Cell::Collection { .. }
+                    | Cell::Promise(_)
+            )
         ) {
             return self
                 .aux_props
@@ -2011,6 +2087,10 @@ impl Realm {
                 // descriptor) — and the Symbol.* methods read a user `exec`
                 // override — so it stores named props in an auxiliary object.
                 || matches!(c, Cell::RegExp { .. })
+                // Date / Map / Set / Promise instances are ordinary (extensible)
+                // objects per spec: a script may set arbitrary own properties on
+                // them (`d.value = 1`), stored in an auxiliary object.
+                || matches!(c, Cell::Date(_) | Cell::Collection { .. } | Cell::Promise(_))
         })
     }
 

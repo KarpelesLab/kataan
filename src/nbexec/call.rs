@@ -93,6 +93,14 @@ impl<'a> Interp<'a> {
         bound: Vec<NanBox>,
     ) -> NanBox {
         let obj = self.realm.new_object();
+        // A bound function's `[[Prototype]]` is the target function's
+        // `[[Prototype]]` (ordinarily `%Function.prototype%`), not
+        // `Object.prototype` (which `new_object` defaults to).
+        let target_proto = target
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|t| self.realm.object_proto(t));
+        self.realm.set_object_proto(obj, target_proto);
         self.realm.set_hidden_property(obj, BOUND_TARGET, target);
         self.realm.set_hidden_property(obj, BOUND_THIS, this_val);
         let arr = self.realm.new_array(bound);
@@ -159,8 +167,10 @@ impl<'a> Interp<'a> {
                     return Err(self.type_error("proxy apply trap is not a function"));
                 }
                 let arr = self.realm.new_array(args.to_vec());
-                return self.call(
+                let handler_box = NanBox::handle(handler.to_raw());
+                return self.call_with_this(
                     trap,
+                    handler_box,
                     &[
                         NanBox::handle(target.to_raw()),
                         this_val,
@@ -986,8 +996,15 @@ impl<'a> Interp<'a> {
                 }
                 let arr = self.realm.new_array(args.to_vec());
                 let target_box = NanBox::handle(target.to_raw());
-                let result =
-                    self.call(trap, &[target_box, NanBox::handle(arr.to_raw()), callee])?;
+                let handler_box = NanBox::handle(handler.to_raw());
+                // newTarget is an explicit `Reflect.construct` newTarget if present,
+                // else the proxy itself.
+                let new_target = self.reflect_new_target.take().unwrap_or(callee);
+                let result = self.call_with_this(
+                    trap,
+                    handler_box,
+                    &[target_box, NanBox::handle(arr.to_raw()), new_target],
+                )?;
                 // The `construct` trap must return an Object (ECMA-262 step 9).
                 if !self.is_object_value(result) {
                     return Err(self.type_error("proxy [[Construct]] must return an object"));

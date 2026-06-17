@@ -365,8 +365,13 @@ impl<'a> Interp<'a> {
                 arg(0)
             }
             N_OBJECT_PREVENT_EXT => {
-                if let Some(raw) = arg(0).as_handle() {
-                    self.realm.prevent_extensions(Handle::from_raw(raw));
+                // Object.preventExtensions returns its argument (a primitive is a
+                // no-op pass-through); a proxy routes through its trap, and a `false`
+                // [[PreventExtensions]] result is a TypeError.
+                if let Some(raw) = arg(0).as_handle().filter(|_| self.is_object_value(arg(0)))
+                    && !self.prevent_extensions_of(Handle::from_raw(raw))?
+                {
+                    return Err(self.type_error("Object.preventExtensions failed"));
                 }
                 arg(0)
             }
@@ -591,39 +596,27 @@ impl<'a> Interp<'a> {
                 NanBox::boolean(true)
             }
             N_REFLECT_HAS => {
-                // Like the `in` operator: own property or anywhere on the
-                // prototype chain (array indices bounds-checked).
+                // `Reflect.has(target, key)` = HasProperty — own or anywhere on the
+                // prototype chain, honoring a proxy `has` trap at any chain step.
                 let target = self.reflect_object_target(arg(0), "has")?;
                 let key = self.coerce_property_key(arg(1))?;
-                let mut present = false;
-                let mut cur = Some(target);
-                while let Some(c) = cur {
-                    let here = if let Some(len) = self.realm.array_length(c) {
-                        key == "length"
-                            || key.parse::<usize>().is_ok_and(|i| i < len)
-                            || self.realm.has_own(c, &key)
-                    } else {
-                        self.realm.has_own(c, &key)
-                    };
-                    if here {
-                        present = true;
-                        break;
-                    }
-                    cur = self.realm.object_proto(c);
-                }
-                NanBox::boolean(present)
+                NanBox::boolean(self.has_property_proxied(target, &key)?)
             }
             N_REFLECT_DELETE => {
-                // Returns the [[Delete]] result: false for a non-configurable property.
+                // Returns the [[Delete]] result (a proxy routes through its
+                // deleteProperty trap; false for a non-configurable property).
                 let target = self.reflect_object_target(arg(0), "deleteProperty")?;
                 let key = self.coerce_property_key(arg(1))?;
-                let ok = self.realm.delete_property(target, &key);
-                NanBox::boolean(ok)
+                NanBox::boolean(self.delete_property_of(target, &key)?)
             }
             N_REFLECT_OWN_KEYS => {
                 // String keys (integer-indexed then insertion order), then own
                 // symbol keys — matching `[[OwnPropertyKeys]]`.
                 let h = self.reflect_object_target(arg(0), "ownKeys")?;
+                // A proxy drives `[[OwnPropertyKeys]]` through its `ownKeys` trap.
+                if let Some(keys) = self.proxy_own_keys_raw(h)? {
+                    return Ok(NanBox::handle(self.realm.new_array(keys).to_raw()));
+                }
                 let mut boxed = Vec::new();
                 {
                     for k in self.realm.own_property_names(h).unwrap_or_default() {
@@ -686,8 +679,7 @@ impl<'a> Interp<'a> {
             // `Reflect.preventExtensions(target)` → boolean success.
             N_REFLECT_PREVENT_EXT => {
                 let obj = self.reflect_object_target(arg(0), "preventExtensions")?;
-                self.realm.prevent_extensions(obj);
-                NanBox::boolean(true)
+                NanBox::boolean(self.prevent_extensions_of(obj)?)
             }
             // `Reflect.isExtensible(target)` → boolean (target must be an Object).
             N_REFLECT_IS_EXTENSIBLE => {
@@ -695,14 +687,15 @@ impl<'a> Interp<'a> {
                 self.is_extensible_of(obj)?
             }
             N_REFLECT_APPLY => {
-                let list = match arg(2).as_handle().map(Handle::from_raw) {
-                    Some(h) => self
-                        .realm
-                        .array_elements(h)
-                        .map(<[_]>::to_vec)
-                        .unwrap_or_default(),
-                    None => Vec::new(),
-                };
+                // The target must be callable; the argumentsList is read via
+                // CreateListFromArrayLike (an array-like object, not just an Array).
+                if !arg(0)
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Err(self.type_error("Reflect.apply target is not a function"));
+                }
+                let list = self.create_list_from_array_like(arg(2))?;
                 return self.call_with_this(arg(0), arg(1), &list);
             }
             N_REFLECT_CONSTRUCT => {
@@ -718,14 +711,7 @@ impl<'a> Interp<'a> {
                 if has_new_target && !self.is_constructor_value(arg(2)) {
                     return Err(self.type_error("Reflect.construct newTarget is not a constructor"));
                 }
-                let list = match arg(1).as_handle().map(Handle::from_raw) {
-                    Some(h) => self
-                        .realm
-                        .array_elements(h)
-                        .map(<[_]>::to_vec)
-                        .unwrap_or_default(),
-                    None => Vec::new(),
-                };
+                let list = self.create_list_from_array_like(arg(1))?;
                 // `target` must be a constructor.
                 if !self.is_constructor(arg(0)) {
                     let m = self.new_str("Reflect.construct target is not a constructor");
@@ -789,6 +775,21 @@ impl<'a> Interp<'a> {
                         self.type_error("Object.getOwnPropertyNames called on null or undefined")
                     );
                 }
+                // A proxy drives `[[OwnPropertyKeys]]` through its `ownKeys` trap;
+                // keep the String keys.
+                if let Some(raw) = arg(0).as_handle()
+                    && let Some(keys) = self.proxy_own_keys_raw(Handle::from_raw(raw))?
+                {
+                    let boxed: Vec<NanBox> = keys
+                        .into_iter()
+                        .filter(|k| {
+                            k.as_handle()
+                                .map(Handle::from_raw)
+                                .is_some_and(|h| self.realm.string_value(h).is_some())
+                        })
+                        .collect();
+                    return Ok(NanBox::handle(self.realm.new_array(boxed).to_raw()));
+                }
                 let names = arg(0)
                     .as_handle()
                     .and_then(|raw| self.realm.own_property_names(Handle::from_raw(raw)))
@@ -803,6 +804,21 @@ impl<'a> Interp<'a> {
                     return Err(
                         self.type_error("Object.getOwnPropertySymbols called on null or undefined")
                     );
+                }
+                // A proxy drives `[[OwnPropertyKeys]]` through its `ownKeys` trap;
+                // keep the Symbol keys.
+                if let Some(raw) = arg(0).as_handle()
+                    && let Some(keys) = self.proxy_own_keys_raw(Handle::from_raw(raw))?
+                {
+                    let boxed: Vec<NanBox> = keys
+                        .into_iter()
+                        .filter(|k| {
+                            k.as_handle()
+                                .map(Handle::from_raw)
+                                .is_some_and(|h| self.realm.symbol_at(h).is_some())
+                        })
+                        .collect();
+                    return Ok(NanBox::handle(self.realm.new_array(boxed).to_raw()));
                 }
                 let mut syms = Vec::new();
                 if let Some(raw) = arg(0).as_handle() {
@@ -871,11 +887,12 @@ impl<'a> Interp<'a> {
                     || self.realm.get_property(h, DATA_VIEW_BUF).is_some()
             })),
             N_OBJECT_ASSIGN => {
-                // ToObject(target): `null`/`undefined` throws.
+                // ToObject(target): `null`/`undefined` throws; a primitive is boxed
+                // to its wrapper object (the return value is that object).
                 if matches!(arg(0).unpack(), Unpacked::Null | Unpacked::Undefined) {
                     return Err(self.type_error("Object.assign target is null or undefined"));
                 }
-                let target = arg(0);
+                let target = self.coerce_to_object(arg(0));
                 if let Some(t) = target.as_handle().map(Handle::from_raw) {
                     for src in &args[1.min(args.len())..] {
                         // A primitive string source contributes its character indices.
@@ -1053,13 +1070,172 @@ impl<'a> Interp<'a> {
             // backed iterator, which carries the helper methods and `next()`.
             N_ITERATOR_FROM => {
                 let src = arg(0);
-                // RequireObjectCoercible-ish: a null/undefined source is a TypeError.
-                if matches!(src.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                    let m = self.new_str("Iterator.from called on null or undefined");
+                self.iterator_from(src)?
+            }
+            // `%IteratorHelperPrototype%.next` — lazy helper step.
+            N_ITER_HELPER_NEXT => {
+                let this = self.this_val;
+                self.iter_helper_next(this)?
+            }
+            // `%IteratorHelperPrototype%.return` — close the helper + source.
+            N_ITER_HELPER_RETURN => {
+                let this = self.this_val;
+                self.iter_helper_return(this)?
+            }
+            // `%WrapForValidIteratorPrototype%.next` — forward to the wrapped
+            // iterator's `next`.
+            N_ITER_WRAP_NEXT => {
+                let this = self.this_val;
+                self.iter_wrap_next(this)?
+            }
+            // `%WrapForValidIteratorPrototype%.return` — forward to the wrapped
+            // iterator's `return` (if any), else `{ value: undefined, done: true }`.
+            N_ITER_WRAP_RETURN => {
+                let this = self.this_val;
+                self.iter_wrap_return(this)?
+            }
+            // `Iterator.concat(...iterables)` — lazy sequencing.
+            N_ITERATOR_CONCAT => self.iterator_concat(args)?,
+            // `%ConcatIteratorPrototype%.next` — advance the concat result.
+            N_ITER_CONCAT_NEXT => {
+                let this = self.this_val;
+                self.iter_concat_next(this)?
+            }
+            // `%ConcatIteratorPrototype%.return` — close the active inner iterator.
+            N_ITER_CONCAT_RETURN => {
+                let this = self.this_val;
+                self.iter_concat_return(this)?
+            }
+            // `%IteratorPrototype%[Symbol.dispose]()` — call the iterator's `return`
+            // (GetMethod, so undefined/null is a no-op), then return undefined.
+            N_ITERATOR_DISPOSE => {
+                let this = self.this_val;
+                if let Some(h) = this.as_handle().map(Handle::from_raw) {
+                    let ret = self.read_member(h, "return")?;
+                    if ret
+                        .as_handle()
+                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                    {
+                        self.call_with_this(ret, this, &[])?;
+                    } else if !matches!(ret.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                        return Err(self.type_error("Iterator dispose: 'return' is not callable"));
+                    }
+                }
+                NanBox::undefined()
+            }
+            // `Iterator.zip(iterables, options)` (joint-iteration).
+            N_ITERATOR_ZIP => self.iterator_zip(arg(0), arg(1), false)?,
+            // `Iterator.zipKeyed(iterables, options)`.
+            N_ITERATOR_ZIP_KEYED => self.iterator_zip(arg(0), arg(1), true)?,
+            // `%ZipIteratorPrototype%.next` / `.return`.
+            N_ITER_ZIP_NEXT => {
+                let this = self.this_val;
+                self.iter_zip_next(this)?
+            }
+            N_ITER_ZIP_RETURN => {
+                let this = self.this_val;
+                self.iter_zip_return(this)?
+            }
+            // `Object.prototype.__defineGetter__(P, getter)` (Annex B).
+            N_OBJ_DEFINE_GETTER | N_OBJ_DEFINE_SETTER => {
+                let this = self.this_val;
+                let obj = self.require_object_coercible_to_object(this, "__defineGetter__")?;
+                let f = arg(1);
+                if !f
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Err(
+                        self.type_error("Object.prototype.__defineGetter__: Expecting function")
+                    );
+                }
+                let key = self.coerce_property_key(arg(0))?;
+                let (getter, setter) = if id == N_OBJ_DEFINE_GETTER {
+                    (f, NanBox::undefined())
+                } else {
+                    (NanBox::undefined(), f)
+                };
+                // DefinePropertyOrThrow with { [get|set], enumerable, configurable }.
+                let existing = self.realm.accessor(obj, &key);
+                let (g, s) = match (id, existing) {
+                    (N_OBJ_DEFINE_GETTER, Some((_, old_s))) => (getter, old_s),
+                    (N_OBJ_DEFINE_SETTER, Some((old_g, _))) => (old_g, setter),
+                    _ => (getter, setter),
+                };
+                self.realm.define_accessor(obj, &key, g, s);
+                NanBox::undefined()
+            }
+            // `Object.prototype.__lookupGetter__(P)` / `__lookupSetter__(P)`.
+            N_OBJ_LOOKUP_GETTER | N_OBJ_LOOKUP_SETTER => {
+                let this = self.this_val;
+                let obj = self.require_object_coercible_to_object(this, "__lookupGetter__")?;
+                let key = self.coerce_property_key(arg(0))?;
+                // Walk the prototype chain for an accessor with the matching half.
+                let mut cur = Some(obj);
+                let mut result = NanBox::undefined();
+                while let Some(c) = cur {
+                    if let Some((g, s)) = self.realm.accessor(c, &key) {
+                        let half = if id == N_OBJ_LOOKUP_GETTER { g } else { s };
+                        if half
+                            .as_handle()
+                            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                        {
+                            result = half;
+                        }
+                        break;
+                    }
+                    if self.realm.has_own(c, &key) {
+                        break; // a data property shadows any inherited accessor
+                    }
+                    cur = self.realm.object_proto(c);
+                }
+                result
+            }
+            // `get Object.prototype.__proto__` (Annex B).
+            N_OBJ_PROTO_GET => {
+                let this = self.this_val;
+                let obj = self.require_object_coercible_to_object(this, "get __proto__")?;
+                self.get_proto_of(obj)?
+            }
+            // `set Object.prototype.__proto__` (Annex B).
+            N_OBJ_PROTO_SET => {
+                let this = self.this_val;
+                // RequireObjectCoercible(this); a primitive `this` is left unchanged
+                // (only objects have a settable prototype).
+                if matches!(this.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    let m = self.new_str("Object.prototype.__proto__ called on null or undefined");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
-                let values = self.iterate_values(src)?;
-                self.make_generator(values)
+                let v = arg(0);
+                // Only `null` or an Object are valid; any other value is ignored.
+                if let Some(oh) = this
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|_| self.is_object_value(this))
+                {
+                    match v.unpack() {
+                        Unpacked::Null => {
+                            self.set_proto_of(oh, None)?;
+                        }
+                        _ if self.is_object_value(v) => {
+                            let p = v.as_handle().map(Handle::from_raw);
+                            self.set_proto_of(oh, p)?;
+                        }
+                        _ => {}
+                    }
+                }
+                NanBox::undefined()
+            }
+            // The eager-generator iterator's `next` — buffer cursor advance.
+            N_GEN_ITER_NEXT => {
+                let this = self.this_val;
+                self.gen_iter_next(this)?
+            }
+            // The eager-generator iterator's `return` — exhaust + report done.
+            N_GEN_ITER_RETURN => {
+                let this = self.this_val;
+                let v = arg(0);
+                self.gen_iter_return(this, v)?
             }
             // The abstract `%TypedArray%` intrinsic is not callable directly.
             N_TYPED_ARRAY_ABSTRACT => {
@@ -1171,21 +1347,37 @@ impl<'a> Interp<'a> {
             N_OBJECT_FROM_ENTRIES => {
                 // RequireObjectCoercible + GetIterator: `null`/`undefined`/a
                 // non-iterable throws a TypeError (propagated, not swallowed).
+                if matches!(arg(0).unpack(), Unpacked::Null | Unpacked::Undefined) {
+                    return Err(self.type_error("Object.fromEntries called on null or undefined"));
+                }
                 let obj = self.realm.new_object();
-                // Accepts any iterable of `[key, value]` pairs (arrays, a Map, …).
-                let pairs = self.iterate_values(arg(0))?;
-                for pair in pairs {
-                    if let Some(kv) = pair
-                        .as_handle()
-                        .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
-                        .map(<[_]>::to_vec)
-                    {
-                        let k = self
-                            .realm
-                            .to_display_string(kv.first().copied().unwrap_or(NanBox::undefined()));
-                        let v = kv.get(1).copied().unwrap_or(NanBox::undefined());
-                        self.realm.set_property(obj, &k, v);
+                // AddEntriesFromIterable: iterate lazily; each entry must be an
+                // Object, and key/value are read via `[[Get]]`. A non-object entry
+                // (or a throwing read) closes the iterator (IteratorClose).
+                let it = self.get_iter_object(arg(0))?;
+                let next = self.read_member(it, "next")?;
+                while let Some(entry) = self.iter_step(it, next)? {
+                    if !self.is_object_value(entry) {
+                        let _ = self.iterator_close(it);
+                        return Err(self.type_error("Object.fromEntries entry is not an object"));
                     }
+                    let eh = entry.as_handle().map(Handle::from_raw).unwrap();
+                    let k = match self.read_member(eh, "0") {
+                        Ok(k) => k,
+                        Err(e) => {
+                            let _ = self.iterator_close(it);
+                            return Err(e);
+                        }
+                    };
+                    let v = match self.read_member(eh, "1") {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = self.iterator_close(it);
+                            return Err(e);
+                        }
+                    };
+                    let key = self.coerce_property_key(k)?;
+                    self.realm.set_property(obj, &key, v);
                 }
                 NanBox::handle(obj.to_raw())
             }

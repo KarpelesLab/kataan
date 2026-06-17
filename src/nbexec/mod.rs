@@ -538,6 +538,45 @@ const N_DATA_VIEW_PROTO_FN: u16 = 302;
 /// per spec. Returns `null` (the spec-mandated result of `DetachArrayBuffer`).
 /// New-id block at 360+ per the batch's allocation rule.
 const N_DETACH_ARRAY_BUFFER: u16 = 360;
+/// `%IteratorHelperPrototype%.next` — drives a lazy ES2025 iterator-helper object
+/// (`map`/`filter`/`take`/`drop`/`flatMap`) one step at a time.
+const N_ITER_HELPER_NEXT: u16 = 340;
+/// `%IteratorHelperPrototype%.return` — closes the helper's underlying iterator.
+const N_ITER_HELPER_RETURN: u16 = 341;
+/// `%WrapForValidIteratorPrototype%.next` — the `Iterator.from` wrapper's `next`.
+const N_ITER_WRAP_NEXT: u16 = 342;
+/// `%WrapForValidIteratorPrototype%.return` — the `Iterator.from` wrapper's `return`.
+const N_ITER_WRAP_RETURN: u16 = 343;
+/// `Iterator.concat` — the `iterator-sequencing` static (lazy concatenation).
+const N_ITERATOR_CONCAT: u16 = 344;
+/// `%ConcatIteratorPrototype%.next` — drives the lazy `Iterator.concat` result.
+const N_ITER_CONCAT_NEXT: u16 = 345;
+/// The eager-generator iterator's `next` — surfaced as a real method so it can be
+/// read once (GetIteratorDirect) and called by the lazy iterator helpers.
+const N_GEN_ITER_NEXT: u16 = 346;
+/// The eager-generator iterator's `return` method.
+const N_GEN_ITER_RETURN: u16 = 347;
+/// `Object.prototype.__defineGetter__(P, getter)` (Annex B).
+const N_OBJ_DEFINE_GETTER: u16 = 348;
+/// `Object.prototype.__defineSetter__(P, setter)` (Annex B).
+const N_OBJ_DEFINE_SETTER: u16 = 349;
+/// `Object.prototype.__lookupGetter__(P)` (Annex B).
+const N_OBJ_LOOKUP_GETTER: u16 = 350;
+/// `Object.prototype.__lookupSetter__(P)` (Annex B).
+const N_OBJ_LOOKUP_SETTER: u16 = 351;
+/// `get/set Object.prototype.__proto__` (Annex B accessor).
+const N_OBJ_PROTO_GET: u16 = 352;
+const N_OBJ_PROTO_SET: u16 = 353;
+/// `%ConcatIteratorPrototype%.return` — closes the active inner iterator.
+const N_ITER_CONCAT_RETURN: u16 = 354;
+/// `Iterator.zip` / `Iterator.zipKeyed` (the `joint-iteration` statics).
+const N_ITERATOR_ZIP: u16 = 355;
+const N_ITERATOR_ZIP_KEYED: u16 = 356;
+/// `%ZipIteratorPrototype%.next` / `.return` driving a lazy zip result.
+const N_ITER_ZIP_NEXT: u16 = 357;
+const N_ITER_ZIP_RETURN: u16 = 358;
+/// `%IteratorPrototype%[Symbol.dispose]` — calls the iterator's `return`.
+const N_ITERATOR_DISPOSE: u16 = 359;
 /// The `%TypedArray%.prototype` methods exposed as first-class own properties,
 /// each paired with its spec `length` (own `length` data property). Dispatched
 /// through [`N_TYPED_ARRAY_PROTO_FN`].
@@ -1040,7 +1079,8 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_TYPED_ARRAY_SPECIES
         | N_TYPED_ARRAY_TO_STRING_TAG => 0,
         // Length 2.
-        N_OBJECT_SET_PROTO
+        N_PROXY
+        | N_OBJECT_SET_PROTO
         | N_OBJECT_IS
         | N_OBJECT_HAS_OWN
         | N_OBJECT_DEFINE_PROPS
@@ -1196,6 +1236,47 @@ const GEN_BUF: &str = "\u{0}gbuf";
 const GEN_IDX: &str = "\u{0}gidx";
 /// A generator's `return` value, surfaced once after its yields are exhausted.
 const GEN_RET: &str = "\u{0}gret";
+/// Reserved hidden slots for a lazy ES2025 iterator-helper object (the object
+/// returned by `Iterator.prototype.{map,filter,take,drop,flatMap}` and
+/// `Iterator.from`). The helper pulls from its underlying iterator one step at a
+/// time, so it interleaves correctly with direct `.next()` calls and never
+/// over-consumes (it works on infinite iterators).
+/// The helper kind discriminant (see `HelperKind`).
+const HELPER_KIND: &str = "\u{0}hkind";
+/// The underlying iterator *object* (what `next`/`return` are invoked on).
+const HELPER_SOURCE: &str = "\u{0}hsrc";
+/// The cached `next` method of the underlying iterator (looked up once).
+const HELPER_NEXT: &str = "\u{0}hnext";
+/// The mapper/filter/flatMap callback (absent for take/drop/from).
+const HELPER_FN: &str = "\u{0}hfn";
+/// A numeric helper parameter: the remaining count for take/drop.
+const HELPER_LIMIT: &str = "\u{0}hlimit";
+/// The element counter passed to the callback (`fn(value, counter)`).
+const HELPER_COUNTER: &str = "\u{0}hcounter";
+/// Set once the helper is exhausted/closed; further `next` returns `{done:true}`.
+const HELPER_DONE: &str = "\u{0}hdone";
+/// For flatMap: the current inner iterator being drained (absent when none).
+const HELPER_INNER: &str = "\u{0}hinner";
+const HELPER_INNER_NEXT: &str = "\u{0}hinnext";
+/// Hidden slots on the `Iterator` constructor caching the three helper-result
+/// prototypes (`%IteratorHelperPrototype%`, `%WrapForValidIteratorPrototype%`,
+/// `%ConcatIteratorPrototype%`).
+const ITER_HELPER_PROTO_SLOT: &str = "\u{0}ihproto";
+const ITER_WRAP_PROTO_SLOT: &str = "\u{0}iwproto";
+const ITER_CONCAT_PROTO_SLOT: &str = "\u{0}icproto";
+const ITER_ZIP_PROTO_SLOT: &str = "\u{0}izproto";
+/// Reserved hidden slots for a lazy `Iterator.zip`/`zipKeyed` result: the array
+/// of open underlying iterators, their cached `next` methods, the live/done
+/// flags, the mode (0=shortest,1=longest,2=strict), the padding array, the
+/// (optional) result keys (zipKeyed), and the done flag.
+const ZIP_ITERS: &str = "\u{0}zits";
+const ZIP_NEXTS: &str = "\u{0}znexts";
+const ZIP_MODE: &str = "\u{0}zmode";
+const ZIP_PADDING: &str = "\u{0}zpad";
+const ZIP_KEYS: &str = "\u{0}zkeys";
+const ZIP_DONE: &str = "\u{0}zdone";
+/// Per-iterator "already finished" flags (longest mode), as a parallel array.
+const ZIP_FINISHED: &str = "\u{0}zfin";
 /// Reserved hidden keys for a bound function (`Function.prototype.bind`).
 /// Hidden slot holding a primitive-wrapper object's boxed value, and its
 /// constructor id (for `instanceof`).
@@ -2157,10 +2238,22 @@ impl<'a> Interp<'a> {
         // `%IteratorPrototype%[Symbol.iterator]` returns `this` (a native bound to
         // the receiver at call time).
         let self_iter = self.realm.new_native(N_ITERATOR_PROTO_SELF);
+        self.install_fn_name_length(self_iter, "[Symbol.iterator]", 0);
         let iter_sym = self.well_known_symbol("iterator");
         let iter_key = self.member_key(iter_sym);
         self.realm
             .set_hidden_property(iter_proto, &iter_key, NanBox::handle(self_iter.to_raw()));
+        // `%IteratorPrototype%[Symbol.dispose]()` — invokes the iterator's `return`.
+        let dispose_native = self.realm.new_native(N_ITERATOR_DISPOSE);
+        self.install_fn_name_length(dispose_native, "[Symbol.dispose]", 0);
+        let dispose_sym = self.well_known_symbol("dispose");
+        let dispose_key = self.member_key(dispose_sym);
+        self.realm.set_property(
+            iter_proto,
+            &dispose_key,
+            NanBox::handle(dispose_native.to_raw()),
+        );
+        self.realm.mark_hidden(iter_proto, &dispose_key);
         // The ES2025 helper methods as first-class functions on `%IteratorPrototype%`
         // (so `Iterator.prototype.map`, `it.map(...)` resolve through the chain).
         for &name in ITERATOR_PROTO_METHODS {
@@ -2182,6 +2275,111 @@ impl<'a> Interp<'a> {
             NanBox::handle(iter_proto.to_raw()),
         );
         self.realm.mark_hidden(iterator_ctor, "prototype");
+        // `Iterator.concat` — the `iterator-sequencing` static (lazy concatenation).
+        let concat_fn = self.realm.new_native(N_ITERATOR_CONCAT);
+        self.install_fn_name_length(concat_fn, "concat", 0);
+        self.realm
+            .set_property(iterator_ctor, "concat", NanBox::handle(concat_fn.to_raw()));
+        self.realm.mark_hidden(iterator_ctor, "concat");
+        // `Iterator.zip` / `Iterator.zipKeyed` — the `joint-iteration` statics.
+        let zip_fn = self.realm.new_native(N_ITERATOR_ZIP);
+        self.install_fn_name_length(zip_fn, "zip", 1);
+        self.realm
+            .set_property(iterator_ctor, "zip", NanBox::handle(zip_fn.to_raw()));
+        self.realm.mark_hidden(iterator_ctor, "zip");
+        let zipk_fn = self.realm.new_native(N_ITERATOR_ZIP_KEYED);
+        self.install_fn_name_length(zipk_fn, "zipKeyed", 1);
+        self.realm
+            .set_property(iterator_ctor, "zipKeyed", NanBox::handle(zipk_fn.to_raw()));
+        self.realm.mark_hidden(iterator_ctor, "zipKeyed");
+        // `%IteratorHelperPrototype%` — the prototype of every lazy helper
+        // (`map`/`filter`/`take`/`drop`/`flatMap` results). Inherits
+        // `%IteratorPrototype%`; carries `next`/`return` and a `Symbol.toStringTag`.
+        let helper_proto = self.realm.new_object_with_proto(Some(iter_proto));
+        let hn = self.realm.new_native(N_ITER_HELPER_NEXT);
+        self.install_fn_name_length(hn, "next", 0);
+        self.realm
+            .set_property(helper_proto, "next", NanBox::handle(hn.to_raw()));
+        self.realm.mark_hidden(helper_proto, "next");
+        let hr = self.realm.new_native(N_ITER_HELPER_RETURN);
+        self.install_fn_name_length(hr, "return", 0);
+        self.realm
+            .set_property(helper_proto, "return", NanBox::handle(hr.to_raw()));
+        self.realm.mark_hidden(helper_proto, "return");
+        let tag = self.new_str("Iterator Helper");
+        let tt_sym = self.well_known_symbol("toStringTag");
+        let tt_key = self.member_key(tt_sym);
+        self.realm.set_property(helper_proto, &tt_key, tag);
+        self.realm.mark_hidden(helper_proto, &tt_key);
+        self.realm.set_readonly_property(helper_proto, &tt_key);
+        // `%WrapForValidIteratorPrototype%` — the prototype of the `Iterator.from`
+        // wrapper. Inherits `%IteratorPrototype%`; carries `next`/`return`.
+        let wrap_proto = self.realm.new_object_with_proto(Some(iter_proto));
+        let wn = self.realm.new_native(N_ITER_WRAP_NEXT);
+        self.install_fn_name_length(wn, "next", 0);
+        self.realm
+            .set_property(wrap_proto, "next", NanBox::handle(wn.to_raw()));
+        self.realm.mark_hidden(wrap_proto, "next");
+        let wr = self.realm.new_native(N_ITER_WRAP_RETURN);
+        self.install_fn_name_length(wr, "return", 0);
+        self.realm
+            .set_property(wrap_proto, "return", NanBox::handle(wr.to_raw()));
+        self.realm.mark_hidden(wrap_proto, "return");
+        // `%ConcatIteratorPrototype%` — the prototype of an `Iterator.concat` result.
+        let concat_proto = self.realm.new_object_with_proto(Some(iter_proto));
+        let cn = self.realm.new_native(N_ITER_CONCAT_NEXT);
+        self.install_fn_name_length(cn, "next", 0);
+        self.realm
+            .set_property(concat_proto, "next", NanBox::handle(cn.to_raw()));
+        self.realm.mark_hidden(concat_proto, "next");
+        let cr = self.realm.new_native(N_ITER_CONCAT_RETURN);
+        self.install_fn_name_length(cr, "return", 0);
+        self.realm
+            .set_property(concat_proto, "return", NanBox::handle(cr.to_raw()));
+        self.realm.mark_hidden(concat_proto, "return");
+        let ctag = self.new_str("Iterator Helper");
+        self.realm.set_property(concat_proto, &tt_key, ctag);
+        self.realm.mark_hidden(concat_proto, &tt_key);
+        self.realm.set_readonly_property(concat_proto, &tt_key);
+        // `%ZipIteratorPrototype%` — the prototype of an `Iterator.zip`/`zipKeyed`
+        // result.
+        let zip_proto = self.realm.new_object_with_proto(Some(iter_proto));
+        let zn = self.realm.new_native(N_ITER_ZIP_NEXT);
+        self.install_fn_name_length(zn, "next", 0);
+        self.realm
+            .set_property(zip_proto, "next", NanBox::handle(zn.to_raw()));
+        self.realm.mark_hidden(zip_proto, "next");
+        let zr = self.realm.new_native(N_ITER_ZIP_RETURN);
+        self.install_fn_name_length(zr, "return", 0);
+        self.realm
+            .set_property(zip_proto, "return", NanBox::handle(zr.to_raw()));
+        self.realm.mark_hidden(zip_proto, "return");
+        let ztag = self.new_str("Iterator Helper");
+        self.realm.set_property(zip_proto, &tt_key, ztag);
+        self.realm.mark_hidden(zip_proto, &tt_key);
+        self.realm.set_readonly_property(zip_proto, &tt_key);
+        self.realm.set_hidden_property(
+            iterator_ctor,
+            ITER_ZIP_PROTO_SLOT,
+            NanBox::handle(zip_proto.to_raw()),
+        );
+        // Stash the three helper prototypes as hidden slots on the Iterator
+        // constructor so the helper-building code can retrieve them.
+        self.realm.set_hidden_property(
+            iterator_ctor,
+            ITER_HELPER_PROTO_SLOT,
+            NanBox::handle(helper_proto.to_raw()),
+        );
+        self.realm.set_hidden_property(
+            iterator_ctor,
+            ITER_WRAP_PROTO_SLOT,
+            NanBox::handle(wrap_proto.to_raw()),
+        );
+        self.realm.set_hidden_property(
+            iterator_ctor,
+            ITER_CONCAT_PROTO_SLOT,
+            NanBox::handle(concat_proto.to_raw()),
+        );
         self.current
             .declare("Iterator", NanBox::handle(iterator_ctor.to_raw()));
         // The `WebAssembly` namespace, backed by the in-house WASM engine
@@ -2226,20 +2424,42 @@ impl<'a> Interp<'a> {
         // A minimal `Object.prototype` carrying the methods commonly invoked via
         // `Object.prototype.<m>.call(x)`. The receiver arrives as `this`.
         let obj_proto = self.realm.new_object();
-        for (name, id) in [
-            ("toString", N_OBJ_PROTO_TOSTRING),
-            ("toLocaleString", N_OBJ_PROTO_TOSTRING),
-            ("valueOf", N_OBJ_PROTO_VALUEOF),
-            ("hasOwnProperty", N_OBJ_PROTO_HASOWN),
-            ("isPrototypeOf", N_OBJ_PROTO_ISPROTOTYPEOF),
-            ("propertyIsEnumerable", N_OBJ_PROTO_PROPISENUM),
+        for (name, id, arity) in [
+            ("toString", N_OBJ_PROTO_TOSTRING, 0u32),
+            ("toLocaleString", N_OBJ_PROTO_TOSTRING, 0),
+            ("valueOf", N_OBJ_PROTO_VALUEOF, 0),
+            ("hasOwnProperty", N_OBJ_PROTO_HASOWN, 1),
+            ("isPrototypeOf", N_OBJ_PROTO_ISPROTOTYPEOF, 1),
+            ("propertyIsEnumerable", N_OBJ_PROTO_PROPISENUM, 1),
+            // Annex B legacy accessor-manipulation methods.
+            ("__defineGetter__", N_OBJ_DEFINE_GETTER, 2),
+            ("__defineSetter__", N_OBJ_DEFINE_SETTER, 2),
+            ("__lookupGetter__", N_OBJ_LOOKUP_GETTER, 1),
+            ("__lookupSetter__", N_OBJ_LOOKUP_SETTER, 1),
         ] {
             let f = self.realm.new_native(id);
+            self.install_fn_name_length(f, name, arity);
             self.realm
                 .set_property(obj_proto, name, NanBox::handle(f.to_raw()));
             // Non-enumerable, so inheriting objects don't surface them in for-in /
             // Object.keys.
             self.realm.mark_hidden(obj_proto, name);
+        }
+        // `Object.prototype.__proto__` (Annex B): an accessor pair
+        // `{ enumerable: false, configurable: true }` whose getter is the object's
+        // `[[GetPrototypeOf]]` and whose setter is `[[SetPrototypeOf]]`.
+        {
+            let getter = self.realm.new_native(N_OBJ_PROTO_GET);
+            self.install_fn_name_length(getter, "get __proto__", 0);
+            let setter = self.realm.new_native(N_OBJ_PROTO_SET);
+            self.install_fn_name_length(setter, "set __proto__", 1);
+            self.realm.define_accessor(
+                obj_proto,
+                "__proto__",
+                NanBox::handle(getter.to_raw()),
+                NanBox::handle(setter.to_raw()),
+            );
+            self.realm.mark_hidden(obj_proto, "__proto__");
         }
         if let Some(obj_ns) = self
             .current
@@ -2265,6 +2485,20 @@ impl<'a> Interp<'a> {
         // that dispatch on their `this`, so the classic `Array.prototype.slice.call`
         // / `String.prototype.X.call` / `Function.prototype.bind.call` idioms work.
         self.setup_first_class_prototype("Array", ARRAY_PROTO_METHODS);
+        // Record `%Array.prototype%` as the default `[[Prototype]]` of every dense
+        // array (so `Object.getPrototypeOf([])`, `[] instanceof Array`, and
+        // `"push" in []` resolve through the chain).
+        if let Some(arr_proto) = self
+            .current
+            .get("Array")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_array_proto_intrinsic(arr_proto);
+        }
         // `Array.prototype[Symbol.unscopables]` — a null-prototype object whose
         // own enumerable data properties (all `true`) name the methods excluded
         // from `with` statement scope. The property itself is non-enumerable,
@@ -2422,6 +2656,20 @@ impl<'a> Interp<'a> {
         }
         self.setup_regexp_prototype();
         self.setup_first_class_prototype("Function", FUNCTION_PROTO_METHODS);
+        // Record `%Function.prototype%` as the default `[[Prototype]]` of every
+        // ordinary/native callable (so `Object.getPrototypeOf(fn)` resolves to it
+        // instead of `null`).
+        if let Some(func_proto) = self
+            .current
+            .get("Function")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|f| self.realm.get_property(f, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_function_proto_intrinsic(func_proto);
+        }
         self.setup_first_class_prototype_id("Set", SET_PROTO_METHODS, N_SET_PROTO_FN);
         self.setup_first_class_prototype_id("Map", MAP_PROTO_METHODS, N_MAP_PROTO_FN);
         self.setup_first_class_prototype_id("WeakMap", WEAKMAP_PROTO_METHODS, N_WEAKMAP_PROTO_FN);
@@ -2447,6 +2695,10 @@ impl<'a> Interp<'a> {
                 .map(Handle::from_raw)
             {
                 self.install_to_string_tag(ns, tag);
+                // These namespace objects were created (via `install_namespace`)
+                // before `Object.prototype` existed, so link them now — their
+                // `[[Prototype]]` is `%Object.prototype%` (an ordinary object).
+                self.realm.set_object_proto(ns, Some(obj_proto));
             }
         }
         // `<ErrorCtor>.prototype` as a real object so `Error.prototype` /
@@ -2485,7 +2737,15 @@ impl<'a> Interp<'a> {
                 proto
             })
         {
-            for name in &ERROR_NAMES[1..N_GLOBAL_ERROR_COUNT] {
+            // Every standard error subclass that is exposed as a JS global:
+            // `Error`'s direct globals (`TypeError`…`AggregateError`) and the
+            // separately-registered `URIError`/`EvalError`. Each gets a
+            // `.prototype` inheriting `Error.prototype` with a `constructor`
+            // back-link and a non-enumerable `name`.
+            let mut subclass_names: Vec<&str> = ERROR_NAMES[1..N_GLOBAL_ERROR_COUNT].to_vec();
+            subclass_names.push("URIError");
+            subclass_names.push("EvalError");
+            for name in subclass_names {
                 if let Some(ctor) = self
                     .current
                     .get(name)
@@ -2501,9 +2761,22 @@ impl<'a> Interp<'a> {
                     let nm = self.new_str(name);
                     self.realm.set_property(proto, "name", nm);
                     self.realm.mark_hidden(proto, "name");
+                    let msg = self.new_str("");
+                    self.realm.set_property(proto, "message", msg);
+                    self.realm.mark_hidden(proto, "message");
                     self.realm
                         .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
                     self.realm.mark_hidden(ctor, "prototype");
+                    // `Object.getPrototypeOf(TypeError) === Error` (the subclass
+                    // constructor inherits `Error`'s static side).
+                    if let Some(error_ctor) = self
+                        .current
+                        .get("Error")
+                        .and_then(|v| v.as_handle())
+                        .map(Handle::from_raw)
+                    {
+                        self.realm.set_native_proto(ctor, error_ctor);
+                    }
                 }
             }
         }
@@ -3033,6 +3306,21 @@ impl<'a> Interp<'a> {
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
         let name = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
         let obj = self.realm.new_object();
+        // Link the error object to its constructor's `.prototype` (so
+        // `Object.getPrototypeOf(new TypeError) === TypeError.prototype`,
+        // `Object.prototype.toString` reports `[object Error]`, and the inherited
+        // `Error.prototype.toString`/`constructor` resolve).
+        if let Some(proto) = self
+            .current
+            .get(name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_object_proto(obj, Some(proto));
+        }
         let name_v = self.new_str(name);
         self.realm.set_property(obj, "name", name_v);
         let msg_str = match message {

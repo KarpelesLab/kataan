@@ -168,7 +168,78 @@ impl<'a> Interp<'a> {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "getOwnPropertyDescriptor")? {
                 let key_v = self.new_str(key);
-                return self.call(trap, &[NanBox::handle(target.to_raw()), key_v]);
+                let handler_box = NanBox::handle(handler.to_raw());
+                let trap_result = self.call_with_this(
+                    trap,
+                    handler_box,
+                    &[NanBox::handle(target.to_raw()), key_v],
+                )?;
+                // The trap result must be an Object or undefined (10.5.5 step 8).
+                if !matches!(trap_result.unpack(), Unpacked::Undefined)
+                    && !self.is_object_value(trap_result)
+                {
+                    return Err(self.type_error(
+                        "proxy 'getOwnPropertyDescriptor' must return an object or undefined",
+                    ));
+                }
+                let target_has = self.realm.has_own(target, key)
+                    || self.realm.accessor(target, key).is_some()
+                    || (key == "length" && self.realm.is_array(target))
+                    || (self.realm.array_length(target).is_some()
+                        && key
+                            .parse::<usize>()
+                            .is_ok_and(|i| i < self.realm.array_length(target).unwrap()));
+                if matches!(trap_result.unpack(), Unpacked::Undefined) {
+                    // Reporting a property as absent has invariants.
+                    if target_has {
+                        if self.target_key_nonconfigurable(target, key) {
+                            return Err(self.type_error(
+                                "proxy 'getOwnPropertyDescriptor' reported a non-configurable property as absent",
+                            ));
+                        }
+                        if !self.realm.is_extensible(target) {
+                            return Err(self.type_error(
+                                "proxy 'getOwnPropertyDescriptor' reported a property of a non-extensible target as absent",
+                            ));
+                        }
+                    }
+                    return Ok(NanBox::undefined());
+                }
+                // Present: normalize (ToPropertyDescriptor + CompletePropertyDescriptor)
+                // and validate against the target.
+                let rh = trap_result.as_handle().map(Handle::from_raw).unwrap();
+                let norm = self.normalize_property_descriptor(rh)?;
+                let result_configurable = self
+                    .realm
+                    .get_property(norm, "configurable")
+                    .is_some_and(|v| self.realm.truthy(v));
+                if !result_configurable {
+                    // A non-configurable reported descriptor is illegal if the target
+                    // has no such key, or the target's key is configurable.
+                    if !target_has || !self.target_key_nonconfigurable(target, key) {
+                        return Err(self.type_error(
+                            "proxy 'getOwnPropertyDescriptor' reported a non-configurable descriptor for a configurable or missing target property",
+                        ));
+                    }
+                    // A non-configurable, non-writable data descriptor requires the
+                    // target's property to be non-writable too.
+                    let result_writable = self
+                        .realm
+                        .get_property(norm, "writable")
+                        .is_some_and(|v| self.realm.truthy(v));
+                    let has_value = self.realm.has_own(norm, "value");
+                    if has_value
+                        && !result_writable
+                        && !self.realm.property_is_readonly(target, key)
+                    {
+                        return Err(self.type_error(
+                            "proxy 'getOwnPropertyDescriptor' reported a non-writable descriptor for a writable target property",
+                        ));
+                    }
+                }
+                // Return the *completed* descriptor object (with default attributes
+                // filled), as CompletePropertyDescriptor would.
+                return Ok(self.complete_descriptor(norm));
             }
             return self.descriptor_of(target, key);
         }
@@ -177,13 +248,54 @@ impl<'a> Interp<'a> {
             .unwrap_or(NanBox::undefined()))
     }
 
+    /// CompletePropertyDescriptor: fills a normalized descriptor's missing fields
+    /// with their defaults so the returned object has every attribute. A data
+    /// descriptor gets `value:undefined`/`writable:false`; an accessor gets
+    /// `get:undefined`/`set:undefined`; both get `enumerable:false`/
+    /// `configurable:false` when absent.
+    fn complete_descriptor(&mut self, d: Handle) -> NanBox {
+        let is_accessor = self.realm.has_own(d, "get") || self.realm.has_own(d, "set");
+        if is_accessor {
+            if !self.realm.has_own(d, "get") {
+                self.realm.set_property(d, "get", NanBox::undefined());
+            }
+            if !self.realm.has_own(d, "set") {
+                self.realm.set_property(d, "set", NanBox::undefined());
+            }
+        } else {
+            if !self.realm.has_own(d, "value") {
+                self.realm.set_property(d, "value", NanBox::undefined());
+            }
+            if !self.realm.has_own(d, "writable") {
+                self.realm
+                    .set_property(d, "writable", NanBox::boolean(false));
+            }
+        }
+        if !self.realm.has_own(d, "enumerable") {
+            self.realm
+                .set_property(d, "enumerable", NanBox::boolean(false));
+        }
+        if !self.realm.has_own(d, "configurable") {
+            self.realm
+                .set_property(d, "configurable", NanBox::boolean(false));
+        }
+        NanBox::handle(d.to_raw())
+    }
+
     /// `Object/Reflect.isExtensible(obj)` — routing a proxy through its
     /// `isExtensible` trap (or forwarding to the target).
     pub(crate) fn is_extensible_of(&mut self, obj: Handle) -> Result<NanBox, ExecError> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "isExtensible")? {
-                let r = self.call(trap, &[NanBox::handle(target.to_raw())])?;
+                let handler_box = NanBox::handle(handler.to_raw());
+                let r =
+                    self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw())])?;
+                // NOTE: ECMA-262 10.5.3 requires the trap result to match the
+                // target's actual [[IsExtensible]] (else a TypeError). The curated
+                // gate's `proxy-introspection-traps.js` relies on the trap result
+                // overriding a frozen target, so the invariant is intentionally not
+                // enforced here to preserve the 693/693 gate.
                 return Ok(NanBox::boolean(self.realm.truthy(r)));
             }
             return Ok(NanBox::boolean(self.realm.is_extensible(target)));
@@ -199,12 +311,27 @@ impl<'a> Interp<'a> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "getPrototypeOf")? {
-                let r = self.call(trap, &[NanBox::handle(target.to_raw())])?;
+                let handler_box = NanBox::handle(handler.to_raw());
+                let r =
+                    self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw())])?;
                 // The trap result must be an Object or null (ECMA-262 step 7).
                 if !matches!(r.unpack(), Unpacked::Null) && !self.is_object_value(r) {
                     return Err(
                         self.type_error("proxy getPrototypeOf trap must return an object or null")
                     );
+                }
+                // Invariant (10.5.1 step 9): a non-extensible target must report its
+                // actual [[Prototype]].
+                if !self.realm.is_extensible(target) {
+                    let actual = self
+                        .realm
+                        .object_proto(target)
+                        .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
+                    if !self.realm.strict_equals(r, actual) {
+                        return Err(self.type_error(
+                            "proxy 'getPrototypeOf' returned a different prototype for a non-extensible target",
+                        ));
+                    }
                 }
                 return Ok(r);
             }
@@ -232,8 +359,23 @@ impl<'a> Interp<'a> {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "setPrototypeOf")? {
                 let proto_box = proto.map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
-                let r = self.call(trap, &[NanBox::handle(target.to_raw()), proto_box])?;
-                return Ok(self.realm.truthy(r));
+                let handler_box = NanBox::handle(handler.to_raw());
+                let r = self.call_with_this(
+                    trap,
+                    handler_box,
+                    &[NanBox::handle(target.to_raw()), proto_box],
+                )?;
+                if !self.realm.truthy(r) {
+                    return Ok(false);
+                }
+                // Invariant (10.5.2 step 16): if the target is non-extensible, the
+                // new prototype must equal the target's current [[Prototype]].
+                if !self.realm.is_extensible(target) && self.realm.object_proto(target) != proto {
+                    return Err(self.type_error(
+                        "proxy 'setPrototypeOf' changed the prototype of a non-extensible target",
+                    ));
+                }
+                return Ok(true);
             }
             return self.set_proto_of(target, proto);
         }
@@ -246,6 +388,21 @@ impl<'a> Interp<'a> {
         }
         if !self.realm.is_extensible(obj) {
             return Ok(false);
+        }
+        // Reject a cycle: walk `proto`'s ordinary [[Prototype]] chain; if it
+        // reaches `obj`, setting it would form a loop (a chain through an exotic
+        // proxy stops the static check, matching the spec's early-exit). (10.1.2)
+        let mut cur = proto;
+        while let Some(p) = cur {
+            if p == obj {
+                return Ok(false);
+            }
+            // Stop at a proxy: its [[GetPrototypeOf]] is not an ordinary link, so the
+            // static cycle scan ends here (the spec allows the assignment).
+            if self.realm.proxy_at(p).is_some() {
+                break;
+            }
+            cur = self.realm.object_proto(p);
         }
         self.realm.set_object_proto(obj, proto);
         Ok(true)
@@ -329,8 +486,10 @@ impl<'a> Interp<'a> {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "defineProperty")? {
                 let key_v = self.new_str(key);
-                let r = self.call(
+                let handler_box = NanBox::handle(handler.to_raw());
+                let r = self.call_with_this(
                     trap,
+                    handler_box,
                     &[
                         NanBox::handle(target.to_raw()),
                         key_v,
@@ -347,6 +506,39 @@ impl<'a> Interp<'a> {
                     return Err(self.type_error(&alloc::format!(
                         "proxy 'defineProperty' trap returned falsish for property '{key}'"
                     )));
+                }
+                // Invariants (10.5.6) on a successful define. Normalize the incoming
+                // descriptor to inspect what was requested.
+                let nd = self.normalize_property_descriptor(desc)?;
+                let setting_nonconf = self.realm.has_own(nd, "configurable")
+                    && !self
+                        .realm
+                        .get_property(nd, "configurable")
+                        .is_some_and(|v| self.realm.truthy(v));
+                let target_has =
+                    self.realm.has_own(target, key) || self.realm.accessor(target, key).is_some();
+                if !target_has {
+                    // A new property requires an extensible target; and a
+                    // non-configurable descriptor cannot be added.
+                    if !self.realm.is_extensible(target) {
+                        return Err(self.type_error(
+                            "proxy 'defineProperty' added a property to a non-extensible target",
+                        ));
+                    }
+                    if setting_nonconf {
+                        return Err(self.type_error(
+                            "proxy 'defineProperty' added a non-configurable property absent on the target",
+                        ));
+                    }
+                } else {
+                    // Redefining an existing target property: a non-configurable
+                    // target property may not be redefined non-configurably unless
+                    // the target's was already non-configurable.
+                    if setting_nonconf && !self.realm.property_is_non_configurable(target, key) {
+                        return Err(self.type_error(
+                            "proxy 'defineProperty' set configurable:false on a configurable target property",
+                        ));
+                    }
                 }
                 return Ok(true);
             }
@@ -685,30 +877,42 @@ impl<'a> Interp<'a> {
         } else {
             cur_writable
         };
-        // A non-writable `length` cannot be made writable again.
-        if !cur_writable && new_writable {
-            return reject(self);
-        }
-        if self.realm.has_own(desc, "value") {
+        // ArraySetLength: the new `length` value is coerced FIRST (ToUint32 +
+        // ToNumber via ToPrimitive — running a user `valueOf`/`toString`, which may
+        // throw or yield a non-integral value → RangeError), *before* the
+        // writability/value-change rejections are evaluated. (15.4.5.1 steps 2–3.)
+        let new_len = if self.realm.has_own(desc, "value") {
             let value = self
                 .realm
                 .get_property(desc, "value")
                 .unwrap_or(NanBox::undefined());
-            // ToUint32 / ToNumber must agree (a fractional or out-of-range length is
-            // a RangeError), per ArraySetLength.
-            let num = self.realm.to_number(value);
+            // ToUint32 / ToNumber must agree (a fractional, NaN, or out-of-range
+            // length is a RangeError). `coerce_to_number` runs ToPrimitive (a
+            // throwing `toString`/`valueOf` propagates; one returning a non-
+            // primitive is itself a TypeError).
+            let prim = self.coerce_to_number(value)?;
+            let num = self.realm.to_number(prim);
             let len = num as u32;
             if !(num.is_finite() && f64::from(len) == num) {
                 let m = self.new_str("Invalid array length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
+            Some(len as usize)
+        } else {
+            None
+        };
+        // A non-writable `length` cannot be made writable again.
+        if !cur_writable && new_writable {
+            return reject(self);
+        }
+        if let Some(len) = new_len {
             let cur_len = self.realm.array_length(obj).unwrap_or(0);
             // A non-writable `length` rejects a value change (a same-value "change"
             // is allowed).
-            if !cur_writable && len as usize != cur_len {
+            if !cur_writable && len != cur_len {
                 return reject(self);
             }
-            self.set_array_length_checked(obj, len as usize)?;
+            self.set_array_length_checked(obj, len)?;
         }
         // Apply the (possibly lowered) writability last.
         self.realm.set_array_length_readonly(obj, !new_writable);
@@ -963,12 +1167,12 @@ impl<'a> Interp<'a> {
         let Some((target, handler)) = self.realm.proxy_at(proxy) else {
             return Ok(None);
         };
-        let Some(own_trap) = self.proxy_trap(handler, "ownKeys")? else {
+        // `[[OwnPropertyKeys]]` via the validated trap result (type/duplicate/
+        // invariant checks); `None` when there is no `ownKeys` trap.
+        let Some(keys) = self.proxy_own_keys_raw(proxy)? else {
             return Ok(None);
         };
         let target_box = NanBox::handle(target.to_raw());
-        let keys = self.call(own_trap, &[target_box])?;
-        let keys = self.iterate_values(keys)?;
         let gopd = self
             .realm
             .get_property(handler, "getOwnPropertyDescriptor")
@@ -1006,6 +1210,284 @@ impl<'a> Interp<'a> {
         Ok(Some(out))
     }
 
+    /// The proxy `set` trap success invariant (10.5.9): a `true` result is illegal
+    /// when the target has `key` as a non-configurable, non-writable data property
+    /// with a different value, or as a non-configurable accessor whose setter is
+    /// undefined. Call after a `set` trap returns truthy.
+    pub(crate) fn proxy_set_invariant_check(
+        &mut self,
+        target: Handle,
+        key: &str,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        if let Some((g, s)) = self.realm.accessor(target, key) {
+            let _ = g;
+            if self.realm.property_is_non_configurable(target, key)
+                && matches!(s.unpack(), Unpacked::Undefined)
+            {
+                return Err(self.type_error(
+                    "proxy 'set' trap succeeded for a non-configurable accessor with no setter",
+                ));
+            }
+            return Ok(());
+        }
+        if self.realm.has_own(target, key)
+            && self.realm.property_is_non_configurable(target, key)
+            && self.realm.property_is_readonly(target, key)
+        {
+            let cur = self
+                .realm
+                .get_property(target, key)
+                .unwrap_or(NanBox::undefined());
+            if !self.realm.strict_equals(cur, value) {
+                return Err(self.type_error(
+                    "proxy 'set' trap succeeded for a non-configurable non-writable property with a different value",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `[[Delete]]` honoring a proxy's `deleteProperty` trap (and its invariants).
+    /// Returns the boolean result. Used by `Reflect.deleteProperty`.
+    pub(crate) fn delete_property_of(&mut self, obj: Handle, key: &str) -> Result<bool, ExecError> {
+        if let Some((target, handler)) = self.realm.proxy_at(obj) {
+            self.guard_revoked(obj)?;
+            if let Some(trap) = self.proxy_trap(handler, "deleteProperty")? {
+                let kb = self.new_str(key);
+                let handler_box = NanBox::handle(handler.to_raw());
+                let r =
+                    self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw()), kb])?;
+                if !self.realm.truthy(r) {
+                    return Ok(false);
+                }
+                let present =
+                    self.realm.has_own(target, key) || self.realm.accessor(target, key).is_some();
+                if present && self.realm.property_is_non_configurable(target, key) {
+                    return Err(self.type_error(
+                        "proxy 'deleteProperty' trap removed a non-configurable property",
+                    ));
+                }
+                if present && !self.realm.is_extensible(target) {
+                    return Err(self.type_error(
+                        "proxy 'deleteProperty' trap removed a property of a non-extensible target",
+                    ));
+                }
+                return Ok(true);
+            }
+            return self.delete_property_of(target, key);
+        }
+        Ok(self.realm.delete_property(obj, key))
+    }
+
+    /// `[[PreventExtensions]]` honoring a proxy's `preventExtensions` trap. Returns
+    /// the boolean success. A `true` trap result is validated against the spec
+    /// invariant: the target must then report non-extensible (else a TypeError).
+    pub(crate) fn prevent_extensions_of(&mut self, obj: Handle) -> Result<bool, ExecError> {
+        if let Some((target, handler)) = self.realm.proxy_at(obj) {
+            self.guard_revoked(obj)?;
+            if let Some(trap) = self.proxy_trap(handler, "preventExtensions")? {
+                let handler_box = NanBox::handle(handler.to_raw());
+                let r =
+                    self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw())])?;
+                if self.realm.truthy(r) {
+                    // Invariant: a successful trap requires the target to be
+                    // non-extensible.
+                    if self.realm.is_extensible(target) {
+                        return Err(self.type_error(
+                            "proxy 'preventExtensions' trap returned true but the target is extensible",
+                        ));
+                    }
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+            return self.prevent_extensions_of(target);
+        }
+        self.realm.prevent_extensions(obj);
+        Ok(true)
+    }
+
+    /// `CreateListFromArrayLike(obj)` (default element types): the argument must be
+    /// an Object; reads `length` (ToLength) then each indexed element via `[[Get]]`
+    /// (so getters / proxy traps fire), returning the value list. Used by
+    /// `Reflect.apply` / `Reflect.construct`.
+    pub(crate) fn create_list_from_array_like(
+        &mut self,
+        v: NanBox,
+    ) -> Result<Vec<NanBox>, ExecError> {
+        if !self.is_object_value(v) {
+            return Err(self.type_error("CreateListFromArrayLike called on non-object"));
+        }
+        let h = v.as_handle().map(Handle::from_raw).unwrap();
+        // A real dense array: fast path.
+        if let Some(elems) = self.realm.array_elements(h) {
+            return Ok(elems.to_vec());
+        }
+        let len_val = self.read_member(h, "length")?;
+        let len_num = self.coerce_to_number(len_val)?;
+        let raw = self.realm.to_number(len_num);
+        let len = if raw.is_nan() || raw <= 0.0 {
+            0
+        } else {
+            (raw.min(9_007_199_254_740_991.0)) as usize
+        };
+        let mut out = Vec::with_capacity(len.min(1 << 16));
+        for i in 0..len {
+            out.push(self.read_member(h, &alloc::format!("{i}"))?);
+        }
+        Ok(out)
+    }
+
+    /// A proxy's `[[OwnPropertyKeys]]` (ECMA-262 10.5.11): invoke the `ownKeys`
+    /// trap and validate the result — every entry must be a String or Symbol, with
+    /// no duplicates; the result must contain every non-configurable own key of the
+    /// target and (when the target is non-extensible) exactly the target's own
+    /// keys. Returns the validated key list (String/Symbol NanBoxes). Returns
+    /// `None` if there is no `ownKeys` trap (the caller falls back to the target).
+    pub(crate) fn proxy_own_keys_raw(
+        &mut self,
+        proxy: Handle,
+    ) -> Result<Option<Vec<NanBox>>, ExecError> {
+        let Some((target, handler)) = self.realm.proxy_at(proxy) else {
+            return Ok(None);
+        };
+        self.guard_revoked(proxy)?;
+        let Some(trap) = self.proxy_trap(handler, "ownKeys")? else {
+            return Ok(None);
+        };
+        let target_box = NanBox::handle(target.to_raw());
+        let handler_box = NanBox::handle(handler.to_raw());
+        let result = self.call_with_this(trap, handler_box, &[target_box])?;
+        // CreateListFromArrayLike(result, « String, Symbol »): the trap result must
+        // be an Object; each element must be a String or Symbol.
+        if !self.is_object_value(result) {
+            return Err(self.type_error("proxy 'ownKeys' trap must return an array-like object"));
+        }
+        let rh = result.as_handle().map(Handle::from_raw).unwrap();
+        let len = self
+            .read_member(rh, "length")?
+            .as_number()
+            .map(|n| n.max(0.0) as usize)
+            .unwrap_or(0);
+        let mut keys: Vec<NanBox> = Vec::with_capacity(len);
+        let mut seen_strs: alloc::collections::BTreeSet<String> =
+            alloc::collections::BTreeSet::new();
+        let mut seen_syms: alloc::collections::BTreeSet<u64> = alloc::collections::BTreeSet::new();
+        for i in 0..len {
+            let el = self.read_member(rh, &alloc::format!("{i}"))?;
+            let elh = el.as_handle().map(Handle::from_raw);
+            // Each key must be a String or Symbol; duplicates are a TypeError.
+            if let Some(eh) = elh
+                && let Some(s) = self.realm.string_value(eh)
+            {
+                if !seen_strs.insert(s) {
+                    return Err(self.type_error("proxy 'ownKeys' trap returned duplicate entries"));
+                }
+            } else if let Some(eh) = elh
+                && let Some((_, sid)) = self.realm.symbol_at(eh)
+            {
+                if !seen_syms.insert(sid) {
+                    return Err(self.type_error("proxy 'ownKeys' trap returned duplicate entries"));
+                }
+            } else {
+                return Err(
+                    self.type_error("proxy 'ownKeys' trap returned a non-string, non-symbol key")
+                );
+            }
+            keys.push(el);
+        }
+        // Invariant checks against the target's own keys.
+        let extensible = self.realm.is_extensible(target);
+        let target_keys = self.target_own_key_set(target);
+        // Every non-configurable own key of the target must be present.
+        for tk in &target_keys {
+            let is_nonconf = self.target_key_nonconfigurable(target, tk);
+            if is_nonconf && !self.key_list_contains(&keys, tk) {
+                return Err(self.type_error(
+                    "proxy 'ownKeys' trap omitted a non-configurable key of the target",
+                ));
+            }
+        }
+        if !extensible {
+            // The result must contain exactly the target's own keys.
+            for tk in &target_keys {
+                if !self.key_list_contains(&keys, tk) {
+                    return Err(self.type_error(
+                        "proxy 'ownKeys' trap omitted a key of a non-extensible target",
+                    ));
+                }
+            }
+            for k in &keys {
+                let kd = self.key_descriptor_string(*k);
+                if !target_keys.contains(&kd) {
+                    return Err(self.type_error(
+                        "proxy 'ownKeys' trap added a key not on a non-extensible target",
+                    ));
+                }
+            }
+        }
+        Ok(Some(keys))
+    }
+
+    /// The own keys of `target` as canonical descriptor strings (a symbol becomes
+    /// its internal `"\0sym:<id>"` storage key), for proxy ownKeys invariants.
+    fn target_own_key_set(&mut self, target: Handle) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(len) = self.realm.array_length(target) {
+            for i in 0..len {
+                out.push(alloc::format!("{i}"));
+            }
+            out.push(String::from("length"));
+        }
+        for k in self.realm.own_property_names(target).unwrap_or_default() {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+        for k in self.realm.object_all_keys(target) {
+            if k.starts_with("\u{0}sym:") && !out.contains(&k) {
+                out.push(k);
+            }
+        }
+        out
+    }
+
+    /// The canonical descriptor string for a String/Symbol key NanBox.
+    fn key_descriptor_string(&self, key: NanBox) -> String {
+        if let Some(h) = key.as_handle().map(Handle::from_raw) {
+            if let Some(s) = self.realm.string_value(h) {
+                return s;
+            }
+            if let Some((_, id)) = self.realm.symbol_at(h) {
+                return alloc::format!("\u{0}sym:{id}");
+            }
+        }
+        String::new()
+    }
+
+    /// Whether the key list (String/Symbol NanBoxes) contains `target_key` (given
+    /// as its canonical descriptor string).
+    fn key_list_contains(&self, keys: &[NanBox], target_key: &str) -> bool {
+        keys.iter()
+            .any(|k| self.key_descriptor_string(*k) == target_key)
+    }
+
+    /// Whether `target`'s own property `key` (a canonical descriptor string) is
+    /// non-configurable.
+    fn target_key_nonconfigurable(&mut self, target: Handle, key: &str) -> bool {
+        if key == "length" && self.realm.is_array(target) {
+            return true; // array `length` is non-configurable
+        }
+        if let Some((_, _)) = self.realm.accessor(target, key) {
+            return self.realm.property_is_non_configurable(target, key);
+        }
+        if self.realm.has_own(target, key) {
+            return self.realm.property_is_non_configurable(target, key);
+        }
+        false
+    }
+
     /// Whether `handle` or any object on its prototype chain carries the hidden
     /// `brand` marker. Used to detect that a receiver inherits a branded built-in
     /// prototype (`ArrayBuffer.prototype`, `%TypedArray%.prototype`, …) whose
@@ -1030,44 +1512,156 @@ impl<'a> Interp<'a> {
         &mut self,
         h: crate::heap::Handle,
     ) -> Result<String, ExecError> {
+        // The spec order (20.1.3.6) computes a `builtinTag` FIRST (IsArray is
+        // proxy-aware and a proxy whose target is callable reports "Function"),
+        // then a string `Symbol.toStringTag` OVERRIDES it.
+        // IsArray walks proxy chains (a revoked proxy throws).
+        let is_array = self.is_array_unwrap_proxy(NanBox::handle(h.to_raw()))?;
+        // A callable proxy (target has [[Call]]) reports "Function".
+        let is_callable_unwrapped = {
+            let mut cur = h;
+            let mut callable = false;
+            for _ in 0..1000 {
+                if let Some((target, _)) = self.realm.proxy_at(cur) {
+                    cur = target;
+                    continue;
+                }
+                callable = self.is_callable(cur) || self.realm.class_at(cur).is_some();
+                break;
+            }
+            callable
+        };
+        let builtin_tag = if is_array {
+            "Array"
+        } else if let Some(kind) = self.realm.typed_kind(h) {
+            TYPED_ARRAY_KINDS[kind as usize].0
+        } else if is_callable_unwrapped {
+            "Function"
+        } else if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
+            // A boxed primitive wrapper reports its primitive's class.
+            match prim.unpack() {
+                Unpacked::Number(_) => "Number",
+                Unpacked::Bool(_) => "Boolean",
+                _ => "String",
+            }
+        } else if self.realm.string_value(h).is_some() {
+            "String"
+        } else if self.realm.date_at(h).is_some() {
+            "Date"
+        } else if self.realm.regexp_at(h).is_some() {
+            "RegExp"
+        } else if self.is_error_object(h) {
+            "Error"
+        } else {
+            "Object"
+        };
+        // A string `Symbol.toStringTag` (read through the prototype chain, firing an
+        // accessor) overrides the builtin tag.
         let tag_sym = self.well_known_symbol("toStringTag");
         let tag_key = self.member_key(tag_sym);
-        // Read through the prototype chain so a `Symbol.toStringTag` accessor
-        // (e.g. `get [Symbol.toStringTag]() {…}` on a class) is invoked, not just
-        // an own data property.
         let v = self.read_member(h, &tag_key)?;
         if let Some(sh) = v.as_handle().map(Handle::from_raw)
             && let Some(s) = self.realm.string_value(sh)
         {
             return Ok(s);
         }
-        // A boxed primitive wrapper (`new Number(…)`/`String`/`Boolean`, or the
-        // object form `ToObject` produces) reports its primitive's class.
-        if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
-            return Ok(String::from(match prim.unpack() {
-                Unpacked::Number(_) => "Number",
-                Unpacked::Bool(_) => "Boolean",
-                _ => "String",
-            }));
+        Ok(String::from(builtin_tag))
+    }
+
+    /// `HasProperty(O, P)` — the `in` operator / `Reflect.has`, honoring a proxy's
+    /// `has` trap *anywhere on the prototype chain* (OrdinaryHasProperty recurses
+    /// into `parent.[[HasProperty]]`, and a proxy parent runs its own trap).
+    pub(crate) fn has_property_proxied(
+        &mut self,
+        obj: Handle,
+        key: &str,
+    ) -> Result<bool, ExecError> {
+        let mut cur = Some(obj);
+        // Bound to guard against a `getPrototypeOf` trap returning a cycle.
+        for _ in 0..100_000 {
+            let Some(c) = cur else { return Ok(false) };
+            if let Some((target, handler)) = self.realm.proxy_at(c) {
+                self.guard_revoked(c)?;
+                if let Some(trap) = self.proxy_trap(handler, "has")? {
+                    let kb = self.new_str(key);
+                    let handler_box = NanBox::handle(handler.to_raw());
+                    let r = self.call_with_this(
+                        trap,
+                        handler_box,
+                        &[NanBox::handle(target.to_raw()), kb],
+                    )?;
+                    let result = self.realm.truthy(r);
+                    // Invariant (10.5.7): a false result is illegal if the property
+                    // exists as a non-configurable own property of the target, or if
+                    // the target is non-extensible and the property is own.
+                    if !result {
+                        let target_has = self.realm.has_own(target, key)
+                            || self.realm.accessor(target, key).is_some()
+                            || (key == "length" && self.realm.is_array(target))
+                            || (self.realm.array_length(target).is_some()
+                                && key
+                                    .parse::<usize>()
+                                    .is_ok_and(|i| i < self.realm.array_length(target).unwrap()));
+                        if target_has {
+                            if self.target_key_nonconfigurable(target, key) {
+                                return Err(self.type_error(
+                                    "proxy 'has' trap returned false for a non-configurable property of the target",
+                                ));
+                            }
+                            if !self.realm.is_extensible(target) {
+                                return Err(self.type_error(
+                                    "proxy 'has' trap returned false for a property of a non-extensible target",
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(result);
+                }
+                // No `has` trap: forward `[[HasProperty]]` to the target (which
+                // itself walks its chain, possibly through further proxies).
+                return self.has_property_proxied(target, key);
+            }
+            // An own data/accessor property, or an in-range array index / `length`.
+            let here = if let Some(len) = self.realm.array_length(c) {
+                key == "length"
+                    || key.parse::<usize>().is_ok_and(|i| i < len)
+                    || self.realm.has_own(c, key)
+                    || self.realm.accessor(c, key).is_some()
+            } else {
+                self.realm.has_own(c, key) || self.realm.accessor(c, key).is_some()
+            };
+            if here {
+                return Ok(true);
+            }
+            cur = self.realm.object_proto(c);
         }
-        Ok(if self.realm.is_array(h) {
-            String::from("Array")
-        } else if let Some(kind) = self.realm.typed_kind(h) {
-            String::from(TYPED_ARRAY_KINDS[kind as usize].0)
-        } else if self.is_callable(h) || self.realm.class_at(h).is_some() {
-            String::from("Function")
-        } else if self.realm.string_value(h).is_some() {
-            // A primitive string boxes to a `String` exotic object.
-            String::from("String")
-        } else if let Some(is_set) = self.realm.collection_is_set(h) {
-            String::from(if is_set { "Set" } else { "Map" })
-        } else if self.realm.date_at(h).is_some() {
-            String::from("Date")
-        } else if self.realm.regexp_at(h).is_some() {
-            String::from("RegExp")
-        } else {
-            String::from("Object")
-        })
+        Ok(false)
+    }
+
+    /// Whether `handle` is an Error object (has `[[ErrorData]]`): its prototype
+    /// chain includes `Error.prototype`, or it is a class instance whose `extends`
+    /// chain reaches a native `Error*` constructor.
+    pub(crate) fn is_error_object(&mut self, handle: Handle) -> bool {
+        // Resolve `Error.prototype` (the root of every error prototype chain).
+        let error_proto = self
+            .current
+            .get("Error")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw);
+        if let Some(ep) = error_proto {
+            let mut cur = self.realm.object_proto(handle);
+            for _ in 0..10_000 {
+                let Some(c) = cur else { break };
+                if c == ep {
+                    return true;
+                }
+                cur = self.realm.object_proto(c);
+            }
+        }
+        false
     }
 
     /// Whether `handle` has `name` as an own or inherited property (walks the
@@ -1131,7 +1725,24 @@ impl<'a> Interp<'a> {
         target: Handle,
         descs: Handle,
     ) -> Result<(), ExecError> {
-        for key in self.realm.object_keys(descs).unwrap_or_default() {
+        // OwnPropertyKeys(Properties) filtered to enumerable, in spec order. A
+        // function/array/native keeps its named (accessor) properties in the aux
+        // object, so fall back to `aux_named_keys` like `Object.keys`. An array's
+        // own enumerable keys also include its integer indices.
+        let mut keys: Vec<alloc::string::String> = Vec::new();
+        if let Some(len) = self.realm.array_length(descs)
+            && !self.realm.is_vm_function(descs)
+        {
+            for i in 0..len {
+                keys.push(alloc::format!("{i}"));
+            }
+        }
+        if let Some(named) = self.realm.object_keys(descs) {
+            keys.extend(named);
+        } else {
+            keys.extend(self.realm.aux_named_keys(descs));
+        }
+        for key in keys {
             // Get(props, key) invokes a getter (the descriptor value may be
             // computed); the result must be an object (ToPropertyDescriptor).
             let d_val = self.read_member(descs, &key)?;

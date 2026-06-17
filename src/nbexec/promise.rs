@@ -22,6 +22,32 @@ impl<'a> Interp<'a> {
         self.realm
             .set_hidden_property(obj, GEN_IDX, NanBox::number(0.0));
         self.realm.set_hidden_property(obj, GEN_RET, ret);
+        // Expose `next`/`return` as real (non-enumerable) methods so the iterator
+        // is a valid GetIteratorDirect target — readable once and callable by the
+        // lazy ES2025 iterator helpers — and `typeof gen.next === "function"`.
+        let next = self.realm.new_native(N_GEN_ITER_NEXT);
+        self.realm
+            .set_property(obj, "next", NanBox::handle(next.to_raw()));
+        self.realm.mark_hidden(obj, "next");
+        let ret_fn = self.realm.new_native(N_GEN_ITER_RETURN);
+        self.realm
+            .set_property(obj, "return", NanBox::handle(ret_fn.to_raw()));
+        self.realm.mark_hidden(obj, "return");
+        // Link the iterator's `[[Prototype]]` to `%IteratorPrototype%` so it is an
+        // `instanceof Iterator`, inherits the helper methods and `Symbol.dispose`,
+        // and `Object.getPrototypeOf(arrayIterator)`'s chain reaches it (reflection
+        // tests). Falls back to the default object proto before Iterator is set up.
+        if let Some(iter_proto) = self
+            .current
+            .get("Iterator")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_object_proto(obj, Some(iter_proto));
+        }
         NanBox::handle(obj.to_raw())
     }
 

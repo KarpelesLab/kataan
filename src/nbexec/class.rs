@@ -154,12 +154,18 @@ impl<'a> Interp<'a> {
                 (None, None)
             } else {
                 match sval.as_handle().map(|r| (sval, Handle::from_raw(r))) {
-                    Some((_, h)) if self.realm.class_at(h).is_some() => (None, None),
+                    // `class D extends C {}` → `getPrototypeOf(D) === C` (the
+                    // constructor inherits the superclass's static members).
+                    Some((_, h)) if self.realm.class_at(h).is_some() => {
+                        self.realm.set_native_proto(handle, h);
+                        (None, None)
+                    }
                     Some((_, h)) if self.realm.native_at(h).is_some() => {
+                        self.realm.set_native_proto(handle, h);
                         (self.realm.native_at(h), None)
                     }
                     // A callable ordinary function used as a superclass — only if it
-                    // is actually a constructor.
+                    // is actually a constructor (its prototype is linked below).
                     Some((v, h)) if self.is_callable(h) && self.is_constructor_value(v) => {
                         (None, Some(v))
                     }
@@ -502,6 +508,34 @@ impl<'a> Interp<'a> {
     /// the engine copies methods directly onto instances at `new` time, but a real
     /// prototype object is still required for `C.prototype.m`, `C.prototype[k]`,
     /// accessor reads, and prototype-chain reflection.
+    /// The global constructor handle for a native built-in id (an `extends`-able
+    /// native superclass: the Error family, `Iterator`, …). The Error family
+    /// resolves by `ERROR_NAMES`; any other native is found by scanning the global
+    /// bindings for the callable whose native id matches.
+    fn native_ctor_by_id(&mut self, id: u16) -> Option<Handle> {
+        if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
+            let name = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
+            return self
+                .current
+                .get(name)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw);
+        }
+        // Known single-name natives.
+        for name in ["Iterator"] {
+            if let Some(h) = self
+                .current
+                .get(name)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                && self.realm.native_at(h) == Some(id)
+            {
+                return Some(h);
+            }
+        }
+        None
+    }
+
     pub(crate) fn class_prototype(&mut self, class_id: u32, class_handle: Handle) -> Handle {
         if let Some(p) = self.realm.class_prototype_cached(class_id) {
             return p;
@@ -525,6 +559,19 @@ impl<'a> Interp<'a> {
                 && let Some(spp) = sp.as_handle().map(Handle::from_raw)
             {
                 self.realm.set_object_proto(proto, Some(spp));
+            }
+        } else if let Some(super_id) = self.class_native_super[class_id as usize] {
+            // `class D extends Error|Iterator|… {}` (a native superclass):
+            // `D.prototype.[[Prototype]]` is `NativeCtor.prototype`. Resolve the
+            // constructor by its global name (Error family by ERROR_NAMES, else by
+            // scanning the global bindings for the native with this id).
+            let super_proto = self
+                .native_ctor_by_id(super_id)
+                .and_then(|c| self.realm.get_property(c, "prototype"))
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw);
+            if let Some(sp) = super_proto {
+                self.realm.set_object_proto(proto, Some(sp));
             }
         }
 
