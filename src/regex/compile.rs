@@ -1,7 +1,7 @@
 //! Compiles the regex AST to the backtracking VM's instruction list.
 
-use super::parser::{ClassItem, Node, RegexError};
-use super::vm::{Assert, Class, ClassMember, Inst};
+use super::parser::{ClassItem, ClassSetExpr, Node, RegexError};
+use super::vm::{Assert, Class, ClassMember, FlagDelta, Inst, SetMatcher};
 use alloc::vec::Vec;
 
 /// Maximum number of instructions a compiled program may contain. Bounded-but-
@@ -105,6 +105,23 @@ impl Compiler<'_> {
                 } else {
                     self.compile(inner)?;
                 }
+            }
+            Node::ClassSet { neg, set } => self.compile_class_set(*neg, set)?,
+            Node::Modifier {
+                ignore_case,
+                multiline,
+                dotall,
+                inner,
+            } => {
+                // `(?ims-ims:…)` — wrap the body in a flag-stack push/pop so the VM
+                // matches it under the adjusted `i`/`m`/`s` flags, then restores.
+                self.emit(Inst::PushFlags(FlagDelta {
+                    ignore_case: *ignore_case,
+                    multiline: *multiline,
+                    dotall: *dotall,
+                }));
+                self.compile(inner)?;
+                self.emit(Inst::PopFlags);
             }
             Node::Alt(branches) => self.compile_alt(branches)?,
             Node::Repeat {
@@ -294,6 +311,55 @@ impl Compiler<'_> {
         }
     }
 
+    /// Compiles a `v`-mode extended character class. The set expression is split
+    /// into a single-code-point [`SetMatcher`] and a set of string alternatives
+    /// (length ≠ 1). With no strings, this is a single `ClassSet` instruction.
+    /// With strings, it compiles to an alternation that tries each string literal
+    /// (longest first, so the maximal match wins) and finally the char class.
+    /// A negated class may not contain strings (a Syntax Error per the spec).
+    fn compile_class_set(&mut self, neg: bool, set: &ClassSetExpr) -> Result<(), RegexError> {
+        let mut strings: Vec<Vec<u32>> = Vec::new();
+        collect_strings(set, &mut strings);
+        // Drop length-1 strings: they behave as ordinary characters and are
+        // already covered by the code-point matcher.
+        strings.retain(|s| s.len() != 1);
+        if neg && !strings.is_empty() {
+            return Err(RegexError::new(
+                "negated character class may not contain strings",
+            ));
+        }
+        let matcher = build_set_matcher(set);
+        if strings.is_empty() {
+            self.emit(Inst::ClassSet { neg, matcher });
+            return Ok(());
+        }
+        // Strings present: longest first so the alternation prefers a maximal
+        // match (e.g. `\q{abc}` over `\q{ab}` over the single-char class).
+        strings.sort_by_key(|s| core::cmp::Reverse(s.len()));
+        // Build an Alt-like structure manually: each non-final branch is
+        // `Split(branch, next); branch; Jmp(end)`, the final branch is the class.
+        let mut jmp_to_end = Vec::new();
+        for s in &strings {
+            let split = self.emit(Inst::Split(0, 0));
+            let branch_start = self.here();
+            for &cp in s {
+                self.emit_char(cp);
+            }
+            let jmp = self.emit(Inst::Jmp(0));
+            jmp_to_end.push(jmp);
+            let next = self.here();
+            self.prog[split] = Inst::Split(branch_start, next);
+            self.check_size()?;
+        }
+        // Final branch: the single-code-point class.
+        self.emit(Inst::ClassSet { neg, matcher });
+        let end = self.here();
+        for j in jmp_to_end {
+            self.prog[j] = Inst::Jmp(end);
+        }
+        Ok(())
+    }
+
     /// Lowers one class item into compiled members, splitting an astral literal
     /// member into its surrogate units in non-`u` mode so `[😀]` (no `u`) matches
     /// either surrogate half, matching JS web-compat semantics. Astral *ranges*
@@ -312,6 +378,103 @@ impl Compiler<'_> {
             }
             ClassItem::Range(a, b) => out.push(ClassMember::Range(*a, *b)),
             ClassItem::Shorthand(s) => out.push(ClassMember::Shorthand(*s)),
+        }
+    }
+}
+
+/// Collects the multi-(or zero-)code-point string alternatives a `v`-mode set
+/// expression can match, honoring set operations. A string of length 1 is also
+/// collected here but the caller drops it (it is an ordinary character). Set
+/// algebra on the string component: union concatenates; intersection keeps
+/// strings present in every operand; difference keeps first-operand strings
+/// absent from all later operands. Single code points never appear as strings.
+fn collect_strings(expr: &ClassSetExpr, out: &mut Vec<Vec<u32>>) {
+    for s in set_strings(expr) {
+        out.push(s);
+    }
+}
+
+/// The set of string alternatives (length ≠ 1) of a class-set expression.
+fn set_strings(expr: &ClassSetExpr) -> Vec<Vec<u32>> {
+    match expr {
+        ClassSetExpr::Items(_) => Vec::new(),
+        ClassSetExpr::Strings(list) => list.iter().filter(|s| s.len() != 1).cloned().collect(),
+        ClassSetExpr::Negated(_) => Vec::new(),
+        ClassSetExpr::Union(kids) => {
+            let mut acc: Vec<Vec<u32>> = Vec::new();
+            for k in kids {
+                for s in set_strings(k) {
+                    if !acc.contains(&s) {
+                        acc.push(s);
+                    }
+                }
+            }
+            acc
+        }
+        ClassSetExpr::Intersection(kids) => {
+            let mut it = kids.iter();
+            let Some(first) = it.next() else {
+                return Vec::new();
+            };
+            let mut acc = set_strings(first);
+            for k in it {
+                let other = set_strings(k);
+                acc.retain(|s| other.contains(s));
+            }
+            acc
+        }
+        ClassSetExpr::Difference(kids) => {
+            let mut it = kids.iter();
+            let Some(first) = it.next() else {
+                return Vec::new();
+            };
+            let mut acc = set_strings(first);
+            for k in it {
+                let other = set_strings(k);
+                acc.retain(|s| !other.contains(s));
+            }
+            acc
+        }
+    }
+}
+
+/// Builds the single-code-point [`SetMatcher`] for a class-set expression. The
+/// string component is handled separately ([`set_strings`]); a `\q{…}` string of
+/// length 1 contributes its single code point to the char matcher here.
+fn build_set_matcher(expr: &ClassSetExpr) -> SetMatcher {
+    match expr {
+        ClassSetExpr::Items(items) => {
+            let mut members = Vec::new();
+            for it in items {
+                match it {
+                    ClassItem::Char(c) => members.push(ClassMember::Char(*c)),
+                    ClassItem::Range(a, b) => members.push(ClassMember::Range(*a, *b)),
+                    ClassItem::Shorthand(s) => members.push(ClassMember::Shorthand(*s)),
+                }
+            }
+            SetMatcher::Leaf(members)
+        }
+        ClassSetExpr::Strings(list) => {
+            // Length-1 strings act as ordinary characters; longer/empty ones add
+            // nothing to single-code-point membership.
+            let members = list
+                .iter()
+                .filter(|s| s.len() == 1)
+                .map(|s| ClassMember::Char(s[0]))
+                .collect();
+            SetMatcher::Leaf(members)
+        }
+        ClassSetExpr::Negated(inner) => {
+            SetMatcher::Negated(alloc::boxed::Box::new(build_set_matcher(inner)))
+        }
+        ClassSetExpr::Union(kids) => {
+            SetMatcher::Union(kids.iter().map(build_set_matcher).collect())
+        }
+        ClassSetExpr::Intersection(kids) => {
+            SetMatcher::Intersection(kids.iter().map(build_set_matcher).collect())
+        }
+        ClassSetExpr::Difference(kids) => {
+            SetMatcher::Difference(kids.iter().map(build_set_matcher).collect())
         }
     }
 }

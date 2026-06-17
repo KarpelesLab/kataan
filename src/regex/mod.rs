@@ -105,6 +105,10 @@ pub struct Flags {
     /// pair is one character) and astral `\u{…}`/ranges are honored. Positions
     /// are still reported as code-unit indices.
     pub unicode: bool,
+    /// `v` — unicodeSets: a stricter superset of `u` enabling extended character
+    /// classes (set operations `&&`/`--`, nested classes, `\q{…}` string
+    /// literals, properties of strings). Implies code-point (`unicode`) operation.
+    pub unicode_sets: bool,
 }
 
 impl Flags {
@@ -119,6 +123,12 @@ impl Flags {
                 's' => f.dotall = true,
                 'y' => f.sticky = true,
                 'u' => f.unicode = true,
+                // `v` (unicodeSets) is a superset of `u`: it turns on code-point
+                // operation and additionally enables extended character classes.
+                'v' => {
+                    f.unicode = true;
+                    f.unicode_sets = true;
+                }
                 'd' => {} // accepted but not yet acted on (hasIndices)
                 other => return Err(RegexError::new(alloc::format!("unknown flag `{other}`"))),
             }
@@ -159,7 +169,7 @@ impl Regex {
         // in non-`u` mode). The scalar-atomic adapter program is built lazily on
         // first `&str`/`&[char]` use (RE-P2) — the interpreter never takes that
         // path, so this is the only compile that runs for real callers.
-        let (ast, _, group_names) = parser::parse(pattern, flags.unicode)?;
+        let (ast, _, group_names) = parser::parse(pattern, flags.unicode, flags.unicode_sets)?;
         let (prog, group_count) = compile::compile(&ast, &group_names, flags.unicode)?;
         Ok(Regex {
             prog,
@@ -186,7 +196,9 @@ impl Regex {
             // which is what the `&str`/`&[char]` adapters require. The pattern
             // compiled cleanly in `new`, so this cannot fail; fall back to an
             // empty program in the impossible error case rather than panicking.
-            let Ok((ast, _, gn)) = parser::parse(&self.source, self.flags.unicode) else {
+            let Ok((ast, _, gn)) =
+                parser::parse(&self.source, self.flags.unicode, self.flags.unicode_sets)
+            else {
                 return Vec::new();
             };
             compile::compile(&ast, &gn, true)

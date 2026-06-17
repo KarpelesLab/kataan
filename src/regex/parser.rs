@@ -52,6 +52,10 @@ pub(crate) enum Node {
     Any,
     /// A character class `[ … ]`.
     Class { neg: bool, items: Vec<ClassItem> },
+    /// A `v`-mode extended character class `[ … ]` (ClassSetExpression): a tree of
+    /// set operations over code points, plus a set of string alternatives (from
+    /// `\q{…}` and properties of strings). `neg` is the leading `^`.
+    ClassSet { neg: bool, set: Box<ClassSetExpr> },
     /// `^`
     Start,
     /// `$`
@@ -61,6 +65,15 @@ pub(crate) enum Node {
     /// A group; `index` is `Some` for a capturing group.
     Group {
         index: Option<usize>,
+        inner: Box<Node>,
+    },
+    /// An inline-modifier group `(?ims-ims:…)`: the flag deltas applied to
+    /// `inner`'s matching. Each field is `Some(true)` to turn the flag on,
+    /// `Some(false)` to turn it off, or `None` to inherit the enclosing value.
+    Modifier {
+        ignore_case: Option<bool>,
+        multiline: Option<bool>,
+        dotall: Option<bool>,
         inner: Box<Node>,
     },
     /// A lookahead `(?=…)` / `(?!…)` (`neg` for the negative form).
@@ -93,6 +106,26 @@ pub(crate) enum ClassItem {
     Shorthand(Shorthand),
 }
 
+/// A `v`-mode ClassSetExpression: a tree of set operations whose leaves are
+/// code-point sets (and, in unions/operands, `\q{…}` string literals). Evaluated
+/// at compile time into a code-point matcher plus the set of matchable strings.
+pub(crate) enum ClassSetExpr {
+    /// A union of operands (the default when items are juxtaposed): a code-point
+    /// matches if any operand matches; the string set is the union of operands'.
+    Union(Vec<ClassSetExpr>),
+    /// `A&&B&&…` — intersection: a code point must match every operand.
+    Intersection(Vec<ClassSetExpr>),
+    /// `A--B--…` — difference: in the first operand and in none of the rest.
+    Difference(Vec<ClassSetExpr>),
+    /// A leaf set of single code points / ranges / shorthands (`[a-z\d\p{L}]`).
+    Items(Vec<ClassItem>),
+    /// A `\q{…}` alternation of strings; each string is a sequence of code points
+    /// (length 1 strings act as ordinary characters).
+    Strings(Vec<Vec<u32>>),
+    /// A nested negated class `[^…]` used as an operand.
+    Negated(Box<ClassSetExpr>),
+}
+
 /// The `\d \w \s` (and negated) class shorthands.
 #[derive(Clone, Copy)]
 pub(crate) enum Shorthand {
@@ -112,7 +145,11 @@ pub(crate) type GroupNames = Vec<(usize, alloc::string::String)>;
 
 /// Parses `pattern` into an AST plus the number of capturing groups and the
 /// `(group index, name)` pairs of any named groups (`(?<name>…)`).
-pub(crate) fn parse(pattern: &str, unicode: bool) -> Result<(Node, usize, GroupNames), RegexError> {
+pub(crate) fn parse(
+    pattern: &str,
+    unicode: bool,
+    unicode_sets: bool,
+) -> Result<(Node, usize, GroupNames), RegexError> {
     let chars: Vec<char> = pattern.chars().collect();
     // Whether the pattern contains `(?<name>…)` group syntax anywhere. Under the
     // `u` flag a `\k` is always a named backreference; without it, `\k<…>` is a
@@ -126,6 +163,7 @@ pub(crate) fn parse(pattern: &str, unicode: bool) -> Result<(Node, usize, GroupN
         group_names: Vec::new(),
         depth: 0,
         unicode,
+        unicode_sets,
         branch_path: Vec::new(),
         next_alt_id: 0,
         decl_paths: Vec::new(),
@@ -174,6 +212,10 @@ struct Parser {
     /// Whether the `u` (unicode) flag is set: enables `\u` surrogate-pair
     /// combination so a pattern like `😀` parses as one astral char.
     unicode: bool,
+    /// Whether the `v` (unicodeSets) flag is set: enables extended character
+    /// classes (set operations, nested classes, `\q{…}` strings). Implies
+    /// `unicode`.
+    unicode_sets: bool,
     /// The current alternation path: `(alt_id, branch_index)` for each enclosing
     /// `Disjunction`. Two named groups may share a name only when they are in
     /// mutually-exclusive alternatives — i.e. some common `alt_id` selects a
@@ -435,6 +477,7 @@ impl Parser {
     fn parse_atom(&mut self) -> Result<Node, RegexError> {
         match self.peek() {
             Some('(') => self.parse_group(),
+            Some('[') if self.unicode_sets => self.parse_class_set(),
             Some('[') => self.parse_class(),
             Some('.') => {
                 self.pos += 1;
@@ -515,6 +558,11 @@ impl Parser {
                     neg,
                     inner: Box::new(inner),
                 });
+            } else if matches!(self.chars.get(self.pos + 1), Some('i' | 'm' | 's' | '-')) {
+                // `(?ims-ims: … )` — an inline-modifier group (ES2025). The flag
+                // letters before the optional `-` are turned on, those after it
+                // turned off, for the enclosed `Disjunction` only.
+                return self.parse_modifier_group();
             } else if self.chars.get(self.pos + 1) == Some(&'<') {
                 // `(?<name> … )` — a capturing group with a name.
                 self.pos += 2; // `?<`
@@ -547,6 +595,90 @@ impl Parser {
         }
         Ok(Node::Group {
             index,
+            inner: Box::new(inner),
+        })
+    }
+
+    /// Parses an inline-modifier group `(?ims-ims:…)` (the `(` already consumed,
+    /// `self.pos` pointing at the `?`). The grammar is
+    /// `( ? AddModifiers ( - RemoveModifiers )? : Disjunction )` where each
+    /// modifier set is a sequence of distinct flags from `{i, m, s}`.
+    ///
+    /// Syntax errors (each a `RegexError` → the host raises `SyntaxError`):
+    /// * an unknown flag letter (only `i`, `m`, `s` are permitted),
+    /// * a repeated flag within the add set or within the remove set,
+    /// * a flag appearing in *both* the add and remove sets,
+    /// * both sets empty (`(?-:…)` or `(?:…)`-via-this-path — the latter never
+    ///   reaches here since `(?:` is handled earlier),
+    /// * a missing `-`/`:` terminator.
+    fn parse_modifier_group(&mut self) -> Result<Node, RegexError> {
+        self.pos += 1; // `?`
+        // Parse a run of distinct flag letters until `-`, `:`, or end.
+        let read_flags = |p: &mut Self| -> Result<(bool, bool, bool), RegexError> {
+            let (mut i, mut m, mut s) = (false, false, false);
+            loop {
+                match p.peek() {
+                    Some('i') => {
+                        if i {
+                            return Err(RegexError::new("duplicate modifier flag `i`"));
+                        }
+                        i = true;
+                        p.pos += 1;
+                    }
+                    Some('m') => {
+                        if m {
+                            return Err(RegexError::new("duplicate modifier flag `m`"));
+                        }
+                        m = true;
+                        p.pos += 1;
+                    }
+                    Some('s') => {
+                        if s {
+                            return Err(RegexError::new("duplicate modifier flag `s`"));
+                        }
+                        s = true;
+                        p.pos += 1;
+                    }
+                    Some('-') | Some(':') => break,
+                    _ => return Err(RegexError::new("invalid inline modifier")),
+                }
+            }
+            Ok((i, m, s))
+        };
+        let (add_i, add_m, add_s) = read_flags(self)?;
+        let (rem_i, rem_m, rem_s) = if self.eat('-') {
+            read_flags(self)?
+        } else {
+            (false, false, false)
+        };
+        if !self.eat(':') {
+            return Err(RegexError::new("expected `:` in inline modifier group"));
+        }
+        // A flag may not be both added and removed.
+        if (add_i && rem_i) || (add_m && rem_m) || (add_s && rem_s) {
+            return Err(RegexError::new("modifier flag both added and removed"));
+        }
+        // At least one modifier must be present (no `(?-:…)` / empty form).
+        if !(add_i || add_m || add_s || rem_i || rem_m || rem_s) {
+            return Err(RegexError::new("empty inline modifier group"));
+        }
+        let merge = |add: bool, rem: bool| -> Option<bool> {
+            if add {
+                Some(true)
+            } else if rem {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        let inner = self.parse_alt()?;
+        if !self.eat(')') {
+            return Err(RegexError::new("unterminated inline modifier group"));
+        }
+        Ok(Node::Modifier {
+            ignore_case: merge(add_i, rem_i),
+            multiline: merge(add_m, rem_m),
+            dotall: merge(add_s, rem_s),
             inner: Box::new(inner),
         })
     }
@@ -871,6 +1003,365 @@ impl Parser {
             items.push(ClassItem::Char(c));
         }
     }
+
+    // --- `v`-mode extended character classes (ClassSetExpression) ---
+
+    /// Parses a `v`-mode character class `[ … ]` into a [`Node::ClassSet`]. The
+    /// body is a `ClassSetExpression`: a union of operands/ranges, an
+    /// intersection (`A&&B`), or a difference (`A--B`).
+    fn parse_class_set(&mut self) -> Result<Node, RegexError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(RegexError::new("pattern nested too deeply"));
+        }
+        let r = self.parse_class_set_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_class_set_inner(&mut self) -> Result<Node, RegexError> {
+        self.pos += 1; // `[`
+        let neg = self.eat('^');
+        let set = self.parse_class_set_expression()?;
+        if !self.eat(']') {
+            return Err(RegexError::new("unterminated character class `[`"));
+        }
+        Ok(Node::ClassSet {
+            neg,
+            set: Box::new(set),
+        })
+    }
+
+    /// Parses a `ClassSetExpression` (the body between `[`…`]`, after any `^`).
+    /// Decides union vs. intersection (`&&`) vs. difference (`--`) by the operator
+    /// that follows the first operand.
+    fn parse_class_set_expression(&mut self) -> Result<ClassSetExpr, RegexError> {
+        // An empty class `[]` (or `[^]`) is a valid empty set.
+        if self.peek() == Some(']') {
+            return Ok(ClassSetExpr::Items(Vec::new()));
+        }
+        let first = self.parse_class_set_operand()?;
+        match self.peek_set_operator() {
+            SetOp::Intersection => {
+                let mut operands = alloc::vec![first];
+                while self.eat_set_operator(SetOp::Intersection)? {
+                    operands.push(self.parse_class_set_operand()?);
+                }
+                Ok(ClassSetExpr::Intersection(operands))
+            }
+            SetOp::Difference => {
+                let mut operands = alloc::vec![first];
+                while self.eat_set_operator(SetOp::Difference)? {
+                    operands.push(self.parse_class_set_operand()?);
+                }
+                Ok(ClassSetExpr::Difference(operands))
+            }
+            SetOp::Union => {
+                // Union: the first operand, plus any further operands/ranges until
+                // `]`. A `ClassSetRange` (`a-z`) is detected when a `-` (not a
+                // `--`) separates two single-character operands.
+                let mut union: Vec<ClassSetExpr> = Vec::new();
+                let mut pending = Some(first);
+                loop {
+                    match self.peek() {
+                        Some(']') | None => break,
+                        // A single `-` between two characters forms a range; `--`
+                        // is the difference operator (handled above) and never
+                        // reaches a union, so a lone `-` here is a range dash.
+                        Some('-') if self.chars.get(self.pos + 1) != Some(&'-') => {
+                            // The left side must be a single code point.
+                            let lo = match pending.take() {
+                                Some(ClassSetExpr::Items(ref items))
+                                    if matches!(items.as_slice(), [ClassItem::Char(_)]) =>
+                                {
+                                    if let [ClassItem::Char(c)] = items.as_slice() {
+                                        *c
+                                    } else {
+                                        unreachable!()
+                                    }
+                                }
+                                _ => return Err(RegexError::new("invalid class set range")),
+                            };
+                            self.pos += 1; // `-`
+                            let hi = self.parse_class_set_char_operand()?;
+                            if hi < lo {
+                                return Err(RegexError::new("class set range out of order"));
+                            }
+                            union.push(ClassSetExpr::Items(alloc::vec![ClassItem::Range(lo, hi)]));
+                        }
+                        _ => {
+                            if let Some(p) = pending.take() {
+                                union.push(p);
+                            }
+                            pending = Some(self.parse_class_set_operand()?);
+                        }
+                    }
+                }
+                if let Some(p) = pending.take() {
+                    union.push(p);
+                }
+                Ok(ClassSetExpr::Union(union))
+            }
+        }
+    }
+
+    /// Reports which set operator (if any) immediately follows, without consuming.
+    fn peek_set_operator(&self) -> SetOp {
+        if self.peek() == Some('&') && self.chars.get(self.pos + 1) == Some(&'&') {
+            SetOp::Intersection
+        } else if self.peek() == Some('-') && self.chars.get(self.pos + 1) == Some(&'-') {
+            SetOp::Difference
+        } else {
+            SetOp::Union
+        }
+    }
+
+    /// Consumes the given set operator if present, returning whether it was. A
+    /// trailing operator with no following operand (`[a&&]`) is a Syntax Error.
+    fn eat_set_operator(&mut self, op: SetOp) -> Result<bool, RegexError> {
+        if self.peek_set_operator() == op {
+            self.pos += 2; // `&&` or `--`
+            if self.peek() == Some(']') {
+                return Err(RegexError::new("missing operand after set operator"));
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Parses one `ClassSetOperand`: a nested class `[…]`, a `\q{…}` string set,
+    /// a character-class escape / property escape, or a single `ClassSetCharacter`.
+    fn parse_class_set_operand(&mut self) -> Result<ClassSetExpr, RegexError> {
+        match self.peek() {
+            Some('[') => {
+                let nested = self.parse_class_set()?;
+                let Node::ClassSet { neg, set } = nested else {
+                    unreachable!("parse_class_set returns a ClassSet node");
+                };
+                Ok(if neg {
+                    ClassSetExpr::Negated(set)
+                } else {
+                    *set
+                })
+            }
+            Some('\\') => self.parse_class_set_escape(),
+            _ => {
+                let c = self.parse_class_set_char_operand()?;
+                Ok(ClassSetExpr::Items(alloc::vec![ClassItem::Char(c)]))
+            }
+        }
+    }
+
+    /// Parses a backslash operand inside a `v`-mode class: a shorthand
+    /// (`\d \w \s` …), a property escape (`\p`/`\P`), a `\q{…}` string set, or a
+    /// character escape (`\u`, `\x`, control, identity). Returns the operand as a
+    /// [`ClassSetExpr`].
+    fn parse_class_set_escape(&mut self) -> Result<ClassSetExpr, RegexError> {
+        self.pos += 1; // `\`
+        let Some(e) = self.peek() else {
+            return Err(RegexError::new("trailing backslash in class"));
+        };
+        match e {
+            'q' => {
+                self.pos += 1; // `q`
+                self.parse_q_strings()
+            }
+            'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
+                self.pos += 1;
+                let sh = match e {
+                    'd' => Shorthand::Digit,
+                    'D' => Shorthand::NotDigit,
+                    'w' => Shorthand::Word,
+                    'W' => Shorthand::NotWord,
+                    's' => Shorthand::Space,
+                    _ => Shorthand::NotSpace,
+                };
+                Ok(ClassSetExpr::Items(alloc::vec![ClassItem::Shorthand(sh)]))
+            }
+            'p' | 'P' => {
+                self.pos += 1; // `p`/`P`
+                let prop = self.parse_property()?;
+                Ok(ClassSetExpr::Items(alloc::vec![ClassItem::Shorthand(
+                    Shorthand::Property(prop, e == 'P'),
+                )]))
+            }
+            _ => {
+                // A single-character class escape (`\u`, `\x`, `\n`, identity, …).
+                let c = self.parse_class_set_char_after_backslash()?;
+                Ok(ClassSetExpr::Items(alloc::vec![ClassItem::Char(c)]))
+            }
+        }
+    }
+
+    /// Parses a `\q{…}` string-set body (the `\q` already consumed): a `|`
+    /// alternation of `ClassStringDisjunction` strings, each a (possibly empty)
+    /// sequence of `ClassSetCharacter`s. Returns a [`ClassSetExpr::Strings`].
+    fn parse_q_strings(&mut self) -> Result<ClassSetExpr, RegexError> {
+        if !self.eat('{') {
+            return Err(RegexError::new("expected `{` after `\\q`"));
+        }
+        let mut strings: Vec<Vec<u32>> = Vec::new();
+        let mut cur: Vec<u32> = Vec::new();
+        loop {
+            match self.peek() {
+                None => return Err(RegexError::new("unterminated `\\q{…}`")),
+                Some('}') => {
+                    self.pos += 1;
+                    strings.push(core::mem::take(&mut cur));
+                    break;
+                }
+                Some('|') => {
+                    self.pos += 1;
+                    strings.push(core::mem::take(&mut cur));
+                }
+                Some('\\') => {
+                    let c = self.parse_class_set_char_after_backslash_consuming()?;
+                    cur.push(c);
+                }
+                Some(_) => {
+                    let c = self.parse_class_set_char_operand()?;
+                    cur.push(c);
+                }
+            }
+        }
+        Ok(ClassSetExpr::Strings(strings))
+    }
+
+    /// Parses one `ClassSetCharacter`: a single (non-escaped) source character or
+    /// an escaped character. In `v`-mode the ClassSetSyntaxCharacters
+    /// (`( ) [ ] { } / - \ |`) must be escaped, and the doubled punctuators
+    /// (`&&`, `!!`, …) are reserved; a bare one of these is a Syntax Error.
+    fn parse_class_set_char_operand(&mut self) -> Result<u32, RegexError> {
+        match self.peek() {
+            Some('\\') => {
+                self.pos += 1;
+                self.parse_class_set_char_after_backslash()
+            }
+            Some(c) => {
+                // Reserved/`ClassSetSyntaxCharacter`s may not appear unescaped.
+                if matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '/' | '|') {
+                    return Err(RegexError::new("unescaped reserved character in class set"));
+                }
+                // A reserved double punctuator (`&&`, `!!`, `##`, …) unescaped is
+                // also forbidden; a single one of these chars is a literal.
+                if is_class_set_reserved_double(c) && self.chars.get(self.pos + 1) == Some(&c) {
+                    return Err(RegexError::new("reserved double punctuator in class set"));
+                }
+                self.pos += 1;
+                Ok(c as u32)
+            }
+            None => Err(RegexError::new("unterminated character class `[`")),
+        }
+    }
+
+    /// Parses a character escape body inside a `v`-mode class, the `\` already
+    /// consumed (e.g. `u1234`, `x41`, `n`, `-`). Used for class-set characters.
+    fn parse_class_set_char_after_backslash(&mut self) -> Result<u32, RegexError> {
+        let Some(e) = self.bump() else {
+            return Err(RegexError::new("trailing backslash in class"));
+        };
+        Ok(match e {
+            'u' => self.parse_unicode_escape()?,
+            'x' => self.parse_hex_escape(2)?,
+            'f' | 'n' | 'r' | 't' | 'v' => escape_char(e) as u32,
+            '0' if !self.peek().is_some_and(|c| c.is_ascii_digit()) => 0,
+            'c' if self.peek().is_some_and(|c| c.is_ascii_alphabetic()) => {
+                let letter = self.bump().unwrap();
+                (letter.to_ascii_uppercase() as u32 - 'A' as u32) + 1
+            }
+            // In `v`-mode the ClassSetSyntaxCharacters and the reserved
+            // punctuators may all be escaped to mean the literal character.
+            'b' => 0x08, // `\b` is backspace inside a class
+            other => {
+                if is_class_set_identity_escape(other) {
+                    other as u32
+                } else {
+                    return Err(RegexError::new("invalid class set escape"));
+                }
+            }
+        })
+    }
+
+    /// Like [`parse_class_set_char_after_backslash`](Self::parse_class_set_char_after_backslash)
+    /// but consumes the leading `\` itself (for `\q{…}` bodies).
+    fn parse_class_set_char_after_backslash_consuming(&mut self) -> Result<u32, RegexError> {
+        self.pos += 1; // `\`
+        self.parse_class_set_char_after_backslash()
+    }
+}
+
+/// A set operator joining `ClassSetExpression` operands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetOp {
+    Union,
+    Intersection,
+    Difference,
+}
+
+/// Whether `c` is one of the characters that, when doubled, forms a reserved
+/// `ClassSetReservedDoublePunctuator` in `v`-mode (so an unescaped doubled run is
+/// a Syntax Error). Source: ClassSetReservedDoublePunctuator production.
+fn is_class_set_reserved_double(c: char) -> bool {
+    matches!(
+        c,
+        '&' | '!'
+            | '#'
+            | '$'
+            | '%'
+            | '*'
+            | '+'
+            | ','
+            | '.'
+            | ':'
+            | ';'
+            | '<'
+            | '='
+            | '>'
+            | '?'
+            | '@'
+            | '^'
+            | '`'
+            | '~'
+    )
+}
+
+/// Whether `c` may follow a backslash as a `ClassSetCharacter` identity escape in
+/// `v`-mode: the ClassSetSyntaxCharacters and the reserved punctuators (so that
+/// `\&`, `\-`, `\|`, … denote the literal character).
+fn is_class_set_identity_escape(c: char) -> bool {
+    matches!(
+        c,
+        '(' | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '/'
+            | '-'
+            | '\\'
+            | '|'
+            | '&'
+            | '!'
+            | '#'
+            | '$'
+            | '%'
+            | '*'
+            | '+'
+            | ','
+            | '.'
+            | ':'
+            | ';'
+            | '<'
+            | '='
+            | '>'
+            | '?'
+            | '@'
+            | '^'
+            | '`'
+            | '~'
+    )
 }
 
 fn class_shorthand(s: Shorthand) -> Node {

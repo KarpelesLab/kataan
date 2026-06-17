@@ -485,3 +485,68 @@ fn quantifier_on_assertion() {
     // A quantified group around an assertion is fine.
     assert!(Regex::new(r"(?:^)+", "u").is_ok());
 }
+
+#[test]
+fn inline_modifier_groups() {
+    // Add/remove i/m/s scoped to the group.
+    assert!(re("(?i:A)", "").is_match("a"));
+    assert!(!re("(?-i:A)", "i").is_match("a"));
+    assert!(re("(?m:^a$)", "").is_match("x\na\ny"));
+    assert!(re("(?s:.)", "").is_match("\n"));
+    // `i` applies only inside the scope.
+    assert!(re("(?i:a)b", "").is_match("Ab"));
+    assert!(!re("(?i:a)b", "").is_match("AB"));
+    // Nested modifiers: inner remove overrides outer add.
+    assert!(!re("(?i:(?-i:a))", "").is_match("A"));
+    assert!(re("(?i:(?-i:a))", "").is_match("a"));
+    // Syntax errors.
+    assert!(Regex::new("(?-:a)", "").is_err()); // both empty
+    assert!(Regex::new("(?ii:a)", "").is_err()); // duplicate in add
+    assert!(Regex::new("(?ims-m:a)", "").is_err()); // m in both add and remove
+    assert!(Regex::new("(?d:a)", "").is_err()); // invalid flag
+}
+
+#[test]
+fn ignore_case_unicode_word_carveout() {
+    // Under `iu`, U+017F (ſ) and U+212A (K) count as word chars.
+    assert!(re(r"\w", "iu").is_match("\u{017F}"));
+    assert!(re(r"\w", "iu").is_match("\u{212A}"));
+    // Without both flags, they do not.
+    assert!(!re(r"\w", "u").is_match("\u{017F}"));
+}
+
+#[test]
+fn case_insensitive_property() {
+    // `\p{Lu}` matches lowercase under `i`; `\P{Lu}` matches uppercase under `i`.
+    assert!(re(r"\p{Lu}", "iu").is_match("a"));
+    assert!(re(r"\P{Lu}", "iu").is_match("A"));
+    assert!(!re(r"\p{Lu}", "u").is_match("a"));
+}
+
+#[test]
+fn v_flag_set_operations() {
+    // Intersection, difference, union, nested classes.
+    assert!(re("^[[0-9]&&[0-9]]+$", "v").is_match("123"));
+    assert!(!re("^[[0-9]&&[a-z]]+$", "v").is_match("1"));
+    assert!(re(r"^[\d--[0-5]]+$", "v").is_match("789"));
+    assert!(!re(r"^[\d--[0-5]]+$", "v").is_match("3"));
+    assert!(re(r"^[\p{ASCII}&&\p{L}]+$", "v").is_match("abc"));
+    assert!(!re(r"^[\p{ASCII}&&\p{L}]+$", "v").is_match("a1"));
+}
+
+#[test]
+fn v_flag_string_literals() {
+    // `\q{…}` string alternatives, longest-match preferred.
+    assert!(re(r"^[\q{abc|de}]+$", "v").is_match("abcde"));
+    assert!(!re(r"^[\q{abc|de}]+$", "v").is_match("abccd"));
+    assert!(re(r"^[[0-9]\q{ab}]+$", "v").is_match("ab9"));
+}
+
+#[test]
+fn v_flag_syntax_errors() {
+    assert!(Regex::new(r"[^\q{ab}]", "v").is_err()); // negated class with string
+    assert!(Regex::new("[a~~b]", "v").is_err()); // reserved double punctuator
+    assert!(Regex::new("[a&&]", "v").is_err()); // trailing operator
+    assert!(Regex::new("[(]", "v").is_err()); // unescaped reserved char
+    assert!(Regex::new(r"[\(]", "v").is_ok()); // escaped is fine
+}

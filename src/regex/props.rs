@@ -644,14 +644,17 @@ impl BinProp {
             QuotationMark => u::is_quotation_mark(c),
             Uppercase => u::is_uppercase(c),
             WhiteSpace => u::is_whitespace(c),
+            // `XID_Start`/`XID_Continue` are exposed by the `intl` `identifiers`
+            // feature, so they resolve exactly.
+            XidStart => u::is_xid_start(c),
+            XidContinue => u::is_xid_continue(c),
             // Properties without a dedicated public `intl` predicate or a closed
-            // form (the `identifiers`/emoji UCD tables are not in this crate's
-            // built feature set). They are valid names (so never a SyntaxError)
-            // but have no data here, so they match nothing. Listed explicitly so
-            // adding data later is a compile-checked change.
-            XidContinue
-            | XidStart
-            | IdStart
+            // form (the emoji/grapheme UCD tables are not in this crate's built
+            // feature set, and `ID_Start`/`ID_Continue` differ from the `XID_*`
+            // forms). They are valid names (so never a SyntaxError) but have no
+            // data here, so they match nothing. Listed explicitly so adding data
+            // later is a compile-checked change.
+            IdStart
             | IdContinue
             | CaseIgnorable
             | ChangesWhenNfkcCasefolded
