@@ -641,8 +641,30 @@ impl<'a> Interp<'a> {
                 } = &**callee
                 {
                     let recv = self.eval(object)?;
-                    if *optional && matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                        return Err(ExecError::OptShortCircuit);
+                    if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                        if *optional {
+                            return Err(ExecError::OptShortCircuit);
+                        }
+                        // Resolving the callee member (`obj.m`) on a nullish base is a
+                        // TypeError, thrown *before* the arguments are evaluated (spec
+                        // reference order): `o.bar.gar(foo())` throws before `foo()`.
+                        let key = match property {
+                            PropertyKey::Ident(s) | PropertyKey::Str(s) => {
+                                alloc::string::String::from(&**s)
+                            }
+                            PropertyKey::Number(n) => {
+                                self.realm.to_display_string(NanBox::number(*n))
+                            }
+                            PropertyKey::Computed(e) => {
+                                let k = self.eval(e)?;
+                                self.coerce_property_key(k)?
+                            }
+                            PropertyKey::Private(s) => alloc::format!("#{s}"),
+                        };
+                        return Err(self.type_error(&alloc::format!(
+                            "Cannot read properties of {} (reading '{key}')",
+                            self.realm.to_display_string(recv)
+                        )));
                     }
                     let args = self.eval_args(arguments)?;
                     // The built-in name-based dispatch (`call_method`) is an
@@ -733,6 +755,20 @@ impl<'a> Interp<'a> {
                     }
                     // Method call: `this` is the receiver.
                     return self.call_with_this(f, recv, &args);
+                }
+                // A bare-identifier callee resolved through a `with (obj)` binding is
+                // called with `obj` as the `this` value (the with-object is the
+                // reference's base), so `with (o) { m(); }` calls `o.m` with `this`=`o`.
+                if let Expr::Ident(id) = &**callee
+                    && let Some(h) = self.with_binding(&id.name)
+                {
+                    let f = self.read_member(h, &id.name)?;
+                    if *call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null)
+                    {
+                        return Err(ExecError::OptShortCircuit);
+                    }
+                    let args = self.eval_args(arguments)?;
+                    return self.call_with_this(f, NanBox::handle(h.to_raw()), &args);
                 }
                 let f = self.eval(callee)?;
                 if *call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) {
