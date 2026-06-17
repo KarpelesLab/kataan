@@ -810,16 +810,19 @@ impl<'a> Interp<'a> {
                                 && let PropertyKey::Ident(s) = key
                                 && &**s == "__proto__"
                             {
+                                // Per spec, the `__proto__` property name in an object
+                                // literal sets `[[Prototype]]` only when the value is an
+                                // Object or `null`; any other primitive (string, number,
+                                // boolean, undefined, symbol, bigint) is ignored — the
+                                // object keeps `%Object.prototype%` and gains *no* own
+                                // `__proto__` property.
                                 let v = self.eval(value)?;
-                                match v.unpack() {
-                                    Unpacked::Null => {
-                                        self.realm.set_object_proto(handle, None);
-                                    }
-                                    _ => {
-                                        if let Some(p) = v.as_handle().map(Handle::from_raw) {
-                                            self.realm.set_object_proto(handle, Some(p));
-                                        }
-                                    }
+                                if matches!(v.unpack(), Unpacked::Null) {
+                                    self.realm.set_object_proto(handle, None);
+                                } else if self.is_object_value(v)
+                                    && let Some(p) = v.as_handle().map(Handle::from_raw)
+                                {
+                                    self.realm.set_object_proto(handle, Some(p));
                                 }
                                 continue;
                             }

@@ -925,15 +925,23 @@ impl<'a> Interp<'a> {
     }
 
     pub(crate) fn resolve_super_member(&mut self, name: &str) -> Result<NanBox, ExecError> {
-        // An object-literal method: `super.x` reads `HomeObject.[[Prototype]].x`
-        // (a data property, or a getter — invoked through the proto here).
+        // An object-literal method: `super.x` reads `HomeObject.[[Prototype]].x`.
+        // A data property is returned directly; an inherited *getter* is invoked
+        // with the current `this` (the receiver), not the prototype — so
+        // `super.accessor` in `obj.method()` sees `obj` as `this`.
         if self.current_home.is_none()
             && let Some(home) = self.current_home_object
         {
-            return match self.realm.object_proto(home) {
-                Some(proto) => self.read_member(proto, name),
-                None => Ok(NanBox::undefined()),
+            let Some(proto) = self.realm.object_proto(home) else {
+                return Ok(NanBox::undefined());
             };
+            if let Some((getter, _)) = self.realm.accessor(proto, name) {
+                if matches!(getter.unpack(), Unpacked::Undefined) {
+                    return Ok(NanBox::undefined());
+                }
+                return self.call_with_this(getter, self.this_val, &[]);
+            }
+            return self.read_member(proto, name);
         }
         let home = self
             .current_home
