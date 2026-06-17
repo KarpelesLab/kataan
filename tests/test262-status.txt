@@ -3163,14 +3163,10 @@ built-ins/Reflect/ownKeys/order-after-define-property.js  # [sloppy] expected pa
 built-ins/Reflect/ownKeys/return-non-enumerable-keys.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Reflect/set/different-property-descriptors.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/15.10.2.15-6-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/CharacterClassEscapes/character-class-digit-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/CharacterClassEscapes/character-class-non-digit-class-escape-positive-cases.js  # crash or timeout (native abort / hang)
 built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-positive-cases.js  # crash or timeout (native abort / hang)
-built-ins/RegExp/CharacterClassEscapes/character-class-non-word-class-escape-positive-cases.js  # crash or timeout (native abort / hang)
-built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-negative-cases.js  # crash or timeout (native abort / hang)
 built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/CharacterClassEscapes/character-class-word-class-escape-positive-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.1_A1_T13.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.1_A1_T14.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/S15.10.1_A1_T15.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3322,8 +3318,6 @@ built-ins/RegExp/property-escapes/generated/Sentence_Terminal.js  # [sloppy] exp
 built-ins/RegExp/property-escapes/generated/Soft_Dotted.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Terminal_Punctuation.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/Unified_Ideograph.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/property-escapes/generated/XID_Continue.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/property-escapes/generated/XID_Start.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji-negative-CharacterClass.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji-negative-P.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji-negative-u.js  # [sloppy] negative: failed at Runtime, expected phase parse
@@ -3533,7 +3527,6 @@ built-ins/RegExp/prototype/exec/duplicate-named-indices-groups-properties.js  # 
 built-ins/RegExp/prototype/exec/failure-g-lastindex-reset.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/failure-lastindex-access.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/failure-lastindex-set.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/prototype/exec/regexp-builtin-exec-v-u-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/success-g-lastindex-no-access.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/success-lastindex-access.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/exec/u-lastindex-adv.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3566,128 +3559,17 @@ built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-25.js  # [slo
 built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-26.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-27.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/prototype/unicodeSets/breaking-change-from-u-to-v-28.js  # [sloppy] negative: failed at Runtime, expected phase parse
-built-ins/RegExp/prototype/unicodeSets/this-val-regexp.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /./v
+built-ins/RegExp/prototype/unicodeSets/uv-flags-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/prototype/unicodeSets/uv-flags.js  # [sloppy] negative: failed at Runtime, expected phase parse
 built-ins/RegExp/quantifier-integer-limit.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /b{9007199254740991}/u
-built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-dotAll-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?s:)/
-built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-dotAll.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-backreferences.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-characterClasses.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-characterEscapes.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-b.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-p.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-w.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-b.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-p.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-ignoreCase-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i:)/
-built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-ignoreCase.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-multiline-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?m:)/
-built-ins/RegExp/regexp-modifiers/add-multiline.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/add-remove-modifiers.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/changing-dotAll-flag-does-not-affect-dotAll-modifier.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?s:^.$)/
-built-ins/RegExp/regexp-modifiers/changing-ignoreCase-flag-does-not-affect-ignoreCase-modifier.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i:aB)/
-built-ins/RegExp/regexp-modifiers/changing-multiline-flag-does-not-affect-multiline-modifier.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?m:es$)/
-built-ins/RegExp/regexp-modifiers/nested-add-remove-modifiers.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/nesting-add-dotAll-within-remove-dotAll.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/nesting-add-ignoreCase-within-remove-ignoreCase.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/nesting-add-multiline-within-remove-multiline.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/nesting-dotAll-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/nesting-ignoreCase-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/nesting-multiline-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/nesting-remove-dotAll-within-add-dotAll.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/nesting-remove-ignoreCase-within-add-ignoreCase.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/nesting-remove-multiline-within-add-multiline.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-dotAll-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-s:^.$)/s
-built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-dotAll.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-backreferences.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-characterClasses.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-characterEscapes.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-lower-p.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-upper-p.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-upper-w.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-ignoreCase-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-i:)/i
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-multiline-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-ignoreCase.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-alternatives-outside.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-dotAll-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-ignoreCase-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-multiline-property.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-m:)/m
-built-ins/RegExp/regexp-modifiers/remove-multiline.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/regexp-modifiers/syntax/valid/add-and-remove-modifiers-can-have-empty-remove-modifiers.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i-:)/
-built-ins/RegExp/regexp-modifiers/syntax/valid/add-and-remove-modifiers.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i-s:)/
-built-ins/RegExp/regexp-modifiers/syntax/valid/add-modifiers-when-nested.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i:(?i:))/
-built-ins/RegExp/regexp-modifiers/syntax/valid/add-modifiers-when-not-set-as-flags.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i:)/
-built-ins/RegExp/regexp-modifiers/syntax/valid/add-modifiers-when-set-as-flags.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?i:)/i
-built-ins/RegExp/regexp-modifiers/syntax/valid/remove-modifiers-when-nested.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-i:(?-i:))/
-built-ins/RegExp/regexp-modifiers/syntax/valid/remove-modifiers-when-not-set-as-flags.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-i:)/
-built-ins/RegExp/regexp-modifiers/syntax/valid/remove-modifiers-when-set-as-flags.js  # [sloppy] expected pass, Runtime SyntaxError: Invalid regular expression: /(?-i:)/i
-built-ins/RegExp/unicodeSets/generated/character-class-difference-character.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/character-class-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-difference-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-character.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/character-class-escape-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-escape-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-intersection-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/character-class-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-class-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-difference-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-difference-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-difference-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/character-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-difference-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-intersection-character.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/character-property-escape-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-property-escape-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/character-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/character-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3707,22 +3589,9 @@ built-ins/RegExp/unicodeSets/generated/rgi-emoji-15.0.js  # [sloppy] expected pa
 built-ins/RegExp/unicodeSets/generated/rgi-emoji-15.1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/rgi-emoji-16.0.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/rgi-emoji-17.0.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-difference-character.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/string-literal-difference-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/string-literal-intersection-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-intersection-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-union-character-class-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-union-character-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-union-character-property-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-union-character.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicodeSets/generated/string-literal-union-property-of-strings-escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/RegExp/unicodeSets/generated/string-literal-union-string-literal.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicode_character_class_backspace_escape.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicode_restricted_character_class_escape.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/unicode_restricted_identity_escape.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3944,7 +3813,6 @@ built-ins/String/prototype/match/S15.5.4.10_A1_T9.js  # [sloppy] expected pass, 
 built-ins/String/prototype/match/duplicate-named-groups-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/match/duplicate-named-indices-groups-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/match/regexp-prototype-match-v-u-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/matchAll/regexp-prototype-matchAll-v-u-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/padEnd/function-length.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/padEnd/normal-operation.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/padStart/function-length.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3953,7 +3821,6 @@ built-ins/String/prototype/repeat/return-abrupt-from-count-as-symbol.js  # [slop
 built-ins/String/prototype/repeat/return-abrupt-from-count.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replace/S15.5.4.11_A1_T13.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replace/S15.5.4.11_A1_T9.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/replace/regexp-prototype-replace-v-u-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replace/replaceValue-evaluation-order-regexp-object.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replace/replaceValue-evaluation-order.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replaceAll/replaceValue-call-matching-empty.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3974,8 +3841,6 @@ built-ins/String/prototype/replaceAll/searchValue-replacer-method-abrupt.js  # [
 built-ins/String/prototype/replaceAll/searchValue-tostring-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replaceAll/searchValue-tostring-regexp.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/replaceAll/this-tostring-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/search/regexp-prototype-search-v-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/String/prototype/search/regexp-prototype-search-v-u-flag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/slice/S15.5.4.13_A1_T5.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/split/checking-by-using-eval.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/String/prototype/split/limit-touint32-error.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -4831,29 +4696,13 @@ intl402/Collator/usage-de.js  # [sloppy] expected pass, Runtime [object Object]:
 intl402/Date/prototype/returns-same-results-as-DateTimeFormat.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/Date/prototype/throws-same-exceptions-as-DateTimeFormat.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/canonicalize-calendar.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/canonicalize-timezone.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/canonicalize-utc-timezone.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-calendar-numberingSystem-order.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/constructor-invalid-offset-timezone.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-calendar-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-dateStyle-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-dateStyle-valid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-dayPeriod-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-dayPeriod-valid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-fractionalSecondDigits-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-fractionalSecondDigits-valid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-invalid-explicit-components.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-numberingSystem-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-order.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-style-conflict.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-throwing-getters.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-timeStyle-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-timeStyle-valid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-timeZoneName-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/constructor-options-timeZoneName-valid.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/DateTimeFormat/constructor-options-calendar-future-fallback.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/DateTimeFormat/constructor-options-calendar-islamic-fallback.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/constructor-options-toobject.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/date-time-options.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/default-options-object-prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/DateTimeFormat/ignore-invalid-unicode-ext-values.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/instance-proto-and-extensible.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/intl-legacy-constructed-symbol-on-unwrap.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 intl402/DateTimeFormat/intl-legacy-constructed-symbol-property.js  # [sloppy] expected pass, Runtime TypeError: Object prototype may only be an Object or null
@@ -4965,17 +4814,13 @@ intl402/DateTimeFormat/prototype/toStringTag/toString-changed-tag.js  # [sloppy]
 intl402/DateTimeFormat/prototype/toStringTag/toString-removed-tag.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/prototype/toStringTag/toString.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/prototype/toStringTag/toStringTag.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-intl402/DateTimeFormat/required-date-time-formats.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/subclassing.js  # [sloppy] expected pass, Runtime TypeError: map callback is not a function
 intl402/DateTimeFormat/supportedLocalesOf/basic.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/test-option-date-time-components.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/test-option-formatMatcher.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/test-option-hour12.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/test-option-localeMatcher.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/timezone-case-insensitive.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+intl402/DateTimeFormat/timezone-case-insensitive.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/timezone-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DateTimeFormat/timezone-legacy-non-iana.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DateTimeFormat/timezone-not-canonicalized.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/DateTimeFormat/timezone-utc.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DisplayNames/ctor-custom-get-prototype-poison-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DisplayNames/ctor-custom-prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DisplayNames/ctor-default-prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5035,7 +4880,7 @@ intl402/DurationFormat/constructor-options-invalid.js  # [sloppy] expected pass,
 intl402/DurationFormat/constructor-options-localeMatcher-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DurationFormat/constructor-options-localeMatcher-valid.js  # [sloppy] expected pass, Runtime TypeError: is not a constructor
 intl402/DurationFormat/constructor-options-numberingSystem-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/DurationFormat/constructor-options-numberingSystem-valid.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+intl402/DurationFormat/constructor-options-numberingSystem-valid.js  # [sloppy] expected pass, Runtime TypeError: is not a constructor
 intl402/DurationFormat/constructor-options-order.js  # [sloppy] expected pass, Runtime TypeError: is not a constructor
 intl402/DurationFormat/constructor-options-style-conflict.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/DurationFormat/constructor-options-style-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5134,68 +4979,34 @@ intl402/FallbackSymbol/description.js  # [sloppy] expected pass, Runtime TypeErr
 intl402/FallbackSymbol/per-realm.js  # [sloppy] expected pass, Runtime TypeError: Object prototype may only be an Object or null
 intl402/Intl/builtin.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/Intl/getCanonicalLocales/Locale-object.js  # [sloppy] expected pass, Runtime TypeError: is not a constructor
-intl402/Intl/getCanonicalLocales/canonicalized-tags.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/canonicalized-unicode-ext-seq.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/complex-language-subtag-replacement.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/complex-region-subtag-replacement.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/descriptor.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/getCanonicalLocales/duplicates.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/elements-not-reordered.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/error-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/getCanonicalLocales/get-locale.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/getCanonicalLocales/getCanonicalLocales.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/getCanonicalLocales/grandfathered.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+intl402/Intl/getCanonicalLocales/canonicalized-tags.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/complex-language-subtag-replacement.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/complex-region-subtag-replacement.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/grandfathered.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/Intl/getCanonicalLocales/has-property.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/getCanonicalLocales/invalid-tags.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/getCanonicalLocales/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-intl402/Intl/getCanonicalLocales/locales-is-not-a-string.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/main.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-intl402/Intl/getCanonicalLocales/non-iana-canon.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/overriden-arg-length.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/getCanonicalLocales/overriden-push.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/preferred-grandfathered.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/preferred-variant.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/returned-object-is-an-array.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/returned-object-is-mutable.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/to-string.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/transformed-ext-canonical.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/transformed-ext-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/getCanonicalLocales/transformed-ext-valid.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-calendar.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-col-strength.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-measurement-system.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-region.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-subdivision.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-timezone.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-yes-to-true.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/getCanonicalLocales/unicode-ext-key-with-digit.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/getCanonicalLocales/weird-cases.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/builtin.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/supportedValuesOf/calendars-accepted-by-DateTimeFormat.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/calendars-accepted-by-DisplayNames.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/calendars-required-by-intl-era-monthcode.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/calendars.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/coerced-to-string.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+intl402/Intl/getCanonicalLocales/non-iana-canon.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/preferred-grandfathered.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/preferred-variant.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/returned-object-is-mutable.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/transformed-ext-canonical.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-calendar.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-col-strength.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-measurement-system.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-region.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-subdivision.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-timezone.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-yes-to-true.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/supportedValuesOf/calendars-required-by-intl-era-monthcode.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/supportedValuesOf/calendars.js  # [sloppy] expected pass, Runtime TypeError: is not a constructor
 intl402/Intl/supportedValuesOf/collations-accepted-by-Collator.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/collations.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/currencies-accepted-by-DisplayNames.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/currencies-accepted-by-NumberFormat.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/currencies.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/invalid-key.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/supportedValuesOf/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-intl402/Intl/supportedValuesOf/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-intl402/Intl/supportedValuesOf/numberingSystems-accepted-by-DateTimeFormat.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/numberingSystems-accepted-by-NumberFormat.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+intl402/Intl/supportedValuesOf/collations.js  # [sloppy] expected pass, Runtime TypeError: is not a constructor
+intl402/Intl/supportedValuesOf/currencies-accepted-by-DisplayNames.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/supportedValuesOf/numberingSystems-accepted-by-DateTimeFormat.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/supportedValuesOf/numberingSystems-accepted-by-NumberFormat.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/Intl/supportedValuesOf/numberingSystems-accepted-by-RelativeTimeFormat.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/numberingSystems-with-simple-digit-mappings.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/numberingSystems.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/Intl/supportedValuesOf/timeZones-accepted-by-DateTimeFormat.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/timeZones-include-non-continental.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/timeZones.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/units-accepted-by-NumberFormat.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-intl402/Intl/supportedValuesOf/units.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+intl402/Intl/supportedValuesOf/numberingSystems-with-simple-digit-mappings.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/Intl/supportedValuesOf/numberingSystems.js  # [sloppy] expected pass, Runtime TypeError: is not a constructor
+intl402/Intl/supportedValuesOf/timeZones-include-non-continental.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/Intl/toStringTag/toString.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/Intl/toStringTag/toStringTag.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/ListFormat/constructor/constructor/locales-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5422,29 +5233,13 @@ intl402/Locale/reject-duplicate-variants.js  # [sloppy] expected pass, Runtime [
 intl402/Locale/subclassing.js  # [sloppy] expected pass, Runtime TypeError: Class extends value is not a constructor or null
 intl402/Number/prototype/toLocaleString/returns-same-results-as-NumberFormat.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/Number/prototype/toLocaleString/throws-same-exceptions-as-NumberFormat.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-compactDisplay-compact.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/constructor-locales-get-tostring.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/constructor-locales-hasproperty.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-locales-toobject.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-notation.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-option-read-order.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-options-numberingSystem-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-options-roundingMode-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-options-throwing-getters.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/constructor-options-toobject.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-order.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/constructor-roundingIncrement-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-roundingIncrement.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-trailingZeroDisplay-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-trailingZeroDisplay.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-unit.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/constructor-unitDisplay.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/currency-code-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/currency-code-well-formed.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/currency-digits-nonstandard-notation.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/currencyDisplay-unit.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/default-minimum-singificant-digits.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/fraction-digit-options-read-once.js  # [sloppy] expected pass, Runtime [object Object]: 
+intl402/NumberFormat/ignore-invalid-unicode-ext-values.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/instance-proto-and-extensible.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/intl-legacy-constructed-symbol-on-unwrap.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 intl402/NumberFormat/intl-legacy-constructed-symbol-property.js  # [sloppy] expected pass, Runtime TypeError: Object prototype may only be an Object or null
@@ -5460,7 +5255,6 @@ intl402/NumberFormat/prototype/format/engineering-scientific-zh-TW.js  # [sloppy
 intl402/NumberFormat/prototype/format/format-fraction-digits-precision.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/format/format-fraction-digits.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/format/format-function-name.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/prototype/format/format-max-min-fraction-significant-digits.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/format/format-rounding-increment-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/format/format-rounding-increment-10.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/format/format-rounding-increment-100.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5526,7 +5320,6 @@ intl402/NumberFormat/prototype/format/unit-en-US.js  # [sloppy] expected pass, R
 intl402/NumberFormat/prototype/format/unit-ja-JP.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/format/unit-ko-KR.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/format/unit-zh-TW.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/prototype/format/units-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/format/units.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/format/useGrouping-en-IN.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/format/useGrouping-extended-de-DE.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5591,36 +5384,19 @@ intl402/NumberFormat/prototype/formatToParts/unit-zh-TW.js  # [sloppy] expected 
 intl402/NumberFormat/prototype/formatToParts/unit.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/formatToParts/value-tonumber.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/prototype/resolvedOptions/basic.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/resolvedOptions/builtin.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-intl402/NumberFormat/prototype/resolvedOptions/compactDisplay.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/resolvedOptions/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 intl402/NumberFormat/prototype/resolvedOptions/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 intl402/NumberFormat/prototype/resolvedOptions/no-instanceof.js  # [sloppy] expected pass, Runtime TypeError: Object prototype may only be an Object or null
-intl402/NumberFormat/prototype/resolvedOptions/order.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/resolvedOptions/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 intl402/NumberFormat/prototype/resolvedOptions/resolved-numbering-system-unicode-extensions-and-options.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/prototype/resolvedOptions/roundingMode.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/prototype/resolvedOptions/this-value-not-numberformat.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 intl402/NumberFormat/prototype/toStringTag/configurable.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 intl402/NumberFormat/prototype/toStringTag/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-intl402/NumberFormat/significant-digits-options-get-sequence.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/style-unit.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/subclassing.js  # [sloppy] expected pass, Runtime TypeError: map callback is not a function
 intl402/NumberFormat/supportedLocalesOf/basic.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/test-option-currency.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/test-option-currencyDisplay.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/test-option-localeMatcher.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/test-option-roundingPriority-mixed-options.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/test-option-roundingPriority.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/test-option-style.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/test-option-useGrouping-extended.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/test-option-useGrouping.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/throws-for-currency-style-without-currency-option.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/throws-for-maximumFractionDigits-over-limit.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/throws-for-maximumFractionDigits-under-limit.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/throws-for-minimumFractionDigits-over-limit.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/NumberFormat/throws-for-minimumFractionDigits-under-limit.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/PluralRules/can-be-subclassed.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'bind')
 intl402/PluralRules/compactDisplay-undefined-unless-notation-compact.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 intl402/PluralRules/constructor-option-read-order.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5803,7 +5579,6 @@ intl402/String/prototype/toLocaleUpperCase/special_casing_Lithuanian.js  # [slop
 intl402/String/prototype/toLocaleUpperCase/special_casing_Turkish.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/String/prototype/toLocaleUpperCase/validates-all-locale-identifiers.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/TypedArray/prototype/toLocaleString/calls-toLocaleString-number-elements.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/constructors-string-and-single-element-array.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/constructors-taint-Object-prototype-2.js  # [sloppy] expected pass, Runtime TypeError: is not a function (Testing with Collator.)
 intl402/constructors-taint-Object-prototype.js  # [sloppy] expected pass, Runtime TypeError: is not a function (Testing with Collator.)
 intl402/default-locale-is-canonicalized.js  # [sloppy] expected pass, Runtime TypeError: is not a function (Testing with Collator.)
