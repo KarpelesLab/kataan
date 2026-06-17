@@ -81,7 +81,11 @@ impl<'a> Interp<'a> {
         match key {
             PropertyKey::Computed(e) => {
                 let v = self.eval(e)?;
-                Ok(self.member_key(v))
+                // ToPropertyKey: a symbol keeps its identity; any other object is
+                // coerced via ToPrimitive(string) so a user `toString` runs and an
+                // uncoercible key (e.g. `Object.create(null)` or a non-callable
+                // `Symbol.toPrimitive`) throws a TypeError.
+                self.coerce_property_key(v)
             }
             _ => static_key(key),
         }
