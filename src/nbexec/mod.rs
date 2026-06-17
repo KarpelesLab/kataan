@@ -1255,6 +1255,15 @@ const CTOR_KEY: &str = "\u{0}ctor";
 /// Hidden slot on an object-literal concise method recording its `[[HomeObject]]`
 /// (the object it was defined on), for `super` resolution.
 const HOME_OBJECT: &str = "\u{0}home";
+/// Hidden slots on an arrow function capturing its *lexical* environment at
+/// definition: the enclosing `this`, `new.target`, object-literal home object,
+/// and class-home (id + static flag). Restored on every call so the arrow's
+/// `this`/`super`/`new.target` follow definition site, not the call site.
+const ARROW_THIS: &str = "\u{0}athis";
+const ARROW_NEW_TARGET: &str = "\u{0}antgt";
+const ARROW_HOME_OBJ: &str = "\u{0}ahome";
+const ARROW_HOME_CLASS: &str = "\u{0}ahcls";
+const ARROW_HOME_STATIC: &str = "\u{0}ahsta";
 /// Reserved hidden keys for an eager generator's result object: the buffer of
 /// yielded values and the current `next()` cursor.
 /// Sentinel description for a `Symbol()` created with no argument (so its

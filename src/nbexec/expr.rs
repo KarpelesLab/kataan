@@ -1041,6 +1041,26 @@ impl<'a> Interp<'a> {
             && let Some((func_id, _)) = self.realm.function_at(Handle::from_raw(raw))
         {
             self.functions[func_id as usize].is_arrow = true;
+            // Capture the *lexical* `this`/`new.target`/home at the definition site
+            // (hidden slots), so a later call (including via `call`/`apply`/`bind`)
+            // resolves them from here rather than the call site.
+            let h = Handle::from_raw(raw);
+            self.realm.set_hidden_property(h, ARROW_THIS, self.this_val);
+            self.realm
+                .set_hidden_property(h, ARROW_NEW_TARGET, self.new_target);
+            if let Some(home) = self.current_home_object {
+                self.realm
+                    .set_hidden_property(h, ARROW_HOME_OBJ, NanBox::handle(home.to_raw()));
+            }
+            if let Some(hc) = self.current_home {
+                self.realm
+                    .set_hidden_property(h, ARROW_HOME_CLASS, NanBox::number(f64::from(hc)));
+            }
+            self.realm.set_hidden_property(
+                h,
+                ARROW_HOME_STATIC,
+                NanBox::boolean(self.current_home_static),
+            );
         }
         f
     }

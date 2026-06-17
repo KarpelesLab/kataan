@@ -832,16 +832,54 @@ impl<'a> Interp<'a> {
         // the duration of the call so `super.x` in the body resolves through it. An
         // arrow has no own home object — it inherits the enclosing one (so an arrow
         // inside a concise method can use `super`), matching its lexical `this`.
-        let saved_home_obj = if def.is_arrow {
-            self.current_home_object
-        } else {
-            let home_obj = self
+        if def.is_arrow {
+            // An arrow restores the *lexical* `this`/`new.target`/home it captured at
+            // definition (hidden slots), so a call from any site — including via
+            // `call`/`apply`/`bind` — sees the defining environment. `invoke_inner`
+            // then inherits these `self.*` fields for the arrow body.
+            let saved_this = self.this_val;
+            let saved_nt = self.new_target;
+            let saved_home_obj = self.current_home_object;
+            let saved_home = self.current_home;
+            let saved_home_static = self.current_home_static;
+            if let Some(t) = self.realm.get_property(handle, ARROW_THIS) {
+                self.this_val = t;
+            }
+            if let Some(nt) = self.realm.get_property(handle, ARROW_NEW_TARGET) {
+                self.new_target = nt;
+            }
+            // Restore the captured home context only when one was recorded at
+            // definition; an arrow defined without a home (e.g. some field-initializer
+            // / direct-eval contexts) keeps inheriting the caller's home so its
+            // `super` still resolves.
+            if let Some(home_obj) = self.realm.get_property(handle, ARROW_HOME_OBJ) {
+                self.current_home_object = home_obj.as_handle().map(Handle::from_raw);
+            }
+            if let Some(hc) = self
                 .realm
-                .get_property(handle, HOME_OBJECT)
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw);
-            core::mem::replace(&mut self.current_home_object, home_obj)
-        };
+                .get_property(handle, ARROW_HOME_CLASS)
+                .and_then(|v| v.as_number())
+            {
+                self.current_home = Some(hc as u32);
+                self.current_home_static = self
+                    .realm
+                    .get_property(handle, ARROW_HOME_STATIC)
+                    .is_some_and(|v| self.realm.truthy(v));
+            }
+            let r = self.invoke(def, captured, this_val, args);
+            self.this_val = saved_this;
+            self.new_target = saved_nt;
+            self.current_home_object = saved_home_obj;
+            self.current_home = saved_home;
+            self.current_home_static = saved_home_static;
+            return r;
+        }
+        let home_obj = self
+            .realm
+            .get_property(handle, HOME_OBJECT)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw);
+        let saved_home_obj = core::mem::replace(&mut self.current_home_object, home_obj);
         let r = self.invoke(def, captured, this_val, args);
         self.current_home_object = saved_home_obj;
         r
