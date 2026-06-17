@@ -2179,6 +2179,28 @@ fn run_frame(
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),
                     }
+                } else if *native == NB_NUMBER {
+                    // `ToNumber` (`Number(x)`, `+x`, `x++`/`x--`) on an object runs
+                    // ToPrimitive(number) — its `valueOf`/`toString`, including the
+                    // default for primitive wrappers (`Number(new Boolean(true))` is
+                    // 1). That can call a JS closure and a Symbol/BigInt operand
+                    // throws a TypeError, so it runs here, not in `call_native`.
+                    let arg = argv.first().copied().unwrap_or(NanBox::undefined());
+                    let prim = to_primitive(ctx, funcs, arg, true);
+                    let bad = prim.as_handle().map(Handle::from_raw).and_then(|h| {
+                        if ctx.realm.symbol_at(h).is_some() {
+                            Some(SYM_NUM_ERR)
+                        } else if ctx.realm.bigint_at(h).is_some() {
+                            Some("Cannot convert a BigInt value to a number")
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(msg) = bad {
+                        let e = make_error(ctx.realm, "TypeError", msg);
+                        handle_throw!(VmError::Thrown(e));
+                    }
+                    regs[*dst as usize] = NanBox::number(ctx.realm.to_number(prim));
                 } else {
                     regs[*dst as usize] = call_native(ctx, *native, &argv);
                 }

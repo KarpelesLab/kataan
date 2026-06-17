@@ -520,7 +520,12 @@ impl<'a> Interp<'a> {
                     let old_box = NanBox::handle(self.realm.new_bigint(big).to_raw());
                     return Ok(if *prefix { next_box } else { old_box });
                 }
-                let old = self.realm.to_number(current);
+                // `ToNumber(GetValue(arg))` runs ToPrimitive(number) on an object
+                // operand (its `valueOf`/`toString`, which may throw) — e.g.
+                // `(new Boolean(true))++` is `2`. The infallible `to_number` routes
+                // an object through `toString` only, so go via the spec path.
+                let coerced = self.coerce_to_number(current)?;
+                let old = self.realm.to_number(coerced);
                 let next = match op {
                     crate::ast::UpdateOp::Inc => old + 1.0,
                     crate::ast::UpdateOp::Dec => old - 1.0,
@@ -886,7 +891,10 @@ impl<'a> Interp<'a> {
                             // key when otherwise anonymous. A computed key that is a
                             // Symbol names the method `[description]` (or `""`); a
                             // static identifier/string key names it directly.
-                            if matches!(&**value, Expr::Function(_) | Expr::Arrow(_)) {
+                            if matches!(
+                                &**value,
+                                Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_)
+                            ) {
                                 match key {
                                     PropertyKey::Ident(s) | PropertyKey::Str(s) => {
                                         self.set_fn_name(v, s);
@@ -894,8 +902,8 @@ impl<'a> Interp<'a> {
                                     PropertyKey::Computed(_) => {
                                         // `k` is the storage key (a `\0sym:` key for a
                                         // Symbol); `method_display_name` renders the
-                                        // spec name. Install it if the function is
-                                        // still anonymous.
+                                        // spec name. Install it if the value is still
+                                        // anonymous (an anonymous class included).
                                         let params: &[Param] = match &**value {
                                             Expr::Function(f) => &f.params,
                                             _ => &[],
@@ -906,7 +914,19 @@ impl<'a> Interp<'a> {
                                                 .map(Handle::from_raw)
                                                 .is_some_and(|h| !self.realm.has_own(h, "name"))
                                         {
-                                            self.install_method_meta(v, &name, params);
+                                            if matches!(&**value, Expr::Class(_)) {
+                                                // A class already has its `length`; only
+                                                // its `name` is set by NamedEvaluation.
+                                                let nm = self.new_str(&name);
+                                                if let Some(h) = v.as_handle().map(Handle::from_raw)
+                                                {
+                                                    self.realm.set_property(h, "name", nm);
+                                                    self.realm.mark_hidden(h, "name");
+                                                    self.realm.set_readonly_property(h, "name");
+                                                }
+                                            } else {
+                                                self.install_method_meta(v, &name, params);
+                                            }
                                         }
                                     }
                                     _ => {}
@@ -978,6 +998,18 @@ impl<'a> Interp<'a> {
                                     HOME_OBJECT,
                                     NanBox::handle(handle.to_raw()),
                                 );
+                                // The accessor's `name` is `"get <key>"` / `"set <key>"`
+                                // (a symbol key → `"get [desc]"`), per SetFunctionName.
+                                let kind = if *is_getter {
+                                    MethodKind::Get
+                                } else {
+                                    MethodKind::Set
+                                };
+                                if let Some(nm) = self.method_display_name(&k, kind)
+                                    && !self.realm.has_own(fh, "name")
+                                {
+                                    self.install_fn_name_length(fh, &nm, value.params.len() as u32);
+                                }
                             }
                             if *is_getter {
                                 self.realm
