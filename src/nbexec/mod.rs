@@ -330,6 +330,10 @@ pub struct Interp<'a> {
     /// `RegExp.prototype`, recorded at setup so RegExp instances can link their
     /// `[[Prototype]]` to it (and species lookups resolve cheaply).
     regexp_proto: Option<Handle>,
+    /// The `%RegExp%` intrinsic constructor handle, recorded at setup. Used to
+    /// brand-check the receiver of the Annex B.2.5 legacy static accessors
+    /// (`RegExp.$1`/`input`/`lastMatch`/…), which require `this === RegExp`.
+    regexp_ctor: Option<Handle>,
     /// Leak-once cache interning `Intl.NumberFormat` currency/unit codes to `&'static str`
     /// (the `intl` crate's options take `'static`); bounded by the distinct codes a program
     /// uses.
@@ -538,6 +542,15 @@ const N_DATA_VIEW_PROTO_FN: u16 = 302;
 /// per spec. Returns `null` (the spec-mandated result of `DetachArrayBuffer`).
 /// New-id block at 360+ per the batch's allocation rule.
 const N_DETACH_ARRAY_BUFFER: u16 = 360;
+/// `escape(string)` (Annex B.2.1): legacy percent/`%u`-escape of a string.
+const N_ESCAPE: u16 = 420;
+/// `unescape(string)` (Annex B.2.2): inverse of [`N_ESCAPE`].
+const N_UNESCAPE: u16 = 421;
+/// A RegExp legacy static getter (Annex B.2.5) — a bound native carrying the
+/// accessor's key (`input`/`lastMatch`/`$1`/…); brand-checks `this === RegExp`.
+const N_REGEXP_LEGACY_GET: u16 = 422;
+/// The `set RegExp.input` / `set RegExp.$_` legacy setter (Annex B.2.5).
+const N_REGEXP_LEGACY_SET: u16 = 423;
 /// `%IteratorHelperPrototype%.next` — drives a lazy ES2025 iterator-helper object
 /// (`map`/`filter`/`take`/`drop`/`flatMap`) one step at a time.
 const N_ITER_HELPER_NEXT: u16 = 340;
@@ -819,6 +832,9 @@ const DATE_PROTO_METHODS: &[&str] = &[
     "setUTCSeconds",
     "setMilliseconds",
     "setUTCMilliseconds",
+    // Annex B.2.4: legacy two-digit-year accessors.
+    "getYear",
+    "setYear",
 ];
 /// A first-class `%TypedArray%.prototype.<method>` (e.g. `map`, `slice`, `every`).
 /// Like [`N_ARRAY_PROTO_FN`] but validates that the call's `this` has a
@@ -945,6 +961,20 @@ const STRING_PROTO_METHODS: &[&str] = &[
     "valueOf",
     "isWellFormed",
     "toWellFormed",
+    // Annex B.2.3: legacy HTML wrapper methods.
+    "anchor",
+    "big",
+    "blink",
+    "bold",
+    "fixed",
+    "fontcolor",
+    "fontsize",
+    "italics",
+    "link",
+    "small",
+    "strike",
+    "sub",
+    "sup",
 ];
 /// `Number.prototype` methods exposed as first-class values.
 const NUMBER_PROTO_METHODS: &[&str] = &[
@@ -1035,6 +1065,9 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "toUpperCase" | "toLowerCase" | "toLocaleUpperCase" | "toLocaleLowerCase"
         | "toReversed" | "toSorted" | "isWellFormed" | "toWellFormed" | "getInt8" | "getUint8"
         | "toArray" | "normalize"
+        // Annex B.2.3 zero-argument HTML wrapper methods.
+        | "big" | "blink" | "bold" | "fixed" | "italics" | "small"
+        | "strike" | "sub" | "sup"
         // `Date.prototype` getters / serializers (length 0).
         | "getTime" | "getFullYear" | "getUTCFullYear" | "getMonth" | "getUTCMonth"
         | "getDate" | "getUTCDate" | "getDay" | "getUTCDay" | "getHours" | "getUTCHours"
@@ -1042,6 +1075,8 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "getMilliseconds" | "getUTCMilliseconds" | "getTimezoneOffset"
         | "toISOString" | "toDateString" | "toTimeString" | "toUTCString"
         | "toLocaleDateString" | "toLocaleTimeString"
+        // Annex B.2.4 `Date.prototype.getYear` (length 0).
+        | "getYear"
         // `ArrayBuffer.prototype.transfer`/`transferToFixedLength` — `length` 0
         // (the optional `newLength` is not counted).
         | "transfer" | "transferToFixedLength"
@@ -1446,6 +1481,7 @@ impl<'a> Interp<'a> {
             well_known_symbols: alloc::collections::BTreeMap::new(),
             tagged_template_cache: alloc::collections::BTreeMap::new(),
             regexp_proto: None,
+            regexp_ctor: None,
             #[cfg(feature = "intl")]
             intl_intern: alloc::collections::BTreeMap::new(),
             method_name_intern: alloc::collections::BTreeMap::new(),
@@ -2170,6 +2206,8 @@ impl<'a> Interp<'a> {
             ("decodeURIComponent", N_DECODE_URI_COMPONENT),
             ("encodeURI", N_ENCODE_URI),
             ("decodeURI", N_DECODE_URI),
+            ("escape", N_ESCAPE),
+            ("unescape", N_UNESCAPE),
             ("structuredClone", N_STRUCTURED_CLONE),
             ("setTimeout", N_SET_TIMEOUT),
             ("clearTimeout", N_CLEAR_TIMEOUT),
@@ -2542,6 +2580,26 @@ impl<'a> Interp<'a> {
             self.realm.set_readonly_property(arr_proto, &key);
         }
         self.setup_first_class_prototype_id("String", STRING_PROTO_METHODS, N_STRING_PROTO_FN);
+        // Annex B.2.3: `String.prototype.trimLeft`/`trimRight` are the *same*
+        // function objects as `trimStart`/`trimEnd` (`===`-identical, and their
+        // `name` is "trimStart"/"trimEnd"). Install the shared handles as
+        // additional writable/configurable, non-enumerable data properties.
+        if let Some(str_proto) = self
+            .current
+            .get("String")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|s| self.realm.get_property(s, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            for (alias, original) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
+                if let Some(f) = self.realm.get_property(str_proto, original) {
+                    self.realm.set_property(str_proto, alias, f);
+                    self.realm.mark_hidden(str_proto, alias);
+                }
+            }
+        }
         self.setup_first_class_prototype_id("Number", NUMBER_PROTO_METHODS, N_NUMBER_PROTO_FN);
         // The `Number` numeric constants are own data properties of the
         // constructor with the built-in attributes `{ writable: false,
@@ -2605,6 +2663,22 @@ impl<'a> Interp<'a> {
         }
         self.setup_first_class_prototype_id("BigInt", BIGINT_PROTO_METHODS, N_BIGINT_PROTO_FN);
         self.setup_first_class_prototype_id("Date", DATE_PROTO_METHODS, N_DATE_PROTO_FN);
+        // Annex B.2.4: `Date.prototype.toGMTString` is the *same* function object
+        // as `toUTCString` (`===`-identical), installed as a writable,
+        // configurable, non-enumerable data property.
+        if let Some(date_proto) = self
+            .current
+            .get("Date")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|d| self.realm.get_property(d, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+            && let Some(f) = self.realm.get_property(date_proto, "toUTCString")
+        {
+            self.realm.set_property(date_proto, "toGMTString", f);
+            self.realm.mark_hidden(date_proto, "toGMTString");
+        }
         // `Date.prototype[Symbol.toPrimitive]` — a method (length 1) keyed by the
         // well-known symbol, `{ writable: false, enumerable: false,
         // configurable: true }`.
@@ -4819,6 +4893,76 @@ fn uri_decode(s: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+/// `escape(string)` (Annex B.2.1.1). Operates on the UTF-16 code units of the
+/// WTF-8 `bytes`: a unit in the unescaped set (`A-Za-z0-9` plus `@*_+-./`) is
+/// kept; a unit `< 256` becomes `%XX`; any larger unit becomes `%uXXXX`. The
+/// result is pure ASCII, so its WTF-8 form is its UTF-8 form.
+fn legacy_escape(bytes: &[u8]) -> Vec<u8> {
+    fn hex(n: u32) -> u8 {
+        char::from_digit(n, 16).unwrap().to_ascii_uppercase() as u8
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    for u in crate::wtf8::utf16_units(bytes) {
+        let keep = matches!(u, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A)
+            || matches!(u as u8 as char, '@' | '*' | '_' | '+' | '-' | '.' | '/') && u < 0x80;
+        if keep {
+            out.push(u as u8);
+        } else if u < 256 {
+            out.push(b'%');
+            out.push(hex((u as u32) >> 4));
+            out.push(hex((u as u32) & 0xF));
+        } else {
+            out.push(b'%');
+            out.push(b'u');
+            out.push(hex((u as u32) >> 12));
+            out.push(hex(((u as u32) >> 8) & 0xF));
+            out.push(hex(((u as u32) >> 4) & 0xF));
+            out.push(hex((u as u32) & 0xF));
+        }
+    }
+    out
+}
+
+/// `unescape(string)` (Annex B.2.2.1). The inverse of [`legacy_escape`], over the
+/// UTF-16 code units of `bytes`: `%uXXXX` decodes to a single unit, `%XX` to a
+/// unit `< 256`; an incomplete or non-hex escape is left verbatim. The rebuilt
+/// units are re-encoded to WTF-8 (so a decoded surrogate is preserved).
+fn legacy_unescape(bytes: &[u8]) -> Vec<u8> {
+    let units: Vec<u16> = crate::wtf8::utf16_units(bytes).collect();
+    let hex4 = |s: &[u16]| -> Option<u16> {
+        let mut v: u32 = 0;
+        for &u in s {
+            let d = char::from_u32(u32::from(u)).and_then(|c| c.to_digit(16))?;
+            v = v * 16 + d;
+        }
+        Some(v as u16)
+    };
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        if units[i] == u16::from(b'%') {
+            if i + 5 < units.len()
+                && units[i + 1] == u16::from(b'u')
+                && let Some(v) = hex4(&units[i + 2..i + 6])
+            {
+                out.push(v);
+                i += 6;
+                continue;
+            }
+            if i + 2 < units.len()
+                && let Some(v) = hex4(&units[i + 1..i + 3])
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(units[i]);
+        i += 1;
+    }
+    crate::wtf8::from_utf16(&out)
 }
 
 fn parse_float_prefix(s: &str) -> f64 {

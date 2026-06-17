@@ -1121,6 +1121,7 @@ impl<'a> Interp<'a> {
                         | "getMilliseconds"
                         | "getUTCMilliseconds"
                         | "getTimezoneOffset"
+                        | "getYear"
                 )
             {
                 return Ok(Some(NanBox::number(f64::NAN)));
@@ -1133,6 +1134,9 @@ impl<'a> Interp<'a> {
                 // The engine models all dates in UTC, so `getUTC*` aliases `get*`.
                 "getTime" | "valueOf" => NanBox::number(ms),
                 "getFullYear" | "getUTCFullYear" => NanBox::number(y as f64),
+                // Annex B.2.4.1 `getYear`: `YearFromTime(LocalTime(t)) - 1900`
+                // (the engine is UTC, so `LocalTime(t) == t`).
+                "getYear" => NanBox::number((y - 1900) as f64),
                 "getMonth" | "getUTCMonth" => NanBox::number((mo - 1) as f64), // 0-based
                 "getDate" | "getUTCDate" => NanBox::number(d as f64),
                 "getDay" | "getUTCDay" => {
@@ -1197,6 +1201,46 @@ impl<'a> Interp<'a> {
                     // ToNumber(time) → TimeClip.
                     let raw = self.coerce_to_number(arg(0))?;
                     let nms = time_clip(self.realm.to_number(raw));
+                    self.realm.set_date_ms(handle, nms);
+                    NanBox::number(nms)
+                }
+                // Annex B.2.5.1 `setYear(year)`: like `setFullYear` but maps a
+                // two-digit year argument (integer part in `0..=99`) to `1900 + y`.
+                // Works on an invalid date (treats the time as +0).
+                "setYear" => {
+                    let num = self.coerce_to_number(arg(0))?;
+                    let yf = self.realm.to_number(num);
+                    if yf.is_nan() {
+                        self.realm.set_date_ms(handle, f64::NAN);
+                        return Ok(Some(NanBox::number(f64::NAN)));
+                    }
+                    // MakeFullYear: 0..=99 (integer part) becomes 1900-relative.
+                    // (`trunc_toward_zero` is the no_std-safe `f64::trunc`.)
+                    let yint = trunc_toward_zero(yf);
+                    let yy = if (0.0..=99.0).contains(&yint) {
+                        1900 + yint as i64
+                    } else {
+                        yint as i64
+                    };
+                    // Decompose the current time (or the epoch when invalid).
+                    let date_is_nan = !ms.is_finite();
+                    let (mo1, dd, hh, mi, ss, mss) = if date_is_nan {
+                        (1, 1, 0, 0, 0, 0)
+                    } else {
+                        (
+                            mo,
+                            d as i64,
+                            tod / 3_600_000,
+                            tod / 60_000 % 60,
+                            tod / 1000 % 60,
+                            tod % 1000,
+                        )
+                    };
+                    let base_days = crate::realm::days_from_civil(yy, mo1, 1) + (dd - 1);
+                    let nms = time_clip(
+                        (base_days * 86_400_000 + hh * 3_600_000 + mi * 60_000 + ss * 1000 + mss)
+                            as f64,
+                    );
                     self.realm.set_date_ms(handle, nms);
                     NanBox::number(nms)
                 }
@@ -1938,6 +1982,34 @@ impl<'a> Interp<'a> {
                     let s = crate::wtf8::to_string_lossy(&bytes);
                     Some(self.new_str(s.trim_end()))
                 }
+                // Annex B.2.3: `trimLeft`/`trimRight` are legacy aliases of
+                // `trimStart`/`trimEnd`.
+                "trimLeft" => {
+                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    Some(self.new_str(s.trim_start()))
+                }
+                "trimRight" => {
+                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    Some(self.new_str(s.trim_end()))
+                }
+                // Annex B.2.3 legacy HTML wrapper methods. `CreateHTML(S, tag,
+                // attribute, value)`: wraps the receiver string `S` in
+                // `<tag …>S</tag>`, optionally emitting `attribute="value"` with
+                // the value's `"` escaped as `&quot;`. The attribute value is
+                // ToString-coerced (its error must propagate).
+                "anchor" => Some(self.create_html(&bytes, "a", "name", Some(arg(0)))?),
+                "big" => Some(self.create_html(&bytes, "big", "", None)?),
+                "blink" => Some(self.create_html(&bytes, "blink", "", None)?),
+                "bold" => Some(self.create_html(&bytes, "b", "", None)?),
+                "fixed" => Some(self.create_html(&bytes, "tt", "", None)?),
+                "fontcolor" => Some(self.create_html(&bytes, "font", "color", Some(arg(0)))?),
+                "fontsize" => Some(self.create_html(&bytes, "font", "size", Some(arg(0)))?),
+                "italics" => Some(self.create_html(&bytes, "i", "", None)?),
+                "link" => Some(self.create_html(&bytes, "a", "href", Some(arg(0)))?),
+                "small" => Some(self.create_html(&bytes, "small", "", None)?),
+                "strike" => Some(self.create_html(&bytes, "strike", "", None)?),
+                "sub" => Some(self.create_html(&bytes, "sub", "", None)?),
+                "sup" => Some(self.create_html(&bytes, "sup", "", None)?),
                 // A string's `toString`/`valueOf` is the string itself.
                 "toString" | "valueOf" => Some(recv),
                 // `isWellFormed`/`toWellFormed`: a string is well-formed iff it has
@@ -3143,5 +3215,40 @@ impl<'a> Interp<'a> {
             return Ok(Some(self.new_str(&alloc::format!("[object {tag}]"))));
         }
         Ok(None)
+    }
+
+    /// `CreateHTML(string, tag, attribute, value)` (Annex B.2.3): wraps the WTF-8
+    /// receiver `s_bytes` in `<tag …>S</tag>`. When `attribute` is non-empty and
+    /// `value` is `Some`, emits `attribute="V"` where `V` is `ToString(value)`
+    /// with every `"` replaced by `&quot;`. The receiver bytes pass through
+    /// verbatim (so lone surrogates survive).
+    fn create_html(
+        &mut self,
+        s_bytes: &[u8],
+        tag: &str,
+        attribute: &str,
+        value: Option<NanBox>,
+    ) -> Result<NanBox, ExecError> {
+        let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        out.push(b'<');
+        out.extend_from_slice(tag.as_bytes());
+        if !attribute.is_empty()
+            && let Some(v) = value
+        {
+            // ToString first (errors propagate), then escape `"` → `&quot;`.
+            let v = self.coerce_to_string(v)?;
+            let escaped = v.replace('"', "&quot;");
+            out.push(b' ');
+            out.extend_from_slice(attribute.as_bytes());
+            out.extend_from_slice(b"=\"");
+            out.extend_from_slice(escaped.as_bytes());
+            out.push(b'"');
+        }
+        out.push(b'>');
+        out.extend_from_slice(s_bytes);
+        out.extend_from_slice(b"</");
+        out.extend_from_slice(tag.as_bytes());
+        out.push(b'>');
+        Ok(self.new_str_bytes(out))
     }
 }

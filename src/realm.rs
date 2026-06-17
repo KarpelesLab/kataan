@@ -136,9 +136,33 @@ pub struct Realm {
     /// override is recorded in [`native_protos`](Realm::native_protos) /
     /// [`callable_null_protos`](Realm::callable_null_protos).
     array_proto_intrinsic: Option<Handle>,
+    /// The RegExp legacy static match record (Annex B.2.5): updated after every
+    /// successful built-in match, read by the `RegExp.$1`..`$9` / `RegExp.input`
+    /// / `lastMatch` / … static accessors.
+    legacy_regexp: LegacyRegExpState,
     /// Tunable resource limits for work driven in this realm. Defaults to
     /// [`crate::limits::Limits::default`]; override with [`Realm::with_limits`].
     pub limits: crate::limits::Limits,
+}
+
+/// The mutable state behind the Annex B.2.5 RegExp legacy static accessors
+/// (`RegExp.input`/`$_`, `RegExp.lastMatch`/`$&`, `RegExp.lastParen`/`$+`,
+/// `RegExp.leftContext`/`` $` ``, `RegExp.rightContext`/`$'`, `RegExp.$1`..`$9`).
+/// Each field stores WTF-8 bytes so a surrogate-bearing subject round-trips.
+#[derive(Default, Clone)]
+pub struct LegacyRegExpState {
+    /// The last subject string matched against (`RegExp.input` / `$_`).
+    pub input: alloc::vec::Vec<u8>,
+    /// The portion of the subject that matched (`RegExp.lastMatch` / `$&`).
+    pub last_match: alloc::vec::Vec<u8>,
+    /// The last (highest-index) captured group (`RegExp.lastParen` / `$+`).
+    pub last_paren: alloc::vec::Vec<u8>,
+    /// The substring preceding the match (`RegExp.leftContext` / `` $` ``).
+    pub left_context: alloc::vec::Vec<u8>,
+    /// The substring following the match (`RegExp.rightContext` / `$'`).
+    pub right_context: alloc::vec::Vec<u8>,
+    /// Captured groups 1..=9 (`RegExp.$1`..`$9`); absent groups are empty.
+    pub parens: [alloc::vec::Vec<u8>; 9],
 }
 
 impl Default for Realm {
@@ -179,8 +203,20 @@ impl Realm {
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
             array_proto_intrinsic: None,
+            legacy_regexp: LegacyRegExpState::default(),
             limits,
         }
+    }
+
+    /// A shared reference to the RegExp legacy static match record (Annex B.2.5).
+    #[must_use]
+    pub fn legacy_regexp(&self) -> &LegacyRegExpState {
+        &self.legacy_regexp
+    }
+
+    /// Replaces the RegExp legacy static match record after a successful match.
+    pub fn set_legacy_regexp(&mut self, state: LegacyRegExpState) {
+        self.legacy_regexp = state;
     }
 
     /// Records an explicit `[[Prototype]]` for a callable cell (native / bound

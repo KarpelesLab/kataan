@@ -1191,6 +1191,22 @@ impl<'a> Interp<'a> {
                 }
                 result
             }
+            // `set RegExp.input` / `set RegExp.$_` (Annex B.2.5): brand-check
+            // `this === %RegExp%`, then store ToString(value) as the legacy input.
+            N_REGEXP_LEGACY_SET => {
+                let this = self.this_val;
+                if this.as_handle().map(Handle::from_raw) != Some(self.regexp_constructor_handle()?)
+                {
+                    return Err(self.type_error(
+                        "RegExp legacy static property setter called on a non-RegExp receiver",
+                    ));
+                }
+                let bytes = self.coerce_to_string_bytes(arg(0))?;
+                let mut st = self.realm.legacy_regexp().clone();
+                st.input = bytes;
+                self.realm.set_legacy_regexp(st);
+                NanBox::undefined()
+            }
             // `get Object.prototype.__proto__` (Annex B).
             N_OBJ_PROTO_GET => {
                 let this = self.this_val;
@@ -1564,6 +1580,21 @@ impl<'a> Interp<'a> {
                         return Err(ExecError::Throw(self.make_error(N_URI_ERROR, Some(m))));
                     }
                 }
+            }
+            // `escape(string)` (Annex B.2.1): the legacy escaper. Each UTF-16
+            // code unit that is not in the unescaped set (`A-Za-z0-9@*_+-./`) is
+            // emitted as `%XX` (units < 256) or `%uXXXX` (units >= 256). The
+            // argument is ToString-coerced first (its error propagates).
+            N_ESCAPE => {
+                let bytes = self.coerce_to_string_bytes(arg(0))?;
+                self.new_str_bytes(legacy_escape(&bytes))
+            }
+            // `unescape(string)` (Annex B.2.2): the inverse of `escape`. Reads
+            // `%uXXXX` (4 hex digits) and `%XX` (2 hex digits) escapes; any
+            // malformed escape is left verbatim.
+            N_UNESCAPE => {
+                let bytes = self.coerce_to_string_bytes(arg(0))?;
+                self.new_str_bytes(legacy_unescape(&bytes))
             }
             N_STRUCTURED_CLONE => {
                 let mut seen: Vec<(u64, NanBox)> = Vec::new();

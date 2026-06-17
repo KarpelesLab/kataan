@@ -127,10 +127,11 @@ impl<'a> Interp<'a> {
         for &name in REGEXP_PROTO_METHODS {
             let name_h = self.realm.new_string(name);
             let f = self.realm.new_bound_native(N_REGEXP_PROTO_FN, name_h);
-            let arity = if name == "exec" || name == "test" || name == "compile" {
-                1
-            } else {
-                0
+            let arity = match name {
+                // `compile(pattern, flags)` has `length` 2 (Annex B.2.5.1).
+                "compile" => 2,
+                "exec" | "test" => 1,
+                _ => 0,
             };
             self.install_fn_name_length(f, name, arity);
             self.realm
@@ -181,6 +182,7 @@ impl<'a> Interp<'a> {
         self.realm.set_non_configurable_property(ctor, "prototype");
         // Record it so instances and species lookups can find it cheaply.
         self.regexp_proto = Some(proto);
+        self.regexp_ctor = Some(ctor);
         // `RegExp[Symbol.species]` — a getter returning `this`.
         let species_getter = self.realm.new_bound_native(N_REGEXP_SPECIES, ctor);
         self.install_fn_name_length(species_getter, "get [Symbol.species]", 0);
@@ -193,6 +195,59 @@ impl<'a> Interp<'a> {
             NanBox::undefined(),
         );
         self.realm.mark_hidden(ctor, &species_key);
+        self.setup_regexp_legacy_accessors(ctor);
+    }
+
+    /// Installs the Annex B.2.5 RegExp legacy static accessors on the constructor.
+    /// Each is a getter (and, for `input`/`$_`, a setter) that brand-checks
+    /// `this === RegExp` and reads/writes the realm's legacy match record. The
+    /// getter's bound-native target string selects which field it exposes; the
+    /// alias keys (`$_`, `$&`, …) share the same getter as their long names.
+    fn setup_regexp_legacy_accessors(&mut self, ctor: Handle) {
+        // (key, getter-field-selector, has-setter)
+        const ENTRIES: &[(&str, &str, bool)] = &[
+            ("input", "input", true),
+            ("$_", "input", true),
+            ("lastMatch", "lastMatch", false),
+            ("$&", "lastMatch", false),
+            ("lastParen", "lastParen", false),
+            ("$+", "lastParen", false),
+            ("leftContext", "leftContext", false),
+            ("$`", "leftContext", false),
+            ("rightContext", "rightContext", false),
+            ("$'", "rightContext", false),
+            ("$1", "$1", false),
+            ("$2", "$2", false),
+            ("$3", "$3", false),
+            ("$4", "$4", false),
+            ("$5", "$5", false),
+            ("$6", "$6", false),
+            ("$7", "$7", false),
+            ("$8", "$8", false),
+            ("$9", "$9", false),
+        ];
+        for &(key, selector, has_setter) in ENTRIES {
+            let sel = self.realm.new_string(selector);
+            let getter = self.realm.new_bound_native(N_REGEXP_LEGACY_GET, sel);
+            self.install_fn_name_length(getter, &alloc::format!("get {key}"), 0);
+            let setter = if has_setter {
+                let s = self.realm.new_native(N_REGEXP_LEGACY_SET);
+                self.install_fn_name_length(s, &alloc::format!("set {key}"), 1);
+                NanBox::handle(s.to_raw())
+            } else {
+                NanBox::undefined()
+            };
+            self.realm
+                .define_accessor(ctor, key, NanBox::handle(getter.to_raw()), setter);
+            self.realm.mark_hidden(ctor, key);
+        }
+    }
+
+    /// The `%RegExp%` intrinsic constructor handle (recorded at setup), used to
+    /// brand-check the Annex B.2.5 legacy static accessors.
+    pub(crate) fn regexp_constructor_handle(&mut self) -> Result<Handle, ExecError> {
+        self.regexp_ctor
+            .ok_or_else(|| self.type_error("RegExp constructor is not available"))
     }
 
     /// Allocates a RegExp instance and links its `[[Prototype]]` to
@@ -444,7 +499,19 @@ impl<'a> Interp<'a> {
             let e = self.regexp_syntax_error(&pat_s, &flags_s);
             return Err(ExecError::Throw(e));
         }
+        // RegExpInitialize replaces source/flags, then performs
+        // `Set(R, "lastIndex", 0, true)` — the *throwing* form. A non-writable
+        // own `lastIndex` (installed via `defineProperty`) therefore makes
+        // `compile` throw a TypeError *after* the source/flags have been updated.
         self.realm.recompile_regexp(h, &pat_s, &flags_s);
+        if self.realm.has_own(h, "lastIndex")
+            && (self.realm.property_is_readonly(h, "lastIndex") || self.realm.is_frozen(h))
+        {
+            return Err(self.type_error("Cannot assign to read only property 'lastIndex'"));
+        }
+        if self.realm.has_own(h, "lastIndex") {
+            self.realm.set_property(h, "lastIndex", NanBox::number(0.0));
+        }
         Ok(this_val)
     }
 
@@ -503,6 +570,9 @@ impl<'a> Interp<'a> {
                 if global || sticky {
                     self.set_last_index(h, c.whole().1)?;
                 }
+                // Annex B.2.5: update the RegExp legacy static match record from
+                // this successful match (read by `RegExp.$1`/`lastMatch`/…).
+                self.update_legacy_regexp(&units, &c);
                 let has_indices = flags.contains('d');
                 Ok(self.regex_match_object_u16_indices(
                     &units,
@@ -513,6 +583,30 @@ impl<'a> Interp<'a> {
                 ))
             }
         }
+    }
+
+    /// Updates the Annex B.2.5 RegExp legacy static match record from a successful
+    /// match: the subject `units`, the matched span, the surrounding contexts, and
+    /// capture groups 1..=9 (plus `lastParen`, the highest-index group that
+    /// participated). All slices are stored as WTF-8 (surrogates preserved).
+    #[cfg(feature = "regex")]
+    fn update_legacy_regexp(&mut self, units: &[u16], c: &crate::regex::Captures) {
+        let slice = |a: usize, b: usize| crate::wtf8::from_utf16(&units[a..b]);
+        let (ms, me) = c.whole();
+        let mut st = crate::realm::LegacyRegExpState {
+            input: crate::wtf8::from_utf16(units),
+            last_match: slice(ms, me),
+            left_context: slice(0, ms),
+            right_context: slice(me, units.len()),
+            ..Default::default()
+        };
+        for i in 1..=9usize {
+            if let Some((a, b)) = c.group(i) {
+                st.parens[i - 1] = slice(a, b);
+                st.last_paren = slice(a, b);
+            }
+        }
+        self.realm.set_legacy_regexp(st);
     }
 
     /// The spec's internal `Set(rx, "lastIndex", n, true)` (Throw = true): always

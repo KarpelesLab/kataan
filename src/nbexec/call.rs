@@ -332,6 +332,36 @@ impl<'a> Interp<'a> {
             if id == N_REGEXP_SPECIES {
                 return Ok(this_val);
             }
+            // A RegExp legacy static getter (Annex B.2.5): `target` carries the
+            // field selector. Brand-check `this === %RegExp%` (only the original
+            // constructor passes; a subclass / instance / primitive throws).
+            if id == N_REGEXP_LEGACY_GET {
+                let selector = self.realm.string_value(target).unwrap_or_default();
+                if this_val.as_handle().map(Handle::from_raw)
+                    != Some(self.regexp_constructor_handle()?)
+                {
+                    return Err(self.type_error(
+                        "RegExp legacy static property getter called on a non-RegExp receiver",
+                    ));
+                }
+                let st = self.realm.legacy_regexp();
+                let bytes = match selector.as_str() {
+                    "input" => st.input.clone(),
+                    "lastMatch" => st.last_match.clone(),
+                    "lastParen" => st.last_paren.clone(),
+                    "leftContext" => st.left_context.clone(),
+                    "rightContext" => st.right_context.clone(),
+                    s if s.starts_with('$') => {
+                        let n: usize = s[1..].parse().unwrap_or(0);
+                        st.parens
+                            .get(n.wrapping_sub(1))
+                            .cloned()
+                            .unwrap_or_default()
+                    }
+                    _ => alloc::vec::Vec::new(),
+                };
+                return Ok(self.new_str_bytes(bytes));
+            }
             // A `get %TypedArray%.prototype.<accessor>` getter: compute the
             // buffer/byteLength/byteOffset/length of the `this` typed array (or a
             // TypeError if `this` is not a typed array).
