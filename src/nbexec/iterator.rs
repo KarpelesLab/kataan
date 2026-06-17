@@ -630,6 +630,31 @@ impl<'a> Interp<'a> {
         Ok(NanBox::handle(h.to_raw()))
     }
 
+    /// Whether `h` inherits the generic `Array.prototype` methods through its
+    /// `[[Prototype]]` chain — true when an actual `Array` (e.g. an object whose
+    /// prototype was set to `[...]`) or the realm's `Array.prototype` itself is
+    /// in the chain. Used to decide, for a direct `obj.reduce(...)` call, whether
+    /// `obj` should be treated as an array-like (its inherited array method runs)
+    /// rather than reporting "reduce is not a function".
+    pub(crate) fn inherits_array_proto(&mut self, h: Handle) -> bool {
+        let array_proto = self
+            .current
+            .get("Array")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw);
+        let mut cur = self.realm.object_proto(h);
+        while let Some(c) = cur {
+            if Some(c) == array_proto || self.realm.is_array(c) {
+                return true;
+            }
+            cur = self.realm.object_proto(c);
+        }
+        false
+    }
+
     /// Whether `h`'s prototype chain includes `%IteratorPrototype%`.
     pub(crate) fn inherits_iterator_proto(&mut self, h: Handle) -> bool {
         let Some(iter_proto) = self

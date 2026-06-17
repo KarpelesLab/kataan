@@ -847,6 +847,33 @@ impl<'a> Interp<'a> {
             let m = this.new_str("Cannot redefine property: length");
             Err(ExecError::Throw(this.make_error(N_TYPE_ERROR, Some(m))))
         };
+        // ArraySetLength: the new `length` value is coerced FIRST (ToUint32 +
+        // ToNumber via ToPrimitive — running a user `valueOf`/`toString`, which may
+        // throw or yield a non-integral value → RangeError), *before* any
+        // descriptor-attribute rejection. (10.4.3.1 steps 2–4: the RangeError on
+        // an invalid value precedes the configurable/enumerable/writable checks,
+        // so `defineProperty(arr,"length",{value:-1,configurable:true})` is a
+        // RangeError, not a TypeError.)
+        let new_len = if self.realm.has_own(desc, "value") {
+            let value = self
+                .realm
+                .get_property(desc, "value")
+                .unwrap_or(NanBox::undefined());
+            // ToUint32 / ToNumber must agree (a fractional, NaN, or out-of-range
+            // length is a RangeError). `coerce_to_number` runs ToPrimitive (a
+            // throwing `toString`/`valueOf` propagates; one returning a non-
+            // primitive is itself a TypeError).
+            let prim = self.coerce_to_number(value)?;
+            let num = self.realm.to_number(prim);
+            let len = num as u32;
+            if !(num.is_finite() && f64::from(len) == num) {
+                let m = self.new_str("Invalid array length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            Some(len as usize)
+        } else {
+            None
+        };
         // `length` is non-configurable and non-enumerable: reject any descriptor
         // that asks to make it configurable or enumerable.
         if self.realm.has_own(desc, "configurable")
@@ -876,30 +903,6 @@ impl<'a> Interp<'a> {
                 .is_some_and(|v| self.realm.truthy(v))
         } else {
             cur_writable
-        };
-        // ArraySetLength: the new `length` value is coerced FIRST (ToUint32 +
-        // ToNumber via ToPrimitive — running a user `valueOf`/`toString`, which may
-        // throw or yield a non-integral value → RangeError), *before* the
-        // writability/value-change rejections are evaluated. (15.4.5.1 steps 2–3.)
-        let new_len = if self.realm.has_own(desc, "value") {
-            let value = self
-                .realm
-                .get_property(desc, "value")
-                .unwrap_or(NanBox::undefined());
-            // ToUint32 / ToNumber must agree (a fractional, NaN, or out-of-range
-            // length is a RangeError). `coerce_to_number` runs ToPrimitive (a
-            // throwing `toString`/`valueOf` propagates; one returning a non-
-            // primitive is itself a TypeError).
-            let prim = self.coerce_to_number(value)?;
-            let num = self.realm.to_number(prim);
-            let len = num as u32;
-            if !(num.is_finite() && f64::from(len) == num) {
-                let m = self.new_str("Invalid array length");
-                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
-            }
-            Some(len as usize)
-        } else {
-            None
         };
         // A non-writable `length` cannot be made writable again.
         if !cur_writable && new_writable {
@@ -1120,6 +1123,75 @@ impl<'a> Interp<'a> {
         self.realm.set_hidden_property(obj, PRIM_WRAP, prim);
         self.realm
             .set_hidden_property(obj, PRIM_WRAP_TYPE, NanBox::number(f64::from(ctor_id)));
+        NanBox::handle(obj.to_raw())
+    }
+
+    /// Builds an `arguments` exotic object for a function call (`args`), per
+    /// 10.4.4 CreateUnmappedArgumentsObject / a best-effort mapped object:
+    ///
+    /// - `[[Prototype]]` is `Object.prototype` (not `Array.prototype`).
+    /// - Indexed elements `0..len` are ordinary enumerable, writable,
+    ///   configurable own data properties.
+    /// - `length` is a writable, configurable, **non-enumerable** data property.
+    /// - `[Symbol.iterator]` is `Array.prototype.values` (writable, configurable,
+    ///   non-enumerable), so `[...arguments]`/`for-of` work.
+    /// - `callee`: in sloppy mode the *function itself* (writable, configurable,
+    ///   non-enumerable); in strict mode a poisoned accessor throwing `TypeError`.
+    /// - A hidden `ARGS_MARKER` makes `Object.prototype.toString` report
+    ///   `[object Arguments]`.
+    ///
+    /// (True parameter↔index aliasing for a mapped object is not modeled; the
+    /// values are a snapshot of the call arguments.)
+    pub(crate) fn make_arguments_object(&mut self, args: &[NanBox], callee: NanBox) -> NanBox {
+        let obj = self.realm.new_object();
+        // [[Prototype]] = Object.prototype.
+        if let Some(proto) = self
+            .current
+            .get("Object")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_object_proto(obj, Some(proto));
+        }
+        // Indexed elements: ordinary enumerable own data properties.
+        for (i, v) in args.iter().enumerate() {
+            self.realm.set_property(obj, &alloc::format!("{i}"), *v);
+        }
+        // `length` — writable, configurable, non-enumerable.
+        self.realm
+            .set_hidden_property(obj, "length", NanBox::number(args.len() as f64));
+        // `[Symbol.iterator]` = `%Array.prototype.values%` — the SAME function
+        // value as `Array.prototype[Symbol.iterator]` (i.e. `[][Symbol.iterator]`,
+        // which aliases `values`), so a `verifyProperty(arguments, Symbol.iterator,
+        // {value: [][Symbol.iterator]})` SameValue check holds. Non-enumerable.
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
+        if let Some(values) = self
+            .current
+            .get("Array")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|proto| self.realm.get_property(proto, "values"))
+        {
+            self.realm.set_hidden_property(obj, &iter_key, values);
+        }
+        // `callee`.
+        if self.strict {
+            // A strict arguments object's `callee` is a poisoned accessor.
+            let thrower = NanBox::handle(self.realm.new_native(N_THROW_TYPE_ERROR).to_raw());
+            self.realm.define_accessor(obj, "callee", thrower, thrower);
+            self.realm.mark_hidden(obj, "callee");
+        } else {
+            self.realm.set_hidden_property(obj, "callee", callee);
+        }
+        self.realm
+            .set_hidden_property(obj, ARGS_MARKER, NanBox::boolean(true));
         NanBox::handle(obj.to_raw())
     }
 
@@ -1552,6 +1624,8 @@ impl<'a> Interp<'a> {
             "RegExp"
         } else if self.is_error_object(h) {
             "Error"
+        } else if self.realm.get_property(h, ARGS_MARKER).is_some() {
+            "Arguments"
         } else {
             "Object"
         };

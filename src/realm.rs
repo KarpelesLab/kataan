@@ -849,6 +849,33 @@ impl Realm {
         self.is_array(handle) || self.typed_len(handle).is_some()
     }
 
+    /// Whether `handle` is a plausible target for a *generic* `Array.prototype`
+    /// method applied via `.call`/`.apply` (or inherited through an array
+    /// prototype) — i.e. an ordinary object-ish value whose `length`/indexed
+    /// properties should be read array-like. This is every heap object **except**
+    /// a real `Array` (its own fast path), a typed array, a `Map`/`Set`, a
+    /// `Promise`, and the bare `Symbol`/`BigInt`/string/bytes primitives.
+    /// `Object`, `Function`, `Date`, `RegExp`, primitive wrappers, `arguments`,
+    /// and proxies all qualify.
+    #[must_use]
+    pub fn is_generic_array_like_target(&self, handle: Handle) -> bool {
+        let Some(cell) = self.heap.get(handle) else {
+            return false;
+        };
+        if self.is_array(handle) || self.typed_len(handle).is_some() {
+            return false;
+        }
+        !matches!(
+            cell,
+            Cell::Collection { .. }
+                | Cell::Promise(_)
+                | Cell::Symbol { .. }
+                | Cell::BigInt(_)
+                | Cell::Str(_)
+                | Cell::Bytes(_)
+        )
+    }
+
     /// Allocates a fresh, unique `Symbol` with the given description.
     pub fn new_symbol(&mut self, description: &str) -> Handle {
         let id = self.next_symbol_id;
@@ -3208,6 +3235,28 @@ impl Realm {
     #[must_use]
     pub fn to_uint32(&self, v: NanBox) -> u32 {
         self.to_int32(v) as u32
+    }
+
+    /// `ArraySetLength` length validation for an already-`ToNumber`'d value:
+    /// `ToUint32(v)` must equal `ToNumber(v)` (so `-1`, `4294967296`, `1.5`,
+    /// `NaN` are rejected), returning `Some(len)` or `None` when the caller must
+    /// raise a `RangeError("Invalid array length")`. (The caller is responsible
+    /// for firing `ToNumber`'s `valueOf`/`toString` first when `v` may be an
+    /// object.) Self-contained (no `f64::trunc`) so it is available in the
+    /// `no_std`/`alloc`-only build too: a valid array length is exactly an
+    /// integer in `[0, 2^32-1]`, which is its own `ToUint32`.
+    #[must_use]
+    pub fn array_length_uint32(&self, v: NanBox) -> Option<u32> {
+        let number_len = self.to_number(v);
+        // A length is valid iff it is a non-negative integer below 2^32; such a
+        // value already equals its ToUint32, so no modular reduction is needed.
+        // `as u32` saturates an out-of-range/negative value, so the round-trip
+        // equality alone rejects `-1`/`2^32`/`1.5`/`NaN`/`Infinity`.
+        if number_len.is_finite() && number_len == f64::from(number_len as u32) {
+            Some(number_len as u32)
+        } else {
+            None
+        }
     }
 
     /// `a & b` (bitwise AND over `ToInt32`). Needs `std`.

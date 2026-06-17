@@ -31,10 +31,26 @@ impl<'a> Interp<'a> {
             )));
         }
 
+        // When reached through a *generic* `Array.prototype.<m>` call, a
+        // primitive-wrapper `this` must be handled as an array-like object (not
+        // unwrapped) — consume the one-shot flag so it applies only to this call.
+        let array_proto_generic = core::mem::take(&mut self.array_proto_generic);
+        // `Array.prototype.<m>.call(strOrStrWrapper, …)`: the receiver must be
+        // read as an array-like (each UTF-16 unit an element), so the String
+        // primitive/wrapper method handlers below must NOT intercept this method.
+        let force_array_like = array_proto_generic && ARRAY_LIKE_METHODS.contains(&method);
+
         // A primitive wrapper object (`new Number`/`String`/`Boolean`): `valueOf`
-        // recovers the boxed primitive; every other method delegates to it.
+        // recovers the boxed primitive; every other method delegates to it. Skip
+        // this when a generic `Array.prototype.<m>`/`Function.prototype.<m>` is
+        // being applied to the wrapper (the boxed `this`): the array-like methods
+        // read the wrapper itself, and `call`/`apply`/`bind` must observe the
+        // wrapper as a non-callable `this` and throw rather than unwrap.
         if let Some(h) = recv.as_handle().map(Handle::from_raw)
             && let Some(prim) = self.realm.get_property(h, PRIM_WRAP)
+            && !(array_proto_generic
+                && (ARRAY_LIKE_METHODS.contains(&method)
+                    || matches!(method, "call" | "apply" | "bind")))
         {
             return match method {
                 "valueOf" => Ok(Some(prim)),
@@ -340,12 +356,19 @@ impl<'a> Interp<'a> {
                         if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
                             elems
                         } else {
-                            // An array-like: its `length` and indexed properties.
-                            let len = self
-                                .realm
-                                .get_property(h, "length")
-                                .map_or(0, |v| self.realm.to_number(v).max(0.0) as usize);
-                            let mut v = Vec::with_capacity(len);
+                            // An array-like: ToLength(Get(O, "length")) fires a
+                            // getter (whose abrupt completion propagates) and is
+                            // coerced through `valueOf`/`toString`, then each index
+                            // is read via Get.
+                            let len_val = self.read_member(h, "length")?;
+                            let len_num = self.coerce_to_number(len_val)?;
+                            let raw = self.realm.to_number(len_num);
+                            let len = if raw.is_nan() || raw <= 0.0 {
+                                0
+                            } else {
+                                raw.min(9_007_199_254_740_991.0) as usize
+                            };
+                            let mut v = Vec::with_capacity(len.min(1 << 16));
                             for i in 0..len {
                                 v.push(self.read_member(h, &alloc::format!("{i}"))?);
                             }
@@ -374,6 +397,18 @@ impl<'a> Interp<'a> {
                 }
                 _ => {}
             }
+        } else if array_proto_generic && matches!(method, "call" | "apply" | "bind" | "toString") {
+            // The *genuine* `Function.prototype.{call,apply,bind,toString}` (reached
+            // through the first-class bound-native dispatch, which set
+            // `array_proto_generic`) requires an `IsCallable` `this`: a non-callable
+            // receiver (`bind.call(5)`, `toString.call(new Proxy({},{}))`,
+            // `obj.bind = Function.prototype.bind; obj.bind()`) is a TypeError.
+            // We gate on the flag so a *user* method named call/apply/bind/toString
+            // inherited on a non-callable object (`new M().call()`,
+            // `({}).toString()`) still resolves through the normal property lookup.
+            return Err(self.type_error(&alloc::format!(
+                "Function.prototype.{method} called on non-callable receiver"
+            )));
         }
 
         // --- generator iterator protocol (`next`/`return`) ---
@@ -1075,7 +1110,7 @@ impl<'a> Interp<'a> {
             return Ok(Some(self.new_str(&s)));
         }
         // --- Date instance methods ---
-        if let Some(ms) = self.realm.date_at(handle) {
+        if let Some(ms) = self.realm.date_at(handle).filter(|_| !force_array_like) {
             // A user-overridden prototype method wins over the built-in dispatch
             // (e.g. `Date.prototype.toString = Object.prototype.toString`). If the
             // method resolves on the proto chain to anything other than a first-class
@@ -1658,7 +1693,13 @@ impl<'a> Interp<'a> {
         }
 
         // --- string methods ---
-        if let Some(bytes) = self.realm.string_bytes(handle) {
+        // (Skipped when a generic `Array.prototype.<m>` is being applied to a
+        // String primitive/wrapper, which must run the array-like path instead.)
+        if let Some(bytes) = self
+            .realm
+            .string_bytes(handle)
+            .filter(|_| !force_array_like)
+        {
             // The lossless WTF-8 bytes — used by the UTF-16-unit-correct ops
             // (length/index/slice/search/pad/for-of) and the surrogate-aware
             // case/normalize ops. Most methods read only `bytes`; the few that take
@@ -2192,11 +2233,27 @@ impl<'a> Interp<'a> {
             "at",
             "flat",
             "flatMap",
+            "values",
+            "keys",
+            "entries",
+            "toLocaleString",
+            // The ES2023 immutable copies read the array-like by index and return
+            // a fresh dense array, so they work on a generic array-like receiver.
+            "with",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
         ];
         let mut array_like = None;
-        if self.realm.array_elements(handle).is_none()
-            && self.realm.object_keys(handle).is_some()
+        if self.realm.is_generic_array_like_target(handle)
             && ARRAY_LIKE_METHODS.contains(&method)
+            // Only treat the receiver as a generic array-like when the call was
+            // an explicit `Array.prototype.<m>.call(o)` (the flag) OR `o` actually
+            // inherits the array methods through its prototype chain. A plain
+            // object whose chain has no array method must report "<m> is not a
+            // function" via the normal property lookup (return `None` below),
+            // not be silently coerced.
+            && (array_proto_generic || self.inherits_array_proto(handle))
             // An iterator (a value inheriting `%IteratorPrototype%`, e.g. a lazy
             // iterator-helper) must run its *own* `map`/`filter`/… helper, not be
             // treated as an array-like — so skip the array-like coercion for it.
@@ -2214,16 +2271,77 @@ impl<'a> Interp<'a> {
             } else {
                 raw.min(9_007_199_254_740_991.0)
             };
+            // Spec order for the callback-taking methods: IsCallable(callbackfn)
+            // is checked *after* reading `length` but *before* any element access
+            // (so `reduceRight.call({…length getter…}, undefined)` reads length,
+            // then throws, without touching the indices/getters).
+            if matches!(
+                method,
+                "forEach"
+                    | "map"
+                    | "filter"
+                    | "some"
+                    | "every"
+                    | "find"
+                    | "findIndex"
+                    | "findLast"
+                    | "findLastIndex"
+                    | "reduce"
+                    | "reduceRight"
+                    | "flatMap"
+            ) {
+                self.require_callable(arg(0), &alloc::format!("{method} callback"))?;
+            }
+            // A length beyond the engine's array cap (e.g. `{length: Infinity}`,
+            // whose ToLength is 2^53-1) cannot be materialized/allocated — throw a
+            // catchable RangeError rather than silently skipping (and never attempt
+            // a multi-gigabyte allocation).
+            if len_f > self.realm.limits.max_array_len as f64 {
+                let m = self.new_str("Invalid array length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
             if len_f <= (1u64 << 24) as f64 {
                 let len = len_f as usize;
+                // A String primitive/wrapper `this` (its boxed string) exposes every
+                // in-range index as a present own data property — `HasProperty`
+                // wouldn't see them, so treat them all as present.
+                let is_string_like = self.realm.string_value(handle).is_some()
+                    || self
+                        .realm
+                        .get_property(handle, PRIM_WRAP)
+                        .and_then(|p| p.as_handle())
+                        .map(Handle::from_raw)
+                        .is_some_and(|p| self.realm.string_value(p).is_some());
                 let mut tmp = Vec::with_capacity(len);
+                let mut present = Vec::with_capacity(len);
                 for i in 0..len {
-                    // Get(O, idx) walks the prototype chain and invokes getters.
-                    tmp.push(self.read_member(handle, &alloc::format!("{i}"))?);
+                    let key = alloc::format!("{i}");
+                    // HasProperty(O, idx) — a hole (absent index) is skipped by the
+                    // iteration methods; Get(O, idx) walks the prototype chain and
+                    // invokes getters only for a present index.
+                    let here = is_string_like || self.has_property(handle, &key);
+                    present.push(here);
+                    tmp.push(if here {
+                        self.read_member(handle, &key)?
+                    } else {
+                        NanBox::undefined()
+                    });
                 }
                 array_like = Some(self.realm.new_array(tmp));
+                self.array_like_present = Some(present);
             }
         }
+        // Take the per-index presence mask (set above for a materialized generic
+        // array-like); the iteration arms below consult it to skip holes.
+        let array_like_present = self.array_like_present.take();
+        // `true` if index `i` is *present* (not a hole) — always `true` for a dense
+        // real array (no mask), and the recorded `HasProperty` for a materialized
+        // generic array-like.
+        let is_present = |i: usize| -> bool {
+            array_like_present
+                .as_ref()
+                .is_none_or(|m| m.get(i).copied().unwrap_or(false))
+        };
         // For a generic array-like `this`, the callback receives the *original*
         // object as its 3rd argument (`O`), not the materialized snapshot — so
         // `(v, i, arr) => arr === O` and `arr instanceof Boolean` hold.
@@ -2608,10 +2726,14 @@ impl<'a> Interp<'a> {
                 "indexOf" => {
                     let target = arg(0);
                     let from = self.array_from_index_checked(arg(1), elems.len())?;
-                    let idx = elems[from..]
-                        .iter()
-                        .position(|e| self.realm.strict_equals(*e, target))
-                        .map_or(-1.0, |i| (i + from) as f64);
+                    let mut idx = -1.0;
+                    for (i, e) in elems.iter().enumerate().skip(from) {
+                        // `indexOf` skips holes (HasProperty is false).
+                        if is_present(i) && self.realm.strict_equals(*e, target) {
+                            idx = i as f64;
+                            break;
+                        }
+                    }
                     return Ok(Some(NanBox::number(idx)));
                 }
                 "map" => {
@@ -2620,6 +2742,12 @@ impl<'a> Interp<'a> {
                     let arr = callback_recv;
                     let mut out = Vec::with_capacity(elems.len());
                     for (i, e) in elems.iter().enumerate() {
+                        // A hole maps to a hole (callback skipped); modeled as
+                        // `undefined` in the dense result.
+                        if !is_present(i) {
+                            out.push(NanBox::undefined());
+                            continue;
+                        }
                         let cb_args = [*e, NanBox::number(i as f64), arr];
                         out.push(self.call_with_this(f, this_arg, &cb_args)?);
                     }
@@ -2632,6 +2760,9 @@ impl<'a> Interp<'a> {
                     let arr = callback_recv;
                     let mut out = Vec::new();
                     for (i, e) in elems.iter().enumerate() {
+                        if !is_present(i) {
+                            continue; // holes are skipped
+                        }
                         let cb_args = [*e, NanBox::number(i as f64), arr];
                         let r = self.call_with_this(f, this_arg, &cb_args)?;
                         if self.realm.truthy(r) {
@@ -2646,6 +2777,9 @@ impl<'a> Interp<'a> {
                     let this_arg = arg(1);
                     let arr = callback_recv;
                     for (i, e) in elems.iter().enumerate() {
+                        if !is_present(i) {
+                            continue; // holes are skipped
+                        }
                         let cb_args = [*e, NanBox::number(i as f64), arr];
                         self.call_with_this(f, this_arg, &cb_args)?;
                     }
@@ -2653,19 +2787,32 @@ impl<'a> Interp<'a> {
                 }
                 "reduce" => {
                     let f = arg(0);
+                    let arr = callback_recv;
                     let mut acc;
                     let mut start = 0;
                     if args.len() >= 2 {
                         acc = arg(1);
-                    } else if elems.is_empty() {
-                        let m = self.new_str("Reduce of empty array with no initial value");
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     } else {
-                        acc = elems[0];
-                        start = 1;
+                        // Seed from the first *present* element; a holes-only (or
+                        // empty) array with no initial value is a TypeError.
+                        let first = (0..elems.len()).find(|&i| is_present(i));
+                        match first {
+                            Some(i) => {
+                                acc = elems[i];
+                                start = i + 1;
+                            }
+                            None => {
+                                let m = self.new_str("Reduce of empty array with no initial value");
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_TYPE_ERROR, Some(m)),
+                                ));
+                            }
+                        }
                     }
-                    let arr = callback_recv;
                     for (i, e) in elems.iter().enumerate().skip(start) {
+                        if !is_present(i) {
+                            continue; // holes are skipped
+                        }
                         acc = self.call(f, &[acc, *e, NanBox::number(i as f64), arr])?;
                     }
                     return Ok(Some(acc));
@@ -2673,20 +2820,32 @@ impl<'a> Interp<'a> {
                 // `reduceRight` — like `reduce` but right-to-left.
                 "reduceRight" => {
                     let f = arg(0);
+                    let arr = callback_recv;
                     let mut acc;
                     let mut idx = elems.len();
                     if args.len() >= 2 {
                         acc = arg(1);
-                    } else if elems.is_empty() {
-                        let m = self.new_str("Reduce of empty array with no initial value");
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     } else {
-                        idx -= 1;
-                        acc = elems[idx];
+                        // Seed from the last present element.
+                        let last = (0..elems.len()).rev().find(|&i| is_present(i));
+                        match last {
+                            Some(i) => {
+                                acc = elems[i];
+                                idx = i;
+                            }
+                            None => {
+                                let m = self.new_str("Reduce of empty array with no initial value");
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_TYPE_ERROR, Some(m)),
+                                ));
+                            }
+                        }
                     }
-                    let arr = callback_recv;
                     while idx > 0 {
                         idx -= 1;
+                        if !is_present(idx) {
+                            continue; // holes are skipped
+                        }
                         acc = self.call(f, &[acc, elems[idx], NanBox::number(idx as f64), arr])?;
                     }
                     return Ok(Some(acc));
@@ -2745,13 +2904,18 @@ impl<'a> Interp<'a> {
                     let spread_key = self.member_key(sym);
                     for a in args {
                         let ah = a.as_handle().map(Handle::from_raw);
+                        // IsConcatSpreadable: a defined `[Symbol.isConcatSpreadable]`
+                        // (read via the accessor path so a getter fires) decides via
+                        // ToBoolean; otherwise spread iff `IsArray`.
                         let spread = match ah {
-                            Some(h) => match self.realm.get_property(h, &spread_key) {
-                                Some(v) if !matches!(v.unpack(), Unpacked::Undefined) => {
+                            Some(h) => {
+                                let v = self.read_member(h, &spread_key)?;
+                                if matches!(v.unpack(), Unpacked::Undefined) {
+                                    self.realm.is_array(h)
+                                } else {
                                     self.realm.truthy(v)
                                 }
-                                _ => self.realm.is_array(h),
-                            },
+                            }
                             None => false,
                         };
                         match (spread, ah) {
@@ -2760,21 +2924,46 @@ impl<'a> Interp<'a> {
                                 {
                                     out.extend(other);
                                 } else {
-                                    // A spreadable array-like: read length + indices.
-                                    let len = self
-                                        .realm
-                                        .get_property(h, "length")
-                                        .map(|v| self.realm.to_number(v))
-                                        .unwrap_or(0.0)
-                                        .max(0.0)
-                                        as usize;
+                                    // A spreadable array-like: ToLength(Get(E,
+                                    // "length")) — the getter fires (abrupt
+                                    // completion propagates) and the value is coerced
+                                    // through `valueOf`/`toString`. Per spec, if the
+                                    // running total `n + len` exceeds 2^53 - 1 a
+                                    // TypeError is thrown (also guards against OOM).
+                                    let len_val = self.read_member(h, "length")?;
+                                    let len_num = self.coerce_to_number(len_val)?;
+                                    let raw = self.realm.to_number(len_num);
+                                    // ToLength: clamp to [0, 2^53-1] and truncate
+                                    // toward zero. `as u64` truncates a finite,
+                                    // already-clamped value without needing the
+                                    // std-only `f64::trunc`.
+                                    let len_int = if raw.is_nan() || raw <= 0.0 {
+                                        0.0
+                                    } else {
+                                        let clamped = if raw > 9_007_199_254_740_991.0 {
+                                            9_007_199_254_740_991.0
+                                        } else {
+                                            raw
+                                        };
+                                        clamped as u64 as f64
+                                    };
+                                    if out.len() as f64 + len_int > 9_007_199_254_740_991.0 {
+                                        return Err(self.type_error(
+                                            "Array.prototype.concat result exceeds maximum array length",
+                                        ));
+                                    }
+                                    let len = len_int as usize;
                                     for i in 0..len {
                                         let k = alloc::format!("{i}");
-                                        out.push(
-                                            self.realm
-                                                .get_property(h, &k)
-                                                .unwrap_or(NanBox::undefined()),
-                                        );
+                                        // Spec: only set a result element when the
+                                        // source HasProperty(k); read via the full
+                                        // accessor path so getters fire (and may
+                                        // throw, propagating here).
+                                        if self.has_property(h, &k) {
+                                            out.push(self.read_member(h, &k)?);
+                                        } else {
+                                            out.push(NanBox::undefined());
+                                        }
                                     }
                                 }
                             }
@@ -2910,10 +3099,15 @@ impl<'a> Interp<'a> {
                     } else {
                         len - 1
                     };
-                    let found = elems[..=from]
-                        .iter()
-                        .rposition(|e| self.realm.strict_equals(*e, target));
-                    return Ok(Some(NanBox::number(found.map_or(-1.0, |i| i as f64))));
+                    let mut found = -1.0;
+                    for i in (0..=from).rev() {
+                        // `lastIndexOf` skips holes.
+                        if is_present(i) && self.realm.strict_equals(elems[i], target) {
+                            found = i as f64;
+                            break;
+                        }
+                    }
+                    return Ok(Some(NanBox::number(found)));
                 }
                 "find" => {
                     let f = arg(0);
@@ -2971,6 +3165,9 @@ impl<'a> Interp<'a> {
                 "some" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
+                        if !is_present(i) {
+                            continue; // holes are skipped
+                        }
                         if self.call_truthy_this(
                             f,
                             arg(1),
@@ -2984,6 +3181,9 @@ impl<'a> Interp<'a> {
                 "every" => {
                     let f = arg(0);
                     for (i, e) in elems.iter().enumerate() {
+                        if !is_present(i) {
+                            continue; // holes are skipped
+                        }
                         if !self.call_truthy_this(
                             f,
                             arg(1),

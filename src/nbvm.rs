@@ -1552,16 +1552,16 @@ fn run_frame(
                         let pk = to_primitive(ctx, funcs, k, false);
                         let ks = ctx.realm.to_display_string(pk);
                         // C1: a computed `arr["length"] = n` (numeric string key) on
-                        // an array resizes; a length above the uint32 ceiling is
-                        // invalid (RangeError), a valid one past the dense cap is
-                        // stored as a sparse logical length.
+                        // an array resizes; `ToUint32(v)` must equal `ToNumber(v)`
+                        // (else a catchable `RangeError`).
                         if ctx.realm.is_array(handle) && ks == "length" {
-                            let n = num(regs[*src as usize]).unwrap_or(0.0).max(0.0) as usize;
-                            if n as u64 > u64::from(u32::MAX) {
+                            let v = regs[*src as usize];
+                            if let Some(n) = ctx.realm.array_length_uint32(v) {
+                                ctx.realm.set_array_length(handle, n as usize);
+                            } else {
                                 let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                                 handle_throw!(VmError::Thrown(e));
                             }
-                            ctx.realm.set_array_length(handle, n);
                             continue;
                         }
                         ctx.realm.set_property(handle, &ks, regs[*src as usize]);
@@ -1760,16 +1760,17 @@ fn run_frame(
                     ctx.realm.set_regex_last_index(handle, n);
                     continue;
                 }
-                // `arr.length = n` resizes the array (truncate/pad). A length above
-                // the uint32 ceiling is invalid (catchable `RangeError`); a valid one
-                // past the dense capacity cap is stored as a sparse logical length.
+                // `arr.length = n` resizes the array (truncate/pad). `ToUint32(v)`
+                // must equal `ToNumber(v)` (so `-1`, `4294967296`, `1.5`, `NaN`
+                // are catchable `RangeError`s).
                 if key.as_str() == "length" && ctx.realm.is_array(handle) {
-                    let n = num(regs[*src as usize]).unwrap_or(0.0).max(0.0) as usize;
-                    if n as u64 > u64::from(u32::MAX) {
+                    let v = regs[*src as usize];
+                    if let Some(n) = ctx.realm.array_length_uint32(v) {
+                        ctx.realm.set_array_length(handle, n as usize);
+                    } else {
                         let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                         handle_throw!(VmError::Thrown(e));
                     }
-                    ctx.realm.set_array_length(handle, n);
                     continue;
                 }
                 // A setter accessor (own or inherited) takes precedence over a
@@ -2169,15 +2170,15 @@ fn run_frame(
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),
                     }
-                } else if *native == NB_ARRAY_FROM
-                    && let Some(e) = array_from_alloc_guard(ctx, &argv)
-                {
-                    // Refuse `Array.from(arrayLike)` whose `length` exceeds the array
-                    // cap BEFORE call_native materializes it — otherwise a source
-                    // like `{length: 2**32-1}` triggers a multi-gigabyte allocation
-                    // (an unbounded-memory bug). call_native cannot throw, so the
-                    // guard runs here where the throw machinery is available.
-                    handle_throw!(VmError::Thrown(e));
+                } else if *native == NB_ARRAY_FROM {
+                    // `Array.from` is interpreter-aware: it validates/invokes a
+                    // `mapFn` closure and throws (null/undefined items, non-callable
+                    // mapFn, length over the array cap), so it runs here where the
+                    // throw machinery and `funcs` are available, not in call_native.
+                    match vm_array_from(ctx, funcs, &argv) {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
                 } else {
                     regs[*dst as usize] = call_native(ctx, *native, &argv);
                 }
@@ -3287,32 +3288,114 @@ fn builtin_method(
     None
 }
 
-/// Invokes a built-in by id (`console.log` writes to `ctx.output`; `Math.*`
-/// fold over the numeric arguments).
-/// Guards `Array.from(source)` against an unbounded allocation: if `source` is an
-/// array-like object whose `length` exceeds [`Limits::max_array_len`](crate::limits::Limits::max_array_len),
-/// returns a `RangeError` to throw instead of letting `call_native` build a vector
-/// of that size. Real arrays/strings/collections are sized by their (already
-/// capped) element count, so they are not affected.
-fn array_from_alloc_guard(ctx: &mut Ctx, args: &[NanBox]) -> Option<NanBox> {
-    let h = args.first().copied()?.as_handle().map(Handle::from_raw)?;
-    // Element-backed sources are already bounded by their real length.
-    if ctx.realm.array_elements(h).is_some()
-        || ctx.realm.string_value(h).is_some()
-        || ctx.realm.collection_entries(h).is_some()
+/// VM-side `Array.from(items, mapFn?, thisArg?)` — handled in the VM loop (not
+/// `call_native`) because it must validate/invoke a `mapFn` closure and throw
+/// (`null`/`undefined` items, a non-callable `mapFn`). Element extraction covers
+/// arrays, strings, Sets/Maps, and array-likes; the result is mapped through
+/// `mapFn` when supplied.
+fn vm_array_from(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<NanBox, VmError> {
+    use crate::nanbox::Unpacked;
+    let items_box = args.first().copied().unwrap_or(NanBox::undefined());
+    let map_fn = args.get(1).copied().unwrap_or(NanBox::undefined());
+    let this_arg = args.get(2).copied().unwrap_or(NanBox::undefined());
+    let has_map = !matches!(map_fn.unpack(), Unpacked::Undefined);
+    // A defined mapFn must be callable (checked before reading items).
+    if has_map
+        && !map_fn
+            .as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| ctx.realm.is_vm_function(h) || ctx.realm.is_callable_cell(h))
     {
-        return None;
+        return Err(VmError::Thrown(make_error(
+            ctx.realm,
+            "TypeError",
+            "Array.from mapFn is not a function",
+        )));
     }
-    let len = ctx
-        .realm
-        .get_property(h, "length")
-        .map(|v| ctx.realm.to_number(v))?;
-    if len > ctx.realm.limits.max_array_len as f64 {
-        return Some(make_error(ctx.realm, "RangeError", "Invalid array length"));
+    // items is ToObject'd — null/undefined is a TypeError.
+    if matches!(items_box.unpack(), Unpacked::Undefined | Unpacked::Null) {
+        return Err(VmError::Thrown(make_error(
+            ctx.realm,
+            "TypeError",
+            "Array.from requires an array-like or iterable object, not null/undefined",
+        )));
     }
-    None
+    // Extract the raw element list. Check collections and strings before the
+    // generic array branch (a Set/Map is not an Array, but order defensively).
+    let raw: Vec<NanBox> = match items_box.as_handle().map(Handle::from_raw) {
+        Some(h) if ctx.realm.collection_is_set(h).is_some() => {
+            let is_set = ctx.realm.collection_is_set(h) == Some(true);
+            ctx.realm
+                .collection_entries(h)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, v)| {
+                    if is_set {
+                        // A Set yields its elements.
+                        k
+                    } else {
+                        // A Map yields `[key, value]` pairs.
+                        NanBox::handle(ctx.realm.new_array(alloc::vec![k, v]).to_raw())
+                    }
+                })
+                .collect()
+        }
+        Some(h) if ctx.realm.is_array(h) && !ctx.realm.is_vm_function(h) => ctx
+            .realm
+            .array_elements(h)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default(),
+        Some(h) if ctx.realm.string_value(h).is_some() => ctx
+            .realm
+            .string_value(h)
+            .unwrap_or_default()
+            .chars()
+            .map(|c| NanBox::handle(ctx.realm.new_string(&String::from(c)).to_raw()))
+            .collect(),
+        Some(h) => {
+            // Array-like: ToLength(Get(O, "length")) then Get each index.
+            let len_raw = ctx
+                .realm
+                .get_property(h, "length")
+                .map(|v| ctx.realm.to_number(v))
+                .unwrap_or(0.0);
+            if len_raw > ctx.realm.limits.max_array_len as f64 {
+                return Err(VmError::Thrown(make_error(
+                    ctx.realm,
+                    "RangeError",
+                    "Invalid array length",
+                )));
+            }
+            let len = if len_raw.is_nan() || len_raw <= 0.0 {
+                0
+            } else {
+                len_raw as usize
+            };
+            (0..len)
+                .map(|i| {
+                    ctx.realm
+                        .get_property(h, &alloc::format!("{i}"))
+                        .unwrap_or(NanBox::undefined())
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let items = if has_map {
+        let mut out = Vec::with_capacity(raw.len());
+        for (i, e) in raw.into_iter().enumerate() {
+            let v = call_closure(ctx, funcs, map_fn, &[e, NanBox::number(i as f64)], this_arg)?;
+            out.push(v);
+        }
+        out
+    } else {
+        raw
+    };
+    Ok(NanBox::handle(ctx.realm.new_array(items).to_raw()))
 }
 
+/// Invokes a built-in by id (`console.log` writes to `ctx.output`; `Math.*`
+/// fold over the numeric arguments).
 fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
     match native {
         NB_CONSOLE_LOG => {

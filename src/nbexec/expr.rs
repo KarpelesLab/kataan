@@ -1367,14 +1367,30 @@ impl<'a> Interp<'a> {
                 cur = self.realm.object_proto(p);
             }
         }
-        // `arr.length = n` resizes the array.
+        // `arr.length = n` resizes the array (with ToUint32 + RangeError check).
         if name == "length" && self.realm.is_array(handle) {
-            let n = self.realm.to_number(new).max(0.0) as usize;
+            let n = self.array_length_from_value(new)?;
             self.set_array_length_checked(handle, n)?;
         } else {
             self.realm.set_property(handle, &name, new);
         }
         Ok(())
+    }
+
+    /// `ArraySetLength` length coercion: `ToUint32(v)` must equal `ToNumber(v)`
+    /// (so `-1`, `4294967296`, `1.5`, `NaN` are RangeErrors), and the `ToNumber`
+    /// coercion fires `valueOf`/`toString` (a Symbol throws). Returns the
+    /// validated `u32` length.
+    pub(crate) fn array_length_from_value(&mut self, v: NanBox) -> Result<usize, ExecError> {
+        // ToNumber(v) — abrupt-propagating (a Symbol/throwing valueOf).
+        let num = self.coerce_to_number(v)?;
+        match self.realm.array_length_uint32(num) {
+            Some(n) => Ok(n as usize),
+            None => {
+                let m = self.new_str("Invalid array length");
+                Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))))
+            }
+        }
     }
 
     pub(crate) fn read_member(
@@ -1670,10 +1686,15 @@ impl<'a> Interp<'a> {
                     });
                 }
             }
-            if let Some(id) = self.realm.native_at(handle)
-                && name == "length"
-            {
-                return Ok(NanBox::number(builtin_native_arity(id) as f64));
+            if let Some(id) = self.realm.native_at(handle) {
+                // `Function.prototype[Symbol.hasInstance].name` is the spec's
+                // bracketed symbol description.
+                if id == N_FN_HAS_INSTANCE && name == "name" {
+                    return Ok(self.new_str("[Symbol.hasInstance]"));
+                }
+                if name == "length" {
+                    return Ok(NanBox::number(builtin_native_arity(id) as f64));
+                }
             }
         }
         // `Number.*` static constants.
@@ -1976,6 +1997,24 @@ impl<'a> Interp<'a> {
                 }
                 let this = NanBox::handle(handle.to_raw());
                 return self.call_with_this(getter, this, &[]);
+            }
+            // A prototype that is itself an Array (or typed array) exposes its
+            // elements and `length` as inherited indexed/`length` properties —
+            // so `Object.create([1,2,3])[0]`/`.length` resolve when the chain
+            // reaches the backing array (`get_property` only reads an array's
+            // *aux* named props, never its elements).
+            if self.realm.is_array_like(p) {
+                if let Ok(i) = name.parse::<usize>()
+                    && alloc::format!("{i}") == name
+                {
+                    if i < self.realm.array_length(p).unwrap_or(0) {
+                        return Ok(self.realm.get_element(p, i));
+                    }
+                } else if name == "length"
+                    && let Some(len) = self.realm.array_length(p)
+                {
+                    return Ok(NanBox::number(len as f64));
+                }
             }
             if self.realm.has_own(p, name) {
                 return Ok(self
@@ -2473,7 +2512,7 @@ impl<'a> Interp<'a> {
                 // `arr.length = n` resizes the array (truncate/pad), rather than
                 // storing a `length` property.
                 if &**s == "length" && self.realm.is_array(handle) {
-                    let n = self.realm.to_number(new).max(0.0) as usize;
+                    let n = self.array_length_from_value(new)?;
                     self.set_array_length_checked(handle, n)?;
                 } else if &**s == "prototype"
                     && let Some((func_id, _)) = self.realm.function_at(handle)
@@ -2962,6 +3001,28 @@ impl<'a> Interp<'a> {
     /// `obj instanceof Ctor`: true when `obj` was constructed from `Ctor`'s
     /// class or one of its subclasses (via the instance's class tag and the
     /// `extends` chain).
+    /// `OrdinaryHasInstance(C, O)` for `Function.prototype[Symbol.hasInstance]`:
+    /// `false` if `C` is not callable; a bound function defers to its target;
+    /// otherwise walk `O`'s `[[Prototype]]` chain for `C.prototype`. `instance_of`
+    /// already implements this (and skips the default `@@hasInstance` to avoid
+    /// recursion), so delegate with the arguments in instanceof order.
+    pub(crate) fn ordinary_has_instance(
+        &mut self,
+        c: NanBox,
+        o: NanBox,
+    ) -> Result<bool, ExecError> {
+        // IsCallable(C): a non-callable `this` reports `false` (no throw). The
+        // `Get(C,"prototype")` must-be-Object check (a TypeError otherwise) is
+        // performed inside `instance_of`'s ordinary path.
+        let Some(ch) = c.as_handle().map(Handle::from_raw) else {
+            return Ok(false);
+        };
+        if !(self.is_callable(ch) || self.realm.class_at(ch).is_some()) {
+            return Ok(false);
+        }
+        self.instance_of(o, c)
+    }
+
     pub(crate) fn instance_of(&mut self, obj: NanBox, ctor: NanBox) -> Result<bool, ExecError> {
         // A custom `[Symbol.hasInstance]` on the right-hand side overrides the
         // ordinary prototype/cell-kind check (and applies even to a primitive
@@ -2971,9 +3032,13 @@ impl<'a> Interp<'a> {
             let sym = self.well_known_symbol("hasInstance");
             let key = self.member_key(sym);
             let method = self.read_member(ch, &key)?;
-            if method
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            if let Some(mh) = method.as_handle().map(Handle::from_raw)
+                && self.is_callable(mh)
+                // Skip the *default* `Function.prototype[Symbol.hasInstance]`
+                // (every function inherits it): it just performs OrdinaryHasInstance,
+                // which is exactly the ordinary path below — calling it here would
+                // recurse. Only a *user* `[Symbol.hasInstance]` override is honored.
+                && self.realm.native_at(mh) != Some(N_FN_HAS_INSTANCE)
             {
                 let result = self.call_with_this(method, ctor, &[obj])?;
                 return Ok(self.realm.truthy(result));
@@ -3148,9 +3213,20 @@ impl<'a> Interp<'a> {
         }
         // Plain function constructors: walk the instance's `[[Prototype]]` chain for
         // the constructor's current `.prototype` (so `Object.create(C.prototype)` is an
-        // instance, and reassigning `C.prototype` is reflected).
-        if let Some((func_id, _)) = self.realm.function_at(ch) {
-            let proto = self.realm.function_prototype(func_id);
+        // instance, and reassigning `C.prototype` is reflected). `Get(C,"prototype")`
+        // must be an Object — otherwise OrdinaryHasInstance is a TypeError (e.g.
+        // `C.prototype = undefined`).
+        if self.realm.function_at(ch).is_some() {
+            let proto_val = self.read_member(ch, "prototype")?;
+            let Some(proto) = proto_val
+                .as_handle()
+                .map(Handle::from_raw)
+                .filter(|_| self.is_object_value(proto_val))
+            else {
+                return Err(
+                    self.type_error("Function has non-object prototype in instanceof check")
+                );
+            };
             // Walk via `get_proto_of` so a proxy's `getPrototypeOf` trap is honored at
             // each step (bounded to guard against a trap returning a cycle).
             let mut cur = oh;

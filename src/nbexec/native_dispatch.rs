@@ -998,51 +998,81 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_array(pairs).to_raw())
             }
             N_ARRAY_FROM => {
-                // Iterable → array (arrays, strings, Sets, Maps), with an
-                // optional map callback applied to each element. A non-iterable
-                // array-like (an object with a `length`) is read by index.
-                let items = match self.iterate_values(arg(0)) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        let mut out = Vec::new();
-                        if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
-                            let len_raw = self
-                                .realm
-                                .get_property(h, "length")
-                                .map(|v| self.realm.to_number(v))
-                                .unwrap_or(0.0);
-                            // Cap the array-like length against `max_array_len`
-                            // BEFORE allocating, so `from({length: 2**32-1})` throws
-                            // a catchable RangeError instead of attempting a
-                            // multi-gigabyte allocation (an unbounded-memory bug).
-                            if len_raw > self.realm.limits.max_array_len as f64 {
-                                let m = self.new_str("Invalid array length");
-                                return Err(ExecError::Throw(
-                                    self.make_error(N_RANGE_ERROR, Some(m)),
-                                ));
-                            }
-                            let len = len_raw.max(0.0) as usize;
-                            for i in 0..len {
-                                let k = alloc::format!("{i}");
-                                out.push(
-                                    self.realm
-                                        .get_property(h, &k)
-                                        .unwrap_or(NanBox::undefined()),
-                                );
-                            }
-                        }
-                        out
+                // `Array.from(items, mapFn?, thisArg?)`. Step 1-2: a defined
+                // `mapFn` must be callable (a TypeError otherwise, checked first).
+                let map_fn = arg(1);
+                let has_map = !matches!(map_fn.unpack(), Unpacked::Undefined);
+                if has_map {
+                    self.require_callable(map_fn, "Array.from mapFn")?;
+                }
+                let this_arg = arg(2);
+                // Step 3: items is ToObject'd — `null`/`undefined` is a TypeError.
+                if matches!(arg(0).unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    return Err(self.type_error(
+                        "Array.from requires an array-like or iterable object, not null/undefined",
+                    ));
+                }
+                // GetMethod(items, @@iterator): the getter fires (a throw
+                // propagates). A present, callable iterator method → iterate;
+                // otherwise fall back to the array-like (length + indices) read.
+                let items_box = arg(0);
+                let is_iterable = match items_box.as_handle().map(Handle::from_raw) {
+                    Some(h) => {
+                        // A user/inherited callable `@@iterator` (its getter fires,
+                        // a throw propagating), OR a built-in iterable whose
+                        // iteration `iterate_values` handles directly without a
+                        // readable `@@iterator` method (arrays, strings, Set/Map,
+                        // generators).
+                        let has_iter = self
+                            .find_iterator_fn(h)?
+                            .filter(|f| {
+                                f.as_handle()
+                                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                            })
+                            .is_some();
+                        has_iter
+                            || self.realm.is_array_like(h)
+                            || self.realm.string_value(h).is_some()
+                            || self.realm.collection_is_set(h).is_some()
+                            || self.realm.get_property(h, GEN_BUF).is_some()
                     }
+                    None => false,
                 };
-                let items = if matches!(arg(1).unpack(), Unpacked::Undefined) {
-                    items
+                let raw_items = if is_iterable {
+                    // Drain the iterator; a `next`/getter throw propagates.
+                    self.iterate_values(items_box)?
                 } else {
-                    let f = arg(1);
-                    let this_arg = arg(2); // `Array.from(items, mapFn, thisArg)`
-                    let mut out = Vec::with_capacity(items.len());
-                    for (i, e) in items.iter().enumerate() {
+                    // Array-like: ToLength(Get(O, "length")) then Get each index.
+                    let mut out = Vec::new();
+                    if let Some(h) = items_box.as_handle().map(Handle::from_raw) {
+                        let len_val = self.read_member(h, "length")?;
+                        let len_num = self.coerce_to_number(len_val)?;
+                        let len_raw = self.realm.to_number(len_num);
+                        // Cap the array-like length against `max_array_len` BEFORE
+                        // allocating, so `from({length: 2**32-1})` throws a catchable
+                        // RangeError instead of a multi-gigabyte allocation.
+                        if len_raw > self.realm.limits.max_array_len as f64 {
+                            let m = self.new_str("Invalid array length");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
+                        let len = if len_raw.is_nan() || len_raw <= 0.0 {
+                            0
+                        } else {
+                            len_raw as usize
+                        };
+                        for i in 0..len {
+                            out.push(self.read_member(h, &alloc::format!("{i}"))?);
+                        }
+                    }
+                    out
+                };
+                let items = if !has_map {
+                    raw_items
+                } else {
+                    let mut out = Vec::with_capacity(raw_items.len());
+                    for (i, e) in raw_items.iter().enumerate() {
                         out.push(self.call_with_this(
-                            f,
+                            map_fn,
                             this_arg,
                             &[*e, NanBox::number(i as f64)],
                         )?);
@@ -1603,6 +1633,22 @@ impl<'a> Interp<'a> {
             // `$262_detachArrayBuffer(buffer)` — the Test262 `$262.detachArrayBuffer`
             // host hook. Detaches the buffer (empties its store + every view, flags it
             // detached) and returns `null` per the abstract `DetachArrayBuffer`.
+            // `%ThrowTypeError%`: the poisoned accessor for a strict `arguments`
+            // object's `callee` and `Function.prototype.caller`/`.arguments`
+            // (get or set) — always a TypeError.
+            N_THROW_TYPE_ERROR => {
+                return Err(self.type_error(
+                    "'caller', 'callee', and 'arguments' may not be accessed on strict mode \
+                     functions or the arguments objects for calls to them",
+                ));
+            }
+            // `Function.prototype[Symbol.hasInstance](V)`: OrdinaryHasInstance for
+            // `this` (the function). A non-callable `this` reports `false`.
+            N_FN_HAS_INSTANCE => {
+                let this = self.this_val;
+                let v = arg(0);
+                return Ok(NanBox::boolean(self.ordinary_has_instance(this, v)?));
+            }
             N_DETACH_ARRAY_BUFFER => {
                 let buf = arg(0)
                     .as_handle()

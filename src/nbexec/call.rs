@@ -634,8 +634,14 @@ impl<'a> Interp<'a> {
                 // ToObject(this): a primitive `this` (a boolean/number/string/
                 // symbol/bigint, e.g. `Array.prototype.reduce.call("abc", …)`) is
                 // boxed to its wrapper object so its array-like indexed properties
-                // and `length` are read generically.
-                let this_obj = if this_val.as_handle().is_none() {
+                // and `length` are read generically. A string primitive is a heap
+                // value (`Cell::Str`) but still needs boxing into a `String`
+                // wrapper so its per-unit indices are read as array-like.
+                let is_string_prim = this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| self.realm.string_value(h).is_some());
+                let this_obj = if this_val.as_handle().is_none() || is_string_prim {
                     self.coerce_to_object(this_val)
                 } else {
                     this_val
@@ -650,6 +656,10 @@ impl<'a> Interp<'a> {
                     }
                     _ => this_obj,
                 };
+                // Mark this as a generic `Array.prototype.<m>` application so a
+                // primitive-wrapper `this` is treated as an array-like object
+                // rather than unwrapped to its boxed primitive.
+                self.array_proto_generic = true;
                 return Ok(self
                     .call_method(this_eff, &name, args)?
                     .unwrap_or(NanBox::undefined()));
@@ -866,7 +876,13 @@ impl<'a> Interp<'a> {
                     .get_property(handle, ARROW_HOME_STATIC)
                     .is_some_and(|v| self.realm.truthy(v));
             }
-            let r = self.invoke(def, captured, this_val, args);
+            let r = self.invoke(
+                def,
+                captured,
+                this_val,
+                args,
+                NanBox::handle(handle.to_raw()),
+            );
             self.this_val = saved_this;
             self.new_target = saved_nt;
             self.current_home_object = saved_home_obj;
@@ -880,7 +896,13 @@ impl<'a> Interp<'a> {
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw);
         let saved_home_obj = core::mem::replace(&mut self.current_home_object, home_obj);
-        let r = self.invoke(def, captured, this_val, args);
+        let r = self.invoke(
+            def,
+            captured,
+            this_val,
+            args,
+            NanBox::handle(handle.to_raw()),
+        );
         self.current_home_object = saved_home_obj;
         r
     }
@@ -896,6 +918,7 @@ impl<'a> Interp<'a> {
         captured: Scope,
         this_val: NanBox,
         args: &[NanBox],
+        callee: NanBox,
     ) -> Result<NanBox, ExecError> {
         if self.call_depth >= self.realm.limits.max_call_depth {
             let msg = self.new_str("Maximum call stack size exceeded");
@@ -905,7 +928,7 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(err));
         }
         self.call_depth += 1;
-        let r = self.invoke_inner(def, captured, this_val, args);
+        let r = self.invoke_inner(def, captured, this_val, args, callee);
         self.call_depth -= 1;
         r
     }
@@ -916,6 +939,7 @@ impl<'a> Interp<'a> {
         captured: Scope,
         this_val: NanBox,
         args: &[NanBox],
+        callee: NanBox,
     ) -> Result<NanBox, ExecError> {
         let call_scope = captured.child();
         let saved = core::mem::replace(&mut self.current, call_scope);
@@ -924,12 +948,34 @@ impl<'a> Interp<'a> {
         let saved_this = if def.is_arrow {
             self.this_val
         } else {
-            // Sloppy-mode `this` coercion: an `undefined`/`null` receiver becomes
-            // the global object. Strict functions keep it as-is.
-            let bound = if !def.is_strict
-                && matches!(this_val.unpack(), Unpacked::Undefined | Unpacked::Null)
-            {
+            // Sloppy-mode `this` coercion (OrdinaryCallBindThis): a strict
+            // function keeps `this` as-is; a sloppy function maps `undefined`/
+            // `null` to the global object and `ToObject`-boxes a primitive
+            // receiver (a number/string/boolean/symbol/bigint) into its wrapper,
+            // so `(function(){ this.x = 1; return this; }).apply(1)` mutates and
+            // returns a `Number` wrapper.
+            let bound = if def.is_strict {
+                this_val
+            } else if matches!(this_val.unpack(), Unpacked::Undefined | Unpacked::Null) {
                 self.global_this
+            } else if this_val.as_handle().is_none() {
+                // A primitive immediate (number/boolean) — box it.
+                self.coerce_to_object(this_val)
+            } else if self
+                .realm
+                .string_value(this_val.as_handle().map(Handle::from_raw).unwrap())
+                .is_some()
+                || self
+                    .realm
+                    .symbol_at(this_val.as_handle().map(Handle::from_raw).unwrap())
+                    .is_some()
+                || self
+                    .realm
+                    .bigint_at(this_val.as_handle().map(Handle::from_raw).unwrap())
+                    .is_some()
+            {
+                // A primitive stored as a heap cell (string/symbol/bigint) — box it.
+                self.coerce_to_object(this_val)
             } else {
                 this_val
             };
@@ -984,9 +1030,8 @@ impl<'a> Interp<'a> {
             // the parameters so a parameter default can reference `arguments`
             // (`function f(x = arguments[0]) {}`).
             if !def.is_arrow {
-                let arr = self.realm.new_array(args.to_vec());
-                self.current
-                    .declare("arguments", NanBox::handle(arr.to_raw()));
+                let arguments = self.make_arguments_object(args, callee);
+                self.current.declare("arguments", arguments);
             }
             for (i, param) in def.params.iter().enumerate() {
                 let value = if param.rest {

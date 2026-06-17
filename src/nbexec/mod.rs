@@ -296,6 +296,19 @@ pub struct Interp<'a> {
     /// One-shot `newTarget` override for the next `construct` (set by
     /// `Reflect.construct(target, args, newTarget)`); else `new.target` is the callee.
     reflect_new_target: Option<NanBox>,
+    /// One-shot: the next `call_method` was reached through a *generic*
+    /// `Array.prototype.<m>` invocation (e.g. `Array.prototype.reduce.call(o)`),
+    /// so a primitive-wrapper `this` must be treated as an array-like object
+    /// (read its own `length`/indexed properties) rather than unwrapped to its
+    /// boxed primitive and dispatched as a String/Number/Boolean method.
+    array_proto_generic: bool,
+    /// When a *generic* array-like receiver is materialized for an iteration
+    /// method (`map`/`filter`/`forEach`/`reduce`/…), this records which indices
+    /// were actually *present* (`HasProperty`) on the source object, so those
+    /// methods skip the holes per spec (`Array.prototype.filter.call({1:11,
+    /// length:2})` skips the absent index 0). `None` for a dense real array (no
+    /// holes are tracked — the dense fast path is unchanged).
+    array_like_present: Option<alloc::vec::Vec<bool>>,
     /// Persistent mutable state (memory/globals) of each live WASM instance, keyed
     /// by an instance id stored on the instance's export wrappers — so a
     /// `WebAssembly.Instance`'s memory and globals survive across export calls.
@@ -590,6 +603,14 @@ const N_ITER_ZIP_NEXT: u16 = 357;
 const N_ITER_ZIP_RETURN: u16 = 358;
 /// `%IteratorPrototype%[Symbol.dispose]` — calls the iterator's `return`.
 const N_ITERATOR_DISPOSE: u16 = 359;
+/// `%ThrowTypeError%` — the shared poisoned accessor used as a strict
+/// `arguments` object's `callee` getter/setter; calling it always throws a
+/// `TypeError`. (New native-id range starts at 400.)
+const N_THROW_TYPE_ERROR: u16 = 400;
+/// `Function.prototype[Symbol.hasInstance]` — OrdinaryHasInstance(this, V):
+/// reports whether `V` is in `this` function's `.prototype` chain (a bound
+/// function defers to its target).
+const N_FN_HAS_INSTANCE: u16 = 401;
 /// The `%TypedArray%.prototype` methods exposed as first-class own properties,
 /// each paired with its spec `length` (own `length` data property). Dispatched
 /// through [`N_TYPED_ARRAY_PROTO_FN`].
@@ -1326,6 +1347,10 @@ const ZIP_FINISHED: &str = "\u{0}zfin";
 /// constructor id (for `instanceof`).
 const PRIM_WRAP: &str = "\u{0}prim";
 const PRIM_WRAP_TYPE: &str = "\u{0}primtype";
+/// Marks an ordinary object as an `arguments` exotic object, so
+/// `Object.prototype.toString` reports `[object Arguments]`. (A mapped/sloppy
+/// arguments object additionally carries `ARGS_CALLEE` parameter linkage.)
+const ARGS_MARKER: &str = "\u{0}args";
 /// `ArrayBuffer` byte store (an array of 0–255 numbers) and `DataView` linkage.
 const ARRAY_BUFFER_BYTES: &str = "\u{0}abytes";
 /// Marks an `ArrayBuffer` as detached (after `transfer()`): its `byteLength` reads 0 and its
@@ -1481,6 +1506,8 @@ impl<'a> Interp<'a> {
             new_target: NanBox::undefined(),
             pending_new_target: None,
             reflect_new_target: None,
+            array_proto_generic: false,
+            array_like_present: None,
             wasm_states: alloc::collections::BTreeMap::new(),
             wasm_modules: alloc::collections::BTreeMap::new(),
             wasm_mem_objs: alloc::collections::BTreeMap::new(),
@@ -2545,6 +2572,15 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
         {
             self.realm.set_array_proto_intrinsic(arr_proto);
+            // `Array.prototype[Symbol.iterator]` is the *same* function object as
+            // `Array.prototype.values` (per spec), so `[][Symbol.iterator] ===
+            // [].values` and the `arguments` object's iterator matches
+            // `[][Symbol.iterator]`. Installed as a non-enumerable own property.
+            if let Some(values) = self.realm.get_property(arr_proto, "values") {
+                let iter_sym = self.well_known_symbol("iterator");
+                let iter_key = self.member_key(iter_sym);
+                self.realm.set_hidden_property(arr_proto, &iter_key, values);
+            }
         }
         // `Array.prototype[Symbol.unscopables]` — a null-prototype object whose
         // own enumerable data properties (all `true`) name the methods excluded
@@ -2752,6 +2788,27 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
         {
             self.realm.set_function_proto_intrinsic(func_proto);
+            // `Function.prototype.caller` / `.arguments` are poisoned accessors
+            // (`%ThrowTypeError%` for both get and set), enumerable: false,
+            // configurable: true. Strict and bound functions inherit them, so
+            // `boundFn.caller` / `strictFn.arguments` throw a TypeError without a
+            // (forbidden) own property.
+            let thrower = NanBox::handle(self.realm.new_native(N_THROW_TYPE_ERROR).to_raw());
+            for key in ["caller", "arguments"] {
+                self.realm
+                    .define_accessor(func_proto, key, thrower, thrower);
+                self.realm.mark_hidden(func_proto, key);
+            }
+            // `Function.prototype[Symbol.hasInstance]` — OrdinaryHasInstance,
+            // non-writable, non-enumerable, non-configurable (a first-class
+            // native so `instanceof` and explicit `.call` both work).
+            let has_instance = NanBox::handle(self.realm.new_native(N_FN_HAS_INSTANCE).to_raw());
+            let sym = self.well_known_symbol("hasInstance");
+            let key = self.member_key(sym);
+            self.realm
+                .set_hidden_property(func_proto, &key, has_instance);
+            self.realm.set_readonly_property(func_proto, &key);
+            self.realm.set_non_configurable_property(func_proto, &key);
         }
         self.setup_first_class_prototype_id("Set", SET_PROTO_METHODS, N_SET_PROTO_FN);
         self.setup_first_class_prototype_id("Map", MAP_PROTO_METHODS, N_MAP_PROTO_FN);
