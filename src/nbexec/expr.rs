@@ -2646,6 +2646,17 @@ impl<'a> Interp<'a> {
         a: NanBox,
         b: NanBox,
     ) -> Result<NanBox, ExecError> {
+        // An operand that is a wrapper/plain object (not a bigint/string primitive
+        // or symbol) must be ToPrimitive-coerced *before* the BigInt path, so a
+        // BigInt wrapper (`Object(1n)`) or a `Symbol.toPrimitive` yielding a BigInt
+        // is unwrapped first. Defer the BigInt check in that case.
+        let is_coercible_object = |this: &Self, v: NanBox| {
+            v.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                this.realm.bigint_at(h).is_none()
+                    && this.realm.string_value(h).is_none()
+                    && this.realm.symbol_at(h).is_none()
+            })
+        };
         // BigInt operands take a dedicated path (i128 arithmetic; mixing with
         // other numeric types throws, per the spec).
         let abig = a
@@ -2655,6 +2666,8 @@ impl<'a> Interp<'a> {
             .as_handle()
             .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)));
         if (abig.is_some() || bbig.is_some())
+            && !is_coercible_object(self, a)
+            && !is_coercible_object(self, b)
             && let Some(r) = self.bigint_binary(op, abig, bbig, a, b)?
         {
             return Ok(r);
@@ -2694,6 +2707,22 @@ impl<'a> Interp<'a> {
         } else {
             (a, b)
         };
+        // ToPrimitive may have unwrapped a BigInt wrapper object (`Object(1n)`) or a
+        // `Symbol.toPrimitive` returning a BigInt; retry the BigInt path now that the
+        // operands are primitives (`Object(5n) & 3n` → `1n`).
+        if coerces {
+            let abig = a
+                .as_handle()
+                .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)));
+            let bbig = b
+                .as_handle()
+                .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)));
+            if (abig.is_some() || bbig.is_some())
+                && let Some(r) = self.bigint_binary(op, abig, bbig, a, b)?
+            {
+                return Ok(r);
+            }
+        }
         // `==`/`!=` between an object/array and a number/string primitive coerces
         // the object side (arrays via their join; plain objects via ToPrimitive).
         let (a, b) = if matches!(op, BinaryOp::EqEq | BinaryOp::NotEq) {
