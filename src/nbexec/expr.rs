@@ -3,6 +3,42 @@ use super::*;
 impl<'a> Interp<'a> {
     // --- expressions ---
 
+    /// Resolves an identifier *reference* and returns its value (`GetValue`):
+    /// the predeclared globals (`undefined`/`NaN`/`Infinity`), a `with`-object
+    /// property, a lexical binding, or a global-object own property — throwing a
+    /// catchable `ReferenceError` when the reference is unresolvable. Shared by a
+    /// bare-identifier read and the read step of a compound assignment.
+    pub(crate) fn read_ident_ref(&mut self, name: &str) -> Result<NanBox, ExecError> {
+        match name {
+            "undefined" => return Ok(NanBox::undefined()),
+            "NaN" => return Ok(NanBox::number(f64::NAN)),
+            "Infinity" => return Ok(NanBox::number(f64::INFINITY)),
+            _ => {}
+        }
+        // A bare identifier inside `with (obj)` first resolves against the
+        // with-object's properties (via `[[Get]]`, so accessors fire).
+        if let Some(h) = self.with_binding(name) {
+            return self.read_member(h, name);
+        }
+        match self.current.get(name) {
+            Some(v) => Ok(v),
+            // Not in the lexical scope chain: a property added directly to the
+            // global object (`this.x = …` / `globalThis.x = …` at script level) is
+            // a global binding, so fall back to a global-object own property.
+            None => {
+                if let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+                    && self.realm.has_own(g, name)
+                {
+                    return self.read_member(g, name);
+                }
+                let msg = self.new_str(&alloc::format!("{name} is not defined"));
+                Err(ExecError::Throw(
+                    self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                ))
+            }
+        }
+    }
+
     /// Returns the cached well-known symbol `name` (e.g. `iterator`), creating it
     /// on first use. Each is a stable, unique symbol for the realm's lifetime.
     pub(crate) fn well_known_symbol(&mut self, name: &'static str) -> NanBox {
@@ -149,37 +185,7 @@ impl<'a> Interp<'a> {
                 let h = self.realm.new_string_wtf8(value.to_vec());
                 Ok(NanBox::handle(h.to_raw()))
             }
-            Expr::Ident(id) => match &*id.name {
-                "undefined" => Ok(NanBox::undefined()),
-                "NaN" => Ok(NanBox::number(f64::NAN)),
-                "Infinity" => Ok(NanBox::number(f64::INFINITY)),
-                name => {
-                    // A bare identifier inside `with (obj)` first resolves against
-                    // the with-object's properties (via `[[Get]]`, so accessors fire).
-                    if let Some(h) = self.with_binding(name) {
-                        return self.read_member(h, name);
-                    }
-                    match self.current.get(name) {
-                        Some(v) => Ok(v),
-                        // Not in the lexical scope chain: a property added directly
-                        // to the global object (`this.x = …` / `globalThis.x = …` at
-                        // script level) is a global binding, so fall back to a
-                        // global-object own property before failing.
-                        None => {
-                            if let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
-                                && self.realm.has_own(g, name)
-                            {
-                                return self.read_member(g, name);
-                            }
-                            // An unresolved reference throws a catchable ReferenceError.
-                            let msg = self.new_str(&alloc::format!("{name} is not defined"));
-                            Err(ExecError::Throw(
-                                self.make_error(N_REFERENCE_ERROR, Some(msg)),
-                            ))
-                        }
-                    }
-                }
-            },
+            Expr::Ident(id) => self.read_ident_ref(&id.name),
             Expr::Regex { pattern, flags, .. } => Ok(NanBox::handle(
                 self.new_regexp_instance(pattern, flags).to_raw(),
             )),
@@ -2088,10 +2094,10 @@ impl<'a> Interp<'a> {
                     }
                     rhs
                 } else {
-                    let current = self
-                        .current
-                        .get(name)
-                        .ok_or_else(|| ExecError::NotDefined(String::from(name)))?;
+                    // A compound assignment reads the LHS first (`GetValue`); an
+                    // unresolvable reference throws a catchable ReferenceError (matching
+                    // a bare-identifier read), not an internal error.
+                    let current = self.read_ident_ref(name)?;
                     self.binary(compound_op(op)?, current, rhs)?
                 };
                 if !self.current.set(name, new) {
