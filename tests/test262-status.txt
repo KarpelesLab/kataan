@@ -1,29 +1,5 @@
 # Test262 known-failures ledger (paths relative to vendor/test262/test/).
 # Regenerate with KATAAN_TEST262_BLESS=1. Target: empty (literal 100%).
-annexB/built-ins/Date/prototype/getYear/B.2.4.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/Date/prototype/getYear/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/Date/prototype/getYear/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/Date/prototype/getYear/nan.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/Date/prototype/getYear/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/Date/prototype/getYear/return-value.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/Date/prototype/getYear/this-not-date.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/Date/prototype/setYear/B.2.5.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/Date/prototype/setYear/date-value-read-before-tonumber-when-date-is-invalid.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/Date/prototype/setYear/date-value-read-before-tonumber-when-date-is-valid.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/Date/prototype/setYear/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/Date/prototype/setYear/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/Date/prototype/setYear/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/Date/prototype/setYear/this-not-date.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/Date/prototype/setYear/this-time-nan.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/Date/prototype/setYear/this-time-valid.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/Date/prototype/setYear/time-clip.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/Date/prototype/setYear/year-nan.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/Date/prototype/setYear/year-number-absolute.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/Date/prototype/setYear/year-number-relative.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/Date/prototype/setYear/year-to-number-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/Date/prototype/toGMTString/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/Date/prototype/toGMTString/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/Date/prototype/toGMTString/value.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/Function/createdynfn-html-close-comment-body.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: unexpected token Gt (at 28..29)
 annexB/built-ins/Function/createdynfn-html-close-comment-params.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: expected a binding name, found MinusMinus (at 21..23)
 annexB/built-ins/Function/createdynfn-html-open-comment-body.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: unexpected token Lt (at 25..26)
@@ -36,154 +12,10 @@ annexB/built-ins/RegExp/RegExp-invalid-control-escape-character-class.js  # [slo
 annexB/built-ins/RegExp/RegExp-leading-escape-BMP.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/RegExp/RegExp-trailing-escape-BMP.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/RegExp/incomplete_hex_unicode_escape.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/legacy-accessors/index/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/index/this-not-regexp-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/index/this-subclass-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/legacy-accessors/input/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/input/this-not-regexp-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 annexB/built-ins/RegExp/legacy-accessors/input/this-subclass-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/legacy-accessors/lastMatch/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/lastMatch/this-not-regexp-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/lastMatch/this-subclass-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/legacy-accessors/lastParen/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/lastParen/this-not-regexp-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/lastParen/this-subclass-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/legacy-accessors/leftContext/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/leftContext/this-not-regexp-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/leftContext/this-subclass-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/legacy-accessors/rightContext/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/rightContext/this-not-regexp-constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-annexB/built-ins/RegExp/legacy-accessors/rightContext/this-subclass-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/RegExp/prototype/Symbol.split/Symbol.match-getter-recompiles-source.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/RegExp/prototype/compile/flags-string-invalid.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/prototype/compile/length.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/RegExp/prototype/compile/pattern-regexp-immutable-lastindex.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/anchor/B.2.3.2.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/anchor/attr-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/anchor/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/anchor/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/anchor/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/anchor/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/anchor/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/big/B.2.3.3.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/big/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/big/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/big/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/big/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/big/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/blink/B.2.3.4.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/blink/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/blink/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/blink/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/blink/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/blink/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/bold/B.2.3.5.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/bold/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/bold/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/bold/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/bold/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/bold/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fixed/B.2.3.6.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/fixed/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/fixed/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/fixed/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fixed/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fixed/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/fontcolor/attr-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fontcolor/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/fontcolor/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/fontcolor/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fontcolor/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fontcolor/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fontsize/B.2.3.8.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/fontsize/attr-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fontsize/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/fontsize/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/fontsize/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fontsize/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/fontsize/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/italics/B.2.3.9.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/italics/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/italics/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/italics/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/italics/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/italics/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/link/B.2.3.10.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/link/attr-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/link/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/link/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/link/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/link/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/link/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/small/B.2.3.11.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/small/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/small/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/small/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/small/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/small/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/strike/B.2.3.12.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/strike/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/strike/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/strike/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/strike/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/strike/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/sub/B.2.3.13.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/sub/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/sub/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/sub/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/sub/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/sub/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 annexB/built-ins/String/prototype/substr/surrogate-pairs.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/sup/B.2.3.14.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-annexB/built-ins/String/prototype/sup/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/sup/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/sup/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/sup/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/sup/this-val-tostring-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/trimLeft/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/trimLeft/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/trimLeft/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/trimLeft/reference-trimStart.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/trimRight/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/trimRight/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-annexB/built-ins/String/prototype/trimRight/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/String/prototype/trimRight/reference-trimEnd.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/escape/argument_bigint.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/argument_types.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/empty-string.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/escape-above-astral.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/escape-above.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/escape-below.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/length.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/name.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/not-a-constructor.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/escape/to-primitive-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/escape/to-primitive-observe.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/to-string-err-symbol.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/escape/to-string-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/escape/to-string-observe.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/escape/unmodified.js  # [sloppy] expected pass, Runtime ReferenceError: escape is not defined
-annexB/built-ins/unescape/argument_bigint.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/argument_types.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/empty-string.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/four-ignore-bad-u.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/four-ignore-end-str.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/four-ignore-non-hex.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/four.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/length.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/name.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/not-a-constructor.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/unescape/to-primitive-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/unescape/to-primitive-observe.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/to-string-err-symbol.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/unescape/to-string-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-annexB/built-ins/unescape/to-string-observe.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/two-ignore-end-str.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/two-ignore-non-hex.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
-annexB/built-ins/unescape/two.js  # [sloppy] expected pass, Runtime ReferenceError: unescape is not defined
 annexB/language/comments/multi-line-html-close.js  # [sloppy] negative: failed at Parse, expected phase runtime
 annexB/language/comments/single-line-html-close-asi.js  # [sloppy] negative: failed at Parse, expected phase runtime
 annexB/language/comments/single-line-html-close-first-line-1.js  # [sloppy] negative: failed at Parse, expected phase runtime
@@ -837,15 +669,15 @@ built-ins/Array/fromAsync/sync-iterable-with-thenable-awaits-once.js  # [sloppy]
 built-ins/Array/fromAsync/sync-iterable-with-thenable-sync-mapped-awaits-once.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
 built-ins/Array/fromAsync/sync-iterable-with-thenable-sync-mapped-callback-err.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
 built-ins/Array/fromAsync/sync-iterable-with-thenable-then-method-err.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
-built-ins/Array/fromAsync/this-constructor-operations.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: cannot read property of null or undefined )
+built-ins/Array/fromAsync/this-constructor-operations.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: Cannot read properties of undefined (reading 'call') )
 built-ins/Array/fromAsync/this-constructor-with-bad-length-setter.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Promise rejected if setting length fails Expected a Test262Error to)
-built-ins/Array/fromAsync/this-constructor-with-readonly-elements.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: cannot read property of null or undefined )
+built-ins/Array/fromAsync/this-constructor-with-readonly-elements.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: Cannot read properties of undefined (reading 'call') )
 built-ins/Array/fromAsync/this-constructor-with-readonly-length.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Setting read-only length fails Expected a TypeError to be thrown as)
 built-ins/Array/fromAsync/this-constructor-with-unsettable-element-closes-async-iterator.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Promise rejected if defining element fails Expected a TypeError to )
 built-ins/Array/fromAsync/this-constructor-with-unsettable-element-closes-sync-iterator.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Promise rejected if defining element fails Expected a TypeError to )
 built-ins/Array/fromAsync/this-constructor-with-unsettable-element.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Promise rejected if defining element fails Expected a TypeError to )
-built-ins/Array/fromAsync/this-constructor.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: cannot read property of null or undefined )
-built-ins/Array/fromAsync/this-non-constructor.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: cannot read property of null or undefined )
+built-ins/Array/fromAsync/this-constructor.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: Cannot read properties of undefined (reading 'call') )
+built-ins/Array/fromAsync/this-non-constructor.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: Cannot read properties of undefined (reading 'call') )
 built-ins/Array/fromAsync/thisarg-object.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
 built-ins/Array/fromAsync/thisarg-omitted-sloppy.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
 built-ins/Array/fromAsync/thisarg-omitted-strict.js  # [strict] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
@@ -2003,9 +1835,9 @@ built-ins/AsyncGeneratorFunction/instance-await-expr-in-param.js  # [sloppy] exp
 built-ins/AsyncGeneratorFunction/instance-construct-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/AsyncGeneratorFunction/instance-prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/AsyncGeneratorFunction/instance-yield-expr-in-param.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/AsyncGeneratorFunction/invoked-as-constructor-no-arguments.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/AsyncGeneratorFunction/invoked-as-constructor-no-arguments.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'next')
 built-ins/AsyncGeneratorFunction/invoked-as-function-multiple-arguments.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: expected a semicolon or newline, found Identifier (at 34..35)
-built-ins/AsyncGeneratorFunction/invoked-as-function-no-arguments.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/AsyncGeneratorFunction/invoked-as-function-no-arguments.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'next')
 built-ins/AsyncGeneratorFunction/invoked-as-function-single-argument.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: expected a semicolon or newline, found Number (at 31..32)
 built-ins/AsyncGeneratorFunction/name.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/AsyncGeneratorFunction/prototype/Symbol.toStringTag.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2018,7 +1850,7 @@ built-ins/AsyncGeneratorPrototype/next/length.js  # [sloppy] expected pass, Runt
 built-ins/AsyncGeneratorPrototype/next/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/AsyncGeneratorPrototype/next/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/AsyncGeneratorPrototype/next/request-queue-await-order.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/AsyncGeneratorPrototype/next/request-queue-order-state-executing.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/AsyncGeneratorPrototype/next/request-queue-order-state-executing.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'next')
 built-ins/AsyncGeneratorPrototype/next/request-queue-order.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/AsyncGeneratorPrototype/next/request-queue-promise-resolve-order.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/AsyncGeneratorPrototype/next/return-promise.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2028,7 +1860,7 @@ built-ins/AsyncGeneratorPrototype/return/iterator-result-prototype.js  # [sloppy
 built-ins/AsyncGeneratorPrototype/return/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/AsyncGeneratorPrototype/return/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/AsyncGeneratorPrototype/return/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/AsyncGeneratorPrototype/return/request-queue-order-state-executing.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/AsyncGeneratorPrototype/return/request-queue-order-state-executing.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'return')
 built-ins/AsyncGeneratorPrototype/return/return-promise.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/AsyncGeneratorPrototype/return/return-state-completed-broken-promise.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/AsyncGeneratorPrototype/return/return-state-completed.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -2046,7 +1878,7 @@ built-ins/AsyncGeneratorPrototype/return/this-val-not-object.js  # [sloppy] expe
 built-ins/AsyncGeneratorPrototype/throw/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/AsyncGeneratorPrototype/throw/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/AsyncGeneratorPrototype/throw/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/AsyncGeneratorPrototype/throw/request-queue-order-state-executing.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/AsyncGeneratorPrototype/throw/request-queue-order-state-executing.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'throw')
 built-ins/AsyncGeneratorPrototype/throw/return-rejected-promise.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/AsyncGeneratorPrototype/throw/this-val-not-async-generator.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/AsyncGeneratorPrototype/throw/this-val-not-object.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
@@ -2064,7 +1896,7 @@ built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/is-function.js  # [sloppy] 
 built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/return-val.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/return-val.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of null (reading ' sym:12')
 built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/throw-rejected-return.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Promise should be rejected Expected a CatchError to be thrown async)
 built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/throw-return-getter.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Promise should be rejected Expected a CatchError to be thrown async)
 built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/throw-return.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Promise should be rejected Expected a CatchError to be thrown async)
@@ -2380,7 +2212,7 @@ built-ins/Function/prototype/Symbol.hasInstance/length.js  # [sloppy] expected p
 built-ins/Function/prototype/Symbol.hasInstance/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/Function/prototype/Symbol.hasInstance/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Function/prototype/Symbol.hasInstance/this-val-bound-target.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Function/prototype/Symbol.hasInstance/this-val-not-callable.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/Function/prototype/Symbol.hasInstance/this-val-not-callable.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'call')
 built-ins/Function/prototype/Symbol.hasInstance/this-val-poisoned-prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Function/prototype/Symbol.hasInstance/value-get-prototype-of-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Function/prototype/Symbol.hasInstance/value-negative.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -2438,6 +2270,7 @@ built-ins/Function/prototype/property-order.js  # [sloppy] expected pass, Runtim
 built-ins/Function/prototype/toString/GeneratorFunction.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: expected a semicolon or newline, found Keyword(Yield) (at 65..70)
 built-ins/Function/prototype/toString/S15.3.4.2_A14.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Function/prototype/toString/S15.3.4.2_A16.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Function/prototype/toString/built-in-function-object.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Function/prototype/toString/class-declaration-complex-heritage.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Function/prototype/toString/class-declaration-explicit-ctor.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Function/prototype/toString/class-declaration-implicit-ctor.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2456,9 +2289,9 @@ built-ins/GeneratorFunction/instance-construct-throws.js  # [sloppy] expected pa
 built-ins/GeneratorFunction/instance-prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/GeneratorFunction/instance-restricted-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/GeneratorFunction/instance-yield-expr-in-param.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/GeneratorFunction/invoked-as-constructor-no-arguments.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/GeneratorFunction/invoked-as-constructor-no-arguments.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'next')
 built-ins/GeneratorFunction/invoked-as-function-multiple-arguments.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: expected a semicolon or newline, found Identifier (at 34..35)
-built-ins/GeneratorFunction/invoked-as-function-no-arguments.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/GeneratorFunction/invoked-as-function-no-arguments.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'next')
 built-ins/GeneratorFunction/invoked-as-function-single-argument.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: expected a semicolon or newline, found Number (at 31..32)
 built-ins/GeneratorFunction/name.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/GeneratorFunction/prototype/Symbol.toStringTag.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2466,13 +2299,13 @@ built-ins/GeneratorFunction/prototype/constructor.js  # [sloppy] expected pass, 
 built-ins/GeneratorFunction/prototype/prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/GeneratorPrototype/Symbol.toStringTag.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/GeneratorPrototype/constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/GeneratorPrototype/next/from-state-executing.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/GeneratorPrototype/next/from-state-executing.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'next')
 built-ins/GeneratorPrototype/next/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/GeneratorPrototype/next/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/GeneratorPrototype/next/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/GeneratorPrototype/next/property-descriptor.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/GeneratorPrototype/next/return-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/GeneratorPrototype/return/from-state-executing.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/GeneratorPrototype/return/from-state-executing.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'return')
 built-ins/GeneratorPrototype/return/from-state-suspended-start.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/GeneratorPrototype/return/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/GeneratorPrototype/return/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
@@ -2492,7 +2325,7 @@ built-ins/GeneratorPrototype/return/try-finally-nested-try-catch-within-outer-tr
 built-ins/GeneratorPrototype/return/try-finally-set-property-within-try.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/GeneratorPrototype/return/try-finally-within-finally.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/GeneratorPrototype/return/try-finally-within-try.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/GeneratorPrototype/throw/from-state-executing.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/GeneratorPrototype/throw/from-state-executing.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'throw')
 built-ins/GeneratorPrototype/throw/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/GeneratorPrototype/throw/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/GeneratorPrototype/throw/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2510,7 +2343,6 @@ built-ins/GeneratorPrototype/throw/try-finally-nested-try-catch-within-outer-try
 built-ins/GeneratorPrototype/throw/try-finally-nested-try-catch-within-outer-try-before-nested.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/GeneratorPrototype/throw/try-finally-within-finally.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/GeneratorPrototype/throw/try-finally-within-try.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Infinity/S15.1.1.2_A3_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Iterator/concat/get-iterator-method-only-once.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Iterator/concat/iterable-primitive-wrapper-objects.js  # [sloppy] expected pass, Runtime TypeError: Object.defineProperty called on non-object
 built-ins/Iterator/concat/throws-typeerror-when-generator-is-running-next.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2526,7 +2358,7 @@ built-ins/Iterator/prototype/Symbol.dispose/is-function.js  # [sloppy] expected 
 built-ins/Iterator/prototype/Symbol.dispose/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Iterator/prototype/Symbol.dispose/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Iterator/prototype/Symbol.dispose/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/Iterator/prototype/Symbol.dispose/return-val.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/Iterator/prototype/Symbol.dispose/return-val.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of null (reading ' sym:3')
 built-ins/Iterator/prototype/Symbol.iterator/is-function.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Iterator/prototype/Symbol.iterator/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Iterator/prototype/Symbol.iterator/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
@@ -2535,7 +2367,7 @@ built-ins/Iterator/prototype/Symbol.iterator/return-val.js  # [sloppy] expected 
 built-ins/Iterator/prototype/Symbol.toStringTag/prop-desc.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Iterator/prototype/Symbol.toStringTag/weird-setter.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
 built-ins/Iterator/prototype/constructor/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Iterator/prototype/constructor/weird-setter.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/Iterator/prototype/constructor/weird-setter.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'call')
 built-ins/Iterator/prototype/drop/throws-typeerror-when-generator-is-running.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Iterator/prototype/every/iterator-has-no-return.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Iterator/prototype/filter/throws-typeerror-when-generator-is-running.js  # [sloppy] expected pass, Runtime generator yield limit: 
@@ -2746,7 +2578,6 @@ built-ins/Math/sumPrecise/sum-is-minus-zero.js  # [sloppy] expected pass, Runtim
 built-ins/Math/sumPrecise/sum.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/Math/sumPrecise/takes-iterable.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/Math/sumPrecise/throws-on-non-number.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/NaN/S15.1.1.1_A3_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/NativeErrors/EvalError/prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/NativeErrors/EvalError/prototype/constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/NativeErrors/EvalError/prototype/not-error-object.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2790,7 +2621,7 @@ built-ins/Object/assign/target-is-frozen-data-property-set-throws.js  # [sloppy]
 built-ins/Object/assign/target-is-non-extensible-property-creation-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/assign/target-is-sealed-property-creation-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/assign/target-set-not-writable.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/bigint.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
+built-ins/Object/bigint.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-0-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/15.2.3.5-4-15.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/create/properties-arg-to-object-non-empty-string.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3133,6 +2964,7 @@ built-ins/Object/groupBy/toPropertyKey.js  # [sloppy] expected pass, Runtime [ob
 built-ins/Object/hasOwn/symbol_property_toPrimitive.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/hasOwn/symbol_property_toString.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/hasOwn/symbol_property_valueOf.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Object/internals/DefineOwnProperty/consistent-writable-regexp-dollar1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/is-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/isFrozen/15.2.3.12-2-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/isFrozen/15.2.3.12-2-2.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3310,7 +3142,7 @@ built-ins/Promise/allKeyed/arg-is-function.js  # [sloppy] async did not complete
 built-ins/Promise/allKeyed/arg-not-object-reject-bigint.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: BigInt Expected a TypeError to be thrown asynchronously but the fun)
 built-ins/Promise/allKeyed/arg-not-object-reject.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: undefined Expected a TypeError to be thrown asynchronously but the )
 built-ins/Promise/allKeyed/capability-executor-not-callable.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Promise/allKeyed/ctx-ctor-constructed.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/Promise/allKeyed/ctx-ctor-constructed.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'call')
 built-ins/Promise/allKeyed/ctx-ctor-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Promise/allKeyed/extensible.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Promise/allKeyed/getownproperty-not-enumerable.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
@@ -3333,7 +3165,7 @@ built-ins/Promise/allKeyed/reject-deferred.js  # [sloppy] async did not complete
 built-ins/Promise/allKeyed/reject-immed.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
 built-ins/Promise/allKeyed/reject-last.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 built-ins/Promise/allKeyed/reject-second.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Promise/allKeyed/resolve-before-loop-exit.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/Promise/allKeyed/resolve-before-loop-exit.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'call')
 built-ins/Promise/allKeyed/resolve-not-callable-reject-with-typeerror.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected a TypeError to be thrown asynchronously but the function t)
 built-ins/Promise/allKeyed/resolves-empty-object.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
 built-ins/Promise/allKeyed/symbol-keys.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
@@ -3405,7 +3237,7 @@ built-ins/Promise/allSettledKeyed/arg-is-function.js  # [sloppy] async did not c
 built-ins/Promise/allSettledKeyed/arg-not-object-reject-bigint.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: BigInt Expected a TypeError to be thrown asynchronously but the fun)
 built-ins/Promise/allSettledKeyed/arg-not-object-reject.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: undefined Expected a TypeError to be thrown asynchronously but the )
 built-ins/Promise/allSettledKeyed/capability-executor-not-callable.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Promise/allSettledKeyed/ctx-ctor-constructed.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/Promise/allSettledKeyed/ctx-ctor-constructed.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'call')
 built-ins/Promise/allSettledKeyed/ctx-ctor-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Promise/allSettledKeyed/extensible.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Promise/allSettledKeyed/getownproperty-not-enumerable.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
@@ -3424,7 +3256,7 @@ built-ins/Promise/allSettledKeyed/ownkeys-throws.js  # [sloppy] async did not co
 built-ins/Promise/allSettledKeyed/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Promise/allSettledKeyed/proto.js  # [sloppy] expected pass, Runtime TypeError: Object.getPrototypeOf called on null or undefined
 built-ins/Promise/allSettledKeyed/prototype-keys-ignored.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
-built-ins/Promise/allSettledKeyed/resolve-before-loop-exit.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/Promise/allSettledKeyed/resolve-before-loop-exit.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'call')
 built-ins/Promise/allSettledKeyed/resolve-not-callable-reject-with-typeerror.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected a TypeError to be thrown asynchronously but the function t)
 built-ins/Promise/allSettledKeyed/resolved-all-fulfilled.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
 built-ins/Promise/allSettledKeyed/resolved-all-mixed.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
@@ -3628,7 +3460,7 @@ built-ins/Promise/resolve/resolve-poisoned-then.js  # [sloppy] async did not com
 built-ins/Promise/resolve/resolve-self.js  # [sloppy] async did not complete (output: )
 built-ins/Promise/try/args.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: is not a function )
 built-ins/Promise/try/ctx-ctor-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Promise/try/ctx-ctor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/Promise/try/ctx-ctor.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'call')
 built-ins/Promise/try/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/Promise/try/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/Promise/try/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5249,7 +5081,7 @@ built-ins/WeakRef/prototype-from-newtarget-abrupt.js  # [sloppy] expected pass, 
 built-ins/WeakRef/prototype-from-newtarget-custom.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakRef/prototype-from-newtarget.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakRef/prototype/Symbol.toStringTag.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/WeakRef/prototype/constructor.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/WeakRef/prototype/constructor.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'hasOwnProperty')
 built-ins/WeakRef/prototype/deref/custom-this.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/WeakRef/prototype/deref/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/WeakRef/prototype/deref/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
@@ -5323,14 +5155,12 @@ built-ins/parseInt/S15.1.2.2_A3.1_T6.js  # [sloppy] expected pass, Runtime [obje
 built-ins/parseInt/S15.1.2.2_A3.1_T7.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/parseInt/S15.1.2.2_A3.2_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/undefined/15.1.1.3-2.js  # [strict] expected pass, Runtime [object Object]: 
-built-ins/undefined/S15.1.1.3_A3_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 harness/assert-throws-same-realm.js  # [sloppy] expected pass, Runtime TypeError: $262.createRealm is not supported
 harness/asyncHelpers-asyncTest-returns-undefined.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: asyncTest called with non-function argument Test262:AsyncTestFailur)
 harness/asyncHelpers-asyncTest-then-rejects.js  # [sloppy] async did not complete (output: Test262:AsyncTestComplete Test262:AsyncTestFailure:Test262Error: [object Object] Test262:AsyncTestFailure:Test262Error: )
 harness/asyncHelpers-asyncTest-then-resolves.js  # [sloppy] async did not complete (output: Test262:AsyncTestComplete Test262:AsyncTestFailure:Test262Error: Test262Error: asyncTest called $DONE with undefined Exp)
 harness/asyncHelpers-throwsAsync-same-realm.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: $262.createRealm is not supported )
 harness/deepEqual-mapset.js  # [sloppy] expected pass, Runtime [object Object]: 
-harness/deepEqual-primitives-bigint.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 harness/isConstructor.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/Array/prototype/toLocaleString/calls-toLocaleString-number-elements.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/Array/prototype/toLocaleString/invoke-element-tolocalestring.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -6179,7 +6009,7 @@ intl402/NumberFormat/throws-for-maximumFractionDigits-over-limit.js  # [sloppy] 
 intl402/NumberFormat/throws-for-maximumFractionDigits-under-limit.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/throws-for-minimumFractionDigits-over-limit.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/NumberFormat/throws-for-minimumFractionDigits-under-limit.js  # [sloppy] expected pass, Runtime [object Object]: 
-intl402/PluralRules/can-be-subclassed.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+intl402/PluralRules/can-be-subclassed.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'bind')
 intl402/PluralRules/compactDisplay-undefined-unless-notation-compact.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 intl402/PluralRules/constructor-option-read-order.js  # [sloppy] expected pass, Runtime [object Object]: 
 intl402/PluralRules/constructor-options-throwing-getters.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -6514,8 +6344,6 @@ language/computed-property-names/class/static/method-symbol-order.js  # [sloppy]
 language/computed-property-names/class/static/setter-prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/computed-property-names/to-name-side-effects/class.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/computed-property-names/to-name-side-effects/numbers-class.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/computed-property-names/to-name-side-effects/numbers-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/computed-property-names/to-name-side-effects/object.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/destructuring/binding/keyed-destructuring-property-reference-target-evaluation-order-with-bindings.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/destructuring/binding/typedarray-backed-by-resizable-buffer.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/directive-prologue/10.1.1-1-s.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: unexpected token Keyword(Public) (at 6508..6514)
@@ -6714,8 +6542,7 @@ language/eval-code/indirect/var-env-global-lex-non-strict.js  # [sloppy] expecte
 language/eval-code/indirect/var-env-var-init-global-exstng.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/addition/S11.6.1_A2.2_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/addition/S11.6.1_A2.2_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/addition/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/addition/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
+language/expressions/addition/bigint-toprimitive.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/addition/coerce-symbol-to-prim-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/addition/get-symbol-to-prim-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/array/spread-err-sngl-err-itr-get-value.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -6742,10 +6569,8 @@ language/expressions/arrow-function/dstr/dflt-ary-ptrn-empty.js  # [sloppy] expe
 language/expressions/arrow-function/dstr/dflt-ary-ptrn-rest-id-elision-next-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/arrow-function/dstr/dflt-ary-ptrn-rest-id-iter-step-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/arrow-function/eval-var-scope-syntax-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/arrow-function/lexical-new.target-closure-returned.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/arrow-function/lexical-super-call-from-within-constructor.js  # [sloppy] expected pass, Runtime Error: Unsupported("super outside a derived constructor")
 language/expressions/arrow-function/lexical-super-property-from-within-constructor.js  # [sloppy] expected pass, Runtime Error: Unsupported("super outside a method")
-language/expressions/arrow-function/lexical-this.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/arrow-function/name.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/arrow-function/param-dflt-yield-expr.js  # [sloppy] negative: failed at Runtime, expected phase parse
 language/expressions/arrow-function/scope-body-lex-distinct.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -6759,36 +6584,25 @@ language/expressions/assignment/S11.13.1_A5_T3.js  # [sloppy] expected pass, Run
 language/expressions/assignment/S11.13.1_A6_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/S11.13.1_A6_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/S11.13.1_A6_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/assignment/destructuring/default-expr-throws-iterator-return-get-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/destructuring/iterator-destructuring-property-reference-target-evaluation-order.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/destructuring/keyed-destructuring-property-reference-target-evaluation-order-with-bindings.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/destructuring/keyed-destructuring-property-reference-target-evaluation-order.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/assignment/destructuring/target-assign-throws-iterator-return-get-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-init-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/assignment/dstr/array-elem-iter-nrml-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-iter-rtrn-close-err.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/assignment/dstr/array-elem-iter-rtrn-close-null.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
 language/expressions/assignment/dstr/array-elem-iter-rtrn-close.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
-language/expressions/assignment/dstr/array-elem-iter-thrw-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/assignment/dstr/array-elem-iter-thrw-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-nested-array-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-nested-obj-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-put-let.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-target-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/assignment/dstr/array-elem-trlg-iter-elision-iter-nrml-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/assignment/dstr/array-elem-trlg-iter-list-nrml-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/assignment/dstr/array-elem-trlg-iter-list-rtrn-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/expressions/assignment/dstr/array-elem-trlg-iter-list-rtrn-close-err.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
 language/expressions/assignment/dstr/array-elem-trlg-iter-list-rtrn-close-null.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
 language/expressions/assignment/dstr/array-elem-trlg-iter-list-rtrn-close.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
-language/expressions/assignment/dstr/array-elem-trlg-iter-list-thrw-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/assignment/dstr/array-elem-trlg-iter-list-thrw-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-trlg-iter-rest-rtrn-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-trlg-iter-rest-rtrn-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-trlg-iter-rest-rtrn-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-trlg-iter-rest-thrw-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-elem-trlg-iter-rest-thrw-close.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/assignment/dstr/array-elision-iter-nrml-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/assignment/dstr/array-empty-iter-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-iteration.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-rest-before-elision.js  # [sloppy] negative: failed at Runtime, expected phase parse
 language/expressions/assignment/dstr/array-rest-elision-invalid.js  # [sloppy] negative: failed at Runtime, expected phase parse
@@ -7290,31 +7104,19 @@ language/expressions/await/await-monkey-patched-promise.js  # [sloppy] async did
 language/expressions/await/await-non-promise-thenable.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [Await: [object Object], Await: [object Object], Promise: 1])
 language/expressions/await/await-non-promise.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [Await: 1, Promise: 1] and expected [Await: 1, Promise: 1, P)
 language/expressions/await/for-await-of-interleaved.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [Await: 3, Await: 2, Await: 1, Promise: 6, Promise: 5, Promi)
-language/expressions/bitwise-and/bigint-non-primitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/bitwise-and/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/bitwise-and/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 language/expressions/bitwise-and/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/bitwise-not/bigint-non-primitive.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/bitwise-or/bigint-non-primitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/bitwise-or/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/bitwise-or/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 language/expressions/bitwise-or/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/bitwise-xor/bigint-non-primitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/bitwise-xor/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/bitwise-xor/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 language/expressions/bitwise-xor/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/call/11.2.3-3_3.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/call/eval-strictness-inherit-strict.js  # [strict] expected pass, Runtime [object Object]: 
 language/expressions/call/spread-err-sngl-err-itr-get-value.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/call/spread-obj-spread-order.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/call/with-base-obj.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/accessor-name-inst-computed-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/accessor-name-inst/computed-err-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/accessor-name-inst/computed-err-to-prop-key.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/accessor-name-inst/computed-err-unresolvable.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/accessor-name-inst/literal-numeric-non-canonical.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/accessor-name-static-computed-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/class/accessor-name-static/computed-err-to-prop-key.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/accessor-name-static/literal-numeric-non-canonical.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/async-gen-method-static/dflt-params-arg-val-not-undefined.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/class/async-gen-method-static/dflt-params-arg-val-undefined.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -7471,19 +7273,19 @@ language/expressions/class/async-gen-method/yield-star-sync-next.js  # [sloppy] 
 language/expressions/class/async-gen-method/yield-star-sync-return.js  # crash or timeout (native abort / hang)
 language/expressions/class/async-gen-method/yield-star-sync-throw.js  # crash or timeout (native abort / hang)
 language/expressions/class/async-method-static/dflt-params-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/class/async-method-static/dflt-params-arg-val-not-undefined.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method-static/dflt-params-arg-val-undefined.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+language/expressions/class/async-method-static/dflt-params-arg-val-not-undefined.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method-static/dflt-params-arg-val-undefined.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
 language/expressions/class/async-method-static/dflt-params-ref-later.js  # [sloppy] expected pass, Runtime ReferenceError: y is not defined
-language/expressions/class/async-method-static/dflt-params-ref-prior.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method-static/dflt-params-ref-self.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method-static/dflt-params-trailing-comma.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method-static/forbidden-ext/b1/cls-expr-async-meth-static-forbidden-ext-direct-access-prop-arguments.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method-static/forbidden-ext/b1/cls-expr-async-meth-static-forbidden-ext-direct-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method-static/forbidden-ext/b2/cls-expr-async-meth-static-forbidden-ext-indirect-access-own-prop-caller-get.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method-static/forbidden-ext/b2/cls-expr-async-meth-static-forbidden-ext-indirect-access-own-prop-caller-value.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method-static/forbidden-ext/b2/cls-expr-async-meth-static-forbidden-ext-indirect-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method-static/params-trailing-comma-multiple.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method-static/params-trailing-comma-single.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+language/expressions/class/async-method-static/dflt-params-ref-prior.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method-static/dflt-params-ref-self.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method-static/dflt-params-trailing-comma.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method-static/forbidden-ext/b1/cls-expr-async-meth-static-forbidden-ext-direct-access-prop-arguments.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method-static/forbidden-ext/b1/cls-expr-async-meth-static-forbidden-ext-direct-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method-static/forbidden-ext/b2/cls-expr-async-meth-static-forbidden-ext-indirect-access-own-prop-caller-get.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method-static/forbidden-ext/b2/cls-expr-async-meth-static-forbidden-ext-indirect-access-own-prop-caller-value.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method-static/forbidden-ext/b2/cls-expr-async-meth-static-forbidden-ext-indirect-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method-static/params-trailing-comma-multiple.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method-static/params-trailing-comma-single.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
 language/expressions/class/async-method-static/returns-async-arrow-returns-arguments-from-parent-function.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/class/async-method-static/returns-async-arrow-returns-newtarget.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/class/async-method-static/returns-async-arrow.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -7491,19 +7293,19 @@ language/expressions/class/async-method-static/returns-async-function-returns-ar
 language/expressions/class/async-method-static/returns-async-function-returns-newtarget.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/class/async-method-static/returns-async-function.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/class/async-method/dflt-params-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/class/async-method/dflt-params-arg-val-not-undefined.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method/dflt-params-arg-val-undefined.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+language/expressions/class/async-method/dflt-params-arg-val-not-undefined.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method/dflt-params-arg-val-undefined.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
 language/expressions/class/async-method/dflt-params-ref-later.js  # [sloppy] expected pass, Runtime ReferenceError: y is not defined
-language/expressions/class/async-method/dflt-params-ref-prior.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method/dflt-params-ref-self.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method/dflt-params-trailing-comma.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method/forbidden-ext/b1/cls-expr-async-meth-forbidden-ext-direct-access-prop-arguments.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method/forbidden-ext/b1/cls-expr-async-meth-forbidden-ext-direct-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method/forbidden-ext/b2/cls-expr-async-meth-forbidden-ext-indirect-access-own-prop-caller-get.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method/forbidden-ext/b2/cls-expr-async-meth-forbidden-ext-indirect-access-own-prop-caller-value.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method/forbidden-ext/b2/cls-expr-async-meth-forbidden-ext-indirect-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method/params-trailing-comma-multiple.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/expressions/class/async-method/params-trailing-comma-single.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+language/expressions/class/async-method/dflt-params-ref-prior.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method/dflt-params-ref-self.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method/dflt-params-trailing-comma.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method/forbidden-ext/b1/cls-expr-async-meth-forbidden-ext-direct-access-prop-arguments.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method/forbidden-ext/b1/cls-expr-async-meth-forbidden-ext-direct-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method/forbidden-ext/b2/cls-expr-async-meth-forbidden-ext-indirect-access-own-prop-caller-get.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method/forbidden-ext/b2/cls-expr-async-meth-forbidden-ext-indirect-access-own-prop-caller-value.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method/forbidden-ext/b2/cls-expr-async-meth-forbidden-ext-indirect-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method/params-trailing-comma-multiple.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/expressions/class/async-method/params-trailing-comma-single.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
 language/expressions/class/async-method/returns-async-arrow-returns-arguments-from-parent-function.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/class/async-method/returns-async-arrow-returns-newtarget.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/class/async-method/returns-async-arrow.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -8513,7 +8315,6 @@ language/expressions/class/elements/same-line-async-method-static-private-method
 language/expressions/class/elements/same-line-async-method-static-private-methods.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/class/elements/same-line-async-method-string-literal-names.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/class/elements/static-field-anonymous-function-name.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/class/elements/static-field-init-this-inside-arrow-function.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/elements/static-field-redeclaration.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/class/elements/static-private-getter-access-on-inner-class.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/elements/static-private-method-subclass-receiver.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -8600,26 +8401,6 @@ language/expressions/class/subclass-builtins/subclass-Uint8ClampedArray.js  # [s
 language/expressions/class/subclass-builtins/subclass-WeakMap.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/subclass-builtins/subclass-WeakRef.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/subclass-builtins/subclass-WeakSet.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/11.13.2-1-s.js  # [sloppy] expected pass, Runtime Error: NotDefined("_11_13_2_1")
-language/expressions/compound-assignment/11.13.2-10-s.js  # [sloppy] expected pass, Runtime Error: NotDefined("_11_13_2_10")
-language/expressions/compound-assignment/11.13.2-11-s.js  # [sloppy] expected pass, Runtime Error: NotDefined("_11_13_2_11")
-language/expressions/compound-assignment/11.13.2-2-s.js  # [sloppy] expected pass, Runtime Error: NotDefined("_11_13_2_2")
-language/expressions/compound-assignment/11.13.2-4-s.js  # [sloppy] expected pass, Runtime Error: NotDefined("_11_13_2_4")
-language/expressions/compound-assignment/11.13.2-5-s.js  # [sloppy] expected pass, Runtime Error: NotDefined("_11_13_2_5")
-language/expressions/compound-assignment/11.13.2-6-s.js  # [sloppy] expected pass, Runtime Error: NotDefined("_11_13_2_6")
-language/expressions/compound-assignment/11.13.2-8-s.js  # [sloppy] expected pass, Runtime Error: NotDefined("_11_13_2_8")
-language/expressions/compound-assignment/11.13.2-9-s.js  # [sloppy] expected pass, Runtime Error: NotDefined("_11_13_2_9")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.1.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.10.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.11.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.2.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.3.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.4.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.5.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.6.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.7.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.8.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/S11.13.2_A2.1_T3.9.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/S11.13.2_A6.10_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A6.11_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A6.1_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -8631,60 +8412,27 @@ language/expressions/compound-assignment/S11.13.2_A6.6_T1.js  # [sloppy] expecte
 language/expressions/compound-assignment/S11.13.2_A6.7_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A6.8_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A6.9_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.10_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.10_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.10_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.11_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.11_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.11_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.1_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.1_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.1_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.2_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.2_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.2_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.3_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.3_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.3_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.4_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.4_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.4_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.5_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.5_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.5_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.6_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.6_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.6_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.7_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.7_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.7_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.8_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.8_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.8_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.9_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/S11.13.2_A7.9_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/S11.13.2_A7.9_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--1.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--10.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--11.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--12.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--13.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--14.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--15.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--16.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--17.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--18.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--19.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--20.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--21.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--3.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--4.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--5.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--6.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--7.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--8.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v--9.js  # [sloppy] expected pass, Runtime Error: NotDefined("x")
 language/expressions/compound-assignment/compound-assignment-operator-calls-putvalue-lref--v-.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/left-hand-side-private-reference-method-add.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/left-hand-side-private-reference-method-bitand.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -8698,8 +8446,6 @@ language/expressions/compound-assignment/left-hand-side-private-reference-method
 language/expressions/compound-assignment/left-hand-side-private-reference-method-rshift.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/left-hand-side-private-reference-method-srshift.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/compound-assignment/left-hand-side-private-reference-method-sub.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/delete/11.4.1-2-2.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/delete/11.4.1-4.a-4.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/delete/11.4.1-4.a-6.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/delete/11.4.1-4.a-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/delete/S11.4.1_A3.1.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -8712,8 +8458,6 @@ language/expressions/delete/member-identifier-reference-null.js  # [sloppy] expe
 language/expressions/delete/member-identifier-reference-undefined.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/delete/super-property.js  # [sloppy] expected pass, Runtime TypeError: Class extends value is not a constructor or null
 language/expressions/division/bigint-complex-infinity.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/division/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/division/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 language/expressions/division/no-magic-asi-from-block-eval.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: unterminated regular expression literal (at 11..13)
 language/expressions/division/no-magic-asi.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: unterminated regular expression literal (line terminator) (at 6627..6630)
 language/expressions/division/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -9181,8 +8925,6 @@ language/expressions/equals/bigint-and-string.js  # [sloppy] expected pass, Runt
 language/expressions/equals/coerce-symbol-to-prim-return-prim.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/equals/get-symbol-to-prim-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/exponentiation/bigint-negative-exponent-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/exponentiation/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/exponentiation/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 language/expressions/exponentiation/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/function/dflt-params-ref-self.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/function/dstr/ary-init-iter-get-err-array-prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -9286,9 +9028,6 @@ language/expressions/instanceof/primitive-prototype-with-primitive.js  # [sloppy
 language/expressions/instanceof/prototype-getter-with-object-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/instanceof/prototype-getter-with-object.js  # [sloppy] expected pass, Runtime TypeError: Right-hand side of 'instanceof' is not callable
 language/expressions/instanceof/prototype-getter-with-primitive.js  # [sloppy] expected pass, Runtime TypeError: Right-hand side of 'instanceof' is not callable
-language/expressions/left-shift/bigint-non-primitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/left-shift/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/left-shift/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 language/expressions/left-shift/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/less-than-or-equal/S11.8.3_A4.12_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/less-than-or-equal/bigint-and-incomparable-string.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -9313,19 +9052,12 @@ language/expressions/logical-assignment/lgcl-or-assignment-operator-namedevaluat
 language/expressions/logical-assignment/lgcl-or-assignment-operator-namedevaluation-class-expression.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/logical-assignment/lgcl-or-assignment-operator-namedevaluation-function.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/modulus/bigint-modulo-zero.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/modulus/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/modulus/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 language/expressions/modulus/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/multiplication/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/multiplication/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 language/expressions/multiplication/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/new.target/value-via-super-property.js  # [sloppy] expected pass, Runtime Error: Unsupported("super outside a method")
 language/expressions/new/spread-err-sngl-err-itr-get-value.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/new/spread-obj-spread-order.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/object/__proto__-value-non-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/object/accessor-name-computed-err-to-prop-key.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/object/accessor-name-computed-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/object/computed-property-name-topropertykey-before-value-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/object/cpn-obj-lit-computed-property-name-from-generator-function-declaration.js  # [sloppy] expected pass, Runtime TypeError: Cannot convert object to primitive value
 language/expressions/object/dstr/async-gen-meth-ary-init-iter-close.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/object/dstr/async-gen-meth-ary-init-iter-get-err-array-prototype.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -9675,20 +9407,13 @@ language/expressions/prefix-increment/S11.4.4_A6_T1.js  # [sloppy] expected pass
 language/expressions/prefix-increment/S11.4.4_A6_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/prefix-increment/S11.4.4_A6_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/prefix-increment/operator-prefix-increment-x-calls-putvalue-lhs-newvalue--1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/property-accessors/S11.2.1_A3_T1.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-language/expressions/property-accessors/S11.2.1_A3_T2.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/property-accessors/S11.2.1_A4_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/property-accessors/S11.2.1_A4_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/property-accessors/S11.2.1_A4_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/property-accessors/S11.2.1_A4_T5.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/right-shift/bigint-non-primitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/right-shift/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/right-shift/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 language/expressions/right-shift/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/strict-does-not-equals/bigint-and-object.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/strict-equals/bigint-and-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/subtraction/bigint-toprimitive.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
-language/expressions/subtraction/bigint-wrapped-values.js  # [sloppy] expected pass, Runtime TypeError: Cannot mix BigInt and other types
 language/expressions/subtraction/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/call-arg-evaluation-err.js  # [sloppy] expected pass, Runtime TypeError: Class extends value is not a constructor or null
 language/expressions/super/call-bind-this-value-twice.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -9707,7 +9432,6 @@ language/expressions/super/prop-dot-cls-val-from-eval.js  # [sloppy] expected pa
 language/expressions/super/prop-dot-cls-val.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/prop-dot-obj-null-proto.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/prop-dot-obj-ref-strict.js  # [strict] expected pass, Runtime [object Object]: 
-language/expressions/super/prop-dot-obj-ref-this.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/prop-expr-cls-key-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/prop-expr-cls-null-proto.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/prop-expr-cls-ref-strict.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -9722,13 +9446,11 @@ language/expressions/super/prop-expr-getsuperbase-before-topropertykey-putvalue.
 language/expressions/super/prop-expr-obj-key-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/prop-expr-obj-null-proto.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/prop-expr-obj-ref-strict.js  # [strict] expected pass, Runtime [object Object]: 
-language/expressions/super/prop-expr-obj-ref-this.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/prop-expr-uninitialized-this-getvalue.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/prop-expr-uninitialized-this-putvalue-compound-assign.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/super/prop-expr-uninitialized-this-putvalue-increment.js  # [sloppy] expected pass, Runtime Error: Unsupported("expression")
 language/expressions/super/prop-expr-uninitialized-this-putvalue.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/tagged-template/cache-eval-inner-function.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/tagged-template/call-expression-context-strict.js  # [strict] expected pass, Runtime [object Object]: 
 language/expressions/tagged-template/constructor-invocation.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/tagged-template/invalid-escape-sequences.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/tagged-template/template-object.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -9742,8 +9464,6 @@ language/expressions/typeof/symbol.js  # [sloppy] expected pass, Runtime [object
 language/expressions/unary-minus/bigint-non-primitive.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/unary-plus/S11.4.6_A3_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/unary-plus/bigint-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/unsigned-right-shift/bigint-non-primitive.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/unsigned-right-shift/bigint-toprimitive.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/unsigned-right-shift/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/yield/formal-parameters-after-reassignment-non-strict.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/yield/in-rltn-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -10328,7 +10048,6 @@ language/statements/class/accessor-name-inst/computed-err-to-prop-key.js  # [slo
 language/statements/class/accessor-name-inst/computed-err-unresolvable.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/accessor-name-inst/literal-numeric-non-canonical.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/accessor-name-static-computed-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/class/accessor-name-static/computed-err-to-prop-key.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/accessor-name-static/literal-numeric-non-canonical.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/async-gen-method-static/dflt-params-arg-val-not-undefined.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/class/async-gen-method-static/dflt-params-arg-val-undefined.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -10485,19 +10204,19 @@ language/statements/class/async-gen-method/yield-star-sync-next.js  # [sloppy] e
 language/statements/class/async-gen-method/yield-star-sync-return.js  # crash or timeout (native abort / hang)
 language/statements/class/async-gen-method/yield-star-sync-throw.js  # crash or timeout (native abort / hang)
 language/statements/class/async-method-static/dflt-params-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/class/async-method-static/dflt-params-arg-val-not-undefined.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method-static/dflt-params-arg-val-undefined.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+language/statements/class/async-method-static/dflt-params-arg-val-not-undefined.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method-static/dflt-params-arg-val-undefined.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
 language/statements/class/async-method-static/dflt-params-ref-later.js  # [sloppy] expected pass, Runtime ReferenceError: y is not defined
-language/statements/class/async-method-static/dflt-params-ref-prior.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method-static/dflt-params-ref-self.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method-static/dflt-params-trailing-comma.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method-static/forbidden-ext/b1/cls-decl-async-meth-static-forbidden-ext-direct-access-prop-arguments.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method-static/forbidden-ext/b1/cls-decl-async-meth-static-forbidden-ext-direct-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method-static/forbidden-ext/b2/cls-decl-async-meth-static-forbidden-ext-indirect-access-own-prop-caller-get.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method-static/forbidden-ext/b2/cls-decl-async-meth-static-forbidden-ext-indirect-access-own-prop-caller-value.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method-static/forbidden-ext/b2/cls-decl-async-meth-static-forbidden-ext-indirect-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method-static/params-trailing-comma-multiple.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method-static/params-trailing-comma-single.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+language/statements/class/async-method-static/dflt-params-ref-prior.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method-static/dflt-params-ref-self.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method-static/dflt-params-trailing-comma.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method-static/forbidden-ext/b1/cls-decl-async-meth-static-forbidden-ext-direct-access-prop-arguments.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method-static/forbidden-ext/b1/cls-decl-async-meth-static-forbidden-ext-direct-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method-static/forbidden-ext/b2/cls-decl-async-meth-static-forbidden-ext-indirect-access-own-prop-caller-get.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method-static/forbidden-ext/b2/cls-decl-async-meth-static-forbidden-ext-indirect-access-own-prop-caller-value.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method-static/forbidden-ext/b2/cls-decl-async-meth-static-forbidden-ext-indirect-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method-static/params-trailing-comma-multiple.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method-static/params-trailing-comma-single.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
 language/statements/class/async-method-static/returns-async-arrow-returns-arguments-from-parent-function.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/class/async-method-static/returns-async-arrow-returns-newtarget.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/class/async-method-static/returns-async-arrow.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -10505,19 +10224,19 @@ language/statements/class/async-method-static/returns-async-function-returns-arg
 language/statements/class/async-method-static/returns-async-function-returns-newtarget.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/class/async-method-static/returns-async-function.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/class/async-method/dflt-params-abrupt.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/class/async-method/dflt-params-arg-val-not-undefined.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method/dflt-params-arg-val-undefined.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+language/statements/class/async-method/dflt-params-arg-val-not-undefined.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method/dflt-params-arg-val-undefined.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
 language/statements/class/async-method/dflt-params-ref-later.js  # [sloppy] expected pass, Runtime ReferenceError: y is not defined
-language/statements/class/async-method/dflt-params-ref-prior.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method/dflt-params-ref-self.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method/dflt-params-trailing-comma.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method/forbidden-ext/b1/cls-decl-async-meth-forbidden-ext-direct-access-prop-arguments.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method/forbidden-ext/b1/cls-decl-async-meth-forbidden-ext-direct-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method/forbidden-ext/b2/cls-decl-async-meth-forbidden-ext-indirect-access-own-prop-caller-get.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method/forbidden-ext/b2/cls-decl-async-meth-forbidden-ext-indirect-access-own-prop-caller-value.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method/forbidden-ext/b2/cls-decl-async-meth-forbidden-ext-indirect-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method/params-trailing-comma-multiple.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/async-method/params-trailing-comma-single.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+language/statements/class/async-method/dflt-params-ref-prior.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method/dflt-params-ref-self.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method/dflt-params-trailing-comma.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method/forbidden-ext/b1/cls-decl-async-meth-forbidden-ext-direct-access-prop-arguments.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method/forbidden-ext/b1/cls-decl-async-meth-forbidden-ext-direct-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method/forbidden-ext/b2/cls-decl-async-meth-forbidden-ext-indirect-access-own-prop-caller-get.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method/forbidden-ext/b2/cls-decl-async-meth-forbidden-ext-indirect-access-own-prop-caller-value.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method/forbidden-ext/b2/cls-decl-async-meth-forbidden-ext-indirect-access-prop-caller.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method/params-trailing-comma-multiple.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/async-method/params-trailing-comma-single.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
 language/statements/class/async-method/returns-async-arrow-returns-arguments-from-parent-function.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/class/async-method/returns-async-arrow-returns-newtarget.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/class/async-method/returns-async-arrow.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -10536,8 +10255,8 @@ language/statements/class/definition/fn-length-static-precedence-order.js  # [sl
 language/statements/class/definition/fn-name-static-precedence-order.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/definition/getters-non-configurable-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/definition/invalid-extends.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/class/definition/methods-async-super-call-body.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/class/definition/methods-async-super-call-param.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+language/statements/class/definition/methods-async-super-call-body.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
+language/statements/class/definition/methods-async-super-call-param.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'then')
 language/statements/class/definition/methods-restricted-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/definition/prototype-getter.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/definition/prototype-property.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
@@ -11596,7 +11315,6 @@ language/statements/class/elements/set-access-of-missing-shadowed-private-setter
 language/statements/class/elements/set-access-of-private-method.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/elements/set-access-of-shadowed-private-method.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/elements/static-field-anonymous-function-name.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/class/elements/static-field-init-this-inside-arrow-function.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/elements/static-field-redeclaration.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/class/elements/static-private-getter-access-on-inner-class.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/elements/static-private-method-subclass-receiver.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -11758,7 +11476,6 @@ language/statements/do-while/cptn-normal.js  # [sloppy] expected pass, Runtime [
 language/statements/empty/cptn-value.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-await-of/async-from-sync-iterator-continuation-abrupt-completion-get-constructor.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [start, never reached, tick 1, tick 2] and expected [start, )
 language/statements/for-await-of/async-func-decl-dstr-array-elem-init-in.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected Comma, found Keyword(In) (at 7968..7970)
-language/statements/for-await-of/async-func-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-null.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Promise incorrectly fulfilled. Test262:AsyncTestComplete )
 language/statements/for-await-of/async-func-decl-dstr-obj-id-init-in.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected Comma, found Keyword(In) (at 7971..7973)
 language/statements/for-await-of/async-func-decl-dstr-obj-prop-elem-init-in.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected Comma, found Keyword(In) (at 7980..7982)
 language/statements/for-await-of/async-func-decl-dstr-obj-rest-str-val.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected SameValue(«undefined», «"f"») to be true Test262:AsyncTest)
@@ -11802,7 +11519,7 @@ language/statements/for-await-of/async-gen-decl-dstr-array-elem-init-simple-no-s
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-init-yield-expr.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-iter-get-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-iter-nrml-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-await-of/async-gen-decl-dstr-array-elem-iter-nrml-close-null.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+language/statements/for-await-of/async-gen-decl-dstr-array-elem-iter-nrml-close-null.js  # [sloppy] expected pass, Runtime TypeError: iterator return must return an object
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-iter-nrml-close-skip.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-iter-nrml-close.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-iter-rtrn-close-null.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
@@ -11827,7 +11544,7 @@ language/statements/for-await-of/async-gen-decl-dstr-array-elem-put-unresolvable
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-target-simple-no-strict.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-target-yield-expr.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-null.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-null.js  # [sloppy] expected pass, Runtime TypeError: iterator return must return an object
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-skip.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-list-nrml-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -12374,8 +12091,8 @@ language/statements/for-await-of/ticks-with-sync-iter-resolved-promise-and-const
 language/statements/for-in/12.6.4-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-in/S12.6.4_A3.1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-in/S12.6.4_A3.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-in/S12.6.4_A4.1.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/statements/for-in/S12.6.4_A4.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+language/statements/for-in/S12.6.4_A4.1.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'indexOf')
+language/statements/for-in/S12.6.4_A4.js  # [sloppy] expected pass, Runtime TypeError: Cannot read properties of undefined (reading 'indexOf')
 language/statements/for-in/S12.6.4_A7_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-in/cptn-decl-abrupt-empty.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-in/cptn-decl-itr.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -12413,30 +12130,21 @@ language/statements/for-of/cptn-expr-abrupt-empty.js  # [sloppy] expected pass, 
 language/statements/for-of/cptn-expr-itr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-init-in.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected Comma, found Keyword(In) (at 7214..7216)
 language/statements/for-of/dstr/array-elem-init-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-of/dstr/array-elem-iter-nrml-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-iter-rtrn-close-err.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-of/dstr/array-elem-iter-rtrn-close-null.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
 language/statements/for-of/dstr/array-elem-iter-rtrn-close.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
-language/statements/for-of/dstr/array-elem-iter-thrw-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-of/dstr/array-elem-iter-thrw-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-nested-array-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-nested-obj-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-put-let.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-target-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-of/dstr/array-elem-trlg-iter-elision-iter-nrml-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-of/dstr/array-elem-trlg-iter-list-nrml-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-of/dstr/array-elem-trlg-iter-list-rtrn-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/for-of/dstr/array-elem-trlg-iter-list-rtrn-close-err.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
 language/statements/for-of/dstr/array-elem-trlg-iter-list-rtrn-close-null.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
 language/statements/for-of/dstr/array-elem-trlg-iter-list-rtrn-close.js  # [sloppy] expected pass, Runtime TypeError: Cannot destructure 'null' or 'undefined' as an object
-language/statements/for-of/dstr/array-elem-trlg-iter-list-thrw-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-of/dstr/array-elem-trlg-iter-list-thrw-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-trlg-iter-rest-rtrn-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-trlg-iter-rest-rtrn-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-trlg-iter-rest-rtrn-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-trlg-iter-rest-thrw-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-elem-trlg-iter-rest-thrw-close.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-of/dstr/array-elision-iter-nrml-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-of/dstr/array-empty-iter-close-null.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-iteration.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-rest-before-elision.js  # [sloppy] negative: failed at Runtime, expected phase parse
 language/statements/for-of/dstr/array-rest-elision-invalid.js  # [sloppy] negative: failed at Runtime, expected phase parse
@@ -12499,8 +12207,6 @@ language/statements/for-of/head-using-bound-names-fordecl-tdz.js  # [sloppy] exp
 language/statements/for-of/int16array-mutate.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/int32array-mutate.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/int8array-mutate.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-of/iterator-close-non-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-of/iterator-close-non-throw-get-method-non-callable.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/iterator-next-reference.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/iterator-next-result-type.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/map-contract.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -12776,9 +12482,9 @@ language/statements/while/cptn-iter.js  # [sloppy] expected pass, Runtime [objec
 language/statements/with/12.10-0-3.js  # [sloppy] expected pass, Runtime ReferenceError: prop is not defined
 language/statements/with/12.10-0-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/12.10.1-10-s.js  # [strict] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.10_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.10_T1.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A1.10_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.10_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.10_T4.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A1.11_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A1.11_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A1.11_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -12787,33 +12493,33 @@ language/statements/with/S12.10_A1.11_T5.js  # [sloppy] expected pass, Runtime [
 language/statements/with/S12.10_A1.12_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A1.12_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A1.12_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.1_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.1_T1.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A1.1_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.2_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.2_T1.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A1.2_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A1.2_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.3_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.3_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.3_T1.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
+language/statements/with/S12.10_A1.3_T2.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A1.3_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.4_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.4_T1.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A1.4_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.4_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.5_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.4_T4.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
+language/statements/with/S12.10_A1.5_T1.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A1.5_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.5_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.6_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.5_T4.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
+language/statements/with/S12.10_A1.6_T1.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A1.6_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.7_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.7_T1.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A1.7_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A1.7_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A1.7_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A1.7_T5.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.8_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.8_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.8_T1.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
+language/statements/with/S12.10_A1.8_T2.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A1.8_T4.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A1.8_T5.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.9_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/S12.10_A1.9_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/with/S12.10_A1.9_T1.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
+language/statements/with/S12.10_A1.9_T2.js  # [sloppy] expected pass, Runtime ReferenceError: p3 is not defined
 language/statements/with/S12.10_A3.11_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A3.11_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/S12.10_A3.11_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -12842,7 +12548,7 @@ language/statements/with/has-property-err.js  # [sloppy] expected pass, Runtime 
 language/statements/with/scope-var-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/scope-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/set-mutable-binding-binding-deleted-in-get-unscopables-strict-mode.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/with/set-mutable-binding-idref-compound-assign-with-proxy-env.js  # [sloppy] expected pass, Runtime Error: NotDefined("p")
+language/statements/with/set-mutable-binding-idref-compound-assign-with-proxy-env.js  # [sloppy] expected pass, Runtime ReferenceError: p is not defined
 language/statements/with/set-mutable-binding-idref-with-proxy-env.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/unscopables-get-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/with/unscopables-inc-dec.js  # [sloppy] expected pass, Runtime [object Object]: 
