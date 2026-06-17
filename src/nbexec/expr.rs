@@ -1999,10 +1999,16 @@ impl<'a> Interp<'a> {
             let key = self.eval(key_expr)?;
             let Some(raw) = obj.as_handle() else {
                 // `null`/`undefined` (or a number/boolean) base: a number/boolean
-                // is a primitive whose write is silently ignored in sloppy mode;
-                // `null`/`undefined` throws a TypeError after the RHS is evaluated.
+                // is a primitive whose write is silently ignored in sloppy mode.
+                // For a *compound* op the LHS `GetValue` (RequireObjectCoercible)
+                // runs before the RHS, so a `null`/`undefined` base throws *before*
+                // the RHS is evaluated; a plain `=` defers the throw past the RHS.
+                let is_nullish = matches!(obj.unpack(), Unpacked::Null | Unpacked::Undefined);
+                if op != AssignOp::Assign && is_nullish {
+                    return Err(self.type_error("Cannot read property of null or undefined"));
+                }
                 let rhs = self.eval(value)?;
-                if matches!(obj.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                if is_nullish {
                     return Err(self.type_error("Cannot set property of null or undefined"));
                 }
                 return Ok(rhs);
@@ -2044,6 +2050,42 @@ impl<'a> Interp<'a> {
                 (name, self.binary(compound_op(op)?, current, rhs)?)
             };
             self.assign_super_member(&name, new)?;
+            return Ok(new);
+        }
+        // A *compound* assignment to a static (non-computed, non-super) member
+        // target follows spec reference order: evaluate the base (`lref`), read the
+        // current value (`lval = GetValue(lref)`), *then* evaluate the RHS, apply the
+        // op, and write back. So `obj.x op= rhs()` reads `obj.x` before running
+        // `rhs()`, and a nullish base throws *before* the RHS is evaluated.
+        // (Computed-key targets are handled by the branch above.)
+        if op != AssignOp::Assign
+            && let Expr::Member {
+                object, property, ..
+            } = target
+            && !matches!(&**object, Expr::Super(_))
+            && !matches!(property, PropertyKey::Computed(_))
+        {
+            let obj = self.eval(object)?;
+            let Some(raw) = obj.as_handle() else {
+                if matches!(obj.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                    return Err(self.type_error("Cannot read property of null or undefined"));
+                }
+                // A primitive base: read the (boxed) current value, evaluate the RHS
+                // for side effects, then ignore the write (sloppy mode).
+                let key = static_key(property)?;
+                let boxed = self.coerce_to_object(obj);
+                let current = match boxed.as_handle() {
+                    Some(br) => self.read_member(crate::heap::Handle::from_raw(br), &key)?,
+                    None => NanBox::undefined(),
+                };
+                let rhs = self.eval(value)?;
+                return self.binary(compound_op(op)?, current, rhs);
+            };
+            let handle = crate::heap::Handle::from_raw(raw);
+            let current = self.member(handle, property)?;
+            let rhs = self.eval(value)?;
+            let new = self.binary(compound_op(op)?, current, rhs)?;
+            self.assign_member(handle, property, new)?;
             return Ok(new);
         }
         // For `name = class {}`, hand the LHS name to `make_class` so an anonymous
