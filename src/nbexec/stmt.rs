@@ -1,5 +1,15 @@
 use super::*;
 
+/// A pre-evaluated assignment reference for a simple destructuring leaf: its
+/// object/key (for a member), super-property name, or the identifier target
+/// expression. Lets the target be resolved *before* the iterator step, then
+/// assigned once the element value is known (spec evaluation order).
+enum AssignRef {
+    Ident(String),
+    Member { obj: NanBox, key: String },
+    Super { name: String },
+}
+
 impl<'a> Interp<'a> {
     pub(crate) fn run_body(&mut self, body: Body<'a>) -> Result<NanBox, ExecError> {
         match body {
@@ -672,6 +682,76 @@ impl<'a> Interp<'a> {
         Ok(Some(self.read_member(rh, "value")?))
     }
 
+    /// Interleaved array destructuring-assignment over a *user* iterator `ih`
+    /// (no rest element). For each element, a simple leaf target's reference is
+    /// evaluated *before* the iterator step (spec order), then the step runs, then
+    /// the value is assigned. `IteratorClose` is performed once on a normal finish
+    /// (a non-Object/uncallable `return` throws), suppressed on an abrupt finish,
+    /// and skipped entirely when the iterator is already done.
+    fn assign_destructure_array_iter(
+        &mut self,
+        elements: &'a [ArrayElement],
+        ih: Handle,
+    ) -> Result<(), ExecError> {
+        let iterator = NanBox::handle(ih.to_raw());
+        // `exhausted` mirrors `iteratorRecord.[[done]]`: once the iterator finishes
+        // or a step completes abruptly it is done and must not be closed. Only an
+        // error from a *target* (reference eval or assignment) with the iterator not
+        // yet done triggers `IteratorClose`.
+        let mut exhausted = false;
+        let result: Result<(), ExecError> = 'pat: {
+            for el in elements {
+                // For a simple leaf target (`a`, `obj[k]`) the reference is evaluated
+                // before the step, so its side effects run first.
+                let target = match el {
+                    ArrayElement::Item(e) if Self::is_simple_assign_target(e) => {
+                        match self.eval_assign_ref(e) {
+                            Ok(r) => Some(r),
+                            Err(e) => break 'pat Err(e),
+                        }
+                    }
+                    _ => None,
+                };
+                let v = if exhausted {
+                    NanBox::undefined()
+                } else {
+                    let step = self.dstr_iter_step(ih, iterator);
+                    exhausted = !matches!(step, Ok(Some(_)));
+                    match step {
+                        Ok(opt) => opt.unwrap_or(NanBox::undefined()),
+                        Err(e) => break 'pat Err(e),
+                    }
+                };
+                let assigned = match el {
+                    ArrayElement::Hole => Ok(()),
+                    ArrayElement::Item(e) => match target {
+                        Some(r) => self.set_assign_ref(r, v),
+                        None => self.assign_destructure(e, v),
+                    },
+                    ArrayElement::Spread(_) => unreachable!("has_rest guard"),
+                };
+                if let Err(e) = assigned {
+                    break 'pat Err(e);
+                }
+            }
+            Ok(())
+        };
+        match result {
+            Ok(()) => {
+                if !exhausted {
+                    self.iterator_close(ih)?;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if !exhausted {
+                    let _ = self.iterator_close(ih);
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Destructures `value` into an assignment pattern of existing targets
     /// (`[a, b] = …`, `({ x: obj.p } = …)`), recursing into nested patterns.
     pub(crate) fn assign_destructure(
@@ -695,53 +775,7 @@ impl<'a> Interp<'a> {
                 {
                     // Real user iterator: interleave `next()`, target evaluation and
                     // assignment per spec, and run `IteratorClose` at the right moment.
-                    // On a normal finish we close (a non-Object/uncallable `return`
-                    // throws); on an error during assignment we close with the original
-                    // error preserved (close failures suppressed).
-                    let iterator = NanBox::handle(ih.to_raw());
-                    // `exhausted` mirrors the spec's `iteratorRecord.[[done]]`: once the
-                    // iterator finishes *or* a step (`next()`/result access) completes
-                    // abruptly, it is done and must not be closed. Only an error from a
-                    // *target assignment* (done still false) triggers `IteratorClose`.
-                    let mut exhausted = false;
-                    let result = (|| -> Result<(), ExecError> {
-                        for el in elements {
-                            // Pull the next value (unless the iterator already ended).
-                            // `IteratorStep` yields `None` at end-of-iteration; any abrupt
-                            // completion while stepping marks the iterator done — both keep
-                            // the error path below from running `IteratorClose`.
-                            let v = if exhausted {
-                                NanBox::undefined()
-                            } else {
-                                let step = self.dstr_iter_step(ih, iterator);
-                                exhausted = !matches!(step, Ok(Some(_)));
-                                match step? {
-                                    Some(v) => v,
-                                    None => NanBox::undefined(),
-                                }
-                            };
-                            match el {
-                                ArrayElement::Hole => {}
-                                ArrayElement::Item(e) => self.assign_destructure(e, v)?,
-                                ArrayElement::Spread(_) => unreachable!("has_rest guard"),
-                            }
-                        }
-                        Ok(())
-                    })();
-                    match result {
-                        Ok(()) => {
-                            if !exhausted {
-                                self.iterator_close(ih)?;
-                            }
-                            Ok(())
-                        }
-                        Err(e) => {
-                            if !exhausted {
-                                let _ = self.iterator_close(ih);
-                            }
-                            Err(e)
-                        }
-                    }
+                    self.assign_destructure_array_iter(elements, ih)
                 } else {
                     // Built-in iterables / generators / rest patterns: eager value list.
                     let items = self.iterate_values(value)?;
@@ -870,36 +904,87 @@ impl<'a> Interp<'a> {
         None
     }
 
-    pub(crate) fn assign_to(&mut self, target: &'a Expr, value: NanBox) -> Result<(), ExecError> {
+    /// Whether `target` is a *simple* assignment leaf (an identifier or member
+    /// reference) — as opposed to a nested destructuring pattern or a defaulted
+    /// element. For a simple leaf the DestructuringAssignmentTarget reference is
+    /// evaluated *before* the corresponding iterator step (spec ordering).
+    fn is_simple_assign_target(target: &Expr) -> bool {
+        matches!(target, Expr::Ident(_) | Expr::Member { .. })
+    }
+
+    /// Evaluates the *reference* of a simple assignment leaf (its object/key for a
+    /// member, or the name for an identifier) without yet producing a value, then
+    /// returns a closure-free handle to complete the assignment later via
+    /// [`set_assign_ref`](Self::set_assign_ref). Side effects in the object/key
+    /// expressions happen here, matching the spec's "evaluate target, then step".
+    fn eval_assign_ref(&mut self, target: &'a Expr) -> Result<AssignRef, ExecError> {
         match target {
-            Expr::Ident(id) => {
-                // A bare identifier inside `with (obj)` assigns to the with-object's
-                // property (via `[[Set]]`, so setters fire) when it provides the name.
-                if let Some(h) = self.with_binding(&id.name) {
-                    let key = self.new_str(&id.name);
-                    self.assign_member_value(h, key, value)?;
-                    return Ok(());
+            Expr::Member {
+                object, property, ..
+            } => {
+                if matches!(&**object, Expr::Super(_)) {
+                    let name = self.eval_prop_key(property)?;
+                    return Ok(AssignRef::Super { name });
                 }
-                // Reassigning a `const` binding is a TypeError.
-                if self.current.is_const(&id.name) {
-                    let m = self.new_str("Assignment to constant variable.");
-                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                }
-                if !self.current.set(&id.name, value) {
-                    // Strict mode forbids creating an implicit global.
-                    if self.strict {
-                        let m = self.new_str(&alloc::format!("{} is not defined", id.name));
-                        return Err(ExecError::Throw(
-                            self.make_error(N_REFERENCE_ERROR, Some(m)),
-                        ));
-                    }
-                    // Sloppy mode: assigning to an unresolvable reference creates a
-                    // property on the *global* object (not a binding in the current
-                    // scope), so it is visible after a block/loop scope is popped.
-                    self.declare_sloppy_global(&id.name, value);
+                let obj = self.eval(object)?;
+                let key = self.eval_prop_key(property)?;
+                Ok(AssignRef::Member { obj, key })
+            }
+            Expr::Ident(id) => Ok(AssignRef::Ident(String::from(&*id.name))),
+            _ => unreachable!("eval_assign_ref on a non-simple target"),
+        }
+    }
+
+    /// Completes a pre-evaluated assignment reference with `value`.
+    fn set_assign_ref(&mut self, r: AssignRef, value: NanBox) -> Result<(), ExecError> {
+        match r {
+            AssignRef::Ident(name) => self.assign_to_name(&name, value),
+            AssignRef::Super { name } => self.assign_super_member(&name, value),
+            AssignRef::Member { obj, key } => {
+                if let Some(raw) = obj.as_handle() {
+                    let k = self.new_str(&key);
+                    self.assign_member_value(Handle::from_raw(raw), k, value)?;
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Assigns `value` to the identifier reference `name`, applying `with`-object
+    /// shadowing, the `const` reassignment check, and the strict/sloppy rules for
+    /// an unresolvable reference. Shared by `assign_to` and `set_assign_ref`.
+    fn assign_to_name(&mut self, name: &str, value: NanBox) -> Result<(), ExecError> {
+        // A bare identifier inside `with (obj)` assigns to the with-object's
+        // property (via `[[Set]]`, so setters fire) when it provides the name.
+        if let Some(h) = self.with_binding(name) {
+            let key = self.new_str(name);
+            self.assign_member_value(h, key, value)?;
+            return Ok(());
+        }
+        // Reassigning a `const` binding is a TypeError.
+        if self.current.is_const(name) {
+            let m = self.new_str("Assignment to constant variable.");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        if !self.current.set(name, value) {
+            // Strict mode forbids creating an implicit global.
+            if self.strict {
+                let m = self.new_str(&alloc::format!("{name} is not defined"));
+                return Err(ExecError::Throw(
+                    self.make_error(N_REFERENCE_ERROR, Some(m)),
+                ));
+            }
+            // Sloppy mode: assigning to an unresolvable reference creates a property
+            // on the *global* object (not a binding in the current scope), so it is
+            // visible after a block/loop scope is popped.
+            self.declare_sloppy_global(name, value);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn assign_to(&mut self, target: &'a Expr, value: NanBox) -> Result<(), ExecError> {
+        match target {
+            Expr::Ident(id) => self.assign_to_name(&id.name, value),
             Expr::Member {
                 object, property, ..
             } => {
