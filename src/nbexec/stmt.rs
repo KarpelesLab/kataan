@@ -338,6 +338,14 @@ impl<'a> Interp<'a> {
             // `var` assigns to its hoisted binding (in the function/program
             // scope), so a declaration inside a block updates the same variable.
             if is_var && let BindingTarget::Ident(Ident { name, .. }) = &d.target {
+                // Inside `with (obj)`, a `var x = v` *initializer* is an ordinary
+                // assignment whose target resolves through the scope chain, so when
+                // the with-object provides `x` it writes that property (via `[[Set]]`),
+                // not the hoisted binding (`with ({foo:…}) { var foo = v }` sets `obj.foo`).
+                if self.with_binding(name).is_some() {
+                    self.assign_to_name(name, value)?;
+                    continue;
+                }
                 if !self.current.set(name, value) {
                     self.current.declare(name, value);
                 }
@@ -387,6 +395,11 @@ impl<'a> Interp<'a> {
             BindingTarget::Array(pat) => {
                 // Any iterable destructures (strings, Sets, generators, …); a
                 // non-iterable (null, a plain object, a number) is a TypeError.
+                // ArrayBindingPattern performs GetIterator: an array whose
+                // `Symbol.iterator` was deleted or made non-callable must throw,
+                // even though the fast path below would otherwise read its backing
+                // store directly (`delete Array.prototype[Symbol.iterator]`).
+                self.require_iterator_method(value)?;
                 let has_rest = pat
                     .elements
                     .iter()

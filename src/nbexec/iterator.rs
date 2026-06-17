@@ -1490,8 +1490,31 @@ impl<'a> Interp<'a> {
         out
     }
 
-    /// Runs `body` once per `item`, binding the loop variable (a fresh scope per
-    /// iteration for a declared head).
+    /// `GetIterator` step `GetMethod(obj, @@iterator)` for an *array* — the one
+    /// built-in iterable that exposes a real, deletable `Symbol.iterator` method
+    /// (the array-destructuring/spread fast path would otherwise iterate its
+    /// backing store directly). Throws a `TypeError` when that method has been
+    /// deleted or replaced by a non-callable (`delete Array.prototype[Symbol.iterator]`).
+    /// Strings, Maps, and Sets iterate via engine special-casing (no readable
+    /// `Symbol.iterator` property) and are left to the regular machinery.
+    pub(crate) fn require_iterator_method(&mut self, v: NanBox) -> Result<(), ExecError> {
+        let Some(h) = v.as_handle().map(Handle::from_raw) else {
+            return Ok(());
+        };
+        if self.realm.array_elements(h).is_none() {
+            return Ok(());
+        }
+        let callable = self
+            .find_iterator_fn(h)?
+            .and_then(|f| f.as_handle().map(Handle::from_raw))
+            .is_some_and(|r| self.is_callable(r));
+        if !callable {
+            let m = self.new_str("is not iterable");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        Ok(())
+    }
+
     /// Obtains a *user* iterable's iterator object (calling `[Symbol.iterator]`
     /// once), for the lazy `for-of` path. Returns `None` for built-in iterables
     /// (arrays/strings/Maps/Sets) and generator values, which `iterate_values`
