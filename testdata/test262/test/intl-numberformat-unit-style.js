@@ -25,5 +25,6 @@ assert.sameValue(nf({ style: "unit", unit: "meter" }, -3), "-3" + NBSP + "m", "n
 assert.sameValue(nf({ style: "unit", unit: "meter" }, 1234567), "1,234,567" + NBSP + "m", "grouped unit");
 assert.sameValue(nf({ style: "unit", unit: "liter", minimumFractionDigits: 2 }, 1.5), "1.50" + NBSP + "L", "fraction digits");
 
-// An unrecognized unit falls back to its own name.
-assert.sameValue(nf({ style: "unit", unit: "furlong" }, 2), "2" + NBSP + "furlong", "unknown unit");
+// A unit identifier outside the ECMA-402 sanctioned set is a RangeError
+// (IsWellFormedUnitIdentifier).
+assert.throws(RangeError, function () { nf({ style: "unit", unit: "furlong" }, 2); }, "unsanctioned unit");

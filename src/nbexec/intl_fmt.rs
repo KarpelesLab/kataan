@@ -22,18 +22,61 @@ fn is_well_formed_currency(code: &str) -> bool {
     code.len() == 3 && code.bytes().all(|b| b.is_ascii_alphabetic())
 }
 
-/// Whether `unit` is a well-formed `unitIdentifier`: a core unit (3-8 alnum, or
-/// any of CLDR's sanctioned simple units) optionally as a `X-per-Y` compound.
+/// The ECMA-402 sanctioned single-unit identifiers (Table: "Single units
+/// sanctioned for use in ECMAScript"). Shared by `Intl.supportedValuesOf("unit")`
+/// and `IsWellFormedUnitIdentifier`.
+pub(crate) const SANCTIONED_UNITS: &[&str] = &[
+    "acre",
+    "bit",
+    "byte",
+    "celsius",
+    "centimeter",
+    "day",
+    "degree",
+    "fahrenheit",
+    "fluid-ounce",
+    "foot",
+    "gallon",
+    "gigabit",
+    "gigabyte",
+    "gram",
+    "hectare",
+    "hour",
+    "inch",
+    "kilobit",
+    "kilobyte",
+    "kilogram",
+    "kilometer",
+    "liter",
+    "megabit",
+    "megabyte",
+    "meter",
+    "microsecond",
+    "mile",
+    "mile-scandinavian",
+    "milliliter",
+    "millimeter",
+    "millisecond",
+    "minute",
+    "month",
+    "nanosecond",
+    "ounce",
+    "percent",
+    "petabyte",
+    "pound",
+    "second",
+    "stone",
+    "terabit",
+    "terabyte",
+    "week",
+    "yard",
+    "year",
+];
+
+/// `IsWellFormedUnitIdentifier(unit)`: a sanctioned single unit, or a
+/// `<numerator>-per-<denominator>` compound of two sanctioned single units.
 fn is_well_formed_unit(unit: &str) -> bool {
-    let valid_single = |u: &str| {
-        // ECMA-402's `IsWellFormedUnitIdentifier` checks the unit is in the
-        // sanctioned list; we accept the CLDR core-unit shape (lowercase ASCII
-        // letters, possibly hyphenated) which covers all sanctioned units.
-        !u.is_empty()
-            && u.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
-            && !u.starts_with('-')
-            && !u.ends_with('-')
-    };
+    let valid_single = |u: &str| SANCTIONED_UNITS.contains(&u);
     match unit.split_once("-per-") {
         Some((a, b)) => valid_single(a) && valid_single(b),
         None => valid_single(unit),
@@ -434,7 +477,7 @@ impl<'a> Interp<'a> {
             let m = self.new_str(&alloc::format!("value out of range for option {prop}"));
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
-        Ok(Some(n.trunc()))
+        Ok(Some(trunc_toward_zero(n)))
     }
 
     /// Stores a resolved option on the formatter (under its own key) when present.
@@ -495,31 +538,30 @@ impl<'a> Interp<'a> {
             &["short", "narrow", "long"],
             Some("short"),
         )?;
-        if style == "currency" {
-            match &currency {
-                None => {
-                    let m = self.new_str("currency code is required with currency style");
-                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                }
-                Some(c) if !is_well_formed_currency(c) => {
-                    let m = self.new_str("invalid currency code");
-                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
-                }
-                _ => {}
+        // SetNumberFormatUnitOptions: a `currency` is required (TypeError) when
+        // style is "currency"; whenever present it must be well-formed (RangeError)
+        // regardless of style. Same shape for `unit`.
+        match &currency {
+            None if style == "currency" => {
+                let m = self.new_str("currency code is required with currency style");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
+            Some(c) if !is_well_formed_currency(c) => {
+                let m = self.new_str("invalid currency code");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            _ => {}
         }
-        if style == "unit" {
-            match &unit {
-                None => {
-                    let m = self.new_str("unit is required with unit style");
-                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                }
-                Some(u) if !is_well_formed_unit(u) => {
-                    let m = self.new_str("invalid unit");
-                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
-                }
-                _ => {}
+        match &unit {
+            None if style == "unit" => {
+                let m = self.new_str("unit is required with unit style");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
+            Some(u) if !is_well_formed_unit(u) => {
+                let m = self.new_str("invalid unit");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            _ => {}
         }
         let style_s = Some(style.clone());
         self.store_str(obj, "style", &style_s);
@@ -549,8 +591,8 @@ impl<'a> Interp<'a> {
         let mnid = self
             .get_int_option(opts, "minimumIntegerDigits", 1.0, 21.0, Some(1.0))?
             .unwrap();
-        let mnfd = self.get_int_option(opts, "minimumFractionDigits", 0.0, 20.0, None)?;
-        let mxfd = self.get_int_option(opts, "maximumFractionDigits", 0.0, 20.0, None)?;
+        let mnfd = self.get_int_option(opts, "minimumFractionDigits", 0.0, 100.0, None)?;
+        let mxfd = self.get_int_option(opts, "maximumFractionDigits", 0.0, 100.0, None)?;
         let mnsd = self.get_int_option(opts, "minimumSignificantDigits", 1.0, 21.0, None)?;
         let mxsd = self.get_int_option(opts, "maximumSignificantDigits", 1.0, 21.0, None)?;
         // Cross-validation: an explicit minimum may not exceed an explicit maximum.
@@ -625,7 +667,7 @@ impl<'a> Interp<'a> {
             Some(h) => self.read_member(h, "useGrouping")?,
             None => NanBox::undefined(),
         };
-        let use_grouping_val = self.normalize_use_grouping(ug_raw, &notation);
+        let use_grouping_val = self.normalize_use_grouping(ug_raw)?;
         let sign_display = self
             .get_string_option(
                 opts,
@@ -674,23 +716,29 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    /// Normalizes the `useGrouping` option (ECMA-402): `false` → `false`; `true`/
-    /// `"always"` → `"always"`; `"auto"`/undefined → `"auto"`; `"min2"` → `"min2"`.
-    /// A non-compact notation defaults to `"auto"`.
-    fn normalize_use_grouping(&mut self, raw: NanBox, _notation: &str) -> UseGroupingResolved {
-        match raw.unpack() {
-            Unpacked::Undefined => UseGroupingResolved::Str("auto"),
-            Unpacked::Bool(false) => UseGroupingResolved::Bool(false),
-            Unpacked::Bool(true) => UseGroupingResolved::Str("always"),
+    /// `GetBooleanOrStringNumberFormatOption` for `useGrouping`: `undefined` →
+    /// `"auto"`; `true` → `"always"`; a falsy value → `false`; the strings
+    /// `"true"`/`"false"` → `"auto"`; one of `"min2"`/`"auto"`/`"always"` → that
+    /// string; any other string (or non-string, via ToString) → **RangeError**.
+    fn normalize_use_grouping(&mut self, raw: NanBox) -> Result<UseGroupingResolved, ExecError> {
+        if matches!(raw.unpack(), Unpacked::Undefined) {
+            return Ok(UseGroupingResolved::Str("auto"));
+        }
+        if matches!(raw.unpack(), Unpacked::Bool(true)) {
+            return Ok(UseGroupingResolved::Str("always"));
+        }
+        if !self.realm.truthy(raw) {
+            return Ok(UseGroupingResolved::Bool(false));
+        }
+        let s = self.coerce_to_string(raw)?;
+        match s.as_str() {
+            "true" | "false" => Ok(UseGroupingResolved::Str("auto")),
+            "min2" => Ok(UseGroupingResolved::Str("min2")),
+            "auto" => Ok(UseGroupingResolved::Str("auto")),
+            "always" => Ok(UseGroupingResolved::Str("always")),
             _ => {
-                let s = self.realm.to_display_string(raw);
-                match s.as_str() {
-                    "min2" => UseGroupingResolved::Str("min2"),
-                    "always" => UseGroupingResolved::Str("always"),
-                    "false" => UseGroupingResolved::Bool(false),
-                    "true" => UseGroupingResolved::Str("always"),
-                    _ => UseGroupingResolved::Str("auto"),
-                }
+                let m = self.new_str(&alloc::format!("invalid useGrouping value '{s}'"));
+                Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))))
             }
         }
     }
@@ -2102,53 +2150,7 @@ impl<'a> Interp<'a> {
                 "vaii", "wara", "wcho",
             ],
             "timeZone" => &["UTC"],
-            "unit" => &[
-                "acre",
-                "bit",
-                "byte",
-                "celsius",
-                "centimeter",
-                "day",
-                "degree",
-                "fahrenheit",
-                "fluid-ounce",
-                "foot",
-                "gallon",
-                "gigabit",
-                "gigabyte",
-                "gram",
-                "hectare",
-                "hour",
-                "inch",
-                "kilobit",
-                "kilobyte",
-                "kilogram",
-                "kilometer",
-                "liter",
-                "megabit",
-                "megabyte",
-                "meter",
-                "microsecond",
-                "mile",
-                "mile-scandinavian",
-                "milliliter",
-                "millimeter",
-                "millisecond",
-                "minute",
-                "month",
-                "nanosecond",
-                "ounce",
-                "percent",
-                "petabyte",
-                "pound",
-                "second",
-                "stone",
-                "terabit",
-                "terabyte",
-                "week",
-                "yard",
-                "year",
-            ],
+            "unit" => SANCTIONED_UNITS,
             _ => {
                 let m = self.new_str(&alloc::format!("invalid key: {k}"));
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
