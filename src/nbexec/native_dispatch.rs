@@ -1635,8 +1635,28 @@ impl<'a> Interp<'a> {
             // detached) and returns `null` per the abstract `DetachArrayBuffer`.
             // `%ThrowTypeError%`: the poisoned accessor for a strict `arguments`
             // object's `callee` and `Function.prototype.caller`/`.arguments`
-            // (get or set) — always a TypeError.
+            // (get or set) — a TypeError for strict/bound functions and the
+            // strict `arguments` object. A legacy *non-strict, non-bound* function
+            // keeps the implementation-defined `.caller`/`.arguments` reads benign
+            // (Test262 `caller` feature): reading them yields `null` rather than
+            // throwing, matching mainstream engines.
             N_THROW_TYPE_ERROR => {
+                if let Some(h) = self.this_val.as_handle().map(Handle::from_raw)
+                    && self.realm.get_property(h, BOUND_TARGET).is_none()
+                    && self.realm.get_property(h, DYN_FN_MARKER).is_none()
+                    && let Some((func_id, _)) = self.realm.function_at(h)
+                {
+                    let def = &self.functions[func_id as usize];
+                    // Only an *ordinary*, source-declared non-strict function keeps
+                    // the legacy benign read (returns `null`); strict, generator,
+                    // async, arrow, bound, and dynamically-built functions are
+                    // restricted and their `.caller`/`.arguments` always throw a
+                    // TypeError (an arrow has no own `caller`/`arguments` and
+                    // inherits the poisoned accessor).
+                    if !def.is_strict && !def.is_generator && !def.is_async && !def.is_arrow {
+                        return Ok(NanBox::null());
+                    }
+                }
                 return Err(self.type_error(
                     "'caller', 'callee', and 'arguments' may not be accessed on strict mode \
                      functions or the arguments objects for calls to them",

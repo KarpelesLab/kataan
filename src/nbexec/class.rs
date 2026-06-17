@@ -146,7 +146,13 @@ impl<'a> Interp<'a> {
         // the prototype chain, and `instanceof` can reach it (neither has a class
         // id). A class superclass is handled via `resolve_super`'s class chain.
         let (native_super, fn_super) = if let Some(expr) = &class.super_class {
-            let sval = self.eval(expr)?;
+            // A class definition is strict code, so the heritage (`extends <expr>`)
+            // is evaluated in strict mode — a function expression there is strict
+            // (its `.caller`/`.arguments` are the poisoned accessors).
+            let saved_heritage_strict = core::mem::replace(&mut self.strict, true);
+            let sval = self.eval(expr);
+            self.strict = saved_heritage_strict;
+            let sval = sval?;
             // `extends null` makes a base-ish class with a null prototype; any other
             // non-object, or a non-constructor object (arrow/generator/async fn,
             // a plain object), is a TypeError (the superclass must be a constructor).

@@ -1385,6 +1385,11 @@ const REGEXP_PROTO_BRAND: &str = "\u{0}reproto";
 const BOUND_TARGET: &str = "\u{0}bnd_t";
 const BOUND_THIS: &str = "\u{0}bnd_this";
 const BOUND_ARGS: &str = "\u{0}bnd_args";
+/// Marks a function built by the dynamic `Function`/`GeneratorFunction`/… constructor.
+/// Such a function's `.caller`/`.arguments` keep the conservative poisoned-accessor
+/// throw (the engine cannot yet distinguish a dynamically-built *generator* from an
+/// ordinary one, and a restricted dynamic generator must throw).
+const DYN_FN_MARKER: &str = "\u{0}dynfn";
 /// A safety cap on eagerly-collected `yield`s (an infinite generator would
 /// otherwise hang); exceeding it throws instead.
 const GEN_CAP: usize = 1_000_000;
@@ -3312,6 +3317,10 @@ impl<'a> Interp<'a> {
         // `Function`-created functions are named "anonymous".
         self.set_fn_name(f, "anonymous");
         if let Some(h) = f.as_handle().map(Handle::from_raw) {
+            // Tag it so the `%ThrowTypeError%` poison stays conservative for a
+            // dynamically-built function (a dynamic generator must still throw).
+            self.realm
+                .set_hidden_property(h, DYN_FN_MARKER, NanBox::boolean(true));
             // Surface `name`/`length` as own data properties with the spec
             // attributes, matching other built-in functions.
             let len = func
