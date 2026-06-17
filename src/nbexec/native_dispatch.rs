@@ -1661,6 +1661,10 @@ impl<'a> Interp<'a> {
                 self.detach_array_buffer(buf);
                 NanBox::null()
             }
+            // `Intl.getCanonicalLocales(locales)` — canonical locale-tag list.
+            N_INTL_GET_CANONICAL_LOCALES => return self.intl_get_canonical_locales(arg(0)),
+            // `Intl.supportedValuesOf(key)` — supported identifiers for a key.
+            N_INTL_SUPPORTED_VALUES_OF => return self.intl_supported_values_of(arg(0)),
             // `Intl.NumberFormat(...)` / `Intl.DateTimeFormat(...)` called without
             // `new` build the same formatter object.
             N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => self.make_intl_formatter(id, args),

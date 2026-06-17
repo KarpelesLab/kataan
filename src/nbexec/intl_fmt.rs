@@ -1,5 +1,271 @@
 use super::*;
 
+/// Validates and canonicalizes a BCP-47 / UTS-35 `unicode_locale_id` (the
+/// structural grammar, without CLDR alias/grandfathered replacement which the
+/// `intl` crate doesn't expose). Returns the canonical tag, or `None` if the tag
+/// is structurally invalid (the caller raises a `RangeError`).
+///
+/// Canonicalization performed: lowercase language; Titlecase script; UPPERCASE
+/// region; lowercase variants **sorted** alphabetically; extensions ordered by
+/// singleton (`x` private-use last); `-u-`/`-t-` keyword/field groups sorted by
+/// key in ASCII order. Not performed (needs CLDR data the crate omits): legacy
+/// language/region alias replacement, `-u-` type alias mapping (e.g. `yes`→`true`).
+pub(crate) fn canonicalize_locale_id(tag: &str) -> Option<String> {
+    // Structurally rejected outright: empty, non-ASCII, `_` separators, and the
+    // empty subtags produced by leading/trailing/doubled `-`.
+    if tag.is_empty() || !tag.is_ascii() || tag.contains('_') {
+        return None;
+    }
+    let parts: Vec<&str> = tag.split('-').collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let is_alpha = |s: &str| s.bytes().all(|b| b.is_ascii_alphabetic());
+    let is_digit = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let is_alnum = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric());
+
+    let mut idx = 0usize;
+    let n = parts.len();
+
+    // unicode_language_subtag = alpha{2,3} | alpha{5,8}  (NOT 4, NOT extlang).
+    let lang = parts[idx];
+    if !((2..=3).contains(&lang.len()) || (5..=8).contains(&lang.len())) || !is_alpha(lang) {
+        return None;
+    }
+    let language = lang.to_ascii_lowercase();
+    idx += 1;
+    // No extlang subtags allowed in UTS-35: a 3-alpha subtag after a 2-3 alpha
+    // language would be an extlang (BCP-47) — invalid here.
+    if idx < n && is_alpha(parts[idx]) && parts[idx].len() == 3 {
+        return None;
+    }
+
+    // unicode_script_subtag = alpha{4}.
+    let mut script = None;
+    if idx < n && parts[idx].len() == 4 && is_alpha(parts[idx]) {
+        let s = parts[idx];
+        let mut t = String::new();
+        for (i, c) in s.chars().enumerate() {
+            if i == 0 {
+                t.push(c.to_ascii_uppercase());
+            } else {
+                t.push(c.to_ascii_lowercase());
+            }
+        }
+        script = Some(t);
+        idx += 1;
+    }
+
+    // unicode_region_subtag = alpha{2} | digit{3}.
+    let mut region = None;
+    if idx < n
+        && ((parts[idx].len() == 2 && is_alpha(parts[idx]))
+            || (parts[idx].len() == 3 && is_digit(parts[idx])))
+    {
+        region = Some(parts[idx].to_ascii_uppercase());
+        idx += 1;
+    }
+
+    // unicode_variant_subtag = (alphanum{5,8} | digit alphanum{3}).
+    let mut variants: Vec<String> = Vec::new();
+    while idx < n {
+        let s = parts[idx];
+        let is_variant = ((5..=8).contains(&s.len()) && is_alnum(s))
+            || (s.len() == 4 && s.as_bytes()[0].is_ascii_digit() && is_alnum(s));
+        if !is_variant {
+            break;
+        }
+        let v = s.to_ascii_lowercase();
+        if variants.contains(&v) {
+            return None; // duplicate variant
+        }
+        variants.push(v);
+        idx += 1;
+    }
+    variants.sort();
+
+    // Extensions and private use: singleton (alphanum) followed by subtags.
+    // Each singleton may appear once; `u`/`t` have their own subtag grammars but
+    // we validate generically and canonicalize key ordering for `u` and `t`.
+    let mut extensions: Vec<(char, String)> = Vec::new();
+    let mut seen_singletons: Vec<char> = Vec::new();
+    while idx < n {
+        let sing = parts[idx];
+        if sing.len() != 1 || !sing.as_bytes()[0].is_ascii_alphanumeric() {
+            return None; // expected a singleton here
+        }
+        let singleton = sing.as_bytes()[0].to_ascii_lowercase() as char;
+        if seen_singletons.contains(&singleton) {
+            return None; // duplicate singleton
+        }
+        seen_singletons.push(singleton);
+        idx += 1;
+        // Gather this singleton's subtags. Private use (`x`) consumes *all* the
+        // remaining subtags, including length-1 ones (so `x-u-foo` is one private
+        // sequence, not the start of a `u` extension).
+        let mut subs: Vec<String> = Vec::new();
+        let private = singleton == 'x';
+        while idx < n && (private || parts[idx].len() != 1) {
+            let st = parts[idx];
+            // Private-use subtags: 1..=8 alphanum. Others: 2..=8 alphanum.
+            let min = if private { 1 } else { 2 };
+            if !((min..=8).contains(&st.len()) && is_alnum(st)) {
+                return None;
+            }
+            subs.push(st.to_ascii_lowercase());
+            idx += 1;
+        }
+        // A singleton with a length-1 subtag (private use excepted) is invalid,
+        // and any singleton must have at least one subtag.
+        if subs.is_empty() {
+            return None;
+        }
+        let body = canonicalize_extension(singleton, &subs)?;
+        extensions.push((singleton, body));
+    }
+    // UTS-35 forbids a `unicode_locale_id` consisting only of private use; a
+    // valid id must have a real language (we already required one), so this is
+    // satisfied. Extensions sort by singleton with `x` last.
+    extensions.sort_by_key(|(s, _)| (*s == 'x', *s));
+
+    let mut out = language;
+    if let Some(s) = script {
+        out.push('-');
+        out.push_str(&s);
+    }
+    if let Some(r) = region {
+        out.push('-');
+        out.push_str(&r);
+    }
+    for v in &variants {
+        out.push('-');
+        out.push_str(v);
+    }
+    for (_, body) in &extensions {
+        out.push('-');
+        out.push_str(body);
+    }
+    Some(out)
+}
+
+/// Canonicalizes one extension's subtags into its `singleton-subtag-…` body.
+/// For `u`/`t` the keyword/field groups are sorted by key (ASCII order); for
+/// other singletons (and private use `x`) the order is preserved.
+fn canonicalize_extension(singleton: char, subs: &[String]) -> Option<String> {
+    if singleton == 'u' {
+        // -u- = attribute* (key type*)* — attributes (length-2..8, but a *key*
+        // is exactly length 2) come first, then keyword groups keyed by a
+        // 2-char key. Group the trailing keyword sequences and sort by key.
+        let mut attributes: Vec<String> = Vec::new();
+        let mut i = 0;
+        // A `key` is exactly 2 chars: alphanum then alpha (e.g. `ca`, `nu`, `0c`).
+        // An `attribute`/`type` is 3..=8 alphanum. A 2-char subtag whose 2nd char
+        // is a digit (e.g. `c0`, `00`) is neither — structurally invalid.
+        let is_key = |s: &str| s.len() == 2 && s.as_bytes()[1].is_ascii_alphabetic();
+        let is_attr_or_type = |s: &str| (3..=8).contains(&s.len());
+        while i < subs.len() && !is_key(&subs[i]) {
+            if !is_attr_or_type(&subs[i]) {
+                return None;
+            }
+            attributes.push(subs[i].clone());
+            i += 1;
+        }
+        attributes.sort();
+        let mut keywords: Vec<(String, Vec<String>)> = Vec::new();
+        while i < subs.len() {
+            let key = subs[i].clone();
+            i += 1;
+            let mut vals: Vec<String> = Vec::new();
+            while i < subs.len() && !is_key(&subs[i]) {
+                if !is_attr_or_type(&subs[i]) {
+                    return None;
+                }
+                vals.push(subs[i].clone());
+                i += 1;
+            }
+            // A `true` type value is elided in canonical form.
+            if vals.len() == 1 && vals[0] == "true" {
+                vals.clear();
+            }
+            keywords.push((key, vals));
+        }
+        keywords.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut body = String::from("u");
+        for a in &attributes {
+            body.push('-');
+            body.push_str(a);
+        }
+        for (k, vals) in &keywords {
+            body.push('-');
+            body.push_str(k);
+            for v in vals {
+                body.push('-');
+                body.push_str(v);
+            }
+        }
+        return Some(body);
+    }
+    if singleton == 't' {
+        // -t- = (tlang)? (tfield)*  where tfield = tkey tvalue+. A tkey is
+        // exactly 2 chars with an alpha first and digit second (e.g. `m0`, `k0`).
+        // The optional tlang (a language subtag) comes first.
+        let is_tkey = |s: &str| {
+            s.len() == 2
+                && s.as_bytes()[0].is_ascii_alphabetic()
+                && s.as_bytes()[1].is_ascii_digit()
+        };
+        let mut i = 0;
+        let mut tlang: Vec<String> = Vec::new();
+        while i < subs.len() && !is_tkey(&subs[i]) {
+            tlang.push(subs[i].clone());
+            i += 1;
+        }
+        // Canonicalize the tlang via the locale-id rules (lang/script/region/variants).
+        let tlang_canon = if tlang.is_empty() {
+            None
+        } else {
+            Some(canonicalize_locale_id(&tlang.join("-"))?)
+        };
+        let mut fields: Vec<(String, Vec<String>)> = Vec::new();
+        while i < subs.len() {
+            let key = subs[i].clone();
+            i += 1;
+            let mut vals: Vec<String> = Vec::new();
+            while i < subs.len() && !is_tkey(&subs[i]) {
+                vals.push(subs[i].clone());
+                i += 1;
+            }
+            if vals.is_empty() {
+                return None; // a tfield key must have a value
+            }
+            fields.push((key, vals));
+        }
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut body = String::from("t");
+        if let Some(tl) = &tlang_canon {
+            body.push('-');
+            body.push_str(&tl.to_ascii_lowercase());
+        }
+        for (k, vals) in &fields {
+            body.push('-');
+            body.push_str(k);
+            for v in vals {
+                body.push('-');
+                body.push_str(v);
+            }
+        }
+        return Some(body);
+    }
+    // Other singletons / private use: subtags in given order, already lowercased.
+    let mut body = String::new();
+    body.push(singleton);
+    for s in subs {
+        body.push('-');
+        body.push_str(s);
+    }
+    Some(body)
+}
+
 impl<'a> Interp<'a> {
     /// Builds an `Intl.NumberFormat`/`DateTimeFormat` instance — an object that
     /// captures the relevant options behind a `\0intl` kind marker. Used for both
@@ -1024,5 +1290,228 @@ impl<'a> Interp<'a> {
             _ => "",
         };
         alloc::format!("{sign}{styled}")
+    }
+
+    /// ECMA-402 `CanonicalizeLocaleList(locales)`: coerces `locales` to a list of
+    /// canonical locale tags (deduplicated, order preserved). `undefined` → empty
+    /// list; a single string is treated as a one-element list; otherwise the
+    /// argument is `ToObject`-ed and iterated by its `length`. Each element must be
+    /// a String or Object (else **TypeError**), and each tag must be a structurally
+    /// valid locale (else **RangeError**). A `Locale` instance contributes its
+    /// already-canonical `[[Locale]]` tag.
+    pub(crate) fn canonicalize_locale_list(
+        &mut self,
+        locales: NanBox,
+    ) -> Result<Vec<String>, ExecError> {
+        let mut seen: Vec<String> = Vec::new();
+        if matches!(locales.unpack(), Unpacked::Undefined) {
+            return Ok(seen);
+        }
+        // A bare string is a single-element list (no ToObject coercion of the
+        // characters). A `Locale` object short-circuits below in the loop.
+        let is_string = locales
+            .as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| self.realm.string_value(h).is_some());
+        let push_tag =
+            |this: &mut Self, tag: &str, seen: &mut Vec<String>| -> Result<(), ExecError> {
+                match canonicalize_locale_id(tag) {
+                    Some(c) => {
+                        if !seen.contains(&c) {
+                            seen.push(c);
+                        }
+                        Ok(())
+                    }
+                    None => {
+                        let m = this.new_str(&alloc::format!(
+                            "Incorrect locale information provided: {tag}"
+                        ));
+                        Err(ExecError::Throw(this.make_error(N_RANGE_ERROR, Some(m))))
+                    }
+                }
+            };
+        if is_string {
+            let s = self.coerce_to_string(locales)?;
+            push_tag(self, &s, &mut seen)?;
+            return Ok(seen);
+        }
+        // ToObject(null) is a TypeError (undefined was handled above).
+        if matches!(locales.unpack(), Unpacked::Null) {
+            let m = self.new_str("Cannot convert null to object");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        // ToObject, then iterate [0, len) reading each element (getter-aware, so
+        // throwing getters and inherited indices behave per spec).
+        let obj = self.coerce_to_object(locales);
+        let Some(oh) = obj.as_handle().map(Handle::from_raw) else {
+            return Ok(seen);
+        };
+        let len_v = self.read_member(oh, "length")?;
+        // ToLength: a Symbol `length` is a TypeError (ToNumber throws).
+        let len_v = self.coerce_to_number(len_v)?;
+        let len_f = self.realm.to_number(len_v);
+        let len = if len_f.is_nan() || len_f <= 0.0 {
+            0u64
+        } else {
+            len_f.min(u32::MAX as f64 * 2.0) as u64
+        };
+        for i in 0..len {
+            let key = alloc::format!("{i}");
+            // HasProperty check: skip absent indices (sparse array-likes).
+            if !self.has_property(oh, &key) {
+                continue;
+            }
+            let el = self.read_member(oh, &key)?;
+            // Element must be a String or Object.
+            let el_is_string = el
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|h| self.realm.string_value(h).is_some());
+            let el_is_object = self.is_object_value(el) && !el_is_string;
+            if !el_is_string && !el_is_object {
+                let m = self.new_str("locale list element is not a string or object");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            // A `Locale` instance contributes its canonical `[[Locale]]`.
+            if let Some(h) = el.as_handle().map(Handle::from_raw)
+                && let Some(loc) = self.realm.get_property(h, "\u{0}locale_tag")
+            {
+                let tag = self.realm.to_display_string(loc);
+                if !seen.contains(&tag) {
+                    seen.push(tag);
+                }
+                continue;
+            }
+            let s = self.coerce_to_string(el)?;
+            push_tag(self, &s, &mut seen)?;
+        }
+        Ok(seen)
+    }
+
+    /// `Intl.getCanonicalLocales(locales)` — a fresh, mutable Array of the
+    /// canonicalized tags.
+    pub(crate) fn intl_get_canonical_locales(
+        &mut self,
+        locales: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let tags = self.canonicalize_locale_list(locales)?;
+        let elems: Vec<NanBox> = tags.iter().map(|t| self.new_str(t)).collect();
+        Ok(NanBox::handle(self.realm.new_array(elems).to_raw()))
+    }
+
+    /// `Intl.supportedValuesOf(key)` — a sorted, duplicate-free Array of the
+    /// supported identifiers for `key` (`calendar`/`collation`/`currency`/
+    /// `numberingSystem`/`timeZone`/`unit`). A `key` outside this set is a
+    /// **RangeError**.
+    pub(crate) fn intl_supported_values_of(&mut self, key: NanBox) -> Result<NanBox, ExecError> {
+        let k = self.coerce_to_string(key)?;
+        let values: &[&str] = match k.as_str() {
+            "calendar" => &[
+                "buddhist",
+                "chinese",
+                "coptic",
+                "dangi",
+                "ethioaa",
+                "ethiopic",
+                "gregory",
+                "hebrew",
+                "indian",
+                "islamic",
+                "islamic-civil",
+                "islamic-rgsa",
+                "islamic-tbla",
+                "islamic-umalqura",
+                "iso8601",
+                "japanese",
+                "persian",
+                "roc",
+            ],
+            "collation" => &[
+                "compat", "dict", "emoji", "eor", "phonebk", "phonetic", "pinyin", "searchjl",
+                "stroke", "trad", "unihan", "zhuyin",
+            ],
+            "currency" => &[
+                "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD",
+                "BDT", "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BRL", "BSD", "BTN", "BWP", "BYN",
+                "BZD", "CAD", "CDF", "CHF", "CLP", "CNY", "COP", "CRC", "CUP", "CVE", "CZK", "DJF",
+                "DKK", "DOP", "DZD", "EGP", "ERN", "ETB", "EUR", "FJD", "FKP", "GBP", "GEL", "GHS",
+                "GIP", "GMD", "GNF", "GTQ", "GYD", "HKD", "HNL", "HRK", "HTG", "HUF", "IDR", "ILS",
+                "INR", "IQD", "IRR", "ISK", "JMD", "JOD", "JPY", "KES", "KGS", "KHR", "KMF", "KPW",
+                "KRW", "KWD", "KYD", "KZT", "LAK", "LBP", "LKR", "LRD", "LSL", "LYD", "MAD", "MDL",
+                "MGA", "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR", "MWK", "MXN", "MYR", "MZN",
+                "NAD", "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB", "PEN", "PGK", "PHP", "PKR",
+                "PLN", "PYG", "QAR", "RON", "RSD", "RUB", "RWF", "SAR", "SBD", "SCR", "SDG", "SEK",
+                "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN", "SVC", "SYP", "SZL", "THB", "TJS",
+                "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "UGX", "USD", "UYU", "UZS",
+                "VES", "VND", "VUV", "WST", "XAF", "XCD", "XOF", "XPF", "YER", "ZAR", "ZMW", "ZWL",
+            ],
+            "numberingSystem" => &[
+                "adlm", "ahom", "arab", "arabext", "bali", "beng", "bhks", "brah", "cakm", "cham",
+                "deva", "diak", "fullwide", "gong", "gonm", "gujr", "guru", "hanidec", "hmng",
+                "hmnp", "java", "kali", "kawi", "khmr", "knda", "lana", "lanatham", "laoo", "latn",
+                "lepc", "limb", "mathbold", "mathdbl", "mathmono", "mathsanb", "mathsans", "mlym",
+                "modi", "mong", "mroo", "mtei", "mymr", "mymrshan", "mymrtlng", "nagm", "newa",
+                "nkoo", "olck", "orya", "osma", "rohg", "saur", "segment", "shrd", "sind", "sinh",
+                "sora", "sund", "takr", "talu", "tamldec", "telu", "thai", "tibt", "tirh", "tnsa",
+                "vaii", "wara", "wcho",
+            ],
+            "timeZone" => &["UTC"],
+            "unit" => &[
+                "acre",
+                "bit",
+                "byte",
+                "celsius",
+                "centimeter",
+                "day",
+                "degree",
+                "fahrenheit",
+                "fluid-ounce",
+                "foot",
+                "gallon",
+                "gigabit",
+                "gigabyte",
+                "gram",
+                "hectare",
+                "hour",
+                "inch",
+                "kilobit",
+                "kilobyte",
+                "kilogram",
+                "kilometer",
+                "liter",
+                "megabit",
+                "megabyte",
+                "meter",
+                "microsecond",
+                "mile",
+                "mile-scandinavian",
+                "milliliter",
+                "millimeter",
+                "millisecond",
+                "minute",
+                "month",
+                "nanosecond",
+                "ounce",
+                "percent",
+                "petabyte",
+                "pound",
+                "second",
+                "stone",
+                "terabit",
+                "terabyte",
+                "week",
+                "yard",
+                "year",
+            ],
+            _ => {
+                let m = self.new_str(&alloc::format!("invalid key: {k}"));
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+        };
+        let mut sorted: Vec<&str> = values.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let elems: Vec<NanBox> = sorted.iter().map(|s| self.new_str(s)).collect();
+        Ok(NanBox::handle(self.realm.new_array(elems).to_raw()))
     }
 }

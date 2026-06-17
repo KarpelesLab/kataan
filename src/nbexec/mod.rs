@@ -515,6 +515,10 @@ const N_INTL_DISPLAY_NAMES_OF: u16 = 226;
 const N_INTL_SEGMENTER: u16 = 227;
 /// `Intl.Segmenter.prototype.segment`.
 const N_INTL_SEGMENTER_SEGMENT: u16 = 228;
+/// `Intl.getCanonicalLocales(locales)` — canonicalizes a locale list.
+const N_INTL_GET_CANONICAL_LOCALES: u16 = 460;
+/// `Intl.supportedValuesOf(key)` — the supported values for a key.
+const N_INTL_SUPPORTED_VALUES_OF: u16 = 461;
 /// The shared abstract `%TypedArray%` intrinsic constructor — the value
 /// `Object.getPrototypeOf(Int8Array)` returns. Calling or `new`-ing it directly
 /// throws a `TypeError`; it carries the generic `from`/`of`/`get [Symbol.species]`
@@ -2279,6 +2283,16 @@ impl<'a> Interp<'a> {
                 .set_hidden_property(f, "supportedLocalesOf", NanBox::handle(sl.to_raw()));
             self.realm
                 .set_property(intl, name, NanBox::handle(f.to_raw()));
+        }
+        // `Intl.getCanonicalLocales` / `Intl.supportedValuesOf` — namespace functions.
+        for (name, id) in [
+            ("getCanonicalLocales", N_INTL_GET_CANONICAL_LOCALES),
+            ("supportedValuesOf", N_INTL_SUPPORTED_VALUES_OF),
+        ] {
+            let f = self.new_named_native(name, id);
+            self.realm
+                .set_property(intl, name, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(intl, name);
         }
         self.current.declare("Intl", NanBox::handle(intl.to_raw()));
         // The typed-array constructors.
