@@ -62,7 +62,7 @@ var $262 = {
   global: this,
   gc: function () {},
   evalScript: function (src) { return eval(src); },
-  detachArrayBuffer: function () { throw new TypeError('$262.detachArrayBuffer is not supported'); },
+  detachArrayBuffer: function (b) { return $262_detachArrayBuffer(b); },
   createRealm: function () { throw new TypeError('$262.createRealm is not supported'); },
   IsHTMLDDA: undefined
 };
