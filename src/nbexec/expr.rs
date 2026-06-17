@@ -727,11 +727,25 @@ impl<'a> Interp<'a> {
                         // prototype-assigned) method is found by boxing the value and
                         // walking its prototype chain — then invoked with the original
                         // primitive as `this` (e.g.
-                        // `Number.prototype.toLowerCase = String.prototype.toLowerCase`).
-                        if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property {
+                        // `Number.prototype.toLowerCase = String.prototype.toLowerCase`,
+                        // or a computed key like `false["toString"]()`).
+                        let name = match property {
+                            PropertyKey::Ident(name) | PropertyKey::Str(name) => {
+                                Some(alloc::string::String::from(&**name))
+                            }
+                            PropertyKey::Number(n) => {
+                                Some(self.realm.to_display_string(NanBox::number(*n)))
+                            }
+                            PropertyKey::Computed(e) => {
+                                let k = self.eval(e)?;
+                                Some(self.coerce_property_key(k)?)
+                            }
+                            PropertyKey::Private(_) => None,
+                        };
+                        if let Some(name) = name {
                             let boxed = self.coerce_to_object(recv);
                             if let Some(bh) = boxed.as_handle().map(Handle::from_raw) {
-                                let f = self.read_member(bh, name)?;
+                                let f = self.read_member(bh, &name)?;
                                 if *call_optional
                                     && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null)
                                 {
