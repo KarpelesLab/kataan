@@ -649,6 +649,29 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// One `IteratorStep` for array-destructuring: calls `next()`, returns
+    /// `Ok(Some(value))` for a yielded element, `Ok(None)` at end-of-iteration
+    /// (`{ done: true }`). An abrupt result-access is propagated. Callers treat
+    /// both `Ok(None)` and `Err(_)` as "iterator done" for `IteratorClose` purposes.
+    fn dstr_iter_step(
+        &mut self,
+        ih: Handle,
+        iterator: NanBox,
+    ) -> Result<Option<NanBox>, ExecError> {
+        let next_fn = self.read_member(ih, "next")?;
+        let res = self.call_with_this(next_fn, iterator, &[])?;
+        let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+            return Err(ExecError::Throw(
+                self.new_str("iterator result is not an object"),
+            ));
+        };
+        let done = self.read_member(rh, "done")?;
+        if self.realm.truthy(done) {
+            return Ok(None);
+        }
+        Ok(Some(self.read_member(rh, "value")?))
+    }
+
     /// Destructures `value` into an assignment pattern of existing targets
     /// (`[a, b] = …`, `({ x: obj.p } = …)`), recursing into nested patterns.
     pub(crate) fn assign_destructure(
@@ -661,63 +684,85 @@ impl<'a> Interp<'a> {
                 let has_rest = elements
                     .iter()
                     .any(|e| matches!(e, ArrayElement::Spread(_)));
-                let needed = elements
-                    .iter()
-                    .filter(|e| !matches!(e, ArrayElement::Spread(_)))
-                    .count();
                 // Without a rest target, a *user* iterator is pulled lazily for only
                 // the values the pattern needs, then closed (`IteratorClose`) — so
                 // `[a, b] = infiniteIterator` terminates and `return()` runs.
                 // (Mirrors the declaration path in `bind_pattern`.) Built-in
                 // iterables (arrays/strings/Sets/generators) take the eager path.
-                let items = if !has_rest && let Some(ih) = self.for_of_get_iterator(value)? {
-                    if self.realm.get_property(ih, GEN_BUF).is_some() {
-                        self.iterate_values(NanBox::handle(ih.to_raw()))?
-                    } else {
-                        let iterator = NanBox::handle(ih.to_raw());
-                        let mut out = Vec::with_capacity(needed);
-                        let mut exhausted = false;
-                        for _ in 0..needed {
-                            let next_fn = self.read_member(ih, "next")?;
-                            let res = self.call_with_this(next_fn, iterator, &[])?;
-                            let Some(rh) = res.as_handle().map(Handle::from_raw) else {
-                                return Err(ExecError::Throw(
-                                    self.new_str("iterator result is not an object"),
-                                ));
+                if !has_rest
+                    && let Some(ih) = self.for_of_get_iterator(value)?
+                    && self.realm.get_property(ih, GEN_BUF).is_none()
+                {
+                    // Real user iterator: interleave `next()`, target evaluation and
+                    // assignment per spec, and run `IteratorClose` at the right moment.
+                    // On a normal finish we close (a non-Object/uncallable `return`
+                    // throws); on an error during assignment we close with the original
+                    // error preserved (close failures suppressed).
+                    let iterator = NanBox::handle(ih.to_raw());
+                    // `exhausted` mirrors the spec's `iteratorRecord.[[done]]`: once the
+                    // iterator finishes *or* a step (`next()`/result access) completes
+                    // abruptly, it is done and must not be closed. Only an error from a
+                    // *target assignment* (done still false) triggers `IteratorClose`.
+                    let mut exhausted = false;
+                    let result = (|| -> Result<(), ExecError> {
+                        for el in elements {
+                            // Pull the next value (unless the iterator already ended).
+                            // `IteratorStep` yields `None` at end-of-iteration; any abrupt
+                            // completion while stepping marks the iterator done — both keep
+                            // the error path below from running `IteratorClose`.
+                            let v = if exhausted {
+                                NanBox::undefined()
+                            } else {
+                                let step = self.dstr_iter_step(ih, iterator);
+                                exhausted = !matches!(step, Ok(Some(_)));
+                                match step? {
+                                    Some(v) => v,
+                                    None => NanBox::undefined(),
+                                }
                             };
-                            let done = self.read_member(rh, "done")?;
-                            if self.realm.truthy(done) {
-                                exhausted = true;
-                                break;
+                            match el {
+                                ArrayElement::Hole => {}
+                                ArrayElement::Item(e) => self.assign_destructure(e, v)?,
+                                ArrayElement::Spread(_) => unreachable!("has_rest guard"),
                             }
-                            out.push(self.read_member(rh, "value")?);
                         }
-                        if !exhausted {
-                            self.iterator_close(ih)?;
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            if !exhausted {
+                                self.iterator_close(ih)?;
+                            }
+                            Ok(())
                         }
-                        out
+                        Err(e) => {
+                            if !exhausted {
+                                let _ = self.iterator_close(ih);
+                            }
+                            Err(e)
+                        }
                     }
                 } else {
-                    // A non-iterable right-hand side (null, a plain object) is a TypeError.
-                    self.iterate_values(value)?
-                };
-                let mut i = 0;
-                for el in elements {
-                    match el {
-                        ArrayElement::Hole => i += 1,
-                        ArrayElement::Item(e) => {
-                            let v = items.get(i).copied().unwrap_or(NanBox::undefined());
-                            self.assign_destructure(e, v)?;
-                            i += 1;
-                        }
-                        ArrayElement::Spread(e) => {
-                            let rest = items[i.min(items.len())..].to_vec();
-                            let h = NanBox::handle(self.realm.new_array(rest).to_raw());
-                            self.assign_destructure(e, h)?;
+                    // Built-in iterables / generators / rest patterns: eager value list.
+                    let items = self.iterate_values(value)?;
+                    let mut i = 0;
+                    for el in elements {
+                        match el {
+                            ArrayElement::Hole => i += 1,
+                            ArrayElement::Item(e) => {
+                                let v = items.get(i).copied().unwrap_or(NanBox::undefined());
+                                self.assign_destructure(e, v)?;
+                                i += 1;
+                            }
+                            ArrayElement::Spread(e) => {
+                                let rest = items[i.min(items.len())..].to_vec();
+                                let h = NanBox::handle(self.realm.new_array(rest).to_raw());
+                                self.assign_destructure(e, h)?;
+                            }
                         }
                     }
+                    Ok(())
                 }
-                Ok(())
             }
             Expr::Object { members, .. } => {
                 // Object destructuring requires a coercible value: `null`/`undefined`

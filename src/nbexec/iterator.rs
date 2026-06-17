@@ -1500,13 +1500,26 @@ impl<'a> Interp<'a> {
 
     /// `IteratorClose`: invoke the iterator's `return()` method (if any) on an early
     /// exit, so the iterator can release resources. Errors from `return()` propagate.
+    ///
+    /// Per spec, when closing on a *normal* completion (this method's `?` callers),
+    /// a `return` that is present but whose call yields a non-Object result must throw
+    /// a `TypeError`. Error-completion callers discard this via `let _ = ...`, matching
+    /// the spec rule that the original throw takes precedence over `IteratorClose`.
     pub(crate) fn iterator_close(&mut self, ih: Handle) -> Result<(), ExecError> {
         let ret = self.read_member(ih, "return")?;
-        if ret
+        // `GetMethod` treats `undefined`/`null` as an absent method: nothing to close.
+        if ret.is_undefined() || ret.is_null() {
+            return Ok(());
+        }
+        if !ret
             .as_handle()
             .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
         {
-            self.call_with_this(ret, NanBox::handle(ih.to_raw()), &[])?;
+            return Err(self.type_error("iterator return is not a function"));
+        }
+        let result = self.call_with_this(ret, NanBox::handle(ih.to_raw()), &[])?;
+        if result.as_handle().is_none() {
+            return Err(self.type_error("iterator return must return an object"));
         }
         Ok(())
     }
