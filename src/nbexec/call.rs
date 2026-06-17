@@ -1315,7 +1315,7 @@ impl<'a> Interp<'a> {
         }
         // `new Intl.NumberFormat(locales, options)` / `Intl.DateTimeFormat(...)`.
         if id == N_INTL_NUMBER_FORMAT || id == N_INTL_DATETIME_FORMAT {
-            return Ok(self.make_intl_formatter(id, args));
+            return self.make_intl_formatter(id, args);
         }
         // `new Intl.Collator(...)` → an object whose `compare` is a bound function
         // (so `arr.sort(new Intl.Collator().compare)` works); code-point order, no

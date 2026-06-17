@@ -1667,7 +1667,9 @@ impl<'a> Interp<'a> {
             N_INTL_SUPPORTED_VALUES_OF => return self.intl_supported_values_of(arg(0)),
             // `Intl.NumberFormat(...)` / `Intl.DateTimeFormat(...)` called without
             // `new` build the same formatter object.
-            N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => self.make_intl_formatter(id, args),
+            N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => {
+                return self.make_intl_formatter(id, args);
+            }
             // `Intl.Collator(...)` / `Intl.PluralRules(...)` without `new`.
             N_INTL_COLLATOR => self.make_collator(args),
             N_INTL_PLURAL_RULES => self.make_plural_rules(args),
@@ -1910,63 +1912,8 @@ impl<'a> Interp<'a> {
             }
             // `nf.resolvedOptions()` — the resolved configuration of the formatter.
             N_INTL_RESOLVED_OPTIONS => {
-                let out = self.realm.new_object();
                 let fmt = self.this_val.as_handle().map(Handle::from_raw);
-                let kind = fmt
-                    .and_then(|h| self.realm.get_property(h, "\u{0}intl"))
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_else(|| String::from("number"));
-                let getp = |this: &Self, key: &str| -> Option<NanBox> {
-                    fmt.and_then(|h| this.realm.get_property(h, key))
-                        .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
-                };
-                let locale = getp(self, "\u{0}locale")
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_else(|| String::from("en-US"));
-                let lv = self.new_str(&locale);
-                self.realm.set_property(out, "locale", lv);
-                let ns = self.new_str("latn");
-                self.realm.set_property(out, "numberingSystem", ns);
-                if kind == "number" {
-                    let style = getp(self, "style")
-                        .map(|v| self.realm.to_display_string(v))
-                        .unwrap_or_else(|| String::from("decimal"));
-                    let sv = self.new_str(&style);
-                    self.realm.set_property(out, "style", sv);
-                    if style == "currency"
-                        && let Some(c) = getp(self, "currency")
-                    {
-                        self.realm.set_property(out, "currency", c);
-                    }
-                    let (def_min, def_max): (f64, f64) = match style.as_str() {
-                        "currency" => (2.0, 2.0),
-                        "percent" => (0.0, 0.0),
-                        _ => (0.0, 3.0),
-                    };
-                    let min = getp(self, "minimumFractionDigits")
-                        .map_or(def_min, |v| self.realm.to_number(v));
-                    let max = getp(self, "maximumFractionDigits")
-                        .map_or(def_max.max(min), |v| self.realm.to_number(v));
-                    self.realm
-                        .set_property(out, "minimumIntegerDigits", NanBox::number(1.0));
-                    self.realm
-                        .set_property(out, "minimumFractionDigits", NanBox::number(min));
-                    self.realm
-                        .set_property(out, "maximumFractionDigits", NanBox::number(max));
-                    let ug = getp(self, "useGrouping").unwrap_or(NanBox::boolean(true));
-                    self.realm.set_property(out, "useGrouping", ug);
-                    // `signDisplay` ("auto" | "always" | "never" | "exceptZero").
-                    let sd = getp(self, "signDisplay")
-                        .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
-                        .unwrap_or_else(|| self.new_str("auto"));
-                    self.realm.set_property(out, "signDisplay", sd);
-                } else {
-                    let cal = self.new_str("gregory");
-                    self.realm.set_property(out, "calendar", cal);
-                    let tz = self.new_str("UTC");
-                    self.realm.set_property(out, "timeZone", tz);
-                }
-                NanBox::handle(out.to_raw())
+                self.intl_resolved_options(fmt)
             }
             // `Intl.X.supportedLocalesOf(locales)` — the requested locales this engine
             // can serve. With no real locale data, every requested locale is accepted;

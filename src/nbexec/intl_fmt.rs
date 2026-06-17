@@ -1,5 +1,45 @@
 use super::*;
 
+/// The resolved form of `Intl.NumberFormat`'s `useGrouping` option: a boolean
+/// `false`, or one of the string modes `"auto"`/`"always"`/`"min2"`.
+enum UseGroupingResolved {
+    Bool(bool),
+    Str(&'static str),
+}
+
+/// Whether `s` matches the UTS-35 `type` value production: one or more
+/// `alphanum{3,8}` subtags joined by `-` (used for `ca`/`nu` option validation).
+fn is_unicode_type_value(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('-').all(|seg| {
+            (3..=8).contains(&seg.len()) && seg.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+}
+
+/// Whether `code` is a well-formed ISO-4217 currency code: exactly three ASCII
+/// letters (case-insensitive).
+fn is_well_formed_currency(code: &str) -> bool {
+    code.len() == 3 && code.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+/// Whether `unit` is a well-formed `unitIdentifier`: a core unit (3-8 alnum, or
+/// any of CLDR's sanctioned simple units) optionally as a `X-per-Y` compound.
+fn is_well_formed_unit(unit: &str) -> bool {
+    let valid_single = |u: &str| {
+        // ECMA-402's `IsWellFormedUnitIdentifier` checks the unit is in the
+        // sanctioned list; we accept the CLDR core-unit shape (lowercase ASCII
+        // letters, possibly hyphenated) which covers all sanctioned units.
+        !u.is_empty()
+            && u.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+            && !u.starts_with('-')
+            && !u.ends_with('-')
+    };
+    match unit.split_once("-per-") {
+        Some((a, b)) => valid_single(a) && valid_single(b),
+        None => valid_single(unit),
+    }
+}
+
 /// Validates and canonicalizes a BCP-47 / UTS-35 `unicode_locale_id` (the
 /// structural grammar, without CLDR alias/grandfathered replacement which the
 /// `intl` crate doesn't expose). Returns the canonical tag, or `None` if the tag
@@ -270,7 +310,11 @@ impl<'a> Interp<'a> {
     /// Builds an `Intl.NumberFormat`/`DateTimeFormat` instance — an object that
     /// captures the relevant options behind a `\0intl` kind marker. Used for both
     /// `new Intl.X(...)` and the callable-without-`new` form.
-    pub(crate) fn make_intl_formatter(&mut self, id: u16, args: &[NanBox]) -> NanBox {
+    pub(crate) fn make_intl_formatter(
+        &mut self,
+        id: u16,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
         let kind = if id == N_INTL_NUMBER_FORMAT {
             "number"
@@ -292,54 +336,656 @@ impl<'a> Interp<'a> {
         let ftp = self.new_named_native("formatToParts", N_INTL_FORMAT_TO_PARTS);
         self.realm
             .set_property(obj, "formatToParts", NanBox::handle(ftp.to_raw()));
-        // The requested locale (a string first argument), defaulting to en-US.
-        let locale = args
-            .first()
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|h| self.realm.string_value(h))
+        // CanonicalizeLocaleList(locales): the resolved locale is the first
+        // requested tag (this engine serves any structurally valid locale), else
+        // the default. A malformed tag raises a RangeError here.
+        let requested =
+            self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
+        let locale = requested
+            .into_iter()
+            .next()
             .unwrap_or_else(|| String::from("en-US"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
-        if let Some(opts) = args
-            .get(1)
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-        {
-            for key in [
+        // Coerce options: `undefined` → no options; otherwise ToObject (a
+        // primitive other than undefined is wrapped, exposing no option keys).
+        let opts_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
+        let opts = if matches!(opts_arg.unpack(), Unpacked::Undefined) {
+            None
+        } else {
+            self.coerce_to_object(opts_arg)
+                .as_handle()
+                .map(Handle::from_raw)
+        };
+        if id == N_INTL_NUMBER_FORMAT {
+            self.init_number_format(obj, opts)?;
+        } else {
+            self.init_datetime_format(obj, opts)?;
+        }
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    /// `GetOption(options, prop, "string", values, default)` — reads `prop` via
+    /// its getter, returns the default when `undefined`, else coerces to a string
+    /// (a Symbol is a TypeError) and validates membership in `values` (a
+    /// **RangeError** otherwise). `None` `default` with an absent option yields
+    /// `None`.
+    fn get_string_option(
+        &mut self,
+        opts: Option<Handle>,
+        prop: &str,
+        values: &[&str],
+        default: Option<&str>,
+    ) -> Result<Option<String>, ExecError> {
+        let raw = match opts {
+            Some(h) => self.read_member(h, prop)?,
+            None => NanBox::undefined(),
+        };
+        if matches!(raw.unpack(), Unpacked::Undefined) {
+            return Ok(default.map(String::from));
+        }
+        let s = self.coerce_to_string(raw)?;
+        if !values.is_empty() && !values.iter().any(|v| *v == s) {
+            let m = self.new_str(&alloc::format!("invalid value '{s}' for option {prop}"));
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok(Some(s))
+    }
+
+    /// `GetOption(options, prop, "boolean", …)` — reads `prop`; `undefined` →
+    /// `default`, else `ToBoolean`.
+    fn get_bool_option(
+        &mut self,
+        opts: Option<Handle>,
+        prop: &str,
+        default: Option<bool>,
+    ) -> Result<Option<bool>, ExecError> {
+        let raw = match opts {
+            Some(h) => self.read_member(h, prop)?,
+            None => NanBox::undefined(),
+        };
+        if matches!(raw.unpack(), Unpacked::Undefined) {
+            return Ok(default);
+        }
+        Ok(Some(self.realm.truthy(raw)))
+    }
+
+    /// `GetNumberOption` / `DefaultNumberOption`: reads `prop`, coerces to a
+    /// Number (throwing for a Symbol), and requires it to be a finite integer in
+    /// `[min, max]` (else **RangeError**). `undefined` → `default`.
+    fn get_int_option(
+        &mut self,
+        opts: Option<Handle>,
+        prop: &str,
+        min: f64,
+        max: f64,
+        default: Option<f64>,
+    ) -> Result<Option<f64>, ExecError> {
+        let raw = match opts {
+            Some(h) => self.read_member(h, prop)?,
+            None => NanBox::undefined(),
+        };
+        if matches!(raw.unpack(), Unpacked::Undefined) {
+            return Ok(default);
+        }
+        let nv = self.coerce_to_number(raw)?;
+        let n = self.realm.to_number(nv);
+        if n.is_nan() || n < min || n > max {
+            let m = self.new_str(&alloc::format!("value out of range for option {prop}"));
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok(Some(n.trunc()))
+    }
+
+    /// Stores a resolved option on the formatter (under its own key) when present.
+    fn store_str(&mut self, obj: Handle, key: &str, val: &Option<String>) {
+        if let Some(v) = val {
+            let sv = self.new_str(v);
+            self.realm.set_hidden_property(obj, key, sv);
+        }
+    }
+
+    /// Initializes an `Intl.NumberFormat`, reading and validating options in spec
+    /// order (`InitializeNumberFormat` → `SetNumberFormatUnitOptions` →
+    /// `SetNumberFormatDigitOptions`). Stores resolved options on `obj`.
+    fn init_number_format(&mut self, obj: Handle, opts: Option<Handle>) -> Result<(), ExecError> {
+        // localeMatcher (validated, not otherwise used).
+        let _ = self.get_string_option(
+            opts,
+            "localeMatcher",
+            &["lookup", "best fit"],
+            Some("best fit"),
+        )?;
+        let nu = self.get_string_option(opts, "numberingSystem", &[], None)?;
+        if let Some(ns) = &nu {
+            // numberingSystem must match `type` production (3-8 alnum, hyphen-joined).
+            if !is_unicode_type_value(ns) {
+                let m = self.new_str("invalid numberingSystem");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+        }
+        self.store_str(obj, "numberingSystem", &nu);
+
+        // --- SetNumberFormatUnitOptions ---
+        let style = self
+            .get_string_option(
+                opts,
                 "style",
-                "currency",
-                "minimumFractionDigits",
-                "maximumFractionDigits",
-                "useGrouping",
-                "signDisplay",
-                "unit",
-                "unitDisplay",
+                &["decimal", "percent", "currency", "unit"],
+                Some("decimal"),
+            )?
+            .unwrap();
+        let currency = self.get_string_option(opts, "currency", &[], None)?;
+        let currency_display = self.get_string_option(
+            opts,
+            "currencyDisplay",
+            &["code", "symbol", "narrowSymbol", "name"],
+            Some("symbol"),
+        )?;
+        let currency_sign = self.get_string_option(
+            opts,
+            "currencySign",
+            &["standard", "accounting"],
+            Some("standard"),
+        )?;
+        let unit = self.get_string_option(opts, "unit", &[], None)?;
+        let unit_display = self.get_string_option(
+            opts,
+            "unitDisplay",
+            &["short", "narrow", "long"],
+            Some("short"),
+        )?;
+        if style == "currency" {
+            match &currency {
+                None => {
+                    let m = self.new_str("currency code is required with currency style");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                Some(c) if !is_well_formed_currency(c) => {
+                    let m = self.new_str("invalid currency code");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                _ => {}
+            }
+        }
+        if style == "unit" {
+            match &unit {
+                None => {
+                    let m = self.new_str("unit is required with unit style");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                Some(u) if !is_well_formed_unit(u) => {
+                    let m = self.new_str("invalid unit");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                _ => {}
+            }
+        }
+        let style_s = Some(style.clone());
+        self.store_str(obj, "style", &style_s);
+        // Canonical currency code is uppercased.
+        if style == "currency" {
+            let cc = currency.as_ref().map(|c| c.to_ascii_uppercase());
+            self.store_str(obj, "currency", &cc);
+            self.store_str(obj, "currencyDisplay", &currency_display);
+            self.store_str(obj, "currencySign", &currency_sign);
+        }
+        if style == "unit" {
+            self.store_str(obj, "unit", &unit);
+            self.store_str(obj, "unitDisplay", &unit_display);
+        }
+
+        // notation (read before digit options per the spec order).
+        let notation = self
+            .get_string_option(
+                opts,
                 "notation",
-                // DateTimeFormat component options.
+                &["standard", "scientific", "engineering", "compact"],
+                Some("standard"),
+            )?
+            .unwrap();
+
+        // --- SetNumberFormatDigitOptions ---
+        let mnid = self
+            .get_int_option(opts, "minimumIntegerDigits", 1.0, 21.0, Some(1.0))?
+            .unwrap();
+        let mnfd = self.get_int_option(opts, "minimumFractionDigits", 0.0, 20.0, None)?;
+        let mxfd = self.get_int_option(opts, "maximumFractionDigits", 0.0, 20.0, None)?;
+        let mnsd = self.get_int_option(opts, "minimumSignificantDigits", 1.0, 21.0, None)?;
+        let mxsd = self.get_int_option(opts, "maximumSignificantDigits", 1.0, 21.0, None)?;
+        // Cross-validation: an explicit minimum may not exceed an explicit maximum.
+        if let (Some(a), Some(b)) = (mnfd, mxfd)
+            && a > b
+        {
+            let m = self.new_str("minimumFractionDigits is greater than maximumFractionDigits");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        if let (Some(a), Some(b)) = (mnsd, mxsd)
+            && a > b
+        {
+            let m =
+                self.new_str("minimumSignificantDigits is greater than maximumSignificantDigits");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        // roundingIncrement ∈ a fixed allowed set.
+        let rinc = self
+            .get_int_option(opts, "roundingIncrement", 1.0, 5000.0, Some(1.0))?
+            .unwrap();
+        const ALLOWED_INC: [u32; 15] = [
+            1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000,
+        ];
+        if !ALLOWED_INC.contains(&(rinc as u32)) {
+            let m = self.new_str("invalid roundingIncrement");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        let rounding_mode = self
+            .get_string_option(
+                opts,
+                "roundingMode",
+                &[
+                    "ceil",
+                    "floor",
+                    "expand",
+                    "trunc",
+                    "halfCeil",
+                    "halfFloor",
+                    "halfExpand",
+                    "halfTrunc",
+                    "halfEven",
+                ],
+                Some("halfExpand"),
+            )?
+            .unwrap();
+        let rounding_priority = self
+            .get_string_option(
+                opts,
+                "roundingPriority",
+                &["auto", "morePrecision", "lessPrecision"],
+                Some("auto"),
+            )?
+            .unwrap();
+        let tzd = self
+            .get_string_option(
+                opts,
+                "trailingZeroDisplay",
+                &["auto", "stripIfInteger"],
+                Some("auto"),
+            )?
+            .unwrap();
+
+        // compactDisplay, useGrouping, signDisplay.
+        let compact_display =
+            self.get_string_option(opts, "compactDisplay", &["short", "long"], Some("short"))?;
+        if notation == "compact" {
+            self.store_str(obj, "compactDisplay", &compact_display);
+        }
+        // useGrouping: ECMA-402 accepts a boolean or "min2"/"auto"/"always". Read
+        // it without enum validation, then normalize.
+        let ug_raw = match opts {
+            Some(h) => self.read_member(h, "useGrouping")?,
+            None => NanBox::undefined(),
+        };
+        let use_grouping_val = self.normalize_use_grouping(ug_raw, &notation);
+        let sign_display = self
+            .get_string_option(
+                opts,
+                "signDisplay",
+                &["auto", "never", "always", "exceptZero", "negative"],
+                Some("auto"),
+            )?
+            .unwrap();
+
+        // Store digit/notation/sign options for resolvedOptions + formatting.
+        self.realm
+            .set_hidden_property(obj, "minimumIntegerDigits", NanBox::number(mnid));
+        if let Some(v) = mnfd {
+            self.realm
+                .set_hidden_property(obj, "minimumFractionDigits", NanBox::number(v));
+        }
+        if let Some(v) = mxfd {
+            self.realm
+                .set_hidden_property(obj, "maximumFractionDigits", NanBox::number(v));
+        }
+        if let Some(v) = mnsd {
+            self.realm
+                .set_hidden_property(obj, "minimumSignificantDigits", NanBox::number(v));
+        }
+        if let Some(v) = mxsd {
+            self.realm
+                .set_hidden_property(obj, "maximumSignificantDigits", NanBox::number(v));
+        }
+        self.realm
+            .set_hidden_property(obj, "roundingIncrement", NanBox::number(rinc));
+        self.store_str(obj, "notation", &Some(notation));
+        self.store_str(obj, "roundingMode", &Some(rounding_mode));
+        self.store_str(obj, "roundingPriority", &Some(rounding_priority));
+        self.store_str(obj, "trailingZeroDisplay", &Some(tzd));
+        self.store_str(obj, "signDisplay", &Some(sign_display));
+        match use_grouping_val {
+            UseGroupingResolved::Bool(b) => {
+                self.realm
+                    .set_hidden_property(obj, "useGrouping", NanBox::boolean(b));
+            }
+            UseGroupingResolved::Str(s) => {
+                let sv = self.new_str(s);
+                self.realm.set_hidden_property(obj, "useGrouping", sv);
+            }
+        }
+        Ok(())
+    }
+
+    /// Normalizes the `useGrouping` option (ECMA-402): `false` → `false`; `true`/
+    /// `"always"` → `"always"`; `"auto"`/undefined → `"auto"`; `"min2"` → `"min2"`.
+    /// A non-compact notation defaults to `"auto"`.
+    fn normalize_use_grouping(&mut self, raw: NanBox, _notation: &str) -> UseGroupingResolved {
+        match raw.unpack() {
+            Unpacked::Undefined => UseGroupingResolved::Str("auto"),
+            Unpacked::Bool(false) => UseGroupingResolved::Bool(false),
+            Unpacked::Bool(true) => UseGroupingResolved::Str("always"),
+            _ => {
+                let s = self.realm.to_display_string(raw);
+                match s.as_str() {
+                    "min2" => UseGroupingResolved::Str("min2"),
+                    "always" => UseGroupingResolved::Str("always"),
+                    "false" => UseGroupingResolved::Bool(false),
+                    "true" => UseGroupingResolved::Str("always"),
+                    _ => UseGroupingResolved::Str("auto"),
+                }
+            }
+        }
+    }
+
+    /// Initializes an `Intl.DateTimeFormat`, reading and validating options in
+    /// spec order. Stores resolved options on `obj`.
+    fn init_datetime_format(&mut self, obj: Handle, opts: Option<Handle>) -> Result<(), ExecError> {
+        let _ = self.get_string_option(
+            opts,
+            "localeMatcher",
+            &["lookup", "best fit"],
+            Some("best fit"),
+        )?;
+        let ca = self.get_string_option(opts, "calendar", &[], None)?;
+        if let Some(c) = &ca
+            && !is_unicode_type_value(c)
+        {
+            let m = self.new_str("invalid calendar");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        self.store_str(obj, "calendar", &ca);
+        let nu = self.get_string_option(opts, "numberingSystem", &[], None)?;
+        if let Some(n) = &nu
+            && !is_unicode_type_value(n)
+        {
+            let m = self.new_str("invalid numberingSystem");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        self.store_str(obj, "numberingSystem", &nu);
+        // hour12 (boolean) and hourCycle (enum).
+        let hour12 = self.get_bool_option(opts, "hour12", None)?;
+        if let Some(b) = hour12 {
+            self.realm
+                .set_hidden_property(obj, "hour12", NanBox::boolean(b));
+        }
+        let hc = self.get_string_option(opts, "hourCycle", &["h11", "h12", "h23", "h24"], None)?;
+        self.store_str(obj, "hourCycle", &hc);
+        let _tz = self.get_string_option(opts, "timeZone", &[], None)?;
+        self.store_str(obj, "timeZone", &_tz);
+        // weekday/era/year/month/day/hour/minute/second/… component options.
+        let nv = ["numeric", "2-digit"];
+        let nm = ["long", "short", "narrow"];
+        let weekday = self.get_string_option(opts, "weekday", &nm, None)?;
+        self.store_str(obj, "weekday", &weekday);
+        let era = self.get_string_option(opts, "era", &nm, None)?;
+        self.store_str(obj, "era", &era);
+        let year = self.get_string_option(opts, "year", &nv, None)?;
+        self.store_str(obj, "year", &year);
+        let month = self.get_string_option(
+            opts,
+            "month",
+            &["numeric", "2-digit", "long", "short", "narrow"],
+            None,
+        )?;
+        self.store_str(obj, "month", &month);
+        let day = self.get_string_option(opts, "day", &nv, None)?;
+        self.store_str(obj, "day", &day);
+        let day_period = self.get_string_option(opts, "dayPeriod", &nm, None)?;
+        self.store_str(obj, "dayPeriod", &day_period);
+        let hour = self.get_string_option(opts, "hour", &nv, None)?;
+        self.store_str(obj, "hour", &hour);
+        let minute = self.get_string_option(opts, "minute", &nv, None)?;
+        self.store_str(obj, "minute", &minute);
+        let second = self.get_string_option(opts, "second", &nv, None)?;
+        self.store_str(obj, "second", &second);
+        let fsd = self.get_int_option(opts, "fractionalSecondDigits", 1.0, 3.0, None)?;
+        if let Some(v) = fsd {
+            self.realm
+                .set_hidden_property(obj, "fractionalSecondDigits", NanBox::number(v));
+        }
+        let tzn = self.get_string_option(
+            opts,
+            "timeZoneName",
+            &[
+                "long",
+                "short",
+                "shortOffset",
+                "longOffset",
+                "shortGeneric",
+                "longGeneric",
+            ],
+            None,
+        )?;
+        self.store_str(obj, "timeZoneName", &tzn);
+        // formatMatcher (validated, unused).
+        let _ = self.get_string_option(
+            opts,
+            "formatMatcher",
+            &["basic", "best fit"],
+            Some("best fit"),
+        )?;
+        let date_style = self.get_string_option(
+            opts,
+            "dateStyle",
+            &["full", "long", "medium", "short"],
+            None,
+        )?;
+        self.store_str(obj, "dateStyle", &date_style);
+        let time_style = self.get_string_option(
+            opts,
+            "timeStyle",
+            &["full", "long", "medium", "short"],
+            None,
+        )?;
+        self.store_str(obj, "timeStyle", &time_style);
+        // dateStyle/timeStyle are mutually exclusive with explicit component fields.
+        if (date_style.is_some() || time_style.is_some())
+            && (weekday.is_some()
+                || era.is_some()
+                || year.is_some()
+                || month.is_some()
+                || day.is_some()
+                || hour.is_some()
+                || minute.is_some()
+                || second.is_some()
+                || day_period.is_some()
+                || fsd.is_some()
+                || tzn.is_some())
+        {
+            let m = self.new_str("dateStyle/timeStyle may not be combined with component options");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        Ok(())
+    }
+
+    /// `Intl.NumberFormat`/`DateTimeFormat` `resolvedOptions()` — a fresh object
+    /// reporting the resolved configuration, in spec property order. `fmt` is the
+    /// formatter instance (`None` → a default decimal NumberFormat shape).
+    pub(crate) fn intl_resolved_options(&mut self, fmt: Option<Handle>) -> NanBox {
+        let out = self.realm.new_object();
+        let kind = fmt
+            .and_then(|h| self.realm.get_property(h, "\u{0}intl"))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("number"));
+        let get_str = |this: &Self, key: &str| -> Option<String> {
+            fmt.and_then(|h| this.realm.get_property(h, key))
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_display_string(v))
+        };
+        let get_num = |this: &Self, key: &str| -> Option<f64> {
+            fmt.and_then(|h| this.realm.get_property(h, key))
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_number(v))
+        };
+        let locale = get_str(self, "\u{0}locale").unwrap_or_else(|| String::from("en-US"));
+        let lv = self.new_str(&locale);
+        self.realm.set_property(out, "locale", lv);
+
+        if kind == "number" {
+            let ns = get_str(self, "numberingSystem").unwrap_or_else(|| String::from("latn"));
+            let nsv = self.new_str(&ns);
+            self.realm.set_property(out, "numberingSystem", nsv);
+            let style = get_str(self, "style").unwrap_or_else(|| String::from("decimal"));
+            let sv = self.new_str(&style);
+            self.realm.set_property(out, "style", sv);
+            if style == "currency" {
+                if let Some(c) = get_str(self, "currency") {
+                    let cv = self.new_str(&c);
+                    self.realm.set_property(out, "currency", cv);
+                }
+                let cd = get_str(self, "currencyDisplay").unwrap_or_else(|| String::from("symbol"));
+                let cdv = self.new_str(&cd);
+                self.realm.set_property(out, "currencyDisplay", cdv);
+                let cs = get_str(self, "currencySign").unwrap_or_else(|| String::from("standard"));
+                let csv = self.new_str(&cs);
+                self.realm.set_property(out, "currencySign", csv);
+            }
+            if style == "unit" {
+                if let Some(u) = get_str(self, "unit") {
+                    let uv = self.new_str(&u);
+                    self.realm.set_property(out, "unit", uv);
+                }
+                let ud = get_str(self, "unitDisplay").unwrap_or_else(|| String::from("short"));
+                let udv = self.new_str(&ud);
+                self.realm.set_property(out, "unitDisplay", udv);
+            }
+            // Digit options. Resolve per SetNumberFormatDigitOptions: significant
+            // digits (if requested) are reported; otherwise fraction digits with
+            // style-derived defaults. roundingPriority "auto" with neither set
+            // reports fraction digits only.
+            let mnid = get_num(self, "minimumIntegerDigits").unwrap_or(1.0);
+            self.realm
+                .set_property(out, "minimumIntegerDigits", NanBox::number(mnid));
+            let mnsd = get_num(self, "minimumSignificantDigits");
+            let mxsd = get_num(self, "maximumSignificantDigits");
+            let mnfd_opt = get_num(self, "minimumFractionDigits");
+            let mxfd_opt = get_num(self, "maximumFractionDigits");
+            let priority =
+                get_str(self, "roundingPriority").unwrap_or_else(|| String::from("auto"));
+            let has_sig = mnsd.is_some() || mxsd.is_some();
+            let (def_min, def_max): (f64, f64) = match style.as_str() {
+                "currency" => (2.0, 2.0),
+                "percent" => (0.0, 0.0),
+                _ => (0.0, 3.0),
+            };
+            let report_frac = |this: &mut Self, out: Handle| {
+                let mnfd = mnfd_opt.unwrap_or(def_min);
+                let mxfd = mxfd_opt.unwrap_or_else(|| def_max.max(mnfd));
+                this.realm
+                    .set_property(out, "minimumFractionDigits", NanBox::number(mnfd));
+                this.realm
+                    .set_property(out, "maximumFractionDigits", NanBox::number(mxfd));
+            };
+            let report_sig = |this: &mut Self, out: Handle| {
+                let mnsd = mnsd.unwrap_or(1.0);
+                let mxsd = mxsd.unwrap_or(21.0);
+                this.realm
+                    .set_property(out, "minimumSignificantDigits", NanBox::number(mnsd));
+                this.realm
+                    .set_property(out, "maximumSignificantDigits", NanBox::number(mxsd));
+            };
+            if priority == "morePrecision" || priority == "lessPrecision" {
+                // Both groups present.
+                report_frac(self, out);
+                report_sig(self, out);
+            } else if has_sig {
+                report_sig(self, out);
+            } else {
+                // Significant digits absent → fraction digits (with or without
+                // explicit values, defaulted by style).
+                report_frac(self, out);
+            }
+
+            let ug = fmt
+                .and_then(|h| self.realm.get_property(h, "useGrouping"))
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .unwrap_or_else(|| self.new_str("auto"));
+            self.realm.set_property(out, "useGrouping", ug);
+            let notation = get_str(self, "notation").unwrap_or_else(|| String::from("standard"));
+            let nv = self.new_str(&notation);
+            self.realm.set_property(out, "notation", nv);
+            if notation == "compact" {
+                let cd = get_str(self, "compactDisplay").unwrap_or_else(|| String::from("short"));
+                let cdv = self.new_str(&cd);
+                self.realm.set_property(out, "compactDisplay", cdv);
+            }
+            let sd = get_str(self, "signDisplay").unwrap_or_else(|| String::from("auto"));
+            let sdv = self.new_str(&sd);
+            self.realm.set_property(out, "signDisplay", sdv);
+            let rinc = get_num(self, "roundingIncrement").unwrap_or(1.0);
+            self.realm
+                .set_property(out, "roundingIncrement", NanBox::number(rinc));
+            let rm = get_str(self, "roundingMode").unwrap_or_else(|| String::from("halfExpand"));
+            let rmv = self.new_str(&rm);
+            self.realm.set_property(out, "roundingMode", rmv);
+            let rp = self.new_str(&priority);
+            self.realm.set_property(out, "roundingPriority", rp);
+            let tzd = get_str(self, "trailingZeroDisplay").unwrap_or_else(|| String::from("auto"));
+            let tzv = self.new_str(&tzd);
+            self.realm.set_property(out, "trailingZeroDisplay", tzv);
+        } else {
+            // DateTimeFormat resolvedOptions.
+            let ns = get_str(self, "numberingSystem").unwrap_or_else(|| String::from("latn"));
+            let nsv = self.new_str(&ns);
+            self.realm.set_property(out, "numberingSystem", nsv);
+            let cal = get_str(self, "calendar").unwrap_or_else(|| String::from("gregory"));
+            let cv = self.new_str(&cal);
+            self.realm.set_property(out, "calendar", cv);
+            let tz = get_str(self, "timeZone").unwrap_or_else(|| String::from("UTC"));
+            let tzv = self.new_str(&tz);
+            self.realm.set_property(out, "timeZone", tzv);
+            // Component options that were set, plus hourCycle/hour12.
+            if let Some(hc) = get_str(self, "hourCycle") {
+                let v = self.new_str(&hc);
+                self.realm.set_property(out, "hourCycle", v);
+                let h12 = matches!(hc.as_str(), "h11" | "h12");
+                self.realm.set_property(out, "hour12", NanBox::boolean(h12));
+            } else if let Some(h) = fmt.and_then(|h| self.realm.get_property(h, "hour12")) {
+                self.realm.set_property(out, "hour12", h);
+            }
+            for key in [
                 "weekday",
                 "era",
                 "year",
                 "month",
                 "day",
+                "dayPeriod",
                 "hour",
                 "minute",
                 "second",
-                "hour12",
-                "hourCycle",
-                "dayPeriod",
-                "fractionalSecondDigits",
                 "timeZoneName",
                 "dateStyle",
                 "timeStyle",
-                "timeZone",
             ] {
-                if let Some(v) = self.realm.get_property(opts, key) {
-                    self.realm.set_hidden_property(obj, key, v);
+                if let Some(v) = get_str(self, key) {
+                    let vv = self.new_str(&v);
+                    self.realm.set_property(out, key, vv);
                 }
             }
+            if let Some(v) = get_num(self, "fractionalSecondDigits") {
+                self.realm
+                    .set_property(out, "fractionalSecondDigits", NanBox::number(v));
+            }
         }
-        NanBox::handle(obj.to_raw())
+        NanBox::handle(out.to_raw())
     }
 
     /// Formats `value` per the `Intl.NumberFormat`/`DateTimeFormat` instance `handle`

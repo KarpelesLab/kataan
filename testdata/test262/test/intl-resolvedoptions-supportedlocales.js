@@ -11,7 +11,7 @@ assert.sameValue(ro.numberingSystem, "latn", "numberingSystem");
 assert.sameValue(ro.style, "currency", "style");
 assert.sameValue(ro.currency, "USD", "currency");
 assert.sameValue(ro.minimumFractionDigits, 2, "minimumFractionDigits");
-assert.sameValue(ro.useGrouping, true, "useGrouping default");
+assert.sameValue(ro.useGrouping, "auto", "useGrouping default");
 
 // Defaults for a plain decimal formatter.
 var dr = new Intl.NumberFormat("fr").resolvedOptions();
