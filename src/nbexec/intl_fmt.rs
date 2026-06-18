@@ -349,7 +349,412 @@ fn canonicalize_extension(singleton: char, subs: &[String]) -> Option<String> {
     Some(body)
 }
 
+/// Per-`Intl` service metadata used to build its `.prototype` (the spec
+/// `Symbol.toStringTag`, the hidden brand-marker key stamped on every instance,
+/// and the data-method / accessor-getter names installed on the prototype).
+struct IntlService {
+    /// The constructor's native dispatch id (`N_INTL_NUMBER_FORMAT`, …).
+    ctor_id: u16,
+    /// The spec `[Symbol.toStringTag]` string (e.g. `"Intl.NumberFormat"`).
+    tag: &'static str,
+    /// The hidden internal-slot brand-marker property stamped on every instance and
+    /// required by the prototype methods'/accessors' RequireInternalSlot check.
+    marker: &'static str,
+    /// First-class data-method names installed on the prototype (each a branded
+    /// `N_INTL_PROTO_METHOD` wrapper delegating to the underlying method native).
+    methods: &'static [&'static str],
+    /// The single bound-function accessor on this service's prototype, if any:
+    /// `(accessor-name, underlying-selector)`. NumberFormat/DateTimeFormat have
+    /// `get format`; Collator has `get compare`. These return a per-instance bound
+    /// function rather than being plain data methods (ECMA-402).
+    bound_accessor: Option<(&'static str, &'static str)>,
+}
+
+/// The eight constructor-style `Intl` services that share the
+/// formatter/options-object instance shape (NumberFormat … Segmenter). `Intl.Locale`
+/// and `Intl.DurationFormat` have bespoke prototypes built separately.
+const INTL_SERVICES: &[IntlService] = &[
+    IntlService {
+        ctor_id: N_INTL_NUMBER_FORMAT,
+        tag: "Intl.NumberFormat",
+        marker: "\u{0}brand_nf",
+        methods: &["resolvedOptions", "formatToParts"],
+        bound_accessor: Some(("format", "format")),
+    },
+    IntlService {
+        ctor_id: N_INTL_DATETIME_FORMAT,
+        tag: "Intl.DateTimeFormat",
+        marker: "\u{0}brand_dtf",
+        methods: &["resolvedOptions", "formatToParts"],
+        bound_accessor: Some(("format", "format")),
+    },
+    IntlService {
+        ctor_id: N_INTL_COLLATOR,
+        tag: "Intl.Collator",
+        marker: "\u{0}brand_col",
+        methods: &["resolvedOptions"],
+        bound_accessor: Some(("compare", "compare")),
+    },
+    IntlService {
+        ctor_id: N_INTL_PLURAL_RULES,
+        tag: "Intl.PluralRules",
+        marker: "\u{0}brand_pr",
+        methods: &["resolvedOptions", "select"],
+        bound_accessor: None,
+    },
+    IntlService {
+        ctor_id: N_INTL_LIST_FORMAT,
+        tag: "Intl.ListFormat",
+        marker: "\u{0}brand_lf",
+        methods: &["resolvedOptions", "format", "formatToParts"],
+        bound_accessor: None,
+    },
+    IntlService {
+        ctor_id: N_INTL_REL_TIME,
+        tag: "Intl.RelativeTimeFormat",
+        marker: "\u{0}brand_rtf",
+        methods: &["resolvedOptions", "format", "formatToParts"],
+        bound_accessor: None,
+    },
+    IntlService {
+        ctor_id: N_INTL_DISPLAY_NAMES,
+        tag: "Intl.DisplayNames",
+        marker: "\u{0}brand_dn",
+        methods: &["resolvedOptions", "of"],
+        bound_accessor: None,
+    },
+    IntlService {
+        ctor_id: N_INTL_SEGMENTER,
+        tag: "Intl.Segmenter",
+        marker: "\u{0}brand_seg",
+        methods: &["resolvedOptions", "segment"],
+        bound_accessor: None,
+    },
+];
+
+/// `Intl.Locale.prototype` accessor-getter names (each a `get`-only accessor
+/// brand-checking the `[[InitializedLocale]]` slot).
+const LOCALE_ACCESSORS: &[&str] = &[
+    "baseName",
+    "calendar",
+    "caseFirst",
+    "collation",
+    "hourCycle",
+    "language",
+    "numberingSystem",
+    "numeric",
+    "region",
+    "script",
+];
+
+/// The arity (`length`) of a branded `Intl` prototype data method, given its
+/// owning service ctor id and method name (RelativeTimeFormat's `format`/
+/// `formatToParts` are length 2; everywhere else `format`-family methods are length 1).
+fn intl_method_arity(ctor_id: u16, name: &str) -> u32 {
+    match (ctor_id, name) {
+        (_, "resolvedOptions") => 0,
+        (N_INTL_REL_TIME, "format" | "formatToParts") => 2,
+        _ => 1,
+    }
+}
+
 impl<'a> Interp<'a> {
+    /// The underlying method native id for a branded `Intl` prototype data method.
+    fn intl_underlying_native(name: &str) -> u16 {
+        match name {
+            "format" => N_INTL_FORMAT,
+            "resolvedOptions" => N_INTL_RESOLVED_OPTIONS,
+            "formatToParts" | "format_to_parts" => N_INTL_FORMAT_TO_PARTS,
+            "compare" => N_INTL_COMPARE,
+            "select" => N_INTL_PLURAL_SELECT,
+            "of" => N_INTL_DISPLAY_NAMES_OF,
+            "segment" => N_INTL_SEGMENTER_SEGMENT,
+            "list_format" => N_INTL_LIST_FORMAT_FORMAT,
+            "rel_format" => N_INTL_REL_TIME_FORMAT,
+            _ => 0,
+        }
+    }
+
+    /// Builds (once) and links each `Intl` service constructor's `.prototype`,
+    /// installing the branded methods, the `Symbol.toStringTag`, and the
+    /// `constructor` back-link, and replacing the constructor's default
+    /// `Function.prototype`-derived `.prototype` with a real `%XPrototype%`. Idempotent
+    /// (the per-id cache short-circuits a second call). Invoked at realm setup.
+    pub(crate) fn install_intl_prototypes(&mut self) {
+        for svc in INTL_SERVICES {
+            self.intl_service_prototype(svc);
+        }
+        self.intl_locale_prototype();
+        self.intl_duration_prototype();
+    }
+
+    /// The `Intl` namespace object (where the service constructors live), if set up.
+    fn intl_namespace(&mut self) -> Option<Handle> {
+        self.current
+            .get("Intl")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+    }
+
+    /// The constructor function handle for the `Intl` service whose property name
+    /// on the namespace is `ctor_name` (e.g. `"NumberFormat"`).
+    fn intl_ctor_handle(&mut self, ctor_name: &str) -> Option<Handle> {
+        let ns = self.intl_namespace()?;
+        self.realm
+            .get_property(ns, ctor_name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+    }
+
+    /// Builds and caches the `.prototype` object for one of the formatter-shaped
+    /// `Intl` services, wiring it onto the constructor. Returns the prototype handle.
+    fn intl_service_prototype(&mut self, svc: &IntlService) -> Option<Handle> {
+        if let Some(p) = self.realm.intl_prototype(svc.ctor_id) {
+            return Some(p);
+        }
+        // Map the ctor id back to its namespace property name.
+        let ctor_name = match svc.ctor_id {
+            N_INTL_NUMBER_FORMAT => "NumberFormat",
+            N_INTL_DATETIME_FORMAT => "DateTimeFormat",
+            N_INTL_COLLATOR => "Collator",
+            N_INTL_PLURAL_RULES => "PluralRules",
+            N_INTL_LIST_FORMAT => "ListFormat",
+            N_INTL_REL_TIME => "RelativeTimeFormat",
+            N_INTL_DISPLAY_NAMES => "DisplayNames",
+            N_INTL_SEGMENTER => "Segmenter",
+            _ => return None,
+        };
+        let ctor = self.intl_ctor_handle(ctor_name)?;
+        let obj_proto = self.object_prototype();
+        let proto = self.realm.new_object_with_proto(obj_proto);
+        for &m in svc.methods {
+            // ListFormat/RelativeTimeFormat have distinct `format`/`formatToParts`
+            // method natives; pick the underlying selector accordingly.
+            let selector = match (svc.ctor_id, m) {
+                (N_INTL_LIST_FORMAT, "format") => "list_format",
+                (N_INTL_REL_TIME, "format") => "rel_format",
+                (N_INTL_LIST_FORMAT | N_INTL_REL_TIME, "formatToParts") => "format_to_parts",
+                _ => m,
+            };
+            let arity = intl_method_arity(svc.ctor_id, m);
+            let f = self.make_intl_proto_method(svc.marker, m, selector, arity);
+            self.realm
+                .set_property(proto, m, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(proto, m);
+        }
+        // The bound-function accessor (`get format` / `get compare`).
+        if let Some((acc_name, selector)) = svc.bound_accessor {
+            let label = alloc::format!("get {acc_name}");
+            let marker_v = self.new_str(svc.marker);
+            let sel_v = self.new_str(selector);
+            let pair = self.realm.new_array(alloc::vec![marker_v, sel_v]);
+            let getter = self.realm.new_bound_native(N_INTL_BOUND_GETTER, pair);
+            self.install_fn_name_length(getter, &label, 0);
+            self.realm.define_accessor(
+                proto,
+                acc_name,
+                NanBox::handle(getter.to_raw()),
+                NanBox::undefined(),
+            );
+            self.realm.mark_hidden(proto, acc_name);
+        }
+        // `prototype[Symbol.toStringTag]` — a `{ w:false, e:false, c:true }` string
+        // data property (ECMA-402 11.3.x etc.).
+        self.install_to_string_tag(proto, svc.tag);
+        // `prototype.constructor` back-link (non-enumerable).
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
+        self.link_ctor_prototype(ctor, proto);
+        self.realm.set_intl_prototype(svc.ctor_id, proto);
+        Some(proto)
+    }
+
+    /// A branded prototype data method: an `N_INTL_PROTO_METHOD` bound native whose
+    /// target is the 2-element `[markerKey, underlyingSelector]` array. The wrapper
+    /// (in `call_with_this`) RequireInternalSlot-checks the call's `this` before
+    /// delegating to the underlying method native.
+    fn make_intl_proto_method(
+        &mut self,
+        marker: &str,
+        name: &str,
+        selector: &str,
+        arity: u32,
+    ) -> Handle {
+        let marker_v = self.new_str(marker);
+        let sel_v = self.new_str(selector);
+        let pair = self.realm.new_array(alloc::vec![marker_v, sel_v]);
+        let f = self.realm.new_bound_native(N_INTL_PROTO_METHOD, pair);
+        self.install_fn_name_length(f, name, arity);
+        f
+    }
+
+    /// Installs `proto` as the constructor's `prototype` data property, with the
+    /// built-in `{ writable:false, enumerable:false, configurable:false }`
+    /// attributes (every built-in constructor's `prototype`).
+    fn link_ctor_prototype(&mut self, ctor: Handle, proto: Handle) {
+        self.realm
+            .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
+        self.realm.mark_hidden(ctor, "prototype");
+        self.realm.set_readonly_property(ctor, "prototype");
+        self.realm.set_non_configurable_property(ctor, "prototype");
+    }
+
+    /// Stamps a service's internal-slot brand marker on `obj` and links its
+    /// `[[Prototype]]` to the (lazily built) service prototype — turning a bare
+    /// options-bag object into a branded `Intl.X` instance.
+    fn brand_intl_instance(&mut self, obj: Handle, ctor_id: u16) {
+        let svc = INTL_SERVICES.iter().find(|s| s.ctor_id == ctor_id);
+        if let Some(svc) = svc {
+            self.realm
+                .set_hidden_property(obj, svc.marker, NanBox::boolean(true));
+            if let Some(proto) = self.intl_service_prototype(svc) {
+                self.realm.set_object_proto(obj, Some(proto));
+            }
+        }
+    }
+
+    /// RequireInternalSlot for a branded `Intl` receiver: returns the receiver
+    /// handle when `this` is an object carrying the hidden `marker`, else a
+    /// TypeError. The prototype object itself (which has no marker) is rejected,
+    /// matching the spec's per-method brand check.
+    pub(crate) fn require_intl_slot(
+        &mut self,
+        this: NanBox,
+        marker: &str,
+        what: &str,
+    ) -> Result<Handle, ExecError> {
+        if let Some(h) = this.as_handle().map(Handle::from_raw)
+            && self.realm.get_property(h, marker).is_some()
+        {
+            return Ok(h);
+        }
+        Err(self.type_error(&alloc::format!(
+            "{what} called on an object that is not a valid {what} receiver"
+        )))
+    }
+
+    /// Dispatches an `N_INTL_PROTO_METHOD` wrapper: `target` is the
+    /// `[markerKey, underlyingSelector]` pair. Brand-checks `this`, then delegates to
+    /// the underlying method native with `this` preserved.
+    pub(crate) fn intl_proto_method_dispatch(
+        &mut self,
+        this: NanBox,
+        target: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let pair = self
+            .realm
+            .array_elements(target)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        let marker = pair
+            .first()
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .unwrap_or_default();
+        let selector = pair
+            .get(1)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .unwrap_or_default();
+        self.require_intl_slot(this, &marker, "Intl method")?;
+        let id = Self::intl_underlying_native(&selector);
+        // The underlying method native reads `self.this_val`; preserve the receiver.
+        let saved = core::mem::replace(&mut self.this_val, this);
+        let r = self.call_native(id, args);
+        self.this_val = saved;
+        r
+    }
+
+    /// Dispatches an `N_INTL_BOUND_GETTER` accessor (`get format`/`get compare`):
+    /// `target` is `[markerKey, selector]`. Brand-checks `this`, then returns the
+    /// per-instance bound function — created once and cached on the instance under a
+    /// hidden `\0bound_<selector>` key so repeated reads return the same value
+    /// (`nf.format === nf.format`, per ECMA-402).
+    pub(crate) fn intl_bound_getter_dispatch(
+        &mut self,
+        this: NanBox,
+        target: Handle,
+    ) -> Result<NanBox, ExecError> {
+        let pair = self
+            .realm
+            .array_elements(target)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        let marker = pair
+            .first()
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .unwrap_or_default();
+        let selector = pair
+            .get(1)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .unwrap_or_default();
+        let inst = self.require_intl_slot(this, &marker, "Intl bound-function getter")?;
+        let cache_key = alloc::format!("\u{0}bound_{selector}");
+        if let Some(v) = self.realm.get_property(inst, &cache_key) {
+            return Ok(v);
+        }
+        // Build the bound function: target = [instance, selector].
+        let inst_v = NanBox::handle(inst.to_raw());
+        let sel_v = self.new_str(&selector);
+        let bpair = self.realm.new_array(alloc::vec![inst_v, sel_v]);
+        let bound = self.realm.new_bound_native(N_INTL_BOUND_CALL, bpair);
+        // The bound `format`/`compare`'s `name` is `""` and `length` is 1.
+        self.install_fn_name_length(bound, "", 1);
+        let boundv = NanBox::handle(bound.to_raw());
+        self.realm.set_hidden_property(inst, &cache_key, boundv);
+        Ok(boundv)
+    }
+
+    /// Dispatches an `N_INTL_BOUND_CALL` (the function returned by `get format`/
+    /// `get compare`): `target` is `[instance, selector]`. Formats/compares against
+    /// the captured instance regardless of the call's `this` (a BoundFunction).
+    pub(crate) fn intl_bound_call_dispatch(
+        &mut self,
+        target: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let pair = self
+            .realm
+            .array_elements(target)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        let inst = pair
+            .first()
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw);
+        let selector = pair
+            .get(1)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+            .unwrap_or_default();
+        let Some(inst) = inst else {
+            return Ok(NanBox::undefined());
+        };
+        let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
+        match selector.as_str() {
+            "compare" => {
+                // Delegate to N_INTL_COMPARE with the captured collator as `this`.
+                let saved = core::mem::replace(&mut self.this_val, NanBox::handle(inst.to_raw()));
+                let r = self.call_native(N_INTL_COMPARE, args);
+                self.this_val = saved;
+                r
+            }
+            _ => {
+                // `format`: format the single argument against the captured formatter.
+                let s = self.intl_format_value(inst, arg0);
+                Ok(self.new_str(&s))
+            }
+        }
+    }
+
     /// Builds an `Intl.NumberFormat`/`DateTimeFormat` instance — an object that
     /// captures the relevant options behind a `\0intl` kind marker. Used for both
     /// `new Intl.X(...)` and the callable-without-`new` form.
@@ -366,19 +771,10 @@ impl<'a> Interp<'a> {
         };
         let marker = self.new_str(kind);
         self.realm.set_hidden_property(obj, "\u{0}intl", marker);
-        // `.format` is a readable function (so `typeof nf.format === "function"` and a
-        // member call `nf.format(x)` works); it formats against its `this` formatter.
-        let fmt = self.new_named_native("format", N_INTL_FORMAT);
-        self.realm
-            .set_property(obj, "format", NanBox::handle(fmt.to_raw()));
-        // `resolvedOptions()` reports the (resolved) configuration.
-        let ro = self.new_named_native("resolvedOptions", N_INTL_RESOLVED_OPTIONS);
-        self.realm
-            .set_property(obj, "resolvedOptions", NanBox::handle(ro.to_raw()));
-        // `formatToParts(x)` returns the formatted output broken into typed parts.
-        let ftp = self.new_named_native("formatToParts", N_INTL_FORMAT_TO_PARTS);
-        self.realm
-            .set_property(obj, "formatToParts", NanBox::handle(ftp.to_raw()));
+        // Brand the instance with the service's internal slot and link its
+        // `[[Prototype]]` to `Intl.X.prototype` (where `format`/`resolvedOptions`/
+        // `formatToParts` now live as branded prototype methods).
+        self.brand_intl_instance(obj, id);
         // CanonicalizeLocaleList(locales): the resolved locale is the first
         // requested tag (this engine serves any structurally valid locale), else
         // the default. A malformed tag raises a RangeError here.
@@ -1144,9 +1540,7 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        let f = self.new_named_native("format", N_INTL_REL_TIME_FORMAT);
-        self.realm
-            .set_property(obj, "format", NanBox::handle(f.to_raw()));
+        self.brand_intl_instance(obj, N_INTL_REL_TIME);
         NanBox::handle(obj.to_raw())
     }
 
@@ -1173,9 +1567,7 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        let f = self.new_named_native("of", N_INTL_DISPLAY_NAMES_OF);
-        self.realm
-            .set_property(obj, "of", NanBox::handle(f.to_raw()));
+        self.brand_intl_instance(obj, N_INTL_DISPLAY_NAMES);
         NanBox::handle(obj.to_raw())
     }
 
@@ -1203,9 +1595,7 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        let cmp = self.new_named_native("compare", N_INTL_COMPARE);
-        self.realm
-            .set_property(obj, "compare", NanBox::handle(cmp.to_raw()));
+        self.brand_intl_instance(obj, N_INTL_COLLATOR);
         NanBox::handle(obj.to_raw())
     }
 
@@ -1232,9 +1622,7 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        let f = self.new_named_native("format", N_INTL_LIST_FORMAT_FORMAT);
-        self.realm
-            .set_property(obj, "format", NanBox::handle(f.to_raw()));
+        self.brand_intl_instance(obj, N_INTL_LIST_FORMAT);
         NanBox::handle(obj.to_raw())
     }
 
@@ -1258,9 +1646,7 @@ impl<'a> Interp<'a> {
         {
             self.realm.set_hidden_property(obj, "type", v);
         }
-        let sel = self.new_named_native("select", N_INTL_PLURAL_SELECT);
-        self.realm
-            .set_property(obj, "select", NanBox::handle(sel.to_raw()));
+        self.brand_intl_instance(obj, N_INTL_PLURAL_RULES);
         NanBox::handle(obj.to_raw())
     }
 
@@ -1276,9 +1662,7 @@ impl<'a> Interp<'a> {
         {
             self.realm.set_hidden_property(obj, "granularity", v);
         }
-        let f = self.new_named_native("segment", N_INTL_SEGMENTER_SEGMENT);
-        self.realm
-            .set_property(obj, "segment", NanBox::handle(f.to_raw()));
+        self.brand_intl_instance(obj, N_INTL_SEGMENTER);
         NanBox::handle(obj.to_raw())
     }
 
@@ -2162,4 +2546,518 @@ impl<'a> Interp<'a> {
         let elems: Vec<NanBox> = sorted.iter().map(|s| self.new_str(s)).collect();
         Ok(NanBox::handle(self.realm.new_array(elems).to_raw()))
     }
+
+    // --- Intl.Locale -------------------------------------------------------
+
+    /// Builds (once) and links `Intl.Locale.prototype`: the `language`/`script`/…
+    /// brand-checked `get` accessors, the `maximize`/`minimize`/`toString` methods,
+    /// the `constructor` back-link, and `[Symbol.toStringTag] = "Intl.Locale"`.
+    fn intl_locale_prototype(&mut self) -> Option<Handle> {
+        if let Some(p) = self.realm.intl_prototype(N_INTL_LOCALE) {
+            return Some(p);
+        }
+        let ctor = self.intl_ctor_handle("Locale")?;
+        let obj_proto = self.object_prototype();
+        let proto = self.realm.new_object_with_proto(obj_proto);
+        for &name in LOCALE_ACCESSORS {
+            let label = alloc::format!("get {name}");
+            let target = self.new_str(name);
+            let th = target.as_handle().map(Handle::from_raw).unwrap();
+            let getter = self.realm.new_bound_native(N_INTL_LOCALE_ACCESSOR, th);
+            self.install_fn_name_length(getter, &label, 0);
+            self.realm.define_accessor(
+                proto,
+                name,
+                NanBox::handle(getter.to_raw()),
+                NanBox::undefined(),
+            );
+            self.realm.mark_hidden(proto, name);
+        }
+        for &m in &["maximize", "minimize", "toString"] {
+            let target = self.new_str(m);
+            let th = target.as_handle().map(Handle::from_raw).unwrap();
+            let f = self.realm.new_bound_native(N_INTL_LOCALE_METHOD, th);
+            self.install_fn_name_length(f, m, 0);
+            self.realm
+                .set_property(proto, m, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(proto, m);
+        }
+        self.install_to_string_tag(proto, "Intl.Locale");
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
+        self.link_ctor_prototype(ctor, proto);
+        self.realm.set_intl_prototype(N_INTL_LOCALE, proto);
+        Some(proto)
+    }
+
+    /// `new Intl.Locale(tag, options)` — parses and canonicalizes `tag` (a string or
+    /// another `Locale`), applies the `language`/`script`/`region`/`calendar`/
+    /// `collation`/`hourCycle`/`caseFirst`/`kn`/`numberingSystem` options onto the
+    /// Unicode extension, and stores the resolved components behind hidden slots for
+    /// the prototype accessors. Returns a branded `Intl.Locale` instance.
+    pub(crate) fn make_locale(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        let tag_arg = args.first().copied().unwrap_or(NanBox::undefined());
+        // A `Locale` argument contributes its `[[Locale]]` tag; otherwise ToString
+        // (undefined/symbol throw via the usual coercion / TypeError below).
+        let base_tag = if let Some(h) = tag_arg.as_handle().map(Handle::from_raw)
+            && let Some(t) = self.realm.get_property(h, "\u{0}locale_tag")
+        {
+            self.realm.to_display_string(t)
+        } else if matches!(tag_arg.unpack(), Unpacked::Undefined) {
+            let m = self.new_str("Intl.Locale: tag must be a string or Locale");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        } else {
+            self.coerce_to_string(tag_arg)?
+        };
+        let Some(canon) = canonicalize_locale_id(&base_tag) else {
+            let m = self.new_str(&alloc::format!("invalid language tag: {base_tag}"));
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        };
+        // Read the option overrides (each validated like the formatter options).
+        let opts = args
+            .get(1)
+            .copied()
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.coerce_to_object(v))
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw);
+        let language = self.get_string_option(opts, "language", &[], None)?;
+        let script = self.get_string_option(opts, "script", &[], None)?;
+        let region = self.get_string_option(opts, "region", &[], None)?;
+        let calendar = self.get_string_option(opts, "calendar", &[], None)?;
+        let collation = self.get_string_option(opts, "collation", &[], None)?;
+        let hour_cycle =
+            self.get_string_option(opts, "hourCycle", &["h11", "h12", "h23", "h24"], None)?;
+        let case_first =
+            self.get_string_option(opts, "caseFirst", &["upper", "lower", "false"], None)?;
+        let numeric = self.get_bool_option(opts, "numeric", None)?;
+        let numbering = self.get_string_option(opts, "numberingSystem", &[], None)?;
+
+        let mut parsed = ParsedLocale::from_canonical(&canon);
+        if let Some(l) = &language {
+            parsed.language = l.to_ascii_lowercase();
+        }
+        if let Some(s) = &script {
+            parsed.script = Some(titlecase_script(s));
+        }
+        if let Some(r) = &region {
+            parsed.region = Some(r.to_ascii_uppercase());
+        }
+        if let Some(c) = &calendar {
+            parsed.set_keyword("ca", c);
+        }
+        if let Some(c) = &collation {
+            parsed.set_keyword("co", c);
+        }
+        if let Some(h) = &hour_cycle {
+            parsed.set_keyword("hc", h);
+        }
+        if let Some(k) = &case_first {
+            parsed.set_keyword("kf", k);
+        }
+        if let Some(b) = numeric {
+            parsed.set_keyword("kn", if b { "true" } else { "false" });
+        }
+        if let Some(n) = &numbering {
+            parsed.set_keyword("nu", n);
+        }
+        let final_tag = parsed.to_tag();
+        let obj = self.realm.new_object();
+        let tagv = self.new_str(&final_tag);
+        self.realm.set_hidden_property(obj, "\u{0}locale_tag", tagv);
+        // Stash the resolved components so the accessors read them cheaply.
+        let store = |this: &mut Self, key: &str, val: Option<&str>| {
+            if let Some(v) = val {
+                let sv = this.new_str(v);
+                this.realm.set_hidden_property(obj, key, sv);
+            }
+        };
+        store(self, "\u{0}loc_language", Some(&parsed.language));
+        store(self, "\u{0}loc_script", parsed.script.as_deref());
+        store(self, "\u{0}loc_region", parsed.region.as_deref());
+        store(self, "\u{0}loc_baseName", Some(&parsed.base_name()));
+        store(self, "\u{0}loc_ca", parsed.keyword("ca"));
+        store(self, "\u{0}loc_co", parsed.keyword("co"));
+        store(self, "\u{0}loc_hc", parsed.keyword("hc"));
+        store(self, "\u{0}loc_kf", parsed.keyword("kf"));
+        store(self, "\u{0}loc_nu", parsed.keyword("nu"));
+        // `numeric` is the boolean form of the `kn` keyword.
+        let kn = parsed.keyword("kn");
+        let numeric_val = matches!(kn, Some("true") | Some(""));
+        self.realm
+            .set_hidden_property(obj, "\u{0}loc_numeric", NanBox::boolean(numeric_val));
+        // Brand + link to the prototype.
+        self.realm
+            .set_hidden_property(obj, "\u{0}brand_loc", NanBox::boolean(true));
+        if let Some(proto) = self.intl_locale_prototype() {
+            self.realm.set_object_proto(obj, Some(proto));
+        }
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    /// Dispatches an `Intl.Locale` `get` accessor: brand-checks `this`, then returns
+    /// the stored component (a string, or `undefined`; `numeric` is a boolean).
+    pub(crate) fn intl_locale_accessor_dispatch(
+        &mut self,
+        this: NanBox,
+        name: &str,
+    ) -> Result<NanBox, ExecError> {
+        let h = self.require_intl_slot(this, "\u{0}brand_loc", "Intl.Locale.prototype getter")?;
+        let read = |this: &Self, key: &str| -> NanBox {
+            this.realm
+                .get_property(h, key)
+                .unwrap_or(NanBox::undefined())
+        };
+        Ok(match name {
+            "language" => read(self, "\u{0}loc_language"),
+            "script" => read(self, "\u{0}loc_script"),
+            "region" => read(self, "\u{0}loc_region"),
+            "baseName" => read(self, "\u{0}loc_baseName"),
+            "calendar" => read(self, "\u{0}loc_ca"),
+            "collation" => read(self, "\u{0}loc_co"),
+            "hourCycle" => read(self, "\u{0}loc_hc"),
+            "caseFirst" => read(self, "\u{0}loc_kf"),
+            "numberingSystem" => read(self, "\u{0}loc_nu"),
+            "numeric" => read(self, "\u{0}loc_numeric"),
+            _ => NanBox::undefined(),
+        })
+    }
+
+    /// Dispatches an `Intl.Locale` method (`maximize`/`minimize`/`toString`):
+    /// brand-checks `this`. `toString` returns the canonical tag; `maximize`/
+    /// `minimize` return a fresh `Locale` with the same tag (no CLDR likely-subtags
+    /// data, so the tag is returned unchanged — structurally valid).
+    pub(crate) fn intl_locale_method_dispatch(
+        &mut self,
+        this: NanBox,
+        name: &str,
+    ) -> Result<NanBox, ExecError> {
+        let h = self.require_intl_slot(this, "\u{0}brand_loc", "Intl.Locale.prototype method")?;
+        let tag = self
+            .realm
+            .get_property(h, "\u{0}locale_tag")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
+        match name {
+            "toString" => Ok(self.new_str(&tag)),
+            // maximize/minimize: rebuild a Locale from the (unchanged) tag.
+            _ => {
+                let tagv = self.new_str(&tag);
+                self.make_locale(&[tagv])
+            }
+        }
+    }
+
+    // --- Intl.DurationFormat ----------------------------------------------
+
+    /// Builds (once) and links `Intl.DurationFormat.prototype` with branded
+    /// `format`/`formatToParts`/`resolvedOptions` methods, the `constructor`
+    /// back-link, and `[Symbol.toStringTag] = "Intl.DurationFormat"`.
+    fn intl_duration_prototype(&mut self) -> Option<Handle> {
+        if let Some(p) = self.realm.intl_prototype(N_INTL_DURATION_FORMAT) {
+            return Some(p);
+        }
+        let ctor = self.intl_ctor_handle("DurationFormat")?;
+        let obj_proto = self.object_prototype();
+        let proto = self.realm.new_object_with_proto(obj_proto);
+        for &(m, arity) in &[
+            ("resolvedOptions", 0u32),
+            ("format", 1),
+            ("formatToParts", 1),
+        ] {
+            let target = self.new_str(m);
+            let th = target.as_handle().map(Handle::from_raw).unwrap();
+            let f = self.realm.new_bound_native(N_INTL_DURATION_METHOD, th);
+            self.install_fn_name_length(f, m, arity);
+            self.realm
+                .set_property(proto, m, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(proto, m);
+        }
+        self.install_to_string_tag(proto, "Intl.DurationFormat");
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
+        self.link_ctor_prototype(ctor, proto);
+        self.realm.set_intl_prototype(N_INTL_DURATION_FORMAT, proto);
+        Some(proto)
+    }
+
+    /// `new Intl.DurationFormat(locales, options)` — a branded instance capturing the
+    /// resolved locale and `style`/`numberingSystem` options.
+    pub(crate) fn make_duration_format(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        let obj = self.realm.new_object();
+        let requested =
+            self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
+        let locale = requested
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| String::from("en-US"));
+        let locv = self.new_str(&locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
+        let opts = args
+            .get(1)
+            .copied()
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.coerce_to_object(v))
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw);
+        let style = self
+            .get_string_option(
+                opts,
+                "style",
+                &["long", "short", "narrow", "digital"],
+                Some("short"),
+            )?
+            .unwrap();
+        self.store_str(obj, "style", &Some(style));
+        let nu = self.get_string_option(opts, "numberingSystem", &[], None)?;
+        self.store_str(obj, "numberingSystem", &nu);
+        self.realm
+            .set_hidden_property(obj, "\u{0}brand_df", NanBox::boolean(true));
+        if let Some(proto) = self.intl_duration_prototype() {
+            self.realm.set_object_proto(obj, Some(proto));
+        }
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    /// Dispatches an `Intl.DurationFormat` prototype method: brand-checks `this`.
+    pub(crate) fn intl_duration_method_dispatch(
+        &mut self,
+        this: NanBox,
+        name: &str,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let h = self.require_intl_slot(
+            this,
+            "\u{0}brand_df",
+            "Intl.DurationFormat.prototype method",
+        )?;
+        match name {
+            "resolvedOptions" => {
+                let out = self.realm.new_object();
+                let locale = self
+                    .realm
+                    .get_property(h, "\u{0}locale")
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_else(|| String::from("en-US"));
+                let lv = self.new_str(&locale);
+                self.realm.set_property(out, "locale", lv);
+                let style = self
+                    .realm
+                    .get_property(h, "style")
+                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_else(|| String::from("short"));
+                let sv = self.new_str(&style);
+                self.realm.set_property(out, "style", sv);
+                Ok(NanBox::handle(out.to_raw()))
+            }
+            "formatToParts" => Ok(NanBox::handle(self.realm.new_array(Vec::new()).to_raw())),
+            // `format(duration)` — a minimal English rendering of the duration record's
+            // numeric fields (no CLDR unit patterns yet).
+            _ => {
+                let s = self.duration_format_string(args.first().copied());
+                Ok(self.new_str(&s))
+            }
+        }
+    }
+
+    /// A minimal `Intl.DurationFormat.prototype.format` rendering: joins the present
+    /// `years`/`months`/…/`nanoseconds` fields of the duration record as
+    /// `"<n> <unit>"` segments separated by `, `.
+    fn duration_format_string(&mut self, duration: Option<NanBox>) -> String {
+        let Some(h) = duration.and_then(|v| v.as_handle()).map(Handle::from_raw) else {
+            return String::new();
+        };
+        const FIELDS: &[(&str, &str)] = &[
+            ("years", "yr"),
+            ("months", "mth"),
+            ("weeks", "wk"),
+            ("days", "day"),
+            ("hours", "hr"),
+            ("minutes", "min"),
+            ("seconds", "sec"),
+            ("milliseconds", "ms"),
+            ("microseconds", "μs"),
+            ("nanoseconds", "ns"),
+        ];
+        let mut parts: Vec<String> = Vec::new();
+        for (field, unit) in FIELDS {
+            if let Some(v) = self.realm.get_property(h, field)
+                && !matches!(v.unpack(), Unpacked::Undefined)
+            {
+                let n = self.realm.to_number(v);
+                if n != 0.0 {
+                    parts.push(alloc::format!("{n} {unit}"));
+                }
+            }
+        }
+        parts.join(", ")
+    }
+}
+
+/// A parsed `unicode_locale_id` split into core subtags plus its `-u-` keyword
+/// list, used by `Intl.Locale` to apply option overrides and rebuild the tag.
+struct ParsedLocale {
+    language: String,
+    script: Option<String>,
+    region: Option<String>,
+    variants: Vec<String>,
+    /// `-u-` keyword `(key, value)` pairs (value may be empty for `kn`/`true`).
+    keywords: Vec<(String, String)>,
+    /// Any other extensions (`-t-`, `-x-`, …) preserved verbatim after the `-u-` block.
+    other_ext: Vec<String>,
+}
+
+impl ParsedLocale {
+    /// Splits a canonical tag (the output of [`canonicalize_locale_id`]) into its
+    /// components and `-u-` keywords.
+    fn from_canonical(canon: &str) -> Self {
+        let mut language = String::new();
+        let mut script = None;
+        let mut region = None;
+        let mut variants = Vec::new();
+        let mut keywords = Vec::new();
+        let mut other_ext = Vec::new();
+        let parts: Vec<&str> = canon.split('-').collect();
+        let mut i = 0;
+        if i < parts.len() {
+            language = parts[i].to_ascii_lowercase();
+            i += 1;
+        }
+        if i < parts.len()
+            && parts[i].len() == 4
+            && parts[i].bytes().all(|b| b.is_ascii_alphabetic())
+        {
+            script = Some(titlecase_script(parts[i]));
+            i += 1;
+        }
+        if i < parts.len()
+            && ((parts[i].len() == 2 && parts[i].bytes().all(|b| b.is_ascii_alphabetic()))
+                || (parts[i].len() == 3 && parts[i].bytes().all(|b| b.is_ascii_digit())))
+        {
+            region = Some(parts[i].to_ascii_uppercase());
+            i += 1;
+        }
+        // Variants until a singleton.
+        while i < parts.len() && parts[i].len() != 1 {
+            variants.push(parts[i].to_ascii_lowercase());
+            i += 1;
+        }
+        // Extensions.
+        while i < parts.len() {
+            let singleton = parts[i];
+            if singleton == "u" {
+                i += 1;
+                // A `-u-` block alternates 2-char keys with their (3-8 char) values.
+                // Leading attributes (3-8 char, no key) are rare; skip until the first
+                // 2-char key, then read each key's run of non-key value subtags.
+                while i < parts.len() && parts[i].len() != 1 {
+                    if parts[i].len() != 2 {
+                        // An attribute (no key) — preserve as a bare keyword-less subtag.
+                        i += 1;
+                        continue;
+                    }
+                    let key = String::from(parts[i]);
+                    i += 1;
+                    let mut vals: Vec<String> = Vec::new();
+                    while i < parts.len() && parts[i].len() != 1 && parts[i].len() != 2 {
+                        vals.push(String::from(parts[i]));
+                        i += 1;
+                    }
+                    keywords.push((key, vals.join("-")));
+                }
+            } else {
+                // Preserve other extensions verbatim.
+                let mut buf = alloc::vec![String::from(singleton)];
+                i += 1;
+                while i < parts.len() && parts[i].len() != 1 {
+                    buf.push(String::from(parts[i]));
+                    i += 1;
+                }
+                other_ext.push(buf.join("-"));
+            }
+        }
+        ParsedLocale {
+            language,
+            script,
+            region,
+            variants,
+            keywords,
+            other_ext,
+        }
+    }
+
+    /// The value of `-u-` keyword `key`, if present (empty string for a bare key).
+    fn keyword(&self, key: &str) -> Option<&str> {
+        self.keywords
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Sets (or replaces) a `-u-` keyword. A `kf`/`kn` `"false"`/`"true"` is kept
+    /// as-is; the accessors interpret it.
+    fn set_keyword(&mut self, key: &str, val: &str) {
+        let v = val.to_ascii_lowercase();
+        if let Some(e) = self.keywords.iter_mut().find(|(k, _)| k == key) {
+            e.1 = v;
+        } else {
+            self.keywords.push((String::from(key), v));
+        }
+    }
+
+    /// The `baseName`: `language(-script)?(-region)?(-variants)?` (no extensions).
+    fn base_name(&self) -> String {
+        let mut out = self.language.clone();
+        if let Some(s) = &self.script {
+            out.push('-');
+            out.push_str(s);
+        }
+        if let Some(r) = &self.region {
+            out.push('-');
+            out.push_str(r);
+        }
+        for v in &self.variants {
+            out.push('-');
+            out.push_str(v);
+        }
+        out
+    }
+
+    /// Rebuilds the full canonical tag (base name + sorted `-u-` keywords + other
+    /// extensions).
+    fn to_tag(&self) -> String {
+        let mut out = self.base_name();
+        let mut kw = self.keywords.clone();
+        kw.sort_by(|a, b| a.0.cmp(&b.0));
+        if !kw.is_empty() {
+            out.push_str("-u");
+            for (k, v) in &kw {
+                out.push('-');
+                out.push_str(k);
+                if !v.is_empty() && v != "true" {
+                    out.push('-');
+                    out.push_str(v);
+                }
+            }
+        }
+        for e in &self.other_ext {
+            out.push('-');
+            out.push_str(e);
+        }
+        out
+    }
+}
+
+/// Titlecases a 4-letter script subtag (`latn` → `Latn`).
+fn titlecase_script(s: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i == 0 {
+            out.push(c.to_ascii_uppercase());
+        } else {
+            out.push(c.to_ascii_lowercase());
+        }
+    }
+    out
 }
