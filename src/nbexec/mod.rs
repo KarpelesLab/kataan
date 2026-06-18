@@ -332,7 +332,14 @@ pub struct Interp<'a> {
     /// Next WASM-instance id to hand out.
     wasm_next_id: u32,
     /// When running a generator body eagerly, the buffer `yield` appends to.
+    /// (Retained for built-in eager iterables — Map/Set entries, regexp matches —
+    /// and as the degraded fallback for complex yield-bearing operands the lazy
+    /// machine does not reify.)
     gen_sink: Option<Vec<NanBox>>,
+    /// Suspended lazy-generator activations, indexed by the `GEN_FRAME` id stored
+    /// on the generator object. A vacated slot (a finished generator) is `None`
+    /// and may be reused by the next generator call.
+    gen_frames: Vec<Option<generator::GenFrame<'a>>>,
     /// The `Symbol.for` global registry: shared symbols keyed by string.
     symbol_registry: alloc::collections::BTreeMap<String, NanBox>,
     /// Cached well-known symbols (e.g. `Symbol.iterator`), created on first use.
@@ -634,6 +641,12 @@ const N_ITER_CONCAT_NEXT: u16 = 345;
 const N_GEN_ITER_NEXT: u16 = 346;
 /// The eager-generator iterator's `return` method.
 const N_GEN_ITER_RETURN: u16 = 347;
+/// A lazy generator's `next(v)` — resumes the suspended frame, injecting `v`.
+const N_GEN_NEXT: u16 = 520;
+/// A lazy generator's `return(v)` — resumes as `return v` (runs `finally`s).
+const N_GEN_RETURN: u16 = 521;
+/// A lazy generator's `throw(e)` — resumes by throwing `e` at the suspension.
+const N_GEN_THROW: u16 = 522;
 /// `Object.prototype.__defineGetter__(P, getter)` (Annex B).
 const N_OBJ_DEFINE_GETTER: u16 = 348;
 /// `Object.prototype.__defineSetter__(P, setter)` (Annex B).
@@ -1367,6 +1380,9 @@ const GEN_BUF: &str = "\u{0}gbuf";
 const GEN_IDX: &str = "\u{0}gidx";
 /// A generator's `return` value, surfaced once after its yields are exhausted.
 const GEN_RET: &str = "\u{0}gret";
+/// Hidden slot on a *lazy* generator object: the index of its suspended
+/// [`generator::GenFrame`] in `Interp::gen_frames`.
+const GEN_FRAME: &str = "\u{0}gframe";
 /// Reserved hidden slots for a lazy ES2025 iterator-helper object (the object
 /// returned by `Iterator.prototype.{map,filter,take,drop,flatMap}` and
 /// `Iterator.from`). The helper pulls from its underlying iterator one step at a
@@ -1557,6 +1573,7 @@ mod call;
 mod class;
 mod convert;
 mod expr;
+mod generator;
 mod intl_fmt;
 mod iterator;
 mod json;
@@ -1611,6 +1628,7 @@ impl<'a> Interp<'a> {
             wasm_mem_objs: alloc::collections::BTreeMap::new(),
             wasm_next_id: 0,
             gen_sink: None,
+            gen_frames: Vec::new(),
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
             tagged_template_cache: alloc::collections::BTreeMap::new(),

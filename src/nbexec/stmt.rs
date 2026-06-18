@@ -308,61 +308,74 @@ impl<'a> Interp<'a> {
     }
 
     pub(crate) fn exec_var(&mut self, decl: &'a VarDecl) -> Result<(), ExecError> {
-        let is_var = matches!(decl.kind, crate::ast::VarDeclKind::Var);
         for d in &decl.declarations {
-            // A bare `var x;` (no initializer) must not clobber the value a
-            // hoisted binding may already hold from an earlier assignment.
-            if is_var && d.init.is_none() {
-                continue;
-            }
-            // For `const C = class {}`, hand the binding name to `make_class` so the
-            // anonymous class's `name` is set before its static initializers run.
-            if let (Some(Expr::Class(c)), BindingTarget::Ident(Ident { name, .. })) =
-                (&d.init, &d.target)
-                && c.id.is_none()
-            {
-                self.pending_class_name = Some(name);
-            }
-            let value = match &d.init {
-                Some(e) => self.eval(e)?,
-                None => NanBox::undefined(),
-            };
-            self.pending_class_name = None;
-            // An anonymous function/class assigned to a name takes that name
-            // (`const f = function(){}` → `f.name === "f"`).
-            if let (Some(init), BindingTarget::Ident(Ident { name, .. })) = (&d.init, &d.target)
-                && matches!(init, Expr::Function(_) | Expr::Class(_) | Expr::Arrow(_))
-            {
-                self.set_fn_name(value, name);
-            }
-            // `var` assigns to its hoisted binding (in the function/program
-            // scope), so a declaration inside a block updates the same variable.
-            if is_var && let BindingTarget::Ident(Ident { name, .. }) = &d.target {
-                // Inside `with (obj)`, a `var x = v` *initializer* is an ordinary
-                // assignment whose target resolves through the scope chain, so when
-                // the with-object provides `x` it writes that property (via `[[Set]]`),
-                // not the hoisted binding (`with ({foo:…}) { var foo = v }` sets `obj.foo`).
-                if self.with_binding(name).is_some() {
-                    self.assign_to_name(name, value)?;
-                    continue;
-                }
-                if !self.current.set(name, value) {
-                    self.current.declare(name, value);
-                }
-                // A global-scope `var x = v` also publishes `x` on the global
-                // object (so `this.x` / `globalThis.x` see it).
-                self.publish_global_var(name, value);
-                continue;
-            }
-            // A simple `const x = …` binding is tracked so reassignment throws.
-            if matches!(decl.kind, crate::ast::VarDeclKind::Const)
-                && let BindingTarget::Ident(Ident { name, .. }) = &d.target
-            {
-                self.current.declare_const(name, value);
-                continue;
-            }
-            self.bind_pattern(&d.target, value)?;
+            self.exec_single_declarator(decl.kind, d)?;
         }
+        Ok(())
+    }
+
+    /// Binds one `var`/`let`/`const` declarator (evaluating its initializer).
+    /// Factored out of [`Interp::exec_var`] so the lazy-generator machine can
+    /// bind a yield-free declarator in one shot.
+    pub(crate) fn exec_single_declarator(
+        &mut self,
+        kind: crate::ast::VarDeclKind,
+        d: &'a crate::ast::VarDeclarator,
+    ) -> Result<(), ExecError> {
+        let is_var = matches!(kind, crate::ast::VarDeclKind::Var);
+        // A bare `var x;` (no initializer) must not clobber the value a
+        // hoisted binding may already hold from an earlier assignment.
+        if is_var && d.init.is_none() {
+            return Ok(());
+        }
+        // For `const C = class {}`, hand the binding name to `make_class` so the
+        // anonymous class's `name` is set before its static initializers run.
+        if let (Some(Expr::Class(c)), BindingTarget::Ident(Ident { name, .. })) =
+            (&d.init, &d.target)
+            && c.id.is_none()
+        {
+            self.pending_class_name = Some(&**name);
+        }
+        let value = match &d.init {
+            Some(e) => self.eval(e)?,
+            None => NanBox::undefined(),
+        };
+        self.pending_class_name = None;
+        // An anonymous function/class assigned to a name takes that name
+        // (`const f = function(){}` → `f.name === "f"`).
+        if let (Some(init), BindingTarget::Ident(Ident { name, .. })) = (&d.init, &d.target)
+            && matches!(init, Expr::Function(_) | Expr::Class(_) | Expr::Arrow(_))
+        {
+            self.set_fn_name(value, name);
+        }
+        // `var` assigns to its hoisted binding (in the function/program
+        // scope), so a declaration inside a block updates the same variable.
+        if is_var && let BindingTarget::Ident(Ident { name, .. }) = &d.target {
+            let name: &str = name;
+            // Inside `with (obj)`, a `var x = v` *initializer* is an ordinary
+            // assignment whose target resolves through the scope chain, so when
+            // the with-object provides `x` it writes that property (via `[[Set]]`),
+            // not the hoisted binding (`with ({foo:…}) { var foo = v }` sets `obj.foo`).
+            if self.with_binding(name).is_some() {
+                self.assign_to_name(name, value)?;
+                return Ok(());
+            }
+            if !self.current.set(name, value) {
+                self.current.declare(name, value);
+            }
+            // A global-scope `var x = v` also publishes `x` on the global
+            // object (so `this.x` / `globalThis.x` see it).
+            self.publish_global_var(name, value);
+            return Ok(());
+        }
+        // A simple `const x = …` binding is tracked so reassignment throws.
+        if matches!(kind, crate::ast::VarDeclKind::Const)
+            && let BindingTarget::Ident(Ident { name, .. }) = &d.target
+        {
+            self.current.declare_const(name, value);
+            return Ok(());
+        }
+        self.bind_pattern(&d.target, value)?;
         Ok(())
     }
 
@@ -966,7 +979,7 @@ impl<'a> Interp<'a> {
     /// Assigns `value` to the identifier reference `name`, applying `with`-object
     /// shadowing, the `const` reassignment check, and the strict/sloppy rules for
     /// an unresolvable reference. Shared by `assign_to` and `set_assign_ref`.
-    fn assign_to_name(&mut self, name: &str, value: NanBox) -> Result<(), ExecError> {
+    pub(crate) fn assign_to_name(&mut self, name: &str, value: NanBox) -> Result<(), ExecError> {
         // A bare identifier inside `with (obj)` assigns to the with-object's
         // property (via `[[Set]]`, so setters fire) when it provides the name.
         if let Some(h) = self.with_binding(name) {
