@@ -252,9 +252,16 @@ impl<'a> Interp<'a> {
         // `valueOf`/`toString` (and may carry a user-overridden one or an
         // `@@toPrimitive`), so it must go through OrdinaryToPrimitive below — not
         // be returned as-is.
+        // A `Date` is an exotic object with no `object_keys`, but it has a
+        // meaningful `[Symbol.toPrimitive]` / `valueOf` (its timestamp) and so must
+        // run OrdinaryToPrimitive — not be returned as-is (which would make
+        // `Date.prototype.toJSON.call(date)` see the Date object rather than its
+        // numeric time, and call `toISOString` even on an invalid date).
         if self.realm.string_value(h).is_some()
             || self.realm.is_array(h)
-            || (self.realm.object_keys(h).is_none() && self.realm.typed_kind(h).is_none())
+            || (self.realm.object_keys(h).is_none()
+                && self.realm.typed_kind(h).is_none()
+                && self.realm.date_at(h).is_none())
         {
             return Ok(v);
         }

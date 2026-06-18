@@ -345,6 +345,33 @@ impl Object {
         }
     }
 
+    /// Like [`set`](Object::set) but bypasses the extensibility / frozen /
+    /// readonly guards: it always stores (creating a new slot if needed). Used by
+    /// `[[DefineOwnProperty]]`, which validates configurability/extensibility
+    /// itself and must be able to materialize a data slot even on a non-extensible
+    /// object (e.g. converting an existing accessor property to a data property, or
+    /// changing the value of a configurable-but-non-extensible property).
+    pub fn force_set(&mut self, key: &str, value: NanBox) {
+        match &mut self.data {
+            ObjectData::Shaped { shape, slots } => {
+                if let Some(slot) = shape.lookup(key) {
+                    slots[slot as usize] = value;
+                } else {
+                    *shape = shape.transition(key);
+                    slots.push(value);
+                }
+            }
+            ObjectData::Dict { order, map } => {
+                if let Some(v) = map.get_mut(key) {
+                    *v = value;
+                } else {
+                    order.push(Box::from(key));
+                    map.insert(Box::from(key), value);
+                }
+            }
+        }
+    }
+
     /// If adding `key` would be a *new* own property that pushes the own-data
     /// count past `threshold`, converts the object to dictionary mode in place so
     /// the subsequent [`set`](Object::set) — and every later add — creates no

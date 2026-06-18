@@ -815,13 +815,18 @@ impl<'a> Interp<'a> {
                 if let Some(i) = array_index {
                     self.realm.set_element(obj, i, value);
                 } else {
-                    self.realm.set_property(obj, key, value);
+                    // `[[DefineOwnProperty]]` validates extensibility itself, so the
+                    // store must bypass the ordinary non-extensible / frozen guard
+                    // (e.g. converting an accessor to a data property on a sealed
+                    // object, or changing a configurable property's value after
+                    // `preventExtensions`).
+                    self.realm.force_set_property(obj, key, value);
                 }
             } else if !is_own || existing_is_accessor {
                 if let Some(i) = array_index {
                     self.realm.set_element(obj, i, NanBox::undefined());
                 } else {
-                    self.realm.set_property(obj, key, NanBox::undefined());
+                    self.realm.force_set_property(obj, key, NanBox::undefined());
                 }
             }
             // Writable: explicit field, else preserved on redefine, else default false.
@@ -1938,6 +1943,20 @@ impl<'a> Interp<'a> {
     /// read-only/frozen, and either already own or the object is extensible. The shared
     /// predicate behind `allow_property_write` (which adds the strict-mode throw) and
     /// `Reflect.set` (which returns the boolean).
+    /// If `h` is a String (a string primitive cell or a String wrapper object),
+    /// returns its UTF-16 length — the count of own index properties ToObject(str)
+    /// exposes (`"0".."length-1"`). `None` for any non-string.
+    pub(crate) fn string_index_count(&self, h: crate::heap::Handle) -> Option<usize> {
+        // A String wrapper object boxes its primitive under PRIM_WRAP.
+        let sh = if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
+            prim.as_handle().map(Handle::from_raw)?
+        } else {
+            h
+        };
+        let bytes = self.realm.string_bytes(sh)?;
+        Some(crate::wtf8::utf16_len(&bytes))
+    }
+
     pub(crate) fn can_write_property(&self, handle: crate::heap::Handle, key: &str) -> bool {
         let add_to_non_extensible =
             !self.realm.has_own(handle, key) && !self.realm.is_extensible(handle);

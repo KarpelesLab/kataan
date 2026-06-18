@@ -247,51 +247,8 @@ impl<'a> Interp<'a> {
                 NanBox::undefined()
             }
             N_JSON_STRINGIFY => {
-                // Optional `replacer` (arg 1): a function transforms each value,
-                // an array allowlists object keys.
-                let mut value = arg(0);
-                if let Some(rh) = arg(1).as_handle().map(Handle::from_raw) {
-                    if self.is_callable(rh) {
-                        let holder = self.realm.new_object();
-                        self.realm.set_property(holder, "", value);
-                        value = self.json_apply_replacer(holder, "", value, arg(1))?;
-                    } else if self.realm.is_array(rh) {
-                        let allow: Vec<String> = self
-                            .realm
-                            .array_elements(rh)
-                            .map(<[_]>::to_vec)
-                            .unwrap_or_default()
-                            .iter()
-                            .map(|e| self.realm.to_display_string(*e))
-                            .collect();
-                        value = self.json_filter_keys(value, &allow);
-                    }
-                }
-                // Optional `space` (arg 2): a number → that many spaces, a string
-                // → that string (both capped at 10), else compact output.
-                let space = arg(2);
-                let indent = if let Some(n) = space.as_number() {
-                    " ".repeat((n.max(0.0) as usize).min(10))
-                } else if let Some(s) = space
-                    .as_handle()
-                    .and_then(|r| self.realm.string_value(Handle::from_raw(r)))
-                {
-                    s.chars().take(10).collect()
-                } else {
-                    String::new()
-                };
-                let result = if indent.is_empty() {
-                    // Interpreter-aware: honors `toJSON` and invokes getters.
-                    self.json_to_string(value)?
-                } else {
-                    match crate::json::try_stringify_pretty(&self.realm, value, &indent) {
-                        Ok(r) => r,
-                        Err(crate::json::Circular) => {
-                            let m = self.new_str("Converting circular structure to JSON");
-                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                        }
-                    }
-                };
+                let value = arg(0);
+                let result = self.json_stringify(value, arg(1), arg(2))?;
                 match result {
                     Some(s) => NanBox::handle(self.realm.new_string(&s).to_raw()),
                     None => NanBox::undefined(),
@@ -318,6 +275,60 @@ impl<'a> Interp<'a> {
                 }
                 value
             }
+            // `JSON.rawJSON(text)` — validates `ToString(text)` as a single JSON
+            // primitive (number/string/boolean/null, no surrounding whitespace) and
+            // returns a frozen, null-prototype object `{ rawJSON: text }` carrying an
+            // internal RawJSON brand. A BigInt argument is a TypeError (ToString of a
+            // BigInt is allowed, but the resulting "123" parses fine — the spec only
+            // forbids non-primitive/whitespace text).
+            N_JSON_RAW => {
+                // ToString(value); a Symbol throws (ToString of a Symbol is a
+                // TypeError), handled by `coerce_to_string`.
+                let text = self.coerce_to_string(arg(0))?;
+                // Reject empty text or any leading/trailing JSON whitespace.
+                let is_ws = |c: char| matches!(c, '\u{20}' | '\u{09}' | '\u{0A}' | '\u{0D}');
+                let first = text.chars().next();
+                let last = text.chars().next_back();
+                if text.is_empty() || first.is_some_and(is_ws) || last.is_some_and(is_ws) {
+                    return Err(self.json_error("Invalid raw JSON text"));
+                }
+                // Must parse as exactly one JSON value, and that value must be a
+                // primitive (not an object/array).
+                let chars: Vec<char> = text.chars().collect();
+                let mut pos = 0;
+                let parsed = self.json_parse(&chars, &mut pos, 0)?;
+                skip_ws(&chars, &mut pos);
+                if pos != chars.len() {
+                    return Err(self.json_error("Invalid raw JSON text"));
+                }
+                if parsed
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| self.realm.is_array(h) || self.realm.object_keys(h).is_some())
+                {
+                    return Err(self.json_error("Raw JSON must be a primitive value"));
+                }
+                // A null-prototype object with a single own data property `rawJSON`
+                // = the text, plus the internal brand; then frozen.
+                let obj = self.realm.new_object();
+                self.realm.set_object_proto(obj, None);
+                let text_box = self.new_str(&text);
+                self.realm.set_property(obj, "rawJSON", text_box);
+                self.realm
+                    .set_hidden_property(obj, RAW_JSON_BRAND, NanBox::boolean(true));
+                self.realm.freeze_object(obj);
+                NanBox::handle(obj.to_raw())
+            }
+            // `JSON.isRawJSON(value)` — whether `value` is an object carrying the
+            // internal RawJSON brand.
+            N_JSON_IS_RAW => {
+                let is_raw = arg(0)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.get_property(h, RAW_JSON_BRAND))
+                    .is_some_and(|v| self.realm.truthy(v));
+                NanBox::boolean(is_raw)
+            }
             N_OBJECT_KEYS => {
                 // ToObject(O): `null`/`undefined` throws (a primitive coerces to a
                 // wrapper with no own enumerable keys, so it is left as-is here).
@@ -336,6 +347,13 @@ impl<'a> Interp<'a> {
                     .map(|raw| self.proxy_key_target(Handle::from_raw(raw)));
                 let mut keys: Vec<alloc::string::String> = Vec::new();
                 if let Some(h) = target {
+                    // A String (primitive or wrapper): ToObject exposes index
+                    // properties `"0".."length-1"` (each a UTF-16 code unit).
+                    if let Some(n) = self.string_index_count(h) {
+                        for i in 0..n {
+                            keys.push(alloc::format!("{i}"));
+                        }
+                    }
                     // An array's own enumerable keys are its integer indices (in
                     // ascending order) — stored as elements, not named properties.
                     // A VM closure backs onto an array but is a function, so its
@@ -512,12 +530,21 @@ impl<'a> Interp<'a> {
             // `Object.groupBy(items, cb)` — groups each item by `cb(item, i)` into
             // an object of arrays keyed by the (stringified) group.
             N_OBJECT_GROUP_BY => {
-                let items = self.iterate_values(arg(0))?;
+                // RequireObjectCoercible(items): a `null`/`undefined` is a TypeError.
+                if matches!(arg(0).unpack(), Unpacked::Null | Unpacked::Undefined) {
+                    return Err(self.type_error("Object.groupBy called on null or undefined"));
+                }
+                // IsCallable(callbackfn) is checked *before* iterating.
                 let cb = arg(1);
+                self.require_callable(cb, "Object.groupBy callback")?;
+                let items = self.iterate_values(arg(0))?;
+                // The result is a null-prototype object; group keys are property keys
+                // (ToPropertyKey — a Symbol key stays a Symbol).
                 let out = self.realm.new_object();
+                self.realm.set_object_proto(out, None);
                 for (i, item) in items.iter().enumerate() {
                     let key = self.call(cb, &[*item, NanBox::number(i as f64)])?;
-                    let k = self.realm.to_display_string(key);
+                    let k = self.coerce_property_key(key)?;
                     let bucket = match self
                         .realm
                         .get_property(out, &k)
@@ -900,6 +927,12 @@ impl<'a> Interp<'a> {
                 let mut vals = Vec::new();
                 if let Some(raw) = arg(0).as_handle() {
                     let h = self.proxy_key_target(Handle::from_raw(raw));
+                    // A String exposes its code units as index values.
+                    if let Some(n) = self.string_index_count(h) {
+                        for i in 0..n {
+                            vals.push(self.read_member(h, &alloc::format!("{i}"))?);
+                        }
+                    }
                     // Array index values come from element access (ascending) first
                     // — but a VM closure's backing cells are not enumerable values.
                     if !self.realm.is_vm_function(h)
@@ -1010,6 +1043,13 @@ impl<'a> Interp<'a> {
                 let mut entries: Vec<(alloc::string::String, NanBox)> = Vec::new();
                 if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
                     let h = self.proxy_key_target(h);
+                    // A String exposes its code units as index entries.
+                    if let Some(n) = self.string_index_count(h) {
+                        for i in 0..n {
+                            let v = self.read_member(h, &alloc::format!("{i}"))?;
+                            entries.push((alloc::format!("{i}"), v));
+                        }
+                    }
                     // Array index entries (ascending) before named ones — but a VM
                     // closure's backing cells are not enumerable entries.
                     if !self.realm.is_vm_function(h)
@@ -2234,6 +2274,7 @@ impl<'a> Interp<'a> {
                     result,
                     fulfilled: true,
                     finally: false,
+                    thenable: None,
                 });
                 NanBox::undefined()
             }

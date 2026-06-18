@@ -444,6 +444,11 @@ struct Job {
     /// A `finally` job: run the handler for side effects, then pass the original
     /// value/rejection through to `result`.
     finally: bool,
+    /// A PromiseResolveThenableJob: `handler` is the thenable's `then` method, and
+    /// the pair is `(resolve, reject)` to pass to it (with `this` = `value`, the
+    /// thenable). When set, the job calls `then.call(thenable, resolve, reject)`
+    /// instead of the ordinary reaction handling.
+    thenable: Option<(NanBox, NanBox)>,
 }
 
 /// A pending `setTimeout` callback.
@@ -1211,6 +1216,8 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "asUintN" | "setMonth" | "setUTCMonth" | "setSeconds" | "setUTCSeconds" | "subarray"
         // `Map.prototype.getOrInsert(key, value)` / `getOrInsertComputed(key, fn)`.
         | "getOrInsert" | "getOrInsertComputed"
+        // `Promise.prototype.then(onFulfilled, onRejected)`.
+        | "then"
         // `Function.prototype.apply(thisArg, argArray)`.
         | "apply" => 2,
         // Three-argument `Date` setters.
@@ -1613,6 +1620,54 @@ const N_DSTACK_ADOPT_CALL: u16 = 549;
 /// throw during `DisposableStack`/`AsyncDisposableStack` disposal.
 const N_SUPPRESSED_ERROR: u16 = 550;
 
+// --- Promise combinator helper natives (resolve/reject element closures). ---
+// Each is a *bound* native whose target is a per-call state object carrying the
+// shared accounting (remaining counter, values array, capability promise) plus
+// this element's index, all as hidden properties. New ids begin at 640.
+/// `Promise.all` Resolve Element: records its value at the captured index and,
+/// when the last input fulfills, resolves the capability with the values array.
+const N_PROMISE_ALL_ELEMENT: u16 = 640;
+/// `Promise.allSettled` Resolve Element: records `{status:"fulfilled", value}`.
+const N_PROMISE_ALLSETTLED_FULFILL: u16 = 641;
+/// `Promise.allSettled` Reject Element: records `{status:"rejected", reason}`.
+const N_PROMISE_ALLSETTLED_REJECT: u16 = 642;
+/// `Promise.any` Reject Element: records its rejection reason and, when the last
+/// input rejects, rejects the capability with an `AggregateError`.
+const N_PROMISE_ANY_ELEMENT: u16 = 643;
+/// `Promise.prototype.finally` Then Finally / Catch Finally functions: run the
+/// captured `onFinally()`, then thread the original value/reason through
+/// `C.resolve(result).then(valueThunk)`.
+const N_PROMISE_THEN_FINALLY: u16 = 644;
+const N_PROMISE_CATCH_FINALLY: u16 = 645;
+/// `finally` value/throw thunk (`() => value` / `() => { throw reason }`).
+const N_PROMISE_VALUE_THUNK: u16 = 646;
+const N_PROMISE_THROW_THUNK: u16 = 647;
+/// Hidden keys for the `finally` closures' bound state object.
+const PFIN_ONFINALLY: &str = "\u{0}pf_onf";
+const PFIN_CTOR: &str = "\u{0}pf_ctor";
+const PFIN_VALUE: &str = "\u{0}pf_val";
+/// `GetCapabilitiesExecutor` function passed to a user/subclass Promise
+/// constructor by `NewPromiseCapability`: captures the `(resolve, reject)` pair
+/// into the capability state object (its bound target).
+const N_PROMISE_CAPABILITY_EXECUTOR: u16 = 649;
+/// `JSON.rawJSON(text)` / `JSON.isRawJSON(value)` (the JSON source-text proposal).
+const N_JSON_RAW: u16 = 650;
+const N_JSON_IS_RAW: u16 = 651;
+/// Hidden brand + payload on a RawJSON object (the validated source text).
+const RAW_JSON_BRAND: &str = "\u{0}rawjson";
+/// Hidden-property keys for a capability state object built around a foreign `C`.
+const PCAP_RESOLVE: &str = "\u{0}pcap_res";
+const PCAP_REJECT: &str = "\u{0}pcap_rej";
+
+// Hidden-property keys for combinator element state objects.
+const PCOMB_REMAINING: &str = "\u{0}pc_rem";
+const PCOMB_VALUES: &str = "\u{0}pc_vals";
+const PCOMB_CAP: &str = "\u{0}pc_cap";
+const PCOMB_RESOLVE: &str = "\u{0}pc_res";
+const PCOMB_REJECT: &str = "\u{0}pc_rej";
+const PCOMB_INDEX: &str = "\u{0}pc_idx";
+const PCOMB_CALLED: &str = "\u{0}pc_called";
+
 mod call;
 mod class;
 mod convert;
@@ -1730,7 +1785,7 @@ impl<'a> Interp<'a> {
     /// read) makes `f.hasOwnProperty("name")`, `delete f.length`, and
     /// `defineProperty` redefinitions behave per spec — exactly what Test262's
     /// `verifyProperty` exercises.
-    fn install_fn_name_length(&mut self, f: Handle, name: &str, length: u32) {
+    pub(crate) fn install_fn_name_length(&mut self, f: Handle, name: &str, length: u32) {
         // Spec own-key order for a function is `length` before `name`.
         self.realm
             .set_property(f, "length", NanBox::number(f64::from(length)));
@@ -2372,7 +2427,12 @@ impl<'a> Interp<'a> {
         install_namespace(
             self,
             "JSON",
-            &[("stringify", N_JSON_STRINGIFY), ("parse", N_JSON_PARSE)],
+            &[
+                ("stringify", N_JSON_STRINGIFY),
+                ("parse", N_JSON_PARSE),
+                ("rawJSON", N_JSON_RAW),
+                ("isRawJSON", N_JSON_IS_RAW),
+            ],
         );
         install_namespace(
             self,

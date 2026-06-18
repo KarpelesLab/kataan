@@ -1331,7 +1331,9 @@ impl<'a> Interp<'a> {
         {
             let iterator = self.call_with_this(f, v, &[])?;
             let Some(ih) = iterator.as_handle().map(Handle::from_raw) else {
-                return Err(ExecError::Throw(self.new_str("iterator is not an object")));
+                // GetIterator: a `[Symbol.iterator]()` result that is not an Object
+                // is a TypeError (so `e instanceof TypeError` holds).
+                return Err(self.type_error("iterator is not an object"));
             };
             // A generator iterator (its `next` is a built-in method, not a
             // readable property) is drained directly from its buffer.
@@ -1343,9 +1345,7 @@ impl<'a> Interp<'a> {
                 let next_fn = self.read_member(ih, "next")?;
                 let res = self.call_with_this(next_fn, iterator, &[])?;
                 let Some(rh) = res.as_handle().map(Handle::from_raw) else {
-                    return Err(ExecError::Throw(
-                        self.new_str("iterator result is not an object"),
-                    ));
+                    return Err(self.type_error("iterator result is not an object"));
                 };
                 let done = self.read_member(rh, "done")?;
                 if self.realm.truthy(done) {
@@ -1353,7 +1353,7 @@ impl<'a> Interp<'a> {
                 }
                 out.push(self.read_member(rh, "value")?);
                 if out.len() > GEN_CAP {
-                    return Err(ExecError::Throw(self.new_str("iterator did not terminate")));
+                    return Err(self.type_error("iterator did not terminate"));
                 }
             }
             return Ok(out);

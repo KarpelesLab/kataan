@@ -824,8 +824,28 @@ impl<'a> Interp<'a> {
                         .map(Handle::from_raw)
                         .and_then(|h| self.realm.string_value(h))
                 {
+                    // The `this`-aware statics (`Promise.resolve`/`reject` and the
+                    // combinators) are generic over their receiver `C`: a call via
+                    // `Promise.all.call(C, …)` must use `C`, not the bound
+                    // constructor. Route the real `this_val` through `call_method`
+                    // when it is an object; fall back to the bound constructor for a
+                    // plain `Promise.all(…)` call (`this` = the constructor itself).
+                    let this_aware = matches!(
+                        name.as_str(),
+                        "all" | "race" | "allSettled" | "any" | "resolve" | "reject"
+                    );
+                    // For a `this`-aware static, a non-object receiver (number,
+                    // string, boolean, symbol, null, undefined — including a detached
+                    // `const f = Promise.all; f([])` where `this` is undefined) is a
+                    // TypeError up front (NewPromiseCapability / OrdinaryToObject would
+                    // reject it). Otherwise the real `this` is the constructor `C`.
+                    if this_aware && !self.is_object_value(this_val) {
+                        return Err(self
+                            .type_error(&alloc::format!("Promise.{name} called on a non-object")));
+                    }
+                    let recv = if this_aware { this_val } else { ctor };
                     return Ok(self
-                        .call_method(ctor, &name, args)?
+                        .call_method(recv, &name, args)?
                         .unwrap_or(NanBox::undefined()));
                 }
                 return Ok(NanBox::undefined());
@@ -986,6 +1006,60 @@ impl<'a> Interp<'a> {
                     if let Some(fid) = self.async_frame_id(target) {
                         self.async_step(fid, target, generator::Resumption::Throw(arg0));
                     }
+                }
+                // `NewPromiseCapability` executor: capture (resolve, reject) into the
+                // bound state object. Per spec, each may be set only once.
+                N_PROMISE_CAPABILITY_EXECUTOR => {
+                    let resolve = args.first().copied().unwrap_or(NanBox::undefined());
+                    let reject = args.get(1).copied().unwrap_or(NanBox::undefined());
+                    // GetCapabilitiesExecutor (27.2.1.5.1): it is an error only if a
+                    // *non-undefined* resolve/reject was already captured (a prior
+                    // call with `undefined`s is allowed and overwritten).
+                    let prev_resolve = self
+                        .realm
+                        .get_property(target, PCAP_RESOLVE)
+                        .unwrap_or(NanBox::undefined());
+                    let prev_reject = self
+                        .realm
+                        .get_property(target, PCAP_REJECT)
+                        .unwrap_or(NanBox::undefined());
+                    if !matches!(prev_resolve.unpack(), Unpacked::Undefined)
+                        || !matches!(prev_reject.unpack(), Unpacked::Undefined)
+                    {
+                        return Err(self.type_error(
+                            "Promise capability executor already invoked with non-undefined values",
+                        ));
+                    }
+                    self.realm
+                        .set_hidden_property(target, PCAP_RESOLVE, resolve);
+                    self.realm.set_hidden_property(target, PCAP_REJECT, reject);
+                    return Ok(NanBox::undefined());
+                }
+                // Promise combinator resolve/reject element closures.
+                N_PROMISE_ALL_ELEMENT => return self.promise_all_element(target, arg0),
+                N_PROMISE_ALLSETTLED_FULFILL => {
+                    return self.promise_allsettled_element(target, arg0, true);
+                }
+                N_PROMISE_ALLSETTLED_REJECT => {
+                    return self.promise_allsettled_element(target, arg0, false);
+                }
+                N_PROMISE_ANY_ELEMENT => return self.promise_any_element(target, arg0),
+                N_PROMISE_THEN_FINALLY => return self.promise_finally_thunk(target, arg0, true),
+                N_PROMISE_CATCH_FINALLY => return self.promise_finally_thunk(target, arg0, false),
+                // Value/throw thunks: ignore the (one) argument and return/throw the
+                // captured value.
+                N_PROMISE_VALUE_THUNK => {
+                    return Ok(self
+                        .realm
+                        .get_property(target, PFIN_VALUE)
+                        .unwrap_or(NanBox::undefined()));
+                }
+                N_PROMISE_THROW_THUNK => {
+                    let v = self
+                        .realm
+                        .get_property(target, PFIN_VALUE)
+                        .unwrap_or(NanBox::undefined());
+                    return Err(ExecError::Throw(v));
                 }
                 _ => {}
             }
@@ -1724,10 +1798,17 @@ impl<'a> Interp<'a> {
         }
         // `new Promise(executor)`: run executor(resolve, reject).
         if id == N_PROMISE {
+            // The executor must be callable (else a TypeError, before any promise
+            // is observably created beyond the allocation).
+            let executor = args.first().copied().unwrap_or(NanBox::undefined());
+            if !self.is_callable_value(executor) {
+                return Err(self.type_error("Promise executor is not a function"));
+            }
             let promise = self.fresh_promise();
             let resolve = self.realm.new_bound_native(N_RESOLVE, promise);
             let reject = self.realm.new_bound_native(N_REJECT, promise);
-            let executor = args.first().copied().unwrap_or(NanBox::undefined());
+            self.install_fn_name_length(resolve, "", 1);
+            self.install_fn_name_length(reject, "", 1);
             let r = self.call(
                 executor,
                 &[

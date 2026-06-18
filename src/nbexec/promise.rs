@@ -1,5 +1,14 @@
 use super::*;
 
+/// A `PromiseCapability` record: the dependent promise plus its resolve/reject
+/// functions, as produced by `NewPromiseCapability(C)`.
+#[derive(Clone, Copy)]
+pub(crate) struct PromiseCapability {
+    pub promise: NanBox,
+    pub resolve: NanBox,
+    pub reject: NanBox,
+}
+
 impl<'a> Interp<'a> {
     /// Builds an iterator object over a generator's eagerly-collected `values`:
     /// a hidden buffer array plus a `next()` cursor, recognized by `for-of`,
@@ -81,47 +90,83 @@ impl<'a> Interp<'a> {
                 result: r.result,
                 fulfilled,
                 finally: r.finally,
+                thenable: None,
             });
         }
     }
 
     /// Resolves `handle` with `value`, adopting it if `value` is itself a
-    /// promise (chain on its settlement).
+    /// promise/thenable (chain on its settlement). Mirrors the Promise Resolve
+    /// Function (25.6.1.3.2).
     pub(crate) fn resolve_with(&mut self, handle: Handle, value: NanBox) {
-        let inner = value
-            .as_handle()
-            .map(Handle::from_raw)
-            .filter(|h| self.realm.promise_state(*h).is_some());
-        if let Some(inner) = inner {
-            // Adopt: when `inner` settles, settle `handle` the same way.
+        // Self-resolution: resolving a promise with itself is a TypeError
+        // rejection ("Chaining cycle detected").
+        if value.as_handle() == Some(handle.to_raw()) {
+            let m = self.new_str("Chaining cycle detected for promise");
+            let e = self.make_error(N_TYPE_ERROR, Some(m));
+            self.settle(handle, e, false);
+            return;
+        }
+        // A non-object resolution value fulfills directly.
+        let Some(vh) = value.as_handle().map(Handle::from_raw) else {
+            self.settle(handle, value, true);
+            return;
+        };
+        // `Let then = Get(resolution, "then")` — through `read_member` so a `then`
+        // *accessor* getter runs (and a throwing getter rejects the promise).
+        let then = match self.read_member(vh, "then") {
+            Ok(t) => t,
+            Err(ExecError::Throw(e)) => {
+                self.settle(handle, e, false);
+                return;
+            }
+            // A non-throw abrupt completion: settle to avoid leaving it pending.
+            Err(_) => {
+                self.settle(handle, value, true);
+                return;
+            }
+        };
+        // A non-callable `then` fulfills with the value as-is.
+        if !self.is_callable_value(then) {
+            self.settle(handle, value, true);
+            return;
+        }
+        // A real promise with the intrinsic `then` is adopted directly (cheaper and
+        // keeps identity for the common case).
+        if self.realm.promise_state(vh).is_some()
+            && self
+                .current
+                .get("Promise")
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|pc| self.realm.get_property(pc, "prototype"))
+                .and_then(|pp| pp.as_handle())
+                .and_then(|pp| self.realm.get_property(Handle::from_raw(pp), "then"))
+                == Some(then)
+        {
             let on_f = self.realm.new_bound_native(N_RESOLVE, handle);
             let on_r = self.realm.new_bound_native(N_REJECT, handle);
             self.register_then(
-                inner,
+                vh,
                 NanBox::handle(on_f.to_raw()),
                 NanBox::handle(on_r.to_raw()),
                 false,
             );
             return;
         }
-        // A thenable (a non-promise object with a callable `then`) is adopted by
-        // calling `then(resolve, reject)`.
-        if let Some(vh) = value.as_handle().map(Handle::from_raw)
-            && let Some(then) = self.realm.get_property(vh, "then")
-            && then
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-        {
-            let on_f = self.realm.new_bound_native(N_RESOLVE, handle);
-            let on_r = self.realm.new_bound_native(N_REJECT, handle);
-            let args = [NanBox::handle(on_f.to_raw()), NanBox::handle(on_r.to_raw())];
-            // A throw from `then` rejects the promise.
-            if let Err(ExecError::Throw(e)) = self.call_with_this(then, value, &args) {
-                self.settle(handle, e, false);
-            }
-            return;
-        }
-        self.settle(handle, value, true);
+        // A thenable (any object with a callable `then`): EnqueuePromiseResolve-
+        // ThenableJob — call `then(resolve, reject)` as a microtask so ordering
+        // matches the spec (one extra tick before the thenable's `then` runs).
+        let on_f = self.realm.new_bound_native(N_RESOLVE, handle);
+        let on_r = self.realm.new_bound_native(N_REJECT, handle);
+        self.microtasks.push(Job {
+            handler: then,
+            value,
+            result: handle,
+            fulfilled: true,
+            finally: false,
+            thenable: Some((NanBox::handle(on_f.to_raw()), NanBox::handle(on_r.to_raw()))),
+        });
     }
 
     /// `PromiseResolve(%Promise%, value)`: if `value` is already a promise, return
@@ -139,10 +184,60 @@ impl<'a> Interp<'a> {
         p
     }
 
-    /// Registers `then` reactions on `handle`, returning a new dependent promise.
-    pub(crate) fn promise_then(&mut self, handle: Handle, on_f: NanBox, on_r: NanBox) -> NanBox {
-        let result = self.register_then(handle, on_f, on_r, false);
-        NanBox::handle(result.to_raw())
+    /// `SpeciesConstructor(O, %Promise%)` — the constructor used by `then`/`finally`
+    /// to build their result promise. Reads `O.constructor`; if `undefined`, uses
+    /// `%Promise%`; then reads `[Symbol.species]` (using the constructor itself when
+    /// that is `undefined`/`null`). A non-constructor result is a `TypeError`.
+    pub(crate) fn promise_species_constructor(&mut self, o: Handle) -> Result<NanBox, ExecError> {
+        let default_c = self.current.get("Promise").unwrap_or(NanBox::undefined());
+        let ctor = self.read_member(o, "constructor")?;
+        if matches!(ctor.unpack(), Unpacked::Undefined) {
+            return Ok(default_c);
+        }
+        if !self.is_object_value(ctor) {
+            return Err(self.type_error("Promise constructor is not an object"));
+        }
+        let ch = ctor.as_handle().map(Handle::from_raw).unwrap();
+        let species_sym = self.well_known_symbol("species");
+        let key = self.member_key(species_sym);
+        let species = self.read_member(ch, &key)?;
+        if matches!(species.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Ok(default_c);
+        }
+        if !self.is_constructor(species) {
+            return Err(self.type_error("Promise [Symbol.species] is not a constructor"));
+        }
+        Ok(species)
+    }
+
+    /// `Promise.prototype.then(onFulfilled, onRejected)` — the brand-checked,
+    /// species-aware spec algorithm. `this` must be a promise (else a `TypeError`);
+    /// the result promise is built from `SpeciesConstructor(this, %Promise%)`.
+    pub(crate) fn perform_promise_then_method(
+        &mut self,
+        handle: Handle,
+        on_f: NanBox,
+        on_r: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        // Brand check: `this` must have a `[[PromiseState]]` internal slot.
+        if self.realm.promise_state(handle).is_none() {
+            return Err(self.type_error("Promise.prototype.then called on a non-promise"));
+        }
+        let c = self.promise_species_constructor(handle)?;
+        // Fast path: the species is the intrinsic Promise — use the cheap reaction
+        // registration that returns a native promise directly.
+        if self.current.get("Promise").and_then(|v| v.as_handle()) == c.as_handle() {
+            let result = self.register_then(handle, on_f, on_r, false);
+            return Ok(NanBox::handle(result.to_raw()));
+        }
+        // Foreign species: build its capability, then bridge an internal reaction
+        // promise to it — when the internal `then` result settles, drive the
+        // foreign capability's resolve/reject (so the user's `C`-built promise is
+        // what `then` returns, observing its constructor/executor).
+        let cap = self.new_promise_capability(c)?;
+        let bridge = self.register_then(handle, on_f, on_r, false);
+        self.register_then(bridge, cap.resolve, cap.reject, false);
+        Ok(cap.promise)
     }
 
     pub(crate) fn register_then(
@@ -177,6 +272,7 @@ impl<'a> Interp<'a> {
                     result,
                     fulfilled,
                     finally,
+                    thenable: None,
                 });
             }
         }
@@ -224,6 +320,18 @@ impl<'a> Interp<'a> {
     /// Runs the next queued promise reaction.
     pub(crate) fn run_one_microtask(&mut self) -> Result<(), ExecError> {
         let job = self.microtasks.remove(0);
+        // PromiseResolveThenableJob: `handler` is the thenable's `then` method;
+        // call `then.call(thenable, resolve, reject)`. A throw rejects via the
+        // job's `reject` (the bound resolve/reject of `result`).
+        if let Some((resolve, reject)) = job.thenable {
+            let args = [resolve, reject];
+            if let Err(ExecError::Throw(e)) = self.call_with_this(job.handler, job.value, &args) {
+                // Reject the target promise with the thrown value (the resolve/reject
+                // pair may already have settled it, in which case settle is a no-op).
+                self.settle(job.result, e, false);
+            }
+            return Ok(());
+        }
         if job.finally
             && job
                 .handler
@@ -267,25 +375,6 @@ impl<'a> Interp<'a> {
     /// `await value` — for a promise, drains microtasks until it settles (this
     /// model has no timers, so all promises settle via the queue), then yields
     /// its value or throws its rejection. A non-promise passes through.
-    /// The current settled state of `value`: `Some(Ok(v))` if fulfilled (a
-    /// non-promise counts as fulfilled with itself), `Some(Err(e))` if rejected,
-    /// `None` if it is a still-pending promise.
-    pub(crate) fn settled_state(&self, value: NanBox) -> Option<Result<NanBox, NanBox>> {
-        use crate::cell::PromiseStatus::{Fulfilled, Pending, Rejected};
-        let Some(state) = value
-            .as_handle()
-            .and_then(|raw| self.realm.promise_state(Handle::from_raw(raw)))
-        else {
-            return Some(Ok(value));
-        };
-        let s = state.borrow();
-        match s.status {
-            Fulfilled => Some(Ok(s.value)),
-            Rejected => Some(Err(s.value)),
-            Pending => None,
-        }
-    }
-
     pub(crate) fn await_value(&mut self, value: NanBox) -> Result<NanBox, ExecError> {
         use crate::cell::PromiseStatus::{Fulfilled, Pending, Rejected};
         let Some(state) = value
@@ -311,6 +400,539 @@ impl<'a> Interp<'a> {
             Fulfilled => Ok(s.value),
             Rejected => Err(ExecError::Throw(s.value)),
             Pending => Ok(NanBox::undefined()), // never settles
+        }
+    }
+
+    /// `NewPromiseCapability(C)` — produces `{ promise, resolve, reject }` where
+    /// `promise` is `new C(executor)` and `executor(resolve, reject)` captured the
+    /// pair. For the intrinsic `%Promise%` this is the fast path (a fresh promise
+    /// plus its bound resolve/reject natives); for any other constructor `C` it
+    /// runs the full spec algorithm so a subclass / custom thenable participates.
+    ///
+    /// `C` must be a constructor (else a `TypeError`); the executor must be called
+    /// exactly once with two callable arguments (else a `TypeError`).
+    pub(crate) fn new_promise_capability(
+        &mut self,
+        c: NanBox,
+    ) -> Result<PromiseCapability, ExecError> {
+        // Fast path: `C` is the realm's own `Promise` constructor.
+        if self.current.get("Promise").and_then(|v| v.as_handle()) == c.as_handle() {
+            let promise = self.fresh_promise();
+            let resolve = self.realm.new_bound_native(N_RESOLVE, promise);
+            let reject = self.realm.new_bound_native(N_REJECT, promise);
+            // A Promise resolve/reject function has `length: 1`, `name: ""`.
+            self.install_fn_name_length(resolve, "", 1);
+            self.install_fn_name_length(reject, "", 1);
+            return Ok(PromiseCapability {
+                promise: NanBox::handle(promise.to_raw()),
+                resolve: NanBox::handle(resolve.to_raw()),
+                reject: NanBox::handle(reject.to_raw()),
+            });
+        }
+        // `C` must be a constructor.
+        if !self.is_constructor(c) {
+            return Err(self.type_error("Promise capability requires a constructor"));
+        }
+        // Build a GetCapabilitiesExecutor bound to a fresh state object, then
+        // `new C(executor)`. The executor stores `(resolve, reject)` into the state.
+        let state = self.realm.new_object();
+        let executor = self
+            .realm
+            .new_bound_native(N_PROMISE_CAPABILITY_EXECUTOR, state);
+        let promise = self.construct(c, &[NanBox::handle(executor.to_raw())])?;
+        let resolve = self
+            .realm
+            .get_property(state, PCAP_RESOLVE)
+            .unwrap_or(NanBox::undefined());
+        let reject = self
+            .realm
+            .get_property(state, PCAP_REJECT)
+            .unwrap_or(NanBox::undefined());
+        // The executor must have set both to callable values (10.2.x: a capability
+        // whose resolve/reject is not callable is a TypeError).
+        if !self.is_callable_value(resolve) || !self.is_callable_value(reject) {
+            return Err(self.type_error("Promise resolve or reject function is not callable"));
+        }
+        Ok(PromiseCapability {
+            promise,
+            resolve,
+            reject,
+        })
+    }
+
+    /// Calls a capability's resolve/reject with `arg`.
+    pub(crate) fn capability_resolve(
+        &mut self,
+        cap: &PromiseCapability,
+        arg: NanBox,
+    ) -> Result<(), ExecError> {
+        self.call(cap.resolve, &[arg])?;
+        Ok(())
+    }
+    pub(crate) fn capability_reject(
+        &mut self,
+        cap: &PromiseCapability,
+        arg: NanBox,
+    ) -> Result<(), ExecError> {
+        self.call(cap.reject, &[arg])?;
+        Ok(())
+    }
+
+    /// `Invoke(promise, "then", [onFulfilled, onRejected])` — the spec hook used
+    /// by the combinators (so a subclassed/foreign promise's own `then` runs).
+    pub(crate) fn invoke_then(
+        &mut self,
+        promise: NanBox,
+        on_f: NanBox,
+        on_r: NanBox,
+    ) -> Result<(), ExecError> {
+        let Some(h) = promise.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("Promise.then called on a non-object"));
+        };
+        let then = self.read_member(h, "then")?;
+        self.call_with_this(then, promise, &[on_f, on_r])?;
+        Ok(())
+    }
+
+    // --- Promise combinators (spec-faithful: NewPromiseCapability + per-element
+    // resolve closures + Invoke(C,"resolve")/Invoke(p,"then")). ---
+
+    /// Reads `Get(C, "resolve")` and requires it callable (else a `TypeError`).
+    /// Shared by every combinator (PerformPromiseAll step "Let promiseResolve …").
+    fn combinator_resolve_fn(&mut self, c: NanBox) -> Result<NanBox, ExecError> {
+        let Some(ch) = c.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("Promise combinator called on a non-object"));
+        };
+        let resolve = self.read_member(ch, "resolve")?;
+        if !self.is_callable_value(resolve) {
+            return Err(self.type_error("Promise.resolve is not a function"));
+        }
+        Ok(resolve)
+    }
+
+    /// Allocates a per-element state object holding the shared accounting (a
+    /// remaining-count cell, the values/result container, the capability) plus this
+    /// element's index. `extra` keys (e.g. an errors array) are added by the caller.
+    fn combinator_state(
+        &mut self,
+        remaining: Handle,
+        container: NanBox,
+        cap: &PromiseCapability,
+        index: NanBox,
+    ) -> Handle {
+        let state = self.realm.new_object();
+        self.realm
+            .set_hidden_property(state, PCOMB_REMAINING, NanBox::handle(remaining.to_raw()));
+        self.realm
+            .set_hidden_property(state, PCOMB_VALUES, container);
+        self.realm
+            .set_hidden_property(state, PCOMB_CAP, cap.promise);
+        self.realm
+            .set_hidden_property(state, PCOMB_RESOLVE, cap.resolve);
+        self.realm
+            .set_hidden_property(state, PCOMB_REJECT, cap.reject);
+        self.realm.set_hidden_property(state, PCOMB_INDEX, index);
+        self.realm
+            .set_hidden_property(state, PCOMB_CALLED, NanBox::boolean(false));
+        state
+    }
+
+    /// Builds a combinator resolve/reject element function (a bound native over the
+    /// element `state`), with the spec-mandated `length: 1` and `name: ""` own
+    /// properties (a Promise resolve/reject function has length 1).
+    fn make_element_fn(&mut self, id: u16, state: Handle) -> NanBox {
+        let f = self.realm.new_bound_native(id, state);
+        self.install_fn_name_length(f, "", 1);
+        NanBox::handle(f.to_raw())
+    }
+
+    /// A mutable single-element "remaining count" cell (a one-element array used as
+    /// a boxed integer the element closures share and decrement).
+    fn count_cell(&mut self, initial: f64) -> Handle {
+        self.realm.new_array(alloc::vec![NanBox::number(initial)])
+    }
+    fn cell_get(&mut self, cell: Handle) -> f64 {
+        self.realm.get_element(cell, 0).as_number().unwrap_or(0.0)
+    }
+    fn cell_set(&mut self, cell: Handle, v: f64) {
+        self.realm.set_element(cell, 0, NanBox::number(v));
+    }
+
+    /// Reads the shared parts of an element-state object.
+    fn state_parts(&mut self, state: Handle) -> (Handle, NanBox, PromiseCapability, usize) {
+        let remaining = self
+            .realm
+            .get_property(state, PCOMB_REMAINING)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .expect("remaining cell");
+        let container = self
+            .realm
+            .get_property(state, PCOMB_VALUES)
+            .unwrap_or(NanBox::undefined());
+        let cap = PromiseCapability {
+            promise: self
+                .realm
+                .get_property(state, PCOMB_CAP)
+                .unwrap_or(NanBox::undefined()),
+            resolve: self
+                .realm
+                .get_property(state, PCOMB_RESOLVE)
+                .unwrap_or(NanBox::undefined()),
+            reject: self
+                .realm
+                .get_property(state, PCOMB_REJECT)
+                .unwrap_or(NanBox::undefined()),
+        };
+        let index = self
+            .realm
+            .get_property(state, PCOMB_INDEX)
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as usize;
+        (remaining, container, cap, index)
+    }
+
+    /// Whether the element closure at `state` has already been called (each
+    /// resolve/reject element function runs its body at most once).
+    fn element_already_called(&mut self, state: Handle) -> bool {
+        if self
+            .realm
+            .get_property(state, PCOMB_CALLED)
+            .is_some_and(|v| self.realm.truthy(v))
+        {
+            return true;
+        }
+        self.realm
+            .set_hidden_property(state, PCOMB_CALLED, NanBox::boolean(true));
+        false
+    }
+
+    /// `Promise.all` Resolve Element.
+    pub(crate) fn promise_all_element(
+        &mut self,
+        state: Handle,
+        value: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        if self.element_already_called(state) {
+            return Ok(NanBox::undefined());
+        }
+        let (remaining, container, cap, index) = self.state_parts(state);
+        if let Some(arr) = container.as_handle().map(Handle::from_raw) {
+            self.realm.set_element(arr, index, value);
+        }
+        let n = self.cell_get(remaining) - 1.0;
+        self.cell_set(remaining, n);
+        if n == 0.0 {
+            self.capability_resolve(&cap, container)?;
+        }
+        Ok(NanBox::undefined())
+    }
+
+    /// `Promise.allSettled` Resolve/Reject Element (`fulfilled` selects which).
+    pub(crate) fn promise_allsettled_element(
+        &mut self,
+        state: Handle,
+        value: NanBox,
+        fulfilled: bool,
+    ) -> Result<NanBox, ExecError> {
+        if self.element_already_called(state) {
+            return Ok(NanBox::undefined());
+        }
+        let (remaining, container, cap, index) = self.state_parts(state);
+        let obj = self.realm.new_object();
+        if fulfilled {
+            let s = self.new_str("fulfilled");
+            self.realm.set_property(obj, "status", s);
+            self.realm.set_property(obj, "value", value);
+        } else {
+            let s = self.new_str("rejected");
+            self.realm.set_property(obj, "status", s);
+            self.realm.set_property(obj, "reason", value);
+        }
+        if let Some(arr) = container.as_handle().map(Handle::from_raw) {
+            self.realm
+                .set_element(arr, index, NanBox::handle(obj.to_raw()));
+        }
+        let n = self.cell_get(remaining) - 1.0;
+        self.cell_set(remaining, n);
+        if n == 0.0 {
+            self.capability_resolve(&cap, container)?;
+        }
+        Ok(NanBox::undefined())
+    }
+
+    /// `Promise.any` Reject Element.
+    pub(crate) fn promise_any_element(
+        &mut self,
+        state: Handle,
+        reason: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        if self.element_already_called(state) {
+            return Ok(NanBox::undefined());
+        }
+        let (remaining, container, cap, index) = self.state_parts(state);
+        // `container` is the errors array for `any`.
+        if let Some(arr) = container.as_handle().map(Handle::from_raw) {
+            self.realm.set_element(arr, index, reason);
+        }
+        let n = self.cell_get(remaining) - 1.0;
+        self.cell_set(remaining, n);
+        if n == 0.0 {
+            let agg = self.make_aggregate_error(container);
+            self.capability_reject(&cap, agg)?;
+        }
+        Ok(NanBox::undefined())
+    }
+
+    /// Builds an `AggregateError` whose `errors` is `errors_arr`.
+    fn make_aggregate_error(&mut self, errors_arr: NanBox) -> NanBox {
+        let msg = self.new_str("All promises were rejected");
+        // Use the realm's AggregateError constructor when present so the prototype
+        // chain and `instanceof AggregateError` are correct.
+        if let Some(ctor) = self.current.get("AggregateError") {
+            let empty = self.realm.new_array(Vec::new());
+            if let Ok(e) = self.construct(ctor, &[NanBox::handle(empty.to_raw()), msg]) {
+                if let Some(eh) = e.as_handle().map(Handle::from_raw) {
+                    self.realm.set_property(eh, "errors", errors_arr);
+                }
+                return e;
+            }
+        }
+        let agg = self.realm.new_object();
+        let name = self.new_str("AggregateError");
+        self.realm.set_property(agg, "name", name);
+        let msg = self.new_str("All promises were rejected");
+        self.realm.set_property(agg, "message", msg);
+        self.realm.set_property(agg, "errors", errors_arr);
+        NanBox::handle(agg.to_raw())
+    }
+
+    /// `Promise.all(iterable)` (this = `C`).
+    pub(crate) fn perform_promise_all(
+        &mut self,
+        c: NanBox,
+        iterable: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let cap = self.new_promise_capability(c)?;
+        let result = self.perform_promise_all_inner(c, iterable, &cap, false);
+        self.finish_combinator(cap, result)
+    }
+
+    /// `Promise.allSettled(iterable)` (this = `C`).
+    pub(crate) fn perform_promise_all_settled(
+        &mut self,
+        c: NanBox,
+        iterable: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let cap = self.new_promise_capability(c)?;
+        let result = self.perform_promise_all_inner(c, iterable, &cap, true);
+        self.finish_combinator(cap, result)
+    }
+
+    /// Shared `all` / `allSettled` body. On an abrupt completion the caller
+    /// rejects the capability (IfAbruptRejectPromise).
+    fn perform_promise_all_inner(
+        &mut self,
+        c: NanBox,
+        iterable: NanBox,
+        cap: &PromiseCapability,
+        settled: bool,
+    ) -> Result<NanBox, ExecError> {
+        let promise_resolve = self.combinator_resolve_fn(c)?;
+        let items = self.iterate_values(iterable)?;
+        let values = self
+            .realm
+            .new_array(alloc::vec![NanBox::undefined(); items.len()]);
+        let remaining = self.count_cell((items.len() + 1) as f64);
+        let values_box = NanBox::handle(values.to_raw());
+        for (i, item) in items.into_iter().enumerate() {
+            let next = self.call_with_this(promise_resolve, c, &[item])?;
+            let state = self.combinator_state(remaining, values_box, cap, NanBox::number(i as f64));
+            if settled {
+                let on_f = self.make_element_fn(N_PROMISE_ALLSETTLED_FULFILL, state);
+                let on_r = self.make_element_fn(N_PROMISE_ALLSETTLED_REJECT, state);
+                self.invoke_then(next, on_f, on_r)?;
+            } else {
+                let on_f = self.make_element_fn(N_PROMISE_ALL_ELEMENT, state);
+                self.invoke_then(next, on_f, cap.reject)?;
+            }
+        }
+        // Decrement the initial +1: if every input already settled synchronously
+        // (count back to 0) resolve now.
+        let n = self.cell_get(remaining) - 1.0;
+        self.cell_set(remaining, n);
+        if n == 0.0 {
+            self.capability_resolve(cap, values_box)?;
+        }
+        Ok(cap.promise)
+    }
+
+    /// `Promise.race(iterable)` (this = `C`).
+    pub(crate) fn perform_promise_race(
+        &mut self,
+        c: NanBox,
+        iterable: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let cap = self.new_promise_capability(c)?;
+        let result = self.perform_promise_race_inner(c, iterable, &cap);
+        self.finish_combinator(cap, result)
+    }
+
+    fn perform_promise_race_inner(
+        &mut self,
+        c: NanBox,
+        iterable: NanBox,
+        cap: &PromiseCapability,
+    ) -> Result<NanBox, ExecError> {
+        let promise_resolve = self.combinator_resolve_fn(c)?;
+        let items = self.iterate_values(iterable)?;
+        for item in items {
+            let next = self.call_with_this(promise_resolve, c, &[item])?;
+            // Each input forwards directly to the capability's resolve/reject — the
+            // first to settle wins (later settlements are ignored once the
+            // capability promise is settled).
+            self.invoke_then(next, cap.resolve, cap.reject)?;
+        }
+        Ok(cap.promise)
+    }
+
+    /// `Promise.any(iterable)` (this = `C`).
+    pub(crate) fn perform_promise_any(
+        &mut self,
+        c: NanBox,
+        iterable: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let cap = self.new_promise_capability(c)?;
+        let result = self.perform_promise_any_inner(c, iterable, &cap);
+        self.finish_combinator(cap, result)
+    }
+
+    fn perform_promise_any_inner(
+        &mut self,
+        c: NanBox,
+        iterable: NanBox,
+        cap: &PromiseCapability,
+    ) -> Result<NanBox, ExecError> {
+        let promise_resolve = self.combinator_resolve_fn(c)?;
+        let items = self.iterate_values(iterable)?;
+        let errors = self
+            .realm
+            .new_array(alloc::vec![NanBox::undefined(); items.len()]);
+        let remaining = self.count_cell((items.len() + 1) as f64);
+        let errors_box = NanBox::handle(errors.to_raw());
+        for (i, item) in items.into_iter().enumerate() {
+            let next = self.call_with_this(promise_resolve, c, &[item])?;
+            let state = self.combinator_state(remaining, errors_box, cap, NanBox::number(i as f64));
+            let on_r = self.make_element_fn(N_PROMISE_ANY_ELEMENT, state);
+            // Fulfillment forwards directly to the capability resolve (first wins).
+            self.invoke_then(next, cap.resolve, on_r)?;
+        }
+        let n = self.cell_get(remaining) - 1.0;
+        self.cell_set(remaining, n);
+        if n == 0.0 {
+            let agg = self.make_aggregate_error(errors_box);
+            self.capability_reject(cap, agg)?;
+        }
+        Ok(cap.promise)
+    }
+
+    /// `Promise.prototype.finally(onFinally)` — species-aware. When `onFinally`
+    /// is not callable the call degenerates to `then(onFinally, onFinally)`. When
+    /// it is callable, two thunks (Then Finally / Catch Finally) run it on either
+    /// settlement and then re-thread the original value/reason through
+    /// `C.resolve(result).then(valueThunk)`.
+    pub(crate) fn promise_finally(
+        &mut self,
+        handle: Handle,
+        recv: NanBox,
+        on_finally: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        // `this` must be an Object (the spec's RequireInternalSlot-free `finally`
+        // still does `Let C = SpeciesConstructor(promise, %Promise%)`, which reads
+        // `promise.constructor` and so needs an object receiver).
+        if !self.is_object_value(recv) {
+            return Err(self.type_error("Promise.prototype.finally called on a non-object"));
+        }
+        let c = self.promise_species_constructor(handle)?;
+        let then = self.read_member(handle, "then")?;
+        if !self.is_callable_value(on_finally) {
+            // Non-callable: pass it through as both handlers.
+            return self.call_with_this(then, recv, &[on_finally, on_finally]);
+        }
+        // Build the two finally closures over a shared state (onFinally + C).
+        let state = self.realm.new_object();
+        self.realm
+            .set_hidden_property(state, PFIN_ONFINALLY, on_finally);
+        self.realm.set_hidden_property(state, PFIN_CTOR, c);
+        let then_finally = self.realm.new_bound_native(N_PROMISE_THEN_FINALLY, state);
+        let catch_finally = self.realm.new_bound_native(N_PROMISE_CATCH_FINALLY, state);
+        self.install_fn_name_length(then_finally, "", 1);
+        self.install_fn_name_length(catch_finally, "", 1);
+        self.call_with_this(
+            then,
+            recv,
+            &[
+                NanBox::handle(then_finally.to_raw()),
+                NanBox::handle(catch_finally.to_raw()),
+            ],
+        )
+    }
+
+    /// A `finally` Then/Catch closure body: run `onFinally()`, then build
+    /// `promise = C.resolve(result)` and return `promise.then(valueThunk)`
+    /// (`thenmode` selects whether the thunk returns the value or re-throws it).
+    pub(crate) fn promise_finally_thunk(
+        &mut self,
+        state: Handle,
+        value: NanBox,
+        then_mode: bool,
+    ) -> Result<NanBox, ExecError> {
+        let on_finally = self
+            .realm
+            .get_property(state, PFIN_ONFINALLY)
+            .unwrap_or(NanBox::undefined());
+        let c = self
+            .realm
+            .get_property(state, PFIN_CTOR)
+            .unwrap_or(NanBox::undefined());
+        let result = self.call(on_finally, &[])?;
+        // `promise = PromiseResolve(C, result)` via `C.resolve(result)`.
+        let resolve = self.combinator_resolve_fn(c)?;
+        let promise = self.call_with_this(resolve, c, &[result])?;
+        // `valueThunk = () => value` (Then Finally) or `() => { throw value }`
+        // (Catch Finally), bound to a state object carrying the captured value.
+        let thunk_state = self.realm.new_object();
+        self.realm
+            .set_hidden_property(thunk_state, PFIN_VALUE, value);
+        let id = if then_mode {
+            N_PROMISE_VALUE_THUNK
+        } else {
+            N_PROMISE_THROW_THUNK
+        };
+        let thunk = self.realm.new_bound_native(id, thunk_state);
+        self.install_fn_name_length(thunk, "", 0);
+        // `return Invoke(promise, "then", [valueThunk])`.
+        let Some(ph) = promise.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("Promise.resolve did not return an object"));
+        };
+        let then = self.read_member(ph, "then")?;
+        self.call_with_this(then, promise, &[NanBox::handle(thunk.to_raw())])
+    }
+
+    /// IfAbruptRejectPromise: a synchronous throw during a combinator's body
+    /// rejects the capability and returns its promise instead of propagating.
+    fn finish_combinator(
+        &mut self,
+        cap: PromiseCapability,
+        result: Result<NanBox, ExecError>,
+    ) -> Result<NanBox, ExecError> {
+        match result {
+            Ok(p) => Ok(p),
+            Err(ExecError::Throw(e)) => {
+                self.capability_reject(&cap, e)?;
+                Ok(cap.promise)
+            }
+            Err(other) => Err(other),
         }
     }
 

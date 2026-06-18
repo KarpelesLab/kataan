@@ -2258,6 +2258,31 @@ impl Realm {
         false
     }
 
+    /// Like [`set_property`](Realm::set_property) but bypasses the extensibility /
+    /// frozen / readonly guards (it always materializes the slot). For use by
+    /// `[[DefineOwnProperty]]`, which performs its own validation and must be able
+    /// to create or overwrite a data slot even on a non-extensible/frozen object
+    /// (e.g. an accessor→data conversion of a configurable property).
+    pub fn force_set_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
+        let dict_threshold = self.limits.object_dictionary_threshold;
+        if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            obj.maybe_convert_to_dict(key, dict_threshold);
+            obj.force_set(key, value);
+            self.write_barrier(handle, value);
+            return true;
+        }
+        if self.aux_eligible(handle) {
+            let aux = self.aux_object(handle);
+            if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                o.maybe_convert_to_dict(key, dict_threshold);
+                o.force_set(key, value);
+            }
+            self.write_barrier(aux, value);
+            return true;
+        }
+        false
+    }
+
     /// The object cell carrying `handle`'s named properties: the cell itself when
     /// it is a plain object, otherwise its auxiliary object (a native/function/
     /// array stores its named props — and their attribute flags — there). Returns

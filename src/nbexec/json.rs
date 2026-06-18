@@ -1,42 +1,64 @@
 use super::*;
 
 impl<'a> Interp<'a> {
-    /// Serializes a value to JSON (`None` when the value is `undefined` or a
-    /// function — which `JSON.stringify` omits / drops).
-    /// Recursive-descent `JSON.parse` over a char slice, advancing `pos`.
-    /// `JSON.parse` reviver: transforms `holder[key]` bottom-up — children first,
-    /// then `reviver.call(holder, key, value)` (a `undefined` result deletes the
-    /// member). Mirrors `InternalizeJSONProperty`.
+    /// `InternalizeJSONProperty(holder, name, reviver)` (25.5.1.1) — the
+    /// `JSON.parse` reviver walk. Reads `val = Get(holder, name)` via `[[Get]]`
+    /// (so an inherited value is observed and a getter fires); if `val` is an
+    /// array its indices are recursed (CreateDataProperty / Delete the result),
+    /// else its *snapshot* of own enumerable keys is recursed; finally returns
+    /// `reviver.call(holder, name, val)`. A `undefined` child result deletes the
+    /// member; any other re-creates it as an own data property.
     pub(crate) fn json_revive(
         &mut self,
         holder: crate::heap::Handle,
         key: &str,
         reviver: NanBox,
     ) -> Result<NanBox, ExecError> {
-        let value = if self.realm.is_array(holder)
-            && let Ok(i) = key.parse::<usize>()
-        {
-            self.realm.get_element(holder, i)
-        } else {
-            self.realm
-                .get_property(holder, key)
-                .unwrap_or(NanBox::undefined())
-        };
+        // `val = ? Get(holder, name)` — through `[[Get]]` (prototype chain + getters).
+        let value = self.read_member(holder, key)?;
         if let Some(vh) = value.as_handle().map(Handle::from_raw) {
             if self.realm.is_array(vh) {
-                let len = self.realm.array_length(vh).unwrap_or(0);
+                // `len = ? LengthOfArrayLike(val)`; recurse each index.
+                let len_v = self.read_member(vh, "length")?;
+                let len = self.realm.to_number(len_v).max(0.0) as usize;
                 for i in 0..len {
                     let ks = alloc::format!("{i}");
                     let nv = self.json_revive(vh, &ks, reviver)?;
-                    self.realm.set_element(vh, i, nv);
+                    if matches!(nv.unpack(), Unpacked::Undefined) {
+                        // `? val.[[Delete]](P)` — a numeric index on an array clears
+                        // the element to a hole (undefined).
+                        self.realm.set_element(vh, i, NanBox::undefined());
+                    } else {
+                        // `? CreateDataProperty(val, P, newElement)`.
+                        self.realm.set_element(vh, i, nv);
+                    }
                 }
-            } else if let Some(keys) = self.realm.object_keys(vh) {
+            } else if self.realm.object_keys(vh).is_some() || self.realm.proxy_at(vh).is_some() {
+                // `keys = ? EnumerableOwnPropertyNames(val, key)` — snapshot now (the
+                // reviver may mutate `val` during the walk). A proxy drives its
+                // `ownKeys`/`getOwnPropertyDescriptor` traps (errors propagate).
+                let keys = if let Some(pk) = self.proxy_own_enumerable_keys(vh)? {
+                    pk
+                } else {
+                    self.realm.object_keys(vh).unwrap_or_default()
+                };
                 for k in keys {
                     let nv = self.json_revive(vh, &k, reviver)?;
                     if matches!(nv.unpack(), Unpacked::Undefined) {
+                        // `? val.[[Delete]](P)` — silently fails on a non-configurable
+                        // own property (ordinary [[Delete]] returns false, not abrupt).
                         self.realm.delete_property(vh, &k);
                     } else {
-                        self.realm.set_property(vh, &k, nv);
+                        // `? CreateDataProperty(val, P, newElement)` — a fresh
+                        // `{value, writable, enumerable, configurable: true}` data
+                        // property. It silently fails (returns false) when an existing
+                        // own property is non-configurable, leaving it unchanged.
+                        if self.realm.has_own(vh, &k)
+                            && self.realm.property_is_non_configurable(vh, &k)
+                        {
+                            continue;
+                        }
+                        self.realm.force_set_property(vh, &k, nv);
                     }
                 }
             }
@@ -45,89 +67,315 @@ impl<'a> Interp<'a> {
         self.call_with_this(reviver, NanBox::handle(holder.to_raw()), &[kb, value])
     }
 
-    /// `JSON.stringify` function replacer: returns a fresh value tree where each
-    /// node is `replacer.call(holder, key, value)`, recursing into the result's
-    /// own properties/elements (does not mutate the input).
-    pub(crate) fn json_apply_replacer(
+    /// `JSON.stringify(value, replacer, space)` — the unified spec algorithm
+    /// (25.5.2): a single recursive `SerializeJSONProperty` that applies the
+    /// replacer (function or property-list array) and `toJSON` at each node,
+    /// detects cycles, and honors the `space` gap. Returns `None` when the top
+    /// value serializes to nothing (`undefined`/function/symbol).
+    pub(crate) fn json_stringify(
         &mut self,
-        holder: crate::heap::Handle,
-        key: &str,
         value: NanBox,
         replacer: NanBox,
-    ) -> Result<NanBox, ExecError> {
-        let kb = self.new_str(key);
-        let v = self.call_with_this(replacer, NanBox::handle(holder.to_raw()), &[kb, value])?;
-        if let Some(vh) = v.as_handle().map(Handle::from_raw) {
-            if self.realm.is_array(vh) {
+        space: NanBox,
+    ) -> Result<Option<String>, ExecError> {
+        // ReplacerFunction / PropertyList from `replacer`.
+        let mut replacer_fn = NanBox::undefined();
+        let mut property_list: Option<Vec<String>> = None;
+        if let Some(rh) = replacer.as_handle().map(Handle::from_raw) {
+            if self.is_callable(rh) {
+                replacer_fn = replacer;
+            } else if self.realm.is_array(rh) {
+                // Build the PropertyList: ToString each element that is a String, a
+                // Number, or a String/Number wrapper object; dedupe, preserve order.
                 let elems = self
                     .realm
-                    .array_elements(vh)
+                    .array_elements(rh)
                     .map(<[_]>::to_vec)
                     .unwrap_or_default();
-                let mut out = Vec::with_capacity(elems.len());
-                for (i, e) in elems.iter().enumerate() {
-                    let ks = alloc::format!("{i}");
-                    out.push(self.json_apply_replacer(vh, &ks, *e, replacer)?);
-                }
-                return Ok(NanBox::handle(self.realm.new_array(out).to_raw()));
-            }
-            if self.realm.string_value(vh).is_none()
-                && let Some(keys) = self.realm.object_keys(vh)
-            {
-                let no = self.realm.new_object();
-                for k in keys {
-                    let pv = self
-                        .realm
-                        .get_property(vh, &k)
-                        .unwrap_or(NanBox::undefined());
-                    let nv = self.json_apply_replacer(vh, &k, pv, replacer)?;
-                    if !matches!(nv.unpack(), Unpacked::Undefined) {
-                        self.realm.set_property(no, &k, nv);
+                let mut list: Vec<String> = Vec::new();
+                for e in elems {
+                    let item = match e.unpack() {
+                        Unpacked::Number(_) => Some(self.realm.to_display_string(e)),
+                        Unpacked::Handle(raw) => {
+                            let h = Handle::from_raw(raw);
+                            if self.realm.string_value(h).is_some() {
+                                Some(self.realm.to_display_string(e))
+                            } else if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
+                                // A String/Number wrapper object contributes its key.
+                                match prim.unpack() {
+                                    Unpacked::Number(_) => Some(self.realm.to_display_string(prim)),
+                                    Unpacked::Handle(pr)
+                                        if self
+                                            .realm
+                                            .string_value(Handle::from_raw(pr))
+                                            .is_some() =>
+                                    {
+                                        Some(self.realm.to_display_string(prim))
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(k) = item
+                        && !list.contains(&k)
+                    {
+                        list.push(k);
                     }
                 }
-                return Ok(NanBox::handle(no.to_raw()));
+                property_list = Some(list);
             }
         }
-        Ok(v)
+        // The `space` gap: a Number (or Number wrapper) → that many spaces (clamped
+        // to 0..=10); a String (or String wrapper) → its first 10 code units; else
+        // empty (compact).
+        let space = self.json_unwrap_wrapper(space);
+        let gap = if let Some(n) = space.as_number() {
+            // ToIntegerOrInfinity then `min(10)` spaces; a non-positive count is 0.
+            // The cast to `usize` truncates toward zero (ToInteger) and a NaN maps
+            // to 0, matching `min(MIN(ToInteger(space), 10), 0)`-style clamping.
+            let n = if n >= 1.0 { (n as usize).min(10) } else { 0 };
+            " ".repeat(n)
+        } else if let Some(s) = space
+            .as_handle()
+            .and_then(|r| self.realm.string_value(Handle::from_raw(r)))
+        {
+            s.chars().take(10).collect()
+        } else {
+            String::new()
+        };
+        // The wrapper holder `{ "": value }`.
+        let holder = self.realm.new_object();
+        self.realm.set_property(holder, "", value);
+        let mut stack: Vec<Handle> = Vec::new();
+        self.serialize_json_property(
+            holder,
+            "",
+            &replacer_fn,
+            property_list.as_deref(),
+            &gap,
+            "",
+            &mut stack,
+        )
     }
 
-    /// `JSON.stringify` array replacer: a fresh value tree keeping only object
-    /// properties whose key is in `allow` (array elements are always kept).
-    pub(crate) fn json_filter_keys(&mut self, value: NanBox, allow: &[String]) -> NanBox {
-        if let Some(vh) = value.as_handle().map(Handle::from_raw) {
-            if self.realm.is_array(vh) {
-                let elems = self
-                    .realm
-                    .array_elements(vh)
-                    .map(<[_]>::to_vec)
-                    .unwrap_or_default();
-                let out: Vec<NanBox> = elems
-                    .iter()
-                    .map(|e| self.json_filter_keys(*e, allow))
-                    .collect();
-                return NanBox::handle(self.realm.new_array(out).to_raw());
-            }
-            if self.realm.string_value(vh).is_none()
-                && let Some(keys) = self.realm.object_keys(vh)
-            {
-                let no = self.realm.new_object();
-                // Keys are emitted in allowlist order (deduplicated, own keys only).
-                let mut emitted: Vec<&String> = Vec::new();
-                for k in allow {
-                    if keys.contains(k) && !emitted.contains(&k) {
-                        emitted.push(k);
-                        let pv = self
-                            .realm
-                            .get_property(vh, k)
-                            .unwrap_or(NanBox::undefined());
-                        let nv = self.json_filter_keys(pv, allow);
-                        self.realm.set_property(no, k, nv);
-                    }
-                }
-                return NanBox::handle(no.to_raw());
+    /// If `v` is a Number/String/Boolean wrapper object, returns its boxed
+    /// primitive; otherwise returns `v` unchanged. (For the `space` argument.)
+    fn json_unwrap_wrapper(&self, v: NanBox) -> NanBox {
+        if let Some(h) = v.as_handle().map(Handle::from_raw)
+            && let Some(prim) = self.realm.get_property(h, PRIM_WRAP)
+        {
+            return prim;
+        }
+        v
+    }
+
+    /// `SerializeJSONProperty(key, holder)` — serializes `holder[key]`, applying
+    /// `toJSON`, then the replacer function; returns `None` if the value drops
+    /// (`undefined`/callable/symbol at a non-array position).
+    #[allow(clippy::too_many_arguments)]
+    fn serialize_json_property(
+        &mut self,
+        holder: Handle,
+        key: &str,
+        replacer_fn: &NanBox,
+        property_list: Option<&[String]>,
+        gap: &str,
+        indent: &str,
+        stack: &mut Vec<Handle>,
+    ) -> Result<Option<String>, ExecError> {
+        // value = Get(holder, key) — through read_member so getters fire.
+        let mut value = self.read_member(holder, key)?;
+        // If value is an Object (or BigInt) with a callable `toJSON`, call it.
+        if let Some(h) = value.as_handle().map(Handle::from_raw) {
+            let tj = self.read_member(h, "toJSON")?;
+            if self.is_callable_value(tj) {
+                let kb = self.new_str(key);
+                value = self.call_with_this(tj, value, &[kb])?;
             }
         }
-        value
+        // ReplacerFunction: value = replacer.call(holder, key, value).
+        if self.is_callable_value(*replacer_fn) {
+            let kb = self.new_str(key);
+            value =
+                self.call_with_this(*replacer_fn, NanBox::handle(holder.to_raw()), &[kb, value])?;
+        }
+        self.serialize_json_value(value, replacer_fn, property_list, gap, indent, stack)
+    }
+
+    /// The type-dispatch tail of SerializeJSONProperty: serialize an already-
+    /// (toJSON/replacer-)transformed `value`.
+    #[allow(clippy::too_many_arguments)]
+    fn serialize_json_value(
+        &mut self,
+        value: NanBox,
+        replacer_fn: &NanBox,
+        property_list: Option<&[String]>,
+        gap: &str,
+        indent: &str,
+        stack: &mut Vec<Handle>,
+    ) -> Result<Option<String>, ExecError> {
+        // Unwrap a primitive-wrapper object to its boxed primitive first (so a
+        // `new Number(1)` serializes as `1`, `new String("x")` as `"x"`).
+        let value = if let Some(h) = value.as_handle().map(Handle::from_raw) {
+            // RawJSON object: emit the stored source verbatim.
+            if self.realm.get_property(h, RAW_JSON_BRAND).is_some()
+                && let Some(raw) = self.realm.get_property(h, "rawJSON")
+            {
+                return Ok(Some(self.realm.to_display_string(raw)));
+            }
+            if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
+                prim
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+        match value.unpack() {
+            Unpacked::Null => Ok(Some(String::from("null"))),
+            Unpacked::Bool(b) => Ok(Some(String::from(if b { "true" } else { "false" }))),
+            Unpacked::Number(n) => Ok(Some(if n.is_finite() {
+                self.realm.to_display_string(value)
+            } else {
+                String::from("null")
+            })),
+            Unpacked::Undefined => Ok(None),
+            Unpacked::Handle(raw) => {
+                let h = Handle::from_raw(raw);
+                if let Some(bytes) = self.realm.string_bytes(h) {
+                    return Ok(Some(json_quote_wtf8(&bytes)));
+                }
+                if self.realm.bigint_at(h).is_some() {
+                    let m = self.new_str("Do not know how to serialize a BigInt");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                // A callable value (function or class constructor) serializes to
+                // nothing (`typeof` is "function").
+                if self.is_callable(h) || self.realm.class_at(h).is_some() {
+                    return Ok(None);
+                }
+                // Array vs object. A typed array is NOT an Array exotic, so it
+                // serializes as an object keyed by its indices (`{"0":1,…}`), per
+                // `JSON.stringify`.
+                if self.realm.is_array(h) {
+                    self.serialize_json_array(h, replacer_fn, property_list, gap, indent, stack)
+                        .map(Some)
+                } else {
+                    self.serialize_json_object(h, replacer_fn, property_list, gap, indent, stack)
+                        .map(Some)
+                }
+            }
+        }
+    }
+
+    /// `SerializeJSONObject` — `{ … }` with the PropertyList (or own enumerable
+    /// keys), recursing per member; cycle-checked via `stack`.
+    #[allow(clippy::too_many_arguments)]
+    fn serialize_json_object(
+        &mut self,
+        h: Handle,
+        replacer_fn: &NanBox,
+        property_list: Option<&[String]>,
+        gap: &str,
+        indent: &str,
+        stack: &mut Vec<Handle>,
+    ) -> Result<String, ExecError> {
+        if stack.contains(&h) {
+            let m = self.new_str("Converting circular structure to JSON");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        stack.push(h);
+        let new_indent = alloc::format!("{indent}{gap}");
+        // The key set: the explicit PropertyList, else the object's own enumerable
+        // string keys (a typed array enumerates its integer indices).
+        let keys: Vec<String> = match property_list {
+            Some(list) => list.to_vec(),
+            None => {
+                if let Some(len) = self.realm.typed_len(h) {
+                    (0..len).map(|i| alloc::format!("{i}")).collect()
+                } else {
+                    self.realm.object_keys(h).unwrap_or_default()
+                }
+            }
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for k in keys {
+            if let Some(s) = self.serialize_json_property(
+                h,
+                &k,
+                replacer_fn,
+                property_list,
+                gap,
+                &new_indent,
+                stack,
+            )? {
+                let sep = if gap.is_empty() { ":" } else { ": " };
+                parts.push(alloc::format!("{}{sep}{s}", json_quote(&k)));
+            }
+        }
+        stack.pop();
+        let out = if parts.is_empty() {
+            String::from("{}")
+        } else if gap.is_empty() {
+            alloc::format!("{{{}}}", parts.join(","))
+        } else {
+            alloc::format!(
+                "{{\n{new_indent}{}\n{indent}}}",
+                parts.join(&alloc::format!(",\n{new_indent}"))
+            )
+        };
+        Ok(out)
+    }
+
+    /// `SerializeJSONArray` — `[ … ]`, each element serialized (a dropped element
+    /// becomes `null`); cycle-checked via `stack`.
+    #[allow(clippy::too_many_arguments)]
+    fn serialize_json_array(
+        &mut self,
+        h: Handle,
+        replacer_fn: &NanBox,
+        _property_list: Option<&[String]>,
+        gap: &str,
+        indent: &str,
+        stack: &mut Vec<Handle>,
+    ) -> Result<String, ExecError> {
+        if stack.contains(&h) {
+            let m = self.new_str("Converting circular structure to JSON");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        stack.push(h);
+        let new_indent = alloc::format!("{indent}{gap}");
+        let len = if self.realm.typed_kind(h).is_some() {
+            self.realm.typed_len(h).unwrap_or(0)
+        } else {
+            self.realm.array_length(h).unwrap_or(0)
+        };
+        let mut parts: Vec<String> = Vec::with_capacity(len);
+        for i in 0..len {
+            let ks = alloc::format!("{i}");
+            // The element replacer/PropertyList still applies via property serialize;
+            // a PropertyList does NOT filter array indices (arrays ignore it).
+            let s = self
+                .serialize_json_property(h, &ks, replacer_fn, None, gap, &new_indent, stack)?
+                .unwrap_or_else(|| String::from("null"));
+            parts.push(s);
+        }
+        stack.pop();
+        let out = if parts.is_empty() {
+            String::from("[]")
+        } else if gap.is_empty() {
+            alloc::format!("[{}]", parts.join(","))
+        } else {
+            alloc::format!(
+                "[\n{new_indent}{}\n{indent}]",
+                parts.join(&alloc::format!(",\n{new_indent}"))
+            )
+        };
+        Ok(out)
     }
 
     /// A `SyntaxError` for a malformed `JSON.parse` input (the spec error type, so
@@ -311,130 +559,6 @@ impl<'a> Interp<'a> {
                     out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                     *pos += 1;
                 }
-            }
-        }
-    }
-
-    /// Interpreter-aware `JSON.stringify` (compact): honors a `toJSON` method and
-    /// invokes getters, unlike the realm-only `json_stringify`.
-    pub(crate) fn json_to_string(&mut self, v: NanBox) -> Result<Option<String>, ExecError> {
-        self.json_to_string_seen(v, "", &mut Vec::new())
-    }
-
-    /// `JSON.stringify` serialization tracking the ancestor handles in `seen`, so a
-    /// circular structure throws a `TypeError` rather than overflowing the stack.
-    /// `key` is the property name under which `v` appears in its parent (`""` at the
-    /// top level), passed to a `toJSON(key)` method.
-    pub(crate) fn json_to_string_seen(
-        &mut self,
-        v: NanBox,
-        key: &str,
-        seen: &mut Vec<Handle>,
-    ) -> Result<Option<String>, ExecError> {
-        if let Some(h) = v.as_handle().map(Handle::from_raw) {
-            // A primitive-wrapper object (`new Number`/`String`/`Boolean`) serializes
-            // as its boxed primitive.
-            if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
-                return self.json_to_string_seen(prim, key, seen);
-            }
-            // A `Date` serializes as its ISO string (its built-in `toJSON`).
-            if let Some(ms) = self.realm.date_at(h) {
-                return Ok(Some(if ms.is_finite() {
-                    json_quote(&crate::realm::date_to_iso(ms))
-                } else {
-                    String::from("null")
-                }));
-            }
-            // A `BigInt` cannot be serialized to JSON.
-            if self.realm.bigint_at(h).is_some() {
-                let m = self.new_str("Do not know how to serialize a BigInt");
-                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-            }
-        }
-        // A `toJSON` method replaces the value before serialization.
-        if let Some(h) = v.as_handle().map(Handle::from_raw)
-            && self.realm.string_value(h).is_none()
-            && !self.realm.is_array(h)
-            && self.realm.object_keys(h).is_some()
-        {
-            let tj = self.read_member(h, "toJSON")?;
-            if tj
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
-                let key_box = self.new_str(key);
-                let r = self.call_with_this(tj, v, &[key_box])?;
-                return self.json_to_string_seen(r, key, seen);
-            }
-        }
-        match v.unpack() {
-            Unpacked::Undefined => Ok(None),
-            Unpacked::Null => Ok(Some(String::from("null"))),
-            Unpacked::Bool(b) => Ok(Some(String::from(if b { "true" } else { "false" }))),
-            // Use the spec ToString (`0` for `-0`, exponential for ≥ 1e21, …);
-            // non-finite numbers serialize as `null`.
-            Unpacked::Number(n) => Ok(Some(if n.is_finite() {
-                self.realm.to_display_string(v)
-            } else {
-                String::from("null")
-            })),
-            Unpacked::Handle(raw) => {
-                let h = Handle::from_raw(raw);
-                if let Some(bytes) = self.realm.string_bytes(h) {
-                    return Ok(Some(json_quote_wtf8(&bytes)));
-                }
-                // A container that is already an ancestor is a cycle → TypeError.
-                if (self.realm.array_elements(h).is_some() || self.realm.object_keys(h).is_some())
-                    && seen.contains(&h)
-                {
-                    let m = self.new_str("Converting circular structure to JSON");
-                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                }
-                // A typed array serializes as an object keyed by its indices
-                // (`{"0":1,…}`), per ES `JSON.stringify` (it is not an Array exotic).
-                if let Some(elems) = self.realm.typed_elements(h) {
-                    let mut parts = Vec::with_capacity(elems.len());
-                    for (i, e) in elems.into_iter().enumerate() {
-                        if let Some(s) =
-                            self.json_to_string_seen(e, &alloc::format!("{i}"), seen)?
-                        {
-                            parts.push(alloc::format!(
-                                "{}:{}",
-                                json_quote(&alloc::format!("{i}")),
-                                s
-                            ));
-                        }
-                    }
-                    return Ok(Some(alloc::format!("{{{}}}", parts.join(","))));
-                }
-                if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
-                    seen.push(h);
-                    let mut parts = Vec::with_capacity(elems.len());
-                    for (i, e) in elems.into_iter().enumerate() {
-                        parts.push(
-                            self.json_to_string_seen(e, &alloc::format!("{i}"), seen)?
-                                .unwrap_or_else(|| String::from("null")),
-                        );
-                    }
-                    seen.pop();
-                    return Ok(Some(alloc::format!("[{}]", parts.join(","))));
-                }
-                if self.realm.object_keys(h).is_some() {
-                    // Enumerable keys (incl. accessors), read via read_member so
-                    // getters are invoked.
-                    let keys = self.realm.object_keys(h).unwrap_or_default();
-                    seen.push(h);
-                    let mut parts = Vec::new();
-                    for k in keys {
-                        let val = self.read_member(h, &k)?;
-                        if let Some(s) = self.json_to_string_seen(val, &k, seen)? {
-                            parts.push(alloc::format!("{}:{}", json_quote(&k), s));
-                        }
-                    }
-                    seen.pop();
-                    return Ok(Some(alloc::format!("{{{}}}", parts.join(","))));
-                }
-                Ok(None) // a function
             }
         }
     }

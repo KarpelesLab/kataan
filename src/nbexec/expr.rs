@@ -114,6 +114,13 @@ impl<'a> Interp<'a> {
         });
         if is_object_key {
             let p = self.coerce_object(k, "string")?;
+            // ToPropertyKey: if ToPrimitive produced a Symbol, it is the key as-is
+            // (do NOT ToString it). Otherwise ToString the primitive.
+            if let Some(raw) = p.as_handle()
+                && self.realm.symbol_at(Handle::from_raw(raw)).is_some()
+            {
+                return Ok(self.member_key(p));
+            }
             return Ok(self.realm.to_display_string(p));
         }
         Ok(self.member_key(k))
@@ -1456,7 +1463,11 @@ impl<'a> Interp<'a> {
         if name == "length" && self.realm.is_array(handle) {
             let n = self.array_length_from_value(new)?;
             self.set_array_length_checked(handle, n)?;
-        } else {
+        } else if self.allow_property_write(handle, &name)? {
+            // Honor a non-writable own data property / non-extensible object:
+            // strict mode throws, sloppy mode silently drops the write (this is
+            // the computed-key `obj[k] = v` path, e.g. a Symbol-keyed write to a
+            // `writable: false` property).
             self.realm.set_property(handle, &name, new);
         }
         Ok(())

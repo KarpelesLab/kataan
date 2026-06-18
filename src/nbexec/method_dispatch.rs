@@ -1475,6 +1475,8 @@ impl<'a> Interp<'a> {
                     let p = self.fresh_promise();
                     let resolve = self.realm.new_bound_native(N_RESOLVE, p);
                     let reject = self.realm.new_bound_native(N_REJECT, p);
+                    self.install_fn_name_length(resolve, "", 1);
+                    self.install_fn_name_length(reject, "", 1);
                     let obj = self.realm.new_object();
                     self.realm
                         .set_property(obj, "promise", NanBox::handle(p.to_raw()));
@@ -1484,166 +1486,47 @@ impl<'a> Interp<'a> {
                         .set_property(obj, "reject", NanBox::handle(reject.to_raw()));
                     return Ok(Some(NanBox::handle(obj.to_raw())));
                 }
-                // `Promise.all(iterable)`: resolve with the array of awaited
-                // values, or reject with the first rejection (eager model).
-                "all" => {
-                    let p = self.fresh_promise();
-                    // GetIterator / iteration sit inside IfAbruptRejectPromise: an
-                    // abrupt completion (a non-iterable argument, a throwing
-                    // `Symbol.iterator`/`next`) rejects the result promise rather
-                    // than throwing out of `Promise.all`.
-                    let items = match self.iterate_values(arg(0)) {
-                        Ok(v) => v,
-                        Err(ExecError::Throw(e)) => {
-                            self.settle(p, e, false);
-                            return Ok(Some(NanBox::handle(p.to_raw())));
-                        }
-                        Err(other) => return Err(other),
-                    };
-                    let mut results = Vec::with_capacity(items.len());
-                    for item in items {
-                        match self.await_value(item) {
-                            Ok(v) => results.push(v),
-                            Err(ExecError::Throw(e)) => {
-                                self.settle(p, e, false);
-                                return Ok(Some(NanBox::handle(p.to_raw())));
-                            }
-                            Err(other) => return Err(other),
-                        }
-                    }
-                    let arr = self.realm.new_array(results);
-                    self.resolve_with(p, NanBox::handle(arr.to_raw()));
-                    return Ok(Some(NanBox::handle(p.to_raw())));
-                }
-                // `Promise.race(iterable)`: settle with the first input to *settle*.
-                // Steps the event loop, checking the inputs after each task, so a
-                // timer-backed promise that settles first wins (ties in a single step
-                // broken by list order).
-                "race" => {
-                    let p = self.fresh_promise();
-                    let items = match self.iterate_values(arg(0)) {
-                        Ok(v) => v,
-                        Err(ExecError::Throw(e)) => {
-                            self.settle(p, e, false);
-                            return Ok(Some(NanBox::handle(p.to_raw())));
-                        }
-                        Err(other) => return Err(other),
-                    };
-                    'race: loop {
-                        for item in &items {
-                            match self.settled_state(*item) {
-                                Some(Ok(v)) => {
-                                    self.resolve_with(p, v);
-                                    break 'race;
-                                }
-                                Some(Err(e)) => {
-                                    self.settle(p, e, false);
-                                    break 'race;
-                                }
-                                None => {}
-                            }
-                        }
-                        // None settled yet: advance the loop, or stop if it is idle
-                        // (the race promise then stays pending, as the spec requires).
-                        if self.microtasks.is_empty() && self.macrotasks.is_empty() {
-                            break;
-                        }
-                        if self.microtasks.is_empty() {
-                            self.run_one_macrotask()?;
-                        } else {
-                            self.run_one_microtask()?;
-                        }
-                    }
-                    return Ok(Some(NanBox::handle(p.to_raw())));
-                }
-                // `Promise.allSettled(iterable)`: never rejects; each entry is
-                // `{status, value}` or `{status, reason}`.
-                "allSettled" => {
-                    let p = self.fresh_promise();
-                    let items = match self.iterate_values(arg(0)) {
-                        Ok(v) => v,
-                        Err(ExecError::Throw(e)) => {
-                            self.settle(p, e, false);
-                            return Ok(Some(NanBox::handle(p.to_raw())));
-                        }
-                        Err(other) => return Err(other),
-                    };
-                    let mut results = Vec::with_capacity(items.len());
-                    for item in items {
-                        let obj = self.realm.new_object();
-                        match self.await_value(item) {
-                            Ok(v) => {
-                                let s = self.new_str("fulfilled");
-                                self.realm.set_property(obj, "status", s);
-                                self.realm.set_property(obj, "value", v);
-                            }
-                            Err(ExecError::Throw(e)) => {
-                                let s = self.new_str("rejected");
-                                self.realm.set_property(obj, "status", s);
-                                self.realm.set_property(obj, "reason", e);
-                            }
-                            Err(other) => return Err(other),
-                        }
-                        results.push(NanBox::handle(obj.to_raw()));
-                    }
-                    let arr = self.realm.new_array(results);
-                    self.resolve_with(p, NanBox::handle(arr.to_raw()));
-                    return Ok(Some(NanBox::handle(p.to_raw())));
-                }
-                // `Promise.any(iterable)`: fulfills with the first input to
-                // fulfill; rejects with an `AggregateError` if all reject.
-                "any" => {
-                    let p = self.fresh_promise();
-                    let items = match self.iterate_values(arg(0)) {
-                        Ok(v) => v,
-                        Err(ExecError::Throw(e)) => {
-                            self.settle(p, e, false);
-                            return Ok(Some(NanBox::handle(p.to_raw())));
-                        }
-                        Err(other) => return Err(other),
-                    };
-                    let mut errors = Vec::new();
-                    for item in items {
-                        match self.await_value(item) {
-                            Ok(v) => {
-                                self.resolve_with(p, v);
-                                return Ok(Some(NanBox::handle(p.to_raw())));
-                            }
-                            Err(ExecError::Throw(e)) => errors.push(e),
-                            Err(other) => return Err(other),
-                        }
-                    }
-                    // None fulfilled: reject with an AggregateError holding them.
-                    let agg = self.realm.new_object();
-                    let name = self.new_str("AggregateError");
-                    self.realm.set_property(agg, "name", name);
-                    let msg = self.new_str("All promises were rejected");
-                    self.realm.set_property(agg, "message", msg);
-                    let errs = self.realm.new_array(errors);
-                    self.realm
-                        .set_property(agg, "errors", NanBox::handle(errs.to_raw()));
-                    self.settle(p, NanBox::handle(agg.to_raw()), false);
-                    return Ok(Some(NanBox::handle(p.to_raw())));
-                }
                 _ => {}
             }
         }
+        // --- Promise combinators (`all`/`race`/`allSettled`/`any`) ---
+        // These are generic over the receiver `C` (`this`): `Promise.all`,
+        // `Subclass.all`, and `Promise.all.call(C, …)` all dispatch here. They run
+        // the spec algorithm (NewPromiseCapability(C) + Invoke(C,"resolve") +
+        // Invoke(p,"then")), so call counts, resolve-function identity, species,
+        // and AggregateError all hold. Gated on the receiver being a constructor so
+        // an unrelated object's same-named method is not hijacked.
+        if matches!(method, "all" | "race" | "allSettled" | "any") && self.is_constructor(recv) {
+            return match method {
+                "all" => Ok(Some(self.perform_promise_all(recv, arg(0))?)),
+                "allSettled" => Ok(Some(self.perform_promise_all_settled(recv, arg(0))?)),
+                "race" => Ok(Some(self.perform_promise_race(recv, arg(0))?)),
+                "any" => Ok(Some(self.perform_promise_any(recv, arg(0))?)),
+                _ => unreachable!(),
+            };
+        }
         // --- promise instance methods (`then`/`catch`/`finally`) ---
-        if self.realm.promise_state(handle).is_some() {
-            match method {
-                "then" => return Ok(Some(self.promise_then(handle, arg(0), arg(1)))),
-                "catch" => {
-                    return Ok(Some(self.promise_then(handle, NanBox::undefined(), arg(0))));
-                }
-                "finally" => {
-                    // The callback runs on either settlement for side effects; the
-                    // original value/rejection passes through to the new promise.
-                    let cb = arg(0);
-                    let result = self.register_then(handle, cb, cb, true);
-                    return Ok(Some(NanBox::handle(result.to_raw())));
-                }
-                _ => {}
-            }
+        // `then` is brand-checked + species-aware. `catch`/`finally` are generic:
+        // they delegate to `Invoke(this, "then", …)`, so they work on any thenable
+        // receiver and surface a poisoned/throwing/non-callable `then`.
+        if method == "then" {
+            return Ok(Some(self.perform_promise_then_method(
+                handle,
+                arg(0),
+                arg(1),
+            )?));
+        }
+        if method == "catch" {
+            // `return Invoke(promise, "then", [undefined, onRejected])`.
+            let then = self.read_member(handle, "then")?;
+            return Ok(Some(self.call_with_this(
+                then,
+                recv,
+                &[NanBox::undefined(), arg(0)],
+            )?));
+        }
+        if method == "finally" {
+            return Ok(Some(self.promise_finally(handle, recv, arg(0))?));
         }
 
         // A custom matcher/replacer: when the argument defines the matching
