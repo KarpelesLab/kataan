@@ -709,12 +709,13 @@ impl<'a> Interp<'a> {
                         let key = self.eval(e)?;
                         let iter_sym = self.well_known_symbol("iterator");
                         if self.realm.strict_equals(key, iter_sym) {
-                            // A generator/iterator is its own iterator (identity).
-                            if recv
-                                .as_handle()
-                                .map(Handle::from_raw)
-                                .is_some_and(|h| self.realm.get_property(h, GEN_BUF).is_some())
-                            {
+                            // A generator/iterator is its own iterator (identity) —
+                            // both the eager built-in iterables (`GEN_BUF`) and a
+                            // lazy generator (`GEN_FRAME`).
+                            if recv.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                                self.realm.get_property(h, GEN_BUF).is_some()
+                                    || self.realm.get_property(h, GEN_FRAME).is_some()
+                            }) {
                                 return Ok(recv);
                             }
                             let vals = self.iterate_values(recv)?;

@@ -1065,12 +1065,6 @@ impl<'a> Interp<'a> {
                 .unwrap_or(NanBox::undefined());
             core::mem::replace(&mut self.new_target, nt)
         };
-        // A generator body runs eagerly into a fresh yield buffer.
-        let saved_sink = if def.is_generator {
-            Some(self.gen_sink.replace(Vec::new()))
-        } else {
-            None
-        };
         // C2: the tree-walk depth counter measures native recursion *within* one
         // function frame; reset it for the callee's body (deep function-call
         // recursion is bounded separately by `call_depth`) so genuine recursion is
@@ -1109,6 +1103,26 @@ impl<'a> Interp<'a> {
                 };
                 self.bind_pattern(&param.target, value)?;
             }
+            // A generator call does NOT run its body: it captures the
+            // parameter-bound scope and ambient state into a suspended
+            // [`generator::GenFrame`], returning a lazy generator object. The
+            // body runs incrementally on each `next()`.
+            if def.is_generator {
+                let body: &'a [crate::ast::Stmt] = match def.body {
+                    Body::Block(stmts) => stmts,
+                    // A generator always has a block body; an (impossible) concise
+                    // body yields an empty generator.
+                    Body::Expr(_) => &[],
+                };
+                // A body-level `"use strict"` prologue applies to the whole body.
+                if let Body::Block(stmts) = def.body
+                    && has_use_strict(stmts)
+                {
+                    self.strict = true;
+                }
+                let scope = self.current.clone();
+                return Ok(self.make_lazy_generator(body, scope));
+            }
             self.run_body(def.body)
         })();
         self.current = saved;
@@ -1118,15 +1132,12 @@ impl<'a> Interp<'a> {
         self.new_target = saved_target;
         self.eval_depth = saved_eval_depth;
         self.strict = saved_strict;
-        // A generator call returns an iterator over the values it yielded.
-        if def.is_generator {
-            let collected = self.gen_sink.take().unwrap_or_default();
-            self.gen_sink = saved_sink.flatten();
-            let ret = result?; // a throw during collection propagates at call time
-            return Ok(self.make_generator_with_return(collected, ret));
-        }
         // An `async` function returns a promise of its result (rejected on throw).
-        if def.is_async {
+        // An `async function*` (async generator) is *not* wrapped: its call result
+        // is the (lazy) generator object, returned directly — async generators are
+        // a documented follow-up, so they keep the synchronous generator shape the
+        // previous model exposed (`g.next` is a callable method, not a promise).
+        if def.is_async && !def.is_generator {
             let promise = self.fresh_promise();
             match result {
                 Ok(v) => self.resolve_with(promise, v),

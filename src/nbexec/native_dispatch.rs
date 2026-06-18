@@ -1283,6 +1283,20 @@ impl<'a> Interp<'a> {
                 let v = arg(0);
                 self.gen_iter_return(this, v)?
             }
+            // A lazy generator's `next`/`return`/`throw` — resume the suspended
+            // frame with the appropriate resumption.
+            N_GEN_NEXT => {
+                let this = self.this_val;
+                self.lazy_gen_resume(this, generator::Resumption::Next(arg(0)))?
+            }
+            N_GEN_RETURN => {
+                let this = self.this_val;
+                self.lazy_gen_resume(this, generator::Resumption::Return(arg(0)))?
+            }
+            N_GEN_THROW => {
+                let this = self.this_val;
+                self.lazy_gen_resume(this, generator::Resumption::Throw(arg(0)))?
+            }
             // The abstract `%TypedArray%` intrinsic is not callable directly.
             N_TYPED_ARRAY_ABSTRACT => {
                 let m = self.new_str("Abstract class TypedArray not directly constructable");
