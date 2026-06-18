@@ -550,19 +550,13 @@ built-ins/AggregateError/newtarget-proto-custom.js  # [sloppy] expected pass, Ru
 built-ins/AggregateError/order-of-args-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/AggregateError/prototype/constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/AggregateError/prototype/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/15.4.5.1-5-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/S15.4.1_A1.1_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/S15.4.2.1_A1.1_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/S15.4.3_A1.1_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/S15.4.3_A1.1_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/S15.4.3_A1.1_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/S15.4.5.1_A1.2_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/S15.4.5.1_A2.1_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/S15.4.5.2_A1_T1.js  # [sloppy] expected pass, Runtime RangeError: Invalid array length
 built-ins/Array/S15.4_A1.1_T10.js  # [sloppy] expected pass, Runtime RangeError: Invalid array length
-built-ins/Array/S15.4_A1.1_T7.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/S15.4_A1.1_T8.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/S15.4_A1.1_T9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/Symbol.species/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Array/Symbol.species/return-value.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Array/Symbol.species/symbol-species-name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
@@ -734,7 +728,6 @@ built-ins/Array/prototype/concat/is-concat-spreadable-proxy.js  # [sloppy] expec
 built-ins/Array/prototype/copyWithin/call-with-boolean.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/copyWithin/coerced-values-start-change-start.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/copyWithin/coerced-values-start-change-target.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/copyWithin/fill-holes.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/copyWithin/length-near-integer-limit.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/copyWithin/resizable-buffer.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/copyWithin/return-abrupt-from-delete-proxy-target.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -754,7 +747,6 @@ built-ins/Array/prototype/entries/resizable-buffer.js  # [sloppy] expected pass,
 built-ins/Array/prototype/every/15.4.4.16-3-14.js  # [sloppy] expected pass, Runtime RangeError: Invalid array length
 built-ins/Array/prototype/every/15.4.4.16-3-29.js  # [sloppy] expected pass, Runtime RangeError: Invalid array length
 built-ins/Array/prototype/every/15.4.4.16-3-8.js  # [sloppy] expected pass, Runtime RangeError: Invalid array length
-built-ins/Array/prototype/every/15.4.4.16-7-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/15.4.4.16-7-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/15.4.4.16-7-3.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/15.4.4.16-7-4.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -771,12 +763,9 @@ built-ins/Array/prototype/every/15.4.4.16-7-b-9.js  # [sloppy] expected pass, Ru
 built-ins/Array/prototype/every/15.4.4.16-7-c-i-10.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/15.4.4.16-7-c-i-12.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/15.4.4.16-7-c-i-14.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/every/15.4.4.16-7-c-i-16.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/15.4.4.16-7-c-i-18.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/15.4.4.16-7-c-i-20.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/15.4.4.16-7-c-i-28.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/every/15.4.4.16-7-c-i-31.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/every/15.4.4.16-7-c-i-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/15.4.4.16-7-c-ii-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/15.4.4.16-7-c-iii-28.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/every/callbackfn-resize-arraybuffer.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -811,12 +800,9 @@ built-ins/Array/prototype/filter/15.4.4.20-9-b-9.js  # [sloppy] expected pass, R
 built-ins/Array/prototype/filter/15.4.4.20-9-c-i-10.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/filter/15.4.4.20-9-c-i-12.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/filter/15.4.4.20-9-c-i-14.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/filter/15.4.4.20-9-c-i-16.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/filter/15.4.4.20-9-c-i-18.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/filter/15.4.4.20-9-c-i-20.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/filter/15.4.4.20-9-c-i-28.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/filter/15.4.4.20-9-c-i-31.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/filter/15.4.4.20-9-c-i-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/filter/15.4.4.20-9-c-ii-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/filter/callbackfn-resize-arraybuffer.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/filter/create-ctor-non-object.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -882,12 +868,9 @@ built-ins/Array/prototype/forEach/15.4.4.18-7-b-9.js  # [sloppy] expected pass, 
 built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-10.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-12.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-14.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-16.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-18.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-20.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-28.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-31.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/forEach/15.4.4.18-7-c-ii-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/forEach/callbackfn-resize-arraybuffer.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/forEach/resizable-buffer-shrink-mid-iteration.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -905,6 +888,7 @@ built-ins/Array/prototype/indexOf/15.4.4.14-5-12.js  # [sloppy] expected pass, R
 built-ins/Array/prototype/indexOf/15.4.4.14-5-16.js  # [sloppy] expected pass, Runtime RangeError: Invalid array length
 built-ins/Array/prototype/indexOf/15.4.4.14-9-9.js  # [sloppy] expected pass, Runtime RangeError: Invalid array length
 built-ins/Array/prototype/indexOf/15.4.4.14-9-a-10.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Array/prototype/indexOf/15.4.4.14-9-a-14.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-a-16.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-a-17.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-a-18.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -912,18 +896,13 @@ built-ins/Array/prototype/indexOf/15.4.4.14-9-a-19.js  # [sloppy] expected pass,
 built-ins/Array/prototype/indexOf/15.4.4.14-9-a-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-a-3.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-a-5.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/indexOf/15.4.4.14-9-a-6.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-a-8.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/indexOf/15.4.4.14-9-b-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-b-i-11.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-b-i-13.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/indexOf/15.4.4.14-9-b-i-15.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-b-i-17.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-b-i-19.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-b-i-28.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/15.4.4.14-9-b-i-30.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/indexOf/15.4.4.14-9-b-i-7.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/indexOf/15.4.4.14-9-b-i-9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/coerced-searchelement-fromindex-grow.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/coerced-searchelement-fromindex-shrink.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/indexOf/length-near-integer-limit.js  # [sloppy] expected pass, Runtime RangeError: Invalid array length
@@ -943,6 +922,7 @@ built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-9.js  # [sloppy] expected pass
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-10.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-11.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-13.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-14.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-15.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-16.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-17.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -951,21 +931,16 @@ built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-19.js  # [sloppy] expected p
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-3.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-5.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-6.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-7.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-a-9.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-i-11.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-i-13.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-i-15.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-i-17.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-i-28.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-i-29.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-i-30.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-i-31.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-i-7.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/lastIndexOf/15.4.4.15-8-b-i-9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/coerced-position-grow.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/coerced-position-shrink.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/lastIndexOf/length-near-integer-limit.js  # [sloppy] expected pass, Runtime RangeError: Invalid array length
@@ -975,7 +950,6 @@ built-ins/Array/prototype/map/15.4.4.19-8-2.js  # [sloppy] expected pass, Runtim
 built-ins/Array/prototype/map/15.4.4.19-8-3.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-4.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-5.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/map/15.4.4.19-8-9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-b-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-b-11.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-b-13.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -988,12 +962,9 @@ built-ins/Array/prototype/map/15.4.4.19-8-b-9.js  # [sloppy] expected pass, Runt
 built-ins/Array/prototype/map/15.4.4.19-8-c-i-10.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-c-i-12.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-c-i-14.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/map/15.4.4.19-8-c-i-16.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-c-i-18.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-c-i-19.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-c-i-28.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/map/15.4.4.19-8-c-i-31.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/map/15.4.4.19-8-c-i-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/15.4.4.19-8-c-ii-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/callbackfn-resize-arraybuffer.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/map/create-ctor-non-object.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -1042,26 +1013,15 @@ built-ins/Array/prototype/push/set-length-zero-array-is-frozen.js  # [sloppy] ex
 built-ins/Array/prototype/push/set-length-zero-array-length-is-non-writable.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/push/throws-if-integer-limit-exceeded.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/push/throws-with-string-receiver.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-8-b-3.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-8-b-iii-1-10.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-8-b-iii-1-12.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-8-b-iii-1-14.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-8-b-iii-1-16.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-8-b-iii-1-30.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-8-b-iii-1-33.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-8-b-iii-1-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-8-c-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-8-c-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-8-c-3.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-9-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-9-10.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-3.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-4.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-6.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-b-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-9-b-11.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-b-13.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-b-14.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-b-15.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -1078,33 +1038,20 @@ built-ins/Array/prototype/reduce/15.4.4.21-9-b-5.js  # [sloppy] expected pass, R
 built-ins/Array/prototype/reduce/15.4.4.21-9-b-7.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-b-9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-c-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-9-c-i-10.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-9-c-i-12.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-9-c-i-14.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-9-c-i-16.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-9-c-i-30.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-9-c-i-33.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduce/15.4.4.21-9-c-i-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/15.4.4.21-9-c-ii-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/callbackfn-resize-arraybuffer.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/resizable-buffer-shrink-mid-iteration.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduce/resizable-buffer.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-2.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-3.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-iii-1-10.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-iii-1-12.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-iii-1-14.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-iii-1-16.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-iii-1-18.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-iii-1-20.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-iii-1-30.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-iii-1-31.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-iii-1-33.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-8-b-iii-1-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-8-c-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-8-c-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-8-c-3.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-9-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-3.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-4.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -1112,7 +1059,6 @@ built-ins/Array/prototype/reduceRight/15.4.4.22-9-6.js  # [sloppy] expected pass
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-b-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-b-10.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-9-b-11.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-b-12.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-b-13.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-b-14.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -1138,14 +1084,8 @@ built-ins/Array/prototype/reduceRight/15.4.4.22-9-b-7.js  # [sloppy] expected pa
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-b-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-b-9.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-i-10.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-i-12.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-i-14.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-i-16.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-i-30.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-i-31.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-i-33.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-i-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-ii-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/callbackfn-resize-arraybuffer.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/reduceRight/length-near-integer-limit.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -1213,12 +1153,9 @@ built-ins/Array/prototype/some/15.4.4.17-7-b-9.js  # [sloppy] expected pass, Run
 built-ins/Array/prototype/some/15.4.4.17-7-c-i-10.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/some/15.4.4.17-7-c-i-12.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/some/15.4.4.17-7-c-i-14.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/some/15.4.4.17-7-c-i-16.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/some/15.4.4.17-7-c-i-18.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/some/15.4.4.17-7-c-i-20.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/some/15.4.4.17-7-c-i-28.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/some/15.4.4.17-7-c-i-31.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/some/15.4.4.17-7-c-i-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/some/15.4.4.17-7-c-ii-8.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/some/15.4.4.17-7-c-iii-28.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/some/callbackfn-resize-arraybuffer.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -1263,8 +1200,8 @@ built-ins/Array/prototype/splice/S15.4.4.12_A2_T3.js  # [sloppy] expected pass, 
 built-ins/Array/prototype/splice/S15.4.4.12_A2_T4.js  # [sloppy] expected pass, Runtime TypeError: Cannot set property of null or undefined
 built-ins/Array/prototype/splice/S15.4.4.12_A3_T1.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Array/prototype/splice/S15.4.4.12_A3_T3.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Array/prototype/splice/S15.4.4.12_A4_T1.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Array/prototype/splice/S15.4.4.12_A4_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Array/prototype/splice/S15.4.4.12_A4_T1.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
+built-ins/Array/prototype/splice/S15.4.4.12_A4_T2.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Array/prototype/splice/S15.4.4.12_A4_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/splice/S15.4.4.12_A6.1_T2.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Array/prototype/splice/S15.4.4.12_A6.1_T3.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -1937,10 +1874,6 @@ built-ins/JSON/stringify/value-string-object.js  # [sloppy] expected pass, Runti
 built-ins/JSON/stringify/value-tojson-array-circular.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/JSON/stringify/value-tojson-not-function.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/JSON/stringify/value-tojson-result.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Map/Symbol.species/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Map/Symbol.species/return-value.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Map/Symbol.species/symbol-species-name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Map/Symbol.species/symbol-species.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Map/get-set-method-failure.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Map/groupBy/invalid-callback.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Map/groupBy/length.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -1961,38 +1894,8 @@ built-ins/Map/prototype/forEach/deleted-values-during-foreach.js  # [sloppy] exp
 built-ins/Map/prototype/forEach/first-argument-is-not-callable.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Map/prototype/forEach/iterates-values-added-after-foreach-begins.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Map/prototype/forEach/iterates-values-deleted-then-readded.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Map/prototype/getOrInsert/append-new-values-normalizes-zero-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsert/append-new-values.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsert/append-value-if-key-is-not-present-different-key-types.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsert/getOrInsert.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Map/prototype/getOrInsert/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/Map/prototype/getOrInsert/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
-built-ins/Map/prototype/getOrInsert/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Map/prototype/getOrInsert/returns-value-if-key-is-not-present-different-key-types.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsert/returns-value-if-key-is-present-different-key-types.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsert/returns-value-normalized-zero-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/append-new-values-normalizes-zero-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/append-new-values.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/append-value-if-key-is-not-present-different-key-types.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/callbackfn-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Map/prototype/getOrInsertComputed/canonical-key-passed-to-callback.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/check-callback-fn-args.js  # [strict] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/check-state-after-callback-fn-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Map/prototype/getOrInsertComputed/different-types-function-callbackfn-does-not-throw.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/does-not-evaluate-callbackfn-if-key-present.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/getOrInsertComputed.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Map/prototype/getOrInsertComputed/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Map/prototype/getOrInsertComputed/overwrites-mutation-from-callbackfn.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/returns-value-if-key-is-not-present-different-key-types.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/returns-value-if-key-is-present-different-key-types.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/Map/prototype/getOrInsertComputed/returns-value-normalized-zero-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/Map/prototype/getOrInsertComputed/canonical-key-passed-to-callback.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Map/prototype/set/length.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Map/prototype/size/does-not-have-mapdata-internal-slot-set.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Map/prototype/size/does-not-have-mapdata-internal-slot-weakmap.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Map/prototype/size/does-not-have-mapdata-internal-slot.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Map/prototype/size/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Map/prototype/size/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Map/prototype/size/size.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/MapIteratorPrototype/Symbol.toStringTag.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/MapIteratorPrototype/next/iteration-mutable.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/MapIteratorPrototype/next/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
@@ -2056,8 +1959,6 @@ built-ins/Object/create/properties-arg-to-object-non-empty-string.js  # [sloppy]
 built-ins/Object/defineProperties/15.2.3.7-6-a-112.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-113.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-120.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-6-a-155.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-6-a-156.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-161.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-162.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-163.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2078,10 +1979,6 @@ built-ins/Object/defineProperties/15.2.3.7-6-a-181.js  # [sloppy] expected pass,
 built-ins/Object/defineProperties/15.2.3.7-6-a-182.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-184.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-185.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-6-a-190.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-6-a-191.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-6-a-192.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-6-a-193.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-195.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-197.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-198.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2103,7 +2000,6 @@ built-ins/Object/defineProperties/15.2.3.7-6-a-216.js  # [sloppy] expected pass,
 built-ins/Object/defineProperties/15.2.3.7-6-a-217.js  # [sloppy] expected pass, Runtime TypeError: Cannot redefine non-configurable property
 built-ins/Object/defineProperties/15.2.3.7-6-a-218.js  # [sloppy] expected pass, Runtime TypeError: Cannot redefine non-configurable property
 built-ins/Object/defineProperties/15.2.3.7-6-a-220.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-6-a-221.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-222.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-223.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-224.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2125,8 +2021,6 @@ built-ins/Object/defineProperties/15.2.3.7-6-a-239.js  # [sloppy] expected pass,
 built-ins/Object/defineProperties/15.2.3.7-6-a-240.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-241.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-242.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-6-a-244.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperties/15.2.3.7-6-a-245.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-247.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-248.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperties/15.2.3.7-6-a-249.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2148,7 +2042,6 @@ built-ins/Object/defineProperty/15.2.3.6-4-116.js  # [sloppy] expected pass, Run
 built-ins/Object/defineProperty/15.2.3.6-4-117.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-124.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-159.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-4-160.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-167.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-168.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-169.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2166,7 +2059,6 @@ built-ins/Object/defineProperty/15.2.3.6-4-186.js  # [sloppy] expected pass, Run
 built-ins/Object/defineProperty/15.2.3.6-4-188.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-189.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-190.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-4-194.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-195.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-199.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-201.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2220,8 +2112,6 @@ built-ins/Object/defineProperty/15.2.3.6-4-249.js  # [sloppy] expected pass, Run
 built-ins/Object/defineProperty/15.2.3.6-4-250.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-251.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-252.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-4-253.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Object/defineProperty/15.2.3.6-4-255.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-256.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-257.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Object/defineProperty/15.2.3.6-4-258.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -2890,9 +2780,9 @@ built-ins/Proxy/setPrototypeOf/return-abrupt-from-get-trap.js  # [sloppy] expect
 built-ins/Proxy/setPrototypeOf/return-abrupt-from-isextensible-target.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/setPrototypeOf/return-abrupt-from-target-getprototypeof.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Proxy/setPrototypeOf/toboolean-trap-result-true-target-is-extensible.js  # [sloppy] expected pass, Runtime TypeError: proxy 'setPrototypeOf' changed the prototype of a non-extensible target
+built-ins/Reflect/apply/call-target.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Reflect/construct/return-with-newtarget-argument.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Reflect/ownKeys/order-after-define-property.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Reflect/ownKeys/return-non-enumerable-keys.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Reflect/set/different-property-descriptors.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/15.10.2.15-6-1.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-negative-cases.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -3340,90 +3230,20 @@ built-ins/RegExpStringIteratorPrototype/next/length.js  # [sloppy] expected pass
 built-ins/RegExpStringIteratorPrototype/next/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/RegExpStringIteratorPrototype/next/prop-desc.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/RegExpStringIteratorPrototype/next/regexp-tolength-lastindex-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/Symbol.species/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Set/Symbol.species/return-value.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Set/Symbol.species/symbol-species-name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Set/Symbol.species/symbol-species.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
 built-ins/Set/length.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Set/prototype/Symbol.iterator.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Set/prototype/Symbol.iterator/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/difference/allows-set-like-class.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/difference/allows-set-like-object.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/difference/array-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/difference/called-with-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/difference/combines-Map.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/difference/converts-negative-zero.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/difference/set-like-array.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/difference/set-like-class-mutation.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/difference/set-like-class-order.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/difference/size-is-a-number.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Set/prototype/forEach/iterates-values-added-after-foreach-begins.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Set/prototype/forEach/iterates-values-deleted-then-readded.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Set/prototype/forEach/iterates-values-revisits-after-delete-re-add.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/intersection/allows-set-like-class.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/intersection/allows-set-like-object.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/intersection/array-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/intersection/called-with-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/intersection/combines-Map.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/intersection/converts-negative-zero.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/intersection/result-order.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/intersection/set-like-array.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/intersection/set-like-class-mutation.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/intersection/set-like-class-order.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/intersection/size-is-a-number.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isDisjointFrom/allows-set-like-class.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isDisjointFrom/allows-set-like-object.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isDisjointFrom/array-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isDisjointFrom/called-with-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isDisjointFrom/compares-Map.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isDisjointFrom/converts-negative-zero.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isDisjointFrom/set-like-array.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isDisjointFrom/set-like-class-mutation.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isDisjointFrom/set-like-class-order.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isDisjointFrom/set-like-iter-return.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isDisjointFrom/size-is-a-number.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isSubsetOf/allows-set-like-class.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isSubsetOf/allows-set-like-object.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isSubsetOf/array-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isSubsetOf/called-with-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isSubsetOf/set-like-array.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isSubsetOf/set-like-class-mutation.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isSubsetOf/set-like-class-order.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isSubsetOf/size-is-a-number.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isSupersetOf/allows-set-like-class.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isSupersetOf/allows-set-like-object.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isSupersetOf/array-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isSupersetOf/called-with-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isSupersetOf/converts-negative-zero.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isSupersetOf/set-like-array.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/isSupersetOf/set-like-class-mutation.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isSupersetOf/set-like-class-order.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isSupersetOf/set-like-iter-return.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/isSupersetOf/size-is-a-number.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Set/prototype/isDisjointFrom/set-like-class-mutation.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Set/prototype/isDisjointFrom/set-like-class-order.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Set/prototype/isDisjointFrom/set-like-iter-return.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Set/prototype/isSubsetOf/set-like-class-mutation.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Set/prototype/isSupersetOf/set-like-class-order.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Set/prototype/isSupersetOf/set-like-iter-return.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Set/prototype/keys/keys.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/size/length.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Set/prototype/size/name.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Set/prototype/size/size.js  # [sloppy] expected pass, Runtime TypeError: cannot read property of null or undefined
-built-ins/Set/prototype/symmetricDifference/allows-set-like-class.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/symmetricDifference/allows-set-like-object.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/symmetricDifference/array-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/symmetricDifference/called-with-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/symmetricDifference/combines-Map.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/symmetricDifference/converts-negative-zero.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/symmetricDifference/set-like-array.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/symmetricDifference/set-like-class-mutation.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/symmetricDifference/set-like-class-order.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/symmetricDifference/size-is-a-number.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/union/allows-set-like-class.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/union/allows-set-like-object.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/union/array-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/union/called-with-object.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/union/combines-Map.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/union/converts-negative-zero.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/union/set-like-array.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/Set/prototype/union/set-like-class-mutation.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/union/set-like-class-order.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
-built-ins/Set/prototype/union/size-is-a-number.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/Set/prototype/symmetricDifference/set-like-class-mutation.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Set/prototype/values/values-iteration-mutable.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Set/set-get-add-method-failure.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/Set/set-iterable-calls-add.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -4145,30 +3965,16 @@ built-ins/WeakMap/iterator-item-second-entry-returns-abrupt.js  # [sloppy] expec
 built-ins/WeakMap/iterator-items-are-not-object-close-iterator.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakMap/iterator-items-keys-cannot-be-held-weakly.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakMap/length.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/WeakMap/prototype/getOrInsert/adds-object-element.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsert/adds-symbol-element.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/WeakMap/prototype/getOrInsert/does-not-have-weakmapdata-internal-slot-map.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakMap/prototype/getOrInsert/getOrInsert.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakMap/prototype/getOrInsert/length.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/WeakMap/prototype/getOrInsert/name.js  # [sloppy] expected pass, Runtime TypeError: Object.getOwnPropertyDescriptor called on null or undefined
 built-ins/WeakMap/prototype/getOrInsert/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/WeakMap/prototype/getOrInsert/returns-value-if-key-is-not-present-object-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsert/returns-value-if-key-is-not-present-symbol-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsert/returns-value-if-key-is-present-object-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsert/returns-value-if-key-is-present-symbol-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsertComputed/adds-object-element.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsertComputed/adds-symbol-element.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsertComputed/adds-value-different-callbackfn.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsertComputed/callbackfn-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/WeakMap/prototype/getOrInsertComputed/check-callback-fn-args.js  # [strict] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsertComputed/check-state-after-callback-fn-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/WeakMap/prototype/getOrInsertComputed/does-not-evaluate-callbackfn-if-key-present.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/WeakMap/prototype/getOrInsert/throw-if-key-cannot-be-held-weakly.js  # [sloppy] expected pass, Runtime [object Object]: 
+built-ins/WeakMap/prototype/getOrInsertComputed/does-not-have-weakmapdata-internal-slot-map.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakMap/prototype/getOrInsertComputed/getOrInsertComputed.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakMap/prototype/getOrInsertComputed/not-a-constructor.js  # [sloppy] expected pass, Runtime [object Object]: 
-built-ins/WeakMap/prototype/getOrInsertComputed/overwrites-mutation-from-callbackfn.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsertComputed/returns-value-if-key-is-not-present-object-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsertComputed/returns-value-if-key-is-not-present-symbol-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsertComputed/returns-value-if-key-is-present-object-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-built-ins/WeakMap/prototype/getOrInsertComputed/returns-value-if-key-is-present-symbol-key.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+built-ins/WeakMap/prototype/getOrInsertComputed/throw-if-key-cannot-be-held-weakly.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakMap/prototype/set/length.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakMap/prototype/set/throw-if-key-cannot-be-held-weakly.js  # [sloppy] expected pass, Runtime [object Object]: 
 built-ins/WeakMap/set-not-callable-throws.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5274,6 +5080,7 @@ language/expressions/assignment/dstr/array-rest-iter-rtrn-close.js  # [sloppy] e
 language/expressions/assignment/dstr/array-rest-iter-thrw-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-rest-iter-thrw-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-rest-lref-err.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/expressions/assignment/dstr/array-rest-nested-array-undefined-hole.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-rest-nested-array-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-rest-nested-obj-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/assignment/dstr/array-rest-put-let.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -5589,7 +5396,7 @@ language/expressions/async-generator/named-strict-error-reassign-fn-name-in-body
 language/expressions/async-generator/named-strict-error-reassign-fn-name-in-body-in-eval.js  # [strict] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected SameValue(«0», «1») to be true )
 language/expressions/async-generator/named-strict-error-reassign-fn-name-in-body.js  # [strict] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected SameValue(«0», «1») to be true )
 language/expressions/async-generator/named-unscopables-with-in-nested-fn.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-language/expressions/async-generator/named-unscopables-with.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/expressions/async-generator/named-unscopables-with.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/async-generator/named-yield-identifier-non-strict.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/async-generator/named-yield-identifier-spread-non-strict.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/async-generator/named-yield-promise-reject-next-catch.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -5660,7 +5467,7 @@ language/expressions/async-generator/named-yield-star-sync-throw.js  # [sloppy] 
 language/expressions/async-generator/params-trailing-comma-multiple.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/async-generator/params-trailing-comma-single.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/async-generator/unscopables-with-in-nested-fn.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-language/expressions/async-generator/unscopables-with.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/expressions/async-generator/unscopables-with.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/async-generator/yield-identifier-non-strict.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/async-generator/yield-identifier-spread-non-strict.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/async-generator/yield-promise-reject-next-catch.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -5732,14 +5539,11 @@ language/expressions/async-generator/yield-star-sync-return.js  # [sloppy] expec
 language/expressions/async-generator/yield-star-sync-throw.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/async-generator/yield-thenable-create-resolving-functions-reject.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/expressions/async-generator/yield-thenable-create-resolving-functions-resolve.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-language/expressions/await/async-await-interleaved.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [Await: 1, Await: 2, Promise: 1, Promise: 2] and expected [A)
 language/expressions/await/async-generator-interleaved.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [await, await, 1, 2] and expected [await, 1, await, 2] shoul)
-language/expressions/await/await-awaits-thenables-that-throw.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected true but got false )
 language/expressions/await/await-awaits-thenables.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected SameValue(«[object Object]», «42») to be true )
 language/expressions/await/await-monkey-patched-promise.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [Await: 42, Promise: 1] and expected [Promise: 1, Await: 42,)
 language/expressions/await/await-non-promise-thenable.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [Await: [object Object], Await: [object Object], Promise: 1])
-language/expressions/await/await-non-promise.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [Await: 1, Promise: 1] and expected [Await: 1, Promise: 1, P)
-language/expressions/await/for-await-of-interleaved.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [Await: 3, Await: 2, Await: 1, Promise: 6, Promise: 5, Promi)
+language/expressions/await/for-await-of-interleaved.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [Promise: 6, Await: 3, Promise: 5, Await: 2, Promise: 4, Awa)
 language/expressions/bitwise-and/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/bitwise-not/bigint-non-primitive.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/bitwise-or/order-of-evaluation.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -6880,13 +6684,11 @@ language/expressions/class/private-static-setter-multiple-evaluations-of-class-e
 language/expressions/class/private-static-setter-multiple-evaluations-of-class-factory.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/private-static-setter-multiple-evaluations-of-class-function-ctor.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/restricted-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/class/scope-gen-meth-paramsbody-var-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/scope-gen-meth-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/scope-meth-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/scope-name-lex-open-heritage.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/scope-name-lex-open-no-heritage.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/scope-setter-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/class/scope-static-gen-meth-paramsbody-var-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/scope-static-gen-meth-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/scope-static-meth-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/class/scope-static-setter-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -7457,9 +7259,7 @@ language/expressions/generators/prototype-value.js  # [sloppy] expected pass, Ru
 language/expressions/generators/scope-body-lex-distinct.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/generators/scope-name-var-open-non-strict.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/generators/scope-name-var-open-strict.js  # [strict] expected pass, Runtime [object Object]: 
-language/expressions/generators/scope-paramsbody-var-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/generators/scope-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/generators/unscopables-with.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/generators/yield-identifier-non-strict.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/generators/yield-identifier-spread-non-strict.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/generators/yield-spread-arr-multiple.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
@@ -7751,7 +7551,6 @@ language/expressions/object/object-spread-proxy-ownkeys-returned-keys-order.js  
 language/expressions/object/prop-def-id-eval-error-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/object/prop-def-id-eval-error.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/object/scope-gen-meth-body-lex-distinct.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/expressions/object/scope-gen-meth-paramsbody-var-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/object/scope-gen-meth-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/object/scope-getter-body-lex-distinc.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/expressions/object/scope-meth-body-lex-distinct.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -8244,7 +8043,7 @@ language/statements/async-generator/params-trailing-comma-multiple.js  # [sloppy
 language/statements/async-generator/params-trailing-comma-single.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/async-generator/return-undefined-implicit-and-explicit.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/async-generator/unscopables-with-in-nested-fn.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-language/statements/async-generator/unscopables-with.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/async-generator/unscopables-with.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/async-generator/yield-identifier-non-strict.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/async-generator/yield-identifier-spread-non-strict.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/async-generator/yield-promise-reject-next-catch.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -9537,13 +9336,11 @@ language/statements/class/method/dflt-params-ref-self.js  # [sloppy] expected pa
 language/statements/class/name-binding/const.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/name-binding/in-extends-expression-assigned.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/restricted-properties.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/class/scope-gen-meth-paramsbody-var-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/scope-gen-meth-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/scope-meth-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/scope-name-lex-open-heritage.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/scope-name-lex-open-no-heritage.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/scope-setter-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/class/scope-static-gen-meth-paramsbody-var-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/scope-static-gen-meth-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/scope-static-meth-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/class/scope-static-setter-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -9623,8 +9420,9 @@ language/statements/do-while/S12.6.1_A8.js  # [sloppy] expected pass, Runtime [o
 language/statements/do-while/cptn-abrupt-empty.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/do-while/cptn-normal.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/empty/cptn-value.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/for-await-of/async-from-sync-iterator-continuation-abrupt-completion-get-constructor.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [start, never reached, tick 1, tick 2] and expected [start, )
+language/statements/for-await-of/async-from-sync-iterator-continuation-abrupt-completion-get-constructor.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [start, tick 1, never reached, tick 2] and expected [start, )
 language/statements/for-await-of/async-func-decl-dstr-array-elem-init-in.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected Comma, found Keyword(In) (at 7968..7970)
+language/statements/for-await-of/async-func-decl-dstr-array-rest-nested-array-undefined-hole.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected SameValue(«undefined», «undefined») to be true Test262:Asy)
 language/statements/for-await-of/async-func-decl-dstr-obj-id-init-in.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected Comma, found Keyword(In) (at 7971..7973)
 language/statements/for-await-of/async-func-decl-dstr-obj-prop-elem-init-in.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected Comma, found Keyword(In) (at 7980..7982)
 language/statements/for-await-of/async-func-decl-dstr-obj-rest-str-val.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected SameValue(«undefined», «"f"») to be true Test262:AsyncTest)
@@ -9688,7 +9486,7 @@ language/statements/for-await-of/async-gen-decl-dstr-array-rest-iter-nrml-close-
 language/statements/for-await-of/async-gen-decl-dstr-array-rest-iteration.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-rest-lref.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-rest-nested-array-null.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-language/statements/for-await-of/async-gen-decl-dstr-array-rest-nested-array-undefined-hole.js  # [sloppy] expected pass, Runtime TypeError: is not a function
+language/statements/for-await-of/async-gen-decl-dstr-array-rest-nested-array-undefined-hole.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-await-of/async-gen-decl-dstr-array-rest-nested-array-undefined-own.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-rest-nested-array-undefined.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/for-await-of/async-gen-decl-dstr-array-rest-nested-array-yield-expr.js  # [sloppy] expected pass, Runtime TypeError: is not a function
@@ -10209,7 +10007,7 @@ language/statements/for-await-of/iterator-close-throw-get-method-abrupt.js  # [s
 language/statements/for-await-of/iterator-close-throw-get-method-non-callable.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected SameValue(«function TypeError() { [native code] }», «funct)
 language/statements/for-await-of/ticks-with-async-iter-resolved-promise-and-constructor-lookup-two.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [pre, tick 1, tick 2] and expected [pre, constructor, tick 1)
 language/statements/for-await-of/ticks-with-async-iter-resolved-promise-and-constructor-lookup.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [pre, tick 1, tick 2] and expected [pre, tick 1, loop, tick )
-language/statements/for-await-of/ticks-with-sync-iter-resolved-promise-and-constructor-lookup.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [pre, loop, post, tick 1, tick 2, tick 3, tick 4] and expect)
+language/statements/for-await-of/ticks-with-sync-iter-resolved-promise-and-constructor-lookup.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [pre, tick 1, loop, post, tick 2, tick 3, tick 4] and expect)
 language/statements/for-in/12.6.4-2.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-in/S12.6.4_A3.1.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-in/S12.6.4_A3.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -10226,15 +10024,18 @@ language/statements/for-in/head-lhs-let.js  # [sloppy] expected pass, Parse Synt
 language/statements/for-in/identifier-let-allowed-as-lefthandside-expression-not-strict.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected a binding name, found Keyword(In) (at 6531..6533)
 language/statements/for-in/order-after-define-property.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-in/order-enumerable-shadowed.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/for-in/resizable-buffer.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-in/scope-body-lex-open.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-in/scope-head-lex-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-in/scope-head-lex-open.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/for-of/Array.prototype.Symbol.iterator.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/arguments-mapped-aliasing.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/arguments-mapped-mutation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/arguments-unmapped-mutation.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/array-contract.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/array-expand.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/array-key-get-error.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/for-of/array.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/cptn-decl-abrupt-empty.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/cptn-decl-itr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/cptn-expr-abrupt-empty.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -10262,6 +10063,7 @@ language/statements/for-of/dstr/array-rest-iter-rtrn-close.js  # [sloppy] expect
 language/statements/for-of/dstr/array-rest-iter-thrw-close-err.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-rest-iter-thrw-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-rest-lref-err.js  # [sloppy] expected pass, Runtime [object Object]: 
+language/statements/for-of/dstr/array-rest-nested-array-undefined-hole.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-rest-nested-array-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-rest-nested-obj-yield-expr.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/for-of/dstr/array-rest-put-let.js  # [sloppy] expected pass, Runtime [object Object]: 
@@ -10354,9 +10156,7 @@ language/statements/generators/prototype-property-descriptor.js  # [sloppy] expe
 language/statements/generators/prototype-relation-to-function.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/generators/prototype-value.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/generators/scope-body-lex-distinct.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/generators/scope-paramsbody-var-close.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/generators/scope-paramsbody-var-open.js  # [sloppy] expected pass, Runtime [object Object]: 
-language/statements/generators/unscopables-with.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/generators/yield-identifier-non-strict.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/generators/yield-identifier-spread-non-strict.js  # [sloppy] expected pass, Runtime [object Object]: 
 language/statements/generators/yield-spread-arr-multiple.js  # [sloppy] expected pass, Runtime TypeError: is not iterable
