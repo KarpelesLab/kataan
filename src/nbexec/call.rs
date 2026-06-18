@@ -1078,6 +1078,114 @@ impl<'a> Interp<'a> {
         result
     }
 
+    /// `GetPrototypeFromConstructor(newTarget, default)` / the prototype half of
+    /// `OrdinaryCreateFromConstructor`: the `[[Prototype]]` for a freshly built
+    /// built-in instance. `new_target` is the original constructor for a plain
+    /// `new C()`, the subclass for `new Subclass()` (via `super()`), or the
+    /// explicit 3rd argument of `Reflect.construct`. When `new_target` is an
+    /// object with an object `prototype`, that prototype is used; otherwise the
+    /// intrinsic `default_proto` (the constructor's own `.prototype`).
+    ///
+    /// `callee` is the constructor actually invoked; when `new_target` is the same
+    /// callee (the common `new C()` case) the default is returned without a
+    /// redundant `prototype` read.
+    pub(crate) fn instance_proto(
+        &mut self,
+        new_target: NanBox,
+        callee: NanBox,
+        default_proto: Option<Handle>,
+    ) -> Option<Handle> {
+        // A `new.target` distinct from the callee (a subclass via `super()` or a
+        // `Reflect.construct` newTarget) supplies the instance prototype from its
+        // own `.prototype` — when that is an object.
+        if new_target.as_handle().is_some()
+            && new_target.as_handle() != callee.as_handle()
+            && let Some(nt) = new_target.as_handle().map(Handle::from_raw)
+            && let Some(p) = self.constructor_prototype(nt)
+        {
+            return Some(p);
+        }
+        default_proto
+    }
+
+    /// `Get(constructor, "prototype")` reduced to a `[[Prototype]]`-eligible object
+    /// handle. Resolves a class's prototype (stored in the realm's class-prototype
+    /// table), an ordinary function's `.prototype` (the lazily-materialized
+    /// `fn_protos` object), and an aux-stored `prototype` data property (a native
+    /// constructor, or a function whose `prototype` was reassigned). `None` when the
+    /// constructor has no object prototype (so the caller falls back to the
+    /// intrinsic default).
+    pub(crate) fn constructor_prototype(&mut self, ctor: Handle) -> Option<Handle> {
+        // A class: its prototype object (materialized on demand).
+        if let Some((class_id, _)) = self.realm.class_at(ctor) {
+            return Some(self.class_prototype_by_id(class_id));
+        }
+        // An ordinary function: its `.prototype` (an aux reassignment wins over the
+        // default `fn_protos` object, matching `read_member`).
+        if let Some((func_id, _)) = self.realm.function_at(ctor) {
+            if let Some(p) = self
+                .realm
+                .get_property(ctor, "prototype")
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw)
+            {
+                return Some(p);
+            }
+            return Some(self.realm.function_prototype(func_id));
+        }
+        // A native constructor / bound native / any other callable: its `prototype`
+        // data property, if it carries one that is an object.
+        self.realm
+            .get_property(ctor, "prototype")
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+    }
+
+    /// The intrinsic `.prototype` object handle for a constructor bound at the
+    /// given global `name` (e.g. `"Map"` → `Map.prototype`).
+    pub(crate) fn intrinsic_proto(&mut self, name: &str) -> Option<Handle> {
+        self.current
+            .get(name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+    }
+
+    /// Builds the cell-bearing base instance for a class that `extends` a native
+    /// (`class S extends Map {}` → a real `Map` cell). Runs the native constructor
+    /// (resolved from `root_id`) with `args` and `new.target` = the subclass
+    /// (`class_handle`), so the resulting cell carries the native internal slots and
+    /// its `[[Prototype]]` is the subclass's `.prototype` (via the `newTarget` path
+    /// in `construct`). The returned handle becomes the derived instance.
+    pub(crate) fn construct_native_base(
+        &mut self,
+        root_id: u16,
+        args: &[NanBox],
+        class_handle: NanBox,
+    ) -> Result<Handle, ExecError> {
+        // The namespace-object constructors (`Array`/`Object`) carry sentinel ids;
+        // every other base resolves to its callable native constructor.
+        let ctor = self
+            .native_ctor_by_id(root_id)
+            .map(|h| NanBox::handle(h.to_raw()))
+            .ok_or(ExecError::Unsupported(
+                "native superclass constructor not found",
+            ))?;
+        // `new.target` for the base construction is the subclass.
+        let saved = self.reflect_new_target.replace(class_handle);
+        let result = self.construct(ctor, args);
+        self.reflect_new_target = saved;
+        let value = result?;
+        value
+            .as_handle()
+            .map(Handle::from_raw)
+            .ok_or(ExecError::Unsupported(
+                "native superclass produced a non-object",
+            ))
+    }
+
     /// `new Callee(args)` — supports the built-in `Map`/`Set` constructors
     /// (optionally seeded from an iterable argument).
     pub(crate) fn construct(
@@ -1206,8 +1314,20 @@ impl<'a> Interp<'a> {
         // With no/`null`/`undefined` argument it makes a fresh object; otherwise it
         // is ToObject(value) (the same as calling `Object(value)`).
         if self.current.get("Object").and_then(|v| v.as_handle()) == callee.as_handle() {
+            let nt = self.reflect_new_target.unwrap_or(callee);
+            // `Object(value)` with an actual object value returns it as-is, ignoring
+            // newTarget; only the fresh-object path (no/null/undefined arg, or a
+            // primitive being wrapped) honors a subclass's `newTarget.prototype`.
             let v = args.first().copied().unwrap_or(NanBox::undefined());
-            return Ok(self.coerce_to_object(v));
+            let result = self.coerce_to_object(v);
+            if nt.as_handle() != callee.as_handle()
+                && !self.is_object_value(v)
+                && let Some(rh) = result.as_handle().map(Handle::from_raw)
+                && let Some(proto) = self.instance_proto(nt, callee, None)
+            {
+                self.realm.set_object_proto(rh, Some(proto));
+            }
+            return Ok(result);
         }
         // `new Array(...)` — Array is a namespace object, matched by identity.
         // A single number argument is the length; otherwise the elements.
@@ -1230,15 +1350,16 @@ impl<'a> Interp<'a> {
             } else {
                 args.to_vec()
             };
-            return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
-        }
-        // `new Object(value)` — the `Object` namespace object is a constructor.
-        // With no `newTarget` subclassing, it behaves like calling `Object(value)`:
-        // an object value is returned as-is, a primitive is wrapped (ToObject), and
-        // null/undefined/none yield a fresh ordinary object.
-        if self.current.get("Object").and_then(|v| v.as_handle()) == callee.as_handle() {
-            let v = args.first().copied().unwrap_or(NanBox::undefined());
-            return Ok(self.coerce_to_object(v));
+            let arr = self.realm.new_array(elems);
+            // A subclass (`class S extends Array {}` / `Reflect.construct`) links the
+            // dense array to `newTarget.prototype` (default `%Array.prototype%`).
+            let nt = self.reflect_new_target.unwrap_or(callee);
+            if nt.as_handle() != callee.as_handle()
+                && let Some(proto) = self.instance_proto(nt, callee, None)
+            {
+                self.realm.set_object_proto(arr, Some(proto));
+            }
+            return Ok(NanBox::handle(arr.to_raw()));
         }
         let Some(id) = self.realm.native_at(handle) else {
             // A callable that is not a constructor — e.g. a built-in method such as
@@ -1247,6 +1368,20 @@ impl<'a> Interp<'a> {
             // TypeError (catchable), not an internal "unsupported".
             let m = self.new_str("is not a constructor");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        };
+        // The constructor under which the instance is created (`new.target`): the
+        // explicit `Reflect.construct` newTarget, the subclass reached via
+        // `super()`, or — for a plain `new C()` — the callee itself. Consumed (not
+        // peeked) so a `Reflect.construct(NativeCtor, args, NT)` newTarget cannot
+        // leak into a subsequent unrelated construction. The typed-array path reads
+        // `reflect_new_target` directly, so for those ids we leave it in place and
+        // let `link_typed_array_proto` consume the value.
+        let is_typed_array_id =
+            (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id);
+        let native_new_target = if is_typed_array_id {
+            self.reflect_new_target.unwrap_or(callee)
+        } else {
+            self.reflect_new_target.take().unwrap_or(callee)
         };
         // The abstract `%TypedArray%` intrinsic cannot be constructed directly.
         if id == N_TYPED_ARRAY_ABSTRACT {
@@ -1438,18 +1573,12 @@ impl<'a> Interp<'a> {
                 }
             };
             let d = self.realm.new_date(ms);
-            // Register the instance's `[[Prototype]]` as `Date.prototype` so
-            // `Object.getPrototypeOf(date)`, `instanceof`, and
-            // `Date.prototype.isPrototypeOf(date)` resolve correctly.
-            if let Some(proto) = self
-                .current
-                .get("Date")
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw)
-                .and_then(|c| self.realm.get_property(c, "prototype"))
-                .and_then(|p| p.as_handle())
-                .map(Handle::from_raw)
-            {
+            // Register the instance's `[[Prototype]]`: `newTarget.prototype` for a
+            // subclass (`class S extends Date {}` / `Reflect.construct`), else the
+            // intrinsic `Date.prototype` — so `Object.getPrototypeOf(date)`,
+            // `instanceof`, and `Date.prototype.isPrototypeOf(date)` resolve.
+            let default = self.intrinsic_proto("Date");
+            if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
                 self.realm.set_native_proto(d, proto);
             }
             return Ok(NanBox::handle(d.to_raw()));
@@ -1505,6 +1634,12 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
             }
             let r = self.new_regexp_instance(&pat, &flags);
+            // A subclass (`class S extends RegExp {}` / `Reflect.construct`) links
+            // the instance to `newTarget.prototype` instead of `RegExp.prototype`.
+            let default = self.intrinsic_proto("RegExp");
+            if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                self.realm.set_native_proto(r, proto);
+            }
             return Ok(NanBox::handle(r.to_raw()));
         }
         // `new Error(message, { cause })` and friends → `{ name, message }` plus
@@ -1559,6 +1694,14 @@ impl<'a> Interp<'a> {
             let raw = args.first().map_or(0.0, |v| self.realm.to_number(*v));
             let n = self.validate_alloc_len(raw, "Invalid ArrayBuffer length")?;
             let buf = self.make_array_buffer(n);
+            // A subclass (`class S extends ArrayBuffer {}` / `Reflect.construct`)
+            // re-links the buffer to `newTarget.prototype` (the default
+            // `%ArrayBuffer.prototype%` was installed by `make_array_buffer`).
+            if native_new_target.as_handle() != callee.as_handle()
+                && let Some(proto) = self.instance_proto(native_new_target, callee, None)
+            {
+                self.realm.set_object_proto(buf, Some(proto));
+            }
             // `new ArrayBuffer(n, { maxByteLength })` makes the buffer resizable up to `max`.
             if let Some(opts) = args
                 .get(1)
@@ -1647,17 +1790,12 @@ impl<'a> Interp<'a> {
         }
         // `new DataView(buffer, byteOffset?)` — a view onto an ArrayBuffer.
         if id == N_DATA_VIEW {
-            // The instance's `[[Prototype]]` is `DataView.prototype`, so inherited
-            // members (the get*/set* methods, the accessors, `Symbol.toStringTag`)
-            // resolve through the chain.
-            let dv_proto = self
-                .current
-                .get("DataView")
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw)
-                .and_then(|c| self.realm.get_property(c, "prototype"))
-                .and_then(|p| p.as_handle())
-                .map(Handle::from_raw);
+            // The instance's `[[Prototype]]` is `DataView.prototype` (or
+            // `newTarget.prototype` for a subclass / `Reflect.construct`), so
+            // inherited members (the get*/set* methods, the accessors,
+            // `Symbol.toStringTag`) resolve through the chain.
+            let default = self.intrinsic_proto("DataView");
+            let dv_proto = self.instance_proto(native_new_target, callee, default);
             let obj = self.realm.new_object_with_proto(dv_proto);
             let buf = args.first().copied().unwrap_or(NanBox::undefined());
             let mut buf_len = 0usize;
@@ -1896,7 +2034,17 @@ impl<'a> Interp<'a> {
                         .truthy(args.first().copied().unwrap_or(NanBox::undefined())),
                 ),
             };
-            return Ok(self.make_primitive_wrapper(prim, id));
+            let wrapper = self.make_primitive_wrapper(prim, id);
+            // A subclass (`class S extends Number {}` / `Reflect.construct`) links
+            // the wrapper to `newTarget.prototype` (the default intrinsic was set by
+            // `make_primitive_wrapper`).
+            if native_new_target.as_handle() != callee.as_handle()
+                && let Some(wh) = wrapper.as_handle().map(Handle::from_raw)
+                && let Some(proto) = self.instance_proto(native_new_target, callee, None)
+            {
+                self.realm.set_object_proto(wh, Some(proto));
+            }
+            return Ok(wrapper);
         }
         // `new Function(...)` builds an anonymous function from runtime source —
         // identical to calling `Function(...)` as a plain function.
@@ -1925,17 +2073,12 @@ impl<'a> Interp<'a> {
             N_WEAKSET => "WeakSet",
             _ => "",
         };
-        if let Some(proto) = self
-            .current
-            .get(ctor_name)
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|c| self.realm.get_property(c, "prototype"))
-            .and_then(|p| p.as_handle())
-            .map(Handle::from_raw)
-        {
+        let default = self.intrinsic_proto(ctor_name);
+        if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
             // A collection is a non-object cell: its `[[Prototype]]` link is kept
-            // in the realm's native-proto table (read by `object_proto`).
+            // in the realm's native-proto table (read by `object_proto`). A subclass
+            // (`class S extends Map {}` / `Reflect.construct`) links to
+            // `newTarget.prototype`.
             self.realm.set_native_proto(handle, proto);
         }
         // A weak collection rejects primitive keys (its keys must be objects/symbols).

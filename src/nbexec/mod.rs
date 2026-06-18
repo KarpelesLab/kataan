@@ -568,6 +568,15 @@ const N_UNESCAPE: u16 = 421;
 const N_REGEXP_LEGACY_GET: u16 = 422;
 /// The `set RegExp.input` / `set RegExp.$_` legacy setter (Annex B.2.5).
 const N_REGEXP_LEGACY_SET: u16 = 423;
+/// Sentinel "native base kind" id for `Array` — a namespace-object constructor
+/// (no real native id), used by the native-subclassing machinery
+/// (`class S extends Array {}`) to mark that a derived instance must be created as
+/// a dense `Cell::Array` rather than a plain object. Never a real callable's id.
+const N_BASE_ARRAY: u16 = 480;
+/// Sentinel "native base kind" id for `Object` — a namespace-object constructor,
+/// marking that a derived instance is an ordinary object (its `[[Prototype]]`
+/// from the subclass). Never a real callable's id.
+const N_BASE_OBJECT: u16 = 481;
 /// `%IteratorHelperPrototype%.next` — drives a lazy ES2025 iterator-helper object
 /// (`map`/`filter`/`take`/`drop`/`flatMap`) one step at a time.
 const N_ITER_HELPER_NEXT: u16 = 340;

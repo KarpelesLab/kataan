@@ -469,23 +469,20 @@ impl<'a> Interp<'a> {
     /// resolve. (Typed-array views are non-object cells, so the proto lives in the
     /// realm's `native_protos` side table.)
     pub(crate) fn link_typed_array_proto(&mut self, view: Handle, kind: u8, callee: NanBox) {
+        // A `newTarget` distinct from the callee (a subclass via `super()`, a
+        // `Reflect.construct` newTarget, or `TA.of`/`from` with a subclass) supplies
+        // the view's `[[Prototype]]` from its own `.prototype` — resolved through
+        // `constructor_prototype` so a class / function newTarget (whose prototype
+        // is not a plain aux property) is handled. Otherwise the kind's intrinsic.
         let proto = self
             .reflect_new_target
             .filter(|nt| nt.as_handle() != callee.as_handle())
             .and_then(|nt| nt.as_handle())
             .map(Handle::from_raw)
-            .and_then(|nt| self.realm.get_property(nt, "prototype"))
-            .and_then(|p| p.as_handle())
-            .map(Handle::from_raw)
+            .and_then(|nt| self.constructor_prototype(nt))
             .or_else(|| {
                 let kind_name = TYPED_ARRAY_KINDS[kind as usize].0;
-                self.current
-                    .get(kind_name)
-                    .and_then(|v| v.as_handle())
-                    .map(Handle::from_raw)
-                    .and_then(|c| self.realm.get_property(c, "prototype"))
-                    .and_then(|p| p.as_handle())
-                    .map(Handle::from_raw)
+                self.intrinsic_proto(kind_name)
             });
         if let Some(proto) = proto {
             self.realm.set_native_proto(view, proto);
