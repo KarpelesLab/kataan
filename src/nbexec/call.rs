@@ -287,6 +287,60 @@ impl<'a> Interp<'a> {
                         "String.prototype.{name} called on null or undefined"
                     )));
                 }
+                // `replaceAll`/`matchAll`: per spec, when `searchValue`/`regexp` is
+                // a RegExp it must be global — `IsRegExp` then `Get(flags)` must
+                // include "g", else a TypeError — and this is checked *before*
+                // `ToString(this)` runs (so a poisoned `this.toString` is not
+                // called). The string-receiver path validates it again redundantly.
+                if (name == "replaceAll" || name == "matchAll")
+                    && args.first().copied().is_some_and(|a| self.is_regexp_arg(a))
+                    && let Some(argh) = args
+                        .first()
+                        .and_then(|a| a.as_handle())
+                        .map(Handle::from_raw)
+                {
+                    let flags_v = self.read_member(argh, "flags")?;
+                    if matches!(flags_v.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                        return Err(self.type_error(&alloc::format!(
+                            "String.prototype.{name} called with a non-global RegExp argument"
+                        )));
+                    }
+                    let flags_s = self.coerce_to_string(flags_v)?;
+                    if !flags_s.contains('g') {
+                        return Err(self.type_error(&alloc::format!(
+                            "String.prototype.{name} called with a non-global RegExp argument"
+                        )));
+                    }
+                }
+                // match/matchAll/replace/replaceAll/search/split: if the
+                // searchValue/separator is not undefined/null and defines the
+                // matching well-known-symbol method, delegate to
+                // `searchValue[@@method](O, …rest)` with the *original* `this`
+                // (`O` = RequireObjectCoercible(this), NOT ToString'd) — so a String
+                // wrapper receiver reaches the replacer as the object it is, and the
+                // searchValue's own `toString` is never called.
+                if let Some(sym_name) = match name.as_str() {
+                    "match" => Some("match"),
+                    "matchAll" => Some("matchAll"),
+                    "search" => Some("search"),
+                    "replace" | "replaceAll" => Some("replace"),
+                    "split" => Some("split"),
+                    _ => None,
+                } && let Some(arg0) = args.first().copied()
+                    && !matches!(arg0.unpack(), Unpacked::Undefined | Unpacked::Null)
+                    && let Some(argh) = arg0.as_handle().map(Handle::from_raw)
+                {
+                    let sym = self.well_known_symbol(sym_name);
+                    let key = self.member_key(sym);
+                    let m = self.read_member(argh, &key)?;
+                    if m.as_handle()
+                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                    {
+                        let mut call_args = alloc::vec![this_val];
+                        call_args.extend_from_slice(&args[1.min(args.len())..]);
+                        return self.call_with_this(m, arg0, &call_args);
+                    }
+                }
                 let s = self.coerce_to_string(this_val)?;
                 let str_recv = self.new_str(&s);
                 return Ok(self
@@ -444,7 +498,15 @@ impl<'a> Interp<'a> {
                         .typed_array_object(h)
                         .map_or(NanBox::undefined(), |b| NanBox::handle(b.to_raw())),
                     "byteOffset" => {
-                        NanBox::number(self.realm.typed_byte_offset(h).unwrap_or(0) as f64)
+                        // A detached or out-of-bounds view reports byteOffset 0.
+                        let off = if self.typed_array_detached(h)
+                            || self.realm.typed_array_out_of_bounds(h)
+                        {
+                            0
+                        } else {
+                            self.realm.typed_byte_offset(h).unwrap_or(0)
+                        };
+                        NanBox::number(off as f64)
                     }
                     "byteLength" => {
                         NanBox::number(self.realm.typed_len(h).unwrap_or(0) as f64 * bpe)
@@ -476,6 +538,31 @@ impl<'a> Interp<'a> {
                     && let Some(bh) = buf_h
                 {
                     self.guard_detached_buffer(bh)?;
+                    // IsViewOutOfBounds: a resizable buffer shrank under the view —
+                    // `byteLength`/`byteOffset` then throw a TypeError too.
+                    let total = self
+                        .array_buffer_bytes(bh)
+                        .and_then(|b| self.realm.bytes_len(b))
+                        .unwrap_or(0);
+                    let off = self
+                        .realm
+                        .get_property(h, DATA_VIEW_OFF)
+                        .and_then(|n| n.as_number())
+                        .unwrap_or(0.0) as usize;
+                    let recorded = self
+                        .realm
+                        .get_property(h, DATA_VIEW_LEN)
+                        .and_then(|n| n.as_number())
+                        .map(|n| n as usize);
+                    let oob = match recorded {
+                        Some(len) => off.checked_add(len).is_none_or(|end| end > total),
+                        None => off > total,
+                    };
+                    if oob {
+                        return Err(self.type_error(&alloc::format!(
+                            "get DataView.prototype.{name} on an out-of-bounds view"
+                        )));
+                    }
                 }
                 return Ok(match name.as_str() {
                     "buffer" => buf,
@@ -1949,38 +2036,42 @@ impl<'a> Interp<'a> {
             let dv_proto = self.instance_proto(native_new_target, callee, default);
             let obj = self.realm.new_object_with_proto(dv_proto);
             let buf = args.first().copied().unwrap_or(NanBox::undefined());
-            let mut buf_len = 0usize;
-            if let Some(bh) = buf.as_handle().map(Handle::from_raw) {
-                self.guard_detached_buffer(bh)?;
-                buf_len = self
-                    .array_buffer_bytes(bh)
-                    .and_then(|h| self.realm.bytes_len(h))
-                    .unwrap_or(0);
-            }
-            let off = args.get(1).map_or(0.0, |v| self.realm.to_number(*v));
-            // M1: a negative/non-integer offset, or one past the buffer, is a
-            // RangeError — never trusted blindly into the access path.
-            if !off.is_finite() || off < 0.0 || (off as usize as f64) != off {
-                let m = self.new_str("Invalid DataView offset");
-                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
-            }
-            let byte_off = off as usize;
+            // RequireInternalSlot(buffer, [[ArrayBufferData]]): the first argument
+            // must be an ArrayBuffer (has the bytes slot), else a TypeError — *before*
+            // the offset coercion.
+            let Some(bh) = buf
+                .as_handle()
+                .map(Handle::from_raw)
+                .filter(|h| self.realm.get_property(*h, ARRAY_BUFFER_BYTES).is_some())
+            else {
+                return Err(self.type_error("DataView buffer must be an ArrayBuffer"));
+            };
+            // ToIndex(byteOffset) (a Symbol / abrupt valueOf throws; negative /
+            // over-2^53 is a RangeError) — runs before the detached check.
+            let byte_off =
+                self.coerce_to_index(args.get(1).copied().unwrap_or(NanBox::undefined()))? as usize;
+            // IsDetachedBuffer → TypeError (after the offset coercion).
+            self.guard_detached_buffer(bh)?;
+            let buf_len = self
+                .array_buffer_bytes(bh)
+                .and_then(|h| self.realm.bytes_len(h))
+                .unwrap_or(0);
             if byte_off > buf_len {
                 let m = self.new_str("Start offset is outside the bounds of the buffer");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
             self.realm.set_hidden_property(obj, DATA_VIEW_BUF, buf);
             self.realm
-                .set_hidden_property(obj, DATA_VIEW_OFF, NanBox::number(off));
+                .set_hidden_property(obj, DATA_VIEW_OFF, NanBox::number(byte_off as f64));
             // An explicit byteLength (3rd arg) is honored; otherwise the view spans
             // the rest of the buffer from `byteOffset`.
             if let Some(len) = args.get(2)
                 && !matches!(len.unpack(), Unpacked::Undefined)
             {
-                let raw = self.realm.to_number(*len);
+                // ToIndex(byteLength) (a Symbol / abrupt valueOf throws).
+                let view_len = self.coerce_to_index(*len)? as usize;
                 // M1: validate `byteOffset + byteLength <= buffer.byteLength` with
                 // checked arithmetic (a saturated length must not wrap past the end).
-                let view_len = self.validate_alloc_len(raw, "Invalid DataView length")?;
                 let fits = byte_off
                     .checked_add(view_len)
                     .is_some_and(|end| end <= buf_len);
@@ -2005,22 +2096,21 @@ impl<'a> Interp<'a> {
                 && let Some(bh) = v.as_handle().map(Handle::from_raw)
                 && self.realm.get_property(bh, ARRAY_BUFFER_BYTES).is_some()
             {
-                self.guard_detached_buffer(bh)?;
-                let bytes_h = self.array_buffer_bytes(bh).unwrap();
-                let total = self.realm.bytes_len(bytes_h).unwrap_or(0);
-                // H2/T1: validate the byteOffset. It must be a non-negative integer
-                // that is a multiple of the element size, else a RangeError.
+                // Spec order (InitializeTypedArrayFromArrayBuffer):
+                //   1. offset = ? ToIndex(byteOffset)   — Symbol/abrupt → throw here
+                //   2. if offset % elementSize ≠ 0 → RangeError
+                //   3. if length ≠ undefined: newLength = ? ToIndex(length)
+                //   4. **then** IsDetachedBuffer(buffer) → TypeError
+                // So the index coercions (which may run user `valueOf`, possibly
+                // detaching the buffer) happen *before* the detached check.
                 let byte_off = match args
                     .get(1)
                     .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
                 {
                     Some(a) => {
-                        let raw = self.realm.to_number(*a);
-                        if !raw.is_finite() || raw < 0.0 || (raw as usize as f64) != raw {
-                            let m = self.new_str("Invalid typed array offset");
-                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
-                        }
-                        let off = raw as usize;
+                        // ToIndex: a Symbol / abrupt valueOf throws; a negative or
+                        // over-2^53 value is a RangeError.
+                        let off = self.coerce_to_index(*a)? as usize;
                         if !off.is_multiple_of(elem_size) {
                             let m =
                                 self.new_str("start offset must be a multiple of the element size");
@@ -2030,18 +2120,29 @@ impl<'a> Interp<'a> {
                     }
                     None => 0,
                 };
+                let explicit_length = args
+                    .get(2)
+                    .is_some_and(|a| !matches!(a.unpack(), Unpacked::Undefined));
+                // ToIndex(length) (if present) before the detached check.
+                let explicit_len_val = match args
+                    .get(2)
+                    .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
+                {
+                    Some(a) => Some(self.coerce_to_index(*a)? as usize),
+                    None => None,
+                };
+                // Now the buffer must not be detached (a coercion above may have
+                // detached it) and its (possibly changed) byte length is re-read.
+                self.guard_detached_buffer(bh)?;
+                let bytes_h = self.array_buffer_bytes(bh).unwrap();
+                let total = self.realm.bytes_len(bytes_h).unwrap_or(0);
                 if byte_off > total {
                     let m = self.new_str("Start offset is outside the bounds of the buffer");
                     return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                 }
                 let avail = total - byte_off;
-                let length = match args
-                    .get(2)
-                    .filter(|a| !matches!(a.unpack(), Unpacked::Undefined))
-                {
-                    Some(a) => {
-                        let raw = self.realm.to_number(*a);
-                        let len = self.validate_alloc_len(raw, "Invalid typed array length")?;
+                let length = match explicit_len_val {
+                    Some(len) => {
                         // H2/T1: `byteOffset + length*elem_size` must fit the buffer.
                         // Checked arithmetic — a saturated length must not wrap.
                         let fits = len
@@ -2070,6 +2171,12 @@ impl<'a> Interp<'a> {
                 let view = self
                     .realm
                     .new_typed_array(bytes_h, bh, byte_off, length, kind);
+                // A view created with no explicit length over a *resizable* buffer
+                // auto-tracks the buffer's length on resize (per spec). A
+                // fixed-length view (or one over a non-resizable buffer) does not.
+                if !explicit_length && self.realm.get_property(bh, ARRAY_BUFFER_MAXLEN).is_some() {
+                    self.realm.mark_length_tracking(view);
+                }
                 self.link_typed_array_proto(view, kind, callee);
                 return Ok(NanBox::handle(view.to_raw()));
             }
@@ -2087,19 +2194,25 @@ impl<'a> Interp<'a> {
             // Read `length` (ToLength), then Get each index 0..length in order; the
             // per-element ToNumber / ToBigInt coercion happens on the write below.
             if src.is_none()
-                && let Some(h) = args
-                    .first()
-                    .copied()
-                    .and_then(|v| v.as_handle().map(Handle::from_raw))
-                && self.realm.object_keys(h).is_some()
-                && self.realm.string_value(h).is_none()
+                && let Some(arg0) = args.first().copied()
+                && self.is_object_value(arg0)
+                && let Some(h) = arg0.as_handle().map(Handle::from_raw)
             {
+                // `Get(O, @@iterator)` through `read_member` so an accessor /
+                // inherited iterator is observed. A present-but-not-callable
+                // `@@iterator` is a TypeError (GetIterator step 4).
                 let iter_sym = self.well_known_symbol("iterator");
                 let iter_key = self.member_key(iter_sym);
-                let has_iter = self
-                    .realm
-                    .get_property(h, &iter_key)
-                    .is_some_and(|f| !matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null));
+                let iter_fn = self.read_member(h, &iter_key)?;
+                let has_iter = !matches!(iter_fn.unpack(), Unpacked::Undefined | Unpacked::Null);
+                if has_iter
+                    && !iter_fn
+                        .as_handle()
+                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    let m = self.new_str("typed array source is not iterable");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 if has_iter {
                     // InitializeTypedArrayFromList: the source is iterable. Drain
                     // its iterator (calling `[Symbol.iterator]()` then `.next()`),
@@ -2135,8 +2248,11 @@ impl<'a> Interp<'a> {
             let length = match (&src, args.first().copied()) {
                 (Some(s), _) => s.len(),
                 (None, Some(v)) => {
-                    let raw = self.realm.to_number(v);
-                    self.validate_alloc_len(raw, "Invalid typed array length")?
+                    // `new TA(length)`: ToIndex(length) — a Symbol / abrupt valueOf
+                    // throws a TypeError (not a downstream RangeError); the result is
+                    // then validated against the allocation cap.
+                    let n = self.coerce_to_index(v)? as f64;
+                    self.validate_alloc_len(n, "Invalid typed array length")?
                 }
                 (None, None) => 0,
             };
@@ -2145,8 +2261,12 @@ impl<'a> Interp<'a> {
             let view = self.realm.new_typed_array(bytes_h, buf, 0, length, kind);
             if let Some(s) = src {
                 // For a BigInt typed array, ToBigInt every source element up front
-                // (a Number element throws TypeError, per spec); other kinds write
-                // the values straight through.
+                // (a Number element throws TypeError, per spec). For a numeric kind,
+                // ToNumber each element (so a wrapper / a `valueOf`-bearing object /
+                // a numeric string coerces, rather than being written as NaN by the
+                // infallible bulk write). When the source was a real array taken via
+                // `elements_vec` (not the already-coerced array-like/iterable path)
+                // these values are still raw, so the coercion is required here.
                 let s = if is_bigint_kind(kind) {
                     let mut coerced = Vec::with_capacity(s.len());
                     for v in s {
@@ -2154,7 +2274,11 @@ impl<'a> Interp<'a> {
                     }
                     coerced
                 } else {
-                    s
+                    let mut coerced = Vec::with_capacity(s.len());
+                    for v in s {
+                        coerced.push(self.coerce_to_number(v)?);
+                    }
+                    coerced
                 };
                 // Bulk write-through: one buffer borrow, no per-element heap lookup.
                 self.realm.typed_set_from_numbers(view, 0, &s);
@@ -2171,13 +2295,33 @@ impl<'a> Interp<'a> {
         if matches!(id, N_NUMBER | N_STRING | N_BOOLEAN) {
             let prim = match id {
                 N_NUMBER => {
-                    let n = args.first().map_or(0.0, |v| self.realm.to_number(*v));
+                    // `new Number(value)`: ToNumber(value) (number hint) — a Symbol or
+                    // an abrupt `valueOf`/`toString` throws (was an infallible
+                    // `to_number` that swallowed these). A BigInt converts to a double.
+                    let n = match args.first().copied() {
+                        None => 0.0,
+                        Some(v) => {
+                            if let Some(big) = v
+                                .as_handle()
+                                .and_then(|r| self.realm.bigint_at(Handle::from_raw(r)))
+                            {
+                                big.to_f64()
+                            } else {
+                                let p = self.coerce_to_number(v)?;
+                                self.realm.to_number(p)
+                            }
+                        }
+                    };
                     NanBox::number(n)
                 }
                 N_STRING => {
-                    let s = args
-                        .first()
-                        .map_or_else(String::new, |v| self.realm.to_display_string(*v));
+                    // `new String(value)`: ToString(value) — an object runs its
+                    // `toString`/`valueOf`/`@@toPrimitive` (abrupt-propagating), and a
+                    // Symbol is a TypeError (unlike `String(symbol)` as a function).
+                    let s = match args.first().copied() {
+                        None => String::new(),
+                        Some(v) => self.coerce_to_string(v)?,
+                    };
                     self.new_str(&s)
                 }
                 _ => NanBox::boolean(

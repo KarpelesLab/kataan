@@ -247,10 +247,14 @@ impl<'a> Interp<'a> {
         if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
             return Ok(prim);
         }
-        // Strings and arrays are handled by the arithmetic path directly.
+        // Strings and arrays are handled by the arithmetic path directly. A
+        // typed-array view is an exotic object (no `object_keys`) but still has a
+        // `valueOf`/`toString` (and may carry a user-overridden one or an
+        // `@@toPrimitive`), so it must go through OrdinaryToPrimitive below — not
+        // be returned as-is.
         if self.realm.string_value(h).is_some()
             || self.realm.is_array(h)
-            || self.realm.object_keys(h).is_none()
+            || (self.realm.object_keys(h).is_none() && self.realm.typed_kind(h).is_none())
         {
             return Ok(v);
         }

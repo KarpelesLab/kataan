@@ -147,12 +147,13 @@ impl<'a> Interp<'a> {
         new_len: usize,
     ) -> Result<Option<NanBox>, ExecError> {
         let ctor = self.read_member(recv, "constructor")?;
-        let Some(ch) = ctor.as_handle().map(Handle::from_raw) else {
-            if matches!(ctor.unpack(), Unpacked::Undefined) {
-                return Ok(None);
-            }
+        if matches!(ctor.unpack(), Unpacked::Undefined) {
+            return Ok(None);
+        }
+        if !self.is_object_value(ctor) {
             return Err(self.type_error("constructor property is not an object"));
-        };
+        }
+        let ch = ctor.as_handle().map(Handle::from_raw).unwrap();
         // Default concrete TypedArray constructor → fast path.
         if self.realm.native_at(ch).is_some_and(|id| {
             (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id)
@@ -303,6 +304,13 @@ impl<'a> Interp<'a> {
             let view = self
                 .realm
                 .new_typed_array(bytes_h, buf, 0, elems.len(), kind);
+            // Link `[[Prototype]]` to the kind's intrinsic (e.g.
+            // `%Float64Array.prototype%`) so a same-kind result is a real
+            // instance: `result.constructor`, `instanceof`, and prototype
+            // identity all match the default constructor's products.
+            if let Some(proto) = self.intrinsic_proto(TYPED_ARRAY_KINDS[kind as usize].0) {
+                self.realm.set_native_proto(view, proto);
+            }
             // Bulk write-through: one buffer borrow, no per-element heap lookup.
             self.realm.typed_set_from_numbers(view, 0, &elems);
             NanBox::handle(view.to_raw())
@@ -321,6 +329,73 @@ impl<'a> Interp<'a> {
     /// `elems` are written in (coercing per its element kind).
     ///
     /// When `exemplar.constructor`/species resolve to the built-in default, this
+    /// `TypedArraySpeciesCreate(exemplar, « len »)` returning the *result view*
+    /// (zero-filled, length `len`) — used by `map`/`filter` which must allocate the
+    /// destination *before* iterating (so a throwing species getter/ctor aborts
+    /// before the callback runs). Resolves `exemplar.constructor` then its
+    /// `[Symbol.species]` (undefined/null → default; non-constructor → TypeError),
+    /// `Construct(C, [len])`, then ValidateTypedArray (a typed array of length ≥ len).
+    pub(crate) fn typed_species_create(
+        &mut self,
+        recv: Handle,
+        len: usize,
+    ) -> Result<Handle, ExecError> {
+        let Some(kind) = self.realm.typed_kind(recv) else {
+            return Err(self.type_error("not a typed array"));
+        };
+        // SpeciesConstructor(exemplar, defaultConstructor): Get(O,"constructor");
+        // undefined → default; a non-Object (incl. a string/symbol/bigint, which
+        // are heap-backed here but are *not* Objects) → TypeError.
+        let ctor = self.read_member(recv, "constructor")?;
+        let species = if matches!(ctor.unpack(), Unpacked::Undefined) {
+            None
+        } else if !self.is_object_value(ctor) {
+            return Err(self.type_error("constructor property is not an object"));
+        } else {
+            let ch = ctor.as_handle().map(Handle::from_raw).unwrap();
+            let is_default = self.realm.native_at(ch).is_some_and(|id| {
+                (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
+                    .contains(&id)
+            });
+            if is_default {
+                None
+            } else {
+                let species_sym = self.well_known_symbol("species");
+                let species_key = self.member_key(species_sym);
+                let s = self.read_member(ch, &species_key)?;
+                match s.unpack() {
+                    Unpacked::Undefined | Unpacked::Null => None,
+                    _ => Some(s),
+                }
+            }
+        };
+        let Some(species) = species else {
+            // Default path: a same-kind, intrinsic-proto view over its own buffer.
+            let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+            let buf = self.make_array_buffer(len * elem_size);
+            let bytes_h = self.array_buffer_bytes(buf).unwrap();
+            let view = self.realm.new_typed_array(bytes_h, buf, 0, len, kind);
+            if let Some(proto) = self.intrinsic_proto(TYPED_ARRAY_KINDS[kind as usize].0) {
+                self.realm.set_native_proto(view, proto);
+            }
+            return Ok(view);
+        };
+        if !self.is_constructor_value(species) {
+            return Err(self.type_error("Symbol.species is not a constructor"));
+        }
+        let result = self.construct(species, &[NanBox::number(len as f64)])?;
+        let Some(rh) = result.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("TypedArray species constructor did not return an object"));
+        };
+        let Some(rlen) = self.realm.typed_len(rh) else {
+            return Err(self.type_error("Symbol.species did not return a TypedArray"));
+        };
+        if rlen < len {
+            return Err(self.type_error("TypedArray species constructor result is too small"));
+        }
+        Ok(rh)
+    }
+
     /// degenerates to [`Self::typed_like`] (a same-kind view). A plain-array
     /// receiver just builds an ordinary array (Array species is handled elsewhere).
     pub(crate) fn typed_like_species(
@@ -328,72 +403,14 @@ impl<'a> Interp<'a> {
         recv: Handle,
         elems: Vec<NanBox>,
     ) -> Result<NanBox, ExecError> {
-        let Some(kind) = self.realm.typed_kind(recv) else {
+        if self.realm.typed_kind(recv).is_none() {
             return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
-        };
-        let len = elems.len();
-        // SpeciesConstructor(exemplar, defaultConstructor).
-        let ctor = self.read_member(recv, "constructor")?;
-        // A typed array always inherits a `constructor`; the default built-in
-        // constructor needs no species machinery — take the fast same-kind path.
-        let species = match ctor.as_handle().map(Handle::from_raw) {
-            Some(ch) => {
-                // The default concrete TypedArray constructor (a native with the
-                // kind id) → fast path.
-                let is_default = self.realm.native_at(ch).is_some_and(|id| {
-                    (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
-                        .contains(&id)
-                });
-                if is_default {
-                    None
-                } else {
-                    // `constructor` must be an Object (it is — a handle); read
-                    // `[Symbol.species]`.
-                    let species_sym = self.well_known_symbol("species");
-                    let species_key = self.member_key(species_sym);
-                    let s = self.read_member(ch, &species_key)?;
-                    match s.unpack() {
-                        Unpacked::Undefined | Unpacked::Null => None,
-                        _ => Some(s),
-                    }
-                }
-            }
-            None => {
-                // `constructor` resolved to a non-undefined primitive → TypeError;
-                // `undefined` → default constructor.
-                if matches!(ctor.unpack(), Unpacked::Undefined) {
-                    None
-                } else {
-                    return Err(self.type_error("constructor property is not an object"));
-                }
-            }
-        };
-        let Some(species) = species else {
-            // Default path: a same-kind view (no user Construct).
-            return Ok(self.typed_like(recv, elems));
-        };
-        // A non-constructor species (and a null/undefined was already mapped to
-        // the default) is a TypeError.
-        if !self.is_constructor_value(species) {
-            return Err(self.type_error("Symbol.species is not a constructor"));
         }
-        // TypedArrayCreate: Construct(species, [len]).
-        let result = self.construct(species, &[NanBox::number(len as f64)])?;
-        let Some(rh) = result.as_handle().map(Handle::from_raw) else {
-            return Err(self.type_error("TypedArray species constructor did not return an object"));
-        };
-        // ValidateTypedArray: the result must be a (non-detached) typed array,
-        // and — for a single-Number argument — at least `len` elements long.
-        let Some(rlen) = self.realm.typed_len(rh) else {
-            return Err(self.type_error("Symbol.species did not return a TypedArray"));
-        };
-        if rlen < len {
-            return Err(self.type_error("TypedArray species constructor result is too small"));
-        }
-        let _ = kind;
-        // Write the produced elements through (coercing to the result's kind).
+        // TypedArraySpeciesCreate(O, «len») then write the produced elements
+        // through (coercing to the result's kind).
+        let rh = self.typed_species_create(recv, elems.len())?;
         self.realm.typed_set_from_numbers(rh, 0, &elems);
-        Ok(result)
+        Ok(NanBox::handle(rh.to_raw()))
     }
 
     /// Validates a `padStart`/`padEnd` target length: a result longer than

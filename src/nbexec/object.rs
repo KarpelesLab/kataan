@@ -412,6 +412,25 @@ impl<'a> Interp<'a> {
     /// its prototype chain (own data/accessor property, or an in-range array index /
     /// `length`). Mirrors the `in` operator / `Reflect.has`.
     pub(crate) fn has_property(&mut self, obj: Handle, key: &str) -> bool {
+        // Integer-indexed exotic `[[HasProperty]]`: when `obj` is a typed array and
+        // `key` is a *canonical numeric index*, the answer is exactly
+        // IsValidIntegerIndex (in-bounds, attached, not `-0`/non-integer) — the
+        // prototype chain is **never** consulted (so a numeric key set on
+        // `%TypedArray%.prototype` is invisible, and an out-of-bounds index is
+        // false even if inherited).
+        if self.realm.typed_kind(obj).is_some()
+            && let Some(n) = canonical_numeric_index(key)
+        {
+            let is_neg_zero = n == 0.0 && n.is_sign_negative();
+            return !self.typed_array_detached(obj)
+                && !is_neg_zero
+                && n == (n as i64) as f64
+                && n >= 0.0
+                && self
+                    .realm
+                    .typed_len(obj)
+                    .is_some_and(|len| (n as usize) < len);
+        }
         let mut cur = Some(obj);
         while let Some(c) = cur {
             // `has_own` already reports an in-range non-hole index (and `length`)
@@ -1646,6 +1665,24 @@ impl<'a> Interp<'a> {
         obj: Handle,
         key: &str,
     ) -> Result<bool, ExecError> {
+        // Integer-indexed exotic `[[HasProperty]]`: a canonical numeric index on a
+        // (non-proxy) typed array is exactly IsValidIntegerIndex — the prototype
+        // chain is never consulted (an out-of-bounds or proto-set numeric key is
+        // absent).
+        if self.realm.proxy_at(obj).is_none()
+            && self.realm.typed_kind(obj).is_some()
+            && let Some(n) = canonical_numeric_index(key)
+        {
+            let is_neg_zero = n == 0.0 && n.is_sign_negative();
+            return Ok(!self.typed_array_detached(obj)
+                && !is_neg_zero
+                && n == (n as i64) as f64
+                && n >= 0.0
+                && self
+                    .realm
+                    .typed_len(obj)
+                    .is_some_and(|len| (n as usize) < len));
+        }
         let mut cur = Some(obj);
         // Bound to guard against a `getPrototypeOf` trap returning a cycle.
         for _ in 0..100_000 {

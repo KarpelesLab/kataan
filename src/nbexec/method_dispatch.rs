@@ -1,5 +1,12 @@
 use super::*;
 
+/// The ECMAScript `TrimString` white-space set: every Unicode `White_Space`
+/// code point **plus** U+FEFF (ZERO WIDTH NO-BREAK SPACE / BOM), which the spec
+/// includes but Rust's `char::is_whitespace` (current Unicode) does not.
+fn is_js_trim_ws(c: char) -> bool {
+    c.is_whitespace() || c == '\u{FEFF}'
+}
+
 impl<'a> Interp<'a> {
     /// Dispatches a built-in method on a string/array receiver. Returns
     /// `Ok(None)` if `method` is not a recognized built-in (the caller then
@@ -19,15 +26,26 @@ impl<'a> Interp<'a> {
         // (`values`/`keys`/`entries`), and `toString` (generic) are exempt.
         if let Some(h) = recv.as_handle().map(Handle::from_raw)
             && self.realm.typed_kind(h).is_some()
-            && !matches!(
-                method,
-                "subarray" | "values" | "keys" | "entries" | "toString" | "constructor"
-            )
+            && !matches!(method, "subarray" | "toString" | "constructor")
             && TYPED_ARRAY_PROTO_METHODS.iter().any(|(n, _)| *n == method)
             && self.typed_array_detached(h)
         {
             return Err(self.type_error(&alloc::format!(
                 "TypedArray.prototype.{method} called on a detached ArrayBuffer"
+            )));
+        }
+        // ValidateTypedArray also rejects a view that is *out of bounds* (a
+        // fixed-length view whose resizable buffer shrank below its declared
+        // extent) with a TypeError, up front — same exempt set as the detached
+        // guard above.
+        if let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.typed_kind(h).is_some()
+            && !matches!(method, "subarray" | "toString" | "constructor")
+            && TYPED_ARRAY_PROTO_METHODS.iter().any(|(n, _)| *n == method)
+            && self.realm.typed_array_out_of_bounds(h)
+        {
+            return Err(self.type_error(&alloc::format!(
+                "TypedArray.prototype.{method} called on an out-of-bounds typed array"
             )));
         }
 
@@ -1031,6 +1049,23 @@ impl<'a> Interp<'a> {
                 .and_then(|n| n.as_number())
                 .unwrap_or(0.0) as usize;
             let total = self.realm.bytes_len(bh).unwrap_or(0);
+            // IsViewOutOfBounds (resizable buffer shrank under the view): a
+            // fixed-length view whose `base + recorded_len` exceeds the live buffer,
+            // or a length-tracking view whose `base` is past the end, is a TypeError
+            // (checked before the RangeError bounds check below).
+            let recorded_len = self
+                .realm
+                .get_property(handle, DATA_VIEW_LEN)
+                .and_then(|n| n.as_number())
+                .map(|n| n as usize);
+            let dv_oob = match recorded_len {
+                Some(len) => base.checked_add(len).is_none_or(|end| end > total),
+                None => base > total,
+            };
+            if dv_oob {
+                return Err(self
+                    .type_error("DataView access on an out-of-bounds view (buffer was resized)"));
+            }
             // M1: clamp the recorded view length to what the *live* buffer can back
             // (a resizable buffer may have shrunk under the view), so the access can
             // never run past the real bytes.
@@ -1722,7 +1757,7 @@ impl<'a> Interp<'a> {
                 }
                 "trim" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    Some(self.new_str(s.trim()))
+                    Some(self.new_str(s.trim_matches(is_js_trim_ws)))
                 }
                 "charAt" => {
                     // UTF-16-indexed: the unit at `i` as a one-unit string,
@@ -1765,10 +1800,11 @@ impl<'a> Interp<'a> {
                     Some(NanBox::number(index_of_units(&bytes, &needle, from)))
                 }
                 "repeat" => {
+                    // ToIntegerOrInfinity(count) (a Symbol / abrupt valueOf throws).
                     // A negative or `+Infinity` count is a `RangeError`; a finite
                     // count whose product with the length overflows would panic, so
                     // it is a `RangeError` too (an unrepresentable string length).
-                    let nf = self.realm.to_number(arg(0));
+                    let nf = self.coerce_to_integer_or_infinity(arg(0))?;
                     let n = nf as usize;
                     // A product that fits `usize` can still be enormous
                     // (`"x".repeat(2**40)` ≈ 1 TB); cap the result length too.
@@ -1845,12 +1881,15 @@ impl<'a> Interp<'a> {
                 "split" => {
                     // `limit` is ToUint32 (undefined → 2^32-1). A limit of 0 yields
                     // an empty array.
+                    // Spec order: ToUint32(limit) runs *before* ToString(separator),
+                    // and its ToNumber may run a user `valueOf`/`@@toPrimitive` (an
+                    // abrupt one throws here). Computed inline so the no-`std` build
+                    // (no `Realm::to_uint32`) still compiles.
                     let limit = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         u32::MAX
                     } else {
-                        // ToUint32 without the std-only `trunc` (so `no_std` builds):
-                        // truncate toward zero into i64, then take the low 32 bits.
-                        let n = self.realm.to_number(arg(1));
+                        let nv = self.coerce_to_number(arg(1))?;
+                        let n = self.realm.to_number(nv);
                         if n.is_finite() {
                             (n as i64).rem_euclid(4_294_967_296) as u32
                         } else {
@@ -2017,21 +2056,21 @@ impl<'a> Interp<'a> {
                 }
                 "trimStart" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    Some(self.new_str(s.trim_start()))
+                    Some(self.new_str(s.trim_start_matches(is_js_trim_ws)))
                 }
                 "trimEnd" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    Some(self.new_str(s.trim_end()))
+                    Some(self.new_str(s.trim_end_matches(is_js_trim_ws)))
                 }
                 // Annex B.2.3: `trimLeft`/`trimRight` are legacy aliases of
                 // `trimStart`/`trimEnd`.
                 "trimLeft" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    Some(self.new_str(s.trim_start()))
+                    Some(self.new_str(s.trim_start_matches(is_js_trim_ws)))
                 }
                 "trimRight" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    Some(self.new_str(s.trim_end()))
+                    Some(self.new_str(s.trim_end_matches(is_js_trim_ws)))
                 }
                 // Annex B.2.3 legacy HTML wrapper methods. `CreateHTML(S, tag,
                 // attribute, value)`: wraps the receiver string `S` in
@@ -2055,10 +2094,33 @@ impl<'a> Interp<'a> {
                 "toString" | "valueOf" => Some(recv),
                 // `isWellFormed`/`toWellFormed`: a string is well-formed iff it has
                 // no lone surrogate. The WTF-8 bytes are valid UTF-8 exactly then.
-                "isWellFormed" => Some(NanBox::boolean(crate::wtf8::is_utf8(&bytes))),
+                "isWellFormed" => Some(NanBox::boolean(crate::wtf8::is_well_formed_utf16(&bytes))),
                 "toWellFormed" => {
-                    // Replace each lone surrogate with U+FFFD (the lossy decode).
-                    Some(self.new_str(&crate::wtf8::to_string_lossy(&bytes)))
+                    // Scan UTF-16 units: keep valid surrogate pairs (even when they
+                    // span WTF-8 leaves), replace only *unpaired* surrogates with
+                    // U+FFFD. A plain lossy decode would mangle a pair split across
+                    // leaves, so rebuild from the code-unit sequence.
+                    let units: Vec<u16> = crate::wtf8::utf16_units(&bytes).collect();
+                    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+                    let mut i = 0;
+                    while i < units.len() {
+                        let u = units[i];
+                        if (0xD800..=0xDBFF).contains(&u) {
+                            if i + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[i + 1]) {
+                                out.push(u);
+                                out.push(units[i + 1]);
+                                i += 2;
+                                continue;
+                            }
+                            out.push(0xFFFD); // lone high surrogate
+                        } else if (0xDC00..=0xDFFF).contains(&u) {
+                            out.push(0xFFFD); // lone low surrogate
+                        } else {
+                            out.push(u);
+                        }
+                        i += 1;
+                    }
+                    Some(self.new_str_bytes(crate::wtf8::from_utf16(&out)))
                 }
                 // `charCodeAt(i)` is the UTF-16 code unit at index `i` (NaN if
                 // out of range); a surrogate half reads as that 16-bit value.
@@ -2194,7 +2256,9 @@ impl<'a> Interp<'a> {
                 // locale tailoring).
                 "localeCompare" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    let other = self.realm.to_display_string(arg(0));
+                    // ToString(that) — unwraps a String wrapper and runs a user
+                    // toString (abrupt-propagating), rather than the raw display form.
+                    let other = self.coerce_to_string(arg(0))?;
                     let cmp = match s.as_str().cmp(other.as_str()) {
                         core::cmp::Ordering::Less => -1.0,
                         core::cmp::Ordering::Equal => 0.0,
@@ -2420,8 +2484,15 @@ impl<'a> Interp<'a> {
                     };
                     let start = self.typed_clamp_index_checked(arg(1), 0, tlen)?;
                     let end = self.typed_clamp_index_checked(arg(2), tlen, tlen)?;
-                    // A coercion may have detached/shrunk the buffer; re-read the
-                    // live length and clamp so the write never runs past it.
+                    // A value/start/end coercion may have detached the buffer — that
+                    // is a TypeError (re-ValidateTypedArray after the coercions).
+                    if self.typed_array_detached(handle) {
+                        return Err(self.type_error(
+                            "TypedArray.prototype.fill called on a detached ArrayBuffer",
+                        ));
+                    }
+                    // A coercion may have shrunk a resizable buffer; re-read the live
+                    // length and clamp so the write never runs past it.
                     let live = self.realm.typed_len(handle).unwrap_or(0);
                     let (start, end) = (start.min(live), end.min(live));
                     self.realm.typed_fill_range(handle, value, start, end);
@@ -2434,6 +2505,13 @@ impl<'a> Interp<'a> {
                     let target = self.typed_clamp_index_checked(arg(0), 0, tlen)?;
                     let start = self.typed_clamp_index_checked(arg(1), 0, tlen)?;
                     let end = self.typed_clamp_index_checked(arg(2), tlen, tlen)?;
+                    // A target/start/end coercion may have detached the buffer — that
+                    // is a TypeError (re-ValidateTypedArray after the coercions).
+                    if self.typed_array_detached(handle) {
+                        return Err(self.type_error(
+                            "TypedArray.prototype.copyWithin called on a detached ArrayBuffer",
+                        ));
+                    }
                     // A coercion may have shrunk a resizable buffer; clamp to the
                     // live length so the copy stays in bounds.
                     let live = self.realm.typed_len(handle).unwrap_or(0);
@@ -2456,12 +2534,32 @@ impl<'a> Interp<'a> {
                         let m = self.new_str("offset is out of bounds");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
+                    // The offset coercion may have run user code that detached (or
+                    // shrank out of bounds) the target buffer — ValidateTypedArray
+                    // the target *after* it, so that is a TypeError (not a downstream
+                    // RangeError from a now-zero length).
+                    if self.typed_array_detached(handle)
+                        || self.realm.typed_array_out_of_bounds(handle)
+                    {
+                        return Err(self.type_error(
+                            "TypedArray.prototype.set called on a detached or out-of-bounds typed array",
+                        ));
+                    }
                     let src_box = arg(0);
                     if let Some(src) = src_box.as_handle().map(Handle::from_raw) {
                         // A typed-array source: same-kind → raw byte copy; otherwise
                         // element copy with per-element coercion. `offset + srcLen`
                         // must fit the (live) target length.
                         if let Some(src_len) = self.realm.typed_len(src) {
+                            // A typed-array source detached/out-of-bounds (e.g. by the
+                            // offset's valueOf) is a TypeError.
+                            if self.typed_array_detached(src)
+                                || self.realm.typed_array_out_of_bounds(src)
+                            {
+                                return Err(self.type_error(
+                                    "TypedArray.prototype.set source is detached or out of bounds",
+                                ));
+                            }
                             let tlen_live = self.realm.typed_len(handle).unwrap_or(tlen);
                             let offset = if offset_n.is_finite() && offset_n <= tlen_live as f64 {
                                 offset_n as usize
@@ -2537,7 +2635,13 @@ impl<'a> Interp<'a> {
                 // begin/end go through ToIntegerOrInfinity (abrupt-propagating); the
                 // result is allocated via TypedArraySpeciesCreate(O, buffer, off, len).
                 "subarray" => {
-                    let len = tlen;
+                    // srcLength is 0 when the source is already out of bounds (the
+                    // relative indices then clamp into an empty range).
+                    let len = if self.realm.typed_array_out_of_bounds(handle) {
+                        0
+                    } else {
+                        tlen
+                    };
                     let start = self.typed_clamp_index_checked(arg(0), 0, len)?;
                     let end = self.typed_clamp_index_checked(arg(1), len, len)?;
                     let new_len = end.saturating_sub(start);
@@ -2552,10 +2656,32 @@ impl<'a> Interp<'a> {
                     {
                         return Ok(Some(view));
                     }
+                    // The default constructor `new TA(buffer, off, len)` validates the
+                    // buffer: a detached buffer (e.g. by the begin/end coercion) is a
+                    // TypeError. The coercions above already ran (observably).
+                    if self.typed_array_detached(handle) {
+                        return Err(self.type_error(
+                            "TypedArray.prototype.subarray called on a detached ArrayBuffer",
+                        ));
+                    }
                     let bytes_h = self.realm.typed_buffer(handle).unwrap();
                     let view = self
                         .realm
                         .new_typed_array(bytes_h, abuf, sub_off, new_len, kind);
+                    // Link `[[Prototype]]` to the kind's intrinsic so the result is
+                    // a real instance (`toString`/`valueOf`/`instanceof`/`.constructor`
+                    // resolve, and ToPrimitive does not fall through to
+                    // `Function.prototype.toString`).
+                    if let Some(proto) = self.intrinsic_proto(TYPED_ARRAY_KINDS[kind as usize].0) {
+                        self.realm.set_native_proto(view, proto);
+                    }
+                    // A subarray with no explicit length over a length-tracking
+                    // parent is itself length-tracking.
+                    if self.realm.is_length_tracking(handle)
+                        && matches!(arg(1).unpack(), Unpacked::Undefined)
+                    {
+                        self.realm.mark_length_tracking(view);
+                    }
                     return Ok(Some(NanBox::handle(view.to_raw())));
                 }
                 _ => {}
@@ -2681,6 +2807,25 @@ impl<'a> Interp<'a> {
                         } else {
                             self.coerce_to_string(arg(0))?
                         };
+                    // Typed array: `len` is cached, the separator's ToString may have
+                    // detached/shrunk the buffer, after which each element reads as
+                    // `undefined` → rendered empty. Re-read live by index.
+                    if self.realm.typed_kind(handle).is_some() {
+                        let len = elems.len();
+                        let mut parts: Vec<String> = Vec::with_capacity(len);
+                        for i in 0..len {
+                            let e = self
+                                .realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined);
+                            parts.push(match e.unpack() {
+                                Unpacked::Null | Unpacked::Undefined => String::new(),
+                                Unpacked::Number(n) => crate::realm::js_number_string(n),
+                                _ => self.coerce_to_string(e)?,
+                            });
+                        }
+                        return Ok(Some(self.new_str(&parts.join(&sep))));
+                    }
                     // `null`/`undefined` render empty; an object element is run
                     // through ToString (so a custom `toString` is honored). The
                     // receiver array seeds the cycle set, so a self-reference (or a
@@ -2706,6 +2851,43 @@ impl<'a> Interp<'a> {
                 // `toLocaleString()` method (its result ToString'd); `null`/
                 // `undefined` render empty.
                 "toLocaleString" => {
+                    // `%TypedArray%.prototype.toLocaleString`: per spec each element
+                    // is `Invoke(element, "toLocaleString")` (boxing the primitive
+                    // Number/BigInt so a user-overridden `Number.prototype.
+                    // toLocaleString` is honored), the result ToString'd, joined by
+                    // ",". Elements are re-read live from the (length-validated)
+                    // buffer. (Array's path below keeps the no-Intl grouped form to
+                    // preserve the curated gate.)
+                    if let Some(len) = self.realm.typed_len(handle) {
+                        let mut parts: Vec<String> = Vec::with_capacity(len);
+                        for i in 0..len {
+                            let e = self
+                                .realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined);
+                            // Invoke(element, "toLocaleString"): box the Number
+                            // element (ToObject), read the (possibly user-overridden)
+                            // method off the wrapper, and call it with the primitive
+                            // as `this`. A BigInt has no PRIM_WRAP-backed proto, so
+                            // resolve it through the primitive method dispatch.
+                            // Abrupt completions (a throwing override) propagate.
+                            let r = if e
+                                .as_handle()
+                                .map(Handle::from_raw)
+                                .is_some_and(|h| self.realm.bigint_at(h).is_some())
+                            {
+                                self.call_method(e, "toLocaleString", &[])?
+                                    .unwrap_or_else(NanBox::undefined)
+                            } else {
+                                let boxed = self.coerce_to_object(e);
+                                let bh = boxed.as_handle().map(Handle::from_raw).unwrap();
+                                let m = self.read_member(bh, "toLocaleString")?;
+                                self.call_with_this(m, e, &[])?
+                            };
+                            parts.push(self.coerce_to_string(r)?);
+                        }
+                        return Ok(Some(self.new_str(&parts.join(","))));
+                    }
                     let mut parts: Vec<String> = Vec::with_capacity(elems.len());
                     for e in &elems {
                         let s = match e.unpack() {
@@ -2745,6 +2927,33 @@ impl<'a> Interp<'a> {
                 }
                 "includes" => {
                     let target = arg(0);
+                    // For a typed array, `len` is cached at the start; the fromIndex
+                    // coercion may detach the buffer, after which element reads are
+                    // `undefined` (so `includes(0)` is false but `includes(undefined)`
+                    // is true). Re-read elements live rather than from the snapshot.
+                    if self.realm.typed_kind(handle).is_some() {
+                        let len = elems.len();
+                        // Length checked before ToInteger(fromIndex): empty → false.
+                        if len == 0 {
+                            return Ok(Some(NanBox::boolean(false)));
+                        }
+                        let from = self.array_from_index_checked(arg(1), len)?;
+                        let t_nan = target.as_number().is_some_and(f64::is_nan);
+                        let mut found = false;
+                        for i in from..len {
+                            let e = self
+                                .realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined);
+                            if self.realm.strict_equals(e, target)
+                                || (t_nan && e.as_number().is_some_and(f64::is_nan))
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
+                        return Ok(Some(NanBox::boolean(found)));
+                    }
                     let from = self.array_from_index_checked(arg(1), elems.len())?;
                     // SameValueZero: like `===` but `NaN` matches `NaN`. `includes`
                     // does *not* skip holes — a hole reads as `undefined`, so
@@ -2765,9 +2974,43 @@ impl<'a> Interp<'a> {
                     return Ok(Some(self.typed_like(handle, out)));
                 }
                 "with" => {
+                    // Typed-array `%TypedArray%.prototype.with(index, value)`: spec
+                    // order is ToIntegerOrInfinity(index), then ToNumber/ToBigInt(value)
+                    // (which runs *even for an out-of-range index*, so its side effects
+                    // happen), then IsValidIntegerIndex against the *current* length
+                    // (a resize during coercion is observed) — out of range is a
+                    // RangeError.
+                    if self.realm.typed_kind(handle).is_some() {
+                        let len = elems.len() as i64;
+                        let i = self.coerce_to_integer_or_infinity(arg(0))? as i64;
+                        let value = if self.realm.typed_kind(handle).is_some_and(is_bigint_kind) {
+                            self.coerce_typed_array_write(handle, arg(1))?
+                        } else {
+                            self.coerce_to_number(arg(1))?
+                        };
+                        let idx = if i < 0 { len + i } else { i };
+                        let cur = self.realm.typed_len(handle).unwrap_or(0) as i64;
+                        if idx < 0 || idx >= cur {
+                            let m = self.new_str("Invalid typed array index");
+                            return Err(ExecError::Throw(
+                                self.make_error(N_ERROR_BASE + 2, Some(m)),
+                            ));
+                        }
+                        // `with` uses TypedArrayCreateSameType (NOT species) — build a
+                        // same-kind result over the live elements.
+                        let mut out = Vec::with_capacity(cur as usize);
+                        for k in 0..cur as usize {
+                            out.push(if k == idx as usize {
+                                value
+                            } else {
+                                self.realm
+                                    .typed_get(handle, k)
+                                    .unwrap_or_else(NanBox::undefined)
+                            });
+                        }
+                        return Ok(Some(self.typed_like(handle, out)));
+                    }
                     let len = elems.len() as i64;
-                    // ToIntegerOrInfinity (abrupt-propagating). For a typed array
-                    // the value is also coerced (Number/BigInt) per spec.
                     let i = self.coerce_to_integer_or_infinity(arg(0))? as i64;
                     let idx = if i < 0 { len + i } else { i };
                     // An out-of-range index is a RangeError.
@@ -2786,6 +3029,36 @@ impl<'a> Interp<'a> {
                 }
                 "indexOf" => {
                     let target = arg(0);
+                    // Typed array: re-read live after the fromIndex coercion (a detach
+                    // makes every read undefined → not found).
+                    if self.realm.typed_kind(handle).is_some() {
+                        let len = elems.len();
+                        // Length is checked before ToInteger(fromIndex): a zero-length
+                        // array returns -1 without coercing fromIndex.
+                        if len == 0 {
+                            return Ok(Some(NanBox::number(-1.0)));
+                        }
+                        let from = self.array_from_index_checked(arg(1), len)?;
+                        // Per spec, if the fromIndex coercion left the array detached /
+                        // out of bounds, `indexOf` returns -1 (no search).
+                        if self.typed_array_detached(handle)
+                            || self.realm.typed_array_out_of_bounds(handle)
+                        {
+                            return Ok(Some(NanBox::number(-1.0)));
+                        }
+                        let mut idx = -1.0;
+                        for i in from..len {
+                            let e = self
+                                .realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined);
+                            if self.realm.strict_equals(e, target) {
+                                idx = i as f64;
+                                break;
+                            }
+                        }
+                        return Ok(Some(NanBox::number(idx)));
+                    }
                     let from = self.array_from_index_checked(arg(1), elems.len())?;
                     let mut idx = -1.0;
                     for (i, e) in elems.iter().enumerate().skip(from) {
@@ -2801,6 +3074,30 @@ impl<'a> Interp<'a> {
                     let f = arg(0);
                     let this_arg = arg(1);
                     let arr = callback_recv;
+                    // Typed-array `%TypedArray%.prototype.map`: per spec the result
+                    // is allocated via TypedArraySpeciesCreate(O, «len») *before*
+                    // the loop (a throwing species getter/ctor must abort before
+                    // any callback runs), `len` is the *initial* length, and each
+                    // kValue is read live from the (possibly resized) buffer — not
+                    // from a cached snapshot.
+                    if let Some(len) = self.realm.typed_len(handle) {
+                        self.require_callable(f, "map callback")?;
+                        let dest = self.typed_species_create(handle, len)?;
+                        for i in 0..len {
+                            // ToNumber/ToBigInt of an out-of-bounds (shrunk) index
+                            // yields `undefined`; the callback still runs per spec.
+                            let kv = self
+                                .realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined);
+                            let cb_args = [kv, NanBox::number(i as f64), arr];
+                            let mapped = self.call_with_this(f, this_arg, &cb_args)?;
+                            // Set(A, k, mappedValue) — coerce per the result kind
+                            // (a BigInt-result write of a Number throws TypeError).
+                            self.set_element_checked(dest, i, mapped)?;
+                        }
+                        return Ok(Some(NanBox::handle(dest.to_raw())));
+                    }
                     let mut out = Vec::with_capacity(elems.len());
                     for (i, e) in elems.iter().enumerate() {
                         // A hole maps to a hole (callback skipped) — preserved as a
@@ -2823,6 +3120,26 @@ impl<'a> Interp<'a> {
                     let f = arg(0);
                     let this_arg = arg(1);
                     let arr = callback_recv;
+                    // Typed array: `len` is cached, each kValue read live (a callback
+                    // resize/detach is observed), kept values collected, then the
+                    // result is allocated via TypedArraySpeciesCreate(O, «kept»).
+                    if self.realm.typed_kind(handle).is_some() {
+                        self.require_callable(f, "filter callback")?;
+                        let len = elems.len();
+                        let mut out = Vec::new();
+                        for i in 0..len {
+                            let e = self
+                                .realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined);
+                            let cb_args = [e, NanBox::number(i as f64), arr];
+                            let r = self.call_with_this(f, this_arg, &cb_args)?;
+                            if self.realm.truthy(r) {
+                                out.push(e);
+                            }
+                        }
+                        return Ok(Some(self.typed_like_species(handle, out)?));
+                    }
                     let mut out = Vec::new();
                     for (i, e) in elems.iter().enumerate() {
                         if !is_present(i) {
@@ -2834,18 +3151,29 @@ impl<'a> Interp<'a> {
                             out.push(*e);
                         }
                     }
-                    // A typed-array `filter` allocates via TypedArraySpeciesCreate.
                     return Ok(Some(self.typed_like_species(handle, out)?));
                 }
                 "forEach" => {
                     let f = arg(0);
                     let this_arg = arg(1);
                     let arr = callback_recv;
-                    for (i, e) in elems.iter().enumerate() {
-                        if !is_present(i) {
-                            continue; // holes are skipped
-                        }
-                        let cb_args = [*e, NanBox::number(i as f64), arr];
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    // A typed array re-reads each element live by index; a plain array
+                    // reads its snapshot at the same index — an index loop is required.
+                    #[allow(clippy::needless_range_loop)]
+                    for i in 0..elems.len() {
+                        // Typed array: re-read live (a callback resize/detach is
+                        // observed). Plain array skips holes.
+                        let e = if typed {
+                            self.realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined)
+                        } else if is_present(i) {
+                            elems[i]
+                        } else {
+                            continue;
+                        };
+                        let cb_args = [e, NanBox::number(i as f64), arr];
                         self.call_with_this(f, this_arg, &cb_args)?;
                     }
                     return Ok(Some(NanBox::undefined()));
@@ -2853,6 +3181,16 @@ impl<'a> Interp<'a> {
                 "reduce" => {
                     let f = arg(0);
                     let arr = callback_recv;
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    let read = |this: &mut Self, i: usize| -> NanBox {
+                        if typed {
+                            this.realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined)
+                        } else {
+                            elems[i]
+                        }
+                    };
                     let mut acc;
                     let mut start = 0;
                     if args.len() >= 2 {
@@ -2860,10 +3198,10 @@ impl<'a> Interp<'a> {
                     } else {
                         // Seed from the first *present* element; a holes-only (or
                         // empty) array with no initial value is a TypeError.
-                        let first = (0..elems.len()).find(|&i| is_present(i));
+                        let first = (0..elems.len()).find(|&i| typed || is_present(i));
                         match first {
                             Some(i) => {
-                                acc = elems[i];
+                                acc = read(self, i);
                                 start = i + 1;
                             }
                             None => {
@@ -2874,11 +3212,12 @@ impl<'a> Interp<'a> {
                             }
                         }
                     }
-                    for (i, e) in elems.iter().enumerate().skip(start) {
-                        if !is_present(i) {
-                            continue; // holes are skipped
+                    for i in start..elems.len() {
+                        if !typed && !is_present(i) {
+                            continue; // holes are skipped (plain array)
                         }
-                        acc = self.call(f, &[acc, *e, NanBox::number(i as f64), arr])?;
+                        let e = read(self, i);
+                        acc = self.call(f, &[acc, e, NanBox::number(i as f64), arr])?;
                     }
                     return Ok(Some(acc));
                 }
@@ -2886,16 +3225,26 @@ impl<'a> Interp<'a> {
                 "reduceRight" => {
                     let f = arg(0);
                     let arr = callback_recv;
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    let read = |this: &mut Self, i: usize| -> NanBox {
+                        if typed {
+                            this.realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined)
+                        } else {
+                            elems[i]
+                        }
+                    };
                     let mut acc;
                     let mut idx = elems.len();
                     if args.len() >= 2 {
                         acc = arg(1);
                     } else {
                         // Seed from the last present element.
-                        let last = (0..elems.len()).rev().find(|&i| is_present(i));
+                        let last = (0..elems.len()).rev().find(|&i| typed || is_present(i));
                         match last {
                             Some(i) => {
-                                acc = elems[i];
+                                acc = read(self, i);
                                 idx = i;
                             }
                             None => {
@@ -2908,10 +3257,11 @@ impl<'a> Interp<'a> {
                     }
                     while idx > 0 {
                         idx -= 1;
-                        if !is_present(idx) {
-                            continue; // holes are skipped
+                        if !typed && !is_present(idx) {
+                            continue; // holes are skipped (plain array)
                         }
-                        acc = self.call(f, &[acc, elems[idx], NanBox::number(idx as f64), arr])?;
+                        let e = read(self, idx);
+                        acc = self.call(f, &[acc, e, NanBox::number(idx as f64), arr])?;
                     }
                     return Ok(Some(acc));
                 }
@@ -2924,12 +3274,39 @@ impl<'a> Interp<'a> {
                         let len = elems.len();
                         let a = self.typed_clamp_index_checked(arg(0), 0, len)?;
                         let b = self.typed_clamp_index_checked(arg(1), len, len)?;
-                        let sub = if a < b {
-                            elems[a..b].to_vec()
-                        } else {
-                            Vec::new()
-                        };
-                        return Ok(Some(self.typed_like_species(handle, sub)?));
+                        let count = b.saturating_sub(a);
+                        // TypedArraySpeciesCreate(O, «count») runs first (it may itself
+                        // read a custom constructor that detaches the source).
+                        let dest = self.typed_species_create(handle, count)?;
+                        // Spec: if count > 0, re-check the source — a start/end valueOf
+                        // or the species constructor may have detached / shrunk it; that
+                        // is a TypeError (the snapshot `elems` would otherwise copy
+                        // stale/zeroed data).
+                        if count > 0
+                            && (self.typed_array_detached(handle)
+                                || self.realm.typed_array_out_of_bounds(handle))
+                        {
+                            return Err(self.type_error(
+                                "TypedArray.prototype.slice called on a detached or out-of-bounds typed array",
+                            ));
+                        }
+                        // Copy live elements. A resizable buffer may have shrunk
+                        // during the start/end coercion (a length-tracking view stays
+                        // valid but shorter); only indices still within the live length
+                        // are copied — the rest keep the destination's zero fill (a
+                        // read past the end would coerce to NaN, which is wrong).
+                        let live = self.realm.typed_len(handle).unwrap_or(0);
+                        for (k, i) in (a..b).enumerate() {
+                            if i >= live {
+                                break;
+                            }
+                            let v = self
+                                .realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined);
+                            self.set_element_checked(dest, k, v)?;
+                        }
+                        return Ok(Some(NanBox::handle(dest.to_raw())));
                     }
                     let (a, b) = slice_bounds(
                         self.realm.to_number(arg(0)),
@@ -3139,13 +3516,27 @@ impl<'a> Interp<'a> {
                 "at" => {
                     let i = self.coerce_to_integer_or_infinity(arg(0))?;
                     let idx = if i < 0.0 { elems.len() as f64 + i } else { i };
+                    // Typed array: the index coercion may have resized the buffer, so
+                    // read live by index against the current length (an out-of-range
+                    // or now-detached read is `undefined`).
+                    if self.realm.typed_kind(handle).is_some() {
+                        let cur = self.realm.typed_len(handle).unwrap_or(0);
+                        return Ok(Some(
+                            as_index(idx)
+                                .filter(|&u| u < cur)
+                                .map(|u| {
+                                    self.realm
+                                        .typed_get(handle, u)
+                                        .unwrap_or_else(NanBox::undefined)
+                                })
+                                .unwrap_or(NanBox::undefined()),
+                        ));
+                    }
+                    // Plain array: `at` reads via `[[Get]]`, so a hole reads `undefined`.
                     let v = as_index(idx)
                         .and_then(|u| elems.get(u))
                         .copied()
                         .unwrap_or(NanBox::undefined());
-                    // `at` reads via `[[Get]]`: a hole reads `undefined` (it does
-                    // not consult the prototype for a typed array; for a plain
-                    // array `undefined` matches because `at` returns the value).
                     return Ok(Some(if v.is_hole() { NanBox::undefined() } else { v }));
                 }
                 "lastIndexOf" => {
@@ -3166,10 +3557,29 @@ impl<'a> Interp<'a> {
                     } else {
                         len - 1
                     };
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    // Per spec, a fromIndex coercion that detached / OOB'd the typed
+                    // array makes `lastIndexOf` return -1 (no search).
+                    if typed
+                        && (self.typed_array_detached(handle)
+                            || self.realm.typed_array_out_of_bounds(handle))
+                    {
+                        return Ok(Some(NanBox::number(-1.0)));
+                    }
                     let mut found = -1.0;
                     for i in (0..=from).rev() {
-                        // `lastIndexOf` skips holes.
-                        if is_present(i) && self.realm.strict_equals(elems[i], target) {
+                        // Typed array: read live (a fromIndex detach makes every read
+                        // undefined). A plain array skips holes.
+                        let e = if typed {
+                            self.realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined)
+                        } else if is_present(i) {
+                            elems[i]
+                        } else {
+                            continue;
+                        };
+                        if self.realm.strict_equals(e, target) {
                             found = i as f64;
                             break;
                         }
@@ -3178,24 +3588,42 @@ impl<'a> Interp<'a> {
                 }
                 "find" => {
                     let f = arg(0);
-                    for (i, e) in elems.iter().enumerate() {
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    #[allow(clippy::needless_range_loop)]
+                    for i in 0..elems.len() {
+                        let e = if typed {
+                            self.realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined)
+                        } else {
+                            elems[i]
+                        };
                         if self.call_truthy_this(
                             f,
                             arg(1),
-                            &[*e, NanBox::number(i as f64), callback_recv],
+                            &[e, NanBox::number(i as f64), callback_recv],
                         )? {
-                            return Ok(Some(*e));
+                            return Ok(Some(e));
                         }
                     }
                     return Ok(Some(NanBox::undefined()));
                 }
                 "findIndex" => {
                     let f = arg(0);
-                    for (i, e) in elems.iter().enumerate() {
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    #[allow(clippy::needless_range_loop)]
+                    for i in 0..elems.len() {
+                        let e = if typed {
+                            self.realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined)
+                        } else {
+                            elems[i]
+                        };
                         if self.call_truthy_this(
                             f,
                             arg(1),
-                            &[*e, NanBox::number(i as f64), callback_recv],
+                            &[e, NanBox::number(i as f64), callback_recv],
                         )? {
                             return Ok(Some(NanBox::number(i as f64)));
                         }
@@ -3205,24 +3633,42 @@ impl<'a> Interp<'a> {
                 // `findLast`/`findLastIndex` — scan right-to-left.
                 "findLast" => {
                     let f = arg(0);
-                    for (i, e) in elems.iter().enumerate().rev() {
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    #[allow(clippy::needless_range_loop)]
+                    for i in (0..elems.len()).rev() {
+                        let e = if typed {
+                            self.realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined)
+                        } else {
+                            elems[i]
+                        };
                         if self.call_truthy_this(
                             f,
                             arg(1),
-                            &[*e, NanBox::number(i as f64), callback_recv],
+                            &[e, NanBox::number(i as f64), callback_recv],
                         )? {
-                            return Ok(Some(*e));
+                            return Ok(Some(e));
                         }
                     }
                     return Ok(Some(NanBox::undefined()));
                 }
                 "findLastIndex" => {
                     let f = arg(0);
-                    for (i, e) in elems.iter().enumerate().rev() {
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    #[allow(clippy::needless_range_loop)]
+                    for i in (0..elems.len()).rev() {
+                        let e = if typed {
+                            self.realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined)
+                        } else {
+                            elems[i]
+                        };
                         if self.call_truthy_this(
                             f,
                             arg(1),
-                            &[*e, NanBox::number(i as f64), callback_recv],
+                            &[e, NanBox::number(i as f64), callback_recv],
                         )? {
                             return Ok(Some(NanBox::number(i as f64)));
                         }
@@ -3231,14 +3677,24 @@ impl<'a> Interp<'a> {
                 }
                 "some" => {
                     let f = arg(0);
-                    for (i, e) in elems.iter().enumerate() {
-                        if !is_present(i) {
-                            continue; // holes are skipped
-                        }
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    #[allow(clippy::needless_range_loop)]
+                    for i in 0..elems.len() {
+                        // Typed array: re-read live (a callback resize/detach is
+                        // observed; values are not cached). Plain array skips holes.
+                        let e = if typed {
+                            self.realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined)
+                        } else if is_present(i) {
+                            elems[i]
+                        } else {
+                            continue;
+                        };
                         if self.call_truthy_this(
                             f,
                             arg(1),
-                            &[*e, NanBox::number(i as f64), callback_recv],
+                            &[e, NanBox::number(i as f64), callback_recv],
                         )? {
                             return Ok(Some(NanBox::boolean(true)));
                         }
@@ -3247,14 +3703,22 @@ impl<'a> Interp<'a> {
                 }
                 "every" => {
                     let f = arg(0);
-                    for (i, e) in elems.iter().enumerate() {
-                        if !is_present(i) {
-                            continue; // holes are skipped
-                        }
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    #[allow(clippy::needless_range_loop)]
+                    for i in 0..elems.len() {
+                        let e = if typed {
+                            self.realm
+                                .typed_get(handle, i)
+                                .unwrap_or_else(NanBox::undefined)
+                        } else if is_present(i) {
+                            elems[i]
+                        } else {
+                            continue;
+                        };
                         if !self.call_truthy_this(
                             f,
                             arg(1),
-                            &[*e, NanBox::number(i as f64), callback_recv],
+                            &[e, NanBox::number(i as f64), callback_recv],
                         )? {
                             return Ok(Some(NanBox::boolean(false)));
                         }

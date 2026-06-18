@@ -94,6 +94,13 @@ pub struct Realm {
     /// Handles of non-extensible arrays (`Object.preventExtensions`/`seal`/`freeze`)
     /// — element writes past the end are rejected. Same caveat.
     non_extensible_arrays: alloc::collections::BTreeSet<u64>,
+    /// Handles of typed-array *views* that auto-track their backing (resizable)
+    /// `ArrayBuffer`'s length — i.e. created with no explicit `length` argument
+    /// over a resizable buffer. On `resize`, only these views recompute their
+    /// element count to span the buffer; a fixed-length view keeps its `length`
+    /// and instead becomes *out of bounds* when the buffer can no longer hold it.
+    /// Non-GC-root: a stale entry for a dead handle is harmless.
+    length_tracking_views: alloc::collections::BTreeSet<u64>,
     /// Handles of arrays whose `length` property was made non-writable
     /// (`Object.defineProperty(arr, "length", {writable:false})`). An array's
     /// `length` is writable by default; this records the explicit demotion so the
@@ -206,6 +213,7 @@ impl Realm {
             fn_ctor: alloc::collections::BTreeMap::new(),
             class_protos: alloc::collections::BTreeMap::new(),
             aux_props: alloc::collections::BTreeMap::new(),
+            length_tracking_views: alloc::collections::BTreeSet::new(),
             frozen_arrays: alloc::collections::BTreeSet::new(),
             sealed_arrays: alloc::collections::BTreeSet::new(),
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
@@ -312,10 +320,50 @@ impl Realm {
             let Some((_, off, _, kind)) = self.heap.get(v).and_then(Cell::as_typed_array) else {
                 continue;
             };
-            let size = typed_elem_size(kind);
-            let view_len = new_byte_len.saturating_sub(off) / size;
-            self.set_typed_length(v, view_len);
+            // Only an auto-length-tracking view re-spans the resized buffer. A
+            // fixed-length view keeps its intrinsic `length`; whether it currently
+            // fits is determined dynamically (see `typed_array_out_of_bounds`), so
+            // it becomes out of bounds on shrink and valid again on regrow without
+            // losing its declared length.
+            if self.length_tracking_views.contains(&v.to_raw()) {
+                let size = typed_elem_size(kind);
+                let view_len = new_byte_len.saturating_sub(off) / size;
+                self.set_typed_length(v, view_len);
+            }
         }
+    }
+
+    /// Marks the typed-array view at `handle` as auto-length-tracking (created
+    /// with no explicit length over a resizable buffer).
+    pub fn mark_length_tracking(&mut self, handle: Handle) {
+        self.length_tracking_views.insert(handle.to_raw());
+    }
+
+    /// Whether the typed-array view at `handle` auto-tracks its buffer's length.
+    #[must_use]
+    pub fn is_length_tracking(&self, handle: Handle) -> bool {
+        self.length_tracking_views.contains(&handle.to_raw())
+    }
+
+    /// Whether the fixed-length typed-array view at `handle` is currently *out of
+    /// bounds*: its `[[ByteOffset]] + length·elem_size` exceeds the backing
+    /// buffer's current byte length (e.g. the resizable buffer was shrunk below
+    /// the view's declared extent), or its offset itself is past the end. A
+    /// length-tracking view is never out of bounds (it re-spans on resize); a
+    /// detached buffer is reported separately. Returns `false` for a non-view.
+    #[must_use]
+    pub fn typed_array_out_of_bounds(&self, handle: Handle) -> bool {
+        let Some((bytes, off, len, kind)) = self.heap.get(handle).and_then(Cell::as_typed_array)
+        else {
+            return false;
+        };
+        if self.length_tracking_views.contains(&handle.to_raw()) {
+            return false;
+        }
+        let cur = self.bytes_len(bytes).unwrap_or(0);
+        let size = typed_elem_size(kind);
+        off.checked_add(len.saturating_mul(size))
+            .is_none_or(|end| end > cur)
     }
 
     /// Records the realm's `Object.prototype`, applied to subsequently-created
@@ -488,10 +536,18 @@ impl Realm {
     /// The element count of the typed-array view at `handle`, if it is one.
     #[must_use]
     pub fn typed_len(&self, handle: Handle) -> Option<usize> {
-        self.heap
+        let l = self
+            .heap
             .get(handle)?
             .as_typed_array()
-            .map(|(_, _, l, _)| l)
+            .map(|(_, _, l, _)| l)?;
+        // An out-of-bounds fixed-length view (resizable buffer shrank below its
+        // extent) reports length 0 — its `.length`, iteration count, and index
+        // bounds all collapse to empty until the buffer is grown back.
+        if self.typed_array_out_of_bounds(handle) {
+            return Some(0);
+        }
+        Some(l)
     }
 
     /// The element-kind index of the typed-array view at `handle`, if it is one.
@@ -542,7 +598,10 @@ impl Realm {
     /// `BigInt` (hence `&mut self`).
     pub fn typed_get(&mut self, handle: Handle, i: usize) -> Option<NanBox> {
         let (buffer, byte_offset, length, kind) = self.heap.get(handle)?.as_typed_array()?;
-        if i >= length {
+        // A fixed-length view whose resizable buffer shrank below its extent is
+        // out of bounds: every integer-indexed read is `undefined` (IsValidInteger
+        // Index is false), per spec — never a decoded zero from the truncated bytes.
+        if i >= length || self.typed_array_out_of_bounds(handle) {
             return Some(NanBox::undefined());
         }
         let size = typed_elem_size(kind);
@@ -1674,7 +1733,14 @@ impl Realm {
                         .map_or(dense, |logical| logical.max(dense)),
                 )
             }
-            Cell::TypedArray { length, .. } => Some(*length),
+            Cell::TypedArray { length, .. } => {
+                // An out-of-bounds fixed-length view reports length 0.
+                if self.typed_array_out_of_bounds(handle) {
+                    Some(0)
+                } else {
+                    Some(*length)
+                }
+            }
             _ => None,
         }
     }
@@ -2324,6 +2390,15 @@ impl Realm {
     pub fn property_is_enumerable(&self, handle: Handle, key: &str) -> bool {
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
             return !o.is_hidden(key);
+        }
+        // A typed-array in-range canonical integer index is an enumerable own data
+        // property (ES2021+: enumerable, writable, configurable).
+        if let Some((_, _, len, _)) = self.heap.get(handle).and_then(Cell::as_typed_array)
+            && let Ok(i) = key.parse::<usize>()
+            && i < len
+            && alloc::format!("{i}") == key
+        {
+            return true;
         }
         // An array's in-range indices are enumerable by default; `length` is not.
         // A per-index `enumerable: false` set via `Object.defineProperty` is
@@ -3070,7 +3145,7 @@ impl Realm {
                         if let Some((radix, body)) = radixed {
                             return i64::from_str_radix(body, radix).map_or(f64::NAN, |n| n as f64);
                         }
-                        t.parse::<f64>().unwrap_or(f64::NAN)
+                        js_str_to_f64(t)
                     }
                     // A `Date` coerces to its millisecond timestamp (so `b - a`
                     // yields an elapsed-ms difference); any other object coerces
@@ -3106,7 +3181,7 @@ impl Realm {
         if let Some((radix, body)) = radixed {
             return i64::from_str_radix(body, radix).map_or(f64::NAN, |n| n as f64);
         }
-        t.parse::<f64>().unwrap_or(f64::NAN)
+        js_str_to_f64(t)
     }
 
     fn compare(&self, a: NanBox, b: NanBox) -> Option<core::cmp::Ordering> {
@@ -3455,6 +3530,36 @@ fn rope_bytes(r: &Rope) -> alloc::borrow::Cow<'_, [u8]> {
         Some(b) => alloc::borrow::Cow::Borrowed(b),
         None => alloc::borrow::Cow::Owned(r.materialize_bytes()),
     }
+}
+
+/// Parses a (decimal, already-trimmed, non-radix) `StrDecimalLiteral` to an
+/// `f64` per ECMAScript `StringToNumber`. Unlike Rust's `f64::from_str`, the
+/// grammar only admits the exact word `Infinity` (optionally `+`/`-`-signed) —
+/// not `inf`/`infinity`/`INFINITY` — and never `NaN`/`nan` (those are a parse
+/// failure → `NaN`). Everything else defers to Rust's parser.
+#[must_use]
+fn js_str_to_f64(t: &str) -> f64 {
+    // The Infinity word is the only alphabetic literal ECMAScript accepts.
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let neg = t.starts_with('-');
+    if body == "Infinity" {
+        return if neg {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    // Reject every other token containing an ASCII letter (Rust would accept
+    // `inf`/`infinity`/`nan` in any case, plus hex floats via `e`/`x` — guard the
+    // alphabetic ones; `e`/`E` exponents in a numeric literal are still allowed
+    // because such a token also contains digits and parses below).
+    if body
+        .bytes()
+        .any(|b| b.is_ascii_alphabetic() && !matches!(b, b'e' | b'E'))
+    {
+        return f64::NAN;
+    }
+    t.parse::<f64>().unwrap_or(f64::NAN)
 }
 
 /// Renders a number as ECMAScript `ToString` would for the cases the engine
@@ -4091,9 +4196,18 @@ mod tests {
         assert_eq!(realm.get_element(u8v, 0).as_number(), Some(255.0));
         // Float64 over the same first byte sees the raw bytes change.
         assert_ne!(realm.get_element(f64v, 0).as_number(), Some(0.0));
-        // resize_buffer grows the bytes and re-lengths the views.
+        // resize_buffer grows the bytes. Only an auto-length-tracking view
+        // re-spans the resized buffer; a fixed-length view keeps its length.
+        realm.mark_length_tracking(u8v);
         realm.resize_buffer(buf, 16);
-        assert_eq!(realm.typed_len(u8v), Some(16));
+        assert_eq!(realm.typed_len(u8v), Some(16), "tracking view re-spans");
+        // The fixed-length Float64 view keeps its declared length of 1 (and is in
+        // bounds, since the buffer grew).
+        assert_eq!(
+            realm.typed_len(f64v),
+            Some(1),
+            "fixed view keeps its length"
+        );
     }
 
     #[test]

@@ -132,10 +132,20 @@ impl<'a> Interp<'a> {
         let h = Handle::from_raw(raw);
         let sym = self.well_known_symbol("toPrimitive");
         let key = self.member_key(sym);
-        if let Some(f) = self.realm.get_property(h, &key)
-            && f.as_handle()
+        // `Get(O, @@toPrimitive)` — through `read_member` so an *accessor*
+        // `[Symbol.toPrimitive]` getter actually runs (and is observed), and an
+        // inherited method resolves. A bare `get_property` would skip getters.
+        let f = self.read_member(h, &key)?;
+        if !matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            // A non-undefined/null `@@toPrimitive` that is not callable is a
+            // TypeError (per ToPrimitive step 2.c.i).
+            if !f
+                .as_handle()
                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-        {
+            {
+                let m = self.new_str("Symbol.toPrimitive is not a function");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
             let hint_box = self.new_str(hint);
             let r = self.call_with_this(f, v, &[hint_box])?;
             // `[Symbol.toPrimitive]` must return a primitive, else a TypeError.
@@ -2021,8 +2031,13 @@ impl<'a> Interp<'a> {
             && let Some(kind) = self.realm.typed_kind(handle)
         {
             let bpe = f64::from(TYPED_ARRAY_KINDS[kind as usize].1);
+            // A detached or out-of-bounds view reports byteOffset 0 (and typed_len,
+            // used for byteLength, already collapses to 0).
+            let oob =
+                self.typed_array_detached(handle) || self.realm.typed_array_out_of_bounds(handle);
             return Ok(NanBox::number(match name {
                 "BYTES_PER_ELEMENT" => bpe,
+                "byteOffset" if oob => 0.0,
                 "byteOffset" => self.realm.typed_byte_offset(handle).unwrap_or(0) as f64,
                 _ => self.realm.typed_len(handle).unwrap_or(0) as f64 * bpe,
             }));

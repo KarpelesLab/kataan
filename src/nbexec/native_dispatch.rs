@@ -115,6 +115,14 @@ impl<'a> Interp<'a> {
                 }
             }
             N_BOOLEAN => NanBox::boolean(self.realm.truthy(arg(0))),
+            // `Date(...)` called as a *function* (not `new`) ignores its arguments
+            // and returns a string for the current time — equivalent to
+            // `new Date().toString()`, per spec.
+            N_DATE => {
+                let d = self.realm.new_date(now_ms());
+                self.call_method(NanBox::handle(d.to_raw()), "toString", &[])?
+                    .unwrap_or_else(NanBox::undefined)
+            }
             // `RegExp(pattern, flags)` called as a *function* behaves like
             // `new RegExp(...)` here (the spec's species/this-is-RegExp short-circuit
             // returns the same `pattern` only when it is a RegExp whose
@@ -565,6 +573,43 @@ impl<'a> Interp<'a> {
                     } else {
                         NanBox::handle(h.to_raw())
                     };
+                    // Integer-indexed exotic `[[Set]]`: a canonical numeric index on a
+                    // typed-array target never consults the prototype chain.
+                    //   - SameValue(O, Receiver): IntegerIndexedElementSet, return true
+                    //     (an invalid/out-of-bounds index is a no-op).
+                    //   - different Receiver, *invalid* index: return true (no write).
+                    //   - different Receiver, *valid* index: fall to the ordinary
+                    //     [[Set]] on the receiver (handled below).
+                    if self.realm.typed_kind(h).is_some()
+                        && let Some(n) = canonical_numeric_index(&key)
+                    {
+                        let is_neg_zero = n == 0.0 && n.is_sign_negative();
+                        let valid = !self.typed_array_detached(h)
+                            && !is_neg_zero
+                            && n == (n as i64) as f64
+                            && n >= 0.0
+                            && self
+                                .realm
+                                .typed_len(h)
+                                .is_some_and(|len| (n as usize) < len);
+                        let same_receiver = receiver.as_handle() == Some(h.to_raw());
+                        if same_receiver {
+                            if valid {
+                                self.set_element_checked(h, n as usize, value)?;
+                            } else if self.realm.typed_kind(h).is_some_and(is_bigint_kind) {
+                                let _ = self.coerce_to_bigint(value)?;
+                            } else {
+                                let _ = self.coerce_to_number(value)?;
+                            }
+                            return Ok(NanBox::boolean(true));
+                        }
+                        if !valid {
+                            // Different receiver + invalid index: a no-op success
+                            // (never reaches the prototype chain).
+                            return Ok(NanBox::boolean(true));
+                        }
+                        // Different receiver + valid index: ordinary set on receiver.
+                    }
                     // A setter accessor found on the chain runs with `receiver` as
                     // `this` (an accessor with no setter fails).
                     let mut cur = Some(h);

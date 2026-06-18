@@ -4094,17 +4094,18 @@ fn pad_units(s: &[u8], target: usize, pad: &[u8], at_start: bool) -> Vec<u8> {
         return s.to_vec();
     }
     let need = target - len;
-    let pad_units = crate::wtf8::utf16_len(pad);
-    // Repeat the pad until it covers `need` units, then trim to exactly `need`.
-    let mut filler: Vec<u8> = Vec::new();
-    let mut have = 0usize;
-    while have < need {
-        filler.extend_from_slice(pad);
-        have += pad_units;
+    let pad_unit_count = crate::wtf8::utf16_len(pad);
+    // Build the filler from exactly `need` UTF-16 code units (per spec the fill is
+    // truncated by *code unit*, which may leave a lone surrogate — not by whole
+    // code point). Collect the pad's units and repeat them unit-by-unit.
+    let pad_units: Vec<u16> = crate::wtf8::utf16_units(pad).collect();
+    let mut units: Vec<u16> = Vec::with_capacity(need);
+    let mut idx = 0usize;
+    while units.len() < need {
+        units.push(pad_units[idx % pad_unit_count]);
+        idx += 1;
     }
-    if have > need {
-        filler = crate::wtf8::slice_utf16(&filler, 0, need);
-    }
+    let filler = crate::wtf8::from_utf16(&units);
     let mut out = Vec::with_capacity(filler.len() + s.len());
     if at_start {
         out.extend_from_slice(&filler);

@@ -299,6 +299,32 @@ pub fn is_utf8(bytes: &[u8]) -> bool {
     core::str::from_utf8(bytes).is_ok()
 }
 
+/// Whether the string is **well-formed** UTF-16 (ECMAScript
+/// `String.prototype.isWellFormed`): every high surrogate is immediately
+/// followed by a low surrogate and there is no lone low surrogate. Unlike
+/// [`is_utf8`], this scans the UTF-16 *code-unit* sequence, so a valid surrogate
+/// pair that happens to span two WTF-8 leaves (e.g. `"\uD83D" + "\uDCA9"`) is
+/// recognized as well-formed.
+#[must_use]
+pub fn is_well_formed_utf16(bytes: &[u8]) -> bool {
+    let mut expect_low = false;
+    for u in utf16_units(bytes) {
+        let is_high = (0xD800..=0xDBFF).contains(&u);
+        let is_low = (0xDC00..=0xDFFF).contains(&u);
+        if expect_low {
+            if !is_low {
+                return false; // a high surrogate not followed by a low one
+            }
+            expect_low = false;
+        } else if is_low {
+            return false; // a lone low surrogate
+        } else if is_high {
+            expect_low = true;
+        }
+    }
+    !expect_low
+}
+
 /// Decodes WTF-8 to a real Rust `String`, replacing each lone surrogate with the
 /// replacement character U+FFFD. For sinks that require valid UTF-8 (printing,
 /// `&str` interop) and accept the lossy mapping.
