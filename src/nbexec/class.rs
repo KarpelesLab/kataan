@@ -108,7 +108,12 @@ impl<'a> Interp<'a> {
                     if !static_fields.contains(&key) {
                         static_fields.push(key.clone());
                     }
-                    statics.insert(key, NanBox::undefined());
+                    // Install a placeholder, but do NOT clobber an earlier static
+                    // *method*/accessor of the same name: per spec all methods are
+                    // installed before any static field initializer runs, so a field
+                    // initializer like `static g = this.g()` must still see the
+                    // method `g` until the field's own initializer overwrites it.
+                    statics.entry(key).or_insert(NanBox::undefined());
                 }
                 // `static get x() {}` / `static set x(v) {}` — accessors.
                 ClassMember::Method(m)
@@ -312,6 +317,12 @@ impl<'a> Interp<'a> {
             let saved = core::mem::replace(&mut self.current, scope);
             let saved_this = core::mem::replace(&mut self.this_val, class_val);
             let saved_strict = core::mem::replace(&mut self.strict, true);
+            // Static initializers and static blocks run with the class as their
+            // home object so `super.x` resolves against the superclass's static
+            // side (`[[HomeObject]]` is the constructor, `IsStatic` is true).
+            let saved_home = self.current_home.replace(class_id);
+            let saved_home_static = core::mem::replace(&mut self.current_home_static, true);
+            let saved_home_obj = core::mem::take(&mut self.current_home_object);
             let r = (|| {
                 for member in &class.body {
                     match member {
@@ -338,6 +349,9 @@ impl<'a> Interp<'a> {
             self.current = saved;
             self.this_val = saved_this;
             self.strict = saved_strict;
+            self.current_home = saved_home;
+            self.current_home_static = saved_home_static;
+            self.current_home_object = saved_home_obj;
             r?;
         }
         Ok(class_val)
@@ -781,26 +795,38 @@ impl<'a> Interp<'a> {
         instance: Handle,
     ) -> Result<(), ExecError> {
         let class = self.classes[class_id as usize];
-        for member in &class.body {
-            if let ClassMember::Field(field) = member
-                && !field.is_static
-            {
-                // A computed field name (`[expr] = v`) is evaluated here.
-                let key = match &field.key {
-                    PropertyKey::Computed(e) => {
-                        let k = self.eval(e)?;
-                        self.member_key(k)
-                    }
-                    other => static_key(other)?,
-                };
-                let v = match &field.value {
-                    Some(e) => self.eval(e)?,
-                    None => NanBox::undefined(),
-                };
-                self.realm.set_property(instance, &key, v);
+        // Instance field initializers run with the class as their home object, so
+        // `super.x` (e.g. inside an arrow stored in a field) resolves against the
+        // superclass prototype with `IsStatic` false.
+        let saved_home = self.current_home.replace(class_id);
+        let saved_home_static = core::mem::replace(&mut self.current_home_static, false);
+        let saved_home_obj = core::mem::take(&mut self.current_home_object);
+        let result = (|| {
+            for member in &class.body {
+                if let ClassMember::Field(field) = member
+                    && !field.is_static
+                {
+                    // A computed field name (`[expr] = v`) is evaluated here.
+                    let key = match &field.key {
+                        PropertyKey::Computed(e) => {
+                            let k = self.eval(e)?;
+                            self.member_key(k)
+                        }
+                        other => static_key(other)?,
+                    };
+                    let v = match &field.value {
+                        Some(e) => self.eval(e)?,
+                        None => NanBox::undefined(),
+                    };
+                    self.realm.set_property(instance, &key, v);
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        self.current_home = saved_home;
+        self.current_home_static = saved_home_static;
+        self.current_home_object = saved_home_obj;
+        result
     }
 
     pub(crate) fn run_constructor(
@@ -1099,19 +1125,62 @@ impl<'a> Interp<'a> {
                     };
                 }
             }
-            // A function superclass at this level: read `super.x` through
-            // `fn.prototype` (a data property or inherited method/getter), with
-            // `this` = the current receiver for any getter.
-            if let Some(v) = self.fn_super_member(pid, name)? {
+            // A function superclass at this level: for a static member, `super.x`
+            // reads from the superclass *constructor* object directly; for an
+            // instance member, through `fn.prototype`.
+            if self.current_home_static {
+                if let Some(v) = self.fn_super_static_member(pid, name)? {
+                    return Ok(v);
+                }
+            } else if let Some(v) = self.fn_super_member(pid, name)? {
                 return Ok(v);
             }
             cur = self.resolve_super(class, &penv)?;
         }
         // The home class may directly extend a function (no class parent level).
-        if let Some(v) = self.fn_super_member(home, name)? {
+        if self.current_home_static {
+            if let Some(v) = self.fn_super_static_member(home, name)? {
+                return Ok(v);
+            }
+        } else if let Some(v) = self.fn_super_member(home, name)? {
             return Ok(v);
         }
         Ok(NanBox::undefined())
+    }
+
+    /// Reads `super.name` for a *static* member through class `cid`'s function
+    /// superclass *constructor object* (`class C extends fn { static {...} }`): a
+    /// data property is returned directly; a getter anywhere on the constructor's
+    /// prototype chain is invoked with the current `this`. `None` if `cid` has no
+    /// function super or the constructor lacks the name.
+    fn fn_super_static_member(
+        &mut self,
+        cid: u32,
+        name: &str,
+    ) -> Result<Option<NanBox>, ExecError> {
+        let Some(fn_super) = self.class_fn_super[cid as usize] else {
+            return Ok(None);
+        };
+        let Some(sh) = fn_super.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        if !self.has_property(sh, name) {
+            return Ok(None);
+        }
+        let mut cur = Some(sh);
+        while let Some(h) = cur {
+            if let Some((getter, _)) = self.realm.accessor(h, name) {
+                if matches!(getter.unpack(), Unpacked::Undefined) {
+                    return Ok(Some(NanBox::undefined()));
+                }
+                return Ok(Some(self.call_with_this(getter, self.this_val, &[])?));
+            }
+            if self.realm.has_own(h, name) {
+                return Ok(Some(self.read_member(h, name)?));
+            }
+            cur = self.realm.object_proto(h);
+        }
+        Ok(Some(self.read_member(sh, name)?))
     }
 
     /// Reads `super.name` through class `cid`'s function superclass prototype
