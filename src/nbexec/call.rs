@@ -1103,6 +1103,10 @@ impl<'a> Interp<'a> {
     ) -> Result<NanBox, ExecError> {
         let call_scope = captured.child();
         let saved = core::mem::replace(&mut self.current, call_scope);
+        // The callee body opens a new variable environment (set by `hoist_with`);
+        // remember the caller's so it is restored on return.
+        let saved_var_scope = self.var_scope.clone();
+        let saved_annexb = core::mem::take(&mut self.annexb_block_fns);
         // An arrow has no own `this` — it inherits the enclosing one lexically,
         // so leave `self.this_val` unchanged.
         let saved_this = if def.is_arrow {
@@ -1251,6 +1255,8 @@ impl<'a> Interp<'a> {
             self.run_body(def.body)
         })();
         self.current = saved;
+        self.var_scope = saved_var_scope;
+        self.annexb_block_fns = saved_annexb;
         self.this_val = saved_this;
         self.current_home = saved_home;
         self.current_home_static = saved_home_static;

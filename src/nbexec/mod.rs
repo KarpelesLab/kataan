@@ -228,6 +228,16 @@ pub struct Interp<'a> {
     realm: Realm,
     /// The current lexical scope (innermost).
     current: Scope,
+    /// The current *variable* environment — the function/program/eval scope that
+    /// `var` and top-level function declarations hoist into. Tracks where the
+    /// Annex B.3.3 runtime binding-update writes a block-level function value.
+    var_scope: Scope,
+    /// The names of block-level function declarations that the Annex B.3.3
+    /// legacy extension var-hoists into the current variable environment — i.e.
+    /// the only names whose outer `var` binding is updated when a block function
+    /// declaration is *executed*. Excludes names that conflict with a parameter
+    /// or an already-present binding (where the extension does not apply).
+    annexb_block_fns: Vec<String>,
     /// Function-AST table; a closure cell holds an index into this.
     functions: Vec<FnDef<'a>>,
     /// Class-AST table; a class cell holds an index into this.
@@ -1635,6 +1645,8 @@ impl<'a> Interp<'a> {
         let mut interp = Self {
             realm: Realm::with_limits(limits),
             current: Scope::root(),
+            var_scope: Scope::root(),
+            annexb_block_fns: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
             class_statics: Vec::new(),
@@ -1694,6 +1706,7 @@ impl<'a> Interp<'a> {
         // scope before `install_globals` populates it, so indirect eval can run
         // against it later.
         interp.global_scope = interp.current.clone();
+        interp.var_scope = interp.current.clone();
         interp.install_globals();
         interp
     }
@@ -3386,7 +3399,7 @@ impl<'a> Interp<'a> {
     /// NOT drain the event loop — eval runs synchronously within the surrounding
     /// execution, which drains microtasks at its own top level.
     fn run_eval_body(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
-        self.hoist_with(&program.body, true)?;
+        self.hoist_with_kind(&program.body, true, true)?;
         let mut last = NanBox::undefined();
         for stmt in &program.body {
             match self.exec(stmt)? {
@@ -3428,6 +3441,8 @@ impl<'a> Interp<'a> {
 
         let saved_strict = self.strict;
         let saved_scope = self.current.clone();
+        let saved_var_scope = self.var_scope.clone();
+        let saved_annexb = core::mem::take(&mut self.annexb_block_fns);
         let (saved_this, saved_new_target) = (self.this_val, self.new_target);
 
         if !direct {
@@ -3464,6 +3479,8 @@ impl<'a> Interp<'a> {
         self.eval_depth -= 1;
 
         self.current = saved_scope;
+        self.var_scope = saved_var_scope;
+        self.annexb_block_fns = saved_annexb;
         self.strict = saved_strict;
         self.this_val = saved_this;
         self.new_target = saved_new_target;
@@ -3550,15 +3567,45 @@ impl<'a> Interp<'a> {
     /// `var` names hoist only at a function/program boundary (`hoist_vars`), not
     /// per-block, since `var` is function-scoped.
     fn hoist_with(&mut self, stmts: &'a [Stmt], hoist_vars: bool) -> Result<(), ExecError> {
+        self.hoist_with_kind(stmts, hoist_vars, false)
+    }
+
+    /// Hoists a statement sequence. `eval_code` is true for an eval body, where
+    /// the Annex B.3.3.3 rule differs from function code (B.3.3.2): a block
+    /// function whose name matches an enclosing parameter still updates that
+    /// binding in eval code, but not in function code.
+    fn hoist_with_kind(
+        &mut self,
+        stmts: &'a [Stmt],
+        hoist_vars: bool,
+        eval_code: bool,
+    ) -> Result<(), ExecError> {
         // `var` names hoist to the function/program scope as `undefined` (so a
         // read before the declaration yields `undefined`, not a ReferenceError).
         // Done first; a same-named function declaration then overwrites it.
         if hoist_vars {
+            // This is a function/program/eval variable-environment boundary: the
+            // current scope is where `var`/top-level functions hoist, and where
+            // the Annex B.3.3 runtime update for a block function writes.
+            self.var_scope = self.current.clone();
+            self.annexb_block_fns = Vec::new();
             let mut var_names: Vec<&str> = Vec::new();
             collect_var_names(stmts, &mut var_names);
             // Annex B: a function declared inside a block also var-hoists its name
             // to the enclosing function scope (initially `undefined`).
-            collect_block_function_names(stmts, &mut var_names);
+            let mut block_fn_names: Vec<&str> = Vec::new();
+            collect_block_function_names(stmts, &mut block_fn_names);
+            // A block-function name qualifies for the B.3.3 runtime update unless
+            // it collides with a parameter or other binding already present in the
+            // variable environment (where the function-code extension B.3.3.2 does
+            // not apply). In eval code (B.3.3.3) such a collision is permitted, so
+            // the binding is still updated.
+            for name in &block_fn_names {
+                if eval_code || !self.current.has_local(name) {
+                    self.annexb_block_fns.push(String::from(*name));
+                }
+            }
+            var_names.extend_from_slice(&block_fn_names);
             let at_global = self.current.ptr_eq(&self.global_scope);
             for name in var_names {
                 if !self.current.has_local(name) {
@@ -3594,11 +3641,13 @@ impl<'a> Interp<'a> {
                     // object (`function f(){}; this.f === f`).
                     self.publish_global_var(&id.name, value);
                 } else {
-                    // A block-level declaration (Annex B) assigns the function-scope
-                    // `var` binding hoisted above; if none exists, bind locally.
-                    if !self.current.set(&id.name, value) {
-                        self.current.declare(&id.name, value);
-                    }
+                    // A block-level declaration binds *locally* in the block
+                    // scope (block scoping). Its name was also `var`-hoisted to
+                    // the function scope by `collect_block_function_names` when
+                    // the Annex B.3.3 extension applies; the runtime update of
+                    // that outer `var` binding happens when the function-decl
+                    // statement is evaluated (see `exec_inner`'s `Stmt::Function`).
+                    self.current.declare(&id.name, value);
                 }
             }
         }
@@ -3879,55 +3928,153 @@ fn has_use_strict(stmts: &[Stmt]) -> bool {
     false
 }
 
+/// Collects the lexically-declared names (`let`/`const`/`class`) directly in a
+/// statement list — i.e. the names that form the block's lexical environment.
+/// Does not recurse into nested blocks or function bodies. Used for the Annex
+/// B.3.3 early-error check.
+fn collect_lexical_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
+    use crate::ast::VarDeclKind;
+    for stmt in stmts {
+        match stmt {
+            Stmt::Var(decl) if matches!(decl.kind, VarDeclKind::Let | VarDeclKind::Const) => {
+                for d in &decl.declarations {
+                    collect_binding_idents(&d.target, out);
+                }
+            }
+            Stmt::Class(c) => {
+                if let Some(id) = &c.id {
+                    out.push(&id.name);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Pushes every identifier bound by a (possibly destructuring) binding target.
+fn collect_binding_idents<'a>(target: &'a BindingTarget, out: &mut Vec<&'a str>) {
+    use crate::ast::ArrayPatternElement;
+    match target {
+        BindingTarget::Ident(id) => out.push(&id.name),
+        BindingTarget::Array(arr) => {
+            for el in &arr.elements {
+                match el {
+                    ArrayPatternElement::Item { target, .. }
+                    | ArrayPatternElement::Rest { target, .. } => {
+                        collect_binding_idents(target, out)
+                    }
+                    ArrayPatternElement::Hole => {}
+                }
+            }
+        }
+        BindingTarget::Object(obj) => {
+            for p in &obj.properties {
+                collect_binding_idents(&p.value, out);
+            }
+            if let Some(rest) = &obj.rest {
+                collect_binding_idents(rest, out);
+            }
+        }
+    }
+}
+
 /// Collects the names of function declarations that appear **inside a block** (at
-/// any nesting depth below the immediate statement list). Per Annex B, such a
-/// name is var-hoisted to the enclosing function scope. The immediate top-level
-/// functions are excluded — they are bound directly by the hoisting loop.
+/// any nesting depth below the immediate statement list). Per Annex B.3.3, such a
+/// name is var-hoisted to the enclosing function scope — *unless* doing so would
+/// create an early error, i.e. the name is also lexically bound (`let`/`const`/
+/// `class`) in one of the block scopes enclosing the function declaration (up to
+/// and including the function/eval top-level lexical scope). In that case the
+/// legacy var-hoisting extension is skipped. The immediate top-level functions
+/// are excluded — they are bound directly by the hoisting loop.
 fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
     use core::slice::from_ref;
-    fn walk<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>, in_block: bool) {
+    // `blocked` is the set of names lexically declared in any enclosing block on
+    // the current path; a block function with such a name is not var-hoisted.
+    fn walk<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>, in_block: bool, blocked: &[&'a str]) {
+        // Lexical names declared directly in this statement list shadow a
+        // same-named block function nested deeper (Annex B early-error guard).
+        let mut blocked_here: Vec<&str> = blocked.to_vec();
+        collect_lexical_names(stmts, &mut blocked_here);
+
         for stmt in stmts {
             match stmt {
                 Stmt::Function(f) if in_block => {
-                    if let Some(id) = &f.id {
+                    if let Some(id) = &f.id
+                        && !blocked.contains(&&*id.name)
+                    {
                         out.push(&id.name);
                     }
                 }
-                Stmt::Block { body, .. } => walk(body, out, true),
+                Stmt::Block { body, .. } => walk(body, out, true, &blocked_here),
                 Stmt::If {
                     consequent,
                     alternate,
                     ..
                 } => {
-                    walk(from_ref(consequent), out, true);
+                    walk(from_ref(consequent), out, true, &blocked_here);
                     if let Some(a) = alternate {
-                        walk(from_ref(a), out, true);
+                        walk(from_ref(a), out, true, &blocked_here);
                     }
                 }
                 Stmt::While { body, .. }
                 | Stmt::DoWhile { body, .. }
-                | Stmt::Labeled { body, .. }
-                | Stmt::For { body, .. }
-                | Stmt::ForIn { body, .. }
-                | Stmt::ForOf { body, .. } => walk(from_ref(body), out, true),
+                | Stmt::Labeled { body, .. } => walk(from_ref(body), out, true, &blocked_here),
+                Stmt::For { init, body, .. } => {
+                    // A `for (let/const …; …)` head introduces a lexical scope
+                    // enclosing the body; its names block the extension.
+                    let mut for_lex: Vec<&str> = blocked_here.clone();
+                    if let Some(crate::ast::ForInit::Var(decl)) = init
+                        && matches!(
+                            decl.kind,
+                            crate::ast::VarDeclKind::Let | crate::ast::VarDeclKind::Const
+                        )
+                    {
+                        for d in &decl.declarations {
+                            collect_binding_idents(&d.target, &mut for_lex);
+                        }
+                    }
+                    walk(from_ref(body), out, true, &for_lex);
+                }
+                Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
+                    let mut for_lex: Vec<&str> = blocked_here.clone();
+                    if let crate::ast::ForLeft::Decl {
+                        kind: crate::ast::VarDeclKind::Let | crate::ast::VarDeclKind::Const,
+                        target,
+                        ..
+                    } = left
+                    {
+                        collect_binding_idents(target, &mut for_lex);
+                    }
+                    walk(from_ref(body), out, true, &for_lex);
+                }
                 Stmt::Try {
                     block, finalizer, ..
                 } => {
-                    walk(block, out, true);
+                    walk(block, out, true, &blocked_here);
                     if let Some(f) = finalizer {
-                        walk(f, out, true);
+                        walk(f, out, true, &blocked_here);
                     }
                 }
                 Stmt::Switch { cases, .. } => {
+                    // A switch body is a single lexical (block) scope shared by
+                    // all cases.
+                    let mut switch_lex: Vec<&str> = blocked_here.clone();
                     for case in cases {
-                        walk(&case.body, out, true);
+                        collect_lexical_names(&case.body, &mut switch_lex);
+                    }
+                    for case in cases {
+                        walk(&case.body, out, true, &switch_lex);
                     }
                 }
                 _ => {}
             }
         }
     }
-    walk(stmts, out, false);
+    // The function/eval/program top-level lexical scope: its `let`/`const`/`class`
+    // names also block the extension for a same-named nested block function.
+    let mut top_lex: Vec<&str> = Vec::new();
+    collect_lexical_names(stmts, &mut top_lex);
+    walk(stmts, out, false, &top_lex);
 }
 
 /// The binary operator underlying a compound assignment (`+=` → `+`).

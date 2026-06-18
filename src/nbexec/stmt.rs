@@ -67,8 +67,26 @@ impl<'a> Interp<'a> {
                 self.exec_var(decl)?;
                 Ok(Flow::Normal(NanBox::undefined()))
             }
-            // Function declarations are handled by hoisting; nothing to do here.
-            Stmt::Function(_) => Ok(Flow::Normal(NanBox::undefined())),
+            // Function declarations are bound by hoisting. For a *block-level*
+            // declaration, Annex B.3.3 additionally updates the function-scope
+            // `var` binding of the same name when the declaration is evaluated
+            // (so the most recently *executed* block function wins, matching
+            // web-compat semantics). Only applies when the name was var-hoisted
+            // (i.e. the binding exists in the variable environment) and we are
+            // inside a nested block (not at the variable-environment top level).
+            Stmt::Function(func) => {
+                if let Some(id) = &func.id
+                    && !self.current.ptr_eq(&self.var_scope)
+                    && self
+                        .annexb_block_fns
+                        .iter()
+                        .any(|n| n.as_str() == &*id.name)
+                    && let Some(value) = self.current.get(&id.name)
+                {
+                    self.annexb_update_var(&id.name, value);
+                }
+                Ok(Flow::Normal(NanBox::undefined()))
+            }
             Stmt::Class(class) => {
                 let value = self.make_class(class)?;
                 if let Some(id) = &class.id {
@@ -84,9 +102,9 @@ impl<'a> Interp<'a> {
                 ..
             } => {
                 if self.eval_truthy(test)? {
-                    self.exec(consequent)
+                    self.exec_if_branch(consequent)
                 } else if let Some(alt) = alternate {
-                    self.exec(alt)
+                    self.exec_if_branch(alt)
                 } else {
                     Ok(Flow::Normal(NanBox::undefined()))
                 }
@@ -292,6 +310,47 @@ impl<'a> Interp<'a> {
 
     pub(crate) fn exec_block(&mut self, body: &'a [Stmt]) -> Result<Flow, ExecError> {
         self.exec_scoped(body)
+    }
+
+    /// Writes a block-level function value to its `var`-hoisted binding in the
+    /// current variable environment (Annex B.3.3 / B.3.4 runtime update). When the
+    /// variable environment is the global scope, the global object property is
+    /// updated too (where global `var`/function bindings live).
+    fn annexb_update_var(&mut self, name: &str, value: NanBox) {
+        self.var_scope.declare(name, value);
+        if self.var_scope.ptr_eq(&self.global_scope)
+            && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+        {
+            self.realm.set_property(g, name, value);
+        }
+    }
+
+    /// Executes an `if` branch. Annex B.3.4 allows a bare `FunctionDeclaration`
+    /// as the body of an `if`/`else` in sloppy mode (`if (x) function f(){}`).
+    /// Such a declaration is treated as if wrapped in a block: a fresh closure is
+    /// created in a new scope and, when the name was `var`-hoisted to the
+    /// variable environment, that outer binding is updated to the new value.
+    fn exec_if_branch(&mut self, stmt: &'a Stmt) -> Result<Flow, ExecError> {
+        if let Stmt::Function(func) = stmt
+            && let Some(id) = &func.id
+        {
+            let value = self.make_function(
+                &func.params,
+                Body::Block(&func.body),
+                func.is_async,
+                func.is_generator,
+            );
+            self.set_fn_name(value, &id.name);
+            if self
+                .annexb_block_fns
+                .iter()
+                .any(|n| n.as_str() == &*id.name)
+            {
+                self.annexb_update_var(&id.name, value);
+            }
+            return Ok(Flow::Normal(NanBox::undefined()));
+        }
+        self.exec(stmt)
     }
 
     /// Executes a statement sequence in the current scope (with hoisting).
