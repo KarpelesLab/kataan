@@ -124,6 +124,21 @@ impl<'a> Interp<'a> {
         self.settle(handle, value, true);
     }
 
+    /// `PromiseResolve(%Promise%, value)`: if `value` is already a promise, return
+    /// it unchanged (same identity); otherwise wrap it in a fresh promise resolved
+    /// with `value` (adopting a thenable). Used by `await` to obtain the promise
+    /// whose settlement resumes an async coroutine.
+    pub(crate) fn promise_resolve(&mut self, value: NanBox) -> Handle {
+        if let Some(raw) = value.as_handle()
+            && self.realm.promise_state(Handle::from_raw(raw)).is_some()
+        {
+            return Handle::from_raw(raw);
+        }
+        let p = self.fresh_promise();
+        self.resolve_with(p, value);
+        p
+    }
+
     /// Registers `then` reactions on `handle`, returning a new dependent promise.
     pub(crate) fn promise_then(&mut self, handle: Handle, on_f: NanBox, on_r: NanBox) -> NanBox {
         let result = self.register_then(handle, on_f, on_r, false);

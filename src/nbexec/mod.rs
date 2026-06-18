@@ -340,6 +340,11 @@ pub struct Interp<'a> {
     /// on the generator object. A vacated slot (a finished generator) is `None`
     /// and may be reused by the next generator call.
     gen_frames: Vec<Option<generator::GenFrame<'a>>>,
+    /// One-shot: an async coroutine `(frame id, controller handle)` whose first
+    /// synchronous burst must run once the caller's ambient state is restored
+    /// (set while building the frame in `invoke_inner`, consumed immediately
+    /// after). See the async path in `call.rs`.
+    pending_async_start: Option<(usize, Handle)>,
     /// The `Symbol.for` global registry: shared symbols keyed by string.
     symbol_registry: alloc::collections::BTreeMap<String, NanBox>,
     /// Cached well-known symbols (e.g. `Symbol.iterator`), created on first use.
@@ -647,6 +652,14 @@ const N_GEN_NEXT: u16 = 520;
 const N_GEN_RETURN: u16 = 521;
 /// A lazy generator's `throw(e)` — resumes by throwing `e` at the suspension.
 const N_GEN_THROW: u16 = 522;
+/// Async-coroutine resume on fulfilment: bound to the controller object, called
+/// as a microtask reaction when an awaited promise fulfils — resumes the parked
+/// async body with the fulfilment value at the `await` point.
+const N_ASYNC_RESUME_FULFILL: u16 = 560;
+/// Async-coroutine resume on rejection: bound to the controller object, called as
+/// a microtask reaction when an awaited promise rejects — resumes the parked async
+/// body by throwing the rejection reason at the `await` point.
+const N_ASYNC_RESUME_REJECT: u16 = 561;
 /// `Object.prototype.__defineGetter__(P, getter)` (Annex B).
 const N_OBJ_DEFINE_GETTER: u16 = 348;
 /// `Object.prototype.__defineSetter__(P, setter)` (Annex B).
@@ -1383,6 +1396,9 @@ const GEN_RET: &str = "\u{0}gret";
 /// Hidden slot on a *lazy* generator object: the index of its suspended
 /// [`generator::GenFrame`] in `Interp::gen_frames`.
 const GEN_FRAME: &str = "\u{0}gframe";
+/// Hidden slot on an *async* coroutine controller object: the raw handle of the
+/// promise the async function call returned (settled when the body completes).
+const ASYNC_PROMISE: &str = "\u{0}aprom";
 /// Reserved hidden slots for a lazy ES2025 iterator-helper object (the object
 /// returned by `Iterator.prototype.{map,filter,take,drop,flatMap}` and
 /// `Iterator.from`). The helper pulls from its underlying iterator one step at a
@@ -1629,6 +1645,7 @@ impl<'a> Interp<'a> {
             wasm_next_id: 0,
             gen_sink: None,
             gen_frames: Vec::new(),
+            pending_async_start: None,
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
             tagged_template_cache: alloc::collections::BTreeMap::new(),

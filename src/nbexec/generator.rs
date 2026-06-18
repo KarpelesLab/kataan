@@ -49,11 +49,17 @@ pub(crate) enum GenStep {
     Yielded(NanBox),
     /// Ran to completion / `return`; the operand is the result (`{value, done:true}`).
     Done(NanBox),
+    /// (Async only) parked at `await`; the operand is the awaited value, on whose
+    /// settlement the coroutine is resumed by a microtask.
+    Awaited(NanBox),
 }
 
 /// A suspended generator activation.
 pub(crate) struct GenFrame<'a> {
     body: &'a [Stmt],
+    /// For a concise-body async arrow (`async () => expr`), the single expression
+    /// to evaluate and return; `body` is then empty. `None` for a block body.
+    concise: Option<&'a Expr>,
     scope: Scope,
     this_val: NanBox,
     new_target: NanBox,
@@ -101,12 +107,22 @@ enum Step<'a> {
         ran_body: bool,
         scope: Scope,
     },
-    /// Drive a `for-of`/`for-in` over a precomputed value list.
+    /// Drive a `for-of`/`for-in` over a precomputed value list. When `await_each`
+    /// is set (a `for await` loop), each value is `await`ed (suspending the async
+    /// coroutine) before it is bound and the body runs.
     ForEach {
         left: &'a ForLeft,
         body: &'a Stmt,
         values: Vec<NanBox>,
         idx: usize,
+        label: Option<String>,
+        await_each: bool,
+    },
+    /// (`for await` only) Bind the awaited value on the stack to the loop target
+    /// in a fresh per-iteration scope, then run the loop body.
+    ForEachBind {
+        left: &'a ForLeft,
+        body: &'a Stmt,
         label: Option<String>,
     },
     /// A `try` region marker: while present, a throw is routed to `handler` (if
@@ -123,6 +139,10 @@ enum Step<'a> {
     Finally { pending: Completion },
     /// A `yield`/`yield*` whose operand value is on the value stack.
     YieldExpr { delegate: bool },
+    /// An `await` whose operand value is on the value stack: suspend the async
+    /// coroutine on the operand's settlement (the resumed value is pushed back
+    /// as this expression's result).
+    AwaitExpr,
     /// A `yield*` delegation pumping `iter`.
     YieldStar { iter: Handle },
     /// Assign the value on the stack to simple target `name`, leaving the value
@@ -172,6 +192,10 @@ enum Completion {
 enum StepOut {
     Continue,
     Yield(NanBox),
+    /// An async coroutine reached `await <value>`: the operand is the awaited
+    /// value (a promise or plain value). The driver parks the frame and schedules
+    /// a microtask resumption on its settlement.
+    Await(NanBox),
 }
 
 /// An abrupt completion produced while stepping.
@@ -200,6 +224,7 @@ impl<'a> Interp<'a> {
     pub(crate) fn make_lazy_generator(&mut self, body: &'a [Stmt], scope: Scope) -> NanBox {
         let frame = GenFrame {
             body,
+            concise: None,
             scope,
             this_val: self.this_val,
             new_target: self.new_target,
@@ -268,9 +293,29 @@ impl<'a> Interp<'a> {
         let Some(id) = self.gen_frame_id(h) else {
             return Err(self.type_error("Generator method called on a non-generator"));
         };
-        match self.run_generator(id, how)? {
-            GenStep::Yielded(v) => Ok(self.gen_result(v, false)),
-            GenStep::Done(v) => Ok(self.gen_result(v, true)),
+        // A plain `function*` body never awaits. An *async generator*
+        // (`async function*`) runs on this same lazy-generator engine (a
+        // documented simplification of the previous eager-async model): its
+        // `await` is resolved *eagerly* here — drive the event loop until the
+        // awaited value settles and resume in place — preserving the prior async
+        // generator behavior. (True per-`await` microtask suspension for async
+        // generators is a follow-up; this restores the pre-coroutine semantics so
+        // async generators are not regressed by the async-function rework.)
+        let mut how = how;
+        loop {
+            match self.run_generator(id, how)? {
+                GenStep::Yielded(v) => return Ok(self.gen_result(v, false)),
+                GenStep::Done(v) => return Ok(self.gen_result(v, true)),
+                GenStep::Awaited(v) => {
+                    match self.await_value(v) {
+                        Ok(resolved) => how = Resumption::Next(resolved),
+                        Err(ExecError::Throw(e)) => how = Resumption::Throw(e),
+                        Err(other) => return Err(other),
+                    }
+                    // Loop: resume the generator at the await point with the
+                    // settled value (or throw).
+                }
+            }
         }
     }
 
@@ -279,6 +324,121 @@ impl<'a> Interp<'a> {
         self.realm.set_property(r, "value", value);
         self.realm.set_property(r, "done", NanBox::boolean(done));
         NanBox::handle(r.to_raw())
+    }
+
+    // --- async-function coroutines ------------------------------------------
+
+    /// Builds a suspended **async-function** coroutine over `body` (the param-bound
+    /// `scope`) and returns the controller object's [`GenFrame`] id together with
+    /// the promise the async call resolves. The controller object is internal (not
+    /// exposed to JS); it carries the frame id and the result-promise handle so the
+    /// microtask resume reactions can find both.
+    pub(crate) fn make_async_frame(
+        &mut self,
+        body: Body<'a>,
+        scope: Scope,
+    ) -> (usize, Handle, Handle) {
+        let (body, concise) = match body {
+            Body::Block(stmts) => (stmts, None),
+            Body::Expr(e) => (&[][..], Some(e)),
+        };
+        let frame = GenFrame {
+            body,
+            concise,
+            scope,
+            this_val: self.this_val,
+            new_target: self.new_target,
+            home_class: self.current_home,
+            home_static: self.current_home_static,
+            home_object: self.current_home_object,
+            strict: self.strict,
+            stack: Vec::new(),
+            values: Vec::new(),
+            started: false,
+            done: false,
+            running: false,
+        };
+        let id = if let Some(slot) = self.gen_frames.iter().position(Option::is_none) {
+            self.gen_frames[slot] = Some(frame);
+            slot
+        } else {
+            self.gen_frames.push(Some(frame));
+            self.gen_frames.len() - 1
+        };
+        let promise = self.fresh_promise();
+        let controller = self.realm.new_object();
+        self.realm
+            .set_hidden_property(controller, GEN_FRAME, NanBox::number(id as f64));
+        self.realm
+            .set_hidden_property(controller, ASYNC_PROMISE, NanBox::handle(promise.to_raw()));
+        (id, promise, controller)
+    }
+
+    /// Advances an async coroutine one step with `how` (initial `Next(undefined)`
+    /// at call time, or a microtask resume after an awaited promise settles).
+    /// Settles the coroutine's result promise on completion, or parks it on the
+    /// next awaited value (scheduling the resume reactions).
+    pub(crate) fn async_step(&mut self, id: usize, controller: Handle, how: Resumption) {
+        let promise = self
+            .realm
+            .get_property(controller, ASYNC_PROMISE)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw);
+        match self.run_generator(id, how) {
+            Ok(GenStep::Done(v)) => {
+                if let Some(p) = promise {
+                    self.resolve_with(p, v);
+                }
+            }
+            Ok(GenStep::Awaited(v)) => {
+                // `await v`: PromiseResolve(v), then schedule the coroutine's
+                // resume as microtask reactions on its settlement.
+                let inner = self.promise_resolve(v);
+                let on_f = self
+                    .realm
+                    .new_bound_native(N_ASYNC_RESUME_FULFILL, controller);
+                let on_r = self
+                    .realm
+                    .new_bound_native(N_ASYNC_RESUME_REJECT, controller);
+                self.register_then(
+                    inner,
+                    NanBox::handle(on_f.to_raw()),
+                    NanBox::handle(on_r.to_raw()),
+                    false,
+                );
+            }
+            // A generator suspension cannot arise in an async (non-generator) body.
+            Ok(GenStep::Yielded(_)) => {
+                if let Some(p) = promise {
+                    self.resolve_with(p, NanBox::undefined());
+                }
+            }
+            Err(ExecError::Throw(e)) => {
+                if let Some(p) = promise {
+                    self.settle(p, e, false);
+                }
+            }
+            // A non-throw fatal (stack overflow, resource limit): reject with it as
+            // best-effort so the loop does not silently swallow it. There is no
+            // surrounding `Result` here (we run inside a microtask), so surface it
+            // through the promise.
+            Err(other) => {
+                if let Some(p) = promise {
+                    let msg = self.new_str(&alloc::format!("{other:?}"));
+                    let err = self.make_error(N_TYPE_ERROR, Some(msg));
+                    self.settle(p, err, false);
+                }
+            }
+        }
+    }
+
+    /// Recovers the async coroutine `(frame id)` for a controller object handle
+    /// (the `this`/target of a resume reaction).
+    pub(crate) fn async_frame_id(&self, controller: Handle) -> Option<usize> {
+        self.realm
+            .get_property(controller, GEN_FRAME)
+            .and_then(|v| v.as_number())
+            .map(|n| n as usize)
     }
 
     fn run_generator(&mut self, id: usize, how: Resumption) -> Result<GenStep, ExecError> {
@@ -351,7 +511,9 @@ impl<'a> Interp<'a> {
                     f.values.clear();
                 }
             }
-            Ok(GenStep::Yielded(_)) => {}
+            // `Yielded` (generator suspension) and `Awaited` (async suspension)
+            // both keep the frame alive for a later resume.
+            Ok(GenStep::Yielded(_)) | Ok(GenStep::Awaited(_)) => {}
         }
         outcome
     }
@@ -371,17 +533,36 @@ impl<'a> Interp<'a> {
         };
 
         if !started {
-            let body = self.gen_frames[id].as_ref().expect("frame present").body;
-            if let Err(e) = self.hoist(body) {
+            let (body, concise) = {
+                let f = self.gen_frames[id].as_ref().expect("frame present");
+                (f.body, f.concise)
+            };
+            // The body's TOP LEVEL is a *function* scope, not a block: hoist with
+            // function-scope semantics (`var`s + top-level function declarations
+            // bind here, not into an enclosing/global scope). Using the block-level
+            // `hoist` here let a body-level `function X(){}` whose name also exists
+            // in an outer scope (e.g. a built-in like `TypeError`) clobber that
+            // outer binding via the Annex-B `set`-walks-parents path — corrupting
+            // globals. (Pre-existing for `function*`; now also covers async bodies,
+            // which run on this same coroutine engine.)
+            if let Err(e) = self.hoist_with(body, true) {
                 self.store_machine(id, stack, values);
                 return Err(e);
             }
-            stack.push(Step::Seq {
-                body,
-                idx: 0,
-                scope: None,
-                label: None,
-            });
+            match concise {
+                // A concise-body async arrow: evaluate the single expression and
+                // return it (the `EvalThen` lowers any `await` to a suspension).
+                Some(expr) => {
+                    stack.push(Step::ReturnValue);
+                    stack.push(Step::EvalThen { expr });
+                }
+                None => stack.push(Step::Seq {
+                    body,
+                    idx: 0,
+                    scope: None,
+                    label: None,
+                }),
+            }
             self.gen_frames[id].as_mut().unwrap().started = true;
         }
 
@@ -397,6 +578,10 @@ impl<'a> Interp<'a> {
                 Ok(StepOut::Yield(v)) => {
                     self.store_machine(id, stack, values);
                     return Ok(GenStep::Yielded(v));
+                }
+                Ok(StepOut::Await(v)) => {
+                    self.store_machine(id, stack, values);
+                    return Ok(GenStep::Awaited(v));
                 }
                 Ok(StepOut::Continue) => {}
                 Err(GenAbrupt::Throw(e)) => pending = Some(Completion::Throw(e)),
@@ -435,6 +620,7 @@ impl<'a> Interp<'a> {
             match self.gen_step(&mut stack, &mut values) {
                 Ok(StepOut::Continue) => {}
                 Ok(StepOut::Yield(v)) => break Ok(GenStep::Yielded(v)),
+                Ok(StepOut::Await(v)) => break Ok(GenStep::Awaited(v)),
                 Err(GenAbrupt::Throw(e)) => pending = Some(Completion::Throw(e)),
                 Err(GenAbrupt::Return(v)) => pending = Some(Completion::Return(v)),
                 Err(GenAbrupt::Break(l)) => pending = Some(Completion::Break(l)),
@@ -458,6 +644,20 @@ impl<'a> Interp<'a> {
 }
 
 // --- yield detection ---------------------------------------------------------
+
+/// Whether an async function `body` contains a reachable `await` (or `for await`)
+/// at this function level (not inside a nested function/class). An async function
+/// whose body never suspends is run synchronously and its result wrapped in a
+/// settled promise (avoiding the coroutine machine's lowering for forms like
+/// `with` that only the suspending path needs to reify); one that may suspend is
+/// driven as a coroutine. (`expr_has_yield`/`stmt_has_yield` treat `await` and
+/// `for await` as suspension points, so they double as await detectors here.)
+pub(crate) fn body_has_await(body: &Body<'_>) -> bool {
+    match body {
+        Body::Block(stmts) => stmts.iter().any(stmt_has_yield),
+        Body::Expr(e) => expr_has_yield(e),
+    }
+}
 
 /// Whether a statement may execute a `yield` reachable in the *current*
 /// generator (i.e. not nested inside another function/class boundary, which has
@@ -505,6 +705,18 @@ fn stmt_has_yield(s: &Stmt) -> bool {
             }) || test.as_deref().is_some_and(expr_has_yield)
                 || update.as_deref().is_some_and(expr_has_yield)
                 || stmt_has_yield(body)
+        }
+        // A `for await` loop is itself a suspension point of the async coroutine
+        // (each iterated value is `await`ed), so it must be lowered into the
+        // machine even when its operand and body are otherwise suspension-free.
+        Stmt::ForOf {
+            right,
+            body,
+            is_await: true,
+            ..
+        } => {
+            let _ = (right, body);
+            true
         }
         Stmt::ForIn { right, body, .. } | Stmt::ForOf { right, body, .. } => {
             expr_has_yield(right) || stmt_has_yield(body)
@@ -592,7 +804,14 @@ fn expr_has_yield(e: &Expr) -> bool {
                     Argument::Item(e) | Argument::Spread(e) => expr_has_yield(e),
                 })
         }
-        Expr::OptChain { expr, .. } | Expr::Await { argument: expr, .. } => expr_has_yield(expr),
+        // `await` is itself a suspension point of the *async* coroutine machine
+        // (the same explicit-stack engine drives async functions). It can only
+        // appear inside an async function, so treating it as a suspension point
+        // unconditionally is correct: a plain `function*` body never contains a
+        // top-level `await` (a nested async arrow's `await` is past a function
+        // boundary, which this walker already stops at).
+        Expr::Await { .. } => true,
+        Expr::OptChain { expr, .. } => expr_has_yield(expr),
         Expr::Unary { argument, .. } | Expr::Update { argument, .. } => expr_has_yield(argument),
         Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
             expr_has_yield(left) || expr_has_yield(right)
@@ -732,6 +951,7 @@ impl<'a> Interp<'a> {
                 values: items,
                 idx,
                 label,
+                await_each,
             } => {
                 if idx >= items.len() {
                     return Ok(StepOut::Continue);
@@ -743,8 +963,35 @@ impl<'a> Interp<'a> {
                     values: items,
                     idx: idx + 1,
                     label: label.clone(),
+                    await_each,
                 });
+                if await_each {
+                    // `for await`: await the item (a real coroutine suspension),
+                    // then bind the resolved value and run the body.
+                    stack.push(Step::ForEachBind { left, body, label });
+                    stack.push(Step::AwaitExpr);
+                    values.push(item);
+                    return Ok(StepOut::Continue);
+                }
                 // Bind the loop variable in a fresh per-iteration scope.
+                let child = self.current.child();
+                let prev = core::mem::replace(&mut self.current, child);
+                stack.push(Step::PopScope { scope: prev });
+                match left {
+                    ForLeft::Decl { target, .. } => {
+                        self.bind_pattern(target, item).map_err(GenAbrupt::from)?;
+                    }
+                    ForLeft::Target(expr) => {
+                        self.assign_destructure(expr, item)
+                            .map_err(GenAbrupt::from)?;
+                    }
+                }
+                self.gen_exec_loop_body(body, stack, values, &label)
+            }
+            Step::ForEachBind { left, body, label } => {
+                // The awaited value is on the operand stack; bind it in a fresh
+                // per-iteration scope, then run the loop body.
+                let item = values.pop().unwrap_or(NanBox::undefined());
                 let child = self.current.child();
                 let prev = core::mem::replace(&mut self.current, child);
                 stack.push(Step::PopScope { scope: prev });
@@ -873,6 +1120,14 @@ impl<'a> Interp<'a> {
                 // it here means it was not the suspension point, so pump it with
                 // `next(undefined)`.
                 self.gen_yield_star_step(iter, Resumption::Next(NanBox::undefined()), stack, values)
+            }
+            Step::AwaitExpr => {
+                // `await v`: suspend the async coroutine on `v`'s settlement. On
+                // resume, `gen_drive` pushes the fulfilment value (or routes a
+                // rejection through the unwinder), which becomes this expression's
+                // result.
+                let operand = values.pop().unwrap_or(NanBox::undefined());
+                Ok(StepOut::Await(operand))
             }
         }
     }
@@ -1011,18 +1266,20 @@ impl<'a> Interp<'a> {
                 // Eager list of values (mirrors the non-await tree-walker for the
                 // built-in iterables; user iterators are drained up front here —
                 // a documented simplification for yield-bearing for-of bodies).
-                let mut items = self.iterate_values(iterable).map_err(GenAbrupt::from)?;
-                if *is_await {
-                    for v in &mut items {
-                        *v = self.await_value(*v).map_err(GenAbrupt::from)?;
-                    }
-                }
+                // For `for await`, the values are *not* awaited here: each is
+                // `await`ed lazily by the `ForEach` step (a real coroutine
+                // suspension per iteration), preserving microtask ordering.
+                // (A `Symbol.asyncIterator`-based async iterable is a documented
+                // follow-up tied to async generators; `for await` here drives a
+                // sync iterable of promises/values, awaiting each element.)
+                let items = self.iterate_values(iterable).map_err(GenAbrupt::from)?;
                 stack.push(Step::ForEach {
                     left,
                     body,
                     values: items,
                     idx: 0,
                     label: label.clone(),
+                    await_each: *is_await,
                 });
                 Ok(StepOut::Continue)
             }
@@ -1045,6 +1302,7 @@ impl<'a> Interp<'a> {
                     values: keys,
                     idx: 0,
                     label: label.clone(),
+                    await_each: false,
                 });
                 Ok(StepOut::Continue)
             }
@@ -1206,6 +1464,11 @@ impl<'a> Interp<'a> {
                         Ok(StepOut::Continue)
                     }
                 }
+            }
+            Expr::Await { argument, .. } => {
+                // Evaluate the operand (it may itself await/yield), then suspend.
+                stack.push(Step::AwaitExpr);
+                self.gen_eval_expr(argument, stack, values)
             }
             Expr::Sequence { expressions, .. } => {
                 self.gen_eval_sequence(expressions, stack, values)

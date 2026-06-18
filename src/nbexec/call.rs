@@ -887,6 +887,19 @@ impl<'a> Interp<'a> {
                 N_REJECT => self.settle(target, arg0, false),
                 // The `revoke` function from `Proxy.revocable`.
                 N_PROXY_REVOKE => self.realm.revoke_proxy(target),
+                // An async coroutine resume reaction: `target` is the controller
+                // object; resume the parked body with the settled value (fulfil) or
+                // by throwing the rejection reason at the `await` point.
+                N_ASYNC_RESUME_FULFILL => {
+                    if let Some(fid) = self.async_frame_id(target) {
+                        self.async_step(fid, target, generator::Resumption::Next(arg0));
+                    }
+                }
+                N_ASYNC_RESUME_REJECT => {
+                    if let Some(fid) = self.async_frame_id(target) {
+                        self.async_step(fid, target, generator::Resumption::Throw(arg0));
+                    }
+                }
                 _ => {}
             }
             return Ok(NanBox::undefined());
@@ -1123,6 +1136,31 @@ impl<'a> Interp<'a> {
                 let scope = self.current.clone();
                 return Ok(self.make_lazy_generator(body, scope));
             }
+            // An `async` (non-generator) function whose body may `await`: do NOT
+            // run its body synchronously. Capture the parameter-bound scope into a
+            // suspendable coroutine, return its promise immediately, and (after the
+            // caller's ambient state is restored, below) run the body up to the
+            // first `await` (or completion). At each `await` the coroutine parks
+            // and a microtask resumes it on the awaited promise's settlement — so
+            // post-`await` code runs as a microtask, not inline.
+            //
+            // An async function that *never* awaits runs synchronously via
+            // `run_body` (its result wrapped in a settled promise below): this is
+            // observationally identical (no suspension point to reorder) and reuses
+            // the ordinary walker, which fully supports forms — `with`, etc. — that
+            // the coroutine lowering only reifies on the suspending path.
+            if def.is_async && generator::body_has_await(&def.body) {
+                // A body-level `"use strict"` prologue applies to the whole body.
+                if let Body::Block(stmts) = def.body
+                    && has_use_strict(stmts)
+                {
+                    self.strict = true;
+                }
+                let scope = self.current.clone();
+                let (id, promise, controller) = self.make_async_frame(def.body, scope);
+                self.pending_async_start = Some((id, controller));
+                return Ok(NanBox::handle(promise.to_raw()));
+            }
             self.run_body(def.body)
         })();
         self.current = saved;
@@ -1132,11 +1170,27 @@ impl<'a> Interp<'a> {
         self.new_target = saved_target;
         self.eval_depth = saved_eval_depth;
         self.strict = saved_strict;
-        // An `async` function returns a promise of its result (rejected on throw).
-        // An `async function*` (async generator) is *not* wrapped: its call result
-        // is the (lazy) generator object, returned directly — async generators are
-        // a documented follow-up, so they keep the synchronous generator shape the
-        // previous model exposed (`g.next` is a callable method, not a promise).
+        // An `async` (non-generator) function: now that the caller's ambient state
+        // is restored, drive the coroutine's first synchronous burst (the body up
+        // to the first `await` or completion). The coroutine captured its own
+        // scope/`this` into its frame, so it runs independently of the restored
+        // ambient state. `async_step` settles the returned promise on completion or
+        // parks it on the first awaited value.
+        if let Some((id, controller)) = self.pending_async_start.take() {
+            self.async_step(
+                id,
+                controller,
+                generator::Resumption::Next(NanBox::undefined()),
+            );
+            return result;
+        }
+        // An `async` (non-generator) function reaching here did NOT take the
+        // coroutine path: either its body never awaits (run synchronously via
+        // `run_body`) or its parameter binding threw before the frame was built.
+        // Either way the call returns a *promise*: resolved with the body's result
+        // (adopting a returned promise) or rejected with a thrown value (including
+        // a throwing/TDZ parameter default — AsyncFunctionStart wraps argument
+        // binding too), never throwing synchronously.
         if def.is_async && !def.is_generator {
             let promise = self.fresh_promise();
             match result {
