@@ -5621,9 +5621,20 @@ impl Compiler {
             // Map / Set; a user iterable or generator faults at `IterValues` and the
             // program re-runs on the tree-walker), then index it by a hidden counter.
             Stmt::ForOf {
-                left, right, body, ..
+                left,
+                right,
+                body,
+                is_await,
+                ..
             } => {
                 use crate::ast::ForLeft;
+                // `for await (…)` is a coroutine suspension point (each value is
+                // awaited). The bytecode VM has no await machinery, so route any
+                // program containing one to the reference tree-walker, which drives
+                // it through the lazy async coroutine engine.
+                if *is_await {
+                    return Err(CompileError::Unsupported("for await"));
+                }
                 let ForLeft::Decl { target, .. } = left else {
                     return Err(CompileError::Unsupported("for-of binding"));
                 };
