@@ -519,6 +519,39 @@ const N_INTL_SEGMENTER_SEGMENT: u16 = 228;
 const N_INTL_GET_CANONICAL_LOCALES: u16 = 460;
 /// `Intl.supportedValuesOf(key)` — the supported values for a key.
 const N_INTL_SUPPORTED_VALUES_OF: u16 = 461;
+/// `Intl.Locale` constructor. (New `N_*` ids for the prototype/branding work start
+/// at 500 per the task spec.)
+const N_INTL_LOCALE: u16 = 500;
+/// A `get Intl.Locale.prototype.<accessor>` getter (`language`/`script`/`region`/
+/// `baseName`/`calendar`/`numberingSystem`/`hourCycle`/`caseFirst`/`collation`/
+/// `numeric`). A bound native whose target string names the accessor; rejects a
+/// `this` lacking the `[[InitializedLocale]]` slot with a TypeError.
+const N_INTL_LOCALE_ACCESSOR: u16 = 501;
+/// `Intl.Locale.prototype.maximize` / `minimize` / `toString`. A bound native whose
+/// target string names the operation; brand-checks the `this` Locale receiver.
+const N_INTL_LOCALE_METHOD: u16 = 502;
+/// `Intl.DurationFormat` constructor.
+const N_INTL_DURATION_FORMAT: u16 = 503;
+/// `Intl.DurationFormat.prototype.format` / `formatToParts` / `resolvedOptions`.
+/// A bound native whose target string names the method; brand-checks `this`.
+const N_INTL_DURATION_METHOD: u16 = 504;
+/// A prototype-installed Intl method wrapper that brand-checks its `this` receiver
+/// for the service's internal slot before delegating to the underlying native
+/// (`format`/`resolvedOptions`/`formatToParts`/`compare`/`select`/`of`/`segment`).
+/// The bound-native target is a two-element `[slotMarker, methodName]` array. Lets
+/// the existing method natives stay receiver-agnostic while the prototype entry
+/// points enforce branding.
+const N_INTL_PROTO_METHOD: u16 = 505;
+/// A `get Intl.NumberFormat.prototype.format` / `get …DateTimeFormat….format` /
+/// `get Intl.Collator.prototype.compare` accessor. A bound native whose target is
+/// the `[markerKey, selector]` pair; brand-checks `this`, then returns the
+/// per-instance bound function (cached on the instance), an `N_INTL_BOUND_CALL`.
+const N_INTL_BOUND_GETTER: u16 = 506;
+/// The per-instance bound `format`/`compare` function returned by the
+/// `N_INTL_BOUND_GETTER` accessor. A bound native whose target is the
+/// `[instance, selector]` pair; it formats/compares against the captured instance,
+/// independent of how it is later called (`this` is ignored, per BoundFunction).
+const N_INTL_BOUND_CALL: u16 = 507;
 /// The shared abstract `%TypedArray%` intrinsic constructor — the value
 /// `Object.getPrototypeOf(Int8Array)` returns. Calling or `new`-ing it directly
 /// throws a `TypeError`; it carries the generic `from`/`of`/`get [Symbol.species]`
@@ -1146,7 +1179,9 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_TYPED_ARRAY_ABSTRACT
         | N_TYPED_ARRAY_OF
         | N_TYPED_ARRAY_SPECIES
-        | N_TYPED_ARRAY_TO_STRING_TAG => 0,
+        | N_TYPED_ARRAY_TO_STRING_TAG
+        // `Intl.DurationFormat.length === 0` (no required constructor parameters).
+        | N_INTL_DURATION_FORMAT => 0,
         // Length 2.
         N_PROXY
         | N_OBJECT_SET_PROTO
@@ -1234,6 +1269,8 @@ fn is_native_constructor(id: u16) -> bool {
             | N_INTL_REL_TIME
             | N_INTL_DISPLAY_NAMES
             | N_INTL_SEGMENTER
+            | N_INTL_LOCALE
+            | N_INTL_DURATION_FORMAT
     )
 }
 
@@ -2289,6 +2326,7 @@ impl<'a> Interp<'a> {
             ("RelativeTimeFormat", N_INTL_REL_TIME),
             ("DisplayNames", N_INTL_DISPLAY_NAMES),
             ("Segmenter", N_INTL_SEGMENTER),
+            ("DurationFormat", N_INTL_DURATION_FORMAT),
         ] {
             let f = self.new_named_native(name, id);
             // `Intl.X.supportedLocalesOf(locales)` — static on every constructor.
@@ -2297,6 +2335,12 @@ impl<'a> Interp<'a> {
                 .set_hidden_property(f, "supportedLocalesOf", NanBox::handle(sl.to_raw()));
             self.realm
                 .set_property(intl, name, NanBox::handle(f.to_raw()));
+        }
+        // `Intl.Locale` — a constructor with no `supportedLocalesOf` static.
+        {
+            let f = self.new_named_native("Locale", N_INTL_LOCALE);
+            self.realm
+                .set_property(intl, "Locale", NanBox::handle(f.to_raw()));
         }
         // `Intl.getCanonicalLocales` / `Intl.supportedValuesOf` — namespace functions.
         for (name, id) in [
@@ -3009,6 +3053,10 @@ impl<'a> Interp<'a> {
         }
         // Newly-created plain objects now inherit from `Object.prototype`.
         self.realm.set_default_object_proto(obj_proto);
+        // Build the real `.prototype` objects (with branded methods/accessors,
+        // `constructor`, and `[Symbol.toStringTag]`) for every `Intl` service
+        // constructor — `Object.prototype` now exists, so the prototypes inherit it.
+        self.install_intl_prototypes();
         // `globalThis`: an object mirroring the global bindings, referencing
         // itself. Reads like `globalThis.Math` and `globalThis.globalThis` work.
         // Every standard global (constructors, namespaces, functions) is a

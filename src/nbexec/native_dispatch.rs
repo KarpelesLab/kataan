@@ -1808,6 +1808,14 @@ impl<'a> Interp<'a> {
             }
             // `Intl.Segmenter(...)` without `new`.
             N_INTL_SEGMENTER => self.make_segmenter(args),
+            // `Intl.Locale` / `Intl.DurationFormat` require `new` — a plain call
+            // (no `new`) is a TypeError (ECMA-402 sec-intl.locale / -.durationformat).
+            N_INTL_LOCALE => {
+                return Err(self.type_error("Constructor Intl.Locale requires 'new'"));
+            }
+            N_INTL_DURATION_FORMAT => {
+                return Err(self.type_error("Constructor Intl.DurationFormat requires 'new'"));
+            }
             // `Intl.Segmenter.prototype.segment(input)` → an (iterable) array of segment
             // data objects `{ segment, index, input, isWordLike? }`.
             N_INTL_SEGMENTER_SEGMENT => {

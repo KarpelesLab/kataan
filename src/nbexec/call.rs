@@ -332,6 +332,37 @@ impl<'a> Interp<'a> {
             if id == N_REGEXP_SPECIES {
                 return Ok(this_val);
             }
+            // A branded `Intl.X.prototype` data method (resolvedOptions/formatToParts/
+            // select/of/segment/ListFormat+RelativeTimeFormat format): RequireInternalSlot
+            // on `this`, then delegate to the underlying method native.
+            if id == N_INTL_PROTO_METHOD {
+                return self.intl_proto_method_dispatch(this_val, target, args);
+            }
+            // A `get Intl.NumberFormat.prototype.format` / `…DateTimeFormat….format` /
+            // `get Intl.Collator.prototype.compare` accessor: returns the per-instance
+            // bound function.
+            if id == N_INTL_BOUND_GETTER {
+                return self.intl_bound_getter_dispatch(this_val, target);
+            }
+            // The per-instance bound `format`/`compare` function itself.
+            if id == N_INTL_BOUND_CALL {
+                return self.intl_bound_call_dispatch(target, args);
+            }
+            // An `Intl.Locale.prototype` `get` accessor (language/script/region/…).
+            if id == N_INTL_LOCALE_ACCESSOR {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                return self.intl_locale_accessor_dispatch(this_val, &name);
+            }
+            // An `Intl.Locale.prototype` method (maximize/minimize/toString).
+            if id == N_INTL_LOCALE_METHOD {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                return self.intl_locale_method_dispatch(this_val, &name);
+            }
+            // An `Intl.DurationFormat.prototype` method (format/formatToParts/resolvedOptions).
+            if id == N_INTL_DURATION_METHOD {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                return self.intl_duration_method_dispatch(this_val, &name, args);
+            }
             // A RegExp legacy static getter (Annex B.2.5): `target` carries the
             // field selector. Brand-check `this === %RegExp%` (only the original
             // constructor passes; a subclass / instance / primitive throws).
@@ -1477,6 +1508,14 @@ impl<'a> Interp<'a> {
         // `new Intl.Segmenter(locale, { granularity })` → an object with a `segment(s)` method.
         if id == N_INTL_SEGMENTER {
             return Ok(self.make_segmenter(args));
+        }
+        // `new Intl.Locale(tag, options)` → a branded Locale with `language`/… accessors.
+        if id == N_INTL_LOCALE {
+            return self.make_locale(args);
+        }
+        // `new Intl.DurationFormat(locales, options)` → a branded DurationFormat.
+        if id == N_INTL_DURATION_FORMAT {
+            return self.make_duration_format(args);
         }
         // `new Promise(executor)`: run executor(resolve, reject).
         if id == N_PROMISE {

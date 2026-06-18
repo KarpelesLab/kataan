@@ -142,6 +142,14 @@ pub struct Realm {
     /// override is recorded in [`native_protos`](Realm::native_protos) /
     /// [`callable_null_protos`](Realm::callable_null_protos).
     array_proto_intrinsic: Option<Handle>,
+    /// The lazily-materialized `.prototype` objects of the `Intl` service
+    /// constructors (`Intl.NumberFormat`, `Intl.Collator`, …, `Intl.Locale`,
+    /// `Intl.DurationFormat`), keyed by the constructor's native dispatch id. Each
+    /// holds the service's branded methods/accessors and is the `[[Prototype]]` of
+    /// every instance that service creates. Same id-keyed, GC-quiescent caveat as
+    /// `fn_protos`; also kept alive as GC roots in `gc_side_table_values` (and
+    /// reachable through the constructor's `prototype` data property).
+    intl_protos: alloc::collections::BTreeMap<u16, Handle>,
     /// The RegExp legacy static match record (Annex B.2.5): updated after every
     /// successful built-in match, read by the `RegExp.$1`..`$9` / `RegExp.input`
     /// / `lastMatch` / … static accessors.
@@ -210,6 +218,7 @@ impl Realm {
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
             array_proto_intrinsic: None,
+            intl_protos: alloc::collections::BTreeMap::new(),
             legacy_regexp: LegacyRegExpState::default(),
             limits,
         }
@@ -1573,6 +1582,20 @@ impl Realm {
         false
     }
 
+    /// The cached `.prototype` object of the `Intl` service constructor with native
+    /// dispatch id `ctor_id`, if it has been materialized.
+    #[must_use]
+    pub fn intl_prototype(&self, ctor_id: u16) -> Option<Handle> {
+        self.intl_protos.get(&ctor_id).copied()
+    }
+
+    /// Records the `.prototype` object of the `Intl` service constructor with native
+    /// dispatch id `ctor_id` (so instances can link to it and `Intl.X.prototype`
+    /// reads return the same object).
+    pub fn set_intl_prototype(&mut self, ctor_id: u16, proto: Handle) {
+        self.intl_protos.insert(ctor_id, proto);
+    }
+
     /// Allocates an empty object whose `[[Prototype]]` is `proto` (`Object.create`).
     pub fn new_object_with_proto(&mut self, proto: Option<Handle>) -> Handle {
         let h = self.new_object();
@@ -2392,6 +2415,7 @@ impl Realm {
         r.extend(self.aux_props.values().copied());
         r.extend(self.fn_protos.values().copied());
         r.extend(self.fn_ctor.values().copied());
+        r.extend(self.intl_protos.values().copied());
         r.extend(self.symbols_by_id.values().copied());
         r
     }
@@ -2644,6 +2668,7 @@ impl Realm {
             fn_protos,
             fn_ctor,
             symbols_by_id,
+            intl_protos,
             ..
         } = self;
         let stats = gc::compact_with(heap, &mut all, &mut |forward| {
@@ -2673,6 +2698,11 @@ impl Realm {
                 *v = forward(*v);
             }
             for v in fn_ctor.values_mut() {
+                *v = forward(*v);
+            }
+            // `intl_protos` is id→handle (constructor native id → its `.prototype`):
+            // the keys are stable ids, only the relocated value handles need forwarding.
+            for v in intl_protos.values_mut() {
                 *v = forward(*v);
             }
             for v in symbols_by_id.values_mut() {
