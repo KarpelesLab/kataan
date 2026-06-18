@@ -394,6 +394,12 @@ pub struct Interp<'a> {
     /// `eval` and the `Function` constructor run against a fresh child of this,
     /// regardless of the caller's current nesting.
     global_scope: Scope,
+    /// Per-`ShadowRealm`-instance persistent global scope (a child of
+    /// `global_scope`). A `ShadowRealm` instance stores an index into this vector
+    /// under a hidden slot, so successive `evaluate` calls on the same instance
+    /// share variable/function declarations. (Intrinsics are shared with the host
+    /// realm — a best-effort model, not a fully isolated realm.)
+    shadow_realm_scopes: Vec<Scope>,
     /// Programs parsed at runtime by `eval` / the `Function` constructor, keyed by
     /// source string. The interpreter's function/AST tables hold `&'a` references
     /// into the running program; a dynamically-parsed `Program` must therefore
@@ -1181,7 +1187,11 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_TYPED_ARRAY_SPECIES
         | N_TYPED_ARRAY_TO_STRING_TAG
         // `Intl.DurationFormat.length === 0` (no required constructor parameters).
-        | N_INTL_DURATION_FORMAT => 0,
+        | N_INTL_DURATION_FORMAT
+        // `DisposableStack`/`AsyncDisposableStack`/`ShadowRealm` take no parameters.
+        | N_DISPOSABLE_STACK
+        | N_ASYNC_DISPOSABLE_STACK
+        | N_SHADOW_REALM => 0,
         // Length 2.
         N_PROXY
         | N_OBJECT_SET_PROTO
@@ -1203,7 +1213,9 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_MATH_HYPOT
         | N_MATH_IMUL => 2,
         // Length 3.
-        N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP | N_REFLECT_APPLY => 3,
+        N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP | N_REFLECT_APPLY
+        // `SuppressedError(error, suppressed, message)`.
+        | N_SUPPRESSED_ERROR => 3,
         // A concrete TypedArray constructor (`Int8Array`, …) has `length` 3
         // (`new T(buffer, byteOffset, length)`).
         id if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
@@ -1271,6 +1283,10 @@ fn is_native_constructor(id: u16) -> bool {
             | N_INTL_SEGMENTER
             | N_INTL_LOCALE
             | N_INTL_DURATION_FORMAT
+            | N_DISPOSABLE_STACK
+            | N_ASYNC_DISPOSABLE_STACK
+            | N_SHADOW_REALM
+            | N_SUPPRESSED_ERROR
     )
 }
 
@@ -1511,6 +1527,32 @@ const N_WEAKMAP_PROTO_FN: u16 = 255;
 /// (`[[WeakSetData]]`), else a `TypeError`.
 const N_WEAKSET_PROTO_FN: u16 = 256;
 
+// --- ES2025 explicit resource management + ShadowRealm (see `resource.rs`) ---
+/// The `DisposableStack` constructor.
+const N_DISPOSABLE_STACK: u16 = 540;
+/// A brand-checked `DisposableStack.prototype.<method>` (bound to the method name).
+const N_DISPOSABLE_STACK_PROTO: u16 = 541;
+/// The `get DisposableStack.prototype.disposed` accessor.
+const N_DISPOSABLE_STACK_DISPOSED: u16 = 542;
+/// The `AsyncDisposableStack` constructor.
+const N_ASYNC_DISPOSABLE_STACK: u16 = 543;
+/// A brand-checked `AsyncDisposableStack.prototype.<method>`.
+const N_ASYNC_DISPOSABLE_STACK_PROTO: u16 = 544;
+/// The `get AsyncDisposableStack.prototype.disposed` accessor.
+const N_ASYNC_DISPOSABLE_STACK_DISPOSED: u16 = 545;
+/// The `ShadowRealm` constructor.
+const N_SHADOW_REALM: u16 = 546;
+/// A `ShadowRealm.prototype.<method>` (`evaluate`/`importValue`).
+const N_SHADOW_REALM_PROTO: u16 = 547;
+/// A wrapped callable returned across a `ShadowRealm` boundary.
+const N_SHADOW_REALM_WRAPPED: u16 = 548;
+/// The dispose callback recorded by `DisposableStack.prototype.adopt`
+/// (`[value, onDispose]`; calls `onDispose(value)`).
+const N_DSTACK_ADOPT_CALL: u16 = 549;
+/// The `SuppressedError` constructor (ES2025) — thrown when multiple disposers
+/// throw during `DisposableStack`/`AsyncDisposableStack` disposal.
+const N_SUPPRESSED_ERROR: u16 = 550;
+
 mod call;
 mod class;
 mod convert;
@@ -1523,6 +1565,7 @@ mod native_dispatch;
 mod object;
 mod promise;
 mod regexp;
+mod resource;
 mod stmt;
 mod typed_array;
 mod wasm;
@@ -1591,6 +1634,7 @@ impl<'a> Interp<'a> {
             global_this: NanBox::undefined(),
             output: String::new(),
             global_scope: Scope::root(),
+            shadow_realm_scopes: Vec::new(),
             eval_programs: alloc::collections::BTreeMap::new(),
         };
         // The constructor's `current` IS the root scope; capture it as the global
@@ -3057,6 +3101,11 @@ impl<'a> Interp<'a> {
         // `constructor`, and `[Symbol.toStringTag]`) for every `Intl` service
         // constructor — `Object.prototype` now exists, so the prototypes inherit it.
         self.install_intl_prototypes();
+        // The ES2025 explicit-resource-management classes (`DisposableStack`,
+        // `AsyncDisposableStack`) and the `ShadowRealm` constructor — each a real
+        // branded constructor with a `.prototype` (so they appear on `globalThis`
+        // and inherit `Object.prototype`).
+        self.install_resource_management();
         // `globalThis`: an object mirroring the global bindings, referencing
         // itself. Reads like `globalThis.Math` and `globalThis.globalThis` work.
         // Every standard global (constructors, namespaces, functions) is a

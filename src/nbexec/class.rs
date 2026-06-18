@@ -597,6 +597,10 @@ impl<'a> Interp<'a> {
             "ArrayBuffer",
             "DataView",
             "Promise",
+            "DisposableStack",
+            "AsyncDisposableStack",
+            "ShadowRealm",
+            "SuppressedError",
         ] {
             if let Some(h) = self
                 .current

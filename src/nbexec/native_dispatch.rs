@@ -1681,6 +1681,25 @@ impl<'a> Interp<'a> {
                 self.detach_array_buffer(buf);
                 NanBox::null()
             }
+            // `DisposableStack()` / `AsyncDisposableStack()` / `ShadowRealm()`
+            // called without `new` is a TypeError (they require a `[[Construct]]`).
+            N_DISPOSABLE_STACK | N_ASYNC_DISPOSABLE_STACK | N_SHADOW_REALM => {
+                return Err(self.type_error("constructor requires 'new'"));
+            }
+            // `SuppressedError(...)` without `new` builds the same instance
+            // (newTarget = the constructor itself → `SuppressedError.prototype`).
+            N_SUPPRESSED_ERROR => {
+                let callee = self
+                    .current
+                    .get("SuppressedError")
+                    .unwrap_or(NanBox::undefined());
+                return self.construct_suppressed_error(args, callee, callee);
+            }
+            // `get DisposableStack.prototype.disposed` /
+            // `get AsyncDisposableStack.prototype.disposed`: a brand-checked boolean.
+            N_DISPOSABLE_STACK_DISPOSED | N_ASYNC_DISPOSABLE_STACK_DISPOSED => {
+                return self.dstack_disposed_getter(id == N_ASYNC_DISPOSABLE_STACK_DISPOSED);
+            }
             // `Intl.getCanonicalLocales(locales)` — canonical locale-tag list.
             N_INTL_GET_CANONICAL_LOCALES => return self.intl_get_canonical_locales(arg(0)),
             // `Intl.supportedValuesOf(key)` — supported identifiers for a key.

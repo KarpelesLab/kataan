@@ -348,6 +348,35 @@ impl<'a> Interp<'a> {
             if id == N_INTL_BOUND_CALL {
                 return self.intl_bound_call_dispatch(target, args);
             }
+            // A brand-checked `DisposableStack`/`AsyncDisposableStack` prototype
+            // method (`use`/`adopt`/`defer`/`dispose`/`disposeAsync`/`move`): the
+            // receiver carries the internal-slot brand. The dispatch reads
+            // `self.this_val`, so set it for the duration of the call.
+            if id == N_DISPOSABLE_STACK_PROTO || id == N_ASYNC_DISPOSABLE_STACK_PROTO {
+                let is_async = id == N_ASYNC_DISPOSABLE_STACK_PROTO;
+                let saved = core::mem::replace(&mut self.this_val, this_val);
+                let r = self.dstack_proto_dispatch(is_async, target, args);
+                self.this_val = saved;
+                return r;
+            }
+            // The `get DisposableStack.prototype.disposed` /
+            // `get AsyncDisposableStack.prototype.disposed` accessor — handled via
+            // the native id below (it brand-checks `this_val`).
+            // The dispose callback recorded by `adopt(value, onDispose)`.
+            if id == N_DSTACK_ADOPT_CALL {
+                return self.dstack_adopt_call(target);
+            }
+            // A `ShadowRealm.prototype.<method>` (`evaluate`/`importValue`).
+            if id == N_SHADOW_REALM_PROTO {
+                let saved = core::mem::replace(&mut self.this_val, this_val);
+                let r = self.shadow_realm_dispatch(target, args);
+                self.this_val = saved;
+                return r;
+            }
+            // A wrapped callable returned across a `ShadowRealm` boundary.
+            if id == N_SHADOW_REALM_WRAPPED {
+                return self.shadow_realm_wrapped_call(target, args);
+            }
             // An `Intl.Locale.prototype` `get` accessor (language/script/region/…).
             if id == N_INTL_LOCALE_ACCESSOR {
                 let name = self.realm.string_value(target).unwrap_or_default();
@@ -1517,6 +1546,24 @@ impl<'a> Interp<'a> {
         if id == N_INTL_DURATION_FORMAT {
             return self.make_duration_format(args);
         }
+        // `new DisposableStack()` / `new AsyncDisposableStack()`. The instance's
+        // `[[Prototype]]` comes from `native_new_target.prototype` (already
+        // resolved above, consuming any `Reflect.construct` newTarget).
+        if id == N_DISPOSABLE_STACK || id == N_ASYNC_DISPOSABLE_STACK {
+            return self.construct_disposable_stack(
+                id == N_ASYNC_DISPOSABLE_STACK,
+                callee,
+                native_new_target,
+            );
+        }
+        // `new ShadowRealm()`.
+        if id == N_SHADOW_REALM {
+            return self.construct_shadow_realm(callee, native_new_target);
+        }
+        // `new SuppressedError(error, suppressed, message)`.
+        if id == N_SUPPRESSED_ERROR {
+            return self.construct_suppressed_error(args, callee, native_new_target);
+        }
         // `new Promise(executor)`: run executor(resolve, reject).
         if id == N_PROMISE {
             let promise = self.fresh_promise();
@@ -2153,6 +2200,24 @@ impl<'a> Interp<'a> {
     /// Applies a native superclass constructor's effect to `instance` for
     /// `super(...)` in a class that `extends` a native (e.g. `extends Error`).
     pub(crate) fn apply_native_super(&mut self, native_id: u16, instance: Handle, args: &[NanBox]) {
+        // `class S extends DisposableStack {}` (or the async variant): `super()`
+        // stamps the internal-slot brand + an empty disposer list and
+        // `disposed = false` onto the (already-allocated, class-proto-linked)
+        // instance object — the analog of the native `construct_*` initialization.
+        if native_id == N_DISPOSABLE_STACK || native_id == N_ASYNC_DISPOSABLE_STACK {
+            self.init_disposable_stack_super(native_id == N_ASYNC_DISPOSABLE_STACK, instance);
+            return;
+        }
+        // `class S extends ShadowRealm {}`: brand + allocate the persistent scope.
+        if native_id == N_SHADOW_REALM {
+            self.init_shadow_realm_super(instance);
+            return;
+        }
+        // `class S extends SuppressedError {}`: apply error/suppressed/message.
+        if native_id == N_SUPPRESSED_ERROR {
+            self.init_suppressed_error_super(instance, args);
+            return;
+        }
         // Error family: set `message` and the default `name` (a `this.name = …`
         // after `super()` may override it).
         if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&native_id) {
