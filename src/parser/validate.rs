@@ -85,7 +85,7 @@ pub(crate) fn validate_program(program: &Program) -> Result<()> {
 fn body_is_strict(body: &[Stmt]) -> bool {
     for stmt in body {
         if let Stmt::Expr { expression, .. } = stmt {
-            if let Expr::Str { value, span } = &**expression {
+            if let Expr::Str { value, span, .. } = &**expression {
                 // A directive's *source* must be exactly `"use strict"` (11 cooked
                 // bytes inside 13 source bytes — quotes included — i.e. no
                 // escapes). Checking the span length rules out e.g. `"use\x20strict"`.
@@ -111,6 +111,12 @@ struct Ctx {
     /// Whether a `super(...)` call is syntactically permitted here — true only
     /// inside the constructor of a derived class (one with an `extends` clause).
     allow_super_call: bool,
+    /// Whether a `super.prop` / `super[expr]` *property* reference is permitted —
+    /// true inside any method definition (object/class method, accessor,
+    /// constructor), a class field initializer, or a static block; false inside a
+    /// plain function declaration/expression and in top-level script/module code.
+    /// An arrow inherits this from its enclosing scope.
+    allow_super_property: bool,
     /// Whether we are directly inside a class field initializer or static
     /// initialization block (with no intervening function boundary). In that
     /// position a reference to `arguments` and a `super(...)` call are early
@@ -138,6 +144,7 @@ impl Ctx {
         Ctx {
             strict,
             allow_super_call: false,
+            allow_super_property: false,
             in_field_init: false,
             in_function: false,
             allow_new_target: false,
@@ -150,10 +157,20 @@ impl Ctx {
     /// A fresh context at a function boundary (the jump/`return` state resets;
     /// `super`/field-init are passed in by the caller). `new.target` is always
     /// available inside a function-like body.
-    fn function_boundary(strict: bool, allow_super_call: bool, in_field_init: bool) -> Self {
+    ///
+    /// `allow_super_property` is true for a method/accessor/constructor body, a
+    /// class field initializer, and a static block — i.e. wherever a `super.prop`
+    /// reference has a home object — and false for a plain function.
+    fn function_boundary(
+        strict: bool,
+        allow_super_call: bool,
+        allow_super_property: bool,
+        in_field_init: bool,
+    ) -> Self {
         Ctx {
             strict,
             allow_super_call,
+            allow_super_property,
             in_field_init,
             in_function: true,
             allow_new_target: true,
@@ -707,8 +724,9 @@ impl Validator {
         // uses `FormalParameters` — duplicates allowed in sloppy simple lists.
         self.check_params(&f.params, strict, /* unique_required */ false, &f.body)?;
         // A regular function establishes its own `arguments`/`super` bindings and
-        // a fresh label/jump environment.
-        let c = Ctx::function_boundary(strict, false, false);
+        // a fresh label/jump environment. A plain function has no home object, so
+        // `super.prop` is not permitted in its body or parameter list.
+        let c = Ctx::function_boundary(strict, false, /* super_property */ false, false);
         let saved_labels = core::mem::take(&mut self.labels);
         for p in &f.params {
             self.param(p, &c)?;
@@ -733,7 +751,13 @@ impl Validator {
         // A `MethodDefinition` uses `UniqueFormalParameters`: duplicate parameter
         // names are always a Syntax Error.
         self.check_params(&f.params, strict, /* unique_required */ true, &f.body)?;
-        let c = Ctx::function_boundary(strict, allow_super_call, false);
+        // A method has a home object, so `super.prop` is permitted.
+        let c = Ctx::function_boundary(
+            strict,
+            allow_super_call,
+            /* super_property */ true,
+            false,
+        );
         let saved_labels = core::mem::take(&mut self.labels);
         for p in &f.params {
             self.param(p, &c)?;
@@ -757,9 +781,18 @@ impl Validator {
             ArrowBody::Block(body) => body,
             ArrowBody::Expr(_) => &[],
         };
-        // An async arrow's parameters are in an `[+Await]` context: an `await`
-        // expression there is a Syntax Error. (An arrow is never a generator.)
-        self.check_param_yield_await(&a.params, false, a.is_async)?;
+        // An arrow's parameters may not contain a `yield` or an `await`
+        // expression, regardless of the arrow's own kind: a non-async arrow
+        // nested in a generator (`function* g(){ (x = yield) => {}; }`) and an
+        // async arrow (`async (x = await p) => {}`) are both early Syntax Errors —
+        // the surrounding `[?Yield]`/`[+Await]` context makes the keyword an
+        // expression, which the arrow-head cover grammar forbids. Detect both by
+        // passing `is_generator`/`is_async` as `true` to the scanner. (The scanner
+        // does not descend into further nested function/arrow boundaries, so an
+        // inner function's own params are unaffected.)
+        self.check_param_yield_await(
+            &a.params, /* detect_yield */ true, /* detect_await */ true,
+        )?;
         // An `ArrowFunction` uses `UniqueFormalParameters` (`CoverParenthesized…`
         // has no duplicates): duplicate parameter names are always a Syntax Error.
         self.check_params(
@@ -771,6 +804,9 @@ impl Validator {
         let c = Ctx {
             strict,
             allow_super_call: ctx.allow_super_call,
+            // An arrow has no home object of its own; `super.prop` is valid only
+            // if the enclosing scope provides one.
+            allow_super_property: ctx.allow_super_property,
             in_field_init: ctx.in_field_init,
             in_function: true,
             // `new.target` is inherited from the enclosing scope: an arrow has no
@@ -801,23 +837,24 @@ impl Validator {
         Ok(())
     }
 
-    /// Rejects a `yield` expression in a generator's parameter list and an
-    /// `await` expression in an async function/arrow's parameter list (the
-    /// `[+Yield]`/`[+Await]` parameter contexts forbid them). The parser parses
-    /// params in the function's own context, so a `yield`/`await` *binding name*
-    /// is already rejected there; this catches the *expression* forms in
-    /// defaults and computed keys (e.g. `function* g(x = yield) {}`).
+    /// Rejects a `yield`/`await` *expression* in a parameter list where the
+    /// surrounding production forbids it: a generator's params (`detect_yield`),
+    /// an async function's params (`detect_await`), and an arrow's params (both —
+    /// the arrow-head cover grammar admits neither). The parser parses params in
+    /// the enclosing context, so a `yield`/`await` *binding name* is already
+    /// rejected there; this catches the *expression* forms in defaults and
+    /// computed keys (e.g. `function* g(x = yield) {}`, `(x = await p) => {}`).
     fn check_param_yield_await(
         &self,
         params: &[Param],
-        is_generator: bool,
-        is_async: bool,
+        detect_yield: bool,
+        detect_await: bool,
     ) -> Result<()> {
-        if !is_generator && !is_async {
+        if !detect_yield && !detect_await {
             return Ok(());
         }
         for p in params {
-            if let Some((span, kind)) = first_param_yield_await(p, is_generator, is_async) {
+            if let Some((span, kind)) = first_param_yield_await(p, detect_yield, detect_await) {
                 return Err(self.err(
                     span,
                     match kind {
@@ -1037,7 +1074,9 @@ impl Validator {
                         // A field initializer may use `super.prop`, `this`, and
                         // private names, but never `super(...)` or `arguments`.
                         // It is a function boundary, so `return` is not allowed.
-                        let mut c2 = Ctx::function_boundary(true, false, true);
+                        let mut c2 = Ctx::function_boundary(
+                            true, false, /* super_property */ true, true,
+                        );
                         c2.in_function = false;
                         self.expr(v, &c2)?;
                     }
@@ -1046,7 +1085,8 @@ impl Validator {
                     // A static block is a function boundary for jumps but does not
                     // permit `return`; `arguments`/`super()` are also forbidden.
                     // It is `[~Await]`, so an `await` expression is an early error.
-                    let mut c2 = Ctx::function_boundary(true, false, true);
+                    let mut c2 =
+                        Ctx::function_boundary(true, false, /* super_property */ true, true);
                     c2.in_function = false;
                     c2.in_static_block = true;
                     let saved = core::mem::take(&mut self.labels);
@@ -1117,6 +1157,19 @@ impl Validator {
                 *span,
                 "legacy octal / non-octal-decimal literals are not allowed in strict mode",
             )),
+            // A string literal whose source uses a legacy octal escape (`\1`–
+            // `\7`, `\00`, …) or a non-octal decimal escape (`\8` / `\9`) is an
+            // early Syntax Error in strict-mode code (Annex B grants these only in
+            // sloppy code). This also covers an octal-bearing directive that
+            // precedes a `"use strict"` directive in the same prologue.
+            Expr::Str {
+                legacy_octal: true,
+                span,
+                ..
+            } if ctx.strict => Err(self.err(
+                *span,
+                "legacy octal / non-octal escape sequences are not allowed in strict mode",
+            )),
             Expr::Null(_)
             | Expr::Bool { .. }
             | Expr::Number { .. }
@@ -1151,14 +1204,22 @@ impl Validator {
                 }
                 Ok(())
             }
-            Expr::Super(_) => {
-                // The validity of a bare `super` keyword depends on whether the
-                // enclosing function is a method, which the cover-grammar AST does
-                // not record unambiguously (an object method and a
-                // function-valued property are identical here). Defer this check
-                // to the runtime, where the home-object is known; the unambiguous
-                // `super.#private` rule is still enforced at the `Member` node.
-                let _ = ctx;
+            Expr::Super(span) => {
+                // `super` is only legal as a `SuperProperty` (`super.x`,
+                // `super[e]`) or a `SuperCall` (`super(...)`). It is reached here
+                // as the object of a `Member` or the callee of a `Call`; in either
+                // case the keyword is valid only where the enclosing scope grants a
+                // super reference. Both forms require some home object: a method,
+                // accessor, constructor, class field initializer, or static block
+                // (super-property), or a derived-class constructor (super-call).
+                // In a plain function body/params or in top-level code neither is
+                // permitted, which is an early Syntax Error.
+                if !ctx.allow_super_property && !ctx.allow_super_call {
+                    return Err(self.err(
+                        *span,
+                        "`super` is only valid inside a method or a derived class constructor",
+                    ));
+                }
                 Ok(())
             }
             Expr::PrivateName(_, span) => {
@@ -1224,6 +1285,7 @@ impl Validator {
                             value,
                             shorthand: false,
                             span,
+                            ..
                         } = m
                             && !matches!(key, PropertyKey::Computed(_))
                             && !matches!(&**value, Expr::Function(_) | Expr::Arrow(_))
@@ -1263,10 +1325,21 @@ impl Validator {
                             key,
                             value,
                             shorthand,
+                            method,
                             span,
                         } => {
                             if let PropertyKey::Computed(k) = key {
                                 self.expr(k, ctx)?;
+                            }
+                            // A *method definition* (`key() {}`, `*key() {}`,
+                            // `async key() {}`) uses `UniqueFormalParameters`, so a
+                            // duplicate parameter name is always a Syntax Error —
+                            // unlike a data property whose value is an ordinary
+                            // function. The cover grammar makes the two AST-identical,
+                            // so the `method` flag distinguishes them here.
+                            if *method && let Expr::Function(f) = &**value {
+                                self.method_function(f, ctx, false)?;
+                                continue;
                             }
                             // A `CoverInitializedName` (`{ a = 1 }`): a shorthand
                             // property whose value is a simple-assignment default.
@@ -2125,7 +2198,16 @@ fn is_simple_update_target(e: &Expr) -> bool {
 fn is_valid_assign_target(e: &Expr) -> bool {
     match e {
         Expr::Ident(_) | Expr::Member { .. } => true,
-        Expr::Array { elements, .. } => {
+        Expr::Array {
+            elements,
+            rest_trailing_comma,
+            ..
+        } => {
+            // An `AssignmentRestElement` may not be followed by a comma — even a
+            // trailing one (`[...x,]`), which the literal grammar otherwise drops.
+            if *rest_trailing_comma {
+                return false;
+            }
             for (i, el) in elements.iter().enumerate() {
                 match el {
                     crate::ast::ArrayElement::Hole => {}

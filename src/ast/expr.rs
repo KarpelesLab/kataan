@@ -35,7 +35,15 @@ pub enum Expr {
     /// lone UTF-16 surrogate (`"\uD800"`) round-trips losslessly (DOMString
     /// semantics — see [`crate::wtf8`]). A literal with no surrogates is
     /// byte-identical to its UTF-8.
-    Str { value: Box<[u8]>, span: Span },
+    Str {
+        value: Box<[u8]>,
+        /// True if the literal's source contains a `LegacyOctalEscapeSequence`
+        /// (`\1`–`\7`, `\0` followed by a digit, …) or a
+        /// `NonOctalDecimalEscapeSequence` (`\8` / `\9`). Both are tolerated in
+        /// sloppy code (Annex B) but are early Syntax Errors in strict mode.
+        legacy_octal: bool,
+        span: Span,
+    },
     /// A regular-expression literal `/pattern/flags` (kept as source text; the
     /// pattern is compiled by the regex engine, not here).
     Regex {
@@ -69,6 +77,14 @@ pub enum Expr {
     /// [`ArrayElement::Hole`].
     Array {
         elements: Vec<ArrayElement>,
+        /// True if a spread element is immediately followed by a comma (a
+        /// trailing comma or further elision). This is harmless in an array
+        /// *literal*, but when the literal is reinterpreted as an
+        /// `ArrayAssignmentPattern` the `AssignmentRestElement` may not be
+        /// followed by a comma, so it is an early Syntax Error there. (An element
+        /// *after* the spread is recorded structurally; only the dangling comma
+        /// would otherwise be lost.)
+        rest_trailing_comma: bool,
         span: Span,
     },
     /// An object literal, e.g. `{ a: 1, b, ...rest }`.
@@ -289,6 +305,12 @@ pub enum ObjectMember {
         value: Box<Expr>,
         /// True for the shorthand form `{ x }` (where `value` is the ident).
         shorthand: bool,
+        /// True for a *method definition* (`key() { … }`, `*key() { … }`,
+        /// `async key() { … }`), as opposed to a data property whose value
+        /// merely happens to be a function. The cover grammar makes these
+        /// otherwise indistinguishable in the AST; the flag lets the early-error
+        /// pass apply `UniqueFormalParameters` (no duplicate params) to methods.
+        method: bool,
         span: Span,
     },
     /// A spread member `...expr`.

@@ -158,6 +158,49 @@ pub(super) fn string(raw: &str, span: Span) -> Result<Vec<u8>> {
     decode_escapes(inner, span)
 }
 
+/// Whether a string-literal token's source (quotes included) contains a
+/// `LegacyOctalEscapeSequence` (`\1`–`\7`, or `\0` immediately followed by a
+/// decimal digit, e.g. `\00`) or a `NonOctalDecimalEscapeSequence` (`\8` /
+/// `\9`). Both are accepted in sloppy code (Annex B) but are early Syntax Errors
+/// in strict-mode code; the strict check is applied by the validation pass.
+///
+/// Scanning is byte-wise: a backslash, the escape selector, and the decimal
+/// digits are all ASCII, and a UTF-8 continuation byte is always ≥ 0x80, so a
+/// multi-byte scalar inside the literal can never be mistaken for an escape.
+#[must_use]
+pub(super) fn string_has_legacy_octal_escape(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        // `b[i]` is a backslash; inspect the escaped byte (if any).
+        match b.get(i + 1) {
+            // `\1`–`\9`: a legacy octal (`1`–`7`) or non-octal decimal (`8`/`9`).
+            Some(d @ b'1'..=b'9') => {
+                let _ = d;
+                return true;
+            }
+            // `\0` is a legal `NUL` escape only when *not* followed by a digit; a
+            // following digit makes it a legacy octal escape (`\00`, `\012`).
+            Some(b'0') => {
+                if b.get(i + 2).is_some_and(u8::is_ascii_digit) {
+                    return true;
+                }
+                i += 2; // consume `\0`
+            }
+            // Any other escape (`\x`, `\u`, `\n`, `\\`, `\"`, …): skip the
+            // backslash and the escaped byte so an escaped backslash (`\\`) does
+            // not let the following char be misread as starting a new escape.
+            Some(_) => i += 2,
+            None => i += 1,
+        }
+    }
+    false
+}
+
 /// Decodes a string-literal token used as a **property key**, returning a
 /// `String`. Property keys are stored in the `&str`-keyed object/shape layer, so
 /// a lone surrogate in a key is decoded lossily (→ U+FFFD); a non-surrogate key

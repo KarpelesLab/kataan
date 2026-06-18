@@ -64,6 +64,14 @@ pub struct Parser<'src> {
     in_generator: bool,
     /// Whether the cursor is inside an async body (enables `await`).
     in_async: bool,
+    /// Span of the most recently parsed *parenthesized* primary expression whose
+    /// stripped value is an object or array literal — e.g. `({})` / `([a])`. The
+    /// parentheses are not retained in the AST, but a `ParenthesizedExpression`
+    /// wrapping an `ObjectLiteral`/`ArrayLiteral` is **not** a valid assignment
+    /// target (only the bare cover `{ … } = …` reinterprets as a pattern), so the
+    /// assignment parser consults this (matching on span) to reject `({}) = 1`.
+    /// Cleared at the start of every primary parse so it is never stale.
+    paren_obj_arr_span: Option<Span>,
     /// Current recursive-descent nesting depth, bounded by [`MAX_PARSE_DEPTH`].
     depth: u32,
 }
@@ -94,6 +102,7 @@ impl<'src> Parser<'src> {
             no_in: false,
             in_generator: false,
             in_async: false,
+            paren_obj_arr_span: None,
             depth: 0,
         })
     }
@@ -301,6 +310,18 @@ impl<'src> Parser<'src> {
         let Some(op) = assign_op(self.peek()) else {
             return Ok(left);
         };
+        // A parenthesized object/array literal (`({}) = …`, `([a]) = …`) is not a
+        // valid assignment target: only the bare cover reinterprets as a pattern.
+        // The parser strips the parens, so we match the marker span (set by
+        // `parse_paren` while parsing `left`) against the target's span.
+        if matches!(&left, Expr::Object { .. } | Expr::Array { .. })
+            && self.paren_obj_arr_span == Some(left.span())
+        {
+            return Err(self.err_at(
+                left.span(),
+                "a parenthesized object or array literal is not a valid assignment target",
+            ));
+        }
         if !left.is_assignment_target() {
             return Err(self.err_at(left.span(), "invalid assignment target"));
         }
@@ -869,6 +890,9 @@ impl<'src> Parser<'src> {
     // --- primary --------------------------------------------------------
 
     fn parse_primary(&mut self) -> Result<Expr> {
+        // Reset the parenthesized-object/array marker; only `parse_paren` re-sets
+        // it, so it never lingers past the primary it describes.
+        self.paren_obj_arr_span = None;
         let tok = self.peek_tok();
         match tok.kind {
             TokenKind::Number => {
@@ -889,8 +913,10 @@ impl<'src> Parser<'src> {
             }
             TokenKind::String => {
                 self.bump();
+                let raw = tok.text(self.source);
                 Ok(Expr::Str {
-                    value: cook::string(tok.text(self.source), tok.span)?.into(),
+                    value: cook::string(raw, tok.span)?.into(),
+                    legacy_octal: cook::string_has_legacy_octal_escape(raw),
                     span: tok.span,
                 })
             }
@@ -1095,30 +1121,51 @@ impl<'src> Parser<'src> {
         }
         let expr = self.without_no_in(Self::parse_expression)?;
         self.expect(TokenKind::RParen)?;
+        // A parenthesized object/array literal is not a valid assignment target
+        // (only the bare `{ … }`/`[ … ]` cover reinterprets as a destructuring
+        // pattern). Record its span so the assignment parser can reject `({}) = 1`
+        // while still accepting `({ a } = x)` (where the parens wrap the whole
+        // assignment, not just the object). A nested `(({}))` keeps the marker
+        // because the stripped inner is still an object/array literal.
+        self.paren_obj_arr_span = match &expr {
+            Expr::Object { span, .. } | Expr::Array { span, .. } => Some(*span),
+            _ => None,
+        };
         Ok(expr)
     }
 
     fn parse_array(&mut self) -> Result<Expr> {
         let start = self.expect(TokenKind::LBracket)?.span;
         let mut elements = Vec::new();
+        // Records whether a spread element was immediately followed by a comma.
+        // Valid in an array literal, but an early error if the literal is later
+        // reinterpreted as an array assignment pattern (a rest may not be
+        // followed by a comma). The trailing comma is otherwise dropped, so we
+        // capture it here.
+        let mut rest_trailing_comma = false;
         while !self.at(TokenKind::RBracket) {
             if self.at(TokenKind::Comma) {
                 self.bump();
                 elements.push(ArrayElement::Hole);
                 continue;
             }
-            if self.eat(TokenKind::DotDotDot) {
+            let is_spread = self.eat(TokenKind::DotDotDot);
+            if is_spread {
                 elements.push(ArrayElement::Spread(self.parse_assignment()?));
             } else {
                 elements.push(ArrayElement::Item(self.parse_assignment()?));
             }
             if !self.at(TokenKind::RBracket) {
+                if is_spread {
+                    rest_trailing_comma = true;
+                }
                 self.expect(TokenKind::Comma)?;
             }
         }
         let end = self.expect(TokenKind::RBracket)?.span;
         Ok(Expr::Array {
             elements,
+            rest_trailing_comma,
             span: start.to(end),
         })
     }
@@ -1166,6 +1213,7 @@ impl<'src> Parser<'src> {
                 key,
                 value: Box::new(Expr::Function(func)),
                 shorthand: false,
+                method: true,
                 span: start.to(self.prev_span()),
             });
         }
@@ -1179,6 +1227,7 @@ impl<'src> Parser<'src> {
                 key,
                 value: Box::new(Expr::Function(func)),
                 shorthand: false,
+                method: true,
                 span: start.to(self.prev_span()),
             });
         }
@@ -1220,6 +1269,7 @@ impl<'src> Parser<'src> {
                     key: PropertyKey::Computed(Box::new(key_expr)),
                     value: Box::new(Expr::Function(func)),
                     shorthand: false,
+                    method: true,
                     span,
                 });
             }
@@ -1230,6 +1280,7 @@ impl<'src> Parser<'src> {
                 key: PropertyKey::Computed(Box::new(key_expr)),
                 value: Box::new(value),
                 shorthand: false,
+                method: false,
                 span,
             });
         }
@@ -1250,6 +1301,7 @@ impl<'src> Parser<'src> {
                 key,
                 value: Box::new(value),
                 shorthand: false,
+                method: false,
                 span,
             });
         }
@@ -1275,6 +1327,7 @@ impl<'src> Parser<'src> {
                 key: PropertyKey::Ident(name),
                 value: Box::new(Expr::Function(func)),
                 shorthand: false,
+                method: true,
                 span,
             });
         }
@@ -1286,6 +1339,7 @@ impl<'src> Parser<'src> {
                 key: PropertyKey::Ident(name),
                 value: Box::new(value),
                 shorthand: false,
+                method: false,
                 span,
             });
         }
@@ -1316,6 +1370,7 @@ impl<'src> Parser<'src> {
                     span,
                 }),
                 shorthand: true,
+                method: false,
                 span,
             });
         }
@@ -1324,6 +1379,7 @@ impl<'src> Parser<'src> {
             key: PropertyKey::Ident(name),
             value: Box::new(ident_expr),
             shorthand: true,
+            method: false,
             span: tok.span,
         })
     }

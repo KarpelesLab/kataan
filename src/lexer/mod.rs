@@ -45,8 +45,14 @@ use alloc::vec::Vec;
 /// "close a block/object" and "resume a template literal after `${ … }`".
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BraceKind {
-    /// An ordinary `{` (block, object literal, destructuring, …).
-    Normal,
+    /// A `{` opening a *statement block* (function/loop/`if` body, bare block,
+    /// `try`/`catch`/`finally`, …). After its closing `}` the cursor is at the
+    /// start of a new statement, so a following `/` begins a **regex literal**.
+    Block,
+    /// A `{` opening an *object literal* (or class body / destructuring pattern
+    /// used as a value). After its closing `}` the cursor is in expression
+    /// position following a value, so a following `/` is **division**.
+    ExprObject,
     /// The `{` of a template substitution `${ … }`; its `}` resumes the
     /// template body.
     TemplateSubstitution,
@@ -67,8 +73,24 @@ pub struct Lexer<'src> {
     /// The kind of the previous significant (non-trivia) token, used to
     /// resolve the `/` regex-vs-division ambiguity. `None` at start of input.
     prev_significant: Option<TokenKind>,
-    /// Open-brace stack for template-substitution tracking.
+    /// Open-brace stack for template-substitution tracking and block-vs-object
+    /// disambiguation (so a `/` after `}` can be classified).
     brace_stack: Vec<BraceKind>,
+    /// Whether the most recently emitted `}` token closed a *statement block*
+    /// (`BraceKind::Block`). Consulted by [`Lexer::regex_allowed`] when the
+    /// previous significant token is `}`: a `}` ending a block is followed by a
+    /// statement (regex position), whereas a `}` ending an object literal is
+    /// followed by an operator (division position).
+    last_rbrace_closed_block: bool,
+    /// Stack of pending `function` contexts: one entry per `function` keyword
+    /// whose body `{` has not yet been seen, recording whether that `function`
+    /// occurred in *statement* position (a `FunctionDeclaration`, so its body is
+    /// a block and a `/` after the closing `}` is a regex) versus *expression*
+    /// position (a `FunctionExpression`, a value, so a following `/` is
+    /// division). The body `{` — recognized as the first `{` preceded by the
+    /// param-list `)` — pops the matching entry. Nested function expressions in
+    /// parameter defaults push/pop in LIFO order with their own bodies.
+    func_stmt_stack: Vec<bool>,
     /// Set while scanning an identifier (or private name) that contained a
     /// `\u` escape; consumed and cleared by [`Lexer::make`].
     cur_had_escape: bool,
@@ -84,6 +106,8 @@ impl<'src> Lexer<'src> {
             pos: 0,
             prev_significant: None,
             brace_stack: Vec::new(),
+            last_rbrace_closed_block: false,
+            func_stmt_stack: Vec::new(),
             cur_had_escape: false,
         }
     }
@@ -130,7 +154,12 @@ impl<'src> Lexer<'src> {
         let kind = match c {
             b'{' => {
                 self.advance();
-                self.brace_stack.push(BraceKind::Normal);
+                let kind = if self.brace_is_block(newline_before) {
+                    BraceKind::Block
+                } else {
+                    BraceKind::ExprObject
+                };
+                self.brace_stack.push(kind);
                 TokenKind::LBrace
             }
             b'}' => {
@@ -144,7 +173,12 @@ impl<'src> Lexer<'src> {
                     return self.read_template_continuation(start, newline_before);
                 }
                 self.advance();
-                self.brace_stack.pop();
+                // Record whether this `}` closed a statement block, so a `/`
+                // immediately after it is classified as a regex (block) rather
+                // than division (object literal). An unbalanced `}` (empty stack)
+                // is a syntax error the parser will report; default to non-block.
+                self.last_rbrace_closed_block =
+                    matches!(self.brace_stack.pop(), Some(BraceKind::Block));
                 TokenKind::RBrace
             }
             b'(' => self.single(TokenKind::LParen),
@@ -1114,6 +1148,94 @@ impl<'src> Lexer<'src> {
 
     // --- regex-vs-division heuristic ------------------------------------
 
+    /// Whether a `function` keyword (just about to be emitted) begins a
+    /// `FunctionDeclaration` (statement position) rather than a
+    /// `FunctionExpression` (expression position). Keyed on the previous
+    /// significant token. Errs toward `false` (expression / division) for any
+    /// ambiguous position, so the only behavior change versus the historical
+    /// "always division after `}`" is for unambiguous declaration sites.
+    fn function_at_statement_start(&self) -> bool {
+        use TokenKind as T;
+        let Some(prev) = self.prev_significant else {
+            return true; // start of input
+        };
+        match prev {
+            // A statement terminator / opener: the `function` starts a statement.
+            T::Semicolon => true,
+            // After a `}` that closed a statement block (`{} function f(){}`), or
+            // a `{` that opened a block (`{ function f(){} }`): statement context.
+            T::RBrace => self.last_rbrace_closed_block,
+            T::LBrace => matches!(self.brace_stack.last(), Some(BraceKind::Block)),
+            // The single-statement body of `if`/`for`/`while`/`with`/`else`/`do`
+            // (Annex B sloppy `FunctionDeclaration`): `)` or these keywords.
+            T::RParen => true,
+            T::Keyword(Keyword::Else | Keyword::Do) => true,
+            // `case x:` / `default:` / a label introduce a statement; a `:` is the
+            // common spelling, but it is also a ternary/object separator, so keep
+            // it ambiguous (expression) to avoid misclassifying value positions.
+            // Everything else (`,`, `=`, `(`, `return`, operators, …) is an
+            // expression position → a `FunctionExpression`.
+            _ => false,
+        }
+    }
+
+    /// Whether a `{` just consumed opens a *statement block* (vs an object
+    /// literal). Mirrors the classic acorn `braceIsBlock` decision, keyed on the
+    /// previous significant token. The result feeds the brace stack so a `/`
+    /// after the matching `}` is classified correctly.
+    ///
+    /// The decision is deliberately conservative: it returns `true` (block) only
+    /// for positions where a `{` unambiguously begins a statement (so a `/` after
+    /// the block is read as a regex). Any expression position — `=`, `(`, `,`,
+    /// `return`-value, an operator, … — yields an object literal, preserving the
+    /// historical "`/` after `}` is division" behavior there. `newline_before` is
+    /// the line-terminator flag of the `{` token (for the `return`⏎`{` ASI case).
+    fn brace_is_block(&mut self, newline_before: bool) -> bool {
+        use TokenKind as T;
+        let Some(prev) = self.prev_significant else {
+            // Start of input: a `{` begins a (block) statement.
+            return true;
+        };
+        match prev {
+            // A `{` directly inside another `{ … }` is a block iff the enclosing
+            // brace is itself a block (a statement list nests statements; an
+            // object literal value position would have an intervening `:`/`,`).
+            T::LBrace => matches!(self.brace_stack.last(), Some(BraceKind::Block)),
+            // A `{` after `)` closes either a function's parameter list (its body
+            // is a block for a declaration, a value for an expression) or a
+            // control-flow head (`if`/`for`/`while`/`switch`/`catch`/`with` — a
+            // block). The pending-`function` stack tells the two apart.
+            T::RParen => self.func_stmt_stack.pop().unwrap_or(true),
+            // Unambiguous statement boundaries: the next `{` opens a block.
+            T::Semicolon | T::Arrow => true,
+            // A `:` is ambiguous between a label colon (`L: { … }` — block), an
+            // object property separator (`{ a: { … } }` — value), and a ternary
+            // colon (`c ? a : { … }` — value). Only the label form opens a block,
+            // and the three are not reliably distinguishable from the lexer
+            // alone, so we keep the conservative object classification (a `/`
+            // after the matching `}` stays division — the pre-existing behavior).
+            T::Colon => false,
+            // After a `}`: a block follows a block (`{}{}` — two statements), an
+            // object follows an object value position.
+            T::RBrace => self.last_rbrace_closed_block,
+            // `return` / `throw` / `yield` / etc. that precede an expression make
+            // the `{` an object literal — *unless* an ASI-triggering newline
+            // intervenes after `return`/`throw`, which ends the statement so the
+            // `{` starts a fresh (block) statement.
+            T::Keyword(Keyword::Return | Keyword::Throw) => newline_before,
+            // Keywords that introduce a statement whose body is a block.
+            T::Keyword(Keyword::Else | Keyword::Do | Keyword::Try | Keyword::Finally) => true,
+            // Other keywords: those that precede an expression (`typeof`, `new`,
+            // `case`, …) open an object; the value-like ones (`this`, `super`,
+            // literals) would be division anyway but a following `{` is an object.
+            T::Keyword(kw) => !kw.before_expression(),
+            // A value-producing token (identifier, literal, `)`, `]`, …) before a
+            // `{` cannot legally be followed by a block in expression-free code;
+            // treat as object literal (the conservative, pre-existing behavior).
+            _ => false,
+        }
+    }
+
     /// Whether a `/` at the current position should begin a regex literal,
     /// based on the previous significant token. This is the standard heuristic
     /// used by hand-written JS lexers.
@@ -1133,9 +1255,13 @@ impl<'src> Lexer<'src> {
                 | TokenKind::TemplateTail
                 | TokenKind::RParen
                 | TokenKind::RBracket
-                | TokenKind::RBrace
                 | TokenKind::PlusPlus
                 | TokenKind::MinusMinus => false,
+                // A `}` is ambiguous: closing a statement block puts the cursor
+                // at the start of a new statement (regex position), while closing
+                // an object literal leaves a value (division). The brace stack
+                // recorded which it was when the `}` was emitted.
+                TokenKind::RBrace => self.last_rbrace_closed_block,
                 // Keywords that produce/precede a value vs. those that precede
                 // an expression.
                 TokenKind::Keyword(kw) => kw.before_expression(),
@@ -1201,6 +1327,16 @@ impl<'src> Lexer<'src> {
     /// Finalizes a token spanning `[start, self.pos)`, updating the
     /// previous-significant-token state for the regex heuristic.
     fn make(&mut self, kind: TokenKind, start: usize, newline_before: bool) -> Token {
+        // A `function` keyword opens a context whose body-brace classification
+        // depends on whether the keyword begins a `FunctionDeclaration`
+        // (statement position → body is a block, so a `/` after the closing `}`
+        // is a regex) or a `FunctionExpression` (a value → a following `/` is
+        // division). `function_at_statement_start` distinguishes them from the
+        // previous token (computed before `prev_significant` is overwritten).
+        if kind == TokenKind::Keyword(Keyword::Function) {
+            let is_decl = self.function_at_statement_start();
+            self.func_stmt_stack.push(is_decl);
+        }
         if kind != TokenKind::Eof {
             self.prev_significant = Some(kind);
         }
