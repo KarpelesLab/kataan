@@ -3797,9 +3797,17 @@ fn map_set_samevaluezero_and_set_ops() {
     assert_eq!(run("new Set([1,2]).isSubsetOf(new Set([1,2,3]))"), "true");
     assert_eq!(run("new Set([1,2,3]).isSupersetOf(new Set([1,2]))"), "true");
     assert_eq!(run("new Set([1,2]).isDisjointFrom(new Set([3,4]))"), "true");
-    // The argument may be any iterable.
+    // The argument must be a *set-like* record (GetSetRecord), not a bare
+    // iterable: a plain array is a TypeError (no `has`, `size` is `undefined`).
     assert_eq!(
-        run("[...new Set([1,2,3]).intersection([2,3,9])].join(',')"),
+        run("try{new Set([1,2,3]).intersection([2,3,9]); 'no'}catch(e){e instanceof TypeError}"),
+        "true"
+    );
+    // A genuine set-like object (numeric `size`, callable `has`/`keys`) works.
+    assert_eq!(
+        run(
+            "let sl={size:2,has:v=>v===2||v===3,keys:()=>[2,3][Symbol.iterator]()}; [...new Set([1,2,3]).intersection(sl)].join(',')"
+        ),
         "2,3"
     );
 }

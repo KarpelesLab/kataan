@@ -1222,8 +1222,9 @@ fn run_frame(
                 let present = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
                     Some(h) => {
                         let k = ctx.realm.to_display_string(regs[*key as usize]);
-                        // Own or inherited (walk the prototype chain); arrays also
-                        // report in-bounds indices.
+                        // Own or inherited (walk the prototype chain). `has_own`
+                        // already reports an array's in-range non-hole indices and
+                        // `length`, so a hole is correctly absent unless inherited.
                         let mut found = false;
                         let mut cur = Some(h);
                         while let Some(c) = cur {
@@ -1234,10 +1235,6 @@ fn run_frame(
                             cur = ctx.realm.object_proto(c);
                         }
                         found
-                            || ctx
-                                .realm
-                                .array_length(h)
-                                .is_some_and(|len| k.parse::<usize>().is_ok_and(|i| i < len))
                     }
                     None => false,
                 };
@@ -1434,6 +1431,13 @@ fn run_frame(
                         .realm
                         .get_property(handle, &k)
                         .unwrap_or(NanBox::undefined());
+                } else if ctx.realm.typed_len(handle).is_none() && ctx.realm.is_array(handle) {
+                    // A plain array index: a present own element wins; a hole or
+                    // out-of-range index consults the prototype chain.
+                    match vm_array_index_get(ctx, funcs, handle, i, regs[*arr as usize]) {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
                 } else {
                     regs[*dst as usize] = ctx.realm.get_element(handle, i);
                 }
@@ -1477,8 +1481,16 @@ fn run_frame(
                 let handle = object_handle(regs[*obj as usize])?;
                 let k = regs[*key as usize];
                 match k.as_number() {
-                    Some(n) if ctx.realm.is_array(handle) && (n as u64) < u64::from(u32::MAX) => {
-                        regs[*dst as usize] = ctx.realm.get_element(handle, n as usize);
+                    Some(n)
+                        if ctx.realm.is_array(handle)
+                            && n >= 0.0
+                            && n == (n as u64) as f64
+                            && (n as u64) < u64::from(u32::MAX) =>
+                    {
+                        match vm_array_index_get(ctx, funcs, handle, n as usize, recv_key) {
+                            Ok(v) => regs[*dst as usize] = v,
+                            Err(e) => handle_throw!(e),
+                        }
                     }
                     _ => {
                         // ToPropertyKey: an object key uses its `toString`.
@@ -1492,7 +1504,10 @@ fn run_frame(
                             && alloc::format!("{i}") == ks
                             && (i as u64) < u64::from(u32::MAX)
                         {
-                            regs[*dst as usize] = ctx.realm.get_element(handle, i);
+                            match vm_array_index_get(ctx, funcs, handle, i, recv_key) {
+                                Ok(v) => regs[*dst as usize] = v,
+                                Err(e) => handle_throw!(e),
+                            }
                         } else if ks == "length"
                             && let Some(len) = ctx.realm.array_length(handle).or_else(|| {
                                 // String length counts UTF-16 code units (astral
@@ -1575,9 +1590,9 @@ fn run_frame(
                 // An array leads with its integer indices (a VM closure's backing
                 // cells are not enumerable).
                 if !ctx.realm.is_vm_function(h)
-                    && let Some(len) = ctx.realm.array_length(h)
+                    && let Some(indices) = ctx.realm.array_present_indices(h)
                 {
-                    for i in 0..len {
+                    for i in indices {
                         let k = alloc::format!("{i}");
                         if seen.insert(k.clone()) {
                             out.push(NanBox::handle(ctx.realm.new_string(&k).to_raw()));
@@ -2516,6 +2531,50 @@ fn json_normalize(
 }
 
 /// Invokes a closure value (`[func_id, cell…]`) with `args` and `this_val`.
+/// `[[Get]]` of array index `i` on a plain-array receiver, with prototype-chain
+/// fallthrough for a *hole* or an out-of-range index (an absent own index must
+/// consult the prototype, per ordinary `[[Get]]`). A present own element returns
+/// directly; otherwise the chain is walked for an inherited array element, data
+/// property, or accessor (whose getter is invoked with `recv` as `this`).
+fn vm_array_index_get(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    handle: Handle,
+    i: usize,
+    recv: NanBox,
+) -> Result<NanBox, VmError> {
+    // A present own element wins.
+    if i < ctx.realm.array_length(handle).unwrap_or(0) && !ctx.realm.array_hole_at(handle, i) {
+        return Ok(ctx.realm.get_element(handle, i));
+    }
+    // Absent own index (hole or past the end): walk the prototype chain.
+    let key = alloc::format!("{i}");
+    let mut cur = ctx.realm.object_proto(handle);
+    while let Some(p) = cur {
+        if let Some((getter, _)) = ctx.realm.accessor(p, &key) {
+            if getter.as_handle().is_none() {
+                return Ok(NanBox::undefined());
+            }
+            return call_closure(ctx, funcs, getter, &[], recv);
+        }
+        // A prototype that is itself a plain array exposes its present elements.
+        if ctx.realm.is_array(p)
+            && i < ctx.realm.array_length(p).unwrap_or(0)
+            && !ctx.realm.array_hole_at(p, i)
+        {
+            return Ok(ctx.realm.get_element(p, i));
+        }
+        if ctx.realm.has_own(p, &key) {
+            return Ok(ctx
+                .realm
+                .get_property(p, &key)
+                .unwrap_or(NanBox::undefined()));
+        }
+        cur = ctx.realm.object_proto(p);
+    }
+    Ok(NanBox::undefined())
+}
+
 fn call_closure(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -2965,6 +3024,35 @@ fn builtin_method(
                 .map(<[_]>::to_vec)
                 .unwrap_or_default()
         };
+        // A *sparse* array (one with at least one hole) needs the conformant
+        // tree-walker for the callback / element-scanning methods: holes must be
+        // skipped (and inherited prototype indices observed). These VM fast paths
+        // treat every slot as present, so defer (return `None` → whole-program
+        // re-run on the reference engine) when a hole is present.
+        if matches!(
+            key,
+            "map"
+                | "filter"
+                | "forEach"
+                | "reduce"
+                | "reduceRight"
+                | "find"
+                | "findIndex"
+                | "findLast"
+                | "findLastIndex"
+                | "some"
+                | "every"
+                | "indexOf"
+                | "lastIndexOf"
+                | "flat"
+                | "flatMap"
+        ) && ctx
+            .realm
+            .array_elements(h)
+            .is_some_and(|a| a.iter().any(|e| e.is_hole()))
+        {
+            return None;
+        }
         let result = match key {
             "push" => {
                 let mut len = ctx.realm.array_length(h).unwrap_or(0);
@@ -3003,12 +3091,15 @@ fn builtin_method(
             }
             "includes" => {
                 let t = arg0();
-                // SameValueZero: like `===` but `NaN` matches `NaN`.
+                // SameValueZero: like `===` but `NaN` matches `NaN`. A hole reads
+                // as `undefined` (holes are not skipped by `includes`).
                 let t_nan = t.as_number().is_some_and(f64::is_nan);
+                let t_undef = matches!(t.unpack(), Unpacked::Undefined);
                 // Pure scan, no callback: borrow the backing store (M4).
                 let found = ctx.realm.array_elements(h).is_some_and(|elems| {
                     elems.iter().any(|e| {
-                        ctx.realm.strict_equals(*e, t)
+                        (e.is_hole() && t_undef)
+                            || ctx.realm.strict_equals(*e, t)
                             || (t_nan && e.as_number().is_some_and(f64::is_nan))
                     })
                 });
@@ -3515,7 +3606,10 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                     && let Some(elems) = ctx.realm.array_elements(h).map(<[_]>::to_vec)
                 {
                     for (i, v) in elems.into_iter().enumerate() {
-                        pairs.push((alloc::format!("{i}"), v));
+                        // Holes are absent — excluded from keys/values/entries.
+                        if !v.is_hole() {
+                            pairs.push((alloc::format!("{i}"), v));
+                        }
                     }
                 }
                 // Plain objects keep keys in the cell; arrays/functions keep named
@@ -6080,7 +6174,10 @@ impl Compiler {
                             self.ops.push(Op::ArrayPush { arr: dst, src: v });
                         }
                         ArrayElement::Hole => {
-                            let u = self.constant(NanBox::undefined())?;
+                            // A real elision: store the internal hole sentinel so
+                            // `[[Get]]` falls through to the prototype, `in`/
+                            // `Object.keys`/the iteration built-ins skip it, etc.
+                            let u = self.constant(NanBox::hole())?;
                             self.ops.push(Op::ArrayPush { arr: dst, src: u });
                         }
                         ArrayElement::Spread(e) => {

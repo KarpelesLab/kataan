@@ -2331,16 +2331,65 @@ impl<'a> Interp<'a> {
                 self.array_like_present = Some(present);
             }
         }
+        // A *real* array receiver (no generic mask) that contains at least one
+        // hole is materialized like a generic array-like for the callback methods:
+        // presence is `HasProperty` (own or inherited) and each present value is
+        // `[[Get]]` (so an inherited prototype index is observed). This keeps the
+        // dense fast path (no holes) untouched while making sparse arrays
+        // spec-conformant for `forEach`/`map`/`reduce`/etc.
+        const HOLE_AWARE_ITER: &[&str] = &[
+            "forEach",
+            "map",
+            "filter",
+            "some",
+            "every",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "reduce",
+            "reduceRight",
+            "indexOf",
+            "lastIndexOf",
+        ];
+        if array_like.is_none()
+            && self.array_like_present.is_none()
+            && HOLE_AWARE_ITER.contains(&method)
+            && self
+                .realm
+                .array_elements(handle)
+                .is_some_and(|a| a.iter().any(|e| e.is_hole()))
+        {
+            // A sparse array uses the conformant *live* iteration: `len` is read
+            // once, then each index is probed with `HasProperty` and read with
+            // `Get` at that step — so a callback/getter that fills a hole or
+            // deletes an inherited index mid-iteration is observed.
+            return Ok(Some(self.array_iter_sparse(method, handle, args)?));
+        }
         // Take the per-index presence mask (set above for a materialized generic
         // array-like); the iteration arms below consult it to skip holes.
         let array_like_present = self.array_like_present.take();
-        // `true` if index `i` is *present* (not a hole) — always `true` for a dense
-        // real array (no mask), and the recorded `HasProperty` for a materialized
-        // generic array-like.
+        // For a *real* array receiver (no generic mask), record which dense slots
+        // are genuine holes so the iteration arms skip them too (HasProperty is
+        // false for a hole). `None` when the receiver carries a generic mask.
+        let real_holes: Option<Vec<bool>> = if array_like_present.is_some() {
+            None
+        } else {
+            self.realm
+                .array_elements(handle)
+                .map(|a| a.iter().map(|e| e.is_hole()).collect())
+        };
+        // `true` if index `i` is *present* (not a hole): the recorded
+        // `HasProperty` for a materialized generic array-like, or the dense
+        // hole check for a real array (and unconditionally `true` for any other
+        // receiver kind, e.g. a typed array, which has no holes).
         let is_present = |i: usize| -> bool {
-            array_like_present
+            if let Some(m) = array_like_present.as_ref() {
+                return m.get(i).copied().unwrap_or(false);
+            }
+            real_holes
                 .as_ref()
-                .is_none_or(|m| m.get(i).copied().unwrap_or(false))
+                .is_none_or(|h| !h.get(i).copied().unwrap_or(false))
         };
         // For a generic array-like `this`, the callback receives the *original*
         // object as its 3rd argument (`O`), not the materialized snapshot — so
@@ -2581,7 +2630,15 @@ impl<'a> Interp<'a> {
                     if elems.is_empty() {
                         return Ok(Some(NanBox::undefined()));
                     }
+                    // The removed first element: a hole is read as `undefined`
+                    // (the sentinel never escapes). The remaining elements keep
+                    // their holes (shifting preserves absent indices).
                     let first = elems[0];
+                    let first = if first.is_hole() {
+                        NanBox::undefined()
+                    } else {
+                        first
+                    };
                     self.realm.array_set_all(handle, elems[1..].to_vec());
                     return Ok(Some(first));
                 }
@@ -2689,10 +2746,14 @@ impl<'a> Interp<'a> {
                 "includes" => {
                     let target = arg(0);
                     let from = self.array_from_index_checked(arg(1), elems.len())?;
-                    // SameValueZero: like `===` but `NaN` matches `NaN`.
+                    // SameValueZero: like `===` but `NaN` matches `NaN`. `includes`
+                    // does *not* skip holes — a hole reads as `undefined`, so
+                    // `[,].includes(undefined)` is `true`.
                     let t_nan = target.as_number().is_some_and(f64::is_nan);
+                    let t_undef = matches!(target.unpack(), Unpacked::Undefined);
                     let found = elems[from..].iter().any(|e| {
-                        self.realm.strict_equals(*e, target)
+                        (e.is_hole() && t_undef)
+                            || self.realm.strict_equals(*e, target)
                             || (t_nan && e.as_number().is_some_and(f64::is_nan))
                     });
                     return Ok(Some(NanBox::boolean(found)));
@@ -2742,10 +2803,14 @@ impl<'a> Interp<'a> {
                     let arr = callback_recv;
                     let mut out = Vec::with_capacity(elems.len());
                     for (i, e) in elems.iter().enumerate() {
-                        // A hole maps to a hole (callback skipped); modeled as
-                        // `undefined` in the dense result.
+                        // A hole maps to a hole (callback skipped) — preserved as a
+                        // real hole in the dense result (typed arrays have none).
                         if !is_present(i) {
-                            out.push(NanBox::undefined());
+                            out.push(if self.realm.typed_kind(handle).is_some() {
+                                NanBox::undefined()
+                            } else {
+                                NanBox::hole()
+                            });
                             continue;
                         }
                         let cb_args = [*e, NanBox::number(i as f64), arr];
@@ -3074,12 +3139,14 @@ impl<'a> Interp<'a> {
                 "at" => {
                     let i = self.coerce_to_integer_or_infinity(arg(0))?;
                     let idx = if i < 0.0 { elems.len() as f64 + i } else { i };
-                    return Ok(Some(
-                        as_index(idx)
-                            .and_then(|u| elems.get(u))
-                            .copied()
-                            .unwrap_or(NanBox::undefined()),
-                    ));
+                    let v = as_index(idx)
+                        .and_then(|u| elems.get(u))
+                        .copied()
+                        .unwrap_or(NanBox::undefined());
+                    // `at` reads via `[[Get]]`: a hole reads `undefined` (it does
+                    // not consult the prototype for a typed array; for a plain
+                    // array `undefined` matches because `at` returns the value).
+                    return Ok(Some(if v.is_hole() { NanBox::undefined() } else { v }));
                 }
                 "lastIndexOf" => {
                     let target = arg(0);
@@ -3258,6 +3325,33 @@ impl<'a> Interp<'a> {
                     self.realm.collection_clear(handle);
                     return Ok(Some(NanBox::undefined()));
                 }
+                // `Map.prototype.getOrInsert(key, value)` (upsert proposal): return
+                // the existing value if `key` is present, else insert `value` and
+                // return it. Only a non-weak Map (it returns a value, not the map).
+                "getOrInsert" if self.realm.collection_is_set(handle) == Some(false) => {
+                    self.guard_weak_key(handle, arg(0))?;
+                    if let Some(v) = self.realm.collection_get(handle, arg(0)) {
+                        return Ok(Some(v));
+                    }
+                    self.realm.collection_set(handle, arg(0), arg(1));
+                    return Ok(Some(arg(1)));
+                }
+                // `Map.prototype.getOrInsertComputed(key, callbackfn)`: return the
+                // existing value, else call `callbackfn(key)`, insert the result,
+                // and return it. The presence is re-checked *after* the callback
+                // (which may have mutated the map).
+                "getOrInsertComputed" if self.realm.collection_is_set(handle) == Some(false) => {
+                    self.guard_weak_key(handle, arg(0))?;
+                    self.require_callable(arg(1), "getOrInsertComputed callback")?;
+                    if let Some(v) = self.realm.collection_get(handle, arg(0)) {
+                        return Ok(Some(v));
+                    }
+                    let computed = self.call(arg(1), &[arg(0)])?;
+                    // Re-check: the callback may have inserted `key` itself; the
+                    // spec overwrites with the computed value either way.
+                    self.realm.collection_set(handle, arg(0), computed);
+                    return Ok(Some(computed));
+                }
                 "forEach" => {
                     let f = arg(0);
                     let this_arg = arg(1);
@@ -3302,8 +3396,10 @@ impl<'a> Interp<'a> {
                         .collect();
                     return Ok(Some(self.make_generator(arr)));
                 }
-                // ES2025 Set composition. The argument is treated as a set-like
-                // (any iterable supplies its elements).
+                // ES2025 Set composition (24.2.4). Each method reads a *Set Record*
+                // from its argument via `GetSetRecord` — `size` (a number, not NaN),
+                // a callable `has`, and a callable `keys` — and never treats the
+                // argument as a bare iterable (a string/array is a TypeError).
                 "union"
                 | "intersection"
                 | "difference"
@@ -3313,76 +3409,7 @@ impl<'a> Interp<'a> {
                 | "isDisjointFrom"
                     if self.realm.collection_is_set(handle) == Some(true) =>
                 {
-                    let mine: Vec<NanBox> = self
-                        .realm
-                        .collection_entries(handle)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(k, _)| k)
-                        .collect();
-                    let other = self.iterate_values(arg(0))?;
-                    let in_other = |this: &Self, v: NanBox| {
-                        other.iter().any(|o| this.realm.same_value_zero(*o, v))
-                    };
-                    let in_mine = |this: &Self, v: NanBox| {
-                        mine.iter().any(|m| this.realm.same_value_zero(*m, v))
-                    };
-                    // Predicate methods return a boolean.
-                    match method {
-                        "isSubsetOf" => {
-                            return Ok(Some(NanBox::boolean(
-                                mine.iter().all(|m| in_other(self, *m)),
-                            )));
-                        }
-                        "isSupersetOf" => {
-                            return Ok(Some(NanBox::boolean(
-                                other.iter().all(|o| in_mine(self, *o)),
-                            )));
-                        }
-                        "isDisjointFrom" => {
-                            return Ok(Some(NanBox::boolean(
-                                !mine.iter().any(|m| in_other(self, *m)),
-                            )));
-                        }
-                        _ => {}
-                    }
-                    // The rest build a new Set.
-                    let result = self.realm.new_collection(true);
-                    match method {
-                        "union" => {
-                            for e in mine.iter().chain(other.iter()) {
-                                self.realm.collection_set(result, *e, *e);
-                            }
-                        }
-                        "intersection" => {
-                            for e in &mine {
-                                if in_other(self, *e) {
-                                    self.realm.collection_set(result, *e, *e);
-                                }
-                            }
-                        }
-                        "difference" => {
-                            for e in &mine {
-                                if !in_other(self, *e) {
-                                    self.realm.collection_set(result, *e, *e);
-                                }
-                            }
-                        }
-                        // symmetricDifference: in exactly one of the two.
-                        _ => {
-                            for e in &mine {
-                                if !in_other(self, *e) {
-                                    self.realm.collection_set(result, *e, *e);
-                                }
-                            }
-                            for e in &other {
-                                if !in_mine(self, *e) {
-                                    self.realm.collection_set(result, *e, *e);
-                                }
-                            }
-                        }
-                    }
-                    return Ok(Some(NanBox::handle(result.to_raw())));
+                    return Ok(Some(self.set_composition(method, handle, arg(0))?));
                 }
                 _ => {
                     let _ = size;
@@ -3422,6 +3449,444 @@ impl<'a> Interp<'a> {
     /// `value` is `Some`, emits `attribute="V"` where `V` is `ToString(value)`
     /// with every `"` replaced by `&quot;`. The receiver bytes pass through
     /// verbatim (so lone surrogates survive).
+    /// Conformant *live* iteration for a sparse array's callback / scan methods
+    /// (ECMA-262 23.1.3.*): the length is read once, then each index is probed
+    /// with `HasProperty` (own-or-inherited, skipping holes) and read with `Get`
+    /// at that step — so mutations made by the callback / a getter mid-iteration
+    /// are observed. The callback receives `(value, index, O)` with `thisArg`.
+    fn array_iter_sparse(
+        &mut self,
+        method: &str,
+        handle: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+        let f = arg(0);
+        let this_arg = arg(1);
+        let o = NanBox::handle(handle.to_raw());
+        let len = self.realm.array_length(handle).unwrap_or(0);
+        // `indexOf`/`lastIndexOf` take a search target + optional fromIndex; the
+        // rest require a callable callback (already validated upstream, but a
+        // sparse path is reached after that check).
+        match method {
+            "indexOf" => {
+                let target = arg(0);
+                let from = self.array_from_index_checked(arg(1), len)?;
+                for i in from..len {
+                    let key = alloc::format!("{i}");
+                    if self.has_property(handle, &key) {
+                        let v = self.read_member(handle, &key)?;
+                        if self.realm.strict_equals(v, target) {
+                            return Ok(NanBox::number(i as f64));
+                        }
+                    }
+                }
+                return Ok(NanBox::number(-1.0));
+            }
+            "lastIndexOf" => {
+                let target = arg(0);
+                if len == 0 {
+                    return Ok(NanBox::number(-1.0));
+                }
+                let from = if args.len() >= 2 {
+                    let n = self.coerce_to_integer_or_infinity(arg(1))?;
+                    if n < 0.0 {
+                        (len as f64 + n) as i64
+                    } else {
+                        (n as i64).min(len as i64 - 1)
+                    }
+                } else {
+                    len as i64 - 1
+                };
+                let mut i = from;
+                while i >= 0 {
+                    let key = alloc::format!("{i}");
+                    if self.has_property(handle, &key) {
+                        let v = self.read_member(handle, &key)?;
+                        if self.realm.strict_equals(v, target) {
+                            return Ok(NanBox::number(i as f64));
+                        }
+                    }
+                    i -= 1;
+                }
+                return Ok(NanBox::number(-1.0));
+            }
+            _ => {}
+        }
+        self.require_callable(f, &alloc::format!("{method} callback"))?;
+        match method {
+            "forEach" => {
+                for i in 0..len {
+                    let key = alloc::format!("{i}");
+                    if self.has_property(handle, &key) {
+                        let v = self.read_member(handle, &key)?;
+                        self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                    }
+                }
+                Ok(NanBox::undefined())
+            }
+            "map" => {
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    let key = alloc::format!("{i}");
+                    if self.has_property(handle, &key) {
+                        let v = self.read_member(handle, &key)?;
+                        out.push(self.call_with_this(
+                            f,
+                            this_arg,
+                            &[v, NanBox::number(i as f64), o],
+                        )?);
+                    } else {
+                        out.push(NanBox::hole());
+                    }
+                }
+                Ok(NanBox::handle(self.realm.new_array(out).to_raw()))
+            }
+            "filter" => {
+                let mut out = Vec::new();
+                for i in 0..len {
+                    let key = alloc::format!("{i}");
+                    if self.has_property(handle, &key) {
+                        let v = self.read_member(handle, &key)?;
+                        let r =
+                            self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                        if self.realm.truthy(r) {
+                            out.push(v);
+                        }
+                    }
+                }
+                Ok(NanBox::handle(self.realm.new_array(out).to_raw()))
+            }
+            "some" => {
+                for i in 0..len {
+                    let key = alloc::format!("{i}");
+                    if self.has_property(handle, &key) {
+                        let v = self.read_member(handle, &key)?;
+                        let r =
+                            self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                        if self.realm.truthy(r) {
+                            return Ok(NanBox::boolean(true));
+                        }
+                    }
+                }
+                Ok(NanBox::boolean(false))
+            }
+            "every" => {
+                for i in 0..len {
+                    let key = alloc::format!("{i}");
+                    if self.has_property(handle, &key) {
+                        let v = self.read_member(handle, &key)?;
+                        let r =
+                            self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                        if !self.realm.truthy(r) {
+                            return Ok(NanBox::boolean(false));
+                        }
+                    }
+                }
+                Ok(NanBox::boolean(true))
+            }
+            // `find`/`findIndex`/`findLast`/`findLastIndex` do NOT skip holes — they
+            // visit every index `[0,len)` (or reverse), reading a hole as undefined.
+            "find" | "findIndex" => {
+                for i in 0..len {
+                    let v = self.read_member(handle, &alloc::format!("{i}"))?;
+                    let r = self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                    if self.realm.truthy(r) {
+                        return Ok(if method == "find" {
+                            v
+                        } else {
+                            NanBox::number(i as f64)
+                        });
+                    }
+                }
+                Ok(if method == "find" {
+                    NanBox::undefined()
+                } else {
+                    NanBox::number(-1.0)
+                })
+            }
+            "findLast" | "findLastIndex" => {
+                let mut i = len as i64 - 1;
+                while i >= 0 {
+                    let v = self.read_member(handle, &alloc::format!("{i}"))?;
+                    let r = self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                    if self.realm.truthy(r) {
+                        return Ok(if method == "findLast" {
+                            v
+                        } else {
+                            NanBox::number(i as f64)
+                        });
+                    }
+                    i -= 1;
+                }
+                Ok(if method == "findLast" {
+                    NanBox::undefined()
+                } else {
+                    NanBox::number(-1.0)
+                })
+            }
+            "reduce" => {
+                let mut acc;
+                let mut start = 0usize;
+                if args.len() >= 2 {
+                    acc = arg(1);
+                } else {
+                    let mut seed = None;
+                    while start < len {
+                        let key = alloc::format!("{start}");
+                        if self.has_property(handle, &key) {
+                            seed = Some(self.read_member(handle, &key)?);
+                            start += 1;
+                            break;
+                        }
+                        start += 1;
+                    }
+                    match seed {
+                        Some(s) => acc = s,
+                        None => {
+                            let m = self.new_str("Reduce of empty array with no initial value");
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
+                    }
+                }
+                for i in start..len {
+                    let key = alloc::format!("{i}");
+                    if self.has_property(handle, &key) {
+                        let v = self.read_member(handle, &key)?;
+                        acc = self.call(f, &[acc, v, NanBox::number(i as f64), o])?;
+                    }
+                }
+                Ok(acc)
+            }
+            "reduceRight" => {
+                let mut acc;
+                let mut idx = len as i64 - 1;
+                if args.len() >= 2 {
+                    acc = arg(1);
+                } else {
+                    let mut seed = None;
+                    while idx >= 0 {
+                        let key = alloc::format!("{idx}");
+                        if self.has_property(handle, &key) {
+                            seed = Some(self.read_member(handle, &key)?);
+                            idx -= 1;
+                            break;
+                        }
+                        idx -= 1;
+                    }
+                    match seed {
+                        Some(s) => acc = s,
+                        None => {
+                            let m = self.new_str("Reduce of empty array with no initial value");
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
+                    }
+                }
+                while idx >= 0 {
+                    let key = alloc::format!("{idx}");
+                    if self.has_property(handle, &key) {
+                        let v = self.read_member(handle, &key)?;
+                        acc = self.call(f, &[acc, v, NanBox::number(idx as f64), o])?;
+                    }
+                    idx -= 1;
+                }
+                Ok(acc)
+            }
+            _ => Ok(NanBox::undefined()),
+        }
+    }
+
+    /// `GetSetRecord(obj)` (ECMA-262 24.2.1.2): validates `obj` is a set-like —
+    /// an Object with a numeric, non-NaN `size`, a callable `has`, and a callable
+    /// `keys` — returning `(obj, intSize, has, keys)`. A non-object, a NaN `size`,
+    /// or a non-callable `has`/`keys` is a TypeError.
+    fn get_set_record(
+        &mut self,
+        other: NanBox,
+    ) -> Result<(Handle, f64, NanBox, NanBox), ExecError> {
+        let Some(obj) = other
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|_| self.is_object_value(other))
+        else {
+            return Err(self.type_error("Set method argument must be an object"));
+        };
+        // Get(obj, "size") → ToNumber; a NaN (incl. `undefined`) is a TypeError.
+        let size_raw = self.read_member(obj, "size")?;
+        let size_num = self.coerce_to_number(size_raw)?;
+        let size = self.realm.to_number(size_num);
+        if size.is_nan() {
+            return Err(self.type_error("set-like 'size' must not be NaN"));
+        }
+        // intSize = ToIntegerOrInfinity(size), but a negative size is a RangeError.
+        // (`trunc_toward_zero` is the no_std-safe `f64::trunc`; `size` is finite or
+        // ±Infinity here, never NaN.)
+        if size < 0.0 {
+            let m = self.new_str("set-like 'size' must not be negative");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        let int_size = if size.is_infinite() {
+            size
+        } else {
+            trunc_toward_zero(size)
+        };
+        let has = self.read_member(obj, "has")?;
+        self.require_callable(has, "set-like 'has'")?;
+        let keys = self.read_member(obj, "keys")?;
+        self.require_callable(keys, "set-like 'keys'")?;
+        Ok((obj, int_size, has, keys))
+    }
+
+    /// Drives the set-like record's `keys()` iterator to completion, returning
+    /// every yielded value (used by the composition methods that must iterate the
+    /// argument rather than probe it with `has`). `-0` is canonicalized to `+0`.
+    fn set_record_keys(&mut self, obj: Handle, keys: NanBox) -> Result<Vec<NanBox>, ExecError> {
+        let iter = self.call_with_this(keys, NanBox::handle(obj.to_raw()), &[])?;
+        let Some(ih) = iter.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("set-like 'keys' did not return an iterator"));
+        };
+        let next = self.read_member(ih, "next")?;
+        let mut out = Vec::new();
+        while let Some(v) = self.iter_step(ih, next)? {
+            // CanonicalizeKeyedCollectionKey: `-0` is stored/compared as `+0`.
+            let v = if v.as_number() == Some(0.0) {
+                NanBox::number(0.0)
+            } else {
+                v
+            };
+            out.push(v);
+        }
+        Ok(out)
+    }
+
+    /// The ES2025 Set composition methods over a `GetSetRecord` argument.
+    fn set_composition(
+        &mut self,
+        method: &str,
+        handle: Handle,
+        other: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let (obj, other_size, has, keys) = self.get_set_record(other)?;
+        let mine: Vec<NanBox> = self
+            .realm
+            .collection_entries(handle)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let my_size = mine.len() as f64;
+        // `other.has(v)` (with `obj` as `this`), coerced to a boolean.
+        let other_has = |this: &mut Self, v: NanBox| -> Result<bool, ExecError> {
+            let r = this.call_with_this(has, NanBox::handle(obj.to_raw()), &[v])?;
+            Ok(this.realm.truthy(r))
+        };
+        let in_mine =
+            |this: &Self, v: NanBox| mine.iter().any(|m| this.realm.same_value_zero(*m, v));
+
+        match method {
+            "isSubsetOf" => {
+                if my_size > other_size {
+                    return Ok(NanBox::boolean(false));
+                }
+                for m in &mine {
+                    if !other_has(self, *m)? {
+                        return Ok(NanBox::boolean(false));
+                    }
+                }
+                Ok(NanBox::boolean(true))
+            }
+            "isSupersetOf" => {
+                if my_size < other_size {
+                    return Ok(NanBox::boolean(false));
+                }
+                for k in self.set_record_keys(obj, keys)? {
+                    if !in_mine(self, k) {
+                        return Ok(NanBox::boolean(false));
+                    }
+                }
+                Ok(NanBox::boolean(true))
+            }
+            "isDisjointFrom" => {
+                if my_size <= other_size {
+                    for m in &mine {
+                        if other_has(self, *m)? {
+                            return Ok(NanBox::boolean(false));
+                        }
+                    }
+                } else {
+                    for k in self.set_record_keys(obj, keys)? {
+                        if in_mine(self, k) {
+                            return Ok(NanBox::boolean(false));
+                        }
+                    }
+                }
+                Ok(NanBox::boolean(true))
+            }
+            "union" => {
+                let result = self.realm.new_collection(true);
+                for m in &mine {
+                    self.realm.collection_set(result, *m, *m);
+                }
+                for k in self.set_record_keys(obj, keys)? {
+                    self.realm.collection_set(result, k, k);
+                }
+                Ok(NanBox::handle(result.to_raw()))
+            }
+            "intersection" => {
+                let result = self.realm.new_collection(true);
+                if my_size <= other_size {
+                    for m in &mine {
+                        if other_has(self, *m)? {
+                            self.realm.collection_set(result, *m, *m);
+                        }
+                    }
+                } else {
+                    for k in self.set_record_keys(obj, keys)? {
+                        if in_mine(self, k) {
+                            self.realm.collection_set(result, k, k);
+                        }
+                    }
+                }
+                Ok(NanBox::handle(result.to_raw()))
+            }
+            "difference" => {
+                let result = self.realm.new_collection(true);
+                for m in &mine {
+                    self.realm.collection_set(result, *m, *m);
+                }
+                if my_size <= other_size {
+                    for m in &mine {
+                        if other_has(self, *m)? {
+                            self.realm.collection_delete(result, *m);
+                        }
+                    }
+                } else {
+                    for k in self.set_record_keys(obj, keys)? {
+                        if in_mine(self, k) {
+                            self.realm.collection_delete(result, k);
+                        }
+                    }
+                }
+                Ok(NanBox::handle(result.to_raw()))
+            }
+            // symmetricDifference: in exactly one of the two.
+            _ => {
+                let result = self.realm.new_collection(true);
+                for m in &mine {
+                    self.realm.collection_set(result, *m, *m);
+                }
+                for k in self.set_record_keys(obj, keys)? {
+                    if in_mine(self, k) {
+                        self.realm.collection_delete(result, k);
+                    } else {
+                        self.realm.collection_set(result, k, k);
+                    }
+                }
+                Ok(NanBox::handle(result.to_raw()))
+            }
+        }
+    }
+
     fn create_html(
         &mut self,
         s_bytes: &[u8],

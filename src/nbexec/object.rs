@@ -414,14 +414,10 @@ impl<'a> Interp<'a> {
     pub(crate) fn has_property(&mut self, obj: Handle, key: &str) -> bool {
         let mut cur = Some(obj);
         while let Some(c) = cur {
-            let here = if let Some(len) = self.realm.array_length(c) {
-                key == "length"
-                    || key.parse::<usize>().is_ok_and(|i| i < len)
-                    || self.realm.has_own(c, key)
-            } else {
-                self.realm.has_own(c, key)
-            };
-            if here {
+            // `has_own` already reports an in-range non-hole index (and `length`)
+            // for an array, so it suffices for every cell kind. A hole is absent
+            // here but may still be inherited, so the prototype walk continues.
+            if self.realm.has_own(c, key) {
                 return true;
             }
             cur = self.realm.object_proto(c);
@@ -1506,8 +1502,8 @@ impl<'a> Interp<'a> {
     /// its internal `"\0sym:<id>"` storage key), for proxy ownKeys invariants.
     fn target_own_key_set(&mut self, target: Handle) -> Vec<String> {
         let mut out = Vec::new();
-        if let Some(len) = self.realm.array_length(target) {
-            for i in 0..len {
+        if let Some(indices) = self.realm.array_present_indices(target) {
+            for i in indices {
                 out.push(alloc::format!("{i}"));
             }
             out.push(String::from("length"));
@@ -1804,10 +1800,10 @@ impl<'a> Interp<'a> {
         // object, so fall back to `aux_named_keys` like `Object.keys`. An array's
         // own enumerable keys also include its integer indices.
         let mut keys: Vec<alloc::string::String> = Vec::new();
-        if let Some(len) = self.realm.array_length(descs)
+        if let Some(indices) = self.realm.array_present_indices(descs)
             && !self.realm.is_vm_function(descs)
         {
-            for i in 0..len {
+            for i in indices {
                 keys.push(alloc::format!("{i}"));
             }
         }

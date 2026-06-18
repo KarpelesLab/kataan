@@ -332,10 +332,10 @@ impl<'a> Interp<'a> {
                     // ascending order) — stored as elements, not named properties.
                     // A VM closure backs onto an array but is a function, so its
                     // "indices" (captured cells) are not enumerable keys.
-                    if let Some(len) = self.realm.array_length(h)
+                    if let Some(indices) = self.realm.array_present_indices(h)
                         && !self.realm.is_vm_function(h)
                     {
-                        for i in 0..len {
+                        for i in indices {
                             keys.push(alloc::format!("{i}"));
                         }
                     }
@@ -1391,7 +1391,29 @@ impl<'a> Interp<'a> {
                 view
             }
             // `get %TypedArray%[Symbol.species]` — returns the receiver constructor.
+            // (Also shared by `Map`/`Set`/… species getters, which all return `this`.)
             N_TYPED_ARRAY_SPECIES => self.this_val,
+            // `get Map.prototype.size` / `get Set.prototype.size` — brand-checked.
+            // `this` must be a non-weak Map (resp. Set); else a TypeError.
+            N_MAP_SIZE | N_SET_SIZE => {
+                let want_set = id == N_SET_SIZE;
+                let ok = self
+                    .this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| {
+                        self.realm.collection_is_set(h) == Some(want_set)
+                            && !self.realm.collection_is_weak(h)
+                    });
+                if !ok {
+                    let what = if want_set { "Set" } else { "Map" };
+                    return Err(self.type_error(&alloc::format!(
+                        "get {what}.prototype.size called on an incompatible receiver"
+                    )));
+                }
+                let h = Handle::from_raw(self.this_val.as_handle().unwrap());
+                NanBox::number(self.realm.collection_size(h).unwrap_or(0) as f64)
+            }
             // `get %TypedArray%.prototype[Symbol.toStringTag]` — the concrete view
             // name (e.g. "Uint8Array") when `this` is a typed array, else
             // `undefined` (no exception per spec).

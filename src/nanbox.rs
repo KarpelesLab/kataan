@@ -41,6 +41,13 @@ const TAG_UNDEFINED: u64 = QNAN | 0x01;
 const TAG_NULL: u64 = QNAN | 0x02;
 const TAG_FALSE: u64 = QNAN | 0x03;
 const TAG_TRUE: u64 = QNAN | 0x04;
+/// An array *hole* (an elision / absent index in a sparse `Cell::Array`). It is
+/// an internal sentinel that never escapes to user code: a `[[Get]]` of a hole
+/// index walks the prototype chain (and yields `undefined` if nothing is found),
+/// `[[HasProperty]]`/`in`/`Object.keys`/`for-in`/the iteration built-ins all
+/// treat it as absent. It decodes (`unpack`/`is_undefined`/`to_boolean`/…) as
+/// `undefined` so any accidental leak is harmless.
+const TAG_HOLE: u64 = QNAN | 0x05;
 
 /// The canonical quiet-NaN payload a `f64` NaN is normalized to, chosen so that
 /// `(bits & QNAN) != QNAN` (i.e. it still reads back as a number).
@@ -75,6 +82,22 @@ impl NanBox {
     #[must_use]
     pub const fn null() -> Self {
         Self(TAG_NULL)
+    }
+
+    /// An array hole — the internal absent-index sentinel for a sparse
+    /// `Cell::Array` slot. It never escapes to user code: it decodes as
+    /// `undefined`, while [`is_hole`](NanBox::is_hole) distinguishes it so a
+    /// `[[Get]]` of the slot consults the prototype and `[[HasProperty]]` /
+    /// enumeration / the iteration built-ins treat it as absent.
+    #[must_use]
+    pub const fn hole() -> Self {
+        Self(TAG_HOLE)
+    }
+
+    /// Whether this is the array-hole sentinel.
+    #[must_use]
+    pub const fn is_hole(self) -> bool {
+        self.0 == TAG_HOLE
     }
 
     /// A boolean.
@@ -127,10 +150,11 @@ impl NanBox {
         !self.is_number() && (self.0 & SIGN) == SIGN
     }
 
-    /// Whether this is `undefined`.
+    /// Whether this is `undefined`. A leaked array hole also reports `true`
+    /// (it decodes as `undefined`), so callers never observe the sentinel.
     #[must_use]
     pub const fn is_undefined(self) -> bool {
-        self.0 == TAG_UNDEFINED
+        self.0 == TAG_UNDEFINED || self.0 == TAG_HOLE
     }
 
     /// Whether this is `null`.
@@ -182,7 +206,7 @@ impl NanBox {
             return Unpacked::Number(f64::from_bits(self.0));
         }
         match self.0 {
-            TAG_UNDEFINED => Unpacked::Undefined,
+            TAG_UNDEFINED | TAG_HOLE => Unpacked::Undefined,
             TAG_NULL => Unpacked::Null,
             TAG_TRUE => Unpacked::Bool(true),
             TAG_FALSE => Unpacked::Bool(false),

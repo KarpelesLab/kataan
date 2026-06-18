@@ -840,7 +840,7 @@ impl<'a> Interp<'a> {
                 let mut items = Vec::new();
                 for el in elements {
                     match el {
-                        ArrayElement::Hole => items.push(NanBox::undefined()),
+                        ArrayElement::Hole => items.push(NanBox::hole()),
                         ArrayElement::Item(e) => items.push(self.eval(e)?),
                         ArrayElement::Spread(e) => {
                             let v = self.eval(e)?;
@@ -1192,6 +1192,28 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `[[Get]]` of integer index `i` on an array-like receiver, returning
+    /// `Some(value)` when the index is a *present* own element (a typed-array
+    /// in-bounds element, or a plain-array in-range non-hole slot), or `None`
+    /// when the read must fall through to the named `[[Get]]` (a hole or an
+    /// out-of-range index, which consults the prototype chain).
+    pub(crate) fn array_element_get(
+        &mut self,
+        handle: crate::heap::Handle,
+        i: usize,
+    ) -> Option<NanBox> {
+        if self.realm.typed_kind(handle).is_some() {
+            return Some(self.realm.get_element(handle, i));
+        }
+        if i < self.realm.array_length(handle).unwrap_or(0) {
+            let v = self.realm.get_element(handle, i);
+            if !v.is_hole() {
+                return Some(v);
+            }
+        }
+        None
+    }
+
     pub(crate) fn member(
         &mut self,
         handle: crate::heap::Handle,
@@ -1201,14 +1223,22 @@ impl<'a> Interp<'a> {
             PropertyKey::Number(n)
                 if as_index(*n).is_some() && self.realm.is_array_like(handle) =>
             {
-                Ok(self.realm.get_element(handle, as_index(*n).unwrap()))
+                let i = as_index(*n).unwrap();
+                if let Some(v) = self.array_element_get(handle, i) {
+                    return Ok(v);
+                }
+                // A hole / out-of-range index on a plain array consults the prototype.
+                self.read_member(handle, &alloc::format!("{i}"))
             }
             PropertyKey::Computed(e) => {
                 let k = self.eval(e)?;
                 if let Some(i) = k.as_number().and_then(as_index)
                     && self.realm.is_array_like(handle)
                 {
-                    return Ok(self.realm.get_element(handle, i));
+                    if let Some(v) = self.array_element_get(handle, i) {
+                        return Ok(v);
+                    }
+                    return self.read_member(handle, &alloc::format!("{i}"));
                 }
                 let name = self.coerce_property_key(k)?;
                 self.read_member(handle, &name)
@@ -1261,7 +1291,19 @@ impl<'a> Interp<'a> {
             // 2**32−1 is an ordinary named property. Typed arrays accept any index.
             && (self.realm.typed_kind(handle).is_some() || (i as u64) < u64::from(u32::MAX))
         {
-            return Ok(self.realm.get_element(handle, i));
+            // A typed array reads directly (no holes, no prototype indices). A plain
+            // array reads the element only when the index is a present own slot; a
+            // hole or an out-of-range index falls through to the named `[[Get]]`
+            // (which walks the prototype chain).
+            if self.realm.typed_kind(handle).is_some() {
+                return Ok(self.realm.get_element(handle, i));
+            }
+            if i < self.realm.array_length(handle).unwrap_or(0) {
+                let v = self.realm.get_element(handle, i);
+                if !v.is_hole() {
+                    return Ok(v);
+                }
+            }
         }
         let name = self.member_key(key);
         self.read_member(handle, &name)
@@ -1464,8 +1506,16 @@ impl<'a> Interp<'a> {
             && let Ok(i) = name.parse::<usize>()
             && alloc::format!("{i}") == name
             && (i as u64) < u64::from(u32::MAX)
+            && i < self.realm.array_length(handle).unwrap_or(0)
         {
-            return Ok(self.realm.get_element(handle, i));
+            let v = self.realm.get_element(handle, i);
+            // A genuine hole (absent index) is not an own property: the lookup
+            // continues up the `[[Prototype]]` chain (handled by the generic walk
+            // below) instead of resolving to `undefined` here. An out-of-range
+            // index (`i >= length`) likewise falls through (guarded above).
+            if !v.is_hole() {
+                return Ok(v);
+            }
         }
         // Integer-indexed exotic `[[Get]]`: when `handle` is a typed array and `name`
         // is a *canonical numeric index*, the result is the element if the index is
@@ -2041,7 +2091,11 @@ impl<'a> Interp<'a> {
                     && alloc::format!("{i}") == name
                 {
                     if i < self.realm.array_length(p).unwrap_or(0) {
-                        return Ok(self.realm.get_element(p, i));
+                        let v = self.realm.get_element(p, i);
+                        // A hole on a prototype array is also absent — keep walking.
+                        if !v.is_hole() {
+                            return Ok(v);
+                        }
                     }
                 } else if name == "length"
                     && let Some(len) = self.realm.array_length(p)
@@ -3015,13 +3069,10 @@ impl<'a> Interp<'a> {
                             }
                             false
                         };
-                        if let Some(len) = self.realm.array_length(h) {
-                            key == "length"
-                                || key.parse::<usize>().is_ok_and(|i| i < len)
-                                || in_chain()
-                        } else {
-                            in_chain()
-                        }
+                        // `has_own` already reports an array's in-range non-hole
+                        // indices and `length`, so the chain walk suffices (a hole
+                        // is absent unless inherited).
+                        in_chain()
                     }
                     None => false,
                 };

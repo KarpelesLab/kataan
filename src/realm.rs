@@ -1443,8 +1443,11 @@ impl Realm {
         // An array's own keys: its indices (ascending), then `length`, then any
         // aux-stored named properties — matching `[[OwnPropertyKeys]]` for an Array.
         if let Some(a) = self.heap.get(handle).and_then(Cell::as_array) {
-            let mut names: Vec<alloc::string::String> =
-                (0..a.len()).map(|i| alloc::format!("{i}")).collect();
+            // Holes are absent indices — excluded from `[[OwnPropertyKeys]]`.
+            let mut names: Vec<alloc::string::String> = (0..a.len())
+                .filter(|&i| !a[i].is_hole())
+                .map(|i| alloc::format!("{i}"))
+                .collect();
             names.push(alloc::string::String::from("length"));
             if let Some(aux) = self
                 .aux_props
@@ -1676,6 +1679,25 @@ impl Realm {
         }
     }
 
+    /// Whether the dense array slot at `index` is a *hole* (an absent index).
+    /// `false` for a non-array, an out-of-range index, or a present value.
+    #[must_use]
+    pub fn array_hole_at(&self, handle: Handle, index: usize) -> bool {
+        matches!(
+            self.heap.get(handle).and_then(Cell::as_array),
+            Some(a) if a.get(index).is_some_and(|e| e.is_hole())
+        )
+    }
+
+    /// The *present* (non-hole) integer index keys of a dense array, ascending —
+    /// the array's own enumerable indices for `Object.keys`/`for-in`/spread/etc.
+    /// `None` if `handle` is not a plain array.
+    #[must_use]
+    pub fn array_present_indices(&self, handle: Handle) -> Option<Vec<usize>> {
+        let a = self.heap.get(handle).and_then(Cell::as_array)?;
+        Some((0..a.len()).filter(|&i| !a[i].is_hole()).collect())
+    }
+
     /// `arr[index]` — the element at `index`, or `undefined` if out of range or
     /// the cell is not an array (or typed-array view). Takes `&mut self` because a
     /// `BigInt64Array`/`BigUint64Array` element read allocates a `BigInt`.
@@ -1727,7 +1749,9 @@ impl Realm {
                     if new_len > self.limits.max_array_len {
                         return false;
                     }
-                    a.resize(new_len, NanBox::undefined());
+                    // The skipped slots between the old end and `index` become real
+                    // holes (absent indices), not `undefined` data properties.
+                    a.resize(new_len, NanBox::hole());
                 }
                 a[index] = value;
                 self.write_barrier(handle, value);
@@ -1808,11 +1832,14 @@ impl Realm {
     /// `arr.pop()` — removes and returns the last element (`undefined` if empty
     /// or not an array).
     pub fn array_pop(&mut self, handle: Handle) -> NanBox {
-        self.heap
+        let v = self
+            .heap
             .get_mut(handle)
             .and_then(Cell::as_array_mut)
             .and_then(Vec::pop)
-            .unwrap_or(NanBox::undefined())
+            .unwrap_or(NanBox::undefined());
+        // A popped hole reads as `undefined` (the sentinel never escapes).
+        if v.is_hole() { NanBox::undefined() } else { v }
     }
 
     /// The `typeof` string for the heap value at `handle` (`"string"`/`"object"`),
@@ -2060,7 +2087,11 @@ impl Realm {
             if let Ok(i) = key.parse::<usize>()
                 && i < a.len()
                 && alloc::format!("{i}") == key
+                && !a[i].is_hole()
             {
+                // A present (non-hole) in-range index is an own property. A hole
+                // falls through to the aux check below — `defineProperty(arr, i,
+                // {get/set})` records an accessor there over an empty slot.
                 return true;
             }
         }

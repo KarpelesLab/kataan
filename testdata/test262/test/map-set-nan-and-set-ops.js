@@ -26,5 +26,11 @@ assert.sameValue(new Set([1, 9]).isSubsetOf(a), false, "isSubsetOf false");
 assert.sameValue(a.isSupersetOf(new Set([1, 2])), true, "isSupersetOf");
 assert.sameValue(a.isDisjointFrom(new Set([8, 9])), true, "isDisjointFrom true");
 assert.sameValue(a.isDisjointFrom(b), false, "isDisjointFrom false");
-// The argument may be any iterable.
-assert.sameValue([...a.intersection([2, 3, 99])].join(","), "2,3", "intersection with an array argument");
+// The argument must be a *set-like* (GetSetRecord): an Object with a numeric
+// `size` and callable `has`/`keys`. A plain array is not set-like (no `has`,
+// `size` is `undefined`), so it is a TypeError — per ECMA-262 24.2.4 and the
+// official Test262 `Set/prototype/intersection/array-throws.js`.
+assert.throws(TypeError, function () { a.intersection([2, 3, 99]); }, "array argument is not set-like");
+// A genuine set-like object works (its `has`/`keys`/`size` are consulted).
+var setLike = { size: 2, has: function (v) { return v === 2 || v === 3; }, keys: function () { return [2, 3][Symbol.iterator](); } };
+assert.sameValue([...a.intersection(setLike)].join(","), "2,3", "intersection with a set-like object");

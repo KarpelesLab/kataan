@@ -471,6 +471,10 @@ const N_MATH_ROUND: u16 = 14;
 const N_MATH_SQRT: u16 = 15;
 const N_MAP: u16 = 16;
 const N_SET: u16 = 17;
+/// `get Map.prototype.size` — a brand-checking accessor (requires `[[MapData]]`).
+const N_MAP_SIZE: u16 = 580;
+/// `get Set.prototype.size` — a brand-checking accessor (requires `[[SetData]]`).
+const N_SET_SIZE: u16 = 581;
 const N_OBJECT_ASSIGN: u16 = 18;
 const N_OBJECT_ENTRIES: u16 = 19;
 const N_ARRAY_FROM: u16 = 20;
@@ -1108,7 +1112,17 @@ const SET_PROTO_METHODS: &[&str] = &[
 ];
 /// `Map.prototype` methods exposed as first-class values.
 const MAP_PROTO_METHODS: &[&str] = &[
-    "set", "get", "has", "delete", "clear", "forEach", "keys", "values", "entries",
+    "set",
+    "get",
+    "has",
+    "delete",
+    "clear",
+    "forEach",
+    "keys",
+    "values",
+    "entries",
+    "getOrInsert",
+    "getOrInsertComputed",
 ];
 /// `WeakMap.prototype` methods exposed as first-class values.
 const WEAKMAP_PROTO_METHODS: &[&str] = &["set", "get", "has", "delete"];
@@ -1185,6 +1199,8 @@ fn builtin_method_arity(name: &str) -> u32 {
         "slice" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
         | "replaceAll" | "padStart" | "padEnd" | "with" | "setInt8" | "setUint8" | "asIntN"
         | "asUintN" | "setMonth" | "setUTCMonth" | "setSeconds" | "setUTCSeconds" | "subarray"
+        // `Map.prototype.getOrInsert(key, value)` / `getOrInsertComputed(key, fn)`.
+        | "getOrInsert" | "getOrInsertComputed"
         // `Function.prototype.apply(thisArg, argArray)`.
         | "apply" => 2,
         // Three-argument `Date` setters.
@@ -1211,6 +1227,8 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_TYPED_ARRAY_ABSTRACT
         | N_TYPED_ARRAY_OF
         | N_TYPED_ARRAY_SPECIES
+        | N_MAP_SIZE
+        | N_SET_SIZE
         | N_TYPED_ARRAY_TO_STRING_TAG
         // `Intl.DurationFormat.length === 0` (no required constructor parameters).
         | N_INTL_DURATION_FORMAT
@@ -1785,6 +1803,52 @@ impl<'a> Interp<'a> {
 
     /// Installs `Ctor.prototype[Symbol.toStringTag] = tag` for a named global
     /// constructor (no-op if the constructor / its prototype is absent).
+    /// Installs `get <Ctor>.prototype.size` (a brand-checking accessor — the
+    /// `size` getter native validates `[[MapData]]`/`[[SetData]]`) and the
+    /// `get <Ctor>[Symbol.species]` static accessor (returns the receiver
+    /// constructor). Matches ECMA-262: `size` is non-enumerable + configurable
+    /// with no setter; `[Symbol.species]` likewise on the constructor.
+    fn install_collection_accessors(&mut self, ctor_name: &str, size_native: u16) {
+        let Some(ctor) = self
+            .current
+            .get(ctor_name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        let Some(proto) = self
+            .realm
+            .get_property(ctor, "prototype")
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        // `get <Ctor>.prototype.size`.
+        let size_get = self.new_named_native("get size", size_native);
+        self.install_fn_name_length(size_get, "get size", 0);
+        self.realm.define_accessor(
+            proto,
+            "size",
+            NanBox::handle(size_get.to_raw()),
+            NanBox::undefined(),
+        );
+        self.realm.mark_hidden(proto, "size");
+        // `get <Ctor>[Symbol.species]` returns `this` (shared species getter).
+        let species_sym = self.well_known_symbol("species");
+        let species_key = self.member_key(species_sym);
+        let species_get = self.new_named_native("get [Symbol.species]", N_TYPED_ARRAY_SPECIES);
+        self.install_fn_name_length(species_get, "get [Symbol.species]", 0);
+        self.realm.define_accessor(
+            ctor,
+            &species_key,
+            NanBox::handle(species_get.to_raw()),
+            NanBox::undefined(),
+        );
+        self.realm.mark_hidden(ctor, &species_key);
+    }
+
     fn install_proto_to_string_tag(&mut self, ctor_name: &str, tag: &str) {
         if let Some(proto) = self
             .current
@@ -2973,6 +3037,9 @@ impl<'a> Interp<'a> {
         // configurable string. (`Object.prototype.toString` reads it.)
         self.install_proto_to_string_tag("Set", "Set");
         self.install_proto_to_string_tag("Map", "Map");
+        // `Map.prototype.size`/`Set.prototype.size` accessors + `[Symbol.species]`.
+        self.install_collection_accessors("Map", N_MAP_SIZE);
+        self.install_collection_accessors("Set", N_SET_SIZE);
         self.install_proto_to_string_tag("WeakMap", "WeakMap");
         self.install_proto_to_string_tag("WeakSet", "WeakSet");
         self.install_proto_to_string_tag("Promise", "Promise");
