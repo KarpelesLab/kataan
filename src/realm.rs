@@ -1502,12 +1502,18 @@ impl Realm {
         // An array's own keys: its indices (ascending), then `length`, then any
         // aux-stored named properties — matching `[[OwnPropertyKeys]]` for an Array.
         if let Some(a) = self.heap.get(handle).and_then(Cell::as_array) {
-            // Holes are absent indices — excluded from `[[OwnPropertyKeys]]`.
-            let mut names: Vec<alloc::string::String> = (0..a.len())
+            // Dense present indices (holes are absent — excluded), as a set so an
+            // accessor-at-index (stored in the aux map, punched to a dense hole)
+            // is not duplicated.
+            let dense_len = a.len();
+            let mut index_keys: Vec<u32> = (0..dense_len)
                 .filter(|&i| !a[i].is_hole())
-                .map(|i| alloc::format!("{i}"))
+                .filter_map(|i| u32::try_from(i).ok())
                 .collect();
-            names.push(alloc::string::String::from("length"));
+            // Aux-stored properties split into integer-index keys (which join the
+            // element keys, ascending) and ordinary named keys (which follow
+            // `length`), per the array exotic `[[OwnPropertyKeys]]` ordering.
+            let mut named: Vec<alloc::string::String> = Vec::new();
             if let Some(aux) = self
                 .aux_props
                 .get(&handle.to_raw())
@@ -1515,13 +1521,29 @@ impl Realm {
                 .and_then(Cell::as_object)
             {
                 for k in aux
-                    .keys()
+                    .all_keys()
                     .iter()
                     .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
                 {
-                    names.push(alloc::string::String::from(*k));
+                    // A canonical array-index key (`"0".."4294967294"`, no leading
+                    // zeros) is an element key; anything else is a named key.
+                    if let Ok(n) = k.parse::<u32>()
+                        && n != u32::MAX
+                        && alloc::format!("{n}") == **k
+                    {
+                        if !index_keys.contains(&n) {
+                            index_keys.push(n);
+                        }
+                    } else {
+                        named.push(alloc::string::String::from(*k));
+                    }
                 }
             }
+            index_keys.sort_unstable();
+            let mut names: Vec<alloc::string::String> =
+                index_keys.iter().map(|i| alloc::format!("{i}")).collect();
+            names.push(alloc::string::String::from("length"));
+            names.extend(named);
             return Some(names);
         }
         // A typed array's own keys are its integer indices `0..length` (ascending),
@@ -1861,6 +1883,35 @@ impl Realm {
         }
     }
 
+    /// Punches a *hole* into the dense array store at `index`, growing the dense
+    /// `Vec` (with holes) to `index + 1` when the index is at/beyond the current
+    /// dense length — so `length` reports `index + 1`. Used by `defineProperty`
+    /// when an array index becomes a user accessor (the accessor lives in the aux
+    /// map; the dense slot must not shadow it with a stale data value, and the
+    /// exotic `length` must still grow per ArrayDefineOwnProperty 10.4.2.1).
+    /// No-op past the dense cap (the logical sparse length already covers it).
+    pub fn array_index_to_hole(&mut self, handle: Handle, index: usize) {
+        let cap = self.limits.max_array_len;
+        if let Some(a) = self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
+            if index < a.len() {
+                a[index] = NanBox::hole();
+            } else if index < cap {
+                a.resize(index + 1, NanBox::hole());
+            } else {
+                // Beyond the dense cap: record the logical length so `array_length`
+                // reports `index + 1` without materializing billions of slots.
+                let raw = handle.to_raw();
+                let cur = self
+                    .sparse_array_lengths
+                    .get(&raw)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(a.len());
+                self.sparse_array_lengths.insert(raw, cur.max(index + 1));
+            }
+        }
+    }
+
     /// Sets an array's `length` (`arr.length = n`): truncates if smaller, pads
     /// with `undefined` if larger. Returns `false` only if not an array.
     ///
@@ -1885,8 +1936,11 @@ impl Realm {
                     self.sparse_array_lengths.insert(raw, len);
                 } else {
                     // Within the dense cap: resize for real and drop any prior sparse
-                    // override (the dense length is now authoritative).
-                    a.resize(len, NanBox::undefined());
+                    // override (the dense length is now authoritative). Slots added
+                    // past the old end are *holes* (absent indices), not `undefined`
+                    // data properties — `new Array(10)` and `arr.length = 10` create
+                    // a sparse array whose indices report `HasProperty === false`.
+                    a.resize(len, NanBox::hole());
                     self.sparse_array_lengths.remove(&raw);
                 }
                 true
@@ -3537,7 +3591,21 @@ impl Realm {
                     (Some(ra), Some(rb)) => {
                         ra.len() == rb.len() && rope_bytes(ra) == rope_bytes(rb)
                     }
-                    _ => false, // distinct non-string references
+                    _ => {
+                        // Two distinct BigInt cells are `===` iff their mathematical
+                        // values are equal (BigInts are value types, not references).
+                        match (
+                            self.heap
+                                .get(Handle::from_raw(ha))
+                                .and_then(Cell::as_bigint),
+                            self.heap
+                                .get(Handle::from_raw(hb))
+                                .and_then(Cell::as_bigint),
+                        ) {
+                            (Some(ba), Some(bb)) => ba == bb,
+                            _ => false, // distinct non-string/non-bigint references
+                        }
+                    }
                 }
             }
             // At least one primitive: decided by the boxed value itself.

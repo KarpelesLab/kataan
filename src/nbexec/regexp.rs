@@ -250,6 +250,33 @@ impl<'a> Interp<'a> {
             .ok_or_else(|| self.type_error("RegExp constructor is not available"))
     }
 
+    /// `SpeciesConstructor(rx, %RegExp%)` (ECMA-262 7.3.22): `Get(rx,
+    /// "constructor")`; `undefined` → the default; a non-object constructor is a
+    /// TypeError; `Get(C, @@species)`; `undefined`/`null` → the default; an
+    /// `IsConstructor` species is returned, otherwise a TypeError. The result is
+    /// the constructor to `Construct` the splitter/matcher with.
+    fn regex_species_constructor(&mut self, rx: Handle) -> Result<NanBox, ExecError> {
+        let default = NanBox::handle(self.regexp_constructor_handle()?.to_raw());
+        let c = self.read_member(rx, "constructor")?;
+        if matches!(c.unpack(), Unpacked::Undefined) {
+            return Ok(default);
+        }
+        let Some(ch) = c.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("RegExp species constructor is not an object"));
+        };
+        let species_sym = self.well_known_symbol("species");
+        let species_key = self.member_key(species_sym);
+        let s = self.read_member(ch, &species_key)?;
+        if matches!(s.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Ok(default);
+        }
+        if self.is_constructor_value(s) {
+            Ok(s)
+        } else {
+            Err(self.type_error("RegExp species is not a constructor"))
+        }
+    }
+
     /// Allocates a RegExp instance and links its `[[Prototype]]` to
     /// `RegExp.prototype`. `lastIndex` starts at 0.
     pub(crate) fn new_regexp_instance(&mut self, source: &str, flags: &str) -> Handle {
@@ -283,19 +310,33 @@ impl<'a> Interp<'a> {
             return Ok(());
         }
         let n = self.realm.to_number(new);
-        // Mirror into the aux slot (so a `defineProperty`-created data slot reads
-        // back the written value) and the cell field (the search position).
-        if self.realm.has_own(handle, "lastIndex") {
+        // `lastIndex` is an ordinary data property that can hold *any* value (it is
+        // only `ToLength`'d when `exec` runs). A canonical non-negative integer is
+        // stored compactly in the cell's `usize` field; any other value (an object
+        // with a `valueOf`, a non-integer, a negative, `NaN`, a string, …) is
+        // preserved verbatim in an aux data slot so a later `Get` returns it
+        // unchanged (and its `valueOf` runs at `exec` time, not assignment time).
+        let is_canonical = new.as_number().is_some_and(|v| {
+            v.is_finite() && v >= 0.0 && v == (v as u64 as f64) && v <= u32::MAX as f64
+        });
+        if is_canonical {
+            // Drop any stale aux mirror so the compact cell field is authoritative.
+            if self.realm.has_own(handle, "lastIndex") {
+                self.realm.set_property(handle, "lastIndex", new);
+            }
+            self.realm.set_regex_last_index(handle, n as usize);
+        } else {
+            // Materialize (or update) the aux slot to hold the exact value.
             self.realm.set_property(handle, "lastIndex", new);
+            self.realm.set_regex_last_index(
+                handle,
+                if n.is_finite() && n >= 0.0 {
+                    n as usize
+                } else {
+                    0
+                },
+            );
         }
-        self.realm.set_regex_last_index(
-            handle,
-            if n.is_finite() && n >= 0.0 {
-                n as usize
-            } else {
-                0
-            },
-        );
         Ok(())
     }
 
@@ -692,15 +733,18 @@ impl<'a> Interp<'a> {
         };
         let s_bytes = self.coerce_to_string_bytes(string)?;
         let str_v = self.new_str_bytes(s_bytes);
-        // Save/restore lastIndex around the search (per spec; `Set(…, true)`).
+        // Save/restore `lastIndex` around the search via `[[Get]]`/`[[Set]]` (so a
+        // generic receiver's accessor / a throwing setter is observed, per spec).
         let prev = self.read_member(h, "lastIndex")?;
         if !self.same_value(prev, NanBox::number(0.0)) {
-            self.set_last_index(h, 0)?;
+            let key = self.new_str("lastIndex");
+            self.assign_member_value(h, key, NanBox::number(0.0))?;
         }
         let result = self.regexp_exec(rx, str_v)?;
         let cur = self.read_member(h, "lastIndex")?;
         if !self.same_value(cur, prev) {
-            self.set_last_index_value(h, prev)?;
+            let key = self.new_str("lastIndex");
+            self.assign_member_value(h, key, prev)?;
         }
         if matches!(result.unpack(), Unpacked::Null) {
             return Ok(NanBox::number(-1.0));
@@ -770,14 +814,19 @@ impl<'a> Interp<'a> {
         let flags = self.coerce_to_string(flags_v)?;
         let global = flags.contains('g');
         let unicode = flags.contains('u') || flags.contains('v');
-        // Construct a copy of `rx` (same source/flags, current lastIndex) so
-        // iteration does not disturb the original.
+        // Construct the matcher via `SpeciesConstructor(R, %RegExp%)` —
+        // `Construct(C, «R, flags»)` — then copy `R.lastIndex` so iteration does
+        // not disturb the original. A throwing constructor/species propagates.
+        let ctor = self.regex_species_constructor(h)?;
         let li_v = self.read_member(h, "lastIndex")?;
         let li = self.coerce_to_integer_or_infinity(li_v)?.max(0.0) as usize;
-        let (src, _) = self.realm.regexp_at(h).unwrap_or_default();
-        let matcher = self.new_regexp_instance(&src, &flags);
-        self.realm.set_regex_last_index(matcher, li);
-        let matcher_v = NanBox::handle(matcher.to_raw());
+        let flags_for_ctor = self.new_str(&flags);
+        let matcher_v = self.construct(ctor, &[rx, flags_for_ctor])?;
+        let Some(matcher) = matcher_v.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("RegExp @@matchAll matcher is not an object"));
+        };
+        let li_key = self.new_str("lastIndex");
+        self.assign_member_value(matcher, li_key, NanBox::number(li as f64))?;
         let mut out: Vec<NanBox> = Vec::new();
         loop {
             let result = self.regexp_exec(matcher_v, str_v)?;
@@ -832,18 +881,23 @@ impl<'a> Interp<'a> {
         let units: Vec<u16> = crate::wtf8::utf16_units(&s_bytes).collect();
         let s = crate::wtf8::to_string_lossy(&s_bytes);
         let str_v = self.new_str_bytes(s_bytes);
+        // SpeciesConstructor(rx, %RegExp%) — read *before* `flags` per spec order.
+        let ctor = self.regex_species_constructor(h)?;
         let flags_v = self.read_member(h, "flags")?;
         let flags = self.coerce_to_string(flags_v)?;
         let unicode = flags.contains('u') || flags.contains('v');
-        // The splitter is a copy of `rx` forced sticky (`y`).
+        // The splitter is `Construct(C, «rx, newFlags»)` with the source regex
+        // forced sticky (`y`).
         let new_flags = if flags.contains('y') {
             flags.clone()
         } else {
             alloc::format!("{flags}y")
         };
-        let (src, _) = self.realm.regexp_at(h).unwrap_or_default();
-        let splitter = self.new_regexp_instance(&src, &new_flags);
-        let splitter_v = NanBox::handle(splitter.to_raw());
+        let new_flags_v = self.new_str(&new_flags);
+        let splitter_v = self.construct(ctor, &[rx, new_flags_v])?;
+        let Some(splitter) = splitter_v.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("RegExp @@split splitter is not an object"));
+        };
         let lim = if matches!(limit.unpack(), Unpacked::Undefined) {
             u32::MAX as usize
         } else {
@@ -882,7 +936,11 @@ impl<'a> Interp<'a> {
         let mut p = 0usize; // start of the current segment
         let mut q = 0usize; // search cursor
         while q < size {
-            self.realm.set_regex_last_index(splitter, q);
+            // `Set(splitter, "lastIndex", q, true)` — goes through `[[Set]]` so a
+            // custom species splitter observes the write (and a throwing setter
+            // propagates).
+            let li_key = self.new_str("lastIndex");
+            self.assign_member_value(splitter, li_key, NanBox::number(q as f64))?;
             let z = self.regexp_exec(splitter_v, str_v)?;
             if matches!(z.unpack(), Unpacked::Null) {
                 q = self.advance_string_index(&s, q, unicode);

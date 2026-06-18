@@ -1164,7 +1164,33 @@ impl<'a> Interp<'a> {
                     }
                     out
                 };
-                NanBox::handle(self.realm.new_array(items).to_raw())
+                // When `Array.from` is invoked with a constructor `this` (e.g.
+                // `Array.from.call(C, …)` or a subclass `C.from(…)`), the result is
+                // `Construct(C, «len»)` populated via `CreateDataPropertyOrThrow`
+                // and given the final `length`; only the default `%Array%`/non-
+                // constructor `this` builds a plain dense array.
+                let this_c = self.this_val;
+                let is_array_ctor =
+                    self.current.get("Array").and_then(|v| v.as_handle()) == this_c.as_handle();
+                if self.is_constructor_value(this_c) && !is_array_ctor {
+                    // `Construct(C, «len»)`, then `CreateDataPropertyOrThrow` each
+                    // element and `Set(A, "length", len)`.
+                    let len = items.len();
+                    let target = self.construct(this_c, &[NanBox::number(len as f64)])?;
+                    let Some(th) = target.as_handle().map(Handle::from_raw) else {
+                        return Err(
+                            self.type_error("Array.from constructor did not return an object")
+                        );
+                    };
+                    for (i, e) in items.iter().enumerate() {
+                        self.realm.set_property(th, &alloc::format!("{i}"), *e);
+                    }
+                    let len_key = self.new_str("length");
+                    self.assign_member_value(th, len_key, NanBox::number(len as f64))?;
+                    target
+                } else {
+                    NanBox::handle(self.realm.new_array(items).to_raw())
+                }
             }
             N_ARRAY_OF => NanBox::handle(self.realm.new_array(args.to_vec()).to_raw()),
             // `%IteratorPrototype%[Symbol.iterator]()` — an iterator is its own

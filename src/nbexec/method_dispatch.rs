@@ -2191,6 +2191,86 @@ impl<'a> Interp<'a> {
             "toSorted",
             "toSpliced",
         ];
+        // The *mutating* `Array.prototype` methods are intentionally generic: on a
+        // non-array array-like receiver they read `length`, then `[[Get]]`/`[[Set]]`/
+        // `[[Delete]]` indices and finally `[[Set]]` the new `length`. Run them
+        // directly against the original object (no materialize-into-temp, which would
+        // discard the writes) when reached via `Array.prototype.<m>.call(o)` or an
+        // inherited array prototype.
+        const MUTATING_GENERIC: &[&str] = &[
+            "push",
+            "pop",
+            "shift",
+            "unshift",
+            "reverse",
+            "fill",
+            "copyWithin",
+            "splice",
+            "sort",
+        ];
+        if self.realm.is_generic_array_like_target(handle)
+            && MUTATING_GENERIC.contains(&method)
+            && (array_proto_generic || self.inherits_array_proto(handle))
+            && !self.inherits_iterator_proto(handle)
+        {
+            return Ok(Some(self.array_like_mutate(method, handle, args)?));
+        }
+        // The pure *scanning* methods (no result array proportional to `length`)
+        // run lazily over a generic array-like via `[[Get]]`/`HasProperty` with
+        // early exit — so a huge `{length:"Infinity"}` receiver scans without
+        // materializing (and without the RangeError the dense path would raise).
+        const LAZY_SCAN_GENERIC: &[&str] = &[
+            "indexOf",
+            "lastIndexOf",
+            "includes",
+            "some",
+            "every",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "forEach",
+            "reduce",
+            "reduceRight",
+        ];
+        // A String primitive/wrapper receiver exposes its UTF-16 units as own
+        // data properties that `HasProperty` (used by the lazy scan) cannot see;
+        // keep those on the materialization path (which has the `is_string_like`
+        // special case).
+        let is_string_receiver = self.realm.string_value(handle).is_some()
+            || self
+                .realm
+                .get_property(handle, PRIM_WRAP)
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw)
+                .is_some_and(|p| self.realm.string_value(p).is_some());
+        if self.realm.is_generic_array_like_target(handle)
+            && LAZY_SCAN_GENERIC.contains(&method)
+            && (array_proto_generic || self.inherits_array_proto(handle))
+            && !self.inherits_iterator_proto(handle)
+            && !is_string_receiver
+        {
+            // The callback-taking forms validate IsCallable(callback) after reading
+            // `length` but before any element access (spec order).
+            if matches!(
+                method,
+                "some"
+                    | "every"
+                    | "find"
+                    | "findIndex"
+                    | "findLast"
+                    | "findLastIndex"
+                    | "forEach"
+                    | "reduce"
+                    | "reduceRight"
+            ) {
+                // Read `length` first (its getter/coercion side effects happen),
+                // then check the callback.
+                let _ = self.array_like_length(handle)?;
+                self.require_callable(arg(0), &alloc::format!("{method} callback"))?;
+            }
+            return Ok(Some(self.array_iter_sparse(method, handle, args)?));
+        }
         let mut array_like = None;
         if self.realm.is_generic_array_like_target(handle)
             && ARRAY_LIKE_METHODS.contains(&method)
@@ -2674,11 +2754,32 @@ impl<'a> Interp<'a> {
                         (self.realm.to_number(arg(1)).max(0.0) as usize).min(len - start)
                     };
                     let removed: Vec<NanBox> = elems[start..start + delete].to_vec();
+                    // The removed array is `ArraySpeciesCreate(O, deleteCount)`
+                    // populated by `CreateDataPropertyOrThrow` (holes preserved).
+                    let rem_v = self.array_species_create(handle, delete)?;
+                    let Some(rem_h) = rem_v.as_handle().map(Handle::from_raw) else {
+                        return Err(self.type_error("Array species did not return an object"));
+                    };
+                    let default_rem = self.realm.is_array(rem_h)
+                        && self.realm.array_length(rem_h) == Some(delete)
+                        && !self.realm.is_frozen(rem_h);
+                    for (i, e) in removed.iter().enumerate() {
+                        if e.is_hole() {
+                            continue;
+                        }
+                        if default_rem {
+                            self.realm.set_element(rem_h, i, *e);
+                        } else {
+                            self.create_data_property_or_throw(rem_h, i, *e)?;
+                        }
+                    }
+                    let len_key = self.new_str("length");
+                    self.assign_member_value(rem_h, len_key, NanBox::number(delete as f64))?;
                     let mut next: Vec<NanBox> = elems[..start].to_vec();
                     next.extend_from_slice(&args[2.min(args.len())..]);
                     next.extend_from_slice(&elems[start + delete..]);
                     self.realm.array_set_all(handle, next);
-                    return Ok(Some(NanBox::handle(self.realm.new_array(removed).to_raw())));
+                    return Ok(Some(rem_v));
                 }
                 // `arr.toString()` joins with a comma (like `join()`).
                 "join" | "toString" => {
@@ -2849,6 +2950,56 @@ impl<'a> Interp<'a> {
                             || (t_nan && e.as_number().is_some_and(f64::is_nan))
                     });
                     return Ok(Some(NanBox::boolean(found)));
+                }
+                // `toSorted`/`toReversed`/`with`/`toSpliced` — the ES2023 immutable
+                // copies. On a real array these `Get(O, k)` each index after caching
+                // `len`, so an accessor-at-index getter runs and a hole resolves
+                // through the prototype chain. Materialize via `[[Get]]` when the
+                // dense store has any hole (which includes an accessor-punched index).
+                "toReversed"
+                    if self.realm.typed_kind(handle).is_none()
+                        && elems.iter().any(|e| e.is_hole()) =>
+                {
+                    let len = elems.len();
+                    let mut out = Vec::with_capacity(len);
+                    for k in 0..len {
+                        out.push(self.read_member(handle, &alloc::format!("{k}"))?);
+                    }
+                    out.reverse();
+                    return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
+                }
+                "toSorted"
+                    if self.realm.typed_kind(handle).is_none()
+                        && elems.iter().any(|e| e.is_hole()) =>
+                {
+                    let len = elems.len();
+                    let mut materialized = Vec::with_capacity(len);
+                    for k in 0..len {
+                        materialized.push(self.read_member(handle, &alloc::format!("{k}"))?);
+                    }
+                    let sorted = self.sort_array(materialized, arg(0), false)?;
+                    return Ok(Some(NanBox::handle(self.realm.new_array(sorted).to_raw())));
+                }
+                "with"
+                    if self.realm.typed_kind(handle).is_none()
+                        && elems.iter().any(|e| e.is_hole()) =>
+                {
+                    let len = elems.len() as i64;
+                    let i = self.coerce_to_integer_or_infinity(arg(0))? as i64;
+                    let idx = if i < 0 { len + i } else { i };
+                    if idx < 0 || idx >= len {
+                        let m = self.new_str("Invalid index");
+                        return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                    }
+                    let mut out = Vec::with_capacity(len as usize);
+                    for k in 0..len as usize {
+                        out.push(if k == idx as usize {
+                            arg(1)
+                        } else {
+                            self.read_member(handle, &alloc::format!("{k}"))?
+                        });
+                    }
+                    return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
                 }
                 // `toSorted`/`toReversed`/`with` — non-mutating array methods.
                 "toReversed" => {
@@ -3197,8 +3348,30 @@ impl<'a> Interp<'a> {
                         &self.realm,
                         elems.len(),
                     );
-                    let sub = elems[a..b].to_vec();
-                    return Ok(Some(self.typed_like(handle, sub)));
+                    let count = b.saturating_sub(a);
+                    // `A = ArraySpeciesCreate(O, count)`, then
+                    // `CreateDataPropertyOrThrow` each *present* element (holes are
+                    // skipped, leaving a hole in the copy), then `Set length`.
+                    let a_v = self.array_species_create(handle, count)?;
+                    let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
+                        return Err(self.type_error("Array species did not return an object"));
+                    };
+                    let default_array = self.realm.is_array(a_h)
+                        && self.realm.array_length(a_h) == Some(count)
+                        && !self.realm.is_frozen(a_h);
+                    for (k, e) in elems[a..b].iter().enumerate() {
+                        if e.is_hole() {
+                            continue;
+                        }
+                        if default_array {
+                            self.realm.set_element(a_h, k, *e);
+                        } else {
+                            self.create_data_property_or_throw(a_h, k, *e)?;
+                        }
+                    }
+                    let len_key = self.new_str("length");
+                    self.assign_member_value(a_h, len_key, NanBox::number(count as f64))?;
+                    return Ok(Some(a_v));
                 }
                 // Iterators: `keys()` over indices, `values()` over elements,
                 // `entries()` over `[index, element]` pairs (eager generators).
@@ -3221,7 +3394,19 @@ impl<'a> Interp<'a> {
                     return Ok(Some(self.make_generator(pairs)));
                 }
                 "concat" => {
-                    let mut out = elems.clone();
+                    // `A = ArraySpeciesCreate(O, 0)`; then each spreadable source's
+                    // present elements (and each non-spreadable item) are appended
+                    // via `CreateDataPropertyOrThrow`. The receiver `O` is the first
+                    // source. `out` collects `(value, present)`; a hole in a real
+                    // array source is *not* defined on the result.
+                    let mut out: Vec<NanBox> = Vec::new();
+                    // First source = the receiver `O` (always spreadable here: a real
+                    // array reaching this arm). Honor its holes.
+                    if let Some(rec) = self.realm.array_elements(handle).map(<[_]>::to_vec) {
+                        out.extend(rec);
+                    } else {
+                        out.extend(elems.iter().copied());
+                    }
                     // An argument is spread iff it is concat-spreadable: its
                     // `[Symbol.isConcatSpreadable]` (if defined) decides, else it is
                     // spread exactly when it is an array.
@@ -3295,8 +3480,35 @@ impl<'a> Interp<'a> {
                             _ => out.push(*a),
                         }
                     }
-                    let h = self.realm.new_array(out);
-                    return Ok(Some(NanBox::handle(h.to_raw())));
+                    // Build the result via `ArraySpeciesCreate(O, n)` and populate it
+                    // with `CreateDataPropertyOrThrow` for each present element (a
+                    // hole from an array source is skipped, leaving a hole in `A`);
+                    // finally `Set(A, "length", n)`.
+                    let n = out.len();
+                    let a_v = self.array_species_create(handle, n)?;
+                    let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
+                        return Err(self.type_error("Array species did not return an object"));
+                    };
+                    // Fast path: a plain default Array result accepts a bulk write.
+                    if self.realm.is_array(a_h)
+                        && self.realm.array_length(a_h) == Some(n)
+                        && !self.realm.is_frozen(a_h)
+                    {
+                        for (i, v) in out.iter().enumerate() {
+                            if !v.is_hole() {
+                                self.realm.set_element(a_h, i, *v);
+                            }
+                        }
+                    } else {
+                        for (i, v) in out.iter().enumerate() {
+                            if !v.is_hole() {
+                                self.create_data_property_or_throw(a_h, i, *v)?;
+                            }
+                        }
+                    }
+                    let len_key = self.new_str("length");
+                    self.assign_member_value(a_h, len_key, NanBox::number(n as f64))?;
+                    return Ok(Some(a_v));
                 }
                 "reverse" => {
                     // Reverses in place and returns the same array (or typed-array view).
@@ -3617,7 +3829,34 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 // `toSpliced(start, deleteCount, ...items)` — a spliced copy
-                // (the ES2023 immutable counterpart of `splice`).
+                // (the ES2023 immutable counterpart of `splice`). On a real array
+                // with holes/accessor indices, retained elements are read via
+                // `[[Get]]` (so getters fire and holes resolve through the proto).
+                "toSpliced"
+                    if self.realm.typed_kind(handle).is_none()
+                        && elems.iter().any(|e| e.is_hole()) =>
+                {
+                    let len = elems.len() as i64;
+                    let start = {
+                        let s = self.coerce_to_integer_or_infinity(arg(0))? as i64;
+                        if s < 0 { (len + s).max(0) } else { s.min(len) }
+                    } as usize;
+                    let del = if args.len() < 2 {
+                        elems.len() - start
+                    } else {
+                        (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize)
+                            .min(elems.len() - start)
+                    };
+                    let mut out: Vec<NanBox> = Vec::new();
+                    for k in 0..start {
+                        out.push(self.read_member(handle, &alloc::format!("{k}"))?);
+                    }
+                    out.extend_from_slice(&args[2.min(args.len())..]);
+                    for k in (start + del)..elems.len() {
+                        out.push(self.read_member(handle, &alloc::format!("{k}"))?);
+                    }
+                    return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
+                }
                 "toSpliced" => {
                     let len = elems.len() as i64;
                     let start = {
@@ -3801,6 +4040,372 @@ impl<'a> Interp<'a> {
     /// with `HasProperty` (own-or-inherited, skipping holes) and read with `Get`
     /// at that step — so mutations made by the callback / a getter mid-iteration
     /// are observed. The callback receives `(value, index, O)` with `thisArg`.
+    /// `LengthOfArrayLike(O)` — `ToLength(Get(O, "length"))`, clamped to a `usize`
+    /// the engine can index (the 2**53-1 spec cap is far beyond a materializable
+    /// array, so a tighter cap is applied to keep the operations bounded).
+    /// `ArraySpeciesCreate(originalArray, length)` (ECMA-262 23.1.3.13.1): if
+    /// `originalArray` is an Array, consult `Get(O,"constructor")` then
+    /// `Get(C, @@species)`; an `undefined`/`null` species (or a non-Array
+    /// original) builds a plain dense array of `length` holes; a constructor
+    /// species is `Construct(S, «length»)`. Returns the result object.
+    pub(crate) fn array_species_create(
+        &mut self,
+        original: Handle,
+        length: usize,
+    ) -> Result<NanBox, ExecError> {
+        // A non-Array original (the generic-array-like concat path) → ArrayCreate.
+        if !self.realm.is_array(original) {
+            let mut v = alloc::vec![NanBox::hole(); 0];
+            v.resize(length, NanBox::hole());
+            return Ok(NanBox::handle(self.realm.new_array(v).to_raw()));
+        }
+        let mut c = self.read_member(original, "constructor")?;
+        // If C is an object, read C[@@species]; undefined/null → default.
+        if let Some(ch) = c.as_handle().map(Handle::from_raw) {
+            let species_sym = self.well_known_symbol("species");
+            let species_key = self.member_key(species_sym);
+            let s = self.read_member(ch, &species_key)?;
+            c = if matches!(s.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                NanBox::undefined()
+            } else {
+                s
+            };
+        } else if !matches!(c.unpack(), Unpacked::Undefined) {
+            // A non-object, non-undefined `constructor` is a TypeError.
+            return Err(self.type_error("Array species constructor is not an object"));
+        }
+        // Default Array constructor (or `constructor`/species undefined) → an
+        // ordinary array of `length` holes.
+        let is_default = matches!(c.unpack(), Unpacked::Undefined)
+            || self.current.get("Array").and_then(|v| v.as_handle()) == c.as_handle();
+        if is_default {
+            let mut v = alloc::vec![NanBox::hole(); 0];
+            v.resize(length, NanBox::hole());
+            return Ok(NanBox::handle(self.realm.new_array(v).to_raw()));
+        }
+        if !self.is_constructor_value(c) {
+            return Err(self.type_error("Array species is not a constructor"));
+        }
+        self.construct(c, &[NanBox::number(length as f64)])
+    }
+
+    /// `CreateDataPropertyOrThrow(O, ToString(index), value)`: defines a
+    /// writable/enumerable/configurable data property at the integer index, and
+    /// throws a TypeError if the (possibly exotic / non-configurable target)
+    /// `[[DefineOwnProperty]]` reports failure.
+    pub(crate) fn create_data_property_or_throw(
+        &mut self,
+        obj: Handle,
+        index: usize,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        let desc = self.realm.new_object();
+        self.realm.set_property(desc, "value", value);
+        self.realm
+            .set_property(desc, "writable", NanBox::boolean(true));
+        self.realm
+            .set_property(desc, "enumerable", NanBox::boolean(true));
+        self.realm
+            .set_property(desc, "configurable", NanBox::boolean(true));
+        let key = alloc::format!("{index}");
+        // `reflect = true` returns `Ok(false)` on a failed define (instead of
+        // throwing the `Object.defineProperty` TypeError); CreateDataPropertyOrThrow
+        // turns that failure into its own TypeError.
+        if !self.apply_descriptor(obj, &key, desc, true)? {
+            return Err(self.type_error(&alloc::format!(
+                "Cannot create property '{index}' on the species result"
+            )));
+        }
+        Ok(())
+    }
+
+    fn array_like_length(&mut self, handle: Handle) -> Result<usize, ExecError> {
+        let len_val = self.read_member(handle, "length")?;
+        let len_num = self.coerce_to_number(len_val)?;
+        let raw = self.realm.to_number(len_num);
+        let len = if raw.is_nan() || raw <= 0.0 {
+            0.0
+        } else {
+            raw.min(9_007_199_254_740_991.0)
+        };
+        Ok(len as usize)
+    }
+
+    fn array_like_set_length(&mut self, handle: Handle, len: usize) -> Result<(), ExecError> {
+        let key = self.new_str("length");
+        self.assign_member_value(handle, key, NanBox::number(len as f64))
+    }
+
+    fn array_like_get(&mut self, handle: Handle, i: usize) -> Result<NanBox, ExecError> {
+        self.read_member(handle, &alloc::format!("{i}"))
+    }
+
+    fn array_like_set(&mut self, handle: Handle, i: usize, v: NanBox) -> Result<(), ExecError> {
+        let key = self.new_str(&alloc::format!("{i}"));
+        self.assign_member_value(handle, key, v)
+    }
+
+    fn array_like_delete(&mut self, handle: Handle, i: usize) -> Result<(), ExecError> {
+        self.delete_property_of(handle, &alloc::format!("{i}"))?;
+        Ok(())
+    }
+
+    /// Moves the element from `from` to `to` if present, else deletes `to`
+    /// (`CreateDataPropertyOrThrow`/`DeletePropertyOrThrow` per the spec's
+    /// hole-preserving copy loops in `unshift`/`splice`/etc.).
+    fn array_like_move(&mut self, handle: Handle, from: usize, to: usize) -> Result<(), ExecError> {
+        if self.has_property(handle, &alloc::format!("{from}")) {
+            let v = self.array_like_get(handle, from)?;
+            self.array_like_set(handle, to, v)?;
+        } else {
+            self.array_like_delete(handle, to)?;
+        }
+        Ok(())
+    }
+
+    /// Resolves a spec "relative index" argument against `len`: ToIntegerOrInfinity,
+    /// then a negative value counts from the end (clamped to 0) and a positive value
+    /// is clamped to `len`. `default` is used when the argument is `undefined`.
+    fn relative_index(
+        &mut self,
+        v: NanBox,
+        len: usize,
+        default: usize,
+    ) -> Result<usize, ExecError> {
+        if matches!(v.unpack(), Unpacked::Undefined) {
+            return Ok(default);
+        }
+        let n = self.coerce_to_integer_or_infinity(v)?;
+        let len_f = len as f64;
+        let idx = if n < 0.0 {
+            (len_f + n).max(0.0)
+        } else {
+            n.min(len_f)
+        };
+        Ok(idx as usize)
+    }
+
+    /// The *mutating* generic `Array.prototype` methods over a non-array array-like
+    /// `O`: each operates by `Get`/`Set`/`Delete` on integer-index keys and the
+    /// `length` property (ECMA-262 23.1.3 — these are "intentionally generic").
+    fn array_like_mutate(
+        &mut self,
+        method: &str,
+        handle: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+        let len = self.array_like_length(handle)?;
+        match method {
+            "push" => {
+                // `len + argCount` may not exceed 2**53-1 (SetLength would fail);
+                // the check happens before any element is stored.
+                if (len as f64) + (args.len() as f64) > 9_007_199_254_740_991.0 {
+                    let m = self.new_str("Invalid array length");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                // Set each argument at the next index, then update length.
+                let mut n = len;
+                for a in args {
+                    self.array_like_set(handle, n, *a)?;
+                    n += 1;
+                }
+                self.array_like_set_length(handle, n)?;
+                Ok(NanBox::number(n as f64))
+            }
+            "pop" => {
+                if len == 0 {
+                    self.array_like_set_length(handle, 0)?;
+                    return Ok(NanBox::undefined());
+                }
+                let v = self.array_like_get(handle, len - 1)?;
+                self.array_like_delete(handle, len - 1)?;
+                self.array_like_set_length(handle, len - 1)?;
+                Ok(v)
+            }
+            "shift" => {
+                if len == 0 {
+                    self.array_like_set_length(handle, 0)?;
+                    return Ok(NanBox::undefined());
+                }
+                let first = self.array_like_get(handle, 0)?;
+                for to in 1..len {
+                    self.array_like_move(handle, to, to - 1)?;
+                }
+                self.array_like_delete(handle, len - 1)?;
+                self.array_like_set_length(handle, len - 1)?;
+                Ok(first)
+            }
+            "unshift" => {
+                let count = args.len();
+                // `len + argCount` may not exceed 2**53-1 (checked before moving).
+                if count > 0 && (len as f64) + (count as f64) > 9_007_199_254_740_991.0 {
+                    let m = self.new_str("Invalid array length");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                if count > 0 {
+                    // Shift existing elements up by `count`, high index first.
+                    for k in (0..len).rev() {
+                        self.array_like_move(handle, k, k + count)?;
+                    }
+                    for (j, a) in args.iter().enumerate() {
+                        self.array_like_set(handle, j, *a)?;
+                    }
+                }
+                let new_len = len + count;
+                self.array_like_set_length(handle, new_len)?;
+                Ok(NanBox::number(new_len as f64))
+            }
+            "reverse" => {
+                let mid = len / 2;
+                for lower in 0..mid {
+                    let upper = len - lower - 1;
+                    let lower_exists = self.has_property(handle, &alloc::format!("{lower}"));
+                    let upper_exists = self.has_property(handle, &alloc::format!("{upper}"));
+                    let lower_val = self.array_like_get(handle, lower)?;
+                    let upper_val = self.array_like_get(handle, upper)?;
+                    match (lower_exists, upper_exists) {
+                        (true, true) => {
+                            self.array_like_set(handle, lower, upper_val)?;
+                            self.array_like_set(handle, upper, lower_val)?;
+                        }
+                        (false, true) => {
+                            self.array_like_set(handle, lower, upper_val)?;
+                            self.array_like_delete(handle, upper)?;
+                        }
+                        (true, false) => {
+                            self.array_like_delete(handle, lower)?;
+                            self.array_like_set(handle, upper, lower_val)?;
+                        }
+                        (false, false) => {}
+                    }
+                }
+                Ok(NanBox::handle(handle.to_raw()))
+            }
+            "fill" => {
+                let value = arg(0);
+                let start = self.relative_index(arg(1), len, 0)?;
+                let end = self.relative_index(arg(2), len, len)?;
+                for k in start..end {
+                    self.array_like_set(handle, k, value)?;
+                }
+                Ok(NanBox::handle(handle.to_raw()))
+            }
+            "copyWithin" => {
+                let to = self.relative_index(arg(0), len, 0)?;
+                let from = self.relative_index(arg(1), len, 0)?;
+                let fin = self.relative_index(arg(2), len, len)?;
+                let count = fin.saturating_sub(from).min(len.saturating_sub(to));
+                // Copy direction matters when ranges overlap (spec uses a direction
+                // flag); collect-then-write avoids clobbering source elements.
+                let mut buf: Vec<Option<NanBox>> = Vec::with_capacity(count);
+                for k in 0..count {
+                    let idx = from + k;
+                    if self.has_property(handle, &alloc::format!("{idx}")) {
+                        buf.push(Some(self.array_like_get(handle, idx)?));
+                    } else {
+                        buf.push(None);
+                    }
+                }
+                for (k, slot) in buf.into_iter().enumerate() {
+                    let dst = to + k;
+                    match slot {
+                        Some(v) => self.array_like_set(handle, dst, v)?,
+                        None => self.array_like_delete(handle, dst)?,
+                    }
+                }
+                Ok(NanBox::handle(handle.to_raw()))
+            }
+            "sort" => {
+                // `comparefn` must be undefined or callable (checked first).
+                let cmp = arg(0);
+                if !matches!(cmp.unpack(), Unpacked::Undefined) && !self.is_callable_value(cmp) {
+                    return Err(self.type_error("comparefn must be a function"));
+                }
+                // SortIndexedProperties: gather the *present* elements (holes and
+                // absent indices excluded), sort them, then write the sorted run
+                // back to `0..count` and delete `count..len` (holes float to the end).
+                let mut items: Vec<NanBox> = Vec::new();
+                for i in 0..len {
+                    if self.has_property(handle, &alloc::format!("{i}")) {
+                        items.push(self.array_like_get(handle, i)?);
+                    }
+                }
+                let count = items.len();
+                let sorted = self.sort_array(items, cmp, false)?;
+                for (i, v) in sorted.into_iter().enumerate() {
+                    self.array_like_set(handle, i, v)?;
+                }
+                for i in count..len {
+                    self.array_like_delete(handle, i)?;
+                }
+                Ok(NanBox::handle(handle.to_raw()))
+            }
+            "splice" => {
+                let start = self.relative_index(arg(0), len, 0)?;
+                let insert_count = args.len().saturating_sub(2);
+                let delete_count = if args.is_empty() {
+                    0
+                } else if args.len() == 1 {
+                    len - start
+                } else {
+                    let dc = self.coerce_to_integer_or_infinity(arg(1))?;
+                    (dc.max(0.0) as usize).min(len - start)
+                };
+                // Step 8: if the resulting length `len + insertCount - deleteCount`
+                // would exceed 2**53-1, throw a TypeError — *before* creating the
+                // result array or moving any element (this also bounds the work).
+                if (len as f64) + (insert_count as f64) - (delete_count as f64)
+                    > 9_007_199_254_740_991.0
+                {
+                    let m = self.new_str("Invalid array length");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                // ArraySpeciesCreate(O, actualDeleteCount): a non-array `O` builds a
+                // fresh array of that length — ArrayCreate throws a RangeError when
+                // the length exceeds 2**32-1 (and the engine's own cap), *before* any
+                // element is read or written.
+                if delete_count > u32::MAX as usize
+                    || delete_count > self.realm.limits.max_array_len
+                {
+                    let m = self.new_str("Invalid array length");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                // Collect the removed elements (hole-preserving) into a fresh array.
+                let mut removed: Vec<NanBox> = Vec::with_capacity(delete_count);
+                for k in 0..delete_count {
+                    let idx = start + k;
+                    if self.has_property(handle, &alloc::format!("{idx}")) {
+                        removed.push(self.array_like_get(handle, idx)?);
+                    } else {
+                        removed.push(NanBox::hole());
+                    }
+                }
+                let removed_arr = self.realm.new_array(removed);
+                // Shift the tail to its new position.
+                if insert_count < delete_count {
+                    for k in start..(len - delete_count) {
+                        self.array_like_move(handle, k + delete_count, k + insert_count)?;
+                    }
+                    for k in ((len - delete_count + insert_count)..len).rev() {
+                        self.array_like_delete(handle, k)?;
+                    }
+                } else if insert_count > delete_count {
+                    for k in (start..(len - delete_count)).rev() {
+                        self.array_like_move(handle, k + delete_count, k + insert_count)?;
+                    }
+                }
+                // Write the inserted items.
+                for (j, item) in args.iter().skip(2).enumerate() {
+                    self.array_like_set(handle, start + j, *item)?;
+                }
+                self.array_like_set_length(handle, len - delete_count + insert_count)?;
+                Ok(NanBox::handle(removed_arr.to_raw()))
+            }
+            _ => Ok(NanBox::undefined()),
+        }
+    }
+
     fn array_iter_sparse(
         &mut self,
         method: &str,
@@ -3811,7 +4416,10 @@ impl<'a> Interp<'a> {
         let f = arg(0);
         let this_arg = arg(1);
         let o = NanBox::handle(handle.to_raw());
-        let len = self.realm.array_length(handle).unwrap_or(0);
+        // `LengthOfArrayLike(O)` — works for a real array *and* a generic
+        // array-like (a huge `{length:"Infinity"}` scans lazily with early exit
+        // rather than materializing).
+        let len = self.array_like_length(handle)?;
         // `indexOf`/`lastIndexOf` take a search target + optional fromIndex; the
         // rest require a callable callback (already validated upstream, but a
         // sparse path is reached after that check).
@@ -3857,6 +4465,23 @@ impl<'a> Interp<'a> {
                     i -= 1;
                 }
                 return Ok(NanBox::number(-1.0));
+            }
+            "includes" => {
+                // SameValueZero (NaN matches NaN); an absent index reads as
+                // `undefined` and is *not* skipped — `[,].includes(undefined)` is
+                // true. `Get` walks the prototype for an absent own index.
+                let target = arg(0);
+                let from = self.array_from_index_checked(arg(1), len)?;
+                let t_nan = target.as_number().is_some_and(f64::is_nan);
+                for i in from..len {
+                    let v = self.read_member(handle, &alloc::format!("{i}"))?;
+                    if self.realm.strict_equals(v, target)
+                        || (t_nan && v.as_number().is_some_and(f64::is_nan))
+                    {
+                        return Ok(NanBox::boolean(true));
+                    }
+                }
+                return Ok(NanBox::boolean(false));
             }
             _ => {}
         }

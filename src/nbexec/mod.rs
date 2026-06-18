@@ -1917,6 +1917,31 @@ impl<'a> Interp<'a> {
         self.realm.mark_hidden(ctor, &species_key);
     }
 
+    /// Installs `get <Ctor>[Symbol.species]` (returning `this`, no setter,
+    /// non-enumerable + configurable) on a constructor that has no `size`
+    /// accessor (e.g. `Array`).
+    fn install_ctor_species(&mut self, ctor_name: &str) {
+        let Some(ctor) = self
+            .current
+            .get(ctor_name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        let species_sym = self.well_known_symbol("species");
+        let species_key = self.member_key(species_sym);
+        let species_get = self.new_named_native("get [Symbol.species]", N_TYPED_ARRAY_SPECIES);
+        self.install_fn_name_length(species_get, "get [Symbol.species]", 0);
+        self.realm.define_accessor(
+            ctor,
+            &species_key,
+            NanBox::handle(species_get.to_raw()),
+            NanBox::undefined(),
+        );
+        self.realm.mark_hidden(ctor, &species_key);
+    }
+
     fn install_proto_to_string_tag(&mut self, ctor_name: &str, tag: &str) {
         if let Some(proto) = self
             .current
@@ -3113,6 +3138,10 @@ impl<'a> Interp<'a> {
         // `Map.prototype.size`/`Set.prototype.size` accessors + `[Symbol.species]`.
         self.install_collection_accessors("Map", N_MAP_SIZE);
         self.install_collection_accessors("Set", N_SET_SIZE);
+        // `get Array[Symbol.species]` — the shared species getter returns `this`
+        // (the receiver constructor). `{ get, set: undefined, enumerable: false,
+        // configurable: true }` per ECMA-262 23.1.2.5.
+        self.install_ctor_species("Array");
         self.install_proto_to_string_tag("WeakMap", "WeakMap");
         self.install_proto_to_string_tag("WeakSet", "WeakSet");
         self.install_proto_to_string_tag("Promise", "Promise");

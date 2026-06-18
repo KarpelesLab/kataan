@@ -1624,25 +1624,31 @@ impl<'a> Interp<'a> {
         // `new Array(...)` — Array is a namespace object, matched by identity.
         // A single number argument is the length; otherwise the elements.
         if self.current.get("Array").and_then(|v| v.as_handle()) == callee.as_handle() {
-            let elems = if args.len() == 1
+            let single_len = if args.len() == 1
                 && let Some(n) = args[0].as_number()
             {
                 // A single number is the length: a non-negative integer fitting
-                // uint32 (capped here to avoid OOM in this dense model). Otherwise a
-                // `RangeError`.
-                if n < 0.0
-                    || n > f64::from(u32::MAX)
-                    || n > 100_000_000.0
-                    || n != f64::from(n as u32)
-                {
+                // uint32. Otherwise a `RangeError`. The array is *sparse* (its
+                // indices are holes, not `undefined` data properties); a length
+                // beyond the dense cap is recorded as a logical length via
+                // `set_array_length` rather than materialized.
+                if n < 0.0 || n > f64::from(u32::MAX) || n != f64::from(n as u32) {
                     let m = self.new_str("Invalid array length");
                     return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
                 }
-                alloc::vec![NanBox::undefined(); n as usize]
+                Some(n as usize)
+            } else {
+                None
+            };
+            let elems = if single_len.is_some() {
+                alloc::vec![]
             } else {
                 args.to_vec()
             };
             let arr = self.realm.new_array(elems);
+            if let Some(len) = single_len {
+                self.realm.set_array_length(arr, len);
+            }
             // A subclass (`class S extends Array {}` / `Reflect.construct`) links the
             // dense array to `newTarget.prototype` (default `%Array.prototype%`).
             let nt = self.reflect_new_target.unwrap_or(callee);
@@ -2591,8 +2597,11 @@ impl<'a> Interp<'a> {
                         0.0
                     }
                 } else {
-                    let a = self.realm.to_display_string(elems[j - 1]);
-                    let b = self.realm.to_display_string(elems[j]);
+                    // The default comparator orders by `ToString` of each element
+                    // (which invokes a user `toString`/`valueOf`, so abrupt
+                    // completions propagate), compared by code units.
+                    let a = self.coerce_to_string(elems[j - 1])?;
+                    let b = self.coerce_to_string(elems[j])?;
                     if a < b {
                         -1.0
                     } else if a > b {

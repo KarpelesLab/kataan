@@ -73,7 +73,17 @@ impl<'a> Interp<'a> {
                 let writable = !self.realm.array_length_is_readonly(obj);
                 (Some(NanBox::number(len as f64)), writable, false, false)
             } else if let Ok(i) = key.parse::<usize>() {
-                if i < len && alloc::format!("{i}") == key {
+                // An array index may hold a *user-defined accessor* (via
+                // `Object.defineProperty(arr, i, {get/set})`); that is reported as
+                // an accessor descriptor by the generic path below, not as a data
+                // property — fall through when one exists.
+                if i < len
+                    && alloc::format!("{i}") == key
+                    && self.realm.accessor(obj, key).is_none()
+                    // A hole (absent index) is not an own property even within
+                    // `length`; only a present element is a data property.
+                    && !self.realm.array_hole_at(obj, i)
+                {
                     // An in-range index is writable/enumerable/configurable by
                     // default, but `Object.defineProperty(arr, i, …)` can demote
                     // any of those attributes (recorded in the element-flag maps);
@@ -772,6 +782,16 @@ impl<'a> Interp<'a> {
             self.realm.clear_accessor(obj, key);
             self.realm.delete_data_slot(obj, key);
             self.realm.clear_readonly_property(obj, key);
+            // An accessor at an array index (ArrayDefineOwnProperty, 10.4.2.1):
+            // the dense element store can only hold data, so punch a hole at the
+            // index (the accessor takes precedence on read) and grow `length` to
+            // index+1 when the index is at/beyond the current length.
+            if self.realm.is_array(obj)
+                && let Ok(i) = key.parse::<usize>()
+                && alloc::format!("{i}") == key
+            {
+                self.realm.array_index_to_hole(obj, i);
+            }
             self.realm.define_accessor(obj, key, getter, setter);
             // Enumerable: explicit field, else preserved on redefine, else default false.
             if want_enum {

@@ -404,7 +404,31 @@ impl<'a> Interp<'a> {
         elems: Vec<NanBox>,
     ) -> Result<NanBox, ExecError> {
         if self.realm.typed_kind(recv).is_none() {
-            return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
+            // A plain-array receiver: `map`/`filter` allocate the result via
+            // `ArraySpeciesCreate(O, len)` and populate each *present* element with
+            // `CreateDataPropertyOrThrow` (a hole in `elems` stays a hole). The
+            // common default-Array species takes a bulk write-through fast path.
+            let n = elems.len();
+            let a_v = self.array_species_create(recv, n)?;
+            let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
+                return Err(self.type_error("Array species did not return an object"));
+            };
+            let default_array = self.realm.is_array(a_h)
+                && self.realm.array_length(a_h) == Some(n)
+                && !self.realm.is_frozen(a_h);
+            for (i, e) in elems.iter().enumerate() {
+                if e.is_hole() {
+                    continue;
+                }
+                if default_array {
+                    self.realm.set_element(a_h, i, *e);
+                } else {
+                    self.create_data_property_or_throw(a_h, i, *e)?;
+                }
+            }
+            let len_key = self.new_str("length");
+            self.assign_member_value(a_h, len_key, NanBox::number(n as f64))?;
+            return Ok(a_v);
         }
         // TypedArraySpeciesCreate(O, «len») then write the produced elements
         // through (coercing to the result's kind).

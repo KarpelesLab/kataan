@@ -760,6 +760,39 @@ fn to_primitive(ctx: &mut Ctx, funcs: &[FnProto], v: NanBox, number_hint: bool) 
     v
 }
 
+/// `regex.lastIndex = v` for the bytecode VM. `lastIndex` is an ordinary data
+/// property that may hold any value (it is only `ToLength`'d at `exec` time): a
+/// canonical non-negative integer (fitting uint32) is stored compactly in the
+/// cell's `usize` field, and any other value is kept verbatim in an aux data
+/// slot so a later `Get` returns it unchanged (its `valueOf` runs at `exec`
+/// time, not at assignment). A non-writable own `lastIndex` is honored by the
+/// slow tree-walker path; the VM hot path follows the common writable case.
+fn set_regex_last_index_value(realm: &mut Realm, handle: Handle, v: NanBox) {
+    let canonical = v.as_number().filter(|n| {
+        n.is_finite() && *n >= 0.0 && *n == (*n as u64 as f64) && *n <= u32::MAX as f64
+    });
+    match canonical {
+        Some(n) => {
+            if realm.has_own(handle, "lastIndex") {
+                realm.set_property(handle, "lastIndex", v);
+            }
+            realm.set_regex_last_index(handle, n as usize);
+        }
+        None => {
+            realm.set_property(handle, "lastIndex", v);
+            let n = realm.to_number(v);
+            realm.set_regex_last_index(
+                handle,
+                if n.is_finite() && n >= 0.0 {
+                    n as usize
+                } else {
+                    0
+                },
+            );
+        }
+    }
+}
+
 fn make_error(realm: &mut Realm, name: &str, message: &str) -> NanBox {
     let obj = realm.new_object();
     let n = NanBox::handle(realm.new_string(name).to_raw());
@@ -1406,11 +1439,13 @@ fn run_frame(
                         let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                         return Err(VmError::Thrown(e));
                     }
-                    if n > ctx.realm.limits.max_array_len as f64 {
-                        let e = make_error(ctx.realm, "RangeError", "Array length too large");
-                        return Err(VmError::Thrown(e));
-                    }
-                    ctx.realm.new_array(vec![NanBox::undefined(); n as usize])
+                    // The array is *sparse*: its indices are holes (absent),
+                    // not `undefined` data properties. A length beyond the dense
+                    // cap is recorded as a logical length via `set_array_length`
+                    // rather than materialized as billions of slots.
+                    let h = ctx.realm.new_array(vec![]);
+                    ctx.realm.set_array_length(h, n as usize);
+                    h
                 } else {
                     ctx.realm.new_array(vec![v])
                 };
@@ -1577,6 +1612,11 @@ fn run_frame(
                                 let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                                 handle_throw!(VmError::Thrown(e));
                             }
+                            continue;
+                        }
+                        if ks == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
+                            let v = regs[*src as usize];
+                            set_regex_last_index_value(ctx.realm, handle, v);
                             continue;
                         }
                         ctx.realm.set_property(handle, &ks, regs[*src as usize]);
@@ -1769,10 +1809,15 @@ fn run_frame(
             Op::SetProp { obj, key, src } => {
                 let handle = object_handle(regs[*obj as usize])?;
                 let recv = regs[*obj as usize];
-                // `regex.lastIndex = n` updates the stateful search position.
+                // `regex.lastIndex = v` updates the stateful search position.
+                // `lastIndex` is an ordinary data property that may hold *any* value
+                // (it is only `ToLength`'d at `exec` time); a canonical non-negative
+                // integer is stored compactly in the cell field, any other value
+                // (an object with a `valueOf`, a non-integer, a string, …) is kept
+                // verbatim in an aux data slot so a later read returns it unchanged.
                 if key.as_str() == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
-                    let n = num(regs[*src as usize]).unwrap_or(0.0).max(0.0) as usize;
-                    ctx.realm.set_regex_last_index(handle, n);
+                    let v = regs[*src as usize];
+                    set_regex_last_index_value(ctx.realm, handle, v);
                     continue;
                 }
                 // `arr.length = n` resizes the array (truncate/pad). `ToUint32(v)`
@@ -1948,8 +1993,16 @@ fn run_frame(
                                     regs[*dst as usize] = NanBox::boolean(flags.contains('d'))
                                 }
                                 "lastIndex" => {
-                                    regs[*dst as usize] =
-                                        NanBox::number(ctx.realm.regex_last_index(handle) as f64);
+                                    // An aux own slot (a non-canonical value such as
+                                    // an object, or a `defineProperty` descriptor)
+                                    // shadows the compact cell field.
+                                    if ctx.realm.has_own(handle, "lastIndex") {
+                                        done = false;
+                                    } else {
+                                        regs[*dst as usize] = NanBox::number(
+                                            ctx.realm.regex_last_index(handle) as f64,
+                                        );
+                                    }
                                 }
                                 _ => done = false,
                             }
@@ -2698,6 +2751,16 @@ fn regex_method(
     // `re.test(s)` / `re.exec(s)`.
     if let Some((_source, flags)) = ctx.realm.regexp_at(h) {
         if !matches!(key, "test" | "exec") {
+            return None;
+        }
+        // Defer to the spec-accurate tree-walker (`RegExpBuiltinExec`) for the
+        // cases this fast path does not model exactly:
+        //  - a non-canonical own `lastIndex` (e.g. an object whose `valueOf` must
+        //    run via `ToLength`, or a value that must be read but not written for a
+        //    non-global/non-sticky regex),
+        //  - the sticky (`y`) flag (anchored match at exactly `lastIndex`),
+        //  - the `d` (hasIndices) flag (the result needs an `.indices` array).
+        if ctx.realm.has_own(h, "lastIndex") || flags.contains('y') || flags.contains('d') {
             return None;
         }
         let text = ctx.realm.to_display_string(arg0);
