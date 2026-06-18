@@ -166,9 +166,15 @@ impl<'a> Interp<'a> {
                         self.realm.set_native_proto(handle, h);
                         (None, None)
                     }
-                    Some((_, h)) if self.realm.native_at(h).is_some() => {
+                    // A native constructor superclass: a callable native (Map, Set,
+                    // Date, RegExp, typed arrays, wrappers, ArrayBuffer, DataView,
+                    // Error, Promise, …) *or* a namespace-object constructor
+                    // (`Array`/`Object`, recognized by identity). `getPrototypeOf(D)`
+                    // is the superclass; the native base id drives `super()` and the
+                    // instance's internal slots.
+                    Some((_, h)) if self.native_base_kind(h).is_some() => {
                         self.realm.set_native_proto(handle, h);
-                        (self.realm.native_at(h), None)
+                        (self.native_base_kind(h), None)
                     }
                     // A callable ordinary function used as a superclass — only if it
                     // is actually a constructor (its prototype is linked below).
@@ -360,10 +366,12 @@ impl<'a> Interp<'a> {
         let h = Handle::from_raw(raw);
         if let Some(parent) = self.realm.class_at(h) {
             Ok(Some(parent))
-        } else if self.realm.native_at(h).is_some() || self.is_callable(h) {
-            // A native superclass (`extends Error`) or an ordinary-function
-            // superclass (`extends fn`) has no class chain; both are tracked
-            // separately (`class_native_super` / `class_fn_super`).
+        } else if self.native_base_kind(h).is_some() || self.is_callable(h) {
+            // A native superclass (`extends Error|Map|Array|…`) or an ordinary-
+            // function superclass (`extends fn`) has no class chain; both are
+            // tracked separately (`class_native_super` / `class_fn_super`). The
+            // namespace-object constructors (`Array`/`Object`) are recognized by
+            // `native_base_kind` (they are not callable cells / native ids).
             Ok(None)
         } else {
             Err(ExecError::Unsupported("extends a non-class"))
@@ -379,26 +387,49 @@ impl<'a> Interp<'a> {
         env: &Scope,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
-        let instance = self.realm.new_object();
-        let this_val = NanBox::handle(instance.to_raw());
-
-        // Link the instance to the class's `.prototype` object (which carries the
-        // public methods/accessors of the whole `extends` chain), so methods are
-        // *inherited* — `instance.m === C.prototype.m`, `instance` has no own `m`,
-        // and the prototype chain resolves derived-over-base.
-        let proto = self.class_prototype_by_id(class_id);
-        self.realm.set_object_proto(instance, Some(proto));
-
-        // *Private* methods/accessors (`#m`) are not public prototype members:
-        // they brand the instance directly, so install them as own (hidden)
-        // private-keyed members over the whole chain (base-first so a derived
-        // private overrides — though shadowing across the chain is rare).
+        // Build the chain (this class, then each `extends`) up front: it both
+        // drives private-method installation below and lets us find the root native
+        // base — the deepest class's native superclass, if any.
         let mut chain: Vec<(u32, Scope)> = Vec::new();
         let mut cur = Some((class_id, env.clone()));
         while let Some((cid, cenv)) = cur {
             chain.push((cid, cenv.clone()));
             cur = self.resolve_super(self.classes[cid as usize], &cenv)?;
         }
+        // The class prototype carries the public methods/accessors of the whole
+        // `extends` chain — the instance's `[[Prototype]]`, so methods are
+        // *inherited* (`instance.m === C.prototype.m`) and the chain resolves
+        // derived-over-base.
+        let proto = self.class_prototype_by_id(class_id);
+
+        // A class extending a *cell-bearing* native (Map/Set/typed array/Date/
+        // RegExp/wrapper/ArrayBuffer/DataView/Array) must produce a real native
+        // instance (with the native internal slots), not a plain object. The base
+        // native constructor builds it with `newTarget` = this class, so its
+        // `[[Prototype]]` is the class prototype and the existing per-id
+        // construction (storage, seeding, length, …) runs exactly once. (The
+        // implicit/explicit `super(...)` for such a class is then a no-op — the
+        // cell already exists; see `run_constructor`.)
+        let class_handle = self.class_handles[class_id as usize];
+        let native_root = chain
+            .iter()
+            .find_map(|(cid, _)| self.class_native_super[*cid as usize])
+            .filter(|id| Self::native_base_is_cell(*id));
+        let instance = if let Some(root_id) = native_root {
+            // The base constructor links the cell to `class_handle.prototype` (which
+            // is `proto`, the class prototype) via the `newTarget` path.
+            self.construct_native_base(root_id, args, class_handle)?
+        } else {
+            let obj = self.realm.new_object();
+            self.realm.set_object_proto(obj, Some(proto));
+            obj
+        };
+        let this_val = NanBox::handle(instance.to_raw());
+
+        // *Private* methods/accessors (`#m`) are not public prototype members:
+        // they brand the instance directly, so install them as own (hidden)
+        // private-keyed members over the whole chain (base-first so a derived
+        // private overrides — though shadowing across the chain is rare).
         for (cid, cenv) in chain.iter().rev() {
             let class = self.classes[*cid as usize];
             for member in &class.body {
@@ -518,7 +549,7 @@ impl<'a> Interp<'a> {
     /// native superclass: the Error family, `Iterator`, …). The Error family
     /// resolves by `ERROR_NAMES`; any other native is found by scanning the global
     /// bindings for the callable whose native id matches.
-    fn native_ctor_by_id(&mut self, id: u16) -> Option<Handle> {
+    pub(crate) fn native_ctor_by_id(&mut self, id: u16) -> Option<Handle> {
         if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
             let name = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
             return self
@@ -527,8 +558,46 @@ impl<'a> Interp<'a> {
                 .and_then(|v| v.as_handle())
                 .map(Handle::from_raw);
         }
-        // Known single-name natives.
-        for name in ["Iterator"] {
+        // The namespace-object constructors (`Array`/`Object`) carry sentinel base
+        // ids — resolve them by their global binding.
+        let sentinel = match id {
+            N_BASE_ARRAY => Some("Array"),
+            N_BASE_OBJECT => Some("Object"),
+            _ => None,
+        };
+        if let Some(name) = sentinel {
+            return self
+                .current
+                .get(name)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw);
+        }
+        // A typed-array kind resolves by its concrete constructor name.
+        if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id) {
+            let name = TYPED_ARRAY_KINDS[(id - N_TYPED_ARRAY_BASE) as usize].0;
+            return self
+                .current
+                .get(name)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw);
+        }
+        // Other single-name natives: resolve by scanning the well-known global
+        // bindings for the callable whose native id matches.
+        for name in [
+            "Iterator",
+            "Map",
+            "Set",
+            "WeakMap",
+            "WeakSet",
+            "Date",
+            "RegExp",
+            "Number",
+            "String",
+            "Boolean",
+            "ArrayBuffer",
+            "DataView",
+            "Promise",
+        ] {
             if let Some(h) = self
                 .current
                 .get(name)
@@ -540,6 +609,51 @@ impl<'a> Interp<'a> {
             }
         }
         None
+    }
+
+    /// The "native base kind" for a superclass `handle` used as `extends` heritage:
+    /// the native id for a callable native constructor (Map/Set/Date/RegExp/typed
+    /// arrays/wrappers/ArrayBuffer/DataView/Error/…), or the `N_BASE_ARRAY` /
+    /// `N_BASE_OBJECT` sentinel for the namespace-object constructors. `None` for an
+    /// ordinary user function (handled as a function superclass).
+    pub(crate) fn native_base_kind(&mut self, handle: Handle) -> Option<u16> {
+        if let Some(id) = self.realm.native_at(handle) {
+            return Some(id);
+        }
+        // `Array`/`Object` are namespace objects (no native id), matched by the
+        // identity of their global binding.
+        let hv = NanBox::handle(handle.to_raw());
+        if self.current.get("Array").and_then(|v| v.as_handle()) == hv.as_handle() {
+            return Some(N_BASE_ARRAY);
+        }
+        if self.current.get("Object").and_then(|v| v.as_handle()) == hv.as_handle() {
+            return Some(N_BASE_OBJECT);
+        }
+        None
+    }
+
+    /// Whether a native base id denotes a constructor whose instances are
+    /// *cell-bearing* — a real Map/Set/typed array/Date/RegExp/wrapper/ArrayBuffer/
+    /// DataView/Array cell that must be created by the base constructor (so the
+    /// derived instance carries the native internal slots), as opposed to the
+    /// Error/Object families whose instances are ordinary objects decorated in
+    /// place.
+    pub(crate) fn native_base_is_cell(id: u16) -> bool {
+        matches!(
+            id,
+            N_MAP
+                | N_SET
+                | N_WEAKMAP
+                | N_WEAKSET
+                | N_DATE
+                | N_REGEXP
+                | N_NUMBER
+                | N_STRING
+                | N_BOOLEAN
+                | N_ARRAY_BUFFER
+                | N_DATA_VIEW
+                | N_BASE_ARRAY
+        ) || (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id)
     }
 
     pub(crate) fn class_prototype(&mut self, class_id: u32, class_handle: Handle) -> Handle {

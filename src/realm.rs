@@ -120,6 +120,12 @@ pub struct Realm {
     /// (`Object.setPrototypeOf(fn, null)`), distinguishing them from the default
     /// (which resolves to `%Function.prototype%`). Same non-GC-root caveat.
     callable_null_protos: alloc::collections::BTreeSet<u64>,
+    /// Class tags for *non-object* cells — a derived instance of a native base
+    /// (`class S extends Map {}` → a real `Map` cell) records its class here, since
+    /// the inline class tag lives only on plain-object cells. Read by
+    /// [`class_tag`](Realm::class_tag) so `instanceof Subclass` (the class-chain
+    /// walk) recognizes the native-cell instance. Same non-GC-root caveat.
+    native_class_tags: alloc::collections::BTreeMap<u64, u32>,
     /// The shared abstract `%TypedArray%` intrinsic constructor (the value
     /// `Object.getPrototypeOf(Int8Array)` returns), installed at global setup.
     typed_array_intrinsic: Option<Handle>,
@@ -200,6 +206,7 @@ impl Realm {
             default_object_proto: None,
             native_protos: alloc::collections::BTreeMap::new(),
             callable_null_protos: alloc::collections::BTreeSet::new(),
+            native_class_tags: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
             array_proto_intrinsic: None,
@@ -1857,13 +1864,22 @@ impl Realm {
     pub fn set_class_tag(&mut self, handle: Handle, class_id: u32) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.set_class_tag(class_id);
+        } else {
+            // A non-object cell (a derived native instance: a real Map/Set/typed
+            // array/… created by `class S extends Map {}`) keeps its class tag in a
+            // side table, so `instanceof Subclass` still walks the class chain.
+            self.native_class_tags.insert(handle.to_raw(), class_id);
         }
     }
 
-    /// The class tag of the object at `handle`, if any.
+    /// The class tag of the cell at `handle`, if any — the inline tag for a plain
+    /// object, else the side-table tag for a derived native instance.
     #[must_use]
     pub fn class_tag(&self, handle: Handle) -> Option<u32> {
-        self.heap.get(handle)?.as_object()?.class_tag()
+        if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
+            return o.class_tag();
+        }
+        self.native_class_tags.get(&handle.to_raw()).copied()
     }
 
     /// Deletes own property `key` from the object at `handle`; returns whether
