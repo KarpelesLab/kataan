@@ -3938,31 +3938,40 @@ impl<'a> Interp<'a> {
                     self.realm.collection_clear(handle);
                     return Ok(Some(NanBox::undefined()));
                 }
-                // `Map.prototype.getOrInsert(key, value)` (upsert proposal): return
-                // the existing value if `key` is present, else insert `value` and
-                // return it. Only a non-weak Map (it returns a value, not the map).
+                // `Map.prototype.getOrInsert(key, value)` /
+                // `WeakMap.prototype.getOrInsert(key, value)` (upsert proposal):
+                // return the existing value if `key` is present, else insert
+                // `value` and return it. The receiver is brand-checked by the
+                // first-class dispatch (`N_MAP_PROTO_FN`/`N_WEAKMAP_PROTO_FN`), so
+                // here we only canonicalize the key, validate weak-holdability for
+                // a WeakMap, then read/insert.
                 "getOrInsert" if self.realm.collection_is_set(handle) == Some(false) => {
-                    self.guard_weak_key(handle, arg(0))?;
-                    if let Some(v) = self.realm.collection_get(handle, arg(0)) {
+                    self.guard_get_or_insert_key(handle, arg(0))?;
+                    let key = Self::canonicalize_collection_key(arg(0));
+                    if let Some(v) = self.realm.collection_get(handle, key) {
                         return Ok(Some(v));
                     }
-                    self.realm.collection_set(handle, arg(0), arg(1));
+                    self.realm.collection_set(handle, key, arg(1));
                     return Ok(Some(arg(1)));
                 }
-                // `Map.prototype.getOrInsertComputed(key, callbackfn)`: return the
-                // existing value, else call `callbackfn(key)`, insert the result,
-                // and return it. The presence is re-checked *after* the callback
-                // (which may have mutated the map).
+                // `Map.prototype.getOrInsertComputed(key, callbackfn)` /
+                // `WeakMap.prototype.getOrInsertComputed(key, callbackfn)`: return
+                // the existing value, else call `callbackfn(canonicalKey)`, insert
+                // the result, and return it. `callbackfn` must be callable — that
+                // check happens *before* probing for the key (so it throws even
+                // when the key is present). The presence is re-checked *after* the
+                // callback (which may have mutated the map); the spec overwrites
+                // with the computed value either way.
                 "getOrInsertComputed" if self.realm.collection_is_set(handle) == Some(false) => {
-                    self.guard_weak_key(handle, arg(0))?;
+                    self.guard_get_or_insert_key(handle, arg(0))?;
                     self.require_callable(arg(1), "getOrInsertComputed callback")?;
-                    if let Some(v) = self.realm.collection_get(handle, arg(0)) {
+                    let key = Self::canonicalize_collection_key(arg(0));
+                    if let Some(v) = self.realm.collection_get(handle, key) {
                         return Ok(Some(v));
                     }
-                    let computed = self.call(arg(1), &[arg(0)])?;
-                    // Re-check: the callback may have inserted `key` itself; the
-                    // spec overwrites with the computed value either way.
-                    self.realm.collection_set(handle, arg(0), computed);
+                    // The callback receives the *canonical* key as its sole argument.
+                    let computed = self.call(arg(1), &[key])?;
+                    self.realm.collection_set(handle, key, computed);
                     return Ok(Some(computed));
                 }
                 "forEach" => {

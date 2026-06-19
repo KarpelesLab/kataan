@@ -1199,6 +1199,36 @@ impl<'a> Interp<'a> {
         Err(self.type_error("Symbol.prototype method called on a non-symbol value"))
     }
 
+    /// `CanonicalizeKeyedCollectionKey(key)` (ECMA-262): `-0𝔽` becomes `+0𝔽`;
+    /// every other value is returned unchanged. Used by the upsert proposal's
+    /// `getOrInsert`/`getOrInsertComputed` so the canonical key is both stored and
+    /// handed to the callback. (`-0.0 == 0.0` in Rust, and `NanBox::number(0.0)`
+    /// produces positive zero, so this normalizes the sign.)
+    #[must_use]
+    pub(crate) fn canonicalize_collection_key(key: NanBox) -> NanBox {
+        if key.as_number() == Some(0.0) {
+            NanBox::number(0.0)
+        } else {
+            key
+        }
+    }
+
+    /// The key validation shared by `getOrInsert`/`getOrInsertComputed`. For a
+    /// WeakMap, `CanBeHeldWeakly(key)` must hold — an object or a non-registered
+    /// symbol — else a TypeError (this correctly rejects registered symbols and
+    /// every primitive). For a non-weak Map there is no constraint.
+    pub(crate) fn guard_get_or_insert_key(
+        &mut self,
+        coll: Handle,
+        key: NanBox,
+    ) -> Result<(), ExecError> {
+        if !self.realm.collection_is_weak(coll) || self.can_be_held_weakly(key) {
+            return Ok(());
+        }
+        let m = self.new_str("Invalid value used as weak collection key");
+        Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
+    }
+
     pub(crate) fn guard_weak_key(&mut self, coll: Handle, key: NanBox) -> Result<(), ExecError> {
         if !self.realm.collection_is_weak(coll) {
             return Ok(());

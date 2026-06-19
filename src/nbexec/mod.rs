@@ -1145,7 +1145,8 @@ const MAP_PROTO_METHODS: &[&str] = &[
     "getOrInsertComputed",
 ];
 /// `WeakMap.prototype` methods exposed as first-class values.
-const WEAKMAP_PROTO_METHODS: &[&str] = &["set", "get", "has", "delete"];
+const WEAKMAP_PROTO_METHODS: &[&str] =
+    &["set", "get", "has", "delete", "getOrInsert", "getOrInsertComputed"];
 /// `WeakSet.prototype` methods exposed as first-class values.
 const WEAKSET_PROTO_METHODS: &[&str] = &["add", "has", "delete"];
 /// `Promise.prototype` methods exposed as first-class values.
