@@ -133,6 +133,25 @@ pub(crate) fn resolve_lone(name: &str) -> Option<PropEscape> {
     gc_value(name).map(PropEscape::Gc)
 }
 
+/// The seven ECMAScript *properties of strings* (`\p{…}` names valid only in a
+/// `v`-mode class, matching multi-code-point strings). This engine does not yet
+/// implement them, but they are well-formed per spec — so a `\p{…}` with one of
+/// these names is an *unsupported* (deferred) escape rather than a `SyntaxError`,
+/// keeping a never-matched `v`-mode literal that uses one from failing at parse.
+#[must_use]
+pub(crate) fn is_property_of_strings(name: &str) -> bool {
+    matches!(
+        name,
+        "Basic_Emoji"
+            | "Emoji_Keycap_Sequence"
+            | "RGI_Emoji"
+            | "RGI_Emoji_Flag_Sequence"
+            | "RGI_Emoji_Modifier_Sequence"
+            | "RGI_Emoji_Tag_Sequence"
+            | "RGI_Emoji_ZWJ_Sequence"
+    )
+}
+
 /// Resolves a `name=value` property escape. The left-hand side must be one of the
 /// non-binary properties `General_Category`/`gc`, `Script`/`sc`, or
 /// `Script_Extensions`/`scx`; the value is validated against it. Any other LHS,

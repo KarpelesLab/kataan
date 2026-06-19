@@ -858,6 +858,7 @@ impl Parser {
                 None => return Err(RegexError::new("unterminated `\\p{…}`")),
             }
         }
+        let is_lone = value.is_none();
         let resolved = match value {
             // `name=value` — both sides must be non-empty and resolve.
             Some(value) => {
@@ -876,7 +877,19 @@ impl Parser {
                 }
             }
         };
-        resolved.ok_or_else(|| RegexError::unsupported("unsupported `\\p{…}` property escape"))
+        resolved.ok_or_else(|| {
+            // A lone `\p{…}` naming a *property of strings* is well-formed (valid
+            // only in a `v`-mode class) but unimplemented here — defer it rather
+            // than reject the literal at parse. Every other unresolved escape — a
+            // bogus name, an ES-unsupported Unicode property, a binary property
+            // given a value, a non-binary property used without one, loose
+            // (non-exact) matching — is a genuine `SyntaxError`.
+            if is_lone && super::props::is_property_of_strings(&name) {
+                RegexError::unsupported("unsupported `\\p{…}` property of strings")
+            } else {
+                RegexError::new("invalid `\\p{…}` property escape")
+            }
+        })
     }
 
     /// Parses a `\uHHHH` or `\u{H…}` escape body (the `\u` already consumed),
