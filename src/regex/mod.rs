@@ -112,10 +112,28 @@ pub struct Flags {
 }
 
 impl Flags {
-    /// Parses a flags string (e.g. `"gi"`), erroring on unknown flags.
+    /// Parses a flags string (e.g. `"gi"`), erroring on unknown flags, on a
+    /// repeated flag character, or on the incompatible `u`+`v` combination.
+    ///
+    /// Per `RegExp.prototype` flag validation (and the regex-literal early error)
+    /// each flag character may appear at most once and the `u` (unicode) and `v`
+    /// (unicodeSets) flags are mutually exclusive — both are Syntax Errors.
     pub fn parse(s: &str) -> Result<Flags, RegexError> {
         let mut f = Flags::default();
+        // Tracks which flag characters have already been seen so a duplicate
+        // (e.g. `gg`) is rejected as a Syntax Error.
+        let mut seen = [false; 128];
         for c in s.chars() {
+            // A flag is always an ASCII letter; an out-of-range char is an unknown
+            // flag and a non-ASCII char can never be a valid flag. Index the seen
+            // table only for ASCII so the bound is safe.
+            let idx = c as usize;
+            if idx < 128 {
+                if seen[idx] {
+                    return Err(RegexError::new(alloc::format!("duplicate flag `{c}`")));
+                }
+                seen[idx] = true;
+            }
             match c {
                 'i' => f.ignore_case = true,
                 'g' => f.global = true,
@@ -132,6 +150,12 @@ impl Flags {
                 'd' => {} // accepted but not yet acted on (hasIndices)
                 other => return Err(RegexError::new(alloc::format!("unknown flag `{other}`"))),
             }
+        }
+        // `u` and `v` may not both be set: `v` is a distinct, stricter mode, not
+        // an addition to `u`. (`f.unicode` is implied by `v`, so check the raw
+        // presence of both letters.)
+        if f.unicode_sets && s.contains('u') {
+            return Err(RegexError::new("the `u` and `v` flags are mutually exclusive"));
         }
         Ok(f)
     }

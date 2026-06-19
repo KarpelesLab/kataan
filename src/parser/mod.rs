@@ -923,6 +923,24 @@ impl<'src> Parser<'src> {
             TokenKind::Regex => {
                 self.bump();
                 let (pattern, flags) = split_regex(tok.text(self.source));
+                // A regex *literal* is validated at parse time: an invalid pattern
+                // or invalid/duplicate flags is an early (parse-phase) SyntaxError,
+                // per `RegExp` literal evaluation. Running the regex engine's own
+                // parser/compiler here surfaces the same diagnostics the runtime
+                // `new RegExp(...)` path produces, but at the Parse phase. (Lazily
+                // compiled literals would otherwise never be validated until first
+                // matched.) Gated on the `regex` feature: without it there is no
+                // engine to validate against and the lenient behavior is kept.
+                // An unimplemented-but-valid feature (e.g. a `\p{…}` property
+                // escape) is NOT a SyntaxError: defer it to runtime rather than
+                // rejecting the literal at parse, so a never-matched such literal
+                // keeps working. Only genuine syntax errors fail the parse.
+                #[cfg(feature = "regex")]
+                if let Err(e) = crate::regex::Regex::new(pattern, flags)
+                    && !e.is_unsupported()
+                {
+                    return Err(self.err_at(tok.span, alloc::format!("{e}")));
+                }
                 Ok(Expr::Regex {
                     pattern: pattern.into(),
                     flags: flags.into(),

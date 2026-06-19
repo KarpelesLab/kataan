@@ -24,13 +24,34 @@ const MAX_PARSE_DEPTH: u32 = crate::limits::DEFAULT_REGEX_MAX_PARSE_DEPTH;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegexError {
     message: String,
+    /// `true` when the pattern is well-formed per spec but uses a feature this
+    /// engine does not implement yet (e.g. a `\p{…}` property escape) — as
+    /// opposed to a genuine *SyntaxError*. Parse-time literal validation defers
+    /// such patterns to runtime rather than rejecting them at parse, so an
+    /// unsupported-but-valid literal that is never matched does not break.
+    unsupported: bool,
 }
 
 impl RegexError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            unsupported: false,
         }
+    }
+
+    /// A "valid syntax, unimplemented feature" error (see [`Self::unsupported`]).
+    pub(crate) fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            unsupported: true,
+        }
+    }
+
+    /// Whether this is an unimplemented-feature error rather than a `SyntaxError`.
+    #[must_use]
+    pub fn is_unsupported(&self) -> bool {
+        self.unsupported
     }
 }
 
@@ -583,7 +604,7 @@ impl Parser {
                 self.group_names.push((self.group_count, name));
                 Some(self.group_count)
             } else {
-                return Err(RegexError::new("unsupported group extension `(?…)`"));
+                return Err(RegexError::unsupported("unsupported group extension `(?…)`"));
             }
         } else {
             self.group_count += 1;
@@ -855,7 +876,7 @@ impl Parser {
                 }
             }
         };
-        resolved.ok_or_else(|| RegexError::new("unsupported `\\p{…}` property escape"))
+        resolved.ok_or_else(|| RegexError::unsupported("unsupported `\\p{…}` property escape"))
     }
 
     /// Parses a `\uHHHH` or `\u{H…}` escape body (the `\u` already consumed),
@@ -945,6 +966,23 @@ impl Parser {
                     let Some(e) = self.bump() else {
                         return Err(RegexError::new("trailing backslash in class"));
                     };
+                    // A class escape (`\d \D \w \W \s \S`, or `\p`/`\P` under `u`)
+                    // is a *set*, not a single character, so it cannot be an
+                    // endpoint of a range. Under the `u` flag `[\w-z]` (a class
+                    // escape on the left of a `-` range) is a Syntax Error; in
+                    // Annex B (non-`u`) sloppy mode the `-` is a literal dash, so
+                    // only reject under `u`.
+                    let is_class_escape = matches!(e, 'd' | 'D' | 'w' | 'W' | 's' | 'S')
+                        || (self.unicode && matches!(e, 'p' | 'P'));
+                    if self.unicode
+                        && is_class_escape
+                        && self.peek() == Some('-')
+                        && self.chars.get(self.pos + 1).is_some_and(|&n| n != ']')
+                    {
+                        return Err(RegexError::new(
+                            "invalid character class range with a class-escape endpoint",
+                        ));
+                    }
                     match e {
                         'd' => items.push(ClassItem::Shorthand(Shorthand::Digit)),
                         'D' => items.push(ClassItem::Shorthand(Shorthand::NotDigit)),
@@ -962,20 +1000,20 @@ impl Parser {
                         )),
                         'u' => {
                             let ch = self.parse_unicode_escape()?;
-                            self.push_class_member(&mut items, ch);
+                            self.push_class_member(&mut items, ch)?;
                         }
                         'x' => {
                             let ch = self.parse_hex_escape(2)?;
-                            self.push_class_member(&mut items, ch);
+                            self.push_class_member(&mut items, ch)?;
                         }
                         other => {
-                            self.push_class_member(&mut items, escape_char(other) as u32);
+                            self.push_class_member(&mut items, escape_char(other) as u32)?;
                         }
                     }
                 }
                 Some(c) => {
                     self.pos += 1;
-                    self.push_class_member(&mut items, c as u32);
+                    self.push_class_member(&mut items, c as u32)?;
                 }
             }
         }
@@ -983,9 +1021,24 @@ impl Parser {
     }
 
     /// Pushes `c` (a scalar code point) into a class, forming a range if a `-`
-    /// and another member follow.
-    fn push_class_member(&mut self, items: &mut Vec<ClassItem>, c: u32) {
+    /// and another member follow. Returns `Err` for an invalid range whose high
+    /// endpoint is a class escape under the `u` flag (`[a-\d]`); in Annex B
+    /// (non-`u`) sloppy mode that `-` is a literal dash and never errors.
+    fn push_class_member(&mut self, items: &mut Vec<ClassItem>, c: u32) -> Result<(), RegexError> {
         if self.peek() == Some('-') && self.chars.get(self.pos + 1).is_some_and(|&n| n != ']') {
+            // Under `u`, a class escape (`\d`, `\w`, … or `\p`/`\P`) on the right
+            // of a `-` range is a Syntax Error: it is a set, not a single
+            // character, so it cannot serve as a range endpoint (`[a-\d]`).
+            if self.unicode
+                && self.chars.get(self.pos + 1) == Some(&'\\')
+                && self.chars.get(self.pos + 2).is_some_and(|&n| {
+                    matches!(n, 'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'p' | 'P')
+                })
+            {
+                return Err(RegexError::new(
+                    "invalid character class range with a class-escape endpoint",
+                ));
+            }
             self.pos += 1; // `-`
             let hi = if self.peek() == Some('\\') {
                 self.pos += 1;
@@ -1002,6 +1055,7 @@ impl Parser {
         } else {
             items.push(ClassItem::Char(c));
         }
+        Ok(())
     }
 
     // --- `v`-mode extended character classes (ClassSetExpression) ---
