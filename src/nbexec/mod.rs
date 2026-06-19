@@ -1257,7 +1257,11 @@ fn builtin_native_arity(id: u16) -> u32 {
         // `DisposableStack`/`AsyncDisposableStack`/`ShadowRealm` take no parameters.
         | N_DISPOSABLE_STACK
         | N_ASYNC_DISPOSABLE_STACK
-        | N_SHADOW_REALM => 0,
+        | N_SHADOW_REALM
+        // `Uint8Array.prototype.toBase64([options])` / `.toHex()` — `length` 0
+        // (the optional `options` is not counted; `toHex` takes none).
+        | N_UINT8_TO_BASE64
+        | N_UINT8_TO_HEX => 0,
         // Length 2.
         N_PROXY
         | N_OBJECT_SET_PROTO
@@ -1663,6 +1667,16 @@ const N_JSON_IS_RAW: u16 = 651;
 const N_ARRAY_FROM_ASYNC: u16 = 652;
 /// `RegExp.escape(S)` — escapes `S` so it matches literally in a pattern.
 const N_REGEXP_ESCAPE: u16 = 653;
+/// The ES2025 `uint8array-base64` proposal methods. Instance methods on
+/// `Uint8Array.prototype` (`this` must be a `Uint8Array`) and statics on the
+/// `Uint8Array` constructor; all six are pure byte↔string codecs (see
+/// [`base64`]).
+const N_UINT8_TO_BASE64: u16 = 654;
+const N_UINT8_TO_HEX: u16 = 655;
+const N_UINT8_SET_FROM_BASE64: u16 = 656;
+const N_UINT8_SET_FROM_HEX: u16 = 657;
+const N_UINT8_FROM_BASE64: u16 = 658;
+const N_UINT8_FROM_HEX: u16 = 659;
 /// Hidden brand + payload on a RawJSON object (the validated source text).
 const RAW_JSON_BRAND: &str = "\u{0}rawjson";
 /// Hidden-property keys for a capability state object built around a foreign `C`.
@@ -1678,6 +1692,7 @@ const PCOMB_REJECT: &str = "\u{0}pc_rej";
 const PCOMB_INDEX: &str = "\u{0}pc_idx";
 const PCOMB_CALLED: &str = "\u{0}pc_called";
 
+mod base64;
 mod call;
 mod class;
 mod convert;
@@ -2349,6 +2364,43 @@ impl<'a> Interp<'a> {
                 .set_property(ns, name, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(ns, name);
         }
+    }
+
+    /// Installs the ES2025 `uint8array-base64` proposal's six methods. The four
+    /// instance methods (`toBase64`/`toHex`/`setFromBase64`/`setFromHex`) go on
+    /// `Uint8Array.prototype`; the two statics (`fromBase64`/`fromHex`) on the
+    /// `Uint8Array` constructor. Each is a named native (carrying its own
+    /// `name`/`length`) installed as an own `{ writable: true, enumerable: false,
+    /// configurable: true }` data property — exactly the proposal's descriptors.
+    /// These are `Uint8Array`-specific, never on `%TypedArray%.prototype`.
+    fn install_uint8array_base64(&mut self) {
+        let Some(ctor) = self
+            .current
+            .get("Uint8Array")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        let proto = self
+            .realm
+            .get_property(ctor, "prototype")
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw);
+        let install = |this: &mut Self, target: Handle, name: &str, id: u16| {
+            let f = this.new_named_native(name, id);
+            this.realm
+                .set_property(target, name, NanBox::handle(f.to_raw()));
+            this.realm.mark_hidden(target, name);
+        };
+        if let Some(proto) = proto {
+            install(self, proto, "toBase64", N_UINT8_TO_BASE64);
+            install(self, proto, "toHex", N_UINT8_TO_HEX);
+            install(self, proto, "setFromBase64", N_UINT8_SET_FROM_BASE64);
+            install(self, proto, "setFromHex", N_UINT8_SET_FROM_HEX);
+        }
+        install(self, ctor, "fromBase64", N_UINT8_FROM_BASE64);
+        install(self, ctor, "fromHex", N_UINT8_FROM_HEX);
     }
 
     /// Installs a small built-in library: the `Math` object and the global
@@ -3261,6 +3313,9 @@ impl<'a> Interp<'a> {
         // constructor-side hierarchy that hangs the concrete TA constructors off
         // it (so `Object.getPrototypeOf(Int8Array) === %TypedArray%`).
         self.setup_typed_array_intrinsic(obj_proto);
+        // The ES2025 `uint8array-base64` proposal: six `Uint8Array`-specific
+        // methods (not on `%TypedArray%.prototype`).
+        self.install_uint8array_base64();
         // Static methods that are otherwise call-only (readable for feature detection).
         self.setup_static_methods(
             "Promise",

@@ -1221,6 +1221,14 @@ impl<'a> Interp<'a> {
                 let out = regexp_escape_wtf8(&bytes);
                 self.new_str_bytes(out)
             }
+            // The ES2025 `uint8array-base64` proposal: `this`/argument validation,
+            // option-bag reads, and the codec all live in the `base64` module.
+            N_UINT8_TO_BASE64 => self.uint8_to_base64(arg(0))?,
+            N_UINT8_TO_HEX => self.uint8_to_hex()?,
+            N_UINT8_SET_FROM_BASE64 => self.uint8_set_from_base64(arg(0), arg(1))?,
+            N_UINT8_SET_FROM_HEX => self.uint8_set_from_hex(arg(0))?,
+            N_UINT8_FROM_BASE64 => self.uint8_from_base64(arg(0), arg(1))?,
+            N_UINT8_FROM_HEX => self.uint8_from_hex(arg(0))?,
             N_ARRAY_OF => NanBox::handle(self.realm.new_array(args.to_vec()).to_raw()),
             // `%IteratorPrototype%[Symbol.iterator]()` — an iterator is its own
             // iterable: return the receiver.
