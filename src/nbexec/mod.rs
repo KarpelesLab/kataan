@@ -1653,6 +1653,9 @@ const N_PROMISE_CAPABILITY_EXECUTOR: u16 = 649;
 /// `JSON.rawJSON(text)` / `JSON.isRawJSON(value)` (the JSON source-text proposal).
 const N_JSON_RAW: u16 = 650;
 const N_JSON_IS_RAW: u16 = 651;
+/// `Array.fromAsync(asyncItems, mapFn?, thisArg?)` — returns a promise of an
+/// array, awaiting each value of an (a)sync iterable / array-like.
+const N_ARRAY_FROM_ASYNC: u16 = 652;
 /// Hidden brand + payload on a RawJSON object (the validated source text).
 const RAW_JSON_BRAND: &str = "\u{0}rawjson";
 /// Hidden-property keys for a capability state object built around a foreign `C`.
@@ -2494,6 +2497,7 @@ impl<'a> Interp<'a> {
             &[
                 ("isArray", N_ARRAY_IS_ARRAY),
                 ("from", N_ARRAY_FROM),
+                ("fromAsync", N_ARRAY_FROM_ASYNC),
                 ("of", N_ARRAY_OF),
             ],
         );

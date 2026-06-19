@@ -1192,6 +1192,22 @@ impl<'a> Interp<'a> {
                     NanBox::handle(self.realm.new_array(items).to_raw())
                 }
             }
+            // `Array.fromAsync(asyncItems, mapFn?, thisArg?)` — returns a promise.
+            // Its body runs eagerly (awaiting each value through the event loop, per
+            // the engine's eager-async model); the result array fulfills the promise
+            // and any thrown value (bad mapFn, null items, an iteration/await throw)
+            // rejects it, so `fromAsync` never throws synchronously.
+            N_ARRAY_FROM_ASYNC => {
+                let this_ctor = self.this_val;
+                let computed = self.array_from_async_core(arg(0), arg(1), arg(2), this_ctor);
+                let p = self.fresh_promise();
+                match computed {
+                    Ok(v) => self.resolve_with(p, v),
+                    Err(ExecError::Throw(e)) => self.settle(p, e, false),
+                    Err(other) => return Err(other),
+                }
+                NanBox::handle(p.to_raw())
+            }
             N_ARRAY_OF => NanBox::handle(self.realm.new_array(args.to_vec()).to_raw()),
             // `%IteratorPrototype%[Symbol.iterator]()` — an iterator is its own
             // iterable: return the receiver.

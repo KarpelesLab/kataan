@@ -1252,6 +1252,113 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `Array.fromAsync(asyncItems, mapFn?, thisArg?)` — the synchronous core.
+    /// Eagerly drives the (a)sync iterable / array-like (awaiting each value),
+    /// applies `mapFn` (awaiting its result), and builds the result array. The
+    /// dispatch site wraps the returned value — or a thrown value — into the
+    /// promise `fromAsync` returns, so every failure here becomes a rejection.
+    pub(crate) fn array_from_async_core(
+        &mut self,
+        items_box: NanBox,
+        map_fn: NanBox,
+        this_arg: NanBox,
+        this_ctor: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let has_map = !matches!(map_fn.unpack(), Unpacked::Undefined);
+        if has_map {
+            self.require_callable(map_fn, "Array.fromAsync mapFn")?;
+        }
+        if matches!(items_box.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Err(self.type_error(
+                "Array.fromAsync requires an array-like or iterable object, not null/undefined",
+            ));
+        }
+        // An (a)sync iterable is drained through the async-iterator protocol
+        // (`for_await_values`); a bare array-like (a `length` + indices, no
+        // iterator) has each element `Get` then awaited.
+        let h = items_box.as_handle().map(Handle::from_raw);
+        let iterable = match h {
+            Some(h) => {
+                let sym = self.well_known_symbol("asyncIterator");
+                let akey = self.member_key(sym);
+                let has_async = self
+                    .read_member(h, &akey)?
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
+                has_async
+                    || self
+                        .find_iterator_fn(h)?
+                        .filter(|f| {
+                            f.as_handle()
+                                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                        })
+                        .is_some()
+                    || self.realm.is_array(h)
+                    || self.realm.string_value(h).is_some()
+                    || self.realm.collection_is_set(h).is_some()
+                    || self.realm.get_property(h, GEN_BUF).is_some()
+                    || self.gen_frame_id(h).is_some()
+            }
+            None => false,
+        };
+        let raw_items = if iterable {
+            self.for_await_values(items_box)?
+        } else {
+            // Array-like: ToLength(Get(O, "length")), then await Get(O, k).
+            let mut out = Vec::new();
+            if let Some(h) = h {
+                let len_val = self.read_member(h, "length")?;
+                let len_num = self.coerce_to_number(len_val)?;
+                let len_raw = self.realm.to_number(len_num);
+                if len_raw > self.realm.limits.max_array_len as f64 {
+                    let m = self.new_str("Invalid array length");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                let len = if len_raw.is_nan() || len_raw <= 0.0 {
+                    0
+                } else {
+                    len_raw as usize
+                };
+                for i in 0..len {
+                    let v = self.read_member(h, &alloc::format!("{i}"))?;
+                    out.push(self.await_value(v)?);
+                }
+            }
+            out
+        };
+        // Apply `mapFn` (awaiting each result) in index order.
+        let items = if has_map {
+            let mut out = Vec::with_capacity(raw_items.len());
+            for (i, e) in raw_items.iter().enumerate() {
+                let mapped =
+                    self.call_with_this(map_fn, this_arg, &[*e, NanBox::number(i as f64)])?;
+                out.push(self.await_value(mapped)?);
+            }
+            out
+        } else {
+            raw_items
+        };
+        // A subclass / constructor `this` (`C.fromAsync(...)`) is `Construct`ed
+        // and populated; the default `%Array%` builds a plain dense array.
+        let is_array_ctor =
+            self.current.get("Array").and_then(|v| v.as_handle()) == this_ctor.as_handle();
+        if self.is_constructor_value(this_ctor) && !is_array_ctor {
+            let len = items.len();
+            let target = self.construct(this_ctor, &[NanBox::number(len as f64)])?;
+            let Some(th) = target.as_handle().map(Handle::from_raw) else {
+                return Err(self.type_error("Array.fromAsync constructor did not return an object"));
+            };
+            for (i, e) in items.iter().enumerate() {
+                self.realm.set_property(th, &alloc::format!("{i}"), *e);
+            }
+            let len_key = self.new_str("length");
+            self.assign_member_value(th, len_key, NanBox::number(len as f64))?;
+            Ok(target)
+        } else {
+            Ok(NanBox::handle(self.realm.new_array(items).to_raw()))
+        }
+    }
+
     /// Drains an iterable for `for await (… of …)`. An *async* iterator — an
     /// `async function*` generator object, or any object with a callable
     /// `[Symbol.asyncIterator]` — yields **promises of iterator results**, so each
