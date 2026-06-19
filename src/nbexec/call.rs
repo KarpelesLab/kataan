@@ -832,7 +832,7 @@ impl<'a> Interp<'a> {
                     // plain `Promise.all(…)` call (`this` = the constructor itself).
                     let this_aware = matches!(
                         name.as_str(),
-                        "all" | "race" | "allSettled" | "any" | "resolve" | "reject"
+                        "all" | "race" | "allSettled" | "any" | "resolve" | "reject" | "try"
                     );
                     // For a `this`-aware static, a non-object receiver (number,
                     // string, boolean, symbol, null, undefined — including a detached

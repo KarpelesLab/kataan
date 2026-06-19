@@ -1477,6 +1477,45 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
+        // `Promise.try(fn, ...args)` — generic over the receiver `C` (`this`), which
+        // must be a constructor (`NewPromiseCapability(C)` throws otherwise, so
+        // `Promise.try.call(nonCtorObject, …)` is a TypeError; a non-object `this` is
+        // already rejected by the `this_aware` static dispatch). Calls `fn(...args)`
+        // synchronously: a returned value resolves the capability (adopting a
+        // thenable), a throw (incl. a non-callable `fn`) rejects it. Gated to a
+        // non-promise receiver so a `p.try` on a thenable named "try" is not hijacked.
+        if method == "try" && self.realm.promise_state(handle).is_none() {
+            if !self.is_constructor(recv) {
+                return Err(self.type_error("Promise.try called on a non-constructor"));
+            }
+            let callback = arg(0);
+            let rest: Vec<NanBox> = if args.len() > 1 {
+                args[1..].to_vec()
+            } else {
+                Vec::new()
+            };
+            // Fast path for the intrinsic `%Promise%`; a subclass uses its capability.
+            if self.realm.native_at(handle) == Some(N_PROMISE) {
+                let p = self.fresh_promise();
+                match self.call_with_this(callback, NanBox::undefined(), &rest) {
+                    Ok(v) => self.resolve_with(p, v),
+                    Err(ExecError::Throw(e)) => self.settle(p, e, false),
+                    Err(other) => return Err(other),
+                }
+                return Ok(Some(NanBox::handle(p.to_raw())));
+            }
+            let cap = self.new_promise_capability(recv)?;
+            match self.call_with_this(callback, NanBox::undefined(), &rest) {
+                Ok(v) => {
+                    self.call_with_this(cap.resolve, NanBox::undefined(), &[v])?;
+                }
+                Err(ExecError::Throw(e)) => {
+                    self.call_with_this(cap.reject, NanBox::undefined(), &[e])?;
+                }
+                Err(other) => return Err(other),
+            }
+            return Ok(Some(cap.promise));
+        }
         // --- Promise combinators (`all`/`race`/`allSettled`/`any`) ---
         // These are generic over the receiver `C` (`this`): `Promise.all`,
         // `Subclass.all`, and `Promise.all.call(C, …)` all dispatch here. They run

@@ -3517,6 +3517,7 @@ impl<'a> Interp<'a> {
                 "allSettled",
                 "any",
                 "withResolvers",
+                "try",
             ],
         );
         self.setup_static_methods("Map", &["groupBy"]);
