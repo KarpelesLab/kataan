@@ -1786,6 +1786,31 @@ impl Realm {
         Some((0..a.len()).filter(|&i| !a[i].is_hole()).collect())
     }
 
+    /// The present integer index keys that are *enumerable*, ascending — for
+    /// `for-in` / `Object.keys` / spread, which skip an index demoted to
+    /// `enumerable: false` via `defineProperty`. Identical to
+    /// [`array_present_indices`](Realm::array_present_indices) for the common array
+    /// with no per-index overrides; the hidden-flag probe is skipped entirely when
+    /// the array carries no aux object.
+    #[must_use]
+    pub fn array_enumerable_indices(&self, handle: Handle) -> Option<Vec<usize>> {
+        let a = self.heap.get(handle).and_then(Cell::as_array)?;
+        // No aux object ⇒ no index was ever demoted ⇒ every present index enumerates.
+        let hidden_owner = self
+            .aux_props
+            .get(&handle.to_raw())
+            .and_then(|aux| self.heap.get(*aux))
+            .and_then(Cell::as_object);
+        let Some(o) = hidden_owner else {
+            return Some((0..a.len()).filter(|&i| !a[i].is_hole()).collect());
+        };
+        Some(
+            (0..a.len())
+                .filter(|&i| !a[i].is_hole() && !o.is_hidden(&alloc::format!("{i}")))
+                .collect(),
+        )
+    }
+
     /// `arr[index]` — the element at `index`, or `undefined` if out of range or
     /// the cell is not an array (or typed-array view). Takes `&mut self` because a
     /// `BigInt64Array`/`BigUint64Array` element read allocates a `BigInt`.
@@ -1797,6 +1822,33 @@ impl Realm {
             }
             _ => NanBox::undefined(),
         }
+    }
+
+    /// Whether the array index `i` carries a *non-default* own attribute or an
+    /// accessor — i.e. a `defineProperty` once demoted its writability/enumerability/
+    /// configurability or installed a getter/setter, so an `arr[i] = v` write cannot
+    /// take the plain dense-store fast path and must consult the descriptor instead.
+    ///
+    /// Returns `false` immediately for the overwhelming common case (no aux object,
+    /// not frozen), keeping the dense write path untouched and allocation-free.
+    #[must_use]
+    pub fn array_index_has_override(&self, handle: Handle, i: usize) -> bool {
+        let raw = handle.to_raw();
+        // A frozen array makes every index non-writable+non-configurable.
+        if self.frozen_arrays.contains(&raw) || self.sealed_arrays.contains(&raw) {
+            return true;
+        }
+        let Some(aux) = self.aux_props.get(&raw) else {
+            return false;
+        };
+        let Some(o) = self.heap.get(*aux).and_then(Cell::as_object) else {
+            return false;
+        };
+        let key = alloc::format!("{i}");
+        o.is_readonly(&key)
+            || o.is_hidden(&key)
+            || o.is_non_configurable(&key)
+            || o.accessor(&key).is_some()
     }
 
     /// `arr[index] = value` — grows the array with `undefined` holes if `index`
@@ -1949,6 +2001,95 @@ impl Realm {
         }
     }
 
+    /// Whether an `arr.length = new_len` set needs the descriptor-aware tree-walker
+    /// rather than the VM's plain `set_array_length`. True when the array's `length`
+    /// is non-writable (the set must be rejected / strict-thrown), or when a shrink
+    /// could hit a non-configurable index (ArraySetLength's stop-and-fail). Returns
+    /// `false` for the common unrestricted array, so the VM keeps its fast path.
+    #[must_use]
+    pub fn array_length_set_needs_slow_path(&self, handle: Handle, new_len: usize) -> bool {
+        let raw = handle.to_raw();
+        if self.array_length_is_readonly(handle) {
+            return true;
+        }
+        // Only a shrink can hit a non-configurable index.
+        let cur = self.array_length(handle).unwrap_or(0);
+        if new_len >= cur {
+            return false;
+        }
+        self.frozen_arrays.contains(&raw)
+            || self.sealed_arrays.contains(&raw)
+            || self
+                .aux_props
+                .get(&raw)
+                .and_then(|a| self.heap.get(*a))
+                .and_then(Cell::as_object)
+                .is_some_and(|o| !o.non_configurable_is_empty())
+    }
+
+    /// `ArraySetLength` (ECMA-262 10.4.3.1) shrink semantics: lower the array's
+    /// `length` to `new_len`, deleting elements from the top down. A to-be-deleted
+    /// index that is **non-configurable** (a frozen/sealed array, or one demoted via
+    /// `defineProperty(arr, i, {configurable:false})`) cannot be removed — deletion
+    /// stops there, the length is left at `that_index + 1`, and `Ok(false)` is
+    /// returned (a throwing context surfaces a TypeError). When every deletion
+    /// down to `new_len` succeeds, the length becomes `new_len` and `Ok(true)` is
+    /// returned. A non-shrinking `new_len` (>= current length) just sets the length.
+    ///
+    /// Returns `false` (the bool) only on the stop-at-non-configurable case; the
+    /// outer `bool` of the tuple is whether `handle` was an array at all.
+    #[must_use]
+    pub fn array_set_length_truncating(&mut self, handle: Handle, new_len: usize) -> (bool, bool) {
+        let cur = match self.array_length(handle) {
+            Some(n) => n,
+            None => return (false, false),
+        };
+        if new_len >= cur {
+            return (true, self.set_array_length(handle, new_len));
+        }
+        // Find the highest present, non-configurable index in [new_len, cur). The
+        // common case (no per-index flags, not frozen/sealed) has none, so the
+        // override probe short-circuits and the truncation is a plain resize.
+        let raw = handle.to_raw();
+        let restricted = self.frozen_arrays.contains(&raw)
+            || self.sealed_arrays.contains(&raw)
+            || self
+                .aux_props
+                .get(&raw)
+                .and_then(|a| self.heap.get(*a))
+                .and_then(Cell::as_object)
+                .is_some_and(|o| !o.non_configurable_is_empty());
+        let mut stop_at: Option<usize> = None;
+        if restricted {
+            // Walk from the top down; the first index that is present (or has an
+            // accessor) and non-configurable halts the deletion.
+            let mut i = cur;
+            while i > new_len {
+                i -= 1;
+                let present = !self.array_hole_at(handle, i)
+                    && self
+                        .heap
+                        .get(handle)
+                        .and_then(Cell::as_array)
+                        .is_some_and(|a| i < a.len());
+                let key = alloc::format!("{i}");
+                let has_accessor = self.accessor(handle, &key).is_some();
+                if (present || has_accessor) && self.property_is_non_configurable(handle, &key) {
+                    stop_at = Some(i);
+                    break;
+                }
+            }
+        }
+        match stop_at {
+            // Deletion halted at `i`: keep everything up to and including it.
+            Some(i) => {
+                self.set_array_length(handle, i + 1);
+                (false, true)
+            }
+            None => (true, self.set_array_length(handle, new_len)),
+        }
+    }
+
     /// `arr.pop()` — removes and returns the last element (`undefined` if empty
     /// or not an array).
     pub fn array_pop(&mut self, handle: Handle) -> NanBox {
@@ -2056,6 +2197,51 @@ impl Realm {
     /// anything was removed.
     pub fn delete_property(&mut self, handle: Handle, key: &str) -> bool {
         let root = Rc::clone(&self.root_shape);
+        // An array's `length` is non-configurable: `delete arr.length` always fails.
+        if key == "length" && self.heap.get(handle).and_then(Cell::as_array).is_some() {
+            return false;
+        }
+        // An array index is an element of the dense store (or a hole carrying an aux
+        // accessor), not a named slot — `delete arr[i]` must punch a hole there, not
+        // merely touch the aux object.
+        if self.heap.get(handle).and_then(Cell::as_array).is_some() && key != "length" {
+            if let Ok(i) = key.parse::<usize>()
+                && alloc::format!("{i}") == key
+            {
+                // A present element, or an accessor installed over a hole, is the own
+                // property to delete. Anything else (out of range, an already-absent
+                // hole) is a no-op that still "succeeds".
+                let present = !self.array_hole_at(handle, i)
+                    && self
+                        .heap
+                        .get(handle)
+                        .and_then(Cell::as_array)
+                        .is_some_and(|a| i < a.len());
+                let has_accessor = self.accessor(handle, key).is_some();
+                if !present && !has_accessor {
+                    return true;
+                }
+                // A non-configurable index (frozen array, or one demoted via
+                // `defineProperty`) cannot be deleted.
+                if self.property_is_non_configurable(handle, key) {
+                    return false;
+                }
+                // Punch a hole in the dense store and clear every aux entry for the
+                // index (accessor + attribute flags), so a later re-add starts fresh.
+                if let Some(a) = self.heap.get_mut(handle).and_then(Cell::as_array_mut)
+                    && i < a.len()
+                {
+                    a[i] = NanBox::hole();
+                }
+                if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+                    && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+                {
+                    o.delete(root, key);
+                }
+                return true;
+            }
+            // A non-index named property on an array falls through to the aux path.
+        }
         if self.heap.get(handle).and_then(Cell::as_object).is_some() {
             let o = self
                 .heap
@@ -2249,9 +2435,17 @@ impl Realm {
     }
 
     /// Removes any accessor for `key` on `handle` (so a redefined data property
-    /// takes precedence over a former getter/setter).
+    /// takes precedence over a former getter/setter). For a callable/array cell with
+    /// no inline object part, the accessor lives in the auxiliary object — clear it
+    /// there too (e.g. converting an array index's getter/setter back to data).
     pub fn clear_accessor(&mut self, handle: Handle, key: &str) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.clear_accessor(key);
+            return;
+        }
+        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+            && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+        {
             o.clear_accessor(key);
         }
     }
@@ -2457,7 +2651,11 @@ impl Realm {
     /// marked `configurable: false`).
     #[must_use]
     pub fn property_is_non_configurable(&self, handle: Handle, key: &str) -> bool {
-        if self.frozen_arrays.contains(&handle.to_raw()) {
+        let raw = handle.to_raw();
+        // A frozen *or sealed* array makes every own index non-configurable (the
+        // flag lives in the side registries, not the aux object). `length` is
+        // always non-configurable for an array regardless.
+        if self.frozen_arrays.contains(&raw) || self.sealed_arrays.contains(&raw) {
             return true;
         }
         self.props_object(handle)

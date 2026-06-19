@@ -1636,7 +1636,7 @@ impl<'a> Interp<'a> {
         // An array's own keys lead with its integer indices (a VM closure's backing
         // cells are not enumerable).
         if !self.realm.is_vm_function(h)
-            && let Some(indices) = self.realm.array_present_indices(h)
+            && let Some(indices) = self.realm.array_enumerable_indices(h)
         {
             for i in indices {
                 let k = alloc::format!("{i}");

@@ -623,6 +623,12 @@ pub enum VmError {
     NotANumber,
     /// A property op was used on a non-object operand.
     NotAnObject,
+    /// A construct the VM cannot evaluate with correct semantics in-place (e.g. an
+    /// `arr[i] = v` write to an array index that a `defineProperty` demoted or made
+    /// an accessor, which needs the tree-walker's strict-aware / accessor-aware
+    /// store). Faults the whole VM so the program re-runs on the reference engine —
+    /// it is *not* a catchable JS error.
+    Unsupported,
     /// An uncaught `throw` propagating out of the call stack (the thrown value).
     Thrown(NanBox),
 }
@@ -1479,14 +1485,28 @@ fn run_frame(
             }
             Op::SetElem { arr, index, src } => {
                 let handle = object_handle(regs[*arr as usize])?;
-                let i = num(regs[*index as usize])? as usize;
+                let fi = num(regs[*index as usize])?;
+                // A non-canonical numeric index on an array (negative or fractional,
+                // e.g. `a[-1]` / `a[1.5]`) is an ordinary named property, NOT an
+                // element — but `as usize` would truncate it to a real index. The
+                // descriptor-aware tree-walker stores it correctly; fault to it.
+                if (fi < 0.0 || fi.fract() != 0.0)
+                    && ctx.realm.typed_len(handle).is_none()
+                    && ctx.realm.is_array(handle)
+                {
+                    return Err(VmError::Unsupported);
+                }
+                let i = fi as usize;
                 // C1: a dense-array write past the capacity cap is refused by the
                 // realm (a silent no-op); surface it as a catchable
                 // `RangeError("Invalid array length")` so `a[1e9] = 1` throws
                 // rather than vanishing. A typed-array out-of-bounds write stays a
-                // spec no-op.
+                // spec no-op. This applies only to true array *indices*
+                // (`[0, 2**32−1)`); the boundary `2**32−1` and above are ordinary
+                // named properties (handled below) and never raise this RangeError.
                 if ctx.realm.typed_len(handle).is_none()
                     && ctx.realm.is_array(handle)
+                    && (i as u64) < u64::from(u32::MAX)
                     && i >= ctx.realm.limits.max_array_len
                 {
                     let e = make_error(ctx.realm, "RangeError", "Invalid array length");
@@ -1500,6 +1520,13 @@ fn run_frame(
                 {
                     let k = alloc::format!("{i}");
                     ctx.realm.set_property(handle, &k, regs[*src as usize]);
+                } else if ctx.realm.typed_len(handle).is_none()
+                    && ctx.realm.array_index_has_override(handle, i)
+                {
+                    // The index was demoted (non-writable/accessor) or the array is
+                    // frozen/sealed: the tree-walker honors the descriptor (accessor
+                    // setter, read-only no-op, strict throw). Fault to it.
+                    return Err(VmError::Unsupported);
                 } else {
                     // A BigInt typed-array element write ToBigInt-coerces (a Number
                     // throws TypeError) instead of silently no-op'ing.
@@ -1587,13 +1614,27 @@ fn run_frame(
                             Err(e) => handle_throw!(VmError::Thrown(e)),
                         }
                     }
-                    Some(n) if ctx.realm.is_array(handle) && (n as u64) < u64::from(u32::MAX) => {
+                    // A canonical non-negative integer index in [0, 2**32−1). A
+                    // negative or fractional key (`a[-1]`, `a[1.5]`) is NOT an array
+                    // index — `as u64` would truncate it to a real index — so it
+                    // falls through to the `_` arm and becomes an ordinary property.
+                    Some(n)
+                        if ctx.realm.is_array(handle)
+                            && n >= 0.0
+                            && n.fract() == 0.0
+                            && (n as u64) < u64::from(u32::MAX) =>
+                    {
                         // C1: refuse-past-cap surfaces as a catchable RangeError
                         // (see `Op::SetElem`).
                         let i = n as usize;
                         if i >= ctx.realm.limits.max_array_len {
                             let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                             handle_throw!(VmError::Thrown(e));
+                        }
+                        // A demoted / accessor index (or frozen/sealed array) needs
+                        // the descriptor-aware tree-walker store. Fault to it.
+                        if ctx.realm.array_index_has_override(handle, i) {
+                            return Err(VmError::Unsupported);
                         }
                         ctx.realm.set_element(handle, i, regs[*src as usize]);
                     }
@@ -1607,6 +1648,9 @@ fn run_frame(
                         if ctx.realm.is_array(handle) && ks == "length" {
                             let v = regs[*src as usize];
                             if let Some(n) = ctx.realm.array_length_uint32(v) {
+                                if ctx.realm.array_length_set_needs_slow_path(handle, n as usize) {
+                                    return Err(VmError::Unsupported);
+                                }
                                 ctx.realm.set_array_length(handle, n as usize);
                             } else {
                                 let e = make_error(ctx.realm, "RangeError", "Invalid array length");
@@ -1617,6 +1661,25 @@ fn run_frame(
                         if ks == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
                             let v = regs[*src as usize];
                             set_regex_last_index_value(ctx.realm, handle, v);
+                            continue;
+                        }
+                        // A canonical numeric string key on an array (`arr["0"] = v`)
+                        // addresses element storage, like `arr[0] = v` — for a valid
+                        // index in [0, 2**32−1). A demoted/accessor index faults to
+                        // the descriptor-aware tree-walker.
+                        if ctx.realm.is_array(handle)
+                            && let Ok(i) = ks.parse::<usize>()
+                            && alloc::format!("{i}") == ks
+                            && (i as u64) < u64::from(u32::MAX)
+                        {
+                            if i >= ctx.realm.limits.max_array_len {
+                                let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                                handle_throw!(VmError::Thrown(e));
+                            }
+                            if ctx.realm.array_index_has_override(handle, i) {
+                                return Err(VmError::Unsupported);
+                            }
+                            ctx.realm.set_element(handle, i, regs[*src as usize]);
                             continue;
                         }
                         ctx.realm.set_property(handle, &ks, regs[*src as usize]);
@@ -1630,7 +1693,7 @@ fn run_frame(
                 // An array leads with its integer indices (a VM closure's backing
                 // cells are not enumerable).
                 if !ctx.realm.is_vm_function(h)
-                    && let Some(indices) = ctx.realm.array_present_indices(h)
+                    && let Some(indices) = ctx.realm.array_enumerable_indices(h)
                 {
                     for i in indices {
                         let k = alloc::format!("{i}");
@@ -1826,11 +1889,36 @@ fn run_frame(
                 if key.as_str() == "length" && ctx.realm.is_array(handle) {
                     let v = regs[*src as usize];
                     if let Some(n) = ctx.realm.array_length_uint32(v) {
+                        // A non-writable `length`, or a shrink that would hit a
+                        // non-configurable index, needs the descriptor-aware /
+                        // strict-aware tree-walker (ArraySetLength). Fault to it.
+                        if ctx.realm.array_length_set_needs_slow_path(handle, n as usize) {
+                            return Err(VmError::Unsupported);
+                        }
                         ctx.realm.set_array_length(handle, n as usize);
                     } else {
                         let e = make_error(ctx.realm, "RangeError", "Invalid array length");
                         handle_throw!(VmError::Thrown(e));
                     }
+                    continue;
+                }
+                // A canonical numeric string key on an array (`arr["0"] = v` lowered
+                // to a static SetProp) addresses element storage. A demoted/accessor
+                // index (or frozen/sealed array) faults to the descriptor-aware
+                // tree-walker; a plain index writes the element directly.
+                if ctx.realm.is_array(handle)
+                    && let Ok(i) = key.as_str().parse::<usize>()
+                    && alloc::format!("{i}") == key.as_str()
+                    && (i as u64) < u64::from(u32::MAX)
+                {
+                    if i >= ctx.realm.limits.max_array_len {
+                        let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                        handle_throw!(VmError::Thrown(e));
+                    }
+                    if ctx.realm.array_index_has_override(handle, i) {
+                        return Err(VmError::Unsupported);
+                    }
+                    ctx.realm.set_element(handle, i, regs[*src as usize]);
                     continue;
                 }
                 // A setter accessor (own or inherited) takes precedence over a
@@ -2600,8 +2688,16 @@ fn vm_array_index_get(
     if i < ctx.realm.array_length(handle).unwrap_or(0) && !ctx.realm.array_hole_at(handle, i) {
         return Ok(ctx.realm.get_element(handle, i));
     }
-    // Absent own index (hole or past the end): walk the prototype chain.
+    // An OWN accessor installed at this index (`defineProperty(arr, i, {get})`)
+    // lives in the aux object over a hole — invoke its getter before the chain.
     let key = alloc::format!("{i}");
+    if let Some((getter, _)) = ctx.realm.accessor(handle, &key) {
+        if getter.as_handle().is_none() {
+            return Ok(NanBox::undefined());
+        }
+        return call_closure(ctx, funcs, getter, &[], recv);
+    }
+    // Absent own index (hole or past the end): walk the prototype chain.
     let mut cur = ctx.realm.object_proto(handle);
     while let Some(p) = cur {
         if let Some((getter, _)) = ctx.realm.accessor(p, &key) {

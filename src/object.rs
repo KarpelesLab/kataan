@@ -532,6 +532,13 @@ impl Object {
         self.non_configurable.retain(|k| k.as_ref() != key);
     }
 
+    /// Whether *no* own property is marked non-configurable — a cheap probe used to
+    /// skip the per-index ArraySetLength stop scan on the common (unrestricted) array.
+    #[must_use]
+    pub fn non_configurable_is_empty(&self) -> bool {
+        self.non_configurable.is_empty()
+    }
+
     /// Whether `key` is an own property (data slot or accessor).
     #[must_use]
     pub fn has_own_key(&self, key: &str) -> bool {

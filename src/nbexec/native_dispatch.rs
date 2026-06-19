@@ -371,7 +371,7 @@ impl<'a> Interp<'a> {
                     // ascending order) — stored as elements, not named properties.
                     // A VM closure backs onto an array but is a function, so its
                     // "indices" (captured cells) are not enumerable keys.
-                    if let Some(indices) = self.realm.array_present_indices(h)
+                    if let Some(indices) = self.realm.array_enumerable_indices(h)
                         && !self.realm.is_vm_function(h)
                     {
                         for i in indices {

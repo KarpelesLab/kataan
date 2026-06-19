@@ -662,6 +662,22 @@ impl<'a> Interp<'a> {
         if self.realm.is_array(obj) && key == "length" {
             return self.apply_array_length_descriptor(obj, desc, reflect);
         }
+        // ArrayDefineOwnProperty (10.4.2.1): defining an index `>= length` when the
+        // array's `length` is non-writable fails — a new element cannot grow a
+        // frozen length. (An in-range index, or a redefine of an existing one, is
+        // governed by the ordinary rules below.)
+        if self.realm.is_array(obj)
+            && self.realm.array_length_is_readonly(obj)
+            && let Ok(i) = key.parse::<usize>()
+            && alloc::format!("{i}") == key
+            && i >= self.realm.array_length(obj).unwrap_or(0)
+        {
+            if reflect {
+                return Ok(false);
+            }
+            let m = self.new_str("Cannot add array index past a non-writable length");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
         // A callable's `length` and `name` are own properties per spec
         // (`{writable:false, enumerable:false, configurable:true}`), but they are
         // synthesized lazily and may not be materialized in the cell's aux object
@@ -955,7 +971,14 @@ impl<'a> Interp<'a> {
             if !cur_writable && len != cur_len {
                 return reject(self);
             }
-            self.set_array_length_checked(obj, len)?;
+            // ArraySetLength: a shrink that hits a non-configurable index stops there
+            // and fails (the length is left one above it). Apply the writability
+            // demotion *before* reporting the failure, per 10.4.3.1 steps 17–19.
+            let all_deleted = self.set_array_length_checked(obj, len)?;
+            if !all_deleted {
+                self.realm.set_array_length_readonly(obj, !new_writable);
+                return reject(self);
+            }
         }
         // Apply the (possibly lowered) writability last.
         self.realm.set_array_length_readonly(obj, !new_writable);
@@ -1045,10 +1068,18 @@ impl<'a> Interp<'a> {
                 .realm
                 .get_property(desc, "value")
                 .unwrap_or(NanBox::undefined());
-            let cur_val = self
-                .realm
-                .get_property(obj, key)
-                .unwrap_or(NanBox::undefined());
+            // An array index's value lives in the dense element store, not a named
+            // slot, so read it with `get_element` for a same-value comparison.
+            let cur_val = if self.realm.is_array(obj)
+                && let Ok(i) = key.parse::<usize>()
+                && alloc::format!("{i}") == key
+            {
+                self.realm.get_element(obj, i)
+            } else {
+                self.realm
+                    .get_property(obj, key)
+                    .unwrap_or(NanBox::undefined())
+            };
             if !self.realm.same_value(new_val, cur_val) {
                 return Ok(false);
             }

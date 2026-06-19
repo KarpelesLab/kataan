@@ -247,17 +247,27 @@ impl<'a> Interp<'a> {
     /// `RangeError("Invalid array length")`. A valid length above the dense
     /// `limits.max_array_len` is stored as a *sparse* logical length by the realm
     /// (no multi-gigabyte allocation), so it succeeds rather than throwing.
+    ///
+    /// Implements `ArraySetLength`'s shrink semantics: when lowering `length`,
+    /// elements are deleted from the top down, stopping at the first
+    /// **non-configurable** index (a frozen/sealed array, or one demoted via
+    /// `defineProperty`). Returns `Ok(true)` when the requested length was fully
+    /// applied, `Ok(false)` when deletion stopped early (the length is left one
+    /// above the stuck index) — the caller decides whether that is a TypeError.
+    ///
+    /// This does **not** check whether `length` itself is non-writable; the callers
+    /// that need that (`arr.length =` and the `length` descriptor) validate it first.
     pub(crate) fn set_array_length_checked(
         &mut self,
         handle: crate::heap::Handle,
         n: usize,
-    ) -> Result<(), ExecError> {
+    ) -> Result<bool, ExecError> {
         if n as u64 > u64::from(u32::MAX) {
             let m = self.new_str("Invalid array length");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
-        self.realm.set_array_length(handle, n);
-        Ok(())
+        let (all_deleted, _was_array) = self.realm.array_set_length_truncating(handle, n);
+        Ok(all_deleted)
     }
 
     /// Builds a primitive wrapper object (`new Number`/`String`/`Boolean`,

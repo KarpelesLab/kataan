@@ -454,16 +454,12 @@ impl<'a> Interp<'a> {
                                                 .typed_len(h)
                                                 .is_some_and(|len| (n as usize) < len);
                                         result = !valid;
-                                    } else if self.realm.is_array(h) && name == "length" {
-                                        // An array's `length` is non-configurable.
-                                        result = false;
-                                    } else if let (true, Ok(i)) =
-                                        (self.realm.is_array(h), name.parse::<usize>())
-                                    {
-                                        // `delete arr[i]` clears the element (no
-                                        // true holes; the slot becomes undefined).
-                                        self.realm.set_element(h, i, NanBox::undefined());
                                     } else {
+                                        // `delete arr[i]` punches a hole in the dense
+                                        // store (and rejects a non-configurable index
+                                        // or `length`); all other deletes route the
+                                        // same way. `delete_property` handles arrays,
+                                        // objects, and aux-bearing cells uniformly.
                                         result = self.realm.delete_property(h, &name);
                                     }
                                 }
@@ -1418,7 +1414,15 @@ impl<'a> Interp<'a> {
                 self.realm.typed_kind(handle).is_some() || (i as u64) < u64::from(u32::MAX)
             });
             if let Some(i) = idx {
-                self.set_element_checked(handle, i, new)?;
+                // For a plain array, `store_array_index` takes the dense fast path
+                // unless the index carries a descriptor override (accessor / readonly
+                // / frozen), which it then honors. A typed-array view writes through
+                // its bytes via `set_element_checked`.
+                if self.realm.typed_kind(handle).is_none() {
+                    self.store_array_index(handle, i, new)?;
+                } else {
+                    self.set_element_checked(handle, i, new)?;
+                }
                 return Ok(());
             }
         }
@@ -1461,14 +1465,98 @@ impl<'a> Interp<'a> {
         }
         // `arr.length = n` resizes the array (with ToUint32 + RangeError check).
         if name == "length" && self.realm.is_array(handle) {
+            // ToUint32(value) is coerced first (it may RangeError), *before* the
+            // non-writable check — matching the descriptor path's ordering.
             let n = self.array_length_from_value(new)?;
-            self.set_array_length_checked(handle, n)?;
+            self.write_array_length(handle, n)?;
         } else if self.allow_property_write(handle, &name)? {
             // Honor a non-writable own data property / non-extensible object:
             // strict mode throws, sloppy mode silently drops the write (this is
             // the computed-key `obj[k] = v` path, e.g. a Symbol-keyed write to a
             // `writable: false` property).
-            self.realm.set_property(handle, &name, new);
+            // A writable array index that reached here (it carries a non-default
+            // attribute override, so it skipped the dense fast path) stores into the
+            // element store, not a shadowing aux slot.
+            // Only a real array index `[0, 2**32−1)` addresses element storage; the
+            // boundary `2**32−1` and above are ordinary named properties.
+            let array_index = self.realm.is_array(handle).then(|| {
+                name.parse::<usize>()
+                    .ok()
+                    .filter(|i| alloc::format!("{i}") == name && (*i as u64) < u64::from(u32::MAX))
+            });
+            if let Some(Some(i)) = array_index {
+                self.set_element_checked(handle, i, new)?;
+            } else {
+                self.realm.set_property(handle, &name, new);
+            }
+        }
+        Ok(())
+    }
+
+    /// `arr[i] = v` for an array index: the dense fast path unless the index carries
+    /// a non-default attribute override or accessor (or the array is frozen/sealed),
+    /// in which case the descriptor is honored — an accessor's setter runs, a
+    /// non-writable index drops the write (strict → TypeError). Mirrors the inline
+    /// logic of the primary computed-assignment path.
+    pub(crate) fn store_array_index(
+        &mut self,
+        handle: Handle,
+        i: usize,
+        new: NanBox,
+    ) -> Result<(), ExecError> {
+        if self.realm.typed_kind(handle).is_none() && self.realm.array_index_has_override(handle, i)
+        {
+            let key = alloc::format!("{i}");
+            // An accessor setter takes precedence. A getter-only accessor (no
+            // setter) cannot be written: strict mode throws, sloppy drops.
+            if let Some((_, setter)) = self.realm.accessor(handle, &key) {
+                if !matches!(setter.unpack(), Unpacked::Undefined) {
+                    let this = NanBox::handle(handle.to_raw());
+                    self.call_with_this(setter, this, &[new])?;
+                } else if self.strict {
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot assign to read only property '{key}' (accessor has no setter)"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                return Ok(());
+            }
+            // A non-writable / frozen index: strict throws, sloppy drops.
+            if self.allow_property_write(handle, &key)? {
+                self.set_element_checked(handle, i, new)?;
+            }
+            return Ok(());
+        }
+        self.set_element_checked(handle, i, new)
+    }
+
+    /// `arr.length = n` (the assignment path of `ArraySetLength`, ECMA-262
+    /// 10.4.3.1): applies the (already ToUint32-coerced) `n`. A non-writable
+    /// `length` rejects any change — silently in sloppy mode, with a TypeError in
+    /// strict mode (a same-value assignment is a no-op either way). When shrinking
+    /// hits a non-configurable index, the truncation stops there; strict mode then
+    /// throws (the length is left one above the stuck index in both modes).
+    pub(crate) fn write_array_length(
+        &mut self,
+        handle: Handle,
+        n: usize,
+    ) -> Result<(), ExecError> {
+        if self.realm.array_length_is_readonly(handle) {
+            // A non-writable `length`: reject a real change.
+            let cur = self.realm.array_length(handle).unwrap_or(0);
+            if n != cur {
+                if self.strict {
+                    let m = self.new_str("Cannot assign to read only property 'length'");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                return Ok(()); // sloppy: silently dropped
+            }
+            return Ok(()); // same-value: no-op
+        }
+        let all_deleted = self.set_array_length_checked(handle, n)?;
+        if !all_deleted && self.strict {
+            let m = self.new_str("Cannot delete non-configurable array element");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
         Ok(())
     }
@@ -2604,7 +2692,7 @@ impl<'a> Interp<'a> {
         }
         match property {
             PropertyKey::Number(n) if as_index(*n).is_some() && self.realm.is_array(handle) => {
-                self.set_element_checked(handle, as_index(*n).unwrap(), new)?;
+                self.store_array_index(handle, as_index(*n).unwrap(), new)?;
             }
             PropertyKey::Computed(e) => {
                 let k = self.eval(e)?;
@@ -2613,7 +2701,7 @@ impl<'a> Interp<'a> {
                 if let Some(i) = k.as_number().and_then(as_index)
                     && self.realm.is_array(handle)
                 {
-                    self.set_element_checked(handle, i, new)?;
+                    self.store_array_index(handle, i, new)?;
                 } else {
                     let name = self.coerce_property_key(k)?;
                     if self.allow_property_write(handle, &name)? {
@@ -2626,7 +2714,7 @@ impl<'a> Interp<'a> {
                 // storing a `length` property.
                 if &**s == "length" && self.realm.is_array(handle) {
                     let n = self.array_length_from_value(new)?;
-                    self.set_array_length_checked(handle, n)?;
+                    self.write_array_length(handle, n)?;
                 } else if &**s == "prototype"
                     && let Some((func_id, _)) = self.realm.function_at(handle)
                     && let Some(praw) = new.as_handle()
