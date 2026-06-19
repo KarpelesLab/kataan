@@ -1299,7 +1299,7 @@ impl<'a> Interp<'a> {
                     self.strict = true;
                 }
                 let scope = self.current.clone();
-                return Ok(self.make_lazy_generator(body, scope));
+                return Ok(self.make_lazy_generator(body, scope, def.is_async));
             }
             // An `async` (non-generator) function whose body may `await`: do NOT
             // run its body synchronously. Capture the parameter-bound scope into a

@@ -229,14 +229,14 @@ impl<'a> Interp<'a> {
                     }
                     return self.exec_for_of_iter(left, body, ih);
                 }
-                let mut values = self.iterate_values(iterable)?;
-                // `for await (…)`: await each iterated value (a non-promise passes
-                // through unchanged).
-                if *is_await {
-                    for v in &mut values {
-                        *v = self.await_value(*v)?;
-                    }
-                }
+                // `for await (…)`: drive the async-iterator protocol (await each
+                // `next()` result for an async iterable, else await each yielded
+                // value). A plain `for…of` materializes the values directly.
+                let values = if *is_await {
+                    self.for_await_values(iterable)?
+                } else {
+                    self.iterate_values(iterable)?
+                };
                 self.exec_for_each(left, body, values)
             }
             Stmt::ForIn {

@@ -89,7 +89,7 @@ impl<'a> Interp<'a> {
                     let f = self.make_method(
                         &m.value.params,
                         Body::Block(&m.value.body),
-                        false,
+                        m.value.is_async,
                         m.value.is_generator,
                         Some(class_id),
                         true,
@@ -477,7 +477,7 @@ impl<'a> Interp<'a> {
                     let f = self.make_method(
                         &m.value.params,
                         Body::Block(&m.value.body),
-                        false,
+                        m.value.is_async,
                         m.value.is_generator,
                         Some(*cid),
                         false,
@@ -731,7 +731,7 @@ impl<'a> Interp<'a> {
             let f = self.make_method(
                 &m.value.params,
                 Body::Block(&m.value.body),
-                false,
+                m.value.is_async,
                 m.value.is_generator,
                 Some(class_id),
                 false,
@@ -966,7 +966,7 @@ impl<'a> Interp<'a> {
                     let f = self.make_method(
                         &m.value.params,
                         Body::Block(&m.value.body),
-                        false,
+                        m.value.is_async,
                         m.value.is_generator,
                         Some(pid),
                         self.current_home_static,
@@ -1055,7 +1055,7 @@ impl<'a> Interp<'a> {
                     let f = self.make_method(
                         &m.value.params,
                         Body::Block(&m.value.body),
-                        false,
+                        m.value.is_async,
                         m.value.is_generator,
                         Some(pid),
                         self.current_home_static,
@@ -1112,7 +1112,7 @@ impl<'a> Interp<'a> {
                     let f = self.make_method(
                         &m.value.params,
                         Body::Block(&m.value.body),
-                        false,
+                        m.value.is_async,
                         m.value.is_generator,
                         Some(pid),
                         self.current_home_static,

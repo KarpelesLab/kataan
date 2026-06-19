@@ -74,6 +74,10 @@ pub(crate) struct GenFrame<'a> {
     started: bool,
     done: bool,
     running: bool,
+    /// True for an `async function*` generator object. Its `next`/`return`/`throw`
+    /// each return a *promise* (resolved with the `{value, done}` result, or
+    /// rejected with a thrown value) rather than the bare result object.
+    is_async: bool,
 }
 
 /// One pending action on the generator's explicit execution stack.
@@ -221,7 +225,12 @@ type StepResult = Result<StepOut, GenAbrupt>;
 
 impl<'a> Interp<'a> {
     /// Builds a suspended lazy-generator object backed by a [`GenFrame`].
-    pub(crate) fn make_lazy_generator(&mut self, body: &'a [Stmt], scope: Scope) -> NanBox {
+    pub(crate) fn make_lazy_generator(
+        &mut self,
+        body: &'a [Stmt],
+        scope: Scope,
+        is_async: bool,
+    ) -> NanBox {
         let frame = GenFrame {
             body,
             concise: None,
@@ -237,6 +246,7 @@ impl<'a> Interp<'a> {
             started: false,
             done: false,
             running: false,
+            is_async,
         };
         let id = if let Some(slot) = self.gen_frames.iter().position(Option::is_none) {
             self.gen_frames[slot] = Some(frame);
@@ -272,6 +282,15 @@ impl<'a> Interp<'a> {
         NanBox::handle(obj.to_raw())
     }
 
+    /// Whether `h` is a lazy *async* generator (`async function*`): `Some(true)`,
+    /// a sync generator: `Some(false)`, or not a lazy generator at all: `None`.
+    /// A `for await` loop uses this to drive an async-generator iterable through
+    /// the async-iterator protocol (awaiting each `next()` promise).
+    pub(crate) fn lazy_gen_is_async(&self, h: Handle) -> Option<bool> {
+        let id = self.gen_frame_id(h)?;
+        self.gen_frames[id].as_ref().map(|f| f.is_async)
+    }
+
     /// Whether `h` is a lazy-generator object (carries a [`GenFrame`] id).
     pub(crate) fn gen_frame_id(&self, h: Handle) -> Option<usize> {
         self.realm
@@ -293,6 +312,9 @@ impl<'a> Interp<'a> {
         let Some(id) = self.gen_frame_id(h) else {
             return Err(self.type_error("Generator method called on a non-generator"));
         };
+        let is_async = self.gen_frames[id]
+            .as_ref()
+            .is_some_and(|f| f.is_async);
         // A plain `function*` body never awaits. An *async generator*
         // (`async function*`) runs on this same lazy-generator engine (a
         // documented simplification of the previous eager-async model): its
@@ -302,21 +324,36 @@ impl<'a> Interp<'a> {
         // generators is a follow-up; this restores the pre-coroutine semantics so
         // async generators are not regressed by the async-function rework.)
         let mut how = how;
-        loop {
-            match self.run_generator(id, how)? {
-                GenStep::Yielded(v) => return Ok(self.gen_result(v, false)),
-                GenStep::Done(v) => return Ok(self.gen_result(v, true)),
-                GenStep::Awaited(v) => {
+        let result: Result<NanBox, ExecError> = loop {
+            match self.run_generator(id, how) {
+                Ok(GenStep::Yielded(v)) => break Ok(self.gen_result(v, false)),
+                Ok(GenStep::Done(v)) => break Ok(self.gen_result(v, true)),
+                Ok(GenStep::Awaited(v)) => {
                     match self.await_value(v) {
                         Ok(resolved) => how = Resumption::Next(resolved),
                         Err(ExecError::Throw(e)) => how = Resumption::Throw(e),
-                        Err(other) => return Err(other),
+                        Err(other) => break Err(other),
                     }
                     // Loop: resume the generator at the await point with the
                     // settled value (or throw).
                 }
+                Err(e) => break Err(e),
             }
+        };
+        // A sync generator returns the bare `{value, done}` result (or propagates
+        // an escaping throw). An *async generator* method instead always returns a
+        // promise: fulfilled with the result object, or rejected with the thrown
+        // value — never throwing synchronously.
+        if is_async {
+            let p = self.fresh_promise();
+            match result {
+                Ok(v) => self.settle(p, v, true),
+                Err(ExecError::Throw(e)) => self.settle(p, e, false),
+                Err(other) => return Err(other),
+            }
+            return Ok(NanBox::handle(p.to_raw()));
         }
+        result
     }
 
     fn gen_result(&mut self, value: NanBox, done: bool) -> NanBox {
@@ -357,6 +394,7 @@ impl<'a> Interp<'a> {
             started: false,
             done: false,
             running: false,
+            is_async: false,
         };
         let id = if let Some(slot) = self.gen_frames.iter().position(Option::is_none) {
             self.gen_frames[slot] = Some(frame);
@@ -1266,20 +1304,23 @@ impl<'a> Interp<'a> {
                 // Eager list of values (mirrors the non-await tree-walker for the
                 // built-in iterables; user iterators are drained up front here —
                 // a documented simplification for yield-bearing for-of bodies).
-                // For `for await`, the values are *not* awaited here: each is
-                // `await`ed lazily by the `ForEach` step (a real coroutine
-                // suspension per iteration), preserving microtask ordering.
-                // (A `Symbol.asyncIterator`-based async iterable is a documented
-                // follow-up tied to async generators; `for await` here drives a
-                // sync iterable of promises/values, awaiting each element.)
-                let items = self.iterate_values(iterable).map_err(GenAbrupt::from)?;
+                // `for await` drives the async-iterator protocol via
+                // [`Self::for_await_values`] — awaiting each `next()` result for an
+                // async iterable (`async function*` / `[Symbol.asyncIterator]`), or
+                // awaiting each yielded value of a sync iterable. The values come
+                // back already settled, so the `ForEach` step does not re-await.
+                let items = if *is_await {
+                    self.for_await_values(iterable).map_err(GenAbrupt::from)?
+                } else {
+                    self.iterate_values(iterable).map_err(GenAbrupt::from)?
+                };
                 stack.push(Step::ForEach {
                     left,
                     body,
                     values: items,
                     idx: 0,
                     label: label.clone(),
-                    await_each: *is_await,
+                    await_each: false,
                 });
                 Ok(StepOut::Continue)
             }

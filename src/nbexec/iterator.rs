@@ -1252,6 +1252,72 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Drains an iterable for `for await (… of …)`. An *async* iterator — an
+    /// `async function*` generator object, or any object with a callable
+    /// `[Symbol.asyncIterator]` — yields **promises of iterator results**, so each
+    /// `next()` result is awaited before its `done`/`value` is read. Any other
+    /// iterable uses the ordinary synchronous protocol with each yielded value
+    /// awaited (the `AsyncFromSyncIterator` wrapping).
+    pub(crate) fn for_await_values(&mut self, v: NanBox) -> Result<Vec<NanBox>, ExecError> {
+        if let Some(ih) = self.async_iterator_of(v)? {
+            let mut out = Vec::new();
+            loop {
+                let next_fn = self.read_member(ih, "next")?;
+                let res = self.call_with_this(next_fn, NanBox::handle(ih.to_raw()), &[])?;
+                let res = self.await_value(res)?;
+                let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                    return Err(self.type_error("iterator result is not an object"));
+                };
+                let done = self.read_member(rh, "done")?;
+                if self.realm.truthy(done) {
+                    break;
+                }
+                out.push(self.read_member(rh, "value")?);
+                if out.len() > GEN_CAP {
+                    return Err(self.type_error("iterator did not terminate"));
+                }
+            }
+            return Ok(out);
+        }
+        // A sync iterable in `for await`: drain synchronously, then await each
+        // yielded value (a non-promise passes through unchanged).
+        let mut values = self.iterate_values(v)?;
+        for val in &mut values {
+            *val = self.await_value(*val)?;
+        }
+        Ok(values)
+    }
+
+    /// The async iterator to drive for `for await`, if `v` is an async iterable:
+    /// the async-generator object itself, or the result of calling its callable
+    /// `[Symbol.asyncIterator]`. `None` for a sync iterable (the caller falls back
+    /// to the synchronous protocol).
+    fn async_iterator_of(&mut self, v: NanBox) -> Result<Option<Handle>, ExecError> {
+        let Some(h) = v.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        // A lazy generator object: an `async function*` is its own async iterator;
+        // a plain `function*` is a *sync* iterator (drained synchronously).
+        if let Some(is_async) = self.lazy_gen_is_async(h) {
+            return Ok(if is_async { Some(h) } else { None });
+        }
+        // Otherwise, an object whose `[Symbol.asyncIterator]` is callable.
+        let sym = self.well_known_symbol("asyncIterator");
+        let key = self.member_key(sym);
+        let f = self.read_member(h, &key)?;
+        if f
+            .as_handle()
+            .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
+        {
+            let it = self.call_with_this(f, v, &[])?;
+            let Some(ih) = it.as_handle().map(Handle::from_raw) else {
+                return Err(self.type_error("iterator is not an object"));
+            };
+            return Ok(Some(ih));
+        }
+        Ok(None)
+    }
+
     pub(crate) fn iterate_values(&mut self, v: NanBox) -> Result<Vec<NanBox>, ExecError> {
         let Some(h) = v.as_handle().map(Handle::from_raw) else {
             let m = self.new_str("is not iterable");
