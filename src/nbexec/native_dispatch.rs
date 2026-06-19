@@ -1208,6 +1208,19 @@ impl<'a> Interp<'a> {
                 }
                 NanBox::handle(p.to_raw())
             }
+            // `RegExp.escape(S)` (ES2025): `S` must be a String (no coercion);
+            // returns it escaped so it matches literally inside a pattern.
+            N_REGEXP_ESCAPE => {
+                let s = arg(0);
+                let Some(bytes) = s
+                    .as_handle()
+                    .and_then(|r| self.realm.string_bytes(Handle::from_raw(r)))
+                else {
+                    return Err(self.type_error("RegExp.escape requires a string argument"));
+                };
+                let out = regexp_escape_wtf8(&bytes);
+                self.new_str_bytes(out)
+            }
             N_ARRAY_OF => NanBox::handle(self.realm.new_array(args.to_vec()).to_raw()),
             // `%IteratorPrototype%[Symbol.iterator]()` — an iterator is its own
             // iterable: return the receiver.
@@ -2580,4 +2593,69 @@ impl<'a> Interp<'a> {
             }
         })
     }
+}
+
+/// `RegExp.escape` core (ES2025 `EncodeForRegExpEscape`), over WTF-8 bytes.
+/// Iterates code points: a leading ASCII digit/letter is `\xHH`; syntax
+/// characters and `/` are backslash-escaped; control escapes map to
+/// `\t\n\v\f\r`; whitespace / line terminators / "other punctuators" become
+/// `\xHH` (≤ 0xFF) or `\uHHHH` per UTF-16 code unit; everything else is copied
+/// verbatim.
+fn regexp_escape_wtf8(bytes: &[u8]) -> alloc::vec::Vec<u8> {
+    // JS WhiteSpace / LineTerminator code points NOT already covered by a
+    // control escape (TAB/LF/VT/FF/CR), which need a hex escape.
+    fn is_ws_or_lt(c: u32) -> bool {
+        matches!(
+            c,
+            0x20 | 0xA0
+                | 0x1680
+                | 0x2000..=0x200A
+                | 0x2028
+                | 0x2029
+                | 0x202F
+                | 0x205F
+                | 0x3000
+                | 0xFEFF
+        )
+    }
+    const SYNTAX: &[u8] = b"^$\\.*+?()[]{}|";
+    const OTHER_PUNCT: &[u8] = b",-=<>#&!%:;@~'`\"";
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut first = true;
+    for c in crate::wtf8::code_points(bytes) {
+        let leading_alnum = first && matches!(c, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A);
+        if leading_alnum {
+            out.extend_from_slice(alloc::format!("\\x{c:02x}").as_bytes());
+        } else if (c < 0x80 && SYNTAX.contains(&(c as u8))) || c == 0x2F {
+            out.push(b'\\');
+            crate::wtf8::encode_code_point(c, &mut out);
+        } else if let Some(ce) = match c {
+            0x09 => Some(b't'),
+            0x0A => Some(b'n'),
+            0x0B => Some(b'v'),
+            0x0C => Some(b'f'),
+            0x0D => Some(b'r'),
+            _ => None,
+        } {
+            out.push(b'\\');
+            out.push(ce);
+        } else if (c < 0x80 && OTHER_PUNCT.contains(&(c as u8))) || is_ws_or_lt(c) {
+            // Hex-escape per UTF-16 code unit.
+            let mut units = [0u16; 2];
+            for &u in char::from_u32(c)
+                .map(|ch| ch.encode_utf16(&mut units) as &[u16])
+                .unwrap_or(&[c as u16])
+            {
+                if u <= 0xFF {
+                    out.extend_from_slice(alloc::format!("\\x{u:02x}").as_bytes());
+                } else {
+                    out.extend_from_slice(alloc::format!("\\u{u:04x}").as_bytes());
+                }
+            }
+        } else {
+            crate::wtf8::encode_code_point(c, &mut out);
+        }
+        first = false;
+    }
+    out
 }

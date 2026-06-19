@@ -1661,6 +1661,8 @@ const N_JSON_IS_RAW: u16 = 651;
 /// `Array.fromAsync(asyncItems, mapFn?, thisArg?)` — returns a promise of an
 /// array, awaiting each value of an (a)sync iterable / array-like.
 const N_ARRAY_FROM_ASYNC: u16 = 652;
+/// `RegExp.escape(S)` — escapes `S` so it matches literally in a pattern.
+const N_REGEXP_ESCAPE: u16 = 653;
 /// Hidden brand + payload on a RawJSON object (the validated source text).
 const RAW_JSON_BRAND: &str = "\u{0}rawjson";
 /// Hidden-property keys for a capability state object built around a foreign `C`.
@@ -2451,6 +2453,11 @@ impl<'a> Interp<'a> {
         let regexp_ctor = self.new_named_native("RegExp", N_REGEXP);
         self.current
             .declare("RegExp", NanBox::handle(regexp_ctor.to_raw()));
+        // `RegExp.escape` (ES2025) — a static method on the constructor.
+        let escape_fn = self.new_named_native("escape", N_REGEXP_ESCAPE);
+        self.realm
+            .set_property(regexp_ctor, "escape", NanBox::handle(escape_fn.to_raw()));
+        self.realm.mark_hidden(regexp_ctor, "escape");
         // The `Error` family — native constructors producing `{ name, message }`.
         // Only the standard errors are globals; the `WebAssembly.*` error
         // subclasses are installed under the WebAssembly namespace below.

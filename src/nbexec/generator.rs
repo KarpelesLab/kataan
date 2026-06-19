@@ -1894,6 +1894,11 @@ impl<'a> Interp<'a> {
                     return Err(self.type_error("[Symbol.asyncIterator] is not a function"));
                 }
                 let iterator = self.call_with_this(m, operand, &[])?;
+                // GetIterator: the result must be an Object (a returned string /
+                // symbol / number / boolean is a TypeError).
+                if !self.is_object_value(iterator) {
+                    return Err(self.type_error("yield* iterator is not an object"));
+                }
                 return iterator
                     .as_handle()
                     .map(Handle::from_raw)
