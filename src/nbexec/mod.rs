@@ -355,6 +355,11 @@ pub struct Interp<'a> {
     /// (set while building the frame in `invoke_inner`, consumed immediately
     /// after). See the async path in `call.rs`.
     pending_async_start: Option<(usize, Handle)>,
+    /// Whether the coroutine currently being driven (in `gen_drive`) is an *async*
+    /// generator. Read by `yield*` delegation to use the async-iterator protocol
+    /// (`[Symbol.asyncIterator]`, awaiting each `next()` result). Saved/restored
+    /// around `gen_drive` so a reentrant resume (via the event loop) is balanced.
+    gen_is_async: bool,
     /// The `Symbol.for` global registry: shared symbols keyed by string.
     symbol_registry: alloc::collections::BTreeMap<String, NanBox>,
     /// Cached well-known symbols (e.g. `Symbol.iterator`), created on first use.
@@ -1734,6 +1739,7 @@ impl<'a> Interp<'a> {
             gen_sink: None,
             gen_frames: Vec::new(),
             pending_async_start: None,
+            gen_is_async: false,
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
             tagged_template_cache: alloc::collections::BTreeMap::new(),

@@ -562,6 +562,23 @@ impl<'a> Interp<'a> {
         how: Resumption,
         started: bool,
     ) -> Result<GenStep, ExecError> {
+        // Track whether the coroutine being driven is an async generator, so
+        // `yield*` delegation uses the async-iterator protocol. Saved/restored
+        // because the event loop (a microtask drain inside an `await`) can resume a
+        // different coroutine reentrantly.
+        let saved_gen_async = self.gen_is_async;
+        self.gen_is_async = self.gen_frames[id].as_ref().is_some_and(|f| f.is_async);
+        let result = self.gen_drive_inner(id, how, started);
+        self.gen_is_async = saved_gen_async;
+        result
+    }
+
+    fn gen_drive_inner(
+        &mut self,
+        id: usize,
+        how: Resumption,
+        started: bool,
+    ) -> Result<GenStep, ExecError> {
         let (mut stack, mut values) = {
             let f = self.gen_frames[id].as_mut().expect("frame present");
             (
@@ -1860,6 +1877,29 @@ impl<'a> Interp<'a> {
         let Some(h) = operand.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("yield* operand is not iterable"));
         };
+        // In an async generator, `yield*` uses GetIterator(operand, async): a
+        // callable `[Symbol.asyncIterator]` is used directly; a non-callable (but
+        // present) one is a TypeError. An absent `[Symbol.asyncIterator]` falls
+        // through to the sync `[Symbol.iterator]` (AsyncFromSyncIterator — each
+        // result is awaited per step in `gen_yield_star_step`).
+        if self.gen_is_async {
+            let sym = self.well_known_symbol("asyncIterator");
+            let key = self.member_key(sym);
+            let m = self.read_member(h, &key)?;
+            if !(m.is_undefined() || m.is_null()) {
+                if !m
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Err(self.type_error("[Symbol.asyncIterator] is not a function"));
+                }
+                let iterator = self.call_with_this(m, operand, &[])?;
+                return iterator
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .ok_or_else(|| self.type_error("yield* iterator is not an object"));
+            }
+        }
         // A user object exposing `[Symbol.iterator]` is driven through its real
         // iterator (so an infinite/user generator delegates lazily).
         if let Some(f) = self.find_iterator_fn(h)?
@@ -1929,6 +1969,15 @@ impl<'a> Interp<'a> {
         let res = self
             .call_with_this(method, iter_val, &[arg])
             .map_err(GenAbrupt::from)?;
+        // An async generator's inner iterator yields *promises* of results: await
+        // each before reading `done`/`value` (eagerly, per the engine's async
+        // model). A non-promise — a sync inner iterator (AsyncFromSyncIterator) —
+        // passes through unchanged.
+        let res = if self.gen_is_async {
+            self.await_value(res).map_err(GenAbrupt::from)?
+        } else {
+            res
+        };
         let Some(rh) = res.as_handle().map(Handle::from_raw) else {
             return Err(GenAbrupt::Throw(
                 self.make_type_error("iterator result is not an object"),
