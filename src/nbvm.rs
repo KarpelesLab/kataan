@@ -1490,7 +1490,10 @@ fn run_frame(
                 // e.g. `a[-1]` / `a[1.5]`) is an ordinary named property, NOT an
                 // element — but `as usize` would truncate it to a real index. The
                 // descriptor-aware tree-walker stores it correctly; fault to it.
-                if (fi < 0.0 || fi.fract() != 0.0)
+                // `fi != (fi as u64) as f64` is the no_std-safe non-integer test
+                // (`f64::fract` is std-only); the leading `fi < 0.0` short-circuits
+                // so the cast only runs for non-negative values.
+                if (fi < 0.0 || fi != (fi as u64) as f64)
                     && ctx.realm.typed_len(handle).is_none()
                     && ctx.realm.is_array(handle)
                 {
@@ -1621,7 +1624,7 @@ fn run_frame(
                     Some(n)
                         if ctx.realm.is_array(handle)
                             && n >= 0.0
-                            && n.fract() == 0.0
+                            && n == (n as u64) as f64
                             && (n as u64) < u64::from(u32::MAX) =>
                     {
                         // C1: refuse-past-cap surfaces as a catchable RangeError

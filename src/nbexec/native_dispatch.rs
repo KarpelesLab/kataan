@@ -1778,6 +1778,69 @@ impl<'a> Interp<'a> {
             N_MATH_HYPOT | N_MATH_CBRT | N_MATH_LOG2 | N_MATH_LOG10 | N_MATH_EXP | N_MATH_LOG => {
                 return Err(ExecError::Unsupported("Math fns need std"));
             }
+            // `Math.sumPrecise(items)` (ES2025) — correctly-rounded exact sum of a
+            // sequence of Numbers. The argument must be iterable; each element must
+            // already be a Number (no ToNumber coercion — a non-Number element throws
+            // a TypeError *and* closes the iterator). Runs the spec's
+            // Infinity/NaN/-0 state machine; finite values are accumulated with an
+            // exact (error-free) Shewchuk partials list, rounded once at the end.
+            // The empty sum (and an all-`-0` sum) is `-0`.
+            N_MATH_SUM_PRECISE => {
+                let it = self.get_iter_object(arg(0))?;
+                let next = self.read_member(it, "next")?;
+                // Spec state machine. `state`: 0=minus-zero, 1=finite,
+                // 2=plus-infinity, 3=minus-infinity, 4=not-a-number.
+                let mut state: u8 = 0;
+                let mut acc = ExactSum::new();
+                loop {
+                    let step = self.iter_step(it, next);
+                    let v = match step {
+                        Ok(Some(v)) => v,
+                        Ok(None) => break,
+                        Err(e) => return Err(e),
+                    };
+                    let Some(n) = v.as_number() else {
+                        // Non-Number element: close the iterator, then throw.
+                        let _ = self.iterator_close(it);
+                        return Err(self.type_error("Math.sumPrecise expects only Numbers"));
+                    };
+                    if state == 4 {
+                        // Already NaN: keep draining but ignore values.
+                        continue;
+                    }
+                    if n.is_nan() {
+                        state = 4;
+                    } else if n == f64::INFINITY {
+                        state = if state == 3 { 4 } else { 2 };
+                    } else if n == f64::NEG_INFINITY {
+                        state = if state == 2 { 4 } else { 3 };
+                    } else if n == 0.0 && n.is_sign_negative() {
+                        // -0 does not change state (an all-`-0` sum stays `-0`),
+                        // and adds nothing to the exact accumulator.
+                    } else if state == 0 || state == 1 {
+                        // Any finite value other than -0 (including +0) transitions
+                        // minus-zero → finite, so the result becomes +0 not -0.
+                        // Adding +0 to the accumulator is a no-op (`add` ignores 0).
+                        state = 1;
+                        if n != 0.0 {
+                            acc.add(n);
+                        }
+                    }
+                }
+                if state == 1 && acc.overflowed {
+                    // The spec's count/overflow guard: not expected in practice.
+                    let m = self.new_str("Math.sumPrecise overflow");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                NanBox::number(match state {
+                    4 => f64::NAN,
+                    2 => f64::INFINITY,
+                    3 => f64::NEG_INFINITY,
+                    1 => acc.finish(),
+                    // minus-zero: empty sum or all-`-0` input.
+                    _ => -0.0,
+                })
+            }
             N_PARSE_FLOAT => {
                 let s = self.realm.to_display_string(arg(0));
                 NanBox::number(parse_float_prefix(s.trim()))
@@ -2679,4 +2742,176 @@ fn regexp_escape_wtf8(bytes: &[u8]) -> alloc::vec::Vec<u8> {
         first = false;
     }
     out
+}
+
+/// Two-sum error-free transform. Prerequisite: `x.abs() >= y.abs()`. Returns
+/// the rounded sum `hi` and the exact roundoff `lo`, so `x + y == hi + lo`
+/// mathematically.
+#[inline]
+fn twosum(x: f64, y: f64) -> (f64, f64) {
+    let hi = x + y;
+    let lo = y - (hi - x);
+    (hi, lo)
+}
+
+/// Error-free (exact) summation accumulator for `Math.sumPrecise`.
+///
+/// A direct port of the TC39 `Math.sumPrecise` reference polyfill, which adapts
+/// Shewchuk's algorithm (as implemented in CPython's `math.fsum`) to handle
+/// intermediate overflow via a separate biased `overflow` partial conceptually
+/// scaled by 2**1024. Maintains a list of non-overlapping `f64` partials whose
+/// exact mathematical sum equals the sum of all values fed in, then resolves the
+/// correctly-rounded (round-half-to-even) result in a single final reduction.
+///
+/// Only *finite, nonzero* values are ever passed to [`Self::add`] — the
+/// Infinity/NaN/±0 cases are handled by the spec state machine in the caller.
+struct ExactSum {
+    partials: alloc::vec::Vec<f64>,
+    /// Conceptually 2**1024 times this value (the biased high-order partial).
+    overflow: f64,
+    /// Set if `overflow` ever exceeds 2**53 in magnitude (spec: RangeError).
+    overflowed: bool,
+}
+
+const TWO_1023: f64 = 8.98846567431158e307; // exactly 2**1023 (bits 0x7fe0_0000_0000_0000)
+const MAX_DOUBLE: f64 = f64::MAX; // 2**1024 - 2**(1023-52), significand all 1s
+const PENULTIMATE_DOUBLE: f64 = 1.797_693_134_862_315_5e308; // 2**1024 - 2*2**(1023-52)
+const MAX_ULP: f64 = MAX_DOUBLE - PENULTIMATE_DOUBLE; // 2**(1023-52)
+
+impl ExactSum {
+    fn new() -> Self {
+        ExactSum {
+            partials: alloc::vec::Vec::new(),
+            overflow: 0.0,
+            overflowed: false,
+        }
+    }
+
+    /// Fold one finite, nonzero value into the running expansion, keeping every
+    /// nonzero rounding remainder so the stored partials remain non-overlapping
+    /// and their exact sum is preserved. Mirrors the polyfill's main-loop body,
+    /// including the overflow-to-biased-partial rescaling.
+    fn add(&mut self, mut x: f64) {
+        let mut i = 0;
+        for j in 0..self.partials.len() {
+            let mut y = self.partials[j];
+            if x.abs() < y.abs() {
+                core::mem::swap(&mut x, &mut y);
+            }
+            let (mut hi, mut lo) = twosum(x, y);
+            if hi.is_infinite() {
+                let sign = if hi == f64::INFINITY { 1.0 } else { -1.0 };
+                self.overflow += sign;
+                if self.overflow.abs() >= 9_007_199_254_740_992.0 {
+                    self.overflowed = true;
+                }
+                x = (x - sign * TWO_1023) - sign * TWO_1023;
+                if x.abs() < y.abs() {
+                    core::mem::swap(&mut x, &mut y);
+                }
+                let r = twosum(x, y);
+                hi = r.0;
+                lo = r.1;
+            }
+            if lo != 0.0 {
+                self.partials[i] = lo;
+                i += 1;
+            }
+            x = hi;
+        }
+        self.partials.truncate(i);
+        if x != 0.0 {
+            self.partials.push(x);
+        }
+    }
+
+    /// Round the exact expansion to the nearest `f64` (ties to even). Direct port
+    /// of the polyfill's final reduction: the biased-overflow handling, the
+    /// MAX_DOUBLE rounding edge case, and the half-ULP tie correction.
+    fn finish(&self) -> f64 {
+        // Work on a local mutable copy so we can inject a partial in the overflow
+        // path exactly as the polyfill does (`partials[n + 1] = lo`).
+        let mut partials = self.partials.clone();
+        let mut n: isize = partials.len() as isize - 1;
+        let mut hi = 0.0_f64;
+        let mut lo = 0.0_f64;
+
+        if self.overflow != 0.0 {
+            let next = if n >= 0 { partials[n as usize] } else { 0.0 };
+            n -= 1;
+            if self.overflow.abs() > 1.0
+                || (self.overflow > 0.0 && next > 0.0)
+                || (self.overflow < 0.0 && next < 0.0)
+            {
+                return if self.overflow > 0.0 {
+                    f64::INFINITY
+                } else {
+                    f64::NEG_INFINITY
+                };
+            }
+            // |overflow| == 1: drop a factor of 2 to avoid overflowing.
+            let r = twosum(self.overflow * TWO_1023, next / 2.0);
+            hi = r.0;
+            lo = r.1 * 2.0;
+            if (2.0 * hi).is_infinite() {
+                // Rounding right at the maximum representable value.
+                if hi > 0.0 {
+                    if hi == TWO_1023
+                        && lo == -(MAX_ULP / 2.0)
+                        && n >= 0
+                        && partials[n as usize] < 0.0
+                    {
+                        return MAX_DOUBLE;
+                    }
+                    return f64::INFINITY;
+                }
+                if hi == -TWO_1023
+                    && lo == MAX_ULP / 2.0
+                    && n >= 0
+                    && partials[n as usize] > 0.0
+                {
+                    return -MAX_DOUBLE;
+                }
+                return f64::NEG_INFINITY;
+            }
+            if lo != 0.0 {
+                // Re-insert `lo` as the (n+1)-th partial; the next loop consumes it.
+                let slot = (n + 1) as usize;
+                if slot < partials.len() {
+                    partials[slot] = lo;
+                } else {
+                    partials.push(lo);
+                }
+                n += 1;
+                lo = 0.0;
+            }
+            hi *= 2.0;
+        }
+
+        while n >= 0 {
+            let x = hi;
+            let y = partials[n as usize];
+            n -= 1;
+            let r = twosum(x, y);
+            hi = r.0;
+            lo = r.1;
+            if lo != 0.0 {
+                break;
+            }
+        }
+
+        // Half-ULP tie correction (the polyfill's "handle rounding" tail).
+        if n >= 0
+            && ((lo < 0.0 && partials[n as usize] < 0.0)
+                || (lo > 0.0 && partials[n as usize] > 0.0))
+        {
+            let y = lo * 2.0;
+            let x = hi + y;
+            let yr = x - hi;
+            if y == yr {
+                hi = x;
+            }
+        }
+        hi
+    }
 }

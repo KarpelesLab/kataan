@@ -1687,6 +1687,12 @@ const N_UINT8_FROM_HEX: u16 = 659;
 /// `Error.isError(arg)` (ES2025) — `true` iff `arg` carries the [`ERROR_DATA`]
 /// brand (i.e. is a genuine Error instance). A static on the `Error` constructor.
 const N_ERROR_IS_ERROR: u16 = 660;
+/// `Math.sumPrecise(items)` (ES2025) — the correctly-rounded exact sum of a
+/// sequence of Numbers. Iterates `items` one value at a time (closing the
+/// iterator on a non-Number element), runs the spec's Infinity/NaN/-0 state
+/// machine, and accumulates finite values with a Shewchuk-style exact
+/// (error-free) partials list rounded once at the end. `.length` is 1.
+const N_MATH_SUM_PRECISE: u16 = 661;
 /// Hidden brand + payload on a RawJSON object (the validated source text).
 const RAW_JSON_BRAND: &str = "\u{0}rawjson";
 /// Hidden-property keys for a capability state object built around a foreign `C`.
@@ -2470,6 +2476,7 @@ impl<'a> Interp<'a> {
                 ("f16round", N_MATH_F16ROUND),
                 ("clz32", N_MATH_CLZ32),
                 ("imul", N_MATH_IMUL),
+                ("sumPrecise", N_MATH_SUM_PRECISE),
             ],
         );
         // The `Math` numeric constants.
