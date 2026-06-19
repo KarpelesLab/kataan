@@ -2005,19 +2005,46 @@ impl<'a> Interp<'a> {
             return Ok(err);
         }
         // `new WeakRef(target)` — holds the target. `deref()` always returns it
-        // (sound because GC is never driven mid-execution).
+        // (sound because GC is never driven mid-execution). `target` must be
+        // weakly holdable (an object or a non-registered symbol).
         if id == N_WEAKREF {
             let target = args.first().copied().unwrap_or(NanBox::undefined());
+            if !self.can_be_held_weakly(target) {
+                return Err(self.type_error("WeakRef: target must be an object or a non-registered symbol"));
+            }
             let obj = self.realm.new_object();
             self.realm.set_hidden_property(obj, WEAKREF_TARGET, target);
+            // Link to `WeakRef.prototype` (or `newTarget.prototype` for a subclass)
+            // so `instanceof`, `Object.getPrototypeOf`, and the brand-checking
+            // `deref` / `[Symbol.toStringTag]` resolve.
+            let default = self.intrinsic_proto("WeakRef");
+            if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                self.realm.set_object_proto(obj, Some(proto));
+            }
             return Ok(NanBox::handle(obj.to_raw()));
         }
-        // `new FinalizationRegistry(cb)` — bounded: with no mid-execution GC the
-        // cleanup callback never fires, so `register`/`unregister` are inert.
+        // `new FinalizationRegistry(cb)` — `cb` must be callable. Bounded: with no
+        // mid-execution GC the cleanup callback never fires, so the recorded cells
+        // are never visited; `register`/`unregister` still maintain `[[Cells]]`.
         if id == N_FINALIZATION_REGISTRY {
+            let cb = args.first().copied().unwrap_or(NanBox::undefined());
+            if !cb
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|h| self.is_callable(h))
+            {
+                return Err(self.type_error("FinalizationRegistry: cleanup callback must be callable"));
+            }
             let obj = self.realm.new_object();
             self.realm
                 .set_hidden_property(obj, FINREG_TAG, NanBox::boolean(true));
+            let cells = self.realm.new_array(Vec::new());
+            self.realm
+                .set_hidden_property(obj, FINREG_CELLS, NanBox::handle(cells.to_raw()));
+            let default = self.intrinsic_proto("FinalizationRegistry");
+            if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                self.realm.set_object_proto(obj, Some(proto));
+            }
             return Ok(NanBox::handle(obj.to_raw()));
         }
         // `new ArrayBuffer(n)` — a zeroed byte store of length `n`.

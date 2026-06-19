@@ -1261,9 +1261,17 @@ fn builtin_native_arity(id: u16) -> u32 {
         // `Uint8Array.prototype.toBase64([options])` / `.toHex()` — `length` 0
         // (the optional `options` is not counted; `toHex` takes none).
         | N_UINT8_TO_BASE64
-        | N_UINT8_TO_HEX => 0,
+        | N_UINT8_TO_HEX
+        // `WeakRef.prototype.deref()` / `Symbol.prototype.toString()` /
+        // `…valueOf()` / `get Symbol.prototype.description` all take no args.
+        | N_WEAKREF_DEREF
+        | N_SYMBOL_PROTO_TOSTRING
+        | N_SYMBOL_PROTO_VALUEOF
+        | N_SYMBOL_PROTO_DESC_GET => 0,
         // Length 2.
-        N_PROXY
+        // `FinalizationRegistry.prototype.register(target, heldValue [, token])`.
+        N_FINREG_REGISTER
+        | N_PROXY
         | N_OBJECT_SET_PROTO
         | N_OBJECT_IS
         | N_OBJECT_HAS_OWN
@@ -1693,6 +1701,31 @@ const N_ERROR_IS_ERROR: u16 = 660;
 /// machine, and accumulates finite values with a Shewchuk-style exact
 /// (error-free) partials list rounded once at the end. `.length` is 1.
 const N_MATH_SUM_PRECISE: u16 = 661;
+/// `WeakRef.prototype.deref()` — brand-checks `this` (a `[[WeakRefTarget]]`
+/// slot) and returns the held target (never collected here). `.length` is 0.
+const N_WEAKREF_DEREF: u16 = 662;
+/// `FinalizationRegistry.prototype.register(target, heldValue [, token])` —
+/// brand-checks `this` (a `[[Cells]]` slot), validates CanBeHeldWeakly(target)
+/// and `target !== heldValue`, appends a cell, returns undefined. `.length` 2.
+const N_FINREG_REGISTER: u16 = 663;
+/// `FinalizationRegistry.prototype.unregister(token)` — brand-checks `this`,
+/// validates CanBeHeldWeakly(token), removes every cell whose unregister token
+/// SameValue-matches, returns whether any were removed. `.length` is 1.
+const N_FINREG_UNREGISTER: u16 = 664;
+/// `Symbol.prototype.toString()` — `thisSymbolValue(this)` then `SymbolDescriptiveString`.
+const N_SYMBOL_PROTO_TOSTRING: u16 = 665;
+/// `Symbol.prototype.valueOf()` — returns `thisSymbolValue(this)`.
+const N_SYMBOL_PROTO_VALUEOF: u16 = 666;
+/// `get Symbol.prototype.description` — returns `thisSymbolValue(this).[[Description]]`.
+const N_SYMBOL_PROTO_DESC_GET: u16 = 667;
+/// `Symbol.prototype[Symbol.toPrimitive](hint)` — returns `thisSymbolValue(this)`.
+const N_SYMBOL_PROTO_TOPRIMITIVE: u16 = 668;
+/// Hidden array property holding a `FinalizationRegistry`'s `[[Cells]]`: each
+/// cell is a 3-element array `[target, heldValue, unregisterToken]` where an
+/// absent (~empty~) token is stored as `undefined` (safe: `undefined` can never
+/// be a real token — `CanBeHeldWeakly(undefined)` is false, so `unregister`
+/// never matches against it).
+const FINREG_CELLS: &str = "\u{0}finregcells";
 /// Hidden brand + payload on a RawJSON object (the validated source text).
 const RAW_JSON_BRAND: &str = "\u{0}rawjson";
 /// Hidden-property keys for a capability state object built around a foreign `C`.
@@ -2047,6 +2080,38 @@ impl<'a> Interp<'a> {
         // A built-in constructor's `prototype` is `{ writable: false,
         // enumerable: false, configurable: false }` (ECMA-262 — every built-in
         // constructor object).
+        self.realm.mark_hidden(ns, "prototype");
+        self.realm.set_readonly_property(ns, "prototype");
+        self.realm.set_non_configurable_property(ns, "prototype");
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
+    }
+
+    /// Builds `<ctor>.prototype` as a real object whose methods are *direct-id*
+    /// natives (each reads its receiver from `this_val` and brand-checks itself) —
+    /// for `WeakRef`/`FinalizationRegistry`, whose methods carry distinct logic
+    /// rather than name-based re-dispatch. Each method is non-enumerable; the
+    /// `prototype` is `{ writable:false, enumerable:false, configurable:false }`
+    /// and `proto.constructor` links back to the constructor (non-enumerable).
+    fn setup_direct_prototype(&mut self, ctor_name: &str, methods: &[(&str, u16)]) {
+        let Some(ns) = self
+            .current
+            .get(ctor_name)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        let obj_proto = self.object_prototype();
+        let proto = self.realm.new_object_with_proto(obj_proto);
+        for &(name, id) in methods {
+            let f = self.new_named_native(name, id);
+            self.realm
+                .set_property(proto, name, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(proto, name);
+        }
+        self.realm
+            .set_property(ns, "prototype", NanBox::handle(proto.to_raw()));
         self.realm.mark_hidden(ns, "prototype");
         self.realm.set_readonly_property(ns, "prototype");
         self.realm.set_non_configurable_property(ns, "prototype");
@@ -3222,6 +3287,17 @@ impl<'a> Interp<'a> {
         self.setup_first_class_prototype_id("Map", MAP_PROTO_METHODS, N_MAP_PROTO_FN);
         self.setup_first_class_prototype_id("WeakMap", WEAKMAP_PROTO_METHODS, N_WEAKMAP_PROTO_FN);
         self.setup_first_class_prototype_id("WeakSet", WEAKSET_PROTO_METHODS, N_WEAKSET_PROTO_FN);
+        // `WeakRef.prototype.deref` and `FinalizationRegistry.prototype.{register,
+        // unregister}` — direct-id, brand-checking natives. Instances link to these
+        // prototypes (see the `construct` arms).
+        self.setup_direct_prototype("WeakRef", &[("deref", N_WEAKREF_DEREF)]);
+        self.setup_direct_prototype(
+            "FinalizationRegistry",
+            &[
+                ("register", N_FINREG_REGISTER),
+                ("unregister", N_FINREG_UNREGISTER),
+            ],
+        );
         // `Promise.prototype` (then/catch/finally) — so `Promise.prototype.then`
         // is readable / detachable and `Promise.prototype[Symbol.toStringTag]`
         // exists. Promise instances link to it below.
@@ -3240,6 +3316,62 @@ impl<'a> Interp<'a> {
         self.install_proto_to_string_tag("WeakMap", "WeakMap");
         self.install_proto_to_string_tag("WeakSet", "WeakSet");
         self.install_proto_to_string_tag("Promise", "Promise");
+        self.install_proto_to_string_tag("WeakRef", "WeakRef");
+        self.install_proto_to_string_tag("FinalizationRegistry", "FinalizationRegistry");
+        // `Symbol.prototype` — a real object carrying brand-checking methods.
+        // Symbol PRIMITIVE behavior (`.description`/`.toString()`/`typeof`/keys)
+        // keeps flowing through the existing fast paths in `read_member` /
+        // `call_method`; this prototype makes `Symbol.prototype`,
+        // `Object.getPrototypeOf(Symbol())`, and detached-method `.call(sym)` work.
+        if let Some(sym_ctor) = self
+            .current
+            .get("Symbol")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            let proto = self.realm.new_object_with_proto(Some(obj_proto));
+            // `toString` / `valueOf` — { writable:true, enumerable:false, configurable:true }.
+            for (name, nid) in [
+                ("toString", N_SYMBOL_PROTO_TOSTRING),
+                ("valueOf", N_SYMBOL_PROTO_VALUEOF),
+            ] {
+                let f = self.new_named_native(name, nid);
+                self.realm
+                    .set_property(proto, name, NanBox::handle(f.to_raw()));
+                self.realm.mark_hidden(proto, name);
+            }
+            // `get description` — accessor, { enumerable:false, configurable:true }, no setter.
+            let desc_get = self.new_named_native("get description", N_SYMBOL_PROTO_DESC_GET);
+            self.realm.define_accessor(
+                proto,
+                "description",
+                NanBox::handle(desc_get.to_raw()),
+                NanBox::undefined(),
+            );
+            self.realm.mark_hidden(proto, "description");
+            // `[Symbol.toPrimitive]` — { writable:false, enumerable:false, configurable:true }.
+            let to_prim =
+                self.new_named_native("[Symbol.toPrimitive]", N_SYMBOL_PROTO_TOPRIMITIVE);
+            let to_prim_sym = self.well_known_symbol("toPrimitive");
+            let to_prim_key = self.member_key(to_prim_sym);
+            self.realm
+                .set_property(proto, &to_prim_key, NanBox::handle(to_prim.to_raw()));
+            self.realm.mark_hidden(proto, &to_prim_key);
+            self.realm.set_readonly_property(proto, &to_prim_key);
+            // `[Symbol.toStringTag]` === "Symbol".
+            self.install_to_string_tag(proto, "Symbol");
+            // `constructor` — { writable:true, enumerable:false, configurable:true }.
+            self.realm
+                .set_hidden_property(proto, "constructor", NanBox::handle(sym_ctor.to_raw()));
+            // Install on the constructor (read-only, non-enumerable, non-configurable)
+            // and register as the intrinsic `[[Prototype]]` of Symbol primitives.
+            self.realm
+                .set_property(sym_ctor, "prototype", NanBox::handle(proto.to_raw()));
+            self.realm.mark_hidden(sym_ctor, "prototype");
+            self.realm.set_readonly_property(sym_ctor, "prototype");
+            self.realm.set_non_configurable_property(sym_ctor, "prototype");
+            self.realm.set_symbol_proto_intrinsic(proto);
+        }
         // Namespace objects carry their own `[Symbol.toStringTag]` value (not on a
         // prototype): `Reflect`/`JSON`/`Math` → `[object Reflect|JSON|Math]`.
         for (ns_name, tag) in [("Reflect", "Reflect"), ("JSON", "JSON"), ("Math", "Math")] {

@@ -1156,6 +1156,49 @@ impl<'a> Interp<'a> {
         Ok(obox)
     }
 
+    /// CanBeHeldWeakly(v) (ECMA-262): true for an object or a *non-registered*
+    /// symbol. A symbol obtained from `Symbol.for` (present in the global symbol
+    /// registry) cannot be held weakly. Primitives (string/number/bigint/bool/
+    /// null/undefined) cannot either.
+    pub(crate) fn can_be_held_weakly(&self, v: NanBox) -> bool {
+        let Some(h) = v.as_handle().map(Handle::from_raw) else {
+            return false;
+        };
+        // A symbol: weakly holdable unless it lives in the global registry.
+        if self.realm.symbol_at(h).is_some() {
+            return !self
+                .symbol_registry
+                .values()
+                .any(|s| self.realm.same_value(*s, v));
+        }
+        // Any other heap value that is not a non-object primitive (string /
+        // bigint are heap cells but not weakly holdable).
+        self.realm.string_value(h).is_none() && self.realm.bigint_at(h).is_none()
+    }
+
+    /// `thisSymbolValue(this)` (ECMA-262 20.4.3): if `this` is a Symbol
+    /// primitive, return it; if it is a Symbol wrapper object (a [`PRIM_WRAP`]
+    /// holding a symbol), return the boxed symbol; otherwise a TypeError. Used by
+    /// the brand-checking `Symbol.prototype` methods. (Here `Object(sym)` returns
+    /// the primitive itself, so the wrapper branch is a belt-and-braces fallback.)
+    pub(crate) fn this_symbol_value(&mut self) -> Result<NanBox, ExecError> {
+        let this = self.this_val;
+        if let Some(h) = this.as_handle().map(Handle::from_raw) {
+            if self.realm.symbol_at(h).is_some() {
+                return Ok(this);
+            }
+            if let Some(prim) = self.realm.get_property(h, PRIM_WRAP)
+                && prim
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|ph| self.realm.symbol_at(ph).is_some())
+            {
+                return Ok(prim);
+            }
+        }
+        Err(self.type_error("Symbol.prototype method called on a non-symbol value"))
+    }
+
     pub(crate) fn guard_weak_key(&mut self, coll: Handle, key: NanBox) -> Result<(), ExecError> {
         if !self.realm.collection_is_weak(coll) {
             return Ok(());

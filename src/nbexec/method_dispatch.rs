@@ -236,21 +236,9 @@ impl<'a> Interp<'a> {
         };
         let handle = Handle::from_raw(raw);
 
-        // --- WeakRef / FinalizationRegistry (bounded: no mid-execution GC) ---
-        if method == "deref"
-            && let Some(target) = self.realm.get_property(handle, WEAKREF_TARGET)
-        {
-            return Ok(Some(target));
-        }
-        if self.realm.get_property(handle, FINREG_TAG).is_some() {
-            match method {
-                // `register(target, heldValue, unregisterToken?)` — inert.
-                "register" => return Ok(Some(NanBox::undefined())),
-                // `unregister(token)` — nothing was ever registered.
-                "unregister" => return Ok(Some(NanBox::boolean(false))),
-                _ => {}
-            }
-        }
+        // `WeakRef.prototype.deref` / `FinalizationRegistry.prototype.{register,
+        // unregister}` are real, brand-checking natives on their prototypes (set up
+        // in `setup`), reached through ordinary member lookup — no fast-path here.
 
         // --- universal `Object.prototype` methods (own/inherited reflection) ---
         match method {

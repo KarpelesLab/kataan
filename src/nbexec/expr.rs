@@ -501,6 +501,15 @@ impl<'a> Interp<'a> {
                             && self.current.get(&id.name).is_none()
                             && self.with_binding(&id.name).is_none()
                             && !matches!(&*id.name, "undefined" | "NaN" | "Infinity")
+                            // A binding may live only as a global-object own property
+                            // (e.g. `globalThis.x = …`, or a built-in declared onto the
+                            // global object rather than the lexical scope) — `typeof`
+                            // must see it, not report "undefined".
+                            && !self
+                                .global_this
+                                .as_handle()
+                                .map(Handle::from_raw)
+                                .is_some_and(|g| self.realm.has_own(g, &id.name))
                         {
                             return Ok(self.new_str("undefined"));
                         }
@@ -3262,10 +3271,21 @@ impl<'a> Interp<'a> {
             let m = self.new_str("Right-hand side of 'instanceof' is not callable");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
-        // A primitive left-hand side is not an instance of anything.
+        // A primitive left-hand side is not an instance of anything. As well as the
+        // NanBox primitives (number/boolean/null/undefined), the heap-cell
+        // primitives — String, Symbol, BigInt — are values, not objects, so
+        // OrdinaryHasInstance returns false for them (e.g. `Symbol() instanceof
+        // Symbol` is false). A primitive *wrapper* object is a plain `Cell::Object`
+        // and is unaffected.
         let Some(oh) = obj.as_handle().map(Handle::from_raw) else {
             return Ok(false);
         };
+        if self.realm.symbol_at(oh).is_some()
+            || self.realm.string_value(oh).is_some()
+            || self.realm.bigint_at(oh).is_some()
+        {
+            return Ok(false);
+        }
         // Built-in constructors: check the cell kind directly.
         if let Some(id) = self.realm.native_at(ch) {
             // A primitive wrapper (`new Number(…)`) matches its constructor.

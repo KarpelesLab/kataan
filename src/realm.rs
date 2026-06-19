@@ -149,6 +149,11 @@ pub struct Realm {
     /// override is recorded in [`native_protos`](Realm::native_protos) /
     /// [`callable_null_protos`](Realm::callable_null_protos).
     array_proto_intrinsic: Option<Handle>,
+    /// The realm's `Symbol.prototype` intrinsic (the `[[Prototype]]` of a Symbol
+    /// primitive `Cell::Symbol`, which has no inline object part). So
+    /// `Object.getPrototypeOf(Symbol())` resolves to `Symbol.prototype`. Symbol
+    /// primitives are immutable, so this is never overridden per-instance.
+    symbol_proto_intrinsic: Option<Handle>,
     /// The lazily-materialized `.prototype` objects of the `Intl` service
     /// constructors (`Intl.NumberFormat`, `Intl.Collator`, …, `Intl.Locale`,
     /// `Intl.DurationFormat`), keyed by the constructor's native dispatch id. Each
@@ -226,6 +231,7 @@ impl Realm {
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
             array_proto_intrinsic: None,
+            symbol_proto_intrinsic: None,
             intl_protos: alloc::collections::BTreeMap::new(),
             legacy_regexp: LegacyRegExpState::default(),
             limits,
@@ -267,6 +273,12 @@ impl Realm {
     /// `[[Prototype]]` for every dense `Cell::Array`.
     pub fn set_array_proto_intrinsic(&mut self, handle: Handle) {
         self.array_proto_intrinsic = Some(handle);
+    }
+
+    /// Records the realm's `%Symbol.prototype%` intrinsic — the `[[Prototype]]`
+    /// for every `Cell::Symbol` primitive.
+    pub fn set_symbol_proto_intrinsic(&mut self, handle: Handle) {
+        self.symbol_proto_intrinsic = Some(handle);
     }
 
     /// The shared abstract `%TypedArray%` intrinsic constructor, if installed.
@@ -1614,6 +1626,10 @@ impl Realm {
         }
         if let Some(p) = self.native_protos.get(&handle.to_raw()).copied() {
             return Some(p);
+        }
+        // A Symbol primitive's `[[Prototype]]` is `%Symbol.prototype%`.
+        if matches!(self.heap.get(handle), Some(Cell::Symbol { .. })) {
+            return self.symbol_proto_intrinsic;
         }
         // An ordinary/native callable with no explicit override and no inline
         // object part has `[[Prototype]] === %Function.prototype%` (unless it was

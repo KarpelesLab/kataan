@@ -156,6 +156,141 @@ impl<'a> Interp<'a> {
                 };
                 NanBox::handle(self.realm.new_symbol(&desc).to_raw())
             }
+            // `WeakRef.prototype.deref()` — RequireInternalSlot(this, [[Target]]),
+            // then return the held target (never collected here).
+            N_WEAKREF_DEREF => {
+                let this = self.this_val;
+                let target = this
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.get_property(h, WEAKREF_TARGET));
+                match target {
+                    Some(t) => t,
+                    None => {
+                        return Err(self
+                            .type_error("WeakRef.prototype.deref requires that 'this' be a WeakRef"))
+                    }
+                }
+            }
+            // `FinalizationRegistry.prototype.register(target, heldValue [, token])`.
+            N_FINREG_REGISTER => {
+                let this = self.this_val;
+                let Some(cells) = this
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|h| self.realm.get_property(*h, FINREG_TAG).is_some())
+                    .and_then(|h| self.realm.get_property(h, FINREG_CELLS))
+                    .and_then(|c| c.as_handle())
+                    .map(Handle::from_raw)
+                else {
+                    return Err(self.type_error(
+                        "FinalizationRegistry.prototype.register requires that 'this' be a FinalizationRegistry",
+                    ));
+                };
+                let target = arg(0);
+                let held = arg(1);
+                let token = arg(2);
+                if !self.can_be_held_weakly(target) {
+                    return Err(self.type_error(
+                        "FinalizationRegistry.register: target must be an object or a non-registered symbol",
+                    ));
+                }
+                if self.realm.same_value(target, held) {
+                    return Err(
+                        self.type_error("FinalizationRegistry.register: target and heldValue must differ")
+                    );
+                }
+                // `unregisterToken`, when present, must also be weakly holdable;
+                // an `undefined` token records ~empty~ (stored as `undefined`).
+                let token = if matches!(token.unpack(), Unpacked::Undefined) {
+                    NanBox::undefined()
+                } else if self.can_be_held_weakly(token) {
+                    token
+                } else {
+                    return Err(self.type_error(
+                        "FinalizationRegistry.register: unregisterToken must be an object or a non-registered symbol",
+                    ));
+                };
+                let cell = self.realm.new_array(alloc::vec![target, held, token]);
+                self.realm
+                    .array_push(cells, NanBox::handle(cell.to_raw()));
+                NanBox::undefined()
+            }
+            // `FinalizationRegistry.prototype.unregister(token)` — remove every cell
+            // whose unregister token SameValue-matches; report whether any removed.
+            N_FINREG_UNREGISTER => {
+                let this = self.this_val;
+                let Some(cells) = this
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|h| self.realm.get_property(*h, FINREG_TAG).is_some())
+                    .and_then(|h| self.realm.get_property(h, FINREG_CELLS))
+                    .and_then(|c| c.as_handle())
+                    .map(Handle::from_raw)
+                else {
+                    return Err(self.type_error(
+                        "FinalizationRegistry.prototype.unregister requires that 'this' be a FinalizationRegistry",
+                    ));
+                };
+                let token = arg(0);
+                if !self.can_be_held_weakly(token) {
+                    return Err(self.type_error(
+                        "FinalizationRegistry.unregister: token must be an object or a non-registered symbol",
+                    ));
+                }
+                let existing = self
+                    .realm
+                    .array_elements(cells)
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default();
+                let mut kept = Vec::with_capacity(existing.len());
+                let mut removed = false;
+                for cell in existing {
+                    let cell_token = cell
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.array_elements(h))
+                        .and_then(|e| e.get(2).copied())
+                        .unwrap_or(NanBox::undefined());
+                    if !matches!(cell_token.unpack(), Unpacked::Undefined)
+                        && self.realm.same_value(cell_token, token)
+                    {
+                        removed = true;
+                    } else {
+                        kept.push(cell);
+                    }
+                }
+                if removed {
+                    let registry = this.as_handle().map(Handle::from_raw).unwrap();
+                    let fresh = self.realm.new_array(kept);
+                    self.realm.set_hidden_property(
+                        registry,
+                        FINREG_CELLS,
+                        NanBox::handle(fresh.to_raw()),
+                    );
+                }
+                NanBox::boolean(removed)
+            }
+            // `Symbol.prototype.toString()` — `thisSymbolValue` then `SymbolDescriptiveString`.
+            N_SYMBOL_PROTO_TOSTRING => {
+                let sym = self.this_symbol_value()?;
+                let s = self.realm.to_display_string(sym);
+                self.new_str(&s)
+            }
+            // `Symbol.prototype.valueOf()` — return the symbol primitive.
+            N_SYMBOL_PROTO_VALUEOF => self.this_symbol_value()?,
+            // `get Symbol.prototype.description`.
+            N_SYMBOL_PROTO_DESC_GET => {
+                let sym = self.this_symbol_value()?;
+                let h = sym.as_handle().map(Handle::from_raw);
+                match h.and_then(|h| self.realm.symbol_at(h)) {
+                    Some((desc, _)) if &*desc == SYMBOL_NO_DESC => NanBox::undefined(),
+                    Some((desc, _)) => self.new_str(&desc),
+                    None => NanBox::undefined(),
+                }
+            }
+            // `Symbol.prototype[Symbol.toPrimitive](hint)` — return the symbol.
+            N_SYMBOL_PROTO_TOPRIMITIVE => self.this_symbol_value()?,
             N_BIGINT => {
                 // `BigInt(value)`: ToPrimitive(value, number); if the resulting
                 // primitive is a Number, apply NumberToBigInt (a RangeError for a
@@ -467,7 +602,10 @@ impl<'a> Interp<'a> {
                 if !matches!(arg(1).unpack(), Unpacked::Null) && !self.is_object_value(arg(1)) {
                     return Err(self.type_error("Object prototype may only be an Object or null"));
                 }
-                if let Some(raw) = arg(0).as_handle() {
+                // Only an actual Object's prototype is set; a primitive `O` (a
+                // String/Symbol/BigInt heap value passes RequireObjectCoercible but
+                // is not an Object) is returned unchanged.
+                if let Some(raw) = arg(0).as_handle().filter(|_| self.is_object_value(arg(0))) {
                     let proto = arg(1).as_handle().map(Handle::from_raw);
                     // A failed [[SetPrototypeOf]] (a non-extensible object) throws.
                     if !self.set_proto_of(Handle::from_raw(raw), proto)? {

@@ -4423,11 +4423,54 @@ fn weakref_and_finalization_registry() {
         run("typeof WeakRef + ',' + typeof FinalizationRegistry"),
         "function,function"
     );
+    // `register`/`unregister` now maintain a real `[[Cells]]` list with spec
+    // brand/argument validation (the cleanup callback still never fires — no GC).
     assert_eq!(
-        run("let reg=new FinalizationRegistry(()=>{}); reg.register({}, 'h'); reg.unregister('t')"),
-        "false"
+        run("let reg=new FinalizationRegistry(()=>{}); let t={}; reg.register({}, 'h', t); \
+             String(reg.unregister(t)) + ',' + String(reg.unregister(t))"),
+        "true,false"
+    );
+    // An unregister token that cannot be held weakly (a string) is a TypeError.
+    assert_eq!(
+        run("let reg=new FinalizationRegistry(()=>{}); try { reg.unregister('t'); 'no throw' } \
+             catch (e) { e.constructor.name }"),
+        "TypeError"
+    );
+    // Brand checks + prototype shape.
+    assert_eq!(
+        run("typeof WeakRef.prototype.deref + ',' + WeakRef.prototype[Symbol.toStringTag] + ',' + \
+             FinalizationRegistry.prototype[Symbol.toStringTag]"),
+        "function,WeakRef,FinalizationRegistry"
     );
     assert_eq!(run("new WeakRef([1,2,3]).deref().length"), "3");
+}
+
+#[test]
+fn symbol_prototype_methods() {
+    // `Symbol.prototype` exists with brand-checking methods; instance behavior
+    // is unchanged.
+    assert_eq!(run("typeof Symbol.prototype"), "object");
+    assert_eq!(run("Symbol.prototype[Symbol.toStringTag]"), "Symbol");
+    assert_eq!(run("Symbol.prototype.toString.call(Symbol('x'))"), "Symbol(x)");
+    assert_eq!(
+        run("let s=Symbol('y'); Symbol.prototype.valueOf.call(s)===s"),
+        "true"
+    );
+    assert_eq!(run("typeof Symbol.prototype[Symbol.toPrimitive]"), "function");
+    assert_eq!(
+        run("Object.getPrototypeOf(Symbol('66'))===Symbol.prototype"),
+        "true"
+    );
+    assert_eq!(run("Symbol.prototype.constructor===Symbol"), "true");
+    // A non-symbol `this` is a TypeError.
+    assert_eq!(
+        run("try { Symbol.prototype.valueOf.call({}); 'no throw' } catch (e) { e.constructor.name }"),
+        "TypeError"
+    );
+    // Instance fast paths intact; `Symbol() instanceof Symbol` stays false.
+    assert_eq!(run("Symbol('a').description"), "a");
+    assert_eq!(run("Symbol('a') instanceof Symbol"), "false");
+    assert_eq!(run("Symbol().hasOwnProperty('description')"), "false");
 }
 
 #[test]
