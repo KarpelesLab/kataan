@@ -499,11 +499,31 @@ fn inline_modifier_groups() {
     // Nested modifiers: inner remove overrides outer add.
     assert!(!re("(?i:(?-i:a))", "").is_match("A"));
     assert!(re("(?i:(?-i:a))", "").is_match("a"));
-    // Syntax errors.
-    assert!(Regex::new("(?-:a)", "").is_err()); // both empty
-    assert!(Regex::new("(?ii:a)", "").is_err()); // duplicate in add
-    assert!(Regex::new("(?ims-m:a)", "").is_err()); // m in both add and remove
-    assert!(Regex::new("(?d:a)", "").is_err()); // invalid flag
+    // Valid combined / single-sided forms stay accepted.
+    assert!(Regex::new("(?i-m:a)", "").is_ok());
+    assert!(Regex::new("(?-i:a)", "").is_ok());
+    assert!(Regex::new("(?ims:a)", "").is_ok());
+    // RemoveFlags after `-` may be empty: add-only with a trailing dash is valid.
+    assert!(Regex::new("(?i-:a)", "").is_ok());
+    // Syntax errors — each must be a *hard* error (not an `unsupported` deferral),
+    // so that a regex *literal* is rejected at parse phase. `is_unsupported()` must
+    // be false for every one.
+    for src in [
+        "(?-:a)",     // both sets empty
+        "(?ii:a)",    // duplicate within add
+        "(?i-mm:a)",  // duplicate within remove
+        "(?ims-m:a)", // `m` in both add and remove
+        "(?i-i:a)",   // single flag in both
+        "(?d:a)",     // invalid flag (g/y/u/d/v/uppercase/etc.)
+        "(?g:a)", "(?u:a)", "(?y:a)", "(?I:a)", "(?Q:a)", "(?1:a)",
+        "(?i)",  // modifier flags with no `:Disjunction`
+        "(?ms-i)", "(?-s)", "(?i-)", // no colon
+    ] {
+        match Regex::new(src, "") {
+            Ok(_) => panic!("{src} should be a SyntaxError"),
+            Err(e) => assert!(!e.is_unsupported(), "{src} should be a hard SyntaxError"),
+        }
+    }
 }
 
 #[test]

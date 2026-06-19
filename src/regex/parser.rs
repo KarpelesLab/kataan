@@ -604,7 +604,15 @@ impl Parser {
                 self.group_names.push((self.group_count, name));
                 Some(self.group_count)
             } else {
-                return Err(RegexError::unsupported("unsupported group extension `(?…)`"));
+                // After `(?`, the only valid continuations are the forms handled
+                // above (`(?:`, `(?=`, `(?!`, `(?<=`, `(?<!`, `(?<name>`, and an
+                // inline-modifier group `(?ims-ims:…)`). Anything else — e.g. an
+                // unknown flag letter such as `(?g:a)`, `(?d:a)`, `(?I:a)`, or a
+                // non-flag code point — is a genuine Syntax Error per the grammar
+                // `Atom :: ( ? RegularExpressionFlags (- RegularExpressionFlags)? :
+                // Disjunction )`, not an unimplemented-but-valid feature; raise a
+                // hard error so a regex *literal* is rejected at parse phase.
+                return Err(RegexError::new("invalid group extension `(?…)`"));
             }
         } else {
             self.group_count += 1;
@@ -631,7 +639,8 @@ impl Parser {
     /// * a flag appearing in *both* the add and remove sets,
     /// * both sets empty (`(?-:…)` or `(?:…)`-via-this-path — the latter never
     ///   reaches here since `(?:` is handled earlier),
-    /// * a missing `-`/`:` terminator.
+    /// * a `-` with no flags following it (`(?i-:…)`),
+    /// * a missing `:` terminator (`(?ms-i)`, `(?i-)`).
     fn parse_modifier_group(&mut self) -> Result<Node, RegexError> {
         self.pos += 1; // `?`
         // Parse a run of distinct flag letters until `-`, `:`, or end.
@@ -667,7 +676,8 @@ impl Parser {
             Ok((i, m, s))
         };
         let (add_i, add_m, add_s) = read_flags(self)?;
-        let (rem_i, rem_m, rem_s) = if self.eat('-') {
+        let had_dash = self.eat('-');
+        let (rem_i, rem_m, rem_s) = if had_dash {
             read_flags(self)?
         } else {
             (false, false, false)
@@ -675,11 +685,16 @@ impl Parser {
         if !self.eat(':') {
             return Err(RegexError::new("expected `:` in inline modifier group"));
         }
+        // RemoveFlags after `-` MAY be empty: `(?i-:a)` (add `i`, remove nothing) is
+        // valid. Only the all-empty form `(?-:a)` is rejected, by the "empty inline
+        // modifier group" check below.
         // A flag may not be both added and removed.
         if (add_i && rem_i) || (add_m && rem_m) || (add_s && rem_s) {
             return Err(RegexError::new("modifier flag both added and removed"));
         }
-        // At least one modifier must be present (no `(?-:…)` / empty form).
+        // At least one modifier must be present overall (the bare `(?:…)` form is a
+        // plain non-capturing group, handled earlier; reaching here with no flags
+        // and no `-` would be `(?:` which never routes to this function).
         if !(add_i || add_m || add_s || rem_i || rem_m || rem_s) {
             return Err(RegexError::new("empty inline modifier group"));
         }
