@@ -477,6 +477,109 @@ impl<'a> Interp<'a> {
                     .is_some_and(|h| self.realm.has_own(h, ERROR_DATA));
                 NanBox::boolean(is_err)
             }
+            N_ERROR_PROTO_STACK_GET => {
+                // `get Error.prototype.stack` (error-stack-accessor):
+                //   1. If `this` is not an Object, throw a TypeError.
+                //   2. If `this` lacks an `[[ErrorData]]` slot, return undefined.
+                //   3. Else return an implementation string for its stack trace.
+                let this = self.this_val;
+                if !self.is_object_value(this) {
+                    return Err(self.type_error("get Error.prototype.stack called on non-object"));
+                }
+                let h = Handle::from_raw(this.as_handle().unwrap());
+                if !self.realm.has_own(h, ERROR_DATA) {
+                    return Ok(NanBox::undefined());
+                }
+                // The proposal leaves the format implementation-defined; render the
+                // error's `"name: message"` first line (the same shape as
+                // `Error.prototype.toString`), which the conformance tests accept as
+                // a non-empty String.
+                let name = self.read_member(h, "name")?;
+                let name = self.realm.to_display_string(name);
+                let msg = self.read_member(h, "message")?;
+                let msg = self.realm.to_display_string(msg);
+                let line = if msg.is_empty() {
+                    name
+                } else if name.is_empty() {
+                    msg
+                } else {
+                    alloc::format!("{name}: {msg}")
+                };
+                self.new_str(&line)
+            }
+            N_ERROR_PROTO_STACK_SET => {
+                // `set Error.prototype.stack` (error-stack-accessor):
+                //   1. If `this` is not an Object, throw a TypeError.
+                //   2. If `v` is not a String, throw a TypeError.
+                //   3. SetterThatIgnoresPrototypeProperties(this, %Error.prototype%,
+                //      "stack", v): throw if `this` IS %Error.prototype%; else update
+                //      an existing own "stack" via [[Set]] (Throw=true) or create a
+                //      fresh writable/enumerable/configurable own data property.
+                let this = self.this_val;
+                if !self.is_object_value(this) {
+                    return Err(self.type_error("set Error.prototype.stack called on non-object"));
+                }
+                let v = arg(0);
+                let is_string = v
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| self.realm.string_value(h).is_some());
+                if !is_string {
+                    return Err(
+                        self.type_error("set Error.prototype.stack requires a String value")
+                    );
+                }
+                let h = Handle::from_raw(this.as_handle().unwrap());
+                // SameValue(this, %Error.prototype%) — assignment to the home object
+                // emulates a non-writable data property and throws.
+                let error_proto = self
+                    .current
+                    .get("Error")
+                    .and_then(|c| c.as_handle())
+                    .map(Handle::from_raw)
+                    .and_then(|c| self.realm.get_property(c, "prototype"))
+                    .and_then(|p| p.as_handle());
+                if error_proto == Some(h.to_raw()) {
+                    return Err(
+                        self.type_error("Cannot assign to read only property 'stack' of Error.prototype")
+                    );
+                }
+                if self.realm.has_own(h, "stack") {
+                    // [[Set]] with Throw=true. An own accessor with no setter cannot
+                    // be written: throw (the assignment path would silently no-op).
+                    if let Some((_, setter)) = self.realm.accessor(h, "stack")
+                        && matches!(setter.unpack(), Unpacked::Undefined)
+                    {
+                        return Err(self.type_error(
+                            "Cannot set property 'stack' which has only a getter",
+                        ));
+                    }
+                    // A getter-only own accessor is handled above; a non-writable own
+                    // data property must also throw even in sloppy code, so force
+                    // strict semantics for this write.
+                    let key = self.new_str("stack");
+                    let saved = self.strict;
+                    self.strict = true;
+                    let r = self.assign_member_value(h, key, v);
+                    self.strict = saved;
+                    r?;
+                } else {
+                    // CreateDataPropertyOrThrow: fails (TypeError) on a non-extensible
+                    // receiver.
+                    let desc = self.realm.new_object();
+                    self.realm.set_property(desc, "value", v);
+                    self.realm.set_property(desc, "writable", NanBox::boolean(true));
+                    self.realm.set_property(desc, "enumerable", NanBox::boolean(true));
+                    self.realm
+                        .set_property(desc, "configurable", NanBox::boolean(true));
+                    if !self.apply_descriptor(h, "stack", desc, true)? {
+                        return Err(self.type_error(
+                            "Cannot create property 'stack' on a non-extensible object",
+                        ));
+                    }
+                }
+                NanBox::undefined()
+            }
             N_OBJECT_KEYS => {
                 // ToObject(O): `null`/`undefined` throws (a primitive coerces to a
                 // wrapper with no own enumerable keys, so it is left as-is here).

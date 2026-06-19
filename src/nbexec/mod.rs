@@ -1267,7 +1267,9 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_WEAKREF_DEREF
         | N_SYMBOL_PROTO_TOSTRING
         | N_SYMBOL_PROTO_VALUEOF
-        | N_SYMBOL_PROTO_DESC_GET => 0,
+        | N_SYMBOL_PROTO_DESC_GET
+        // `get Error.prototype.stack` takes no arguments.
+        | N_ERROR_PROTO_STACK_GET => 0,
         // Length 2.
         // `FinalizationRegistry.prototype.register(target, heldValue [, token])`.
         N_FINREG_REGISTER
@@ -1720,6 +1722,17 @@ const N_SYMBOL_PROTO_VALUEOF: u16 = 666;
 const N_SYMBOL_PROTO_DESC_GET: u16 = 667;
 /// `Symbol.prototype[Symbol.toPrimitive](hint)` — returns `thisSymbolValue(this)`.
 const N_SYMBOL_PROTO_TOPRIMITIVE: u16 = 668;
+/// `get Error.prototype.stack` (the error-stack-accessor proposal). A non-object
+/// `this` throws a TypeError; an object lacking the `[[ErrorData]]` brand (see
+/// `ERROR_DATA`) returns `undefined`; a genuine Error instance returns an
+/// implementation string. Defined on `Error.prototype` as an accessor property.
+const N_ERROR_PROTO_STACK_GET: u16 = 669;
+/// `set Error.prototype.stack` (the error-stack-accessor proposal). Implements
+/// `SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v)`:
+/// a non-object `this` or a non-String `v` throws a TypeError; `this ===
+/// %Error.prototype%` throws; otherwise an own data property "stack" is created
+/// (or `[[Set]]` runs if one already exists).
+const N_ERROR_PROTO_STACK_SET: u16 = 670;
 /// Hidden array property holding a `FinalizationRegistry`'s `[[Cells]]`: each
 /// cell is a 3-element array `[target, heldValue, unregisterToken]` where an
 /// absent (~empty~) token is stored as `undefined` (safe: `undefined` can never
@@ -3418,6 +3431,25 @@ impl<'a> Interp<'a> {
                 self.realm
                     .set_property(proto, "toString", NanBox::handle(ts.to_raw()));
                 self.realm.mark_hidden(proto, "toString");
+                // `Error.prototype.stack` — the error-stack-accessor proposal: an
+                // accessor property (`{ enumerable: false, configurable: true }`)
+                // with both a getter and a setter. The getter returns an
+                // implementation string for a `[[ErrorData]]`-branded receiver,
+                // `undefined` for any other object, and throws for a non-object;
+                // the setter shadows the accessor with an own data property. The
+                // accessor lives only on `Error.prototype`; subclass prototypes
+                // (e.g. `TypeError.prototype`) inherit it.
+                // `new_named_native` installs `name`/`length` from
+                // `builtin_native_arity` (getter 0, setter 1).
+                let stack_get = self.new_named_native("get stack", N_ERROR_PROTO_STACK_GET);
+                let stack_set = self.new_named_native("set stack", N_ERROR_PROTO_STACK_SET);
+                self.realm.define_accessor(
+                    proto,
+                    "stack",
+                    NanBox::handle(stack_get.to_raw()),
+                    NanBox::handle(stack_set.to_raw()),
+                );
+                self.realm.mark_hidden(proto, "stack");
                 self.realm
                     .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
                 self.realm.mark_hidden(ctor, "prototype");
@@ -4078,16 +4110,10 @@ impl<'a> Interp<'a> {
         // `name`/`message` are non-enumerable (so `Object.keys(err)` is empty).
         self.realm.mark_hidden(obj, "name");
         self.realm.mark_hidden(obj, "message");
-        // A minimal `stack` (the `name: message` header; no real frame capture),
-        // non-enumerable like the real property.
-        let head = if msg_str.is_empty() {
-            String::from(name)
-        } else {
-            alloc::format!("{name}: {msg_str}")
-        };
-        let stack = self.new_str(&alloc::format!("{head}\n    at <anonymous>"));
-        self.realm.set_property(obj, "stack", stack);
-        self.realm.mark_hidden(obj, "stack");
+        // No own `stack` property: per the error-stack-accessor proposal, `stack`
+        // is an inherited accessor on `Error.prototype` (see
+        // `N_ERROR_PROTO_STACK_GET`/`N_ERROR_PROTO_STACK_SET`) driven by the
+        // `[[ErrorData]]` brand, not an own data property of each instance.
         // Stamp the `[[ErrorData]]` brand (hidden; see `ERROR_DATA`) so
         // `Error.isError` recognizes this as a genuine Error instance.
         self.realm
