@@ -53,6 +53,25 @@ impl<'a> Interp<'a> {
         // primitive-wrapper `this` must be handled as an array-like object (not
         // unwrapped) — consume the one-shot flag so it applies only to this call.
         let array_proto_generic = core::mem::take(&mut self.array_proto_generic);
+
+        // `Array.prototype.concat` is receiver-agnostic (ECMA-262 23.1.3.1: it
+        // begins with `ToObject(this)`), so intercept it up front for *any*
+        // receiver — a real array, a non-array array-like, or a boxed primitive —
+        // before the primitive early-returns and the real-array element block
+        // below. Gate exactly like the other generic `Array.prototype` methods: a
+        // receiver only runs this when the call is an explicit
+        // `Array.prototype.concat.call(o)` (the flag) or `o` actually inherits the
+        // array methods through its prototype chain (so a plain object with no
+        // `concat` in its chain still reports "concat is not a function").
+        if method == "concat"
+            && (array_proto_generic
+                || recv
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| self.inherits_array_proto(h)))
+        {
+            return Ok(Some(self.array_concat(recv, args)?));
+        }
         // `Array.prototype.<m>.call(strOrStrWrapper, …)`: the receiver must be
         // read as an array-like (each UTF-16 unit an element), so the String
         // primitive/wrapper method handlers below must NOT intercept this method.
@@ -3421,121 +3440,9 @@ impl<'a> Interp<'a> {
                     return Ok(Some(self.make_generator(pairs)));
                 }
                 "concat" => {
-                    // `A = ArraySpeciesCreate(O, 0)`; then each spreadable source's
-                    // present elements (and each non-spreadable item) are appended
-                    // via `CreateDataPropertyOrThrow`. The receiver `O` is the first
-                    // source. `out` collects `(value, present)`; a hole in a real
-                    // array source is *not* defined on the result.
-                    let mut out: Vec<NanBox> = Vec::new();
-                    // First source = the receiver `O` (always spreadable here: a real
-                    // array reaching this arm). Honor its holes.
-                    if let Some(rec) = self.realm.array_elements(handle).map(<[_]>::to_vec) {
-                        out.extend(rec);
-                    } else {
-                        out.extend(elems.iter().copied());
-                    }
-                    // An argument is spread iff it is concat-spreadable: its
-                    // `[Symbol.isConcatSpreadable]` (if defined) decides, else it is
-                    // spread exactly when it is an array.
-                    let sym = self.well_known_symbol("isConcatSpreadable");
-                    let spread_key = self.member_key(sym);
-                    for a in args {
-                        let ah = a.as_handle().map(Handle::from_raw);
-                        // IsConcatSpreadable: a defined `[Symbol.isConcatSpreadable]`
-                        // (read via the accessor path so a getter fires) decides via
-                        // ToBoolean; otherwise spread iff `IsArray`.
-                        let spread = match ah {
-                            Some(h) => {
-                                let v = self.read_member(h, &spread_key)?;
-                                if matches!(v.unpack(), Unpacked::Undefined) {
-                                    self.realm.is_array(h)
-                                } else {
-                                    self.realm.truthy(v)
-                                }
-                            }
-                            None => false,
-                        };
-                        match (spread, ah) {
-                            (true, Some(h)) => {
-                                if let Some(other) = self.realm.array_elements(h).map(<[_]>::to_vec)
-                                {
-                                    out.extend(other);
-                                } else {
-                                    // A spreadable array-like: ToLength(Get(E,
-                                    // "length")) — the getter fires (abrupt
-                                    // completion propagates) and the value is coerced
-                                    // through `valueOf`/`toString`. Per spec, if the
-                                    // running total `n + len` exceeds 2^53 - 1 a
-                                    // TypeError is thrown (also guards against OOM).
-                                    let len_val = self.read_member(h, "length")?;
-                                    let len_num = self.coerce_to_number(len_val)?;
-                                    let raw = self.realm.to_number(len_num);
-                                    // ToLength: clamp to [0, 2^53-1] and truncate
-                                    // toward zero. `as u64` truncates a finite,
-                                    // already-clamped value without needing the
-                                    // std-only `f64::trunc`.
-                                    let len_int = if raw.is_nan() || raw <= 0.0 {
-                                        0.0
-                                    } else {
-                                        let clamped = if raw > 9_007_199_254_740_991.0 {
-                                            9_007_199_254_740_991.0
-                                        } else {
-                                            raw
-                                        };
-                                        clamped as u64 as f64
-                                    };
-                                    if out.len() as f64 + len_int > 9_007_199_254_740_991.0 {
-                                        return Err(self.type_error(
-                                            "Array.prototype.concat result exceeds maximum array length",
-                                        ));
-                                    }
-                                    let len = len_int as usize;
-                                    for i in 0..len {
-                                        let k = alloc::format!("{i}");
-                                        // Spec: only set a result element when the
-                                        // source HasProperty(k); read via the full
-                                        // accessor path so getters fire (and may
-                                        // throw, propagating here).
-                                        if self.has_property(h, &k) {
-                                            out.push(self.read_member(h, &k)?);
-                                        } else {
-                                            out.push(NanBox::undefined());
-                                        }
-                                    }
-                                }
-                            }
-                            _ => out.push(*a),
-                        }
-                    }
-                    // Build the result via `ArraySpeciesCreate(O, n)` and populate it
-                    // with `CreateDataPropertyOrThrow` for each present element (a
-                    // hole from an array source is skipped, leaving a hole in `A`);
-                    // finally `Set(A, "length", n)`.
-                    let n = out.len();
-                    let a_v = self.array_species_create(handle, n)?;
-                    let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
-                        return Err(self.type_error("Array species did not return an object"));
-                    };
-                    // Fast path: a plain default Array result accepts a bulk write.
-                    if self.realm.is_array(a_h)
-                        && self.realm.array_length(a_h) == Some(n)
-                        && !self.realm.is_frozen(a_h)
-                    {
-                        for (i, v) in out.iter().enumerate() {
-                            if !v.is_hole() {
-                                self.realm.set_element(a_h, i, *v);
-                            }
-                        }
-                    } else {
-                        for (i, v) in out.iter().enumerate() {
-                            if !v.is_hole() {
-                                self.create_data_property_or_throw(a_h, i, *v)?;
-                            }
-                        }
-                    }
-                    let len_key = self.new_str("length");
-                    self.assign_member_value(a_h, len_key, NanBox::number(n as f64))?;
-                    return Ok(Some(a_v));
+                    // A real-array receiver: run the shared, spec-conformant
+                    // `Array.prototype.concat` over `O = this` (already an object).
+                    return Ok(Some(self.array_concat(recv, args)?));
                 }
                 "reverse" => {
                     // Reverses in place and returns the same array (or typed-array view).
@@ -4153,6 +4060,115 @@ impl<'a> Interp<'a> {
             )));
         }
         Ok(())
+    }
+
+    /// `Array.prototype.concat(...args)` (ECMA-262 23.1.3.1), receiver-agnostic.
+    ///
+    /// 1. `O = ToObject(this)`; `A = ArraySpeciesCreate(O, 0)` (reads `O`'s
+    ///    `constructor`/`@@species` *before* any element). `n = 0`.
+    /// 2. For each `E` in `[O, ...args]`: `IsConcatSpreadable(E)` — non-object →
+    ///    false; else `Get(E, @@isConcatSpreadable)` (a getter fires); if defined,
+    ///    `ToBoolean`; else `IsArray(E)` (unwrapping proxies, rejecting functions).
+    ///    - Spreadable: `len = ToLength(Get(E, "length"))`; for each `k in 0..len`,
+    ///      `HasProperty(E, k)` ? `CreateDataProperty(A, n, Get(E, k))` : leave a
+    ///      hole; `n++`. `n + len > 2^53-1` → TypeError.
+    ///    - Else: `n >= 2^53-1` → TypeError; `CreateDataProperty(A, n, E)`; `n++`.
+    /// 3. `Set(A, "length", n)`; return `A`.
+    ///
+    /// Both the receiver and every argument are treated uniformly as `items`, so a
+    /// non-array array-like `this` (`Array.prototype.concat.call(obj)`) and a boxed
+    /// primitive `this` (`.call(101)` → a `Number` wrapper added as one element)
+    /// behave per spec.
+    pub(crate) fn array_concat(
+        &mut self,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        const MAX_SAFE: f64 = 9_007_199_254_740_991.0; // 2^53 - 1
+        // ToObject(this): a primitive receiver is boxed in its wrapper (added as a
+        // single non-spreadable element); an object is used as-is.
+        let o_v = self.coerce_to_object(this);
+        let Some(o_h) = o_v.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("Array.prototype.concat called on a non-object"));
+        };
+        // ArraySpeciesCreate(O, 0) — must run (reading `O.constructor`) before the
+        // `@@isConcatSpreadable` lookups, per spec step order.
+        let a_v = self.array_species_create(o_h, 0)?;
+        let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("Array species did not return an object"));
+        };
+        let sym = self.well_known_symbol("isConcatSpreadable");
+        let spread_key = self.member_key(sym);
+        // `n` (the running result length) is tracked as an `f64` so the spec's
+        // 2^53-1 cap is meaningful even though no such array is materializable.
+        let mut n: f64 = 0.0;
+        // Items = [O, ...args].
+        for item in core::iter::once(o_v).chain(args.iter().copied()) {
+            let ih = item.as_handle().map(Handle::from_raw);
+            // IsConcatSpreadable(E): a non-object is never spread; otherwise a
+            // defined `@@isConcatSpreadable` (read via the accessor path so a getter
+            // fires / may throw) decides via ToBoolean, else `IsArray` (which
+            // unwraps proxies and throws on a revoked one).
+            let spread = match ih {
+                Some(h) => {
+                    let v = self.read_member(h, &spread_key)?;
+                    if matches!(v.unpack(), Unpacked::Undefined) {
+                        self.is_array_unwrap_proxy(item)?
+                    } else {
+                        self.realm.truthy(v)
+                    }
+                }
+                None => false,
+            };
+            if spread {
+                let h = ih.expect("spreadable implies an object");
+                // len = ToLength(Get(E, "length")): the getter fires (abrupt
+                // completion propagates) and the value is coerced through
+                // `valueOf`/`toString`; NaN/negative clamps to 0, capped at 2^53-1.
+                let len_val = self.read_member(h, "length")?;
+                let len_num = self.coerce_to_number(len_val)?;
+                let raw = self.realm.to_number(len_num);
+                // ToLength: truncate toward zero (`as u64` on an already-clamped,
+                // finite value avoids the std-only `f64::trunc`).
+                let len_int = if raw.is_nan() || raw <= 0.0 {
+                    0.0
+                } else {
+                    raw.min(MAX_SAFE) as u64 as f64
+                };
+                if n + len_int > MAX_SAFE {
+                    return Err(self.type_error(
+                        "Array.prototype.concat result exceeds maximum array length",
+                    ));
+                }
+                let len = len_int as usize;
+                for k in 0..len {
+                    let key = alloc::format!("{k}");
+                    // Only define a result element when the source HasProperty(k);
+                    // an absent index leaves a hole in `A` (but `n` still advances).
+                    // `Get`/`HasProperty` walk the prototype chain and fire getters.
+                    if self.has_property(h, &key) {
+                        let v = self.read_member(h, &key)?;
+                        self.create_data_property_or_throw(a_h, n as usize, v)?;
+                    }
+                    n += 1.0;
+                }
+            } else {
+                // Non-spreadable: added as a single element (a `2^53-1` overflow is
+                // a TypeError).
+                if n >= MAX_SAFE {
+                    return Err(self.type_error(
+                        "Array.prototype.concat result exceeds maximum array length",
+                    ));
+                }
+                self.create_data_property_or_throw(a_h, n as usize, item)?;
+                n += 1.0;
+            }
+        }
+        // Set(A, "length", n) — `CreateDataProperty` already grew it, but the spec
+        // sets it explicitly (and a custom species may not auto-track length).
+        let len_key = self.new_str("length");
+        self.assign_member_value(a_h, len_key, NanBox::number(n))?;
+        Ok(a_v)
     }
 
     fn array_like_length(&mut self, handle: Handle) -> Result<usize, ExecError> {
