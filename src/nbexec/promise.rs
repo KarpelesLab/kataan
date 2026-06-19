@@ -377,11 +377,24 @@ impl<'a> Interp<'a> {
     /// its value or throws its rejection. A non-promise passes through.
     pub(crate) fn await_value(&mut self, value: NanBox) -> Result<NanBox, ExecError> {
         use crate::cell::PromiseStatus::{Fulfilled, Pending, Rejected};
-        let Some(state) = value
+        // `Await(value)` is `PromiseResolve(%Promise%, value)` then drive to
+        // settlement. A real promise is awaited directly; a *thenable* (an object
+        // with a callable `then`) is adopted — its `then` is called (one extra
+        // tick) and we await the result; a primitive passes straight through. Only
+        // objects are wrapped, so the common primitive await stays allocation-free.
+        let state = match value
             .as_handle()
             .and_then(|raw| self.realm.promise_state(Handle::from_raw(raw)))
-        else {
-            return Ok(value); // not a promise
+        {
+            Some(s) => s,
+            None if value.as_handle().is_some() => {
+                // A potential thenable: PromiseResolve adopts it (reading `.then`
+                // exactly once via `resolve_with`); a non-thenable object fulfills
+                // synchronously, so this adds no microtask for the ordinary case.
+                let p = self.promise_resolve(value);
+                self.realm.promise_state(p).expect("fresh promise has state")
+            }
+            None => return Ok(value), // a primitive
         };
         // Make progress on the event loop until the promise settles: drain
         // microtasks first, then run a `setTimeout` macrotask if still pending (so an
