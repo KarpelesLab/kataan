@@ -5677,8 +5677,20 @@ pub fn eval_source_typed(
             Ok((String::from(interp.output()), completion))
         }
         Err(ExecError::Throw(thrown)) => {
-            let (name, message) = error_name_message(&interp, thrown)
-                .unwrap_or_else(|| (interp.display(thrown), String::new()));
+            let (name, message) = error_name_message(&interp, thrown).unwrap_or_else(|| {
+                // A throw lacking a `name` property (e.g. Test262Error, which carries
+                // only `message`): surface its `message` so the failure is
+                // diagnosable rather than the opaque `[object Object]`.
+                if let Some(raw) = thrown.as_handle()
+                    && let Some(m) = interp.realm().get_property(Handle::from_raw(raw), "message")
+                {
+                    let s = interp.realm().to_display_string(m);
+                    if !s.is_empty() {
+                        return (String::from("Test262Error"), s);
+                    }
+                }
+                (interp.display(thrown), String::new())
+            });
             Err(Thrown {
                 phase: ErrorPhase::Runtime,
                 name,
