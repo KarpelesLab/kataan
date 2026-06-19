@@ -329,6 +329,19 @@ impl<'a> Interp<'a> {
                     .is_some_and(|v| self.realm.truthy(v));
                 NanBox::boolean(is_raw)
             }
+            N_ERROR_IS_ERROR => {
+                // `Error.isError(arg)` (ES2025): `true` iff `arg` is an object
+                // carrying the `[[ErrorData]]` brand (see `ERROR_DATA`) — a
+                // genuine Error instance. The brand is an own (hidden) property,
+                // so a primitive, a plain `Object.create(Error.prototype)`, or a
+                // `Proxy` wrapping an Error (the slot is not forwarded) all yield
+                // `false`. Never throws.
+                let is_err = arg(0)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| self.realm.has_own(h, ERROR_DATA));
+                NanBox::boolean(is_err)
+            }
             N_OBJECT_KEYS => {
                 // ToObject(O): `null`/`undefined` throws (a primitive coerces to a
                 // wrapper with no own enumerable keys, so it is left as-is here).

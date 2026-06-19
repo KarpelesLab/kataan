@@ -2523,6 +2523,10 @@ impl<'a> Interp<'a> {
         // Error family: set `message` and the default `name` (a `this.name = …`
         // after `super()` may override it).
         if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&native_id) {
+            // A subclass `super()` into an Error base inherits `[[ErrorData]]`:
+            // stamp the brand onto the (class-proto-linked) instance.
+            self.realm
+                .set_hidden_property(instance, ERROR_DATA, NanBox::boolean(true));
             let name = ERROR_NAMES[(native_id - N_ERROR_BASE) as usize];
             let name_v = self.new_str(name);
             self.realm.set_property(instance, "name", name_v);

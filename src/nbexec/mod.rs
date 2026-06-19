@@ -1409,6 +1409,13 @@ const N_EVAL_ERROR: u16 = N_ERROR_BASE + 10;
 /// A reserved, non-identifier key under which a `new fn()` instance records its
 /// constructor function (a hidden, GC-traced slot) so `instanceof` can match it.
 const CTOR_KEY: &str = "\u{0}ctor";
+/// Hidden own-property brand stamped onto every genuine `Error` instance (the
+/// engine's stand-in for the spec's `[[ErrorData]]` internal slot). Set at every
+/// error-construction site (`make_error`, `super()` into an Error base, the
+/// `AggregateError`/`SuppressedError` paths) and checked *only* by `Error.isError`.
+/// Like `CTOR_KEY` it uses a `\u{0}` prefix so it is non-enumerable / invisible to
+/// `Object.keys`, `getOwnPropertyNames`, `for-in`, and `JSON.stringify`.
+const ERROR_DATA: &str = "\u{0}errordata";
 /// Hidden slot on an object-literal concise method recording its `[[HomeObject]]`
 /// (the object it was defined on), for `super` resolution.
 const HOME_OBJECT: &str = "\u{0}home";
@@ -1677,6 +1684,9 @@ const N_UINT8_SET_FROM_BASE64: u16 = 656;
 const N_UINT8_SET_FROM_HEX: u16 = 657;
 const N_UINT8_FROM_BASE64: u16 = 658;
 const N_UINT8_FROM_HEX: u16 = 659;
+/// `Error.isError(arg)` (ES2025) — `true` iff `arg` carries the [`ERROR_DATA`]
+/// brand (i.e. is a genuine Error instance). A static on the `Error` constructor.
+const N_ERROR_IS_ERROR: u16 = 660;
 /// Hidden brand + payload on a RawJSON object (the validated source text).
 const RAW_JSON_BRAND: &str = "\u{0}rawjson";
 /// Hidden-property keys for a capability state object built around a foreign `C`.
@@ -2516,6 +2526,15 @@ impl<'a> Interp<'a> {
         for (i, name) in ERROR_NAMES.iter().enumerate().take(N_GLOBAL_ERROR_COUNT) {
             let ctor = self.new_named_native(name, N_ERROR_BASE + i as u16);
             self.current.declare(name, NanBox::handle(ctor.to_raw()));
+            // `Error.isError` (ES2025) — a static method on the base `Error`
+            // constructor only (a `{writable, !enumerable, configurable}` data
+            // property, like `RegExp.escape`).
+            if i == 0 {
+                let is_error_fn = self.new_named_native("isError", N_ERROR_IS_ERROR);
+                self.realm
+                    .set_property(ctor, "isError", NanBox::handle(is_error_fn.to_raw()));
+                self.realm.mark_hidden(ctor, "isError");
+            }
         }
         install_namespace(
             self,
@@ -3930,6 +3949,10 @@ impl<'a> Interp<'a> {
         let stack = self.new_str(&alloc::format!("{head}\n    at <anonymous>"));
         self.realm.set_property(obj, "stack", stack);
         self.realm.mark_hidden(obj, "stack");
+        // Stamp the `[[ErrorData]]` brand (hidden; see `ERROR_DATA`) so
+        // `Error.isError` recognizes this as a genuine Error instance.
+        self.realm
+            .set_hidden_property(obj, ERROR_DATA, NanBox::boolean(true));
         NanBox::handle(obj.to_raw())
     }
 

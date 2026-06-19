@@ -127,6 +127,10 @@ impl<'a> Interp<'a> {
         self.realm.mark_hidden(obj, "error");
         self.realm.set_property(obj, "suppressed", suppressed);
         self.realm.mark_hidden(obj, "suppressed");
+        // `SuppressedError` is an Error subclass: stamp the `[[ErrorData]]` brand
+        // (hidden; see `ERROR_DATA`) so `Error.isError` recognizes it.
+        self.realm
+            .set_hidden_property(obj, ERROR_DATA, NanBox::boolean(true));
         Ok(NanBox::handle(obj.to_raw()))
     }
 
@@ -387,6 +391,9 @@ impl<'a> Interp<'a> {
         self.realm.mark_hidden(instance, "error");
         self.realm.set_property(instance, "suppressed", suppressed);
         self.realm.mark_hidden(instance, "suppressed");
+        // A `class S extends SuppressedError {}` instance inherits `[[ErrorData]]`.
+        self.realm
+            .set_hidden_property(instance, ERROR_DATA, NanBox::boolean(true));
     }
 
     /// RequireInternalSlot for a disposable-stack receiver: returns the receiver
