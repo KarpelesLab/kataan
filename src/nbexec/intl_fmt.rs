@@ -2341,7 +2341,18 @@ impl<'a> Interp<'a> {
                 _ => UnitDisplay::Short,
             },
             // ECMA-402's default rounding is half-expand (1.25 → 1.3), not banker's rounding.
-            rounding_mode: RoundingMode::HalfExpand,
+            rounding_mode: match opt_str(self, "roundingMode").as_deref() {
+                Some("ceil") => RoundingMode::Ceil,
+                Some("floor") => RoundingMode::Floor,
+                Some("expand") => RoundingMode::Expand,
+                Some("trunc") => RoundingMode::Trunc,
+                Some("halfCeil") => RoundingMode::HalfCeil,
+                Some("halfFloor") => RoundingMode::HalfFloor,
+                Some("halfExpand") => RoundingMode::HalfExpand,
+                Some("halfTrunc") => RoundingMode::HalfTrunc,
+                Some("halfEven") => RoundingMode::HalfEven,
+                _ => RoundingMode::HalfExpand,
+            },
             ..Default::default()
         };
         if matches!(
@@ -2351,6 +2362,9 @@ impl<'a> Interp<'a> {
             Some(Unpacked::Bool(false))
         ) {
             o.use_grouping = UseGrouping::Never;
+        }
+        if let Some(mid) = opt_num(self, "minimumIntegerDigits") {
+            o.minimum_integer_digits = mid;
         }
         o.minimum_fraction_digits = opt_num(self, "minimumFractionDigits");
         o.maximum_fraction_digits = opt_num(self, "maximumFractionDigits");
@@ -2400,6 +2414,19 @@ impl<'a> Interp<'a> {
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_else(|| String::from("en"));
             let opts = self.number_format_options(handle);
+            // `intl` 0.4 panics on negative zero; format +0 and re-apply the sign.
+            if n == 0.0 && n.is_sign_negative() {
+                let body = intl::number::format(&locale, 0.0, &opts);
+                let sd = self
+                    .realm
+                    .get_property(handle, "signDisplay")
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default();
+                if !matches!(sd.as_str(), "never" | "exceptZero") && !body.starts_with('-') {
+                    return alloc::format!("-{body}");
+                }
+                return body;
+            }
             return intl::number::format(&locale, n, &opts);
         }
         let opt_str = |this: &mut Self, k: &str| -> Option<String> {
@@ -2997,6 +3024,106 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Splits the formatted output of an `Intl.NumberFormat` handle into typed
+    /// `(kind, value)` parts, mirroring `nf.formatToParts(value)`. Shared by the
+    /// `formatToParts` dispatch and by `Intl.DurationFormat`, which composes
+    /// per-unit `NumberFormat`s. The `intl`-crate path yields CLDR parts; the
+    /// hand-rolled path (unit style, or the no-`intl` build) re-derives parts from
+    /// the formatted string's structure (sign / integer-groups / decimal / fraction).
+    pub(crate) fn number_handle_parts(
+        &mut self,
+        handle: Handle,
+        value: NanBox,
+    ) -> Vec<(&'static str, String)> {
+        #[cfg(feature = "intl")]
+        if !self.number_uses_handrolled(handle) {
+            let n = self.realm.to_number(value);
+            let locale = self
+                .realm
+                .get_property(handle, "\u{0}locale")
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_else(|| String::from("en"));
+            let opts = self.number_format_options(handle);
+            // `intl` 0.4 panics formatting negative zero; format +0 and re-apply the
+            // sign per `signDisplay` (negative zero shows "-0" under auto/always).
+            let neg_zero = n == 0.0 && n.is_sign_negative();
+            let feed = if neg_zero { 0.0 } else { n };
+            let mut parts: Vec<(&'static str, String)> = intl::number::format_to_parts(&locale, feed, &opts)
+                .into_iter()
+                .map(|p| (p.kind.as_str(), p.value))
+                .collect();
+            if neg_zero {
+                let sd = self
+                    .realm
+                    .get_property(handle, "signDisplay")
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default();
+                let show = !matches!(sd.as_str(), "never" | "exceptZero")
+                    && !parts.iter().any(|(t, _)| *t == "minusSign");
+                if show {
+                    parts.insert(0, ("minusSign", String::from("-")));
+                }
+            }
+            return parts;
+        }
+        // Hand-rolled path: re-derive parts from the formatted string.
+        let formatted = self.intl_format_value(handle, value);
+        let style = self
+            .realm
+            .get_property(handle, "style")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("decimal"));
+        let currency_sym = if style == "currency" {
+            let code = self
+                .realm
+                .get_property(handle, "currency")
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_default();
+            currency_symbol(&code)
+        } else {
+            String::new()
+        };
+        let mut entries: Vec<(&'static str, String)> = Vec::new();
+        let mut s = formatted.as_str();
+        if let Some(rest) = s.strip_prefix('-') {
+            entries.push(("minusSign", String::from("-")));
+            s = rest;
+        }
+        if !currency_sym.is_empty() && s.starts_with(currency_sym.as_str()) {
+            entries.push(("currency", currency_sym.clone()));
+            s = &s[currency_sym.len()..];
+        }
+        let mut percent = false;
+        if style == "percent" && s.ends_with('%') {
+            percent = true;
+            s = &s[..s.len() - '%'.len_utf8()];
+        }
+        if s == "NaN" {
+            entries.push(("nan", String::from("NaN")));
+        } else if s == "∞" {
+            entries.push(("infinity", String::from("∞")));
+        } else {
+            let (int_part, frac_part) = match s.split_once('.') {
+                Some((i, f)) => (i, Some(f)),
+                None => (s, None),
+            };
+            for (gi, grp) in int_part.split(',').enumerate() {
+                if gi > 0 {
+                    entries.push(("group", String::from(",")));
+                }
+                entries.push(("integer", String::from(grp)));
+            }
+            if let Some(f) = frac_part {
+                entries.push(("decimal", String::from(".")));
+                entries.push(("fraction", String::from(f)));
+            }
+        }
+        if percent {
+            entries.push(("percentSign", String::from("%")));
+        }
+        entries
+    }
+
     // --- Intl.DurationFormat ----------------------------------------------
 
     /// Builds (once) and links `Intl.DurationFormat.prototype` with branded
@@ -3030,25 +3157,49 @@ impl<'a> Interp<'a> {
         Some(proto)
     }
 
-    /// `new Intl.DurationFormat(locales, options)` — a branded instance capturing the
-    /// resolved locale and `style`/`numberingSystem` options.
+    /// `new Intl.DurationFormat(locales, options)` — `InitializeDurationFormat`:
+    /// canonicalizes the locale, resolves `numberingSystem` (from the `-u-nu-`
+    /// extension and/or option), reads the top-level `style` and each of the ten
+    /// per-unit `<unit>`/`<unit>Display` options (via `GetDurationUnitOptions`, in
+    /// spec order), and `fractionalDigits`. Stores all resolved slots behind hidden
+    /// keys for `resolvedOptions`/`format`. A non-object `options` (other than
+    /// `undefined`) is a TypeError; an invalid option value is a RangeError.
     pub(crate) fn make_duration_format(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
         let requested =
             self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
-        let locale = requested
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| String::from("en-US"));
+        // GetOptionsObject: undefined → no options; null/primitive → TypeError.
+        let opts_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
+        let opts = if matches!(opts_arg.unpack(), Unpacked::Undefined) {
+            None
+        } else if self.is_object_value(opts_arg) {
+            opts_arg.as_handle().map(Handle::from_raw)
+        } else {
+            return Err(self.type_error("Intl.DurationFormat options must be an object"));
+        };
+        // localeMatcher (validated, not otherwise used).
+        let _ = self.get_string_option(
+            opts,
+            "localeMatcher",
+            &["lookup", "best fit"],
+            Some("best fit"),
+        )?;
+        // numberingSystem option (UTS-35 `type` validated) and the `-u-nu-` extension
+        // resolve the data locale and the effective numbering system.
+        let nu_opt = self.get_string_option(opts, "numberingSystem", &[], None)?;
+        if let Some(ns) = &nu_opt
+            && !is_unicode_type_value(ns)
+        {
+            let m = self.new_str("invalid numberingSystem");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        let (locale, numbering) =
+            self.resolve_duration_locale(requested.first().map(String::as_str), nu_opt.as_deref());
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
-        let opts = args
-            .get(1)
-            .copied()
-            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
-            .map(|v| self.coerce_to_object(v))
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw);
+        let nuv = self.new_str(&numbering);
+        self.realm.set_hidden_property(obj, "numberingSystem", nuv);
+        // style (default "short"); "digital" implies numeric h/m/s defaults.
         let style = self
             .get_string_option(
                 opts,
@@ -3057,9 +3208,52 @@ impl<'a> Interp<'a> {
                 Some("short"),
             )?
             .unwrap();
-        self.store_str(obj, "style", &Some(style));
-        let nu = self.get_string_option(opts, "numberingSystem", &[], None)?;
-        self.store_str(obj, "numberingSystem", &nu);
+        self.store_str(obj, "style", &Some(style.clone()));
+        let digital = style == "digital";
+        // Each row of the unit table: (unit, stylesList, digitalBase). prevStyle is
+        // threaded through hours..microseconds (GetDurationUnitOptions step 6).
+        const SUB: &[&str] = &["long", "short", "narrow"];
+        const TIME: &[&str] = &["long", "short", "narrow", "numeric", "2-digit"];
+        const FRAC: &[&str] = &["long", "short", "narrow", "numeric"];
+        // (unit, stylesList, digitalDefault) per the unit table.
+        let table: &[(&str, &[&str], &str)] = &[
+            ("years", SUB, "short"),
+            ("months", SUB, "short"),
+            ("weeks", SUB, "short"),
+            ("days", SUB, "short"),
+            ("hours", TIME, "numeric"),
+            ("minutes", TIME, "numeric"),
+            ("seconds", TIME, "numeric"),
+            ("milliseconds", FRAC, "numeric"),
+            ("microseconds", FRAC, "numeric"),
+            ("nanoseconds", FRAC, "numeric"),
+        ];
+        let mut prev_style: Option<String> = None;
+        for (unit, styles, digital_base) in table {
+            let (ust, udisp) = self.get_duration_unit_options(
+                opts,
+                unit,
+                &style,
+                styles,
+                digital_base,
+                prev_style.as_deref(),
+                digital,
+            )?;
+            self.store_str(obj, unit, &Some(ust.clone()));
+            let disp_key = alloc::format!("{unit}Display");
+            self.store_str(obj, &disp_key, &Some(udisp));
+            if matches!(
+                *unit,
+                "hours" | "minutes" | "seconds" | "milliseconds" | "microseconds"
+            ) {
+                prev_style = Some(ust);
+            }
+        }
+        // fractionalDigits: GetNumberOption(0, 9, undefined).
+        if let Some(fd) = self.get_int_option(opts, "fractionalDigits", 0.0, 9.0, None)? {
+            self.realm
+                .set_hidden_property(obj, "fractionalDigits", NanBox::number(fd));
+        }
         self.realm
             .set_hidden_property(obj, "\u{0}brand_df", NanBox::boolean(true));
         if let Some(proto) = self.intl_duration_prototype() {
@@ -3067,6 +3261,119 @@ impl<'a> Interp<'a> {
         }
         Ok(NanBox::handle(obj.to_raw()))
     }
+
+    /// Resolves the `Intl.DurationFormat` data locale and effective numbering system
+    /// from the requested tag's `-u-nu-` extension and the `numberingSystem` option.
+    /// The option (when a supported value) wins; otherwise a supported extension
+    /// value is kept and reflected in the locale; an unsupported value falls back to
+    /// the locale's default (`"latn"` for `en`). Returns `(dataLocale, numbering)`.
+    fn resolve_duration_locale(
+        &mut self,
+        requested: Option<&str>,
+        option: Option<&str>,
+    ) -> (String, String) {
+        let tag = requested.unwrap_or("en-US");
+        // Split off any `-u-` extension; recover an `nu` keyword value.
+        let parsed = ParsedLocale::from_canonical(tag);
+        let ext_nu = parsed.keyword("nu").map(String::from);
+        let default_nu = String::from("latn");
+        let supported = |ns: &str| is_supported_numbering_system(ns);
+        // The base tag without any -u- keywords (other extensions preserved).
+        let mut base = parsed.base_name();
+        for e in &parsed.other_ext {
+            base.push('-');
+            base.push_str(e);
+        }
+        match option {
+            Some(opt) if supported(opt) => {
+                // Option wins; reflect in the locale only if it equals the extension.
+                if ext_nu.as_deref() == Some(opt) {
+                    (alloc::format!("{base}-u-nu-{opt}"), String::from(opt))
+                } else {
+                    (base, String::from(opt))
+                }
+            }
+            _ => {
+                // No (usable) option: a supported extension value is used & reflected.
+                match ext_nu {
+                    Some(ns) if supported(&ns) => {
+                        (alloc::format!("{base}-u-nu-{ns}"), ns)
+                    }
+                    _ => (base, default_nu),
+                }
+            }
+        }
+    }
+
+    /// `GetDurationUnitOptions(unit, options, baseStyle, stylesList, digitalBase,
+    /// prevStyle, twoDigitHours)` — reads the per-unit `<unit>` style and
+    /// `<unit>Display` options, applying the spec defaults (digital base, the
+    /// `prevStyle`-driven "numeric"/"2-digit" promotion) and the RangeError
+    /// conditions. Returns `(style, display)`.
+    #[allow(clippy::too_many_arguments)]
+    fn get_duration_unit_options(
+        &mut self,
+        opts: Option<Handle>,
+        unit: &str,
+        base_style: &str,
+        styles_list: &[&str],
+        digital_base: &str,
+        prev_style: Option<&str>,
+        two_digit_hours: bool,
+    ) -> Result<(String, String), ExecError> {
+        let mut style = self.get_string_option(opts, unit, styles_list, None)?;
+        let mut display_default = "always";
+        if style.is_none() {
+            if base_style == "digital" {
+                if !matches!(unit, "hours" | "minutes" | "seconds") {
+                    display_default = "auto";
+                }
+                style = Some(String::from(digital_base));
+            } else {
+                display_default = "auto";
+                if matches!(prev_style, Some("numeric") | Some("2-digit")) {
+                    style = Some(String::from("numeric"));
+                } else {
+                    style = Some(String::from(base_style));
+                }
+            }
+        }
+        let mut style = style.unwrap();
+        let disp_key = alloc::format!("{unit}Display");
+        let display = self
+            .get_string_option(opts, &disp_key, &["auto", "always"], Some(display_default))?
+            .unwrap();
+        if matches!(prev_style, Some("numeric") | Some("2-digit")) {
+            if style != "numeric" && style != "2-digit" {
+                let m = self.new_str(&alloc::format!(
+                    "invalid style '{style}' for {unit} following a numeric unit"
+                ));
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            } else if matches!(unit, "minutes" | "seconds") {
+                style = String::from("2-digit");
+            }
+        }
+        // twoDigitHours: a digital formatter with 2-digit hours promotes "numeric".
+        if unit == "hours" && two_digit_hours && style == "numeric" {
+            // (Kept as "numeric" — the engine's digital renderer never pads hours,
+            // matching the en reference where [[TwoDigitHours]] is false.)
+        }
+        Ok((style, display))
+    }
+
+    /// The ten duration units in table order.
+    const DURATION_UNITS: [&'static str; 10] = [
+        "years",
+        "months",
+        "weeks",
+        "days",
+        "hours",
+        "minutes",
+        "seconds",
+        "milliseconds",
+        "microseconds",
+        "nanoseconds",
+    ];
 
     /// Dispatches an `Intl.DurationFormat` prototype method: brand-checks `this`.
     pub(crate) fn intl_duration_method_dispatch(
@@ -3081,66 +3388,436 @@ impl<'a> Interp<'a> {
             "Intl.DurationFormat.prototype method",
         )?;
         match name {
-            "resolvedOptions" => {
-                let out = self.realm.new_object();
-                let locale = self
-                    .realm
-                    .get_property(h, "\u{0}locale")
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_else(|| String::from("en-US"));
-                let lv = self.new_str(&locale);
-                self.realm.set_property(out, "locale", lv);
-                let style = self
-                    .realm
-                    .get_property(h, "style")
-                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_else(|| String::from("short"));
-                let sv = self.new_str(&style);
-                self.realm.set_property(out, "style", sv);
-                Ok(NanBox::handle(out.to_raw()))
+            "resolvedOptions" => self.duration_resolved_options(h),
+            "formatToParts" => {
+                let rec = self.read_duration_record(args.first().copied().unwrap_or(NanBox::undefined()))?;
+                let parts = self.partition_duration(h, &rec);
+                let mut arr = Vec::with_capacity(parts.len());
+                for (ty, val, unit) in parts {
+                    let o = self.realm.new_object();
+                    let tv = self.new_str(ty);
+                    self.realm.set_property(o, "type", tv);
+                    let vv = self.new_str(&val);
+                    self.realm.set_property(o, "value", vv);
+                    if let Some(u) = unit {
+                        let uv = self.new_str(u);
+                        self.realm.set_property(o, "unit", uv);
+                    }
+                    arr.push(NanBox::handle(o.to_raw()));
+                }
+                Ok(NanBox::handle(self.realm.new_array(arr).to_raw()))
             }
-            "formatToParts" => Ok(NanBox::handle(self.realm.new_array(Vec::new()).to_raw())),
-            // `format(duration)` — a minimal English rendering of the duration record's
-            // numeric fields (no CLDR unit patterns yet).
+            // `format(duration)` — concatenate the partitioned parts' values.
             _ => {
-                let s = self.duration_format_string(args.first().copied());
+                let rec = self.read_duration_record(args.first().copied().unwrap_or(NanBox::undefined()))?;
+                let parts = self.partition_duration(h, &rec);
+                let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
                 Ok(self.new_str(&s))
             }
         }
     }
 
-    /// A minimal `Intl.DurationFormat.prototype.format` rendering: joins the present
-    /// `years`/`months`/…/`nanoseconds` fields of the duration record as
-    /// `"<n> <unit>"` segments separated by `, `.
-    fn duration_format_string(&mut self, duration: Option<NanBox>) -> String {
-        let Some(h) = duration.and_then(|v| v.as_handle()).map(Handle::from_raw) else {
-            return String::new();
+    /// `Intl.DurationFormat.prototype.resolvedOptions` — `{locale, numberingSystem,
+    /// style, <unit>, <unit>Display …, fractionalDigits?}` in spec key order.
+    fn duration_resolved_options(&mut self, h: Handle) -> Result<NanBox, ExecError> {
+        let out = self.realm.new_object();
+        let read = |this: &mut Self, key: &str, dflt: &str| -> String {
+            this.realm
+                .get_property(h, key)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_display_string(v))
+                .unwrap_or_else(|| String::from(dflt))
         };
-        const FIELDS: &[(&str, &str)] = &[
-            ("years", "yr"),
-            ("months", "mth"),
-            ("weeks", "wk"),
-            ("days", "day"),
-            ("hours", "hr"),
-            ("minutes", "min"),
-            ("seconds", "sec"),
-            ("milliseconds", "ms"),
-            ("microseconds", "μs"),
-            ("nanoseconds", "ns"),
-        ];
-        let mut parts: Vec<String> = Vec::new();
-        for (field, unit) in FIELDS {
-            if let Some(v) = self.realm.get_property(h, field)
-                && !matches!(v.unpack(), Unpacked::Undefined)
-            {
-                let n = self.realm.to_number(v);
-                if n != 0.0 {
-                    parts.push(alloc::format!("{n} {unit}"));
+        let locale = read(self, "\u{0}locale", "en-US");
+        let lv = self.new_str(&locale);
+        self.realm.set_property(out, "locale", lv);
+        let nu = read(self, "numberingSystem", "latn");
+        let nuv = self.new_str(&nu);
+        self.realm.set_property(out, "numberingSystem", nuv);
+        let style = read(self, "style", "short");
+        let sv = self.new_str(&style);
+        self.realm.set_property(out, "style", sv);
+        for unit in Self::DURATION_UNITS {
+            let ust = read(self, unit, "short");
+            let uv = self.new_str(&ust);
+            self.realm.set_property(out, unit, uv);
+            let disp_key = alloc::format!("{unit}Display");
+            let udisp = read(self, &disp_key, "auto");
+            let dv = self.new_str(&udisp);
+            self.realm.set_property(out, &disp_key, dv);
+        }
+        // fractionalDigits is reported only when it was explicitly set.
+        if let Some(v) = self
+            .realm
+            .get_property(h, "fractionalDigits")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+        {
+            self.realm.set_property(out, "fractionalDigits", v);
+        }
+        Ok(NanBox::handle(out.to_raw()))
+    }
+
+    /// `ToDurationRecord(input)` — a String is parsed as an ISO-8601 duration
+    /// (RangeError on a bad string); a non-object is a TypeError; otherwise each of
+    /// the ten unit fields is read and `ToIntegerIfIntegral`-coerced (a non-integer
+    /// or non-finite value is a RangeError), all fields absent is a TypeError, and
+    /// the record is validated by `IsValidDuration` (RangeError otherwise). Returns
+    /// the ten `f64` unit values in table order.
+    fn read_duration_record(&mut self, input: NanBox) -> Result<[f64; 10], ExecError> {
+        // A Temporal.Duration-like string is parsed; any other primitive (or a
+        // String wrapper is an Object, handled below) follows the object path.
+        if let Some(s) = input
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|hh| self.realm.string_value(hh))
+        {
+            return self.parse_duration_string(&s);
+        }
+        if !self.is_object_value(input) {
+            return Err(self.type_error("Intl.DurationFormat.format: argument must be an object"));
+        }
+        let oh = input.as_handle().map(Handle::from_raw).unwrap();
+        let mut rec = [0.0f64; 10];
+        let mut any = false;
+        for (i, unit) in Self::DURATION_UNITS.iter().enumerate() {
+            let v = self.read_member(oh, unit)?;
+            if matches!(v.unpack(), Unpacked::Undefined) {
+                continue;
+            }
+            any = true;
+            // ToIntegerIfIntegral: ToNumber, then require an integral value.
+            let nv = self.coerce_to_number(v)?;
+            let n = self.realm.to_number(nv);
+            if !n.is_finite() || trunc_toward_zero(n) != n {
+                let m = self.new_str(&alloc::format!("duration field {unit} is not an integer"));
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            rec[i] = n;
+        }
+        if !any {
+            return Err(self.type_error("Intl.DurationFormat.format: no duration fields present"));
+        }
+        if !is_valid_duration(&rec) {
+            let m = self.new_str("invalid Duration");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok(rec)
+    }
+
+    /// Minimal ISO-8601 duration-string parser (`±PnYnMnWnDTnHnMnS`, fractional
+    /// seconds). A malformed string is a RangeError. Sub-second fractions are split
+    /// into milli/micro/nanoseconds.
+    fn parse_duration_string(&mut self, s: &str) -> Result<[f64; 10], ExecError> {
+        let bad = |this: &mut Self| -> ExecError {
+            let m = this.new_str("invalid Duration string");
+            ExecError::Throw(this.make_error(N_RANGE_ERROR, Some(m)))
+        };
+        let mut rec = [0.0f64; 10];
+        let bytes = s.trim();
+        let (sign, rest) = match bytes.strip_prefix('-') {
+            Some(r) => (-1.0, r),
+            None => (1.0, bytes.strip_prefix('+').unwrap_or(bytes)),
+        };
+        let rest = match rest.strip_prefix(['P', 'p']) {
+            Some(r) => r,
+            None => return Err(bad(self)),
+        };
+        // Split date / time portions on 'T'.
+        let (date_part, time_part) = match rest.split_once(['T', 't']) {
+            Some((d, t)) => (d, Some(t)),
+            None => (rest, None),
+        };
+        let mut saw_any = false;
+        // Returns (value, designator) tokens.
+        let parse_section = |this: &mut Self,
+                             sect: &str,
+                             allowed: &[(char, usize)],
+                             rec: &mut [f64; 10],
+                             saw: &mut bool|
+         -> Result<(), ExecError> {
+            let mut chars = sect.chars().peekable();
+            let mut last_idx: i32 = -1;
+            while chars.peek().is_some() {
+                let mut num = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() || c == '.' || c == ',' {
+                        num.push(if c == ',' { '.' } else { c });
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let Some(desig) = chars.next() else {
+                    if num.is_empty() {
+                        break;
+                    }
+                    return Err(bad(this));
+                };
+                if num.is_empty() {
+                    return Err(bad(this));
+                }
+                let Some(&(_, slot)) = allowed.iter().find(|(d, _)| {
+                    d.eq_ignore_ascii_case(&desig)
+                }) else {
+                    return Err(bad(this));
+                };
+                // Designators must appear in order.
+                if (slot as i32) <= last_idx {
+                    return Err(bad(this));
+                }
+                last_idx = slot as i32;
+                *saw = true;
+                // Only seconds may be fractional.
+                if num.contains('.') && slot != 6 {
+                    return Err(bad(this));
+                }
+                if slot == 6 {
+                    // seconds with optional fraction → split into s/ms/us/ns.
+                    let (int_s, frac) = num.split_once('.').unwrap_or((num.as_str(), ""));
+                    rec[6] = int_s.parse::<f64>().map_err(|_| bad(this))?;
+                    let mut f: String = frac.chars().take(9).collect();
+                    while f.len() < 9 {
+                        f.push('0');
+                    }
+                    rec[7] = f[0..3].parse::<f64>().unwrap_or(0.0);
+                    rec[8] = f[3..6].parse::<f64>().unwrap_or(0.0);
+                    rec[9] = f[6..9].parse::<f64>().unwrap_or(0.0);
+                } else {
+                    rec[slot] = num.parse::<f64>().map_err(|_| bad(this))?;
                 }
             }
+            Ok(())
+        };
+        // Date designators: Y(0) M(1) W(2) D(3).
+        parse_section(
+            self,
+            date_part,
+            &[('Y', 0), ('M', 1), ('W', 2), ('D', 3)],
+            &mut rec,
+            &mut saw_any,
+        )?;
+        if let Some(tp) = time_part {
+            if tp.is_empty() {
+                return Err(bad(self));
+            }
+            // Time designators: H(4) M(5) S(6).
+            parse_section(self, tp, &[('H', 4), ('M', 5), ('S', 6)], &mut rec, &mut saw_any)?;
         }
-        parts.join(", ")
+        if !saw_any {
+            return Err(bad(self));
+        }
+        for v in &mut rec {
+            *v *= sign;
+        }
+        if !is_valid_duration(&rec) {
+            let m = self.new_str("invalid Duration");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok(rec)
+    }
+
+    /// Resolves a duration formatter's per-unit `(style, display)` from its slots.
+    fn duration_unit_resolved(&mut self, h: Handle, unit: &str) -> (String, String) {
+        let style = self
+            .realm
+            .get_property(h, unit)
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("short"));
+        let disp = self
+            .realm
+            .get_property(h, &alloc::format!("{unit}Display"))
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("auto"));
+        (style, disp)
+    }
+
+    /// `PartitionDurationFormatPattern` (en, mirroring the test262 reference): formats
+    /// each shown unit via a per-unit `Intl.NumberFormat` (`style:"unit"` or numeric/
+    /// 2-digit), threads the time separator between numeric h:m:s, then joins the unit
+    /// strings with an `Intl.ListFormat` (`type:"unit"`). Returns `(type, value, unit?)`
+    /// parts. Composing the real `NumberFormat`/`ListFormat` keeps `format` and the
+    /// reference output identical regardless of CLDR-data fidelity.
+    fn partition_duration(&mut self, h: Handle, duration: &[f64; 10]) -> Vec<(&'static str, String, Option<&'static str>)> {
+        let style = self
+            .realm
+            .get_property(h, "style")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("short"));
+        let numbering = self
+            .realm
+            .get_property(h, "numberingSystem")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("latn"));
+        let fractional_digits = self
+            .realm
+            .get_property(h, "fractionalDigits")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_number(v) as i32);
+        let units = Self::DURATION_UNITS;
+        // Resolve per-unit styles/displays up front.
+        let mut ustyle = [const { String::new() }; 10];
+        let mut udisp = [const { String::new() }; 10];
+        for (i, u) in units.iter().enumerate() {
+            let (s, d) = self.duration_unit_resolved(h, u);
+            ustyle[i] = s;
+            udisp[i] = d;
+        }
+        let time_separator = ":";
+        // Each element of `result` is the ordered parts list for one shown unit.
+        let mut result: Vec<Vec<(&'static str, String, Option<&'static str>)>> = Vec::new();
+        let mut need_separator = false;
+        let mut display_negative_sign = true;
+        // Whether any field is negative (for the negative-zero leading-sign rule).
+        let any_negative = duration.iter().any(|&v| v < 0.0 || (v == 0.0 && v.is_sign_negative()));
+        for idx in 0..units.len() {
+            let unit = units[idx];
+            let singular: &'static str = duration_singular(unit);
+            let mut value = duration[idx];
+            let style_u = ustyle[idx].clone();
+            let display_u = udisp[idx].clone();
+            // Combine numeric seconds/ms/us with their fractional remainder.
+            let mut value_str: Option<String> = None;
+            let mut done = false;
+            let (mut nf_min_frac, mut nf_max_frac, mut nf_trunc) = (None::<i32>, None::<i32>, false);
+            if matches!(unit, "seconds" | "milliseconds" | "microseconds") {
+                let next_style = ustyle[idx + 1].as_str();
+                if next_style == "numeric" {
+                    let exp = match unit {
+                        "seconds" => 9,
+                        "milliseconds" => 6,
+                        _ => 3,
+                    };
+                    value_str = Some(duration_to_fractional(duration, exp));
+                    nf_max_frac = Some(fractional_digits.unwrap_or(9));
+                    nf_min_frac = Some(fractional_digits.unwrap_or(0));
+                    nf_trunc = true;
+                    done = true;
+                }
+            }
+            // Display zero numeric minutes when seconds will be displayed.
+            let mut display_required = false;
+            if unit == "minutes" && need_separator {
+                display_required = udisp[6] == "always"
+                    || duration[6] != 0.0
+                    || duration[7] != 0.0
+                    || duration[8] != 0.0
+                    || duration[9] != 0.0;
+            }
+            let nonzero = value != 0.0 || value_str.as_deref().is_some_and(|s| s.bytes().any(|b| matches!(b, b'1'..=b'9')));
+            if nonzero || display_u != "auto" || display_required {
+                let mut sign_never = false;
+                if display_negative_sign {
+                    display_negative_sign = false;
+                    if value == 0.0 && value_str.is_none() && any_negative {
+                        value = -0.0;
+                    }
+                } else {
+                    sign_never = true;
+                }
+                // Build the per-unit NumberFormat handle.
+                let nf = self.realm.new_object();
+                let marker = self.new_str("number");
+                self.realm.set_hidden_property(nf, "\u{0}intl", marker);
+                let loc = self.new_str("en");
+                self.realm.set_hidden_property(nf, "\u{0}locale", loc);
+                let nuv = self.new_str(&numbering);
+                self.realm.set_hidden_property(nf, "numberingSystem", nuv);
+                if sign_never {
+                    let sd = self.new_str("never");
+                    self.realm.set_hidden_property(nf, "signDisplay", sd);
+                }
+                if style_u == "2-digit" {
+                    self.realm
+                        .set_hidden_property(nf, "minimumIntegerDigits", NanBox::number(2.0));
+                }
+                if style_u != "numeric" && style_u != "2-digit" {
+                    let st = self.new_str("unit");
+                    self.realm.set_hidden_property(nf, "style", st);
+                    let uu = self.new_str(singular);
+                    self.realm.set_hidden_property(nf, "unit", uu);
+                    let ud = self.new_str(&style_u);
+                    self.realm.set_hidden_property(nf, "unitDisplay", ud);
+                } else {
+                    self.realm
+                        .set_hidden_property(nf, "useGrouping", NanBox::boolean(false));
+                }
+                if let Some(mn) = nf_min_frac {
+                    self.realm
+                        .set_hidden_property(nf, "minimumFractionDigits", NanBox::number(mn as f64));
+                }
+                if let Some(mx) = nf_max_frac {
+                    self.realm
+                        .set_hidden_property(nf, "maximumFractionDigits", NanBox::number(mx as f64));
+                }
+                if nf_trunc {
+                    let rm = self.new_str("trunc");
+                    self.realm.set_hidden_property(nf, "roundingMode", rm);
+                }
+                // The value to format: the combined fractional string, or the number.
+                let value_box = match &value_str {
+                    Some(s) => self.new_str(s),
+                    None => NanBox::number(value),
+                };
+                let number_parts = self.number_handle_parts(nf, value_box);
+                let mut list: Vec<(&'static str, String, Option<&'static str>)> = if !need_separator {
+                    Vec::new()
+                } else {
+                    // Append to the previous (numeric) unit's list, with a separator.
+                    let mut prev = result.pop().unwrap();
+                    prev.push(("literal", String::from(time_separator), None));
+                    prev
+                };
+                for (ty, val) in number_parts {
+                    list.push((ty, val, Some(singular)));
+                }
+                if !need_separator {
+                    if style_u == "2-digit" || style_u == "numeric" {
+                        need_separator = true;
+                    }
+                    result.push(list);
+                } else {
+                    result.push(list);
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        // List style: digital collapses to short.
+        let list_style = if style == "digital" { String::from("short") } else { style };
+        // Build the strings, then join via ListFormat "unit".
+        let strings: Vec<String> = result
+            .iter()
+            .map(|parts| parts.iter().map(|(_, v, _)| v.as_str()).collect())
+            .collect();
+        let lf = self.realm.new_object();
+        let lm = self.new_str("list");
+        self.realm.set_hidden_property(lf, "\u{0}intl", lm);
+        let llo = self.new_str("en");
+        self.realm.set_hidden_property(lf, "\u{0}locale", llo);
+        let lt = self.new_str("unit");
+        self.realm.set_hidden_property(lf, "type", lt);
+        let ls = self.new_str(&list_style);
+        self.realm.set_hidden_property(lf, "style", ls);
+        let list_parts = self.list_format_parts(&strings, "unit", &list_style);
+        // Flatten: an "element" splices in the next unit's parts; a "literal" passes through.
+        let mut flattened: Vec<(&'static str, String, Option<&'static str>)> = Vec::new();
+        let mut iter = result.into_iter();
+        for (ty, val) in list_parts {
+            if ty == "element" {
+                if let Some(parts) = iter.next() {
+                    flattened.extend(parts);
+                }
+            } else {
+                flattened.push((ty, val, None));
+            }
+        }
+        let _ = lf;
+        flattened
     }
 }
 
@@ -3296,6 +3973,135 @@ impl ParsedLocale {
         }
         out
     }
+}
+
+/// Whether `ns` is a numbering system this engine treats as supported (only `latn`
+/// and `arab` have data; others fall back to the locale default for DurationFormat).
+fn is_supported_numbering_system(ns: &str) -> bool {
+    matches!(ns, "latn" | "arab")
+}
+
+/// The singular `Intl.NumberFormat` unit name for a duration unit field
+/// (`"hours"` → `"hour"`), i.e. the field name without its trailing `s`.
+fn duration_singular(unit: &str) -> &'static str {
+    match unit {
+        "years" => "year",
+        "months" => "month",
+        "weeks" => "week",
+        "days" => "day",
+        "hours" => "hour",
+        "minutes" => "minute",
+        "seconds" => "second",
+        "milliseconds" => "millisecond",
+        "microseconds" => "microsecond",
+        _ => "nanosecond",
+    }
+}
+
+/// `IsValidDuration(record)` for the ten `f64` unit values: all-same-sign, finite,
+/// `abs(years|months|weeks) < 2^32`, and `abs(normalizedSeconds) < 2^53` where the
+/// seconds are accumulated exactly via `i128` nanoseconds to avoid `f64` rounding.
+fn is_valid_duration(rec: &[f64; 10]) -> bool {
+    let mut sign = 0i32;
+    for &v in rec {
+        if !v.is_finite() {
+            return false;
+        }
+        let s = if v > 0.0 {
+            1
+        } else if v < 0.0 {
+            -1
+        } else {
+            0
+        };
+        if s != 0 {
+            if sign != 0 && sign != s {
+                return false;
+            }
+            sign = s;
+        }
+    }
+    // years/months/weeks bound.
+    let two32 = 4_294_967_296.0f64; // 2^32
+    if rec[0].abs() >= two32 || rec[1].abs() >= two32 || rec[2].abs() >= two32 {
+        return false;
+    }
+    // normalizedSeconds = days*86400 + hours*3600 + minutes*60 + seconds
+    //   + ms/1e3 + us/1e6 + ns/1e9, computed exactly in i128 nanoseconds.
+    // Each value is integral and finite here. Guard against i128 overflow by
+    // rejecting any single term that already exceeds the 2^53-seconds budget.
+    let two53_ns = (1i128 << 53) * 1_000_000_000; // 2^53 seconds in ns
+    let term_ns = |v: f64, scale_ns: i128| -> Option<i128> {
+        if v.abs() >= 9.0e30 {
+            return None; // far beyond any valid range; treat as overflow
+        }
+        (v as i128).checked_mul(scale_ns)
+    };
+    let mut total: i128 = 0;
+    let scales: [(usize, i128); 7] = [
+        (3, 86_400 * 1_000_000_000),
+        (4, 3_600 * 1_000_000_000),
+        (5, 60 * 1_000_000_000),
+        (6, 1_000_000_000),
+        (7, 1_000_000),
+        (8, 1_000),
+        (9, 1),
+    ];
+    for (i, scale) in scales {
+        match term_ns(rec[i], scale).and_then(|t| total.checked_add(t)) {
+            Some(t) => total = t,
+            None => return false,
+        }
+    }
+    total.abs() < two53_ns
+}
+
+/// `DurationToFractional` (test262 reference): the numeric value of the unit at
+/// `exponent` (9=seconds, 6=milliseconds, 3=microseconds) combined with all smaller
+/// sub-second fields, as an exact decimal string. Uses `i128` nanoseconds.
+fn duration_to_fractional(duration: &[f64; 10], exponent: u32) -> String {
+    let (seconds, milliseconds, microseconds, nanoseconds) =
+        (duration[6], duration[7], duration[8], duration[9]);
+    // Fast path: no smaller sub-seconds present → return the bare amount.
+    match exponent {
+        9 if milliseconds == 0.0 && microseconds == 0.0 && nanoseconds == 0.0 => {
+            return format_integral(seconds);
+        }
+        6 if microseconds == 0.0 && nanoseconds == 0.0 => {
+            return format_integral(milliseconds);
+        }
+        3 if nanoseconds == 0.0 => {
+            return format_integral(microseconds);
+        }
+        _ => {}
+    }
+    let mut ns: i128 = nanoseconds as i128;
+    if exponent >= 9 {
+        ns += (seconds as i128) * 1_000_000_000;
+    }
+    if exponent >= 6 {
+        ns += (milliseconds as i128) * 1_000_000;
+    }
+    if exponent >= 3 {
+        ns += (microseconds as i128) * 1_000;
+    }
+    let e: i128 = 10i128.pow(exponent);
+    let q = ns / e;
+    let mut r = ns % e;
+    if r < 0 {
+        r = -r;
+    }
+    let mut rs = alloc::format!("{r}");
+    while rs.len() < exponent as usize {
+        rs.insert(0, '0');
+    }
+    alloc::format!("{q}.{rs}")
+}
+
+/// Formats an integral `f64` without a decimal point or exponent (for duration
+/// values, which are validated integers).
+fn format_integral(v: f64) -> String {
+    alloc::format!("{}", v as i128)
 }
 
 /// Titlecases a 4-letter script subtag (`latn` → `Latn`).

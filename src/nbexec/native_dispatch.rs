@@ -2579,96 +2579,44 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(NanBox::handle(self.realm.new_array(arr_elems).to_raw()));
                 }
-                // Number formatters use the `intl` crate's typed parts (CLDR, locale-aware).
-                #[cfg(feature = "intl")]
-                if let Some(h) = fmt
-                    && self
-                        .realm
-                        .get_property(h, "\u{0}intl")
-                        .map(|v| self.realm.to_display_string(v))
-                        .as_deref()
-                        == Some("number")
-                    && !self.number_uses_handrolled(h)
-                {
-                    let n = self.realm.to_number(arg(0));
-                    let locale = self
-                        .realm
-                        .get_property(h, "\u{0}locale")
-                        .map(|v| self.realm.to_display_string(v))
-                        .unwrap_or_else(|| String::from("en"));
-                    let opts = self.number_format_options(h);
-                    let parts = intl::number::format_to_parts(&locale, n, &opts);
-                    let mut arr_elems = Vec::with_capacity(parts.len());
-                    for p in parts {
-                        let o = self.realm.new_object();
-                        let tv = self.new_str(p.kind.as_str());
-                        self.realm.set_property(o, "type", tv);
-                        let vv = self.new_str(&p.value);
-                        self.realm.set_property(o, "value", vv);
-                        arr_elems.push(NanBox::handle(o.to_raw()));
-                    }
-                    return Ok(NanBox::handle(self.realm.new_array(arr_elems).to_raw()));
-                }
-                let formatted = match fmt {
+                // Number formatters (`intl`-crate CLDR parts, or the hand-rolled
+                // sign/integer-group/decimal/fraction split) via the shared helper.
+                let entries: Vec<(&'static str, String)> = match fmt {
                     Some(h) if self.realm.get_property(h, "\u{0}intl").is_some() => {
-                        self.intl_format_value(h, arg(0))
+                        self.number_handle_parts(h, arg(0))
                     }
-                    _ => self.realm.to_display_string(arg(0)),
-                };
-                let style = fmt
-                    .and_then(|h| self.realm.get_property(h, "style"))
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_else(|| String::from("decimal"));
-                let currency_sym = if style == "currency" {
-                    let code = fmt
-                        .and_then(|h| self.realm.get_property(h, "currency"))
-                        .map(|v| self.realm.to_display_string(v))
-                        .unwrap_or_default();
-                    currency_symbol(&code)
-                } else {
-                    String::new()
-                };
-                // Build (type, value) entries from the formatted string's structure.
-                let mut entries: Vec<(&'static str, String)> = Vec::new();
-                let mut s = formatted.as_str();
-                if let Some(rest) = s.strip_prefix('-') {
-                    entries.push(("minusSign", String::from("-")));
-                    s = rest;
-                }
-                if !currency_sym.is_empty() && s.starts_with(currency_sym.as_str()) {
-                    entries.push(("currency", currency_sym.clone()));
-                    s = &s[currency_sym.len()..];
-                }
-                // A trailing percent sign is stripped first, so the core (∞/NaN/digits)
-                // is classified correctly; the percent part is appended at the end.
-                let mut percent = false;
-                if style == "percent" && s.ends_with('%') {
-                    percent = true;
-                    s = &s[..s.len() - '%'.len_utf8()];
-                }
-                if s == "NaN" {
-                    entries.push(("nan", String::from("NaN")));
-                } else if s == "∞" {
-                    entries.push(("infinity", String::from("∞")));
-                } else {
-                    let (int_part, frac_part) = match s.split_once('.') {
-                        Some((i, f)) => (i, Some(f)),
-                        None => (s, None),
-                    };
-                    for (gi, grp) in int_part.split(',').enumerate() {
-                        if gi > 0 {
-                            entries.push(("group", String::from(",")));
+                    _ => {
+                        // A plain (non-Intl) receiver: classify the coerced display string.
+                        let formatted = self.realm.to_display_string(arg(0));
+                        let mut entries: Vec<(&'static str, String)> = Vec::new();
+                        let mut s = formatted.as_str();
+                        if let Some(rest) = s.strip_prefix('-') {
+                            entries.push(("minusSign", String::from("-")));
+                            s = rest;
                         }
-                        entries.push(("integer", String::from(grp)));
+                        if s == "NaN" {
+                            entries.push(("nan", String::from("NaN")));
+                        } else if s == "∞" {
+                            entries.push(("infinity", String::from("∞")));
+                        } else {
+                            let (int_part, frac_part) = match s.split_once('.') {
+                                Some((i, f)) => (i, Some(f)),
+                                None => (s, None),
+                            };
+                            for (gi, grp) in int_part.split(',').enumerate() {
+                                if gi > 0 {
+                                    entries.push(("group", String::from(",")));
+                                }
+                                entries.push(("integer", String::from(grp)));
+                            }
+                            if let Some(f) = frac_part {
+                                entries.push(("decimal", String::from(".")));
+                                entries.push(("fraction", String::from(f)));
+                            }
+                        }
+                        entries
                     }
-                    if let Some(f) = frac_part {
-                        entries.push(("decimal", String::from(".")));
-                        entries.push(("fraction", String::from(f)));
-                    }
-                }
-                if percent {
-                    entries.push(("percentSign", String::from("%")));
-                }
+                };
                 let mut arr_elems = Vec::with_capacity(entries.len());
                 for (ty, val) in entries {
                     let o = self.realm.new_object();

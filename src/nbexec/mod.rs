@@ -2842,6 +2842,7 @@ impl<'a> Interp<'a> {
         // scoped to those services.)
         self.realm.mark_hidden(intl, "ListFormat");
         self.realm.mark_hidden(intl, "RelativeTimeFormat");
+        self.realm.mark_hidden(intl, "DurationFormat");
         // `Intl.Locale` — a constructor with no `supportedLocalesOf` static.
         {
             let f = self.new_named_native("Locale", N_INTL_LOCALE);
