@@ -21,6 +21,6 @@ assert.sameValue(lf({ type: "disjunction" }, ["a", "b"]), "a or b", "2-item disj
 assert.sameValue(lf({ type: "unit" }, ["5 ft", "7 in"]), "5 ft, 7 in", "2-item unit");
 assert.sameValue(lf({ type: "unit" }, ["a", "b", "c"]), "a, b, c", "3-item unit");
 
-// The instance's format is a readable function, and works via new and without new.
+// The instance's format is a readable function; the constructor requires `new`.
 assert.sameValue(typeof new Intl.ListFormat("en").format, "function", "format is readable");
-assert.sameValue(Intl.ListFormat("en").format(["x", "y"]), "x and y", "callable without new");
+assert.throws(TypeError, function () { Intl.ListFormat("en"); }, "constructor requires new");

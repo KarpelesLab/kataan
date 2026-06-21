@@ -27,7 +27,7 @@ assert.sameValue(rtf({ numeric: "auto" }, 0, "hour"), "this hour", "auto 0 hour"
 // auto falls back to explicit for non-adjacent values.
 assert.sameValue(rtf({ numeric: "auto" }, 2, "day"), "in 2 days", "auto +2 days -> explicit");
 
-// A plural unit argument is accepted; format is readable; callable without new.
+// A plural unit argument is accepted; format is readable; constructor requires `new`.
 assert.sameValue(rtf({}, -3, "days"), "3 days ago", "plural unit argument");
 assert.sameValue(typeof new Intl.RelativeTimeFormat("en").format, "function", "format readable");
-assert.sameValue(Intl.RelativeTimeFormat("en").format(-1, "day"), "1 day ago", "callable without new");
+assert.throws(TypeError, function () { Intl.RelativeTimeFormat("en"); }, "constructor requires new");

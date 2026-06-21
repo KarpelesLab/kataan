@@ -848,11 +848,10 @@ fn mode_selection_and_skips() {
     let only_strict = parse_meta("/*---\nflags: [onlyStrict]\n---*/\n");
     assert!(only_strict.has_flag("onlyStrict") && !only_strict.has_flag("noStrict"));
 
+    // Module-flagged tests now RUN (the ES-module executor landed); they are no
+    // longer skipped.
     let module = parse_meta("/*---\nflags: [module]\n---*/\n");
-    assert_eq!(
-        skip_reason("language/module-code/x.js", &module),
-        Some("module (no ES-module executor yet)")
-    );
+    assert_eq!(skip_reason("language/module-code/x.js", &module), None);
 
     let temporal = parse_meta("/*---\nfeatures: [Temporal]\n---*/\n");
     assert_eq!(
