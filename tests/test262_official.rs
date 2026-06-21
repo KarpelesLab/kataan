@@ -323,7 +323,10 @@ fn classify(
                 Ok(())
             }
         }
-        (None, Err(t)) => Err(format!("expected pass, {:?} {}: {}", t.phase, t.name, t.message)),
+        (None, Err(t)) => Err(format!(
+            "expected pass, {:?} {}: {}",
+            t.phase, t.name, t.message
+        )),
         (Some((phase, ty)), Err(t)) => {
             let want_parse = phase == "parse" || phase == "early" || phase == "resolution";
             let phase_ok = (want_parse && t.phase == ErrorPhase::Parse)
@@ -347,7 +350,10 @@ fn classify(
 /// Runs one assembled program through the production engine path and classifies
 /// it against the test's expectation.
 fn run_mode(combined: &str, meta: &Meta) -> Result<(), String> {
-    classify(kataan::nbvm::execute_typed(combined, Limits::default()), meta)
+    classify(
+        kataan::nbvm::execute_typed(combined, Limits::default()),
+        meta,
+    )
 }
 
 /// Runs all required modes for one test; passes only if every mode passes.
@@ -368,8 +374,8 @@ fn run_test(
     // Dynamic-import tests are scripts that call `import("./x_FIXTURE.js")`; the
     // specifier must resolve relative to the test file, so run them with the
     // file as the import base (still strict/sloppy dual mode + harness).
-    let dynamic_import = path.to_string_lossy().contains("dynamic-import")
-        && src.contains("import(");
+    let dynamic_import =
+        path.to_string_lossy().contains("dynamic-import") && src.contains("import(");
     let base = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned());

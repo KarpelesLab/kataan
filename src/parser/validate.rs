@@ -1622,10 +1622,7 @@ impl Validator {
         for i in 0..top_lex.len() {
             for j in (i + 1)..top_lex.len() {
                 if top_lex[i].0 == top_lex[j].0 {
-                    return Err(self.err(
-                        top_lex[j].1,
-                        "duplicate top-level declaration in module",
-                    ));
+                    return Err(self.err(top_lex[j].1, "duplicate top-level declaration in module"));
                 }
             }
         }
@@ -1657,9 +1654,7 @@ impl Validator {
                 for s in &decl.specifiers {
                     let (name, span) = match s {
                         crate::ast::ImportSpecifier::Default(id)
-                        | crate::ast::ImportSpecifier::Namespace(id) => {
-                            (id.name.clone(), id.span)
-                        }
+                        | crate::ast::ImportSpecifier::Namespace(id) => (id.name.clone(), id.span),
                         crate::ast::ImportSpecifier::Named { local, .. } => {
                             (local.name.clone(), local.span)
                         }
@@ -1711,9 +1706,7 @@ impl Validator {
                 // `export * from "m"` introduces no export name here.
                 ExportDecl::All { exported: None, .. } => {}
                 ExportDecl::Named {
-                    specifiers,
-                    source,
-                    ..
+                    specifiers, source, ..
                 } => {
                     for sp in specifiers {
                         exported.push((module_export_name_str(&sp.exported), sp.span));
@@ -1745,20 +1738,14 @@ impl Validator {
         for i in 0..exported.len() {
             for j in (i + 1)..exported.len() {
                 if exported[i].0 == exported[j].0 {
-                    return Err(self.err(
-                        exported[j].1,
-                        "duplicate export name in module",
-                    ));
+                    return Err(self.err(exported[j].1, "duplicate export name in module"));
                 }
             }
         }
         // Every local export binding must be declared somewhere in the module.
         for (name, span) in &bindings {
             if !declared.iter().any(|d| d.as_ref() == name.as_str()) {
-                return Err(self.err(
-                    *span,
-                    "export of an undeclared identifier",
-                ));
+                return Err(self.err(*span, "export of an undeclared identifier"));
             }
         }
         Ok(())

@@ -392,7 +392,9 @@ impl<'a> Interp<'a> {
                 // exactly once via `resolve_with`); a non-thenable object fulfills
                 // synchronously, so this adds no microtask for the ordinary case.
                 let p = self.promise_resolve(value);
-                self.realm.promise_state(p).expect("fresh promise has state")
+                self.realm
+                    .promise_state(p)
+                    .expect("fresh promise has state")
             }
             None => return Ok(value), // a primitive
         };

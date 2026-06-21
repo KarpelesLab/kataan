@@ -631,11 +631,7 @@ impl<'a> Interp<'a> {
     /// `using` (sync-dispose hint) only `@@dispose`. The chosen method must be
     /// callable, else a TypeError. The relevant symbol property is read exactly
     /// once (a getter fires once).
-    fn using_dispose_method(
-        &mut self,
-        value: NanBox,
-        is_await: bool,
-    ) -> Result<NanBox, ExecError> {
+    fn using_dispose_method(&mut self, value: NanBox, is_await: bool) -> Result<NanBox, ExecError> {
         let Some(oh) = value.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("using declaration value is not an object"));
         };

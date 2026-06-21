@@ -658,7 +658,9 @@ impl<'a> Interp<'a> {
                 // rejected with a SyntaxError — NOT a plain dynamic import that would
                 // load the module.
                 #[cfg(all(feature = "module", feature = "std"))]
-                if let Expr::Member { object, property, .. } = &**callee
+                if let Expr::Member {
+                    object, property, ..
+                } = &**callee
                     && matches!(&**object, Expr::Ident(id) if id.name.as_ref() == "import")
                     && matches!(property, PropertyKey::Ident(p) if matches!(&**p, "source" | "defer"))
                 {
@@ -669,7 +671,8 @@ impl<'a> Interp<'a> {
                     let rejection = match arg0 {
                         Some(e) => match self.eval(e).and_then(|v| self.coerce_to_string(v)) {
                             Ok(_) => {
-                                let m = self.new_str("source-phase / deferred import is not supported");
+                                let m =
+                                    self.new_str("source-phase / deferred import is not supported");
                                 self.make_error(N_SYNTAX_ERROR, Some(m))
                             }
                             Err(ExecError::Throw(t)) => t,
@@ -1631,11 +1634,7 @@ impl<'a> Interp<'a> {
     /// strict mode (a same-value assignment is a no-op either way). When shrinking
     /// hits a non-configurable index, the truncation stops there; strict mode then
     /// throws (the length is left one above the stuck index in both modes).
-    pub(crate) fn write_array_length(
-        &mut self,
-        handle: Handle,
-        n: usize,
-    ) -> Result<(), ExecError> {
+    pub(crate) fn write_array_length(&mut self, handle: Handle, n: usize) -> Result<(), ExecError> {
         if self.realm.array_length_is_readonly(handle) {
             // A non-writable `length`: reject a real change.
             let cur = self.realm.array_length(handle).unwrap_or(0);

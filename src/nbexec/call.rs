@@ -2021,7 +2021,9 @@ impl<'a> Interp<'a> {
         if id == N_WEAKREF {
             let target = args.first().copied().unwrap_or(NanBox::undefined());
             if !self.can_be_held_weakly(target) {
-                return Err(self.type_error("WeakRef: target must be an object or a non-registered symbol"));
+                return Err(
+                    self.type_error("WeakRef: target must be an object or a non-registered symbol")
+                );
             }
             let obj = self.realm.new_object();
             self.realm.set_hidden_property(obj, WEAKREF_TARGET, target);
@@ -2044,7 +2046,9 @@ impl<'a> Interp<'a> {
                 .map(Handle::from_raw)
                 .is_some_and(|h| self.is_callable(h))
             {
-                return Err(self.type_error("FinalizationRegistry: cleanup callback must be callable"));
+                return Err(
+                    self.type_error("FinalizationRegistry: cleanup callback must be callable")
+                );
             }
             let obj = self.realm.new_object();
             self.realm

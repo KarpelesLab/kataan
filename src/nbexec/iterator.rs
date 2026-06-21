@@ -1412,8 +1412,7 @@ impl<'a> Interp<'a> {
         let sym = self.well_known_symbol("asyncIterator");
         let key = self.member_key(sym);
         let f = self.read_member(h, &key)?;
-        if f
-            .as_handle()
+        if f.as_handle()
             .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
         {
             let it = self.call_with_this(f, v, &[])?;

@@ -167,8 +167,9 @@ impl<'a> Interp<'a> {
                 match target {
                     Some(t) => t,
                     None => {
-                        return Err(self
-                            .type_error("WeakRef.prototype.deref requires that 'this' be a WeakRef"))
+                        return Err(self.type_error(
+                            "WeakRef.prototype.deref requires that 'this' be a WeakRef",
+                        ));
                     }
                 }
             }
@@ -196,9 +197,9 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 if self.realm.same_value(target, held) {
-                    return Err(
-                        self.type_error("FinalizationRegistry.register: target and heldValue must differ")
-                    );
+                    return Err(self.type_error(
+                        "FinalizationRegistry.register: target and heldValue must differ",
+                    ));
                 }
                 // `unregisterToken`, when present, must also be weakly holdable;
                 // an `undefined` token records ~empty~ (stored as `undefined`).
@@ -212,8 +213,7 @@ impl<'a> Interp<'a> {
                     ));
                 };
                 let cell = self.realm.new_array(alloc::vec![target, held, token]);
-                self.realm
-                    .array_push(cells, NanBox::handle(cell.to_raw()));
+                self.realm.array_push(cells, NanBox::handle(cell.to_raw()));
                 NanBox::undefined()
             }
             // `FinalizationRegistry.prototype.unregister(token)` — remove every cell
@@ -540,9 +540,9 @@ impl<'a> Interp<'a> {
                     .and_then(|c| self.realm.get_property(c, "prototype"))
                     .and_then(|p| p.as_handle());
                 if error_proto == Some(h.to_raw()) {
-                    return Err(
-                        self.type_error("Cannot assign to read only property 'stack' of Error.prototype")
-                    );
+                    return Err(self.type_error(
+                        "Cannot assign to read only property 'stack' of Error.prototype",
+                    ));
                 }
                 if self.realm.has_own(h, "stack") {
                     // [[Set]] with Throw=true. An own accessor with no setter cannot
@@ -550,9 +550,9 @@ impl<'a> Interp<'a> {
                     if let Some((_, setter)) = self.realm.accessor(h, "stack")
                         && matches!(setter.unpack(), Unpacked::Undefined)
                     {
-                        return Err(self.type_error(
-                            "Cannot set property 'stack' which has only a getter",
-                        ));
+                        return Err(
+                            self.type_error("Cannot set property 'stack' which has only a getter")
+                        );
                     }
                     // A getter-only own accessor is handled above; a non-writable own
                     // data property must also throw even in sloppy code, so force
@@ -568,8 +568,10 @@ impl<'a> Interp<'a> {
                     // receiver.
                     let desc = self.realm.new_object();
                     self.realm.set_property(desc, "value", v);
-                    self.realm.set_property(desc, "writable", NanBox::boolean(true));
-                    self.realm.set_property(desc, "enumerable", NanBox::boolean(true));
+                    self.realm
+                        .set_property(desc, "writable", NanBox::boolean(true));
+                    self.realm
+                        .set_property(desc, "enumerable", NanBox::boolean(true));
                     self.realm
                         .set_property(desc, "configurable", NanBox::boolean(true));
                     if !self.apply_descriptor(h, "stack", desc, true)? {
@@ -2245,9 +2247,11 @@ impl<'a> Interp<'a> {
                             .map(|v| self.realm.to_display_string(v))
                             .unwrap_or_else(|| String::from("en"));
                         let refs: Vec<&str> = items.iter().map(String::as_str).collect();
-                        return Ok(
-                            self.new_str(&intl::list::format_list(&locale, &refs, crate_style))
-                        );
+                        return Ok(self.new_str(&intl::list::format_list(
+                            &locale,
+                            &refs,
+                            crate_style,
+                        )));
                     }
                 }
                 let parts = self.list_format_parts(&items, &list_type, &style);
@@ -2257,9 +2261,7 @@ impl<'a> Interp<'a> {
             // `Intl.RelativeTimeFormat(...)` without `new` — a TypeError (the
             // constructor requires `new`, ECMA-402 sec-intl.relativetimeformat).
             N_INTL_REL_TIME => {
-                return Err(
-                    self.type_error("Constructor Intl.RelativeTimeFormat requires 'new'")
-                );
+                return Err(self.type_error("Constructor Intl.RelativeTimeFormat requires 'new'"));
             }
             // `Intl.RelativeTimeFormat.prototype.format(value, unit)`.
             N_INTL_REL_TIME_FORMAT => {
@@ -2942,15 +2944,8 @@ fn regexp_escape_wtf8(bytes: &[u8]) -> alloc::vec::Vec<u8> {
     fn is_ws_or_lt(c: u32) -> bool {
         matches!(
             c,
-            0x20 | 0xA0
-                | 0x1680
-                | 0x2000..=0x200A
-                | 0x2028
-                | 0x2029
-                | 0x202F
-                | 0x205F
-                | 0x3000
-                | 0xFEFF
+            0x20 | 0xA0 | 0x1680 | 0x2000
+                ..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF
         )
     }
     const SYNTAX: &[u8] = b"^$\\.*+?()[]{}|";
@@ -3116,11 +3111,7 @@ impl ExactSum {
                     }
                     return f64::INFINITY;
                 }
-                if hi == -TWO_1023
-                    && lo == MAX_ULP / 2.0
-                    && n >= 0
-                    && partials[n as usize] > 0.0
-                {
+                if hi == -TWO_1023 && lo == MAX_ULP / 2.0 && n >= 0 && partials[n as usize] > 0.0 {
                     return -MAX_DOUBLE;
                 }
                 return f64::NEG_INFINITY;

@@ -1,12 +1,12 @@
 //! The ECMAScript **module** subsystem: a module record / resolve+load /
-//! link / evaluate pipeline layered on the [`Interp`](super::Interp)
+//! link / evaluate pipeline layered on the [`Interp`]
 //! tree-walker, plus dynamic `import()` and `import.meta`.
 //!
 //! This is the abstract-operations machinery of ECMA-262 §16.2 reduced to the
 //! shape that fits a tree-walking interpreter whose lexical environments are
 //! shared `Rc<RefCell<…>>` [`Scope`]s:
 //!
-//! - **Parse** a source to a [`ModuleRecord`]: its import requests, its local /
+//! - **Parse** a source to a `ModuleRecord`: its import requests, its local /
 //!   indirect / star exports, and the (leaked) AST body.
 //! - **Resolve + Load** dependencies through a host [`ModuleHost`] hook,
 //!   transitively, deduping by resolved key and tolerating cycles.
@@ -331,7 +331,7 @@ impl<'a> Interp<'a> {
         self.evaluate_entry(entry_key)
     }
 
-    /// Public wrapper over [`Self::load_module`] (the loader is private; the
+    /// Public wrapper over `Self::load_module` (the loader is private; the
     /// phased entry points need to call it from the free functions).
     pub fn load_module_pub(
         &mut self,
@@ -341,7 +341,7 @@ impl<'a> Interp<'a> {
         self.load_module(entry_key, host)
     }
 
-    /// Public wrapper over [`Self::link_module`].
+    /// Public wrapper over `Self::link_module`.
     pub fn link_module_pub(&mut self, entry_key: &str) -> Result<(), ExecError> {
         self.link_module(entry_key)
     }
@@ -597,7 +597,11 @@ impl<'a> Interp<'a> {
         };
 
         let mut aliases: BTreeMap<String, (Scope, String)> = BTreeMap::new();
-        for DepBinds { dep: dep_key, binds } in &imports {
+        for DepBinds {
+            dep: dep_key,
+            binds,
+        } in &imports
+        {
             for (local, kind) in binds {
                 match kind {
                     ImportKind::Default => {
@@ -816,9 +820,7 @@ impl<'a> Interp<'a> {
         if let Some(slot) = found {
             return Ok(slot);
         }
-        Err(self.syntax_error(&alloc::format!(
-            "module {key} has no export named '{name}'"
-        )))
+        Err(self.syntax_error(&alloc::format!("module {key} has no export named '{name}'")))
     }
 
     // --- Evaluate -------------------------------------------------------
@@ -920,7 +922,9 @@ impl<'a> Interp<'a> {
         match decl {
             // Re-exports and bare `export { … }` bind nothing locally.
             ExportDecl::All { .. } => Ok(()),
-            ExportDecl::Named { source: Some(_), .. } => Ok(()),
+            ExportDecl::Named {
+                source: Some(_), ..
+            } => Ok(()),
             ExportDecl::Named { source: None, .. } => Ok(()),
             ExportDecl::Decl { declaration, .. } => {
                 self.exec(declaration)?;
@@ -1180,7 +1184,6 @@ impl<'a> Interp<'a> {
     pub fn set_script_import_base(&mut self, base: Option<String>) {
         self.script_import_base = base;
     }
-
 }
 
 /// What kind of slot an import binding maps to.
@@ -1273,4 +1276,3 @@ fn collect_pattern_names(target: &crate::ast::BindingTarget, out: &mut Vec<Strin
         }
     }
 }
-

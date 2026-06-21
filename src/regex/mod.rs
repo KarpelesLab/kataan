@@ -155,7 +155,9 @@ impl Flags {
         // an addition to `u`. (`f.unicode` is implied by `v`, so check the raw
         // presence of both letters.)
         if f.unicode_sets && s.contains('u') {
-            return Err(RegexError::new("the `u` and `v` flags are mutually exclusive"));
+            return Err(RegexError::new(
+                "the `u` and `v` flags are mutually exclusive",
+            ));
         }
         Ok(f)
     }

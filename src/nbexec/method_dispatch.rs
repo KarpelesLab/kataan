@@ -4143,9 +4143,8 @@ impl<'a> Interp<'a> {
                     raw.min(MAX_SAFE) as u64 as f64
                 };
                 if n + len_int > MAX_SAFE {
-                    return Err(self.type_error(
-                        "Array.prototype.concat result exceeds maximum array length",
-                    ));
+                    return Err(self
+                        .type_error("Array.prototype.concat result exceeds maximum array length"));
                 }
                 let len = len_int as usize;
                 for k in 0..len {
@@ -4163,9 +4162,8 @@ impl<'a> Interp<'a> {
                 // Non-spreadable: added as a single element (a `2^53-1` overflow is
                 // a TypeError).
                 if n >= MAX_SAFE {
-                    return Err(self.type_error(
-                        "Array.prototype.concat result exceeds maximum array length",
-                    ));
+                    return Err(self
+                        .type_error("Array.prototype.concat result exceeds maximum array length"));
                 }
                 self.create_data_property_or_throw(a_h, n as usize, item)?;
                 n += 1.0;

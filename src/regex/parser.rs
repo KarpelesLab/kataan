@@ -1059,9 +1059,10 @@ impl Parser {
             // character, so it cannot serve as a range endpoint (`[a-\d]`).
             if self.unicode
                 && self.chars.get(self.pos + 1) == Some(&'\\')
-                && self.chars.get(self.pos + 2).is_some_and(|&n| {
-                    matches!(n, 'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'p' | 'P')
-                })
+                && self
+                    .chars
+                    .get(self.pos + 2)
+                    .is_some_and(|&n| matches!(n, 'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'p' | 'P'))
             {
                 return Err(RegexError::new(
                     "invalid character class range with a class-escape endpoint",

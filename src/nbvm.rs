@@ -1651,7 +1651,10 @@ fn run_frame(
                         if ctx.realm.is_array(handle) && ks == "length" {
                             let v = regs[*src as usize];
                             if let Some(n) = ctx.realm.array_length_uint32(v) {
-                                if ctx.realm.array_length_set_needs_slow_path(handle, n as usize) {
+                                if ctx
+                                    .realm
+                                    .array_length_set_needs_slow_path(handle, n as usize)
+                                {
                                     return Err(VmError::Unsupported);
                                 }
                                 ctx.realm.set_array_length(handle, n as usize);
@@ -1895,7 +1898,10 @@ fn run_frame(
                         // A non-writable `length`, or a shrink that would hit a
                         // non-configurable index, needs the descriptor-aware /
                         // strict-aware tree-walker (ArraySetLength). Fault to it.
-                        if ctx.realm.array_length_set_needs_slow_path(handle, n as usize) {
+                        if ctx
+                            .realm
+                            .array_length_set_needs_slow_path(handle, n as usize)
+                        {
                             return Err(VmError::Unsupported);
                         }
                         ctx.realm.set_array_length(handle, n as usize);

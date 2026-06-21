@@ -312,9 +312,7 @@ impl<'a> Interp<'a> {
         let Some(id) = self.gen_frame_id(h) else {
             return Err(self.type_error("Generator method called on a non-generator"));
         };
-        let is_async = self.gen_frames[id]
-            .as_ref()
-            .is_some_and(|f| f.is_async);
+        let is_async = self.gen_frames[id].as_ref().is_some_and(|f| f.is_async);
         // A plain `function*` body never awaits. An *async generator*
         // (`async function*`) runs on this same lazy-generator engine (a
         // documented simplification of the previous eager-async model): its

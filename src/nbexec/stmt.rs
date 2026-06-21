@@ -726,11 +726,9 @@ impl<'a> Interp<'a> {
                         // *this* iteration (in reverse order with any others).
                         if matches!(
                             kind,
-                            crate::ast::VarDeclKind::Using
-                                | crate::ast::VarDeclKind::AwaitUsing
+                            crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
                         ) {
-                            let is_await =
-                                matches!(kind, crate::ast::VarDeclKind::AwaitUsing);
+                            let is_await = matches!(kind, crate::ast::VarDeclKind::AwaitUsing);
                             self.record_using_resource(item, is_await)?;
                         }
                     }
@@ -785,11 +783,9 @@ impl<'a> Interp<'a> {
                         self.bind_pattern(target, item)?;
                         if matches!(
                             kind,
-                            crate::ast::VarDeclKind::Using
-                                | crate::ast::VarDeclKind::AwaitUsing
+                            crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
                         ) {
-                            let is_await =
-                                matches!(kind, crate::ast::VarDeclKind::AwaitUsing);
+                            let is_await = matches!(kind, crate::ast::VarDeclKind::AwaitUsing);
                             self.record_using_resource(item, is_await)?;
                         }
                     }

@@ -492,7 +492,8 @@ pub struct Interp<'a> {
     /// the property itself stays an ordinary writable/non-configurable data
     /// property so `getOwnPropertyDescriptor` still reports a value.
     #[cfg(all(feature = "module", feature = "std"))]
-    module_namespaces: alloc::collections::BTreeMap<u64, alloc::collections::BTreeMap<String, (Scope, String)>>,
+    module_namespaces:
+        alloc::collections::BTreeMap<u64, alloc::collections::BTreeMap<String, (Scope, String)>>,
     /// The key of the module whose body is currently executing, used as the
     /// referrer for a dynamic `import()` when the active scope can't be matched to
     /// a module record (e.g. the `import()` runs inside a nested function/arrow,
@@ -1209,8 +1210,14 @@ const MAP_PROTO_METHODS: &[&str] = &[
     "getOrInsertComputed",
 ];
 /// `WeakMap.prototype` methods exposed as first-class values.
-const WEAKMAP_PROTO_METHODS: &[&str] =
-    &["set", "get", "has", "delete", "getOrInsert", "getOrInsertComputed"];
+const WEAKMAP_PROTO_METHODS: &[&str] = &[
+    "set",
+    "get",
+    "has",
+    "delete",
+    "getOrInsert",
+    "getOrInsertComputed",
+];
 /// `WeakSet.prototype` methods exposed as first-class values.
 const WEAKSET_PROTO_METHODS: &[&str] = &["add", "has", "delete"];
 /// `Promise.prototype` methods exposed as first-class values.
@@ -3456,8 +3463,7 @@ impl<'a> Interp<'a> {
             );
             self.realm.mark_hidden(proto, "description");
             // `[Symbol.toPrimitive]` — { writable:false, enumerable:false, configurable:true }.
-            let to_prim =
-                self.new_named_native("[Symbol.toPrimitive]", N_SYMBOL_PROTO_TOPRIMITIVE);
+            let to_prim = self.new_named_native("[Symbol.toPrimitive]", N_SYMBOL_PROTO_TOPRIMITIVE);
             let to_prim_sym = self.well_known_symbol("toPrimitive");
             let to_prim_key = self.member_key(to_prim_sym);
             self.realm
@@ -3475,7 +3481,8 @@ impl<'a> Interp<'a> {
                 .set_property(sym_ctor, "prototype", NanBox::handle(proto.to_raw()));
             self.realm.mark_hidden(sym_ctor, "prototype");
             self.realm.set_readonly_property(sym_ctor, "prototype");
-            self.realm.set_non_configurable_property(sym_ctor, "prototype");
+            self.realm
+                .set_non_configurable_property(sym_ctor, "prototype");
             self.realm.set_symbol_proto_intrinsic(proto);
         }
         // Namespace objects carry their own `[Symbol.toStringTag]` value (not on a
@@ -5076,11 +5083,12 @@ fn rel_time_number_parts(n: f64) -> alloc::vec::Vec<(&'static str, alloc::string
     let len = digits.len();
     let first = len % 3;
     let first = if first == 0 && len > 0 { 3 } else { first };
-    let emit = |slice: &[char],
-                parts: &mut alloc::vec::Vec<(&'static str, alloc::string::String, bool)>| {
-        let g: alloc::string::String = slice.iter().collect();
-        parts.push(("integer", g, true));
-    };
+    let emit =
+        |slice: &[char],
+         parts: &mut alloc::vec::Vec<(&'static str, alloc::string::String, bool)>| {
+            let g: alloc::string::String = slice.iter().collect();
+            parts.push(("integer", g, true));
+        };
     if len > 0 {
         emit(&digits[..first], &mut parts);
         let mut idx = first;
@@ -5128,11 +5136,7 @@ fn rel_time_parts(
         alloc::vec::Vec::new();
     if is_past {
         parts.extend(rel_time_number_parts(n));
-        parts.push((
-            "literal",
-            alloc::format!(" {unit_disp} ago"),
-            false,
-        ));
+        parts.push(("literal", alloc::format!(" {unit_disp} ago"), false));
     } else {
         parts.push(("literal", alloc::string::String::from("in "), false));
         parts.extend(rel_time_number_parts(n));
@@ -6173,7 +6177,9 @@ pub fn eval_source_typed(
                 // only `message`): surface its `message` so the failure is
                 // diagnosable rather than the opaque `[object Object]`.
                 if let Some(raw) = thrown.as_handle()
-                    && let Some(m) = interp.realm().get_property(Handle::from_raw(raw), "message")
+                    && let Some(m) = interp
+                        .realm()
+                        .get_property(Handle::from_raw(raw), "message")
                 {
                     let s = interp.realm().to_display_string(m);
                     if !s.is_empty() {

@@ -1580,7 +1580,10 @@ impl<'a> Interp<'a> {
             Unpacked::Null => {
                 return Err(self.type_error("Intl.RelativeTimeFormat options cannot be null"));
             }
-            _ => self.coerce_to_object(opts_arg).as_handle().map(Handle::from_raw),
+            _ => self
+                .coerce_to_object(opts_arg)
+                .as_handle()
+                .map(Handle::from_raw),
         };
         // Options are read in spec order: localeMatcher, numberingSystem, style, numeric.
         let _ = self.get_string_option(
@@ -1793,9 +1796,9 @@ impl<'a> Interp<'a> {
                     _ => {
                         // Non-String element: close the iterator, then throw.
                         let _ = self.iterator_close(ih);
-                        return Err(self.type_error(
-                            "Intl.ListFormat: list elements must all be strings",
-                        ));
+                        return Err(
+                            self.type_error("Intl.ListFormat: list elements must all be strings")
+                        );
                     }
                 }
                 if out.len() > GEN_CAP {
@@ -3048,10 +3051,11 @@ impl<'a> Interp<'a> {
             // sign per `signDisplay` (negative zero shows "-0" under auto/always).
             let neg_zero = n == 0.0 && n.is_sign_negative();
             let feed = if neg_zero { 0.0 } else { n };
-            let mut parts: Vec<(&'static str, String)> = intl::number::format_to_parts(&locale, feed, &opts)
-                .into_iter()
-                .map(|p| (p.kind.as_str(), p.value))
-                .collect();
+            let mut parts: Vec<(&'static str, String)> =
+                intl::number::format_to_parts(&locale, feed, &opts)
+                    .into_iter()
+                    .map(|p| (p.kind.as_str(), p.value))
+                    .collect();
             if neg_zero {
                 let sd = self
                     .realm
@@ -3296,9 +3300,7 @@ impl<'a> Interp<'a> {
             _ => {
                 // No (usable) option: a supported extension value is used & reflected.
                 match ext_nu {
-                    Some(ns) if supported(&ns) => {
-                        (alloc::format!("{base}-u-nu-{ns}"), ns)
-                    }
+                    Some(ns) if supported(&ns) => (alloc::format!("{base}-u-nu-{ns}"), ns),
                     _ => (base, default_nu),
                 }
             }
@@ -3390,7 +3392,8 @@ impl<'a> Interp<'a> {
         match name {
             "resolvedOptions" => self.duration_resolved_options(h),
             "formatToParts" => {
-                let rec = self.read_duration_record(args.first().copied().unwrap_or(NanBox::undefined()))?;
+                let rec = self
+                    .read_duration_record(args.first().copied().unwrap_or(NanBox::undefined()))?;
                 let parts = self.partition_duration(h, &rec);
                 let mut arr = Vec::with_capacity(parts.len());
                 for (ty, val, unit) in parts {
@@ -3409,7 +3412,8 @@ impl<'a> Interp<'a> {
             }
             // `format(duration)` — concatenate the partitioned parts' values.
             _ => {
-                let rec = self.read_duration_record(args.first().copied().unwrap_or(NanBox::undefined()))?;
+                let rec = self
+                    .read_duration_record(args.first().copied().unwrap_or(NanBox::undefined()))?;
                 let parts = self.partition_duration(h, &rec);
                 let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
                 Ok(self.new_str(&s))
@@ -3556,9 +3560,8 @@ impl<'a> Interp<'a> {
                 if num.is_empty() {
                     return Err(bad(this));
                 }
-                let Some(&(_, slot)) = allowed.iter().find(|(d, _)| {
-                    d.eq_ignore_ascii_case(&desig)
-                }) else {
+                let Some(&(_, slot)) = allowed.iter().find(|(d, _)| d.eq_ignore_ascii_case(&desig))
+                else {
                     return Err(bad(this));
                 };
                 // Designators must appear in order.
@@ -3601,7 +3604,13 @@ impl<'a> Interp<'a> {
                 return Err(bad(self));
             }
             // Time designators: H(4) M(5) S(6).
-            parse_section(self, tp, &[('H', 4), ('M', 5), ('S', 6)], &mut rec, &mut saw_any)?;
+            parse_section(
+                self,
+                tp,
+                &[('H', 4), ('M', 5), ('S', 6)],
+                &mut rec,
+                &mut saw_any,
+            )?;
         }
         if !saw_any {
             return Err(bad(self));
@@ -3639,7 +3648,11 @@ impl<'a> Interp<'a> {
     /// strings with an `Intl.ListFormat` (`type:"unit"`). Returns `(type, value, unit?)`
     /// parts. Composing the real `NumberFormat`/`ListFormat` keeps `format` and the
     /// reference output identical regardless of CLDR-data fidelity.
-    fn partition_duration(&mut self, h: Handle, duration: &[f64; 10]) -> Vec<(&'static str, String, Option<&'static str>)> {
+    fn partition_duration(
+        &mut self,
+        h: Handle,
+        duration: &[f64; 10],
+    ) -> Vec<(&'static str, String, Option<&'static str>)> {
         let style = self
             .realm
             .get_property(h, "style")
@@ -3672,7 +3685,9 @@ impl<'a> Interp<'a> {
         let mut need_separator = false;
         let mut display_negative_sign = true;
         // Whether any field is negative (for the negative-zero leading-sign rule).
-        let any_negative = duration.iter().any(|&v| v < 0.0 || (v == 0.0 && v.is_sign_negative()));
+        let any_negative = duration
+            .iter()
+            .any(|&v| v < 0.0 || (v == 0.0 && v.is_sign_negative()));
         for idx in 0..units.len() {
             let unit = units[idx];
             let singular: &'static str = duration_singular(unit);
@@ -3682,7 +3697,8 @@ impl<'a> Interp<'a> {
             // Combine numeric seconds/ms/us with their fractional remainder.
             let mut value_str: Option<String> = None;
             let mut done = false;
-            let (mut nf_min_frac, mut nf_max_frac, mut nf_trunc) = (None::<i32>, None::<i32>, false);
+            let (mut nf_min_frac, mut nf_max_frac, mut nf_trunc) =
+                (None::<i32>, None::<i32>, false);
             if matches!(unit, "seconds" | "milliseconds" | "microseconds") {
                 let next_style = ustyle[idx + 1].as_str();
                 if next_style == "numeric" {
@@ -3707,7 +3723,10 @@ impl<'a> Interp<'a> {
                     || duration[8] != 0.0
                     || duration[9] != 0.0;
             }
-            let nonzero = value != 0.0 || value_str.as_deref().is_some_and(|s| s.bytes().any(|b| matches!(b, b'1'..=b'9')));
+            let nonzero = value != 0.0
+                || value_str
+                    .as_deref()
+                    .is_some_and(|s| s.bytes().any(|b| matches!(b, b'1'..=b'9')));
             if nonzero || display_u != "auto" || display_required {
                 let mut sign_never = false;
                 if display_negative_sign {
@@ -3746,12 +3765,18 @@ impl<'a> Interp<'a> {
                         .set_hidden_property(nf, "useGrouping", NanBox::boolean(false));
                 }
                 if let Some(mn) = nf_min_frac {
-                    self.realm
-                        .set_hidden_property(nf, "minimumFractionDigits", NanBox::number(mn as f64));
+                    self.realm.set_hidden_property(
+                        nf,
+                        "minimumFractionDigits",
+                        NanBox::number(mn as f64),
+                    );
                 }
                 if let Some(mx) = nf_max_frac {
-                    self.realm
-                        .set_hidden_property(nf, "maximumFractionDigits", NanBox::number(mx as f64));
+                    self.realm.set_hidden_property(
+                        nf,
+                        "maximumFractionDigits",
+                        NanBox::number(mx as f64),
+                    );
                 }
                 if nf_trunc {
                     let rm = self.new_str("trunc");
@@ -3763,7 +3788,8 @@ impl<'a> Interp<'a> {
                     None => NanBox::number(value),
                 };
                 let number_parts = self.number_handle_parts(nf, value_box);
-                let mut list: Vec<(&'static str, String, Option<&'static str>)> = if !need_separator {
+                let mut list: Vec<(&'static str, String, Option<&'static str>)> = if !need_separator
+                {
                     Vec::new()
                 } else {
                     // Append to the previous (numeric) unit's list, with a separator.
@@ -3788,7 +3814,11 @@ impl<'a> Interp<'a> {
             }
         }
         // List style: digital collapses to short.
-        let list_style = if style == "digital" { String::from("short") } else { style };
+        let list_style = if style == "digital" {
+            String::from("short")
+        } else {
+            style
+        };
         // Build the strings, then join via ListFormat "unit".
         let strings: Vec<String> = result
             .iter()

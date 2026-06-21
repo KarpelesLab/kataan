@@ -177,9 +177,9 @@ impl<'src> Parser<'src> {
             && self.nth_kind(1) == TokenKind::Keyword(Kw::Function)
             && !self.nth_newline(1));
         if !decl_ok {
-            return Err(self.err(
-                "`export` must be followed by a declaration, `default`, `*`, or `{ … }`",
-            ));
+            return Err(
+                self.err("`export` must be followed by a declaration, `default`, `*`, or `{ … }`")
+            );
         }
         // This is a declaration position, so a leading `let` is a
         // `LexicalDeclaration` (parse it as a `StatementListItem`).

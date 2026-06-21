@@ -96,7 +96,11 @@ pub(crate) fn from_base64(
     let length = units.len();
     let mut bytes = Vec::new();
     if max_len == 0 {
-        return DecodeResult { bytes, read: 0, error: false };
+        return DecodeResult {
+            bytes,
+            read: 0,
+            error: false,
+        };
     }
     // The current chunk of base64 *values* being accumulated, the offset where
     // the next char is read, and `read` — the offset after the last *complete*
@@ -112,12 +116,20 @@ pub(crate) fn from_base64(
             if chunk_len > 0 {
                 match last_chunk {
                     LastChunk::StopBeforePartial => {
-                        return DecodeResult { bytes, read, error: false };
+                        return DecodeResult {
+                            bytes,
+                            read,
+                            error: false,
+                        };
                     }
                     LastChunk::Loose => {
                         if chunk_len == 1 {
                             // A single leftover symbol can never form a byte.
-                            return DecodeResult { bytes, read, error: true };
+                            return DecodeResult {
+                                bytes,
+                                read,
+                                error: true,
+                            };
                         }
                         // Decode the unpadded 2/3-symbol chunk (extra bits ignored).
                         let decoded = decode_chunk(&chunk[..chunk_len], false).unwrap();
@@ -125,27 +137,47 @@ pub(crate) fn from_base64(
                     }
                     LastChunk::Strict => {
                         // Missing padding is malformed in strict mode.
-                        return DecodeResult { bytes, read, error: true };
+                        return DecodeResult {
+                            bytes,
+                            read,
+                            error: true,
+                        };
                     }
                 }
             }
-            return DecodeResult { bytes, read: length, error: false };
+            return DecodeResult {
+                bytes,
+                read: length,
+                error: false,
+            };
         }
         let c = units[index];
         index += 1;
         if c == b'=' {
             // Padding is only legal once a chunk holds 2 or 3 symbols.
             if chunk_len < 2 {
-                return DecodeResult { bytes, read, error: true };
+                return DecodeResult {
+                    bytes,
+                    read,
+                    error: true,
+                };
             }
             index = skip_ascii_ws(units, index);
             if chunk_len == 2 {
                 // A 2-symbol chunk needs a second `=`.
                 if index == length {
                     if last_chunk == LastChunk::StopBeforePartial {
-                        return DecodeResult { bytes, read, error: false };
+                        return DecodeResult {
+                            bytes,
+                            read,
+                            error: false,
+                        };
                     }
-                    return DecodeResult { bytes, read, error: true };
+                    return DecodeResult {
+                        bytes,
+                        read,
+                        error: true,
+                    };
                 }
                 if units[index] == b'=' {
                     index = skip_ascii_ws(units, index + 1);
@@ -153,26 +185,48 @@ pub(crate) fn from_base64(
             }
             // Any non-whitespace content after the padding is malformed.
             if index < length {
-                return DecodeResult { bytes, read, error: true };
+                return DecodeResult {
+                    bytes,
+                    read,
+                    error: true,
+                };
             }
             // `strict` requires the chunk's overflow bits to be zero.
             let throw_extra = last_chunk == LastChunk::Strict;
             match decode_chunk(&chunk[..chunk_len], throw_extra) {
                 // A 2/3-symbol chunk yields `chunk_len - 1` bytes (1 or 2).
                 Some(decoded) => bytes.extend_from_slice(&decoded[..chunk_len - 1]),
-                None => return DecodeResult { bytes, read, error: true },
+                None => {
+                    return DecodeResult {
+                        bytes,
+                        read,
+                        error: true,
+                    };
+                }
             }
-            return DecodeResult { bytes, read: length, error: false };
+            return DecodeResult {
+                bytes,
+                read: length,
+                error: false,
+            };
         }
         let Some(v) = b64_value(c, alphabet) else {
             // A non-base64, non-whitespace symbol is malformed.
-            return DecodeResult { bytes, read, error: true };
+            return DecodeResult {
+                bytes,
+                read,
+                error: true,
+            };
         };
         // Stop before a chunk whose decoded bytes would overflow `max_len` (a
         // 2-symbol chunk needs 1 free byte, a 3-symbol chunk needs 2).
         let remaining = max_len - bytes.len();
         if (remaining == 1 && chunk_len == 2) || (remaining == 2 && chunk_len == 3) {
-            return DecodeResult { bytes, read, error: false };
+            return DecodeResult {
+                bytes,
+                read,
+                error: false,
+            };
         }
         chunk[chunk_len] = v;
         chunk_len += 1;
@@ -183,7 +237,11 @@ pub(crate) fn from_base64(
             chunk_len = 0;
             read = index;
             if bytes.len() == max_len {
-                return DecodeResult { bytes, read, error: false };
+                return DecodeResult {
+                    bytes,
+                    read,
+                    error: false,
+                };
             }
         }
     }
@@ -281,20 +339,36 @@ pub(crate) fn from_hex(units: &[u8], max_len: usize) -> DecodeResult {
     let mut bytes = Vec::new();
     if !units.len().is_multiple_of(2) {
         // Odd length: nothing is written.
-        return DecodeResult { bytes, read: 0, error: true };
+        return DecodeResult {
+            bytes,
+            read: 0,
+            error: true,
+        };
     }
     let mut i = 0usize;
     while i + 1 < units.len() {
         if bytes.len() == max_len {
-            return DecodeResult { bytes, read: i, error: false };
+            return DecodeResult {
+                bytes,
+                read: i,
+                error: false,
+            };
         }
         let (Some(hi), Some(lo)) = (hex_value(units[i]), hex_value(units[i + 1])) else {
-            return DecodeResult { bytes, read: i, error: true };
+            return DecodeResult {
+                bytes,
+                read: i,
+                error: true,
+            };
         };
         bytes.push((hi << 4) | lo);
         i += 2;
     }
-    DecodeResult { bytes, read: i, error: false }
+    DecodeResult {
+        bytes,
+        read: i,
+        error: false,
+    }
 }
 
 /// Lowercase hex encoding of `bytes`, two chars per byte.
@@ -362,7 +436,11 @@ impl<'a> Interp<'a> {
         if matches!(options.unpack(), Unpacked::Undefined) {
             return Ok(B64Alphabet::Standard);
         }
-        let Some(oh) = options.as_handle().map(Handle::from_raw).filter(|_| self.is_object_value(options)) else {
+        let Some(oh) = options
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|_| self.is_object_value(options))
+        else {
             return Err(self.type_error("options is not an object"));
         };
         let v = self.read_member(oh, "alphabet")?;
@@ -385,7 +463,11 @@ impl<'a> Interp<'a> {
         if matches!(options.unpack(), Unpacked::Undefined) {
             return Ok(LastChunk::Loose);
         }
-        let Some(oh) = options.as_handle().map(Handle::from_raw).filter(|_| self.is_object_value(options)) else {
+        let Some(oh) = options
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|_| self.is_object_value(options))
+        else {
             return Err(self.type_error("options is not an object"));
         };
         let v = self.read_member(oh, "lastChunkHandling")?;
@@ -445,7 +527,8 @@ impl<'a> Interp<'a> {
     /// properties) returned by `setFromBase64`/`setFromHex`.
     fn read_written_record(&mut self, read: usize, written: usize) -> NanBox {
         let obj = self.realm.new_object();
-        self.realm.set_property(obj, "read", NanBox::number(read as f64));
+        self.realm
+            .set_property(obj, "read", NanBox::number(read as f64));
         self.realm
             .set_property(obj, "written", NanBox::number(written as f64));
         NanBox::handle(obj.to_raw())

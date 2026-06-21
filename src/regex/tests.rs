@@ -515,9 +515,16 @@ fn inline_modifier_groups() {
         "(?ims-m:a)", // `m` in both add and remove
         "(?i-i:a)",   // single flag in both
         "(?d:a)",     // invalid flag (g/y/u/d/v/uppercase/etc.)
-        "(?g:a)", "(?u:a)", "(?y:a)", "(?I:a)", "(?Q:a)", "(?1:a)",
-        "(?i)",  // modifier flags with no `:Disjunction`
-        "(?ms-i)", "(?-s)", "(?i-)", // no colon
+        "(?g:a)",
+        "(?u:a)",
+        "(?y:a)",
+        "(?I:a)",
+        "(?Q:a)",
+        "(?1:a)",
+        "(?i)", // modifier flags with no `:Disjunction`
+        "(?ms-i)",
+        "(?-s)",
+        "(?i-)", // no colon
     ] {
         match Regex::new(src, "") {
             Ok(_) => panic!("{src} should be a SyntaxError"),
