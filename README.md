@@ -25,9 +25,12 @@ tri-modal model proven out in the sibling projects
 >
 > Conformance is measured against the **full upstream tc39/Test262** (~53k tests),
 > run in CI and gated by a known-failures ledger that only ever shrinks. The
-> current pass-rate is **≈ 89 %** of the ~43k tests run (the rest are subsystems
-> not yet implemented — ES modules, Temporal, Atomics/agents). Working areas
-> include closures, classes/inheritance, optional chaining, the iterator protocol,
+> current pass-rate is **≈ 89.2 %** of the ~44k tests run (the rest are
+> subsystems still in progress — Temporal, Atomics/agents, parts of Intl).
+> Working areas include **ES modules** (static `import`/`export`, live bindings,
+> re-exports, cycles, top-level `await`, `import.meta`) and **dynamic `import()`**,
+> explicit resource management (`using`/`await using`), closures,
+> classes/inheritance, optional chaining, the iterator protocol,
 > `Map`/`Set`/`WeakMap`/`WeakRef`/`FinalizationRegistry`, `Symbol` (with a real
 > `Symbol.prototype`), `BigInt`, `Promise` (combinators, `withResolvers`, `try`) +
 > async/await, `Proxy`/`Reflect`, typed arrays (incl. `Uint8Array` base64/hex),

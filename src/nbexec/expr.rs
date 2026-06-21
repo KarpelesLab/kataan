@@ -15,6 +15,24 @@ impl<'a> Interp<'a> {
             "Infinity" => return Ok(NanBox::number(f64::INFINITY)),
             _ => {}
         }
+        // An imported binding (`import { x } from "m"`) resolves *live* through
+        // the exporting module's own scope, so a later mutation of the export is
+        // observed here. A reference before the source module has run leaves the
+        // slot absent (TDZ) and throws a ReferenceError.
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some((src_scope, src_name)) = self.module_imports.get(name).cloned() {
+            return match src_scope.get(&src_name) {
+                Some(v) => Ok(v),
+                None => {
+                    let msg = self.new_str(&alloc::format!(
+                        "Cannot access '{name}' before initialization"
+                    ));
+                    Err(ExecError::Throw(
+                        self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                    ))
+                }
+            };
+        }
         // A bare identifier inside `with (obj)` first resolves against the
         // with-object's properties (via `[[Get]]`, so accessors fire).
         if let Some(h) = self.with_binding(name) {
@@ -608,6 +626,16 @@ impl<'a> Interp<'a> {
                 optional: call_optional,
                 ..
             } => {
+                // Dynamic `import(specifier)`. The parser desugars it to a call of
+                // the bare `import` reference; intercept it here (before that
+                // reference would throw) and return a promise of the requested
+                // module's namespace object. Works in scripts and modules alike.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Expr::Ident(id) = &**callee
+                    && id.name.as_ref() == "import"
+                {
+                    return self.dynamic_import(arguments);
+                }
                 // `super(args)` — invoke the base constructor on the current
                 // instance.
                 if matches!(&**callee, Expr::Super(_)) {
@@ -1052,6 +1080,17 @@ impl<'a> Interp<'a> {
                 optional,
                 ..
             } => {
+                // `import.meta` — the module meta-property. The parser desugars it
+                // to `(import).meta`; resolve it to the current module's meta
+                // object (set up by the module evaluator) here, before the bare
+                // `import` reference would throw "import is not defined".
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Expr::Ident(id) = &**object
+                    && id.name.as_ref() == "import"
+                    && matches!(property, PropertyKey::Ident(p) if &**p == "meta")
+                {
+                    return Ok(self.import_meta.unwrap_or_else(NanBox::undefined));
+                }
                 // `super.name` reads a super getter/method (not via `this`).
                 if matches!(&**object, Expr::Super(_)) {
                     // `super[expr]` — a computed super member. Outside any method

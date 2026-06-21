@@ -4192,6 +4192,70 @@ pub fn execute_typed(
     }
 }
 
+/// Loads, links, and evaluates the ES-module graph rooted at the resolved
+/// `entry_key` through `host`, returning `(console_output, completion_string)`
+/// or a structured [`Thrown`](crate::nbexec::Thrown). Modules run on the
+/// reference tree-walker (the bytecode tier has no module support yet); this is
+/// the entry the Test262 runner uses for `flags: [module]` tests.
+///
+/// # Errors
+/// Returns [`Thrown`](crate::nbexec::Thrown) for any parse/link/runtime failure.
+#[cfg(all(feature = "std", feature = "module"))]
+pub fn execute_module_typed(
+    entry_key: &str,
+    host: &dyn crate::nbexec::module::ModuleHost,
+    limits: crate::limits::Limits,
+) -> Result<(String, String), crate::nbexec::Thrown> {
+    crate::nbexec::module::eval_module_typed(entry_key, host, limits)
+}
+
+/// Like [`execute_module_typed`] but with a flattened error message (for the CLI
+/// / embedders).
+///
+/// # Errors
+/// Returns a human-readable message on any failure.
+#[cfg(all(feature = "std", feature = "module"))]
+pub fn execute_module(
+    entry_key: &str,
+    host: &dyn crate::nbexec::module::ModuleHost,
+    limits: crate::limits::Limits,
+) -> Result<(String, String), String> {
+    crate::nbexec::module::eval_module(entry_key, host, limits)
+}
+
+/// Evaluates `prelude` (script) into the realm global, then runs the module
+/// graph rooted at `entry_key`. The Test262 runner uses this to make the
+/// `assert.js`/`sta.js` harness (and `includes`) available to a module test.
+///
+/// # Errors
+/// Returns [`Thrown`](crate::nbexec::Thrown) for any failure.
+#[cfg(all(feature = "std", feature = "module"))]
+pub fn execute_module_typed_with_prelude(
+    entry_key: &str,
+    host: &dyn crate::nbexec::module::ModuleHost,
+    prelude: &str,
+    limits: crate::limits::Limits,
+) -> Result<(String, String), crate::nbexec::Thrown> {
+    crate::nbexec::module::eval_module_typed_with_prelude(entry_key, host, prelude, limits)
+}
+
+/// Runs `source` as an ordinary **script** but sets a base path so a dynamic
+/// `import("./sibling.js")` inside it resolves relative to `base_path` (the
+/// script file) rather than the process working directory. Used for the Test262
+/// `language/expressions/dynamic-import/` tests, which are scripts that import
+/// sibling `_FIXTURE.js` files. Returns a typed error like [`execute_typed`].
+///
+/// # Errors
+/// Returns [`Thrown`](crate::nbexec::Thrown) for a parse failure or uncaught throw.
+#[cfg(all(feature = "std", feature = "module"))]
+pub fn execute_script_typed_with_import_base(
+    source: &str,
+    base_path: &str,
+    limits: crate::limits::Limits,
+) -> Result<(String, String), crate::nbexec::Thrown> {
+    crate::nbexec::module::eval_script_typed_with_import_base(source, base_path, limits)
+}
+
 /// Whether `program` references the dynamic-code intrinsics `eval` or `Function`
 /// (the `Function` constructor). The bytecode VM has no live tree-walk scope to
 /// support direct `eval`'s scope access, and dynamic code is comparatively rare,

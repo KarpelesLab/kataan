@@ -55,6 +55,33 @@ impl<'src> Parser<'src> {
         Ok(program)
     }
 
+    /// Parses a source as an ECMAScript **module** (the `Module` goal symbol):
+    /// the top level is module-strict and permits top-level `await` (the module
+    /// body is the outermost async context), and `import`/`export` declarations
+    /// are allowed. The result's `source_type` is always [`SourceType::Module`].
+    ///
+    /// Used by the module loader (`Parser::parse_program` infers the goal from
+    /// the presence of `import`/`export`, but cannot enable top-level `await`
+    /// before it has parsed — a module known to be a module up front does).
+    ///
+    /// # Errors
+    /// Returns a parse-phase `SyntaxError` on malformed input.
+    pub fn parse_module(source: &'src str) -> Result<Program> {
+        let mut p = Parser::new(source)?;
+        // The module body is the outermost async context, so top-level `await`
+        // is an operator (not an identifier).
+        p.in_async = true;
+        let body = p.parse_statement_list(TokenKind::Eof)?;
+        p.expect(TokenKind::Eof)?;
+        let program = Program {
+            body,
+            source_type: SourceType::Module,
+            span: Span::new(0, source.len() as u32),
+        };
+        super::validate::validate_program(&program)?;
+        Ok(program)
+    }
+
     /// Parses statements until `terminator` (or `Eof`). Items in a statement
     /// list are `StatementListItem`s, so declarations (`let`/`const`/`class`/…)
     /// are permitted here.

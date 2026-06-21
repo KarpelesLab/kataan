@@ -279,7 +279,7 @@ fn hex_value(c: u8) -> Option<u8> {
 /// kept, for `setFromHex`'s write-up-to-error behavior).
 pub(crate) fn from_hex(units: &[u8], max_len: usize) -> DecodeResult {
     let mut bytes = Vec::new();
-    if units.len() % 2 != 0 {
+    if !units.len().is_multiple_of(2) {
         // Odd length: nothing is written.
         return DecodeResult { bytes, read: 0, error: true };
     }
@@ -434,8 +434,9 @@ impl<'a> Interp<'a> {
         NanBox::handle(view.to_raw())
     }
 
-    /// A `SyntaxError` with `message` — the malformed-input error for the codecs.
-    fn syntax_error(&mut self, message: &str) -> ExecError {
+    /// A `SyntaxError` with `message` — the malformed-input error for the codecs
+    /// (also used by the module loader/linker for parse/link-phase errors).
+    pub(crate) fn syntax_error(&mut self, message: &str) -> ExecError {
         let m = self.new_str(message);
         ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m)))
     }

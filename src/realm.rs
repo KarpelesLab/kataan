@@ -2220,9 +2220,11 @@ impl Realm {
         // An array index is an element of the dense store (or a hole carrying an aux
         // accessor), not a named slot — `delete arr[i]` must punch a hole there, not
         // merely touch the aux object.
-        if self.heap.get(handle).and_then(Cell::as_array).is_some() && key != "length" {
-            if let Ok(i) = key.parse::<usize>()
-                && alloc::format!("{i}") == key
+        if self.heap.get(handle).and_then(Cell::as_array).is_some()
+            && key != "length"
+            && let Ok(i) = key.parse::<usize>()
+            && alloc::format!("{i}") == key
+        {
             {
                 // A present element, or an accessor installed over a hole, is the own
                 // property to delete. Anything else (out of range, an already-absent

@@ -437,6 +437,29 @@ pub struct Interp<'a> {
     /// not re-leak. The leak is bounded by the number of *distinct* eval/Function
     /// sources a program produces.
     eval_programs: alloc::collections::BTreeMap<String, &'static Program>,
+    /// The ES-module loader/linker/evaluator state, present only while running a
+    /// module graph (or after a dynamic `import()` has loaded one). `None` for a
+    /// plain script — module support is purely additive. See [`module`].
+    #[cfg(all(feature = "module", feature = "std"))]
+    modules: module::ModuleRegistry,
+    /// The import-binding alias table of the *currently evaluating* module:
+    /// `local name -> (exporting module's scope, that module's local name)`.
+    /// An identifier read consults this first so an imported binding resolves —
+    /// *live* — through the exporting module's own scope (so a post-evaluation
+    /// mutation in the exporter is observed here). Swapped on each module
+    /// boundary; empty for a script.
+    #[cfg(all(feature = "module", feature = "std"))]
+    module_imports: alloc::rc::Rc<alloc::collections::BTreeMap<String, (Scope, String)>>,
+    /// `import.meta` for the currently evaluating module (an object with at least
+    /// `url`); `None` outside module code.
+    #[cfg(all(feature = "module", feature = "std"))]
+    import_meta: Option<NanBox>,
+    /// A base "referrer" key for dynamic `import()` evaluated from *script* code
+    /// (which has no enclosing module). Lets a script's `import("./x.js")`
+    /// resolve relative to the script file rather than the process cwd. `None`
+    /// for an ordinary script run.
+    #[cfg(all(feature = "module", feature = "std"))]
+    script_import_base: Option<String>,
 }
 
 /// A queued promise reaction: run `handler` with `value`, then settle `result`
@@ -1766,6 +1789,8 @@ mod intl_fmt;
 mod iterator;
 mod json;
 mod method_dispatch;
+#[cfg(all(feature = "module", feature = "std"))]
+pub mod module;
 mod native_dispatch;
 mod object;
 mod promise;
@@ -1846,6 +1871,14 @@ impl<'a> Interp<'a> {
             global_scope: Scope::root(),
             shadow_realm_scopes: Vec::new(),
             eval_programs: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "module", feature = "std"))]
+            modules: module::ModuleRegistry::new(),
+            #[cfg(all(feature = "module", feature = "std"))]
+            module_imports: alloc::rc::Rc::new(alloc::collections::BTreeMap::new()),
+            #[cfg(all(feature = "module", feature = "std"))]
+            import_meta: None,
+            #[cfg(all(feature = "module", feature = "std"))]
+            script_import_base: None,
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run
@@ -3978,6 +4011,10 @@ impl<'a> Interp<'a> {
             }
         }
         for stmt in stmts {
+            // A module's `export function f(){}` / `export default function f(){}`
+            // hoists `f` exactly like a bare function declaration: unwrap the
+            // export wrapper to reach the inner function declaration.
+            let stmt = unwrap_exported_function(stmt);
             if let Stmt::Function(func) = stmt
                 && let Some(id) = &func.id
             {
@@ -4188,6 +4225,25 @@ impl<'a> Interp<'a> {
 /// Collects `var`-declared identifier names in `stmts`, recursing through nested
 /// statements but NOT into nested function bodies (which have their own scope) —
 /// for hoisting `var` bindings to the enclosing function/program scope.
+/// If `stmt` is an `export <decl>` / `export default <decl>` wrapper around a
+/// function/var/class declaration, returns the inner declaration; otherwise
+/// returns `stmt` unchanged. Lets the shared hoisting machinery treat an
+/// exported declaration exactly like a bare one.
+#[cfg(all(feature = "module", feature = "std"))]
+fn unwrap_exported_function(stmt: &Stmt) -> &Stmt {
+    use crate::ast::ExportDecl;
+    match stmt {
+        Stmt::Export(ExportDecl::Decl { declaration, .. })
+        | Stmt::Export(ExportDecl::Default { declaration, .. }) => declaration,
+        _ => stmt,
+    }
+}
+
+#[cfg(not(all(feature = "module", feature = "std")))]
+fn unwrap_exported_function(stmt: &Stmt) -> &Stmt {
+    stmt
+}
+
 fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
     use crate::ast::VarDeclKind;
     fn from_decl<'a>(decl: &'a crate::ast::VarDecl, out: &mut Vec<&'a str>) {
@@ -4202,6 +4258,12 @@ fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
     for stmt in stmts {
         match stmt {
             Stmt::Var(decl) => from_decl(decl, out),
+            // `export var x = …` var-hoists `x` like a bare `var`.
+            Stmt::Export(crate::ast::ExportDecl::Decl { declaration, .. }) => {
+                if let Stmt::Var(decl) = &**declaration {
+                    from_decl(decl, out);
+                }
+            }
             Stmt::Block { body, .. } => collect_var_names(body, out),
             Stmt::If {
                 consequent,
@@ -5877,7 +5939,7 @@ fn format_thrown(interp: &Interp, thrown: NanBox) -> String {
 /// both the human-readable [`format_thrown`] and the structured [`Thrown`] the
 /// conformance runner uses to verify a negative test's declared error *type*.
 /// Returns `None` for a non-error thrown value (e.g. `throw 42`).
-fn error_name_message(interp: &Interp, thrown: NanBox) -> Option<(String, String)> {
+pub(crate) fn error_name_message(interp: &Interp, thrown: NanBox) -> Option<(String, String)> {
     let raw = thrown.as_handle()?;
     let h = Handle::from_raw(raw);
     let realm = interp.realm();

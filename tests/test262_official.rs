@@ -239,9 +239,6 @@ fn assemble(
 
 /// Decides whether a test is out of scope for the current engine/build.
 fn skip_reason(rel: &str, meta: &Meta) -> Option<&'static str> {
-    if meta.has_flag("module") {
-        return Some("module (no ES-module executor yet)");
-    }
     if rel.starts_with("staging/") {
         return Some("staging");
     }
@@ -256,12 +253,63 @@ fn skip_reason(rel: &str, meta: &Meta) -> Option<&'static str> {
     None
 }
 
-/// Runs one assembled program through the production engine path and classifies
-/// it against the test's expectation.
-fn run_mode(combined: &str, meta: &Meta) -> Result<(), String> {
-    let res = kataan::nbvm::execute_typed(combined, Limits::default());
+/// Builds the harness *prelude* (everything `assemble` prepends except the test
+/// source itself) for a module test: the host prelude, `sta.js` + `assert.js`,
+/// `doneprintHandle.js` for an async test, and any `includes`. Evaluated as a
+/// script in the module realm's global so the module body sees `assert` etc.
+fn module_prelude(harness: &std::collections::HashMap<String, String>, meta: &Meta) -> String {
+    let mut out = String::new();
+    out.push_str(HOST_PRELUDE);
+    for h in ["sta.js", "assert.js"] {
+        if let Some(s) = harness.get(h) {
+            out.push_str(s);
+            out.push('\n');
+        }
+    }
+    if meta.has_flag("async")
+        && let Some(s) = harness.get("doneprintHandle.js")
+    {
+        out.push_str(s);
+        out.push('\n');
+    }
+    for inc in &meta.includes {
+        if let Some(s) = harness.get(inc) {
+            out.push_str(s);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Runs a `flags: [module]` test: the test FILE is the entry module, evaluated
+/// (after the harness prelude) with file-relative resolution of its imports
+/// (`import "./x_FIXTURE.js"` loads the sibling). Classifies the outcome against
+/// the test's expectation exactly like [`run_mode`].
+fn run_module_test(
+    path: &std::path::Path,
+    harness: &std::collections::HashMap<String, String>,
+    meta: &Meta,
+) -> Result<(), String> {
+    let prelude = module_prelude(harness, meta);
+    let key = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+    let res = kataan::nbvm::execute_module_typed_with_prelude(
+        &key,
+        &kataan::nbexec::module::FileModuleHost,
+        &prelude,
+        Limits::default(),
+    );
+    classify(res, meta)
+}
+
+/// Classifies an engine result `(output, _)` / `Thrown` against the test's
+/// positive/negative + async expectation. Shared by the script and module paths.
+fn classify(
+    res: Result<(String, String), kataan::nbexec::Thrown>,
+    meta: &Meta,
+) -> Result<(), String> {
     match (&meta.negative, res) {
-        // Positive, non-async: must complete cleanly.
         (None, Ok((output, _))) => {
             if meta.has_flag("async") {
                 if output.contains("Test262:AsyncTestComplete")
@@ -275,13 +323,9 @@ fn run_mode(combined: &str, meta: &Meta) -> Result<(), String> {
                 Ok(())
             }
         }
-        (None, Err(t)) => Err(format!(
-            "expected pass, {:?} {}: {}",
-            t.phase, t.name, t.message
-        )),
-        // Negative: must fail at the declared phase with the declared type.
+        (None, Err(t)) => Err(format!("expected pass, {:?} {}: {}", t.phase, t.name, t.message)),
         (Some((phase, ty)), Err(t)) => {
-            let want_parse = phase == "parse" || phase == "early";
+            let want_parse = phase == "parse" || phase == "early" || phase == "resolution";
             let phase_ok = (want_parse && t.phase == ErrorPhase::Parse)
                 || (!want_parse && t.phase == ErrorPhase::Runtime);
             if !phase_ok {
@@ -300,12 +344,49 @@ fn run_mode(combined: &str, meta: &Meta) -> Result<(), String> {
     }
 }
 
+/// Runs one assembled program through the production engine path and classifies
+/// it against the test's expectation.
+fn run_mode(combined: &str, meta: &Meta) -> Result<(), String> {
+    classify(kataan::nbvm::execute_typed(combined, Limits::default()), meta)
+}
+
 /// Runs all required modes for one test; passes only if every mode passes.
+/// `path` is the absolute test-file path (for file-relative module / dynamic-
+/// import resolution).
 fn run_test(
+    path: &std::path::Path,
     harness: &std::collections::HashMap<String, String>,
     meta: &Meta,
     src: &str,
 ) -> Result<(), String> {
+    // A `flags: [module]` test runs as an ES module (the file is the entry
+    // module), with the harness installed as a global prelude. Modules are always
+    // strict and run once (no sloppy/strict dual mode).
+    if meta.has_flag("module") {
+        return run_module_test(path, harness, meta);
+    }
+    // Dynamic-import tests are scripts that call `import("./x_FIXTURE.js")`; the
+    // specifier must resolve relative to the test file, so run them with the
+    // file as the import base (still strict/sloppy dual mode + harness).
+    let dynamic_import = path.to_string_lossy().contains("dynamic-import")
+        && src.contains("import(");
+    let base = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+    let run = |combined: &str| -> Result<(), String> {
+        if dynamic_import {
+            classify(
+                kataan::nbvm::execute_script_typed_with_import_base(
+                    combined,
+                    &base,
+                    Limits::default(),
+                ),
+                meta,
+            )
+        } else {
+            run_mode(combined, meta)
+        }
+    };
     let raw = meta.has_flag("raw");
     let (do_sloppy, do_strict) = if raw {
         (true, false)
@@ -317,11 +398,10 @@ fn run_test(
         (true, true)
     };
     if do_sloppy {
-        run_mode(&assemble(false, harness, meta, src), meta)
-            .map_err(|e| format!("[sloppy] {e}"))?;
+        run(&assemble(false, harness, meta, src)).map_err(|e| format!("[sloppy] {e}"))?;
     }
     if do_strict {
-        run_mode(&assemble(true, harness, meta, src), meta).map_err(|e| format!("[strict] {e}"))?;
+        run(&assemble(true, harness, meta, src)).map_err(|e| format!("[strict] {e}"))?;
     }
     Ok(())
 }
@@ -429,7 +509,7 @@ fn run_worker(spec: &str) {
         let _ = writeln!(f, "S\t{cur}\t{rel}");
         let _ = f.flush();
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_test(&harness, &meta, &src)
+            run_test(path, &harness, &meta, &src)
         }));
         let (st, reason) = match res {
             Ok(Ok(())) => ("PASS", String::new()),
