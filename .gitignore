@@ -7,3 +7,7 @@
 
 # Local Claude Code agent state (worktrees, memory, settings)
 .claude/
+
+# Python bytecode caches (stray helper-script artifacts)
+__pycache__/
+*.pyc
