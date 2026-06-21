@@ -4538,9 +4538,27 @@ fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
                     walk(from_ref(body), out, true, &for_lex);
                 }
                 Stmt::Try {
-                    block, finalizer, ..
+                    block,
+                    handler,
+                    finalizer,
+                    ..
                 } => {
                     walk(block, out, true, &blocked_here);
+                    if let Some(h) = handler {
+                        // Annex B.3.5: a *simple* (BindingIdentifier) catch
+                        // parameter does NOT block a same-named block function
+                        // from var-hoisting (`catch (f) { { function f(){} } }`
+                        // still hoists `f`). A *destructuring* catch parameter's
+                        // names are lexical and do block (a `var` of the same
+                        // name there would be an early error).
+                        let mut catch_blocked: Vec<&str> = blocked_here.clone();
+                        if let Some(p @ (BindingTarget::Object(_) | BindingTarget::Array(_))) =
+                            &h.param
+                        {
+                            collect_binding_idents(p, &mut catch_blocked);
+                        }
+                        walk(&h.body, out, true, &catch_blocked);
+                    }
                     if let Some(f) = finalizer {
                         walk(f, out, true, &blocked_here);
                     }

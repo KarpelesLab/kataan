@@ -1203,7 +1203,15 @@ impl<'a> Interp<'a> {
         // Run from the matched clause, falling through until `break`.
         let child = self.current.child();
         let saved = core::mem::replace(&mut self.current, child);
+        // A switch body is a single lexical scope shared by all cases: hoist the
+        // block-level function declarations of *every* case into it (regardless
+        // of which clause matched), mirroring a block's `exec_seq` hoist. Without
+        // this, a `function f(){}` inside a `case` is never instantiated and the
+        // Annex B.3.3 runtime update of its outer `var` binding cannot fire.
         let result = (|| {
+            for case in cases {
+                self.hoist(&case.body)?;
+            }
             for case in &cases[start..] {
                 for stmt in &case.body {
                     match self.exec(stmt)? {
