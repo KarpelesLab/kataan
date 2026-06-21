@@ -399,7 +399,7 @@ const INTL_SERVICES: &[IntlService] = &[
         ctor_id: N_INTL_PLURAL_RULES,
         tag: "Intl.PluralRules",
         marker: "\u{0}brand_pr",
-        methods: &["resolvedOptions", "select"],
+        methods: &["resolvedOptions", "select", "selectRange"],
         bound_accessor: None,
     },
     IntlService {
@@ -454,6 +454,7 @@ fn intl_method_arity(ctor_id: u16, name: &str) -> u32 {
     match (ctor_id, name) {
         (_, "resolvedOptions") => 0,
         (N_INTL_REL_TIME, "format" | "formatToParts") => 2,
+        (N_INTL_PLURAL_RULES, "selectRange") => 2,
         _ => 1,
     }
 }
@@ -467,6 +468,7 @@ impl<'a> Interp<'a> {
             "formatToParts" | "format_to_parts" => N_INTL_FORMAT_TO_PARTS,
             "compare" => N_INTL_COMPARE,
             "select" => N_INTL_PLURAL_SELECT,
+            "selectRange" => N_INTL_PLURAL_SELECT_RANGE,
             "of" => N_INTL_DISPLAY_NAMES_OF,
             "segment" => N_INTL_SEGMENTER_SEGMENT,
             "list_format" => N_INTL_LIST_FORMAT_FORMAT,
@@ -983,7 +985,60 @@ impl<'a> Interp<'a> {
             )?
             .unwrap();
 
-        // --- SetNumberFormatDigitOptions ---
+        // --- SetNumberFormatDigitOptions --- (shared with Intl.PluralRules).
+        self.set_number_format_digit_options(obj, opts)?;
+
+        // compactDisplay, useGrouping, signDisplay.
+        let compact_display =
+            self.get_string_option(opts, "compactDisplay", &["short", "long"], Some("short"))?;
+        if notation == "compact" {
+            self.store_str(obj, "compactDisplay", &compact_display);
+        }
+        // useGrouping: ECMA-402 accepts a boolean or "min2"/"auto"/"always". Read
+        // it without enum validation, then normalize.
+        let ug_raw = match opts {
+            Some(h) => self.read_member(h, "useGrouping")?,
+            None => NanBox::undefined(),
+        };
+        let use_grouping_val = self.normalize_use_grouping(ug_raw)?;
+        let sign_display = self
+            .get_string_option(
+                opts,
+                "signDisplay",
+                &["auto", "never", "always", "exceptZero", "negative"],
+                Some("auto"),
+            )?
+            .unwrap();
+
+        // Store notation/sign options for resolvedOptions + formatting (the digit
+        // options were stored by `set_number_format_digit_options`).
+        self.store_str(obj, "notation", &Some(notation));
+        self.store_str(obj, "signDisplay", &Some(sign_display));
+        match use_grouping_val {
+            UseGroupingResolved::Bool(b) => {
+                self.realm
+                    .set_hidden_property(obj, "useGrouping", NanBox::boolean(b));
+            }
+            UseGroupingResolved::Str(s) => {
+                let sv = self.new_str(s);
+                self.realm.set_hidden_property(obj, "useGrouping", sv);
+            }
+        }
+        Ok(())
+    }
+
+    /// `SetNumberFormatDigitOptions`: reads, validates, and stores the shared
+    /// number-format digit slots (`minimumIntegerDigits`, the fraction/significant
+    /// digit pairs, `roundingIncrement`, `roundingMode`, `roundingPriority`,
+    /// `trailingZeroDisplay`) on `obj` under their own hidden keys, in spec read
+    /// order. Shared by `Intl.NumberFormat` and `Intl.PluralRules` so both honor the
+    /// same option semantics and constructor option-read order. An invalid value is a
+    /// RangeError; a Symbol is a TypeError (via the option getters).
+    fn set_number_format_digit_options(
+        &mut self,
+        obj: Handle,
+        opts: Option<Handle>,
+    ) -> Result<(), ExecError> {
         let mnid = self
             .get_int_option(opts, "minimumIntegerDigits", 1.0, 21.0, Some(1.0))?
             .unwrap();
@@ -1051,29 +1106,6 @@ impl<'a> Interp<'a> {
             )?
             .unwrap();
 
-        // compactDisplay, useGrouping, signDisplay.
-        let compact_display =
-            self.get_string_option(opts, "compactDisplay", &["short", "long"], Some("short"))?;
-        if notation == "compact" {
-            self.store_str(obj, "compactDisplay", &compact_display);
-        }
-        // useGrouping: ECMA-402 accepts a boolean or "min2"/"auto"/"always". Read
-        // it without enum validation, then normalize.
-        let ug_raw = match opts {
-            Some(h) => self.read_member(h, "useGrouping")?,
-            None => NanBox::undefined(),
-        };
-        let use_grouping_val = self.normalize_use_grouping(ug_raw)?;
-        let sign_display = self
-            .get_string_option(
-                opts,
-                "signDisplay",
-                &["auto", "never", "always", "exceptZero", "negative"],
-                Some("auto"),
-            )?
-            .unwrap();
-
-        // Store digit/notation/sign options for resolvedOptions + formatting.
         self.realm
             .set_hidden_property(obj, "minimumIntegerDigits", NanBox::number(mnid));
         if let Some(v) = mnfd {
@@ -1094,21 +1126,9 @@ impl<'a> Interp<'a> {
         }
         self.realm
             .set_hidden_property(obj, "roundingIncrement", NanBox::number(rinc));
-        self.store_str(obj, "notation", &Some(notation));
         self.store_str(obj, "roundingMode", &Some(rounding_mode));
         self.store_str(obj, "roundingPriority", &Some(rounding_priority));
         self.store_str(obj, "trailingZeroDisplay", &Some(tzd));
-        self.store_str(obj, "signDisplay", &Some(sign_display));
-        match use_grouping_val {
-            UseGroupingResolved::Bool(b) => {
-                self.realm
-                    .set_hidden_property(obj, "useGrouping", NanBox::boolean(b));
-            }
-            UseGroupingResolved::Str(s) => {
-                let sv = self.new_str(s);
-                self.realm.set_hidden_property(obj, "useGrouping", sv);
-            }
-        }
         Ok(())
     }
 
@@ -1306,6 +1326,77 @@ impl<'a> Interp<'a> {
             let ns = get_str(self, "numberingSystem").unwrap_or_else(|| String::from("latn"));
             let nsv = self.new_str(&ns);
             self.realm.set_property(out, "numberingSystem", nsv);
+        } else if kind == "plural" {
+            // `Intl.PluralRules.prototype.resolvedOptions()` — the key order is
+            // `{ locale, type, notation, minimumIntegerDigits, (fraction|significant
+            // digit pair), pluralCategories, roundingIncrement, roundingMode,
+            // roundingPriority, trailingZeroDisplay }`.
+            let pr_type = get_str(self, "type").unwrap_or_else(|| String::from("cardinal"));
+            let tv = self.new_str(&pr_type);
+            self.realm.set_property(out, "type", tv);
+            let notation = get_str(self, "notation").unwrap_or_else(|| String::from("standard"));
+            let nv = self.new_str(&notation);
+            self.realm.set_property(out, "notation", nv);
+            if notation == "compact" {
+                let cd = get_str(self, "compactDisplay").unwrap_or_else(|| String::from("short"));
+                let cdv = self.new_str(&cd);
+                self.realm.set_property(out, "compactDisplay", cdv);
+            }
+            // Digit options, resolved as in SetNumberFormatDigitOptions (decimal
+            // defaults: minimumFractionDigits 0, maximumFractionDigits 3).
+            let mnid = get_num(self, "minimumIntegerDigits").unwrap_or(1.0);
+            self.realm
+                .set_property(out, "minimumIntegerDigits", NanBox::number(mnid));
+            let mnsd = get_num(self, "minimumSignificantDigits");
+            let mxsd = get_num(self, "maximumSignificantDigits");
+            let mnfd_opt = get_num(self, "minimumFractionDigits");
+            let mxfd_opt = get_num(self, "maximumFractionDigits");
+            let priority =
+                get_str(self, "roundingPriority").unwrap_or_else(|| String::from("auto"));
+            let has_sig = mnsd.is_some() || mxsd.is_some();
+            let report_frac = |this: &mut Self, out: Handle| {
+                let mnfd = mnfd_opt.unwrap_or(0.0);
+                let mxfd = mxfd_opt.unwrap_or_else(|| 3.0_f64.max(mnfd));
+                this.realm
+                    .set_property(out, "minimumFractionDigits", NanBox::number(mnfd));
+                this.realm
+                    .set_property(out, "maximumFractionDigits", NanBox::number(mxfd));
+            };
+            let report_sig = |this: &mut Self, out: Handle| {
+                let mnsd = mnsd.unwrap_or(1.0);
+                let mxsd = mxsd.unwrap_or(21.0);
+                this.realm
+                    .set_property(out, "minimumSignificantDigits", NanBox::number(mnsd));
+                this.realm
+                    .set_property(out, "maximumSignificantDigits", NanBox::number(mxsd));
+            };
+            if priority == "morePrecision" || priority == "lessPrecision" {
+                report_frac(self, out);
+                report_sig(self, out);
+            } else if has_sig {
+                report_sig(self, out);
+            } else {
+                report_frac(self, out);
+            }
+            // pluralCategories: a fresh sorted array on every call.
+            let ordinal = pr_type == "ordinal";
+            let cats = self.plural_categories(&locale, ordinal);
+            let cat_vals: Vec<NanBox> = cats.iter().map(|c| self.new_str(c)).collect();
+            let arr = self.realm.new_array(cat_vals);
+            self.realm
+                .set_property(out, "pluralCategories", NanBox::handle(arr.to_raw()));
+            // Rounding options.
+            let rinc = get_num(self, "roundingIncrement").unwrap_or(1.0);
+            self.realm
+                .set_property(out, "roundingIncrement", NanBox::number(rinc));
+            let rm = get_str(self, "roundingMode").unwrap_or_else(|| String::from("halfExpand"));
+            let rmv = self.new_str(&rm);
+            self.realm.set_property(out, "roundingMode", rmv);
+            let rp = self.new_str(&priority);
+            self.realm.set_property(out, "roundingPriority", rp);
+            let tzd = get_str(self, "trailingZeroDisplay").unwrap_or_else(|| String::from("auto"));
+            let tzv = self.new_str(&tzd);
+            self.realm.set_property(out, "trailingZeroDisplay", tzv);
         } else if kind == "number" {
             let ns = get_str(self, "numberingSystem").unwrap_or_else(|| String::from("latn"));
             let nsv = self.new_str(&ns);
@@ -1878,28 +1969,172 @@ impl<'a> Interp<'a> {
         parts
     }
 
-    /// Builds an `Intl.PluralRules` instance: an object capturing the locale and `type`
-    /// (cardinal/ordinal) with a readable `select(n)` method.
-    pub(crate) fn make_plural_rules(&mut self, args: &[NanBox]) -> NanBox {
+    /// Builds an `Intl.PluralRules` instance (`InitializePluralRules`): canonicalizes
+    /// the locale list, reads `localeMatcher`/`type`/`notation`/`compactDisplay` and
+    /// the shared `SetNumberFormatDigitOptions` slots (in spec read order), and stores
+    /// the resolved configuration behind hidden keys for `select`/`selectRange`/
+    /// `resolvedOptions`. A non-object `options` (other than `undefined`) is a
+    /// TypeError; an invalid option value is a RangeError.
+    pub(crate) fn make_plural_rules(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
-        let locale = args
-            .first()
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|h| self.realm.string_value(h))
+        // Mark the instance kind so `resolvedOptions` reports the PluralRules shape.
+        let kindv = self.new_str("plural");
+        self.realm.set_hidden_property(obj, "\u{0}intl", kindv);
+        self.brand_intl_instance(obj, N_INTL_PLURAL_RULES);
+        // CanonicalizeLocaleList(locales): a malformed tag is a RangeError; the
+        // resolved locale is the first requested tag, else the default.
+        let requested =
+            self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
+        let locale = requested
+            .into_iter()
+            .next()
             .unwrap_or_else(|| String::from("en"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
-        if let Some(opts) = args
-            .get(1)
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            && let Some(v) = self.realm.get_property(opts, "type")
-        {
-            self.realm.set_hidden_property(obj, "type", v);
+        // GetOptionsObject: undefined → no options; a non-object → TypeError.
+        let opts_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
+        let opts = if matches!(opts_arg.unpack(), Unpacked::Undefined) {
+            None
+        } else if self.is_object_value(opts_arg) {
+            opts_arg.as_handle().map(Handle::from_raw)
+        } else {
+            return Err(self.type_error("Intl.PluralRules options must be an object"));
+        };
+        // localeMatcher (validated, not otherwise used).
+        let _ = self.get_string_option(
+            opts,
+            "localeMatcher",
+            &["lookup", "best fit"],
+            Some("best fit"),
+        )?;
+        // type: "cardinal" (default) or "ordinal".
+        let pr_type = self
+            .get_string_option(opts, "type", &["cardinal", "ordinal"], Some("cardinal"))?
+            .unwrap();
+        self.store_str(obj, "type", &Some(pr_type));
+        // notation: "standard" (default) | "compact" | "scientific" | "engineering".
+        let notation = self
+            .get_string_option(
+                opts,
+                "notation",
+                &["standard", "compact", "scientific", "engineering"],
+                Some("standard"),
+            )?
+            .unwrap();
+        // compactDisplay is read regardless, but only stored when notation is compact.
+        let compact_display =
+            self.get_string_option(opts, "compactDisplay", &["short", "long"], Some("short"))?;
+        if notation == "compact" {
+            self.store_str(obj, "compactDisplay", &compact_display);
         }
-        self.brand_intl_instance(obj, N_INTL_PLURAL_RULES);
-        NanBox::handle(obj.to_raw())
+        self.store_str(obj, "notation", &Some(notation));
+        // SetNumberFormatDigitOptions (shared with Intl.NumberFormat).
+        self.set_number_format_digit_options(obj, opts)?;
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    /// The plural category name (`"zero"`/`"one"`/`"two"`/`"few"`/`"many"`/`"other"`)
+    /// of `n` per the receiver `Intl.PluralRules` instance's `[[Locale]]` and
+    /// `[[Type]]`. A non-finite `n` is always `"other"`. With the `intl` feature this
+    /// uses the crate's CLDR cardinal/ordinal rules; otherwise it falls back to the
+    /// English rule (`1` → `"one"`, else `"other"`). Shared by `select`/`selectRange`.
+    pub(crate) fn plural_select_category(&mut self, n: f64) -> &'static str {
+        if !n.is_finite() {
+            return "other";
+        }
+        #[cfg(feature = "intl")]
+        {
+            let fmt = self.this_val.as_handle().map(Handle::from_raw);
+            let locale = fmt
+                .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_else(|| String::from("en"));
+            let ordinal = fmt
+                .and_then(|h| self.realm.get_property(h, "type"))
+                .map(|v| self.realm.to_display_string(v))
+                .as_deref()
+                == Some("ordinal");
+            let ops = if n == (n as i64) as f64 {
+                intl::plural::PluralOperands::from_int(n as i64)
+            } else {
+                intl::plural::PluralOperands::parse(&alloc::format!("{n}"))
+                    .unwrap_or_else(|| intl::plural::PluralOperands::from_int(n as i64))
+            };
+            let cat = if ordinal {
+                intl::plural::ordinal_category(&locale, &ops)
+            } else {
+                intl::plural::plural_category(&locale, &ops)
+            };
+            use intl::plural::PluralCategory::*;
+            match cat {
+                Zero => "zero",
+                One => "one",
+                Two => "two",
+                Few => "few",
+                Many => "many",
+                Other => "other",
+            }
+        }
+        #[cfg(not(feature = "intl"))]
+        {
+            if n == 1.0 { "one" } else { "other" }
+        }
+    }
+
+    /// The sorted `pluralCategories` list for an `Intl.PluralRules` instance's
+    /// locale+type: the distinct categories its cardinal (or ordinal) rules can
+    /// produce, in CLDR order (`zero`, `one`, `two`, `few`, `many`, `other`). With
+    /// the `intl` feature this probes the crate's rules over a representative sample
+    /// of operands; otherwise it returns the English cardinal set `["one","other"]`.
+    pub(crate) fn plural_categories(&mut self, locale: &str, ordinal: bool) -> Vec<&'static str> {
+        const ORDER: [&str; 6] = ["zero", "one", "two", "few", "many", "other"];
+        #[cfg(feature = "intl")]
+        {
+            use intl::plural::PluralCategory::*;
+            let name = |c: intl::plural::PluralCategory| -> &'static str {
+                match c {
+                    Zero => "zero",
+                    One => "one",
+                    Two => "two",
+                    Few => "few",
+                    Many => "many",
+                    Other => "other",
+                }
+            };
+            let mut seen: Vec<&'static str> = Vec::new();
+            // Probe a representative sample of operands: integers 0..=200 capture the
+            // mod-10/mod-100 rule structure, plus a couple of fractional and large
+            // compact-notation values that trigger the `many` category in some locales.
+            let mut push = |this: &mut Self, s: &str| {
+                if let Some(ops) = intl::plural::PluralOperands::parse(s) {
+                    let cat = if ordinal {
+                        intl::plural::ordinal_category(locale, &ops)
+                    } else {
+                        intl::plural::plural_category(locale, &ops)
+                    };
+                    let _ = this;
+                    let nm = name(cat);
+                    if !seen.contains(&nm) {
+                        seen.push(nm);
+                    }
+                }
+            };
+            for i in 0..=200u32 {
+                let s = alloc::format!("{i}");
+                push(self, &s);
+            }
+            for s in ["0.0", "0.1", "1.5", "2.5", "1000000", "1000000.0"] {
+                push(self, s);
+            }
+            // Return in canonical CLDR order.
+            ORDER.iter().copied().filter(|c| seen.contains(c)).collect()
+        }
+        #[cfg(not(feature = "intl"))]
+        {
+            let _ = (locale, ordinal);
+            let _ = ORDER;
+            alloc::vec!["one", "other"]
+        }
     }
 
     /// Builds an `Intl.Segmenter` instance: an object capturing `granularity` with a readable

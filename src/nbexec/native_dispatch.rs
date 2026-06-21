@@ -2217,9 +2217,13 @@ impl<'a> Interp<'a> {
             N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => {
                 return self.make_intl_formatter(id, args);
             }
-            // `Intl.Collator(...)` / `Intl.PluralRules(...)` without `new`.
+            // `Intl.Collator(...)` without `new` builds the same collator object.
             N_INTL_COLLATOR => self.make_collator(args),
-            N_INTL_PLURAL_RULES => self.make_plural_rules(args),
+            // `Intl.PluralRules(...)` without `new` is a TypeError (ECMA-402
+            // sec-intl.pluralrules: "If NewTarget is undefined, throw a TypeError").
+            N_INTL_PLURAL_RULES => {
+                return Err(self.type_error("Constructor Intl.PluralRules requires 'new'"));
+            }
             // `Intl.ListFormat(...)` without `new` is a TypeError (ECMA-402
             // sec-intl.listformat: "If NewTarget is undefined, throw a TypeError").
             N_INTL_LIST_FORMAT => {
@@ -2396,49 +2400,38 @@ impl<'a> Interp<'a> {
                     core::cmp::Ordering::Greater => 1.0,
                 })
             }
-            // `Intl.PluralRules.prototype.select(n)` — the English plural category:
-            // `1` is "one", everything else "other".
+            // `Intl.PluralRules.prototype.select(value)` — ToNumber(value), then the
+            // locale+type plural category of the resulting number.
             N_INTL_PLURAL_SELECT => {
-                let n = self.realm.to_number(arg(0));
-                #[cfg(feature = "intl")]
+                let nv = self.coerce_to_number(arg(0))?;
+                let n = self.realm.to_number(nv);
+                let cat = self.plural_select_category(n);
+                self.new_str(cat)
+            }
+            // `Intl.PluralRules.prototype.selectRange(start, end)`: ToNumber both
+            // (Symbol → TypeError); `undefined` start/end → TypeError; a NaN value →
+            // RangeError; else the range plural category. With only the English
+            // cardinal/ordinal rules implemented, the range category is "other".
+            N_INTL_PLURAL_SELECT_RANGE => {
+                let start = arg(0);
+                let end = arg(1);
+                if matches!(start.unpack(), Unpacked::Undefined)
+                    || matches!(end.unpack(), Unpacked::Undefined)
                 {
-                    let fmt = self.this_val.as_handle().map(Handle::from_raw);
-                    let locale = fmt
-                        .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
-                        .map(|v| self.realm.to_display_string(v))
-                        .unwrap_or_else(|| String::from("en"));
-                    let ordinal = fmt
-                        .and_then(|h| self.realm.get_property(h, "type"))
-                        .map(|v| self.realm.to_display_string(v))
-                        .as_deref()
-                        == Some("ordinal");
-                    let ops = if n == (n as i64) as f64 {
-                        intl::plural::PluralOperands::from_int(n as i64)
-                    } else {
-                        intl::plural::PluralOperands::parse(&alloc::format!("{n}"))
-                            .unwrap_or_else(|| intl::plural::PluralOperands::from_int(n as i64))
-                    };
-                    let cat = if ordinal {
-                        intl::plural::ordinal_category(&locale, &ops)
-                    } else {
-                        intl::plural::plural_category(&locale, &ops)
-                    };
-                    use intl::plural::PluralCategory::*;
-                    let s = match cat {
-                        Zero => "zero",
-                        One => "one",
-                        Two => "two",
-                        Few => "few",
-                        Many => "many",
-                        Other => "other",
-                    };
-                    self.new_str(s)
+                    return Err(self.type_error("selectRange requires both start and end"));
                 }
-                #[cfg(not(feature = "intl"))]
-                {
-                    let cat = if n == 1.0 { "one" } else { "other" };
-                    self.new_str(cat)
+                let sv = self.coerce_to_number(start)?;
+                let ev = self.coerce_to_number(end)?;
+                let s = self.realm.to_number(sv);
+                let e = self.realm.to_number(ev);
+                if s.is_nan() || e.is_nan() {
+                    let m = self.new_str("selectRange argument is NaN");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                 }
+                // ResolvePluralRange: the plural category for the range. Deferred to
+                // the end-value category (English ranges resolve to "other").
+                let cat = self.plural_select_category(e);
+                self.new_str(cat)
             }
             // `nf.format(x)` read as a value then called: format against the `this`
             // formatter (a detached call with no formatter falls back to ToString).

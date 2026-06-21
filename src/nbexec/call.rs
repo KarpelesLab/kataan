@@ -1769,7 +1769,7 @@ impl<'a> Interp<'a> {
         }
         // `new Intl.PluralRules(...)` → an object with a `select(n)` method.
         if id == N_INTL_PLURAL_RULES {
-            return Ok(self.make_plural_rules(args));
+            return self.make_plural_rules(args);
         }
         // `new Intl.ListFormat(locale, { type, style })` → an object with a `format(list)`.
         if id == N_INTL_LIST_FORMAT {

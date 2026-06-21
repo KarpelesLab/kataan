@@ -606,6 +606,8 @@ const N_INTL_PLURAL_RULES: u16 = 208;
 const N_INTL_COMPARE: u16 = 209;
 /// `Intl.PluralRules.prototype.select`.
 const N_INTL_PLURAL_SELECT: u16 = 210;
+/// `Intl.PluralRules.prototype.selectRange`.
+const N_INTL_PLURAL_SELECT_RANGE: u16 = 671;
 /// `Intl.ListFormat` constructor.
 const N_INTL_LIST_FORMAT: u16 = 221;
 /// `Intl.ListFormat.prototype.format`.
@@ -1330,6 +1332,8 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_INTL_LIST_FORMAT
         // `Intl.RelativeTimeFormat.length === 0` (locales/options are optional).
         | N_INTL_REL_TIME
+        // `Intl.PluralRules.length === 0` (locales/options are optional).
+        | N_INTL_PLURAL_RULES
         // `DisposableStack`/`AsyncDisposableStack`/`ShadowRealm` take no parameters.
         | N_DISPOSABLE_STACK
         | N_ASYNC_DISPOSABLE_STACK
@@ -2850,6 +2854,7 @@ impl<'a> Interp<'a> {
         self.realm.mark_hidden(intl, "ListFormat");
         self.realm.mark_hidden(intl, "RelativeTimeFormat");
         self.realm.mark_hidden(intl, "DurationFormat");
+        self.realm.mark_hidden(intl, "PluralRules");
         // `Intl.Locale` — a constructor with no `supportedLocalesOf` static.
         {
             let f = self.new_named_native("Locale", N_INTL_LOCALE);
