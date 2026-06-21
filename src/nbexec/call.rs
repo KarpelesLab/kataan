@@ -1777,7 +1777,7 @@ impl<'a> Interp<'a> {
         }
         // `new Intl.RelativeTimeFormat(locale, { numeric, style })` → an object with `format`.
         if id == N_INTL_REL_TIME {
-            return Ok(self.make_relative_time_format(args));
+            return self.make_relative_time_format(args);
         }
         // `new Intl.DisplayNames(locale, { type })` → an object with an `of(code)` method.
         if id == N_INTL_DISPLAY_NAMES {

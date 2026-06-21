@@ -2254,20 +2254,31 @@ impl<'a> Interp<'a> {
                 let out: String = parts.into_iter().map(|(_, v)| v).collect();
                 self.new_str(&out)
             }
-            // `Intl.RelativeTimeFormat(...)` without `new`.
-            N_INTL_REL_TIME => self.make_relative_time_format(args),
+            // `Intl.RelativeTimeFormat(...)` without `new` — a TypeError (the
+            // constructor requires `new`, ECMA-402 sec-intl.relativetimeformat).
+            N_INTL_REL_TIME => {
+                return Err(
+                    self.type_error("Constructor Intl.RelativeTimeFormat requires 'new'")
+                );
+            }
             // `Intl.RelativeTimeFormat.prototype.format(value, unit)`.
             N_INTL_REL_TIME_FORMAT => {
                 let fmt = self.this_val.as_handle().map(Handle::from_raw);
-                let numeric = fmt
-                    .and_then(|h| self.realm.get_property(h, "numeric"))
-                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_else(|| String::from("always"));
-                let value = self.realm.to_number(arg(0));
-                let unit = self.realm.to_display_string(arg(1));
-                let s = relative_time_string(value, &unit, &numeric);
-                self.new_str(&s)
+                let (numeric, style) = self.rel_time_numeric_style(fmt);
+                // PartitionRelativeTimePattern: ToNumber(value) (a Symbol throws a
+                // TypeError), then SingularRelativeTimeUnit(unit) which ToString's
+                // `unit` (Symbol → TypeError) and validates it (else RangeError);
+                // a non-finite value is a RangeError.
+                let nv = self.coerce_to_number(arg(0))?;
+                let value = self.realm.to_number(nv);
+                let unit = self.singular_relative_time_unit(arg(1))?;
+                if !value.is_finite() {
+                    let m = self.new_str("value must be finite");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                let parts = rel_time_parts(value, &unit, &numeric, &style);
+                let out: String = parts.into_iter().map(|(_, v, _)| v).collect();
+                self.new_str(&out)
             }
             // `Intl.DisplayNames(...)` without `new`.
             N_INTL_DISPLAY_NAMES => self.make_display_names(args),
@@ -2500,6 +2511,42 @@ impl<'a> Interp<'a> {
                         self.realm.set_property(o, "type", tv);
                         let vv = self.new_str(&val);
                         self.realm.set_property(o, "value", vv);
+                        arr_elems.push(NanBox::handle(o.to_raw()));
+                    }
+                    return Ok(NanBox::handle(self.realm.new_array(arr_elems).to_raw()));
+                }
+                // `Intl.RelativeTimeFormat.prototype.formatToParts(value, unit)` → an
+                // array of `{ type, value, unit? }` parts: the numeric substring is
+                // split into integer/group/decimal/fraction parts (each carrying the
+                // singular `unit`), surrounded by `{ type: "literal" }` text.
+                if let Some(h) = fmt
+                    && self
+                        .realm
+                        .get_property(h, "\u{0}intl")
+                        .map(|v| self.realm.to_display_string(v))
+                        .as_deref()
+                        == Some("rtf")
+                {
+                    let (numeric, style) = self.rel_time_numeric_style(Some(h));
+                    let nv = self.coerce_to_number(arg(0))?;
+                    let value = self.realm.to_number(nv);
+                    let unit = self.singular_relative_time_unit(arg(1))?;
+                    if !value.is_finite() {
+                        let m = self.new_str("value must be finite");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
+                    let parts = rel_time_parts(value, &unit, &numeric, &style);
+                    let mut arr_elems = Vec::with_capacity(parts.len());
+                    for (ty, val, with_unit) in parts {
+                        let o = self.realm.new_object();
+                        let tv = self.new_str(ty);
+                        self.realm.set_property(o, "type", tv);
+                        let vv = self.new_str(&val);
+                        self.realm.set_property(o, "value", vv);
+                        if with_unit {
+                            let uv = self.new_str(&unit);
+                            self.realm.set_property(o, "unit", uv);
+                        }
                         arr_elems.push(NanBox::handle(o.to_raw()));
                     }
                     return Ok(NanBox::handle(self.realm.new_array(arr_elems).to_raw()));

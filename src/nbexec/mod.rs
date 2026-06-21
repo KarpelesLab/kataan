@@ -1321,6 +1321,8 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_INTL_DURATION_FORMAT
         // `Intl.ListFormat.length === 0` (locales/options are optional).
         | N_INTL_LIST_FORMAT
+        // `Intl.RelativeTimeFormat.length === 0` (locales/options are optional).
+        | N_INTL_REL_TIME
         // `DisposableStack`/`AsyncDisposableStack`/`ShadowRealm` take no parameters.
         | N_DISPOSABLE_STACK
         | N_ASYNC_DISPOSABLE_STACK
@@ -2836,8 +2838,10 @@ impl<'a> Interp<'a> {
         }
         // ECMA-402: the service constructors are non-enumerable properties of `Intl`
         // (`{ writable:true, enumerable:false, configurable:true }`). (Only
-        // `ListFormat` is corrected here to keep the change scoped to that service.)
+        // `ListFormat`/`RelativeTimeFormat` are corrected here to keep the change
+        // scoped to those services.)
         self.realm.mark_hidden(intl, "ListFormat");
+        self.realm.mark_hidden(intl, "RelativeTimeFormat");
         // `Intl.Locale` — a constructor with no `supportedLocalesOf` static.
         {
             let f = self.new_named_native("Locale", N_INTL_LOCALE);
@@ -5000,38 +5004,140 @@ pub(crate) fn coerce_typed(kind: u16, n: f64) -> f64 {
     }
 }
 
-/// Renders `Intl.RelativeTimeFormat.prototype.format(value, unit)` in en-US. `numeric:
-/// "auto"` yields idiomatic phrases for the adjacent units ("yesterday", "next week",
-/// "now"); otherwise (and as a fallback) it is the explicit "in N units" / "N units ago".
-fn relative_time_string(value: f64, unit: &str, numeric: &str) -> alloc::string::String {
-    let u = unit.strip_suffix('s').unwrap_or(unit); // singular stem
-    // Integer test without std-only float methods (for the `alloc` build).
-    if numeric == "auto" && value == (value as i64) as f64 {
-        let v = value as i64;
-        match (u, v) {
-            ("day", -1) => return String::from("yesterday"),
-            ("day", 0) => return String::from("today"),
-            ("day", 1) => return String::from("tomorrow"),
-            ("second", 0) => return String::from("now"),
-            ("week" | "month" | "quarter" | "year", -1) => return alloc::format!("last {u}"),
-            ("week" | "month" | "quarter" | "year", 1) => return alloc::format!("next {u}"),
-            ("minute" | "hour" | "week" | "month" | "quarter" | "year", 0) => {
-                return alloc::format!("this {u}");
-            }
-            _ => {}
+/// The en-US display string for a relative-time `unit` (already singularized) at the
+/// given `style`, choosing the singular or plural form. `long` is the full word
+/// ("second"/"seconds"); `short`/`narrow` use the CLDR abbreviations.
+fn rel_time_unit_display(unit: &str, style: &str, plural: bool) -> &'static str {
+    // (long-singular, long-plural, short/narrow-singular, short/narrow-plural)
+    let (ls, lp, ss, sp): (&str, &str, &str, &str) = match unit {
+        "second" => ("second", "seconds", "sec.", "sec."),
+        "minute" => ("minute", "minutes", "min.", "min."),
+        "hour" => ("hour", "hours", "hr.", "hr."),
+        "day" => ("day", "days", "day", "days"),
+        "week" => ("week", "weeks", "wk.", "wk."),
+        "month" => ("month", "months", "mo.", "mo."),
+        "quarter" => ("quarter", "quarters", "qtr.", "qtrs."),
+        "year" => ("year", "years", "yr.", "yr."),
+        _ => ("", "", "", ""),
+    };
+    match (style, plural) {
+        ("long", false) => ls,
+        ("long", true) => lp,
+        (_, false) => ss,
+        (_, true) => sp,
+    }
+}
+
+/// The idiomatic en-US `numeric: "auto"` phrase for `unit` at integer offset `v`
+/// ("yesterday"/"this week"/"now"/…), or `None` when CLDR has no special phrase and
+/// the explicit numeric form ("in N units") must be used. Only the `long` style has
+/// these special phrases in the tested data.
+fn rel_time_auto_phrase(unit: &str, v: i64) -> Option<&'static str> {
+    Some(match (unit, v) {
+        ("year", -1) => "last year",
+        ("year", 0) => "this year",
+        ("year", 1) => "next year",
+        ("quarter", -1) => "last quarter",
+        ("quarter", 0) => "this quarter",
+        ("quarter", 1) => "next quarter",
+        ("month", -1) => "last month",
+        ("month", 0) => "this month",
+        ("month", 1) => "next month",
+        ("week", -1) => "last week",
+        ("week", 0) => "this week",
+        ("week", 1) => "next week",
+        ("day", -1) => "yesterday",
+        ("day", 0) => "today",
+        ("day", 1) => "tomorrow",
+        ("hour", 0) => "this hour",
+        ("minute", 0) => "this minute",
+        ("second", 0) => "now",
+        _ => return None,
+    })
+}
+
+/// Formats the (non-negative) magnitude of an en-US relative-time value into typed
+/// number parts: `(type, value, with_unit=true)` triples of `integer`/`group`/
+/// `decimal`/`fraction` (latn digits, `,` grouping, `.` decimal — matching
+/// `Intl.NumberFormat("en-US")`). The integer part is grouped in threes from the right.
+fn rel_time_number_parts(n: f64) -> alloc::vec::Vec<(&'static str, alloc::string::String, bool)> {
+    // Render with the default NumberFormat shape (max 3 fraction digits, no trailing
+    // zeros) by formatting then trimming; `n` is finite and non-negative here.
+    let s = alloc::format!("{n}");
+    let (int_str, frac_str) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s.as_str(), ""),
+    };
+    let mut parts: alloc::vec::Vec<(&'static str, alloc::string::String, bool)> =
+        alloc::vec::Vec::new();
+    // Group the integer digits in threes from the right, emitting `group` parts.
+    let digits: alloc::vec::Vec<char> = int_str.chars().collect();
+    let len = digits.len();
+    let first = len % 3;
+    let first = if first == 0 && len > 0 { 3 } else { first };
+    let emit = |slice: &[char],
+                parts: &mut alloc::vec::Vec<(&'static str, alloc::string::String, bool)>| {
+        let g: alloc::string::String = slice.iter().collect();
+        parts.push(("integer", g, true));
+    };
+    if len > 0 {
+        emit(&digits[..first], &mut parts);
+        let mut idx = first;
+        while idx < len {
+            parts.push(("group", alloc::string::String::from(","), true));
+            emit(&digits[idx..idx + 3], &mut parts);
+            idx += 3;
         }
     }
-    let n = value.abs();
-    let unit_disp = if n == 1.0 {
-        String::from(u)
-    } else {
-        alloc::format!("{u}s")
-    };
-    if value < 0.0 {
-        alloc::format!("{n} {unit_disp} ago")
-    } else {
-        alloc::format!("in {n} {unit_disp}")
+    if !frac_str.is_empty() {
+        parts.push(("decimal", alloc::string::String::from("."), true));
+        parts.push(("fraction", alloc::string::String::from(frac_str), true));
     }
+    parts
+}
+
+/// Partitions an `Intl.RelativeTimeFormat` `format`/`formatToParts(value, unit)` into
+/// `(type, value, with_unit)` parts in en-US. `numeric: "auto"` yields idiomatic
+/// single-`literal` phrases for the adjacent `long`-style units ("yesterday", "next
+/// week", "now"); otherwise the pattern is the explicit "in N <unit>" / "N <unit> ago"
+/// with the numeric magnitude split into typed `integer`/`group`/`decimal`/`fraction`
+/// parts (each carrying the unit) surrounded by `literal` text. `unit` is singular.
+fn rel_time_parts(
+    value: f64,
+    unit: &str,
+    numeric: &str,
+    style: &str,
+) -> alloc::vec::Vec<(&'static str, alloc::string::String, bool)> {
+    // numeric:"auto" idiomatic phrases (integer offsets only, `long` style).
+    if numeric == "auto"
+        && style == "long"
+        && value == (value as i64) as f64
+        && let Some(phrase) = rel_time_auto_phrase(unit, value as i64)
+    {
+        return alloc::vec![("literal", alloc::string::String::from(phrase), false)];
+    }
+    let n = value.abs();
+    let plural = n != 1.0;
+    let unit_disp = rel_time_unit_display(unit, style, plural);
+    // Negative magnitudes use the "past" pattern (" <unit> ago"); positive (and `+0`)
+    // use the "future" pattern ("in " … " <unit>"). The sign *bit* selects the pattern,
+    // so `-0` is past (`format(-0)` → "0 units ago") while `+0` is future.
+    let is_past = value.is_sign_negative();
+    let mut parts: alloc::vec::Vec<(&'static str, alloc::string::String, bool)> =
+        alloc::vec::Vec::new();
+    if is_past {
+        parts.extend(rel_time_number_parts(n));
+        parts.push((
+            "literal",
+            alloc::format!(" {unit_disp} ago"),
+            false,
+        ));
+    } else {
+        parts.push(("literal", alloc::string::String::from("in "), false));
+        parts.extend(rel_time_number_parts(n));
+        parts.push(("literal", alloc::format!(" {unit_disp}"), false));
+    }
+    parts
 }
 
 /// Segments `input` per an `Intl.Segmenter` granularity, returning `(index, segment,

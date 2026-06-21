@@ -1147,11 +1147,12 @@ impl<'a> Interp<'a> {
         }
 
         // --- Intl.NumberFormat / Intl.DateTimeFormat instance methods ---
-        // `Intl.ListFormat` carries the same `\0intl` marker (kind "list") but its
-        // `format`/`formatToParts` take an iterable of strings, not a number — let
+        // `Intl.ListFormat` (kind "list") and `Intl.RelativeTimeFormat` (kind "rtf")
+        // carry the same `\0intl` marker but their `format`/`formatToParts` have
+        // bespoke signatures (an iterable of strings / a `(value, unit)` pair) — let
         // those fall through to the branded prototype methods below.
         if let Some(kind) = self.realm.get_property(handle, "\u{0}intl")
-            && self.realm.to_display_string(kind) != "list"
+            && !matches!(self.realm.to_display_string(kind).as_str(), "list" | "rtf")
             && method == "format"
         {
             let s = self.intl_format_value(handle, arg(0));

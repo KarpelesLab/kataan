@@ -1292,6 +1292,20 @@ impl<'a> Interp<'a> {
             let style = get_str(self, "style").unwrap_or_else(|| String::from("long"));
             let stv = self.new_str(&style);
             self.realm.set_property(out, "style", stv);
+        } else if kind == "rtf" {
+            // `Intl.RelativeTimeFormat.prototype.resolvedOptions()` —
+            // `{ locale, style, numeric, numberingSystem }` in that order
+            // (Table: "Resolved Options of RelativeTimeFormat instances"). The
+            // resolved numbering system for the supported locales is always `latn`.
+            let style = get_str(self, "style").unwrap_or_else(|| String::from("long"));
+            let stv = self.new_str(&style);
+            self.realm.set_property(out, "style", stv);
+            let numeric = get_str(self, "numeric").unwrap_or_else(|| String::from("always"));
+            let nv = self.new_str(&numeric);
+            self.realm.set_property(out, "numeric", nv);
+            let ns = get_str(self, "numberingSystem").unwrap_or_else(|| String::from("latn"));
+            let nsv = self.new_str(&ns);
+            self.realm.set_property(out, "numberingSystem", nsv);
         } else if kind == "number" {
             let ns = get_str(self, "numberingSystem").unwrap_or_else(|| String::from("latn"));
             let nsv = self.new_str(&ns);
@@ -1534,23 +1548,107 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Builds an `Intl.RelativeTimeFormat` instance: an object capturing `numeric`/`style`
-    /// with a readable `format(value, unit)` method.
-    pub(crate) fn make_relative_time_format(&mut self, args: &[NanBox]) -> NanBox {
+    /// Builds an `Intl.RelativeTimeFormat` instance (`InitializeRelativeTimeFormat`):
+    /// canonicalizes the requested locales, then reads and validates the options in
+    /// spec order (`localeMatcher`, `numberingSystem`, `style`, `numeric`), and brands
+    /// the object with `\0intl="rtf"` plus its resolved `\0locale`/`numberingSystem`/
+    /// `style`/`numeric`. Used only by the `new`-form constructor; a plain call (no
+    /// `new`) throws a `TypeError` before reaching here.
+    pub(crate) fn make_relative_time_format(
+        &mut self,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
-        if let Some(opts) = args
-            .get(1)
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-        {
-            for key in ["numeric", "style"] {
-                if let Some(v) = self.realm.get_property(opts, key) {
-                    self.realm.set_hidden_property(obj, key, v);
-                }
+        let marker = self.new_str("rtf");
+        self.realm.set_hidden_property(obj, "\u{0}intl", marker);
+        // 1. CanonicalizeLocaleList(locales) — a malformed tag raises a RangeError.
+        let requested =
+            self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
+        let locale = requested
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| String::from("en-US"));
+        let locv = self.new_str(&locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
+        // `InitializeRelativeTimeFormat` coerces options with `ToObject` (not
+        // GetOptionsObject): `undefined` → an empty options bag; `null` → a TypeError;
+        // any other primitive (boolean/string/number/symbol) → its wrapper object
+        // (which has no own option keys, so all defaults apply).
+        let opts_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
+        let opts = match opts_arg.unpack() {
+            Unpacked::Undefined => None,
+            Unpacked::Null => {
+                return Err(self.type_error("Intl.RelativeTimeFormat options cannot be null"));
+            }
+            _ => self.coerce_to_object(opts_arg).as_handle().map(Handle::from_raw),
+        };
+        // Options are read in spec order: localeMatcher, numberingSystem, style, numeric.
+        let _ = self.get_string_option(
+            opts,
+            "localeMatcher",
+            &["lookup", "best fit"],
+            Some("best fit"),
+        )?;
+        let nu = self.get_string_option(opts, "numberingSystem", &[], None)?;
+        if let Some(ns) = &nu {
+            // numberingSystem must match the UTS-35 `type` production (3-8 alnum,
+            // hyphen-joined) — otherwise a RangeError.
+            if !is_unicode_type_value(ns) {
+                let m = self.new_str("invalid numberingSystem");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
         }
+        let style = self
+            .get_string_option(opts, "style", &["long", "short", "narrow"], Some("long"))?
+            .unwrap();
+        let numeric = self
+            .get_string_option(opts, "numeric", &["always", "auto"], Some("always"))?
+            .unwrap();
+        self.store_str(obj, "style", &Some(style));
+        self.store_str(obj, "numeric", &Some(numeric));
         self.brand_intl_instance(obj, N_INTL_REL_TIME);
-        NanBox::handle(obj.to_raw())
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    /// The resolved `(numeric, style)` of an `Intl.RelativeTimeFormat` instance
+    /// (defaults `"always"`/`"long"` when the slots are absent).
+    pub(crate) fn rel_time_numeric_style(&mut self, fmt: Option<Handle>) -> (String, String) {
+        let numeric = fmt
+            .and_then(|h| self.realm.get_property(h, "numeric"))
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("always"));
+        let style = fmt
+            .and_then(|h| self.realm.get_property(h, "style"))
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("long"));
+        (numeric, style)
+    }
+
+    /// `SingularRelativeTimeUnit(unit)`: `ToString`s `unit` (a Symbol throws a
+    /// TypeError), accepts both the singular and plural forms of the eight relative
+    /// time units, returning the singular stem; any other value is a RangeError.
+    pub(crate) fn singular_relative_time_unit(
+        &mut self,
+        unit: NanBox,
+    ) -> Result<String, ExecError> {
+        let s = self.coerce_to_string(unit)?;
+        let singular = match s.as_str() {
+            "seconds" | "second" => "second",
+            "minutes" | "minute" => "minute",
+            "hours" | "hour" => "hour",
+            "days" | "day" => "day",
+            "weeks" | "week" => "week",
+            "months" | "month" => "month",
+            "quarters" | "quarter" => "quarter",
+            "years" | "year" => "year",
+            _ => {
+                let m = self.new_str(&alloc::format!("invalid relative time unit '{s}'"));
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+        };
+        Ok(String::from(singular))
     }
 
     /// Builds an `Intl.DisplayNames` instance: an object capturing `type` with a readable
