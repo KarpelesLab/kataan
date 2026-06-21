@@ -521,6 +521,9 @@ impl<'a> Interp<'a> {
         let saved_this = core::mem::replace(&mut self.this_val, this_val);
         let saved_target = core::mem::replace(&mut self.new_target, new_target);
         let saved_home = core::mem::replace(&mut self.current_home, home_class);
+        // A coroutine body's lexical class (private-name scope) is its home class —
+        // mirror it so `#x` inside a generator/async method body resolves.
+        let saved_lexical_home = core::mem::replace(&mut self.current_lexical_home, home_class);
         let saved_home_static = core::mem::replace(&mut self.current_home_static, home_static);
         let saved_home_obj = core::mem::replace(&mut self.current_home_object, home_object);
         let saved_strict = core::mem::replace(&mut self.strict, strict);
@@ -537,6 +540,7 @@ impl<'a> Interp<'a> {
         self.this_val = saved_this;
         self.new_target = saved_target;
         self.current_home = saved_home;
+        self.current_lexical_home = saved_lexical_home;
         self.current_home_static = saved_home_static;
         self.current_home_object = saved_home_obj;
         self.strict = saved_strict;

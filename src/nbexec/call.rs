@@ -1231,6 +1231,16 @@ impl<'a> Interp<'a> {
                 core::mem::replace(&mut self.current_home_static, def.home_static),
             )
         };
+        // The lexical class for private-name resolution: an arrow inherits the
+        // enclosing one (left untouched); any other function establishes its own
+        // captured `lexical_class` — so `#x` inside a nested ordinary function
+        // still resolves to its textually-enclosing class even though `super`
+        // (driven by `current_home` above) is `None` there.
+        let saved_lexical_home = if def.is_arrow {
+            self.current_lexical_home
+        } else {
+            core::mem::replace(&mut self.current_lexical_home, def.lexical_class)
+        };
         // A non-arrow invocation establishes its own `new.target`: the constructor
         // when reached via `new` (passed through the one-shot `pending_new_target`),
         // else `undefined`. An arrow inherits the enclosing `new.target`.
@@ -1333,6 +1343,7 @@ impl<'a> Interp<'a> {
         self.annexb_block_fns = saved_annexb;
         self.this_val = saved_this;
         self.current_home = saved_home;
+        self.current_lexical_home = saved_lexical_home;
         self.current_home_static = saved_home_static;
         self.new_target = saved_target;
         self.eval_depth = saved_eval_depth;

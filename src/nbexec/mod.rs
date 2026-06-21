@@ -117,6 +117,12 @@ pub(crate) struct FnDef<'a> {
     /// Whether the home is entered as a *static* method, so `super.x` resolves
     /// against the superclass's static members rather than its prototype's.
     home_static: bool,
+    /// The lexically-enclosing class at *definition* time — used ONLY to resolve
+    /// private names (`#x`), which are lexically scoped and visible inside nested
+    /// ordinary functions (where `home_class`/`super` are intentionally `None`).
+    /// For a method this is its `home_class`; for an ordinary function it is the
+    /// class textually enclosing it (or `None` outside any class).
+    lexical_class: Option<u32>,
 }
 
 /// One SplitMix64 step: scrambles an input word into a well-distributed output.
@@ -271,6 +277,18 @@ pub struct Interp<'a> {
     /// evaluation and shared by every instance (so `c1.#m === c2.#m`), so it is
     /// created lazily on first instantiation and reused thereafter.
     private_method_cache: alloc::collections::BTreeMap<(u32, String), NanBox>,
+    /// Per-class lexically-enclosing class id, parallel to `classes`. Captured
+    /// from `current_home` when the class is set up (the home class of the code
+    /// that evaluates the class definition is its lexical parent). Drives
+    /// private-name resolution: a private reference `#x` resolves to the nearest
+    /// enclosing class that *declares* `#x`, so two classes with `#x` never
+    /// collide and a nested class can shadow an outer one's `#x`.
+    class_lexical_parent: Vec<Option<u32>>,
+    /// Per-class set of bare private names (`x` for `#x`) declared in the class
+    /// body — instance and static fields/methods/accessors — parallel to
+    /// `classes`. Used with `class_lexical_parent` to resolve a private
+    /// reference to its declaring class.
+    class_private_names: Vec<alloc::collections::BTreeSet<alloc::boxed::Box<str>>>,
     /// One-shot binding name for NamedEvaluation of an anonymous class
     /// expression (`var C = class {}`, `x = class {}`): the name the class will
     /// receive. `make_class` consumes it so the class's `name` is set *before*
@@ -391,6 +409,12 @@ pub struct Interp<'a> {
     pending_super_fn: Option<NanBox>,
     /// The class of the currently-running method (for `super.method()`).
     current_home: Option<u32>,
+    /// The lexically-enclosing class of the currently-running function, for
+    /// **private-name** resolution. Unlike `current_home` (which an ordinary
+    /// function resets to `None`, so `super` is unavailable), this preserves the
+    /// class a nested ordinary `function` was textually defined in, so `#x` inside
+    /// it still resolves. Set from each function's `FnDef::lexical_class`.
+    current_lexical_home: Option<u32>,
     /// The `[[HomeObject]]` of the currently-running object-literal method — the
     /// object the method was defined on — so its `super.x` resolves through that
     /// object's prototype (when there is no enclosing class home).
@@ -1843,6 +1867,8 @@ impl<'a> Interp<'a> {
             class_fn_super: Vec::new(),
             class_handles: Vec::new(),
             private_method_cache: alloc::collections::BTreeMap::new(),
+            class_lexical_parent: Vec::new(),
+            class_private_names: Vec::new(),
             pending_class_name: None,
             with_stack: Vec::new(),
             call_depth: 0,
@@ -1874,6 +1900,7 @@ impl<'a> Interp<'a> {
             pending_super_native: None,
             pending_super_fn: None,
             current_home: None,
+            current_lexical_home: None,
             current_home_object: None,
             current_home_static: false,
             pending_label: None,
@@ -4100,6 +4127,11 @@ impl<'a> Interp<'a> {
             || home_class.is_some()
             || matches!(body, Body::Block(stmts) if has_use_strict(stmts));
         let func_id = self.functions.len() as u32;
+        // A method's lexical class is its home; any other function captures the
+        // *lexical* class enclosing its definition. Use `current_lexical_home`
+        // (not `current_home`, which is `None` inside an ordinary function) so a
+        // function nested inside a nested ordinary function still sees the class.
+        let lexical_class = home_class.or(self.current_lexical_home);
         self.functions.push(FnDef {
             params,
             body,
@@ -4110,6 +4142,7 @@ impl<'a> Interp<'a> {
             name: "",
             home_class,
             home_static,
+            lexical_class,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
         NanBox::handle(handle.to_raw())
@@ -6205,20 +6238,28 @@ fn static_key(key: &PropertyKey) -> Result<String, ExecError> {
     match key {
         PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(String::from(&**s)),
         PropertyKey::Number(n) => Ok(alloc::format!("{n}")),
-        // A private field name (`#x`) maps to an internal storage key.
-        PropertyKey::Private(s) => Ok(private_storage_key(s)),
+        // A private name needs its declaring-class scope to form a storage key,
+        // which a free function cannot resolve — callers that may see a private
+        // key (class member declaration / access) handle it explicitly.
+        PropertyKey::Private(_) => Err(ExecError::Unsupported("private key in static_key")),
         PropertyKey::Computed(_) => Err(ExecError::Unsupported("computed key")),
     }
 }
 
-/// The internal storage key for a private element `#name`. Prefixed with `\0` so
-/// it is a true *internal slot*: filtered from every reflection surface
-/// (`Object.keys`, `getOwnPropertyNames`, `for-in`, `JSON`, …) like other
-/// engine internals, and — crucially — invisible to `hasOwnProperty("#name")` /
+/// The internal storage key for a private element `#name` *declared in the class
+/// whose id is `scope`*. Prefixed with `\0` so it is a true *internal slot*:
+/// filtered from every reflection surface (`Object.keys`,
+/// `getOwnPropertyNames`, `for-in`, `JSON`, …) like other engine internals,
+/// and — crucially — invisible to `hasOwnProperty("#name")` /
 /// `getOwnPropertyDescriptor`, since a user string can never equal it. (Storing
 /// under the bare `#name` would collide with a real `obj["#name"]` string key.)
-pub(crate) fn private_storage_key(name: &str) -> String {
-    alloc::format!("\u{0}#{name}")
+///
+/// The trailing `@<scope>` ties the key to the *declaration site* of the private
+/// name: per spec each `#x` is a distinct private name bound to its lexically
+/// enclosing class, so two classes that both declare `#x` get different keys and
+/// never collide (a nested class can shadow an outer one's `#x`).
+pub(crate) fn private_storage_key(name: &str, scope: u32) -> String {
+    alloc::format!("\u{0}#{name}@{scope}")
 }
 
 #[cfg(test)]

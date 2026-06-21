@@ -20,9 +20,11 @@ impl<'a> Interp<'a> {
                 alloc::format!("[{desc}]")
             }
         } else if let Some(rest) = key.strip_prefix('\u{0}') {
-            // A private element's internal storage key is `\0#name`; its spec
-            // `name` is the visible `#name`.
-            String::from(rest)
+            // A private element's internal storage key is `\0#name@<scope>`; its
+            // spec `name` is the visible `#name` (the `@<scope>` suffix that ties
+            // the key to its declaring class is dropped).
+            let visible = rest.rsplit_once('@').map_or(rest, |(n, _)| n);
+            String::from(visible)
         } else {
             String::from(key)
         };
@@ -51,9 +53,64 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// Resolves a private reference `#name` at the current execution site to the
+    /// id of the class that *declares* it: the nearest lexically-enclosing class
+    /// (starting from the running method's home class) whose body declares
+    /// `#name`. Returns `None` only outside any class (which the parser rejects
+    /// for a real private reference) — callers then build a key that matches no
+    /// stored private element, producing the spec TypeError.
+    pub(crate) fn private_scope_id(&self, name: &str) -> Option<u32> {
+        // Private names are lexically scoped: resolve from the running function's
+        // lexical class (which, unlike `current_home`, survives nested ordinary
+        // functions), falling back to `current_home` for any path that sets the
+        // home but not the lexical home.
+        let mut cur = self.current_lexical_home.or(self.current_home);
+        while let Some(cid) = cur {
+            if self.class_private_names[cid as usize].contains(name) {
+                return Some(cid);
+            }
+            cur = self.class_lexical_parent[cid as usize];
+        }
+        None
+    }
+
+    /// The storage key for a private reference `#name` at the current execution
+    /// site, resolving it to its lexically-enclosing declaring class. When the
+    /// name does not resolve (no enclosing class declares it), returns a key
+    /// guaranteed not to match any stored private element, so the brand check at
+    /// the access site throws.
+    pub(crate) fn private_access_key(&self, name: &str) -> String {
+        match self.private_scope_id(name) {
+            Some(scope) => crate::nbexec::private_storage_key(name, scope),
+            // `u32::MAX` is never a real class id (ids are dense from 0), so this
+            // key cannot collide with any declared private element.
+            None => crate::nbexec::private_storage_key(name, u32::MAX),
+        }
+    }
+
+    /// Evaluates a class member's property key to its storage key, given the
+    /// class `cid` whose body *declares* the member. A private name (`#x`) keys
+    /// on `cid` (the declaration site), not on the lexically-enclosing class of
+    /// the surrounding code — so a static private or an installed private method
+    /// is stored under the same key its in-class references resolve to.
+    pub(crate) fn eval_member_key_for_class(
+        &mut self,
+        key: &'a PropertyKey,
+        cid: u32,
+    ) -> Result<String, ExecError> {
+        if let PropertyKey::Private(s) = key {
+            return Ok(crate::nbexec::private_storage_key(s, cid));
+        }
+        self.eval_prop_key(key)
+    }
+
     /// Registers a class and allocates a class value capturing the current scope.
     pub(crate) fn make_class(&mut self, class: &'a Class) -> Result<NanBox, ExecError> {
         let class_id = self.classes.len() as u32;
+        // The home class of the code evaluating this definition is this class's
+        // *lexical parent* — captured now, before the static-member loop below may
+        // set `current_home` to this class while building nested definitions.
+        let lexical_parent = self.current_home;
         self.classes.push(class);
         // Reserve this class's per-id side-table slots *before* evaluating any
         // static member, because a computed key or static field initializer may
@@ -73,6 +130,21 @@ impl<'a> Interp<'a> {
         self.class_native_super.push(None);
         self.class_fn_super.push(None);
         self.class_handles.push(class_val);
+        self.class_lexical_parent.push(lexical_parent);
+        // Record the bare private names this class declares (`#x` → `x`), so a
+        // private reference can be resolved to its declaring class.
+        let mut private_names = alloc::collections::BTreeSet::new();
+        for member in &class.body {
+            let key = match member {
+                ClassMember::Method(m) => &m.key,
+                ClassMember::Field(field) => &field.key,
+                ClassMember::StaticBlock { .. } => continue,
+            };
+            if let PropertyKey::Private(s) = key {
+                private_names.insert(alloc::boxed::Box::<str>::from(&**s));
+            }
+        }
+        self.class_private_names.push(private_names);
         // Build the static members (`static foo() {}` / `static x = …`).
         let mut statics = alloc::collections::BTreeMap::new();
         let mut static_fields = Vec::new();
@@ -83,7 +155,7 @@ impl<'a> Interp<'a> {
                 ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
                     // A computed key is evaluated at class-definition time; a throw
                     // from it propagates (it does not silently skip the member).
-                    let key = self.eval_prop_key(&m.key)?;
+                    let key = self.eval_member_key_for_class(&m.key, class_id)?;
                     // A static method's home is this class, entered statically, so
                     // `super.x` resolves against the superclass's static members.
                     let f = self.make_method(
@@ -104,7 +176,7 @@ impl<'a> Interp<'a> {
                     // initializer is evaluated *later* (in source order with static
                     // blocks, after the constructor object — with its name/methods —
                     // exists), with `this` = the class. Install a placeholder now.
-                    let key = self.eval_prop_key(&field.key)?;
+                    let key = self.eval_member_key_for_class(&field.key, class_id)?;
                     if !static_fields.contains(&key) {
                         static_fields.push(key.clone());
                     }
@@ -119,7 +191,7 @@ impl<'a> Interp<'a> {
                 ClassMember::Method(m)
                     if m.is_static && matches!(m.kind, MethodKind::Get | MethodKind::Set) =>
                 {
-                    let key = self.eval_prop_key(&m.key)?;
+                    let key = self.eval_member_key_for_class(&m.key, class_id)?;
                     let f = self.make_method(
                         &m.value.params,
                         Body::Block(&m.value.body),
@@ -321,6 +393,7 @@ impl<'a> Interp<'a> {
             // home object so `super.x` resolves against the superclass's static
             // side (`[[HomeObject]]` is the constructor, `IsStatic` is true).
             let saved_home = self.current_home.replace(class_id);
+            let saved_lexical_home = self.current_lexical_home.replace(class_id);
             let saved_home_static = core::mem::replace(&mut self.current_home_static, true);
             let saved_home_obj = core::mem::take(&mut self.current_home_object);
             let r = (|| {
@@ -332,7 +405,7 @@ impl<'a> Interp<'a> {
                             }
                         }
                         ClassMember::Field(field) if field.is_static => {
-                            let key = self.eval_prop_key(&field.key)?;
+                            let key = self.eval_member_key_for_class(&field.key, class_id)?;
                             let v = match &field.value {
                                 Some(e) => self.eval(e)?,
                                 None => continue,
@@ -350,6 +423,7 @@ impl<'a> Interp<'a> {
             self.this_val = saved_this;
             self.strict = saved_strict;
             self.current_home = saved_home;
+            self.current_lexical_home = saved_lexical_home;
             self.current_home_static = saved_home_static;
             self.current_home_object = saved_home_obj;
             r?;
@@ -460,7 +534,7 @@ impl<'a> Interp<'a> {
                 }
                 let key = {
                     let saved = core::mem::replace(&mut self.current, cenv.clone());
-                    let k = self.eval_prop_key(&m.key);
+                    let k = self.eval_member_key_for_class(&m.key, *cid);
                     self.current = saved;
                     k?
                 };
@@ -799,6 +873,7 @@ impl<'a> Interp<'a> {
         // `super.x` (e.g. inside an arrow stored in a field) resolves against the
         // superclass prototype with `IsStatic` false.
         let saved_home = self.current_home.replace(class_id);
+        let saved_lexical_home = self.current_lexical_home.replace(class_id);
         let saved_home_static = core::mem::replace(&mut self.current_home_static, false);
         let saved_home_obj = core::mem::take(&mut self.current_home_object);
         let result = (|| {
@@ -812,6 +887,8 @@ impl<'a> Interp<'a> {
                             let k = self.eval(e)?;
                             self.member_key(k)
                         }
+                        // A private field (`#x = …`) keys on its declaring class.
+                        PropertyKey::Private(s) => crate::nbexec::private_storage_key(s, class_id),
                         other => static_key(other)?,
                     };
                     let v = match &field.value {
@@ -824,6 +901,7 @@ impl<'a> Interp<'a> {
             Ok(())
         })();
         self.current_home = saved_home;
+        self.current_lexical_home = saved_lexical_home;
         self.current_home_static = saved_home_static;
         self.current_home_object = saved_home_obj;
         result
@@ -846,6 +924,14 @@ impl<'a> Interp<'a> {
         let saved_scope = core::mem::replace(&mut self.current, env.child());
         // A class constructor body (and its field initializers) is strict code.
         let saved_strict = core::mem::replace(&mut self.strict, true);
+        // The constructor body's home class is this class, so a `this.#x` /
+        // `super.x` inside it resolves the private name (and super members)
+        // against this class. (`init_instance_fields` re-establishes the same
+        // home for the field initializers it runs.)
+        let saved_home = self.current_home.replace(class_id);
+        let saved_lexical_home = self.current_lexical_home.replace(class_id);
+        let saved_home_static = core::mem::replace(&mut self.current_home_static, false);
+        let saved_home_obj = self.current_home_object.replace(instance);
         let result = (|| {
             let ctor = class.body.iter().find_map(|m| match m {
                 ClassMember::Method(m) if m.kind == MethodKind::Constructor => Some(m),
@@ -924,6 +1010,10 @@ impl<'a> Interp<'a> {
         self.pending_super_native = saved_super_native;
         self.pending_super_fn = saved_super_fn;
         self.strict = saved_strict;
+        self.current_home = saved_home;
+        self.current_lexical_home = saved_lexical_home;
+        self.current_home_static = saved_home_static;
+        self.current_home_object = saved_home_obj;
         result
     }
 

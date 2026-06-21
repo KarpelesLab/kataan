@@ -105,6 +105,9 @@ impl<'a> Interp<'a> {
                 // `Symbol.toPrimitive`) throws a TypeError.
                 self.coerce_property_key(v)
             }
+            // A private name (`#x`) resolves to the storage key of the `#x`
+            // declared in the lexically-enclosing class of this access site.
+            PropertyKey::Private(s) => Ok(self.private_access_key(s)),
             _ => static_key(key),
         }
     }
@@ -595,7 +598,7 @@ impl<'a> Interp<'a> {
                     && let Expr::PrivateName(name, _) = &**left
                 {
                     let obj = self.eval(right)?;
-                    let key = crate::nbexec::private_storage_key(name);
+                    let key = self.private_access_key(name);
                     let present = obj.as_handle().map(Handle::from_raw).is_some_and(|h| {
                         self.realm.has_own(h, &key) || self.realm.accessor(h, &key).is_some()
                     });
@@ -660,12 +663,9 @@ impl<'a> Interp<'a> {
                     && matches!(property, PropertyKey::Ident(p) if matches!(&**p, "source" | "defer"))
                 {
                     let p = self.fresh_promise();
-                    let arg0 = arguments
-                        .first()
-                        .and_then(|a| match a {
-                            crate::ast::Argument::Item(e) => Some(e),
-                            crate::ast::Argument::Spread(e) => Some(e),
-                        });
+                    let arg0 = arguments.first().map(|a| match a {
+                        crate::ast::Argument::Item(e) | crate::ast::Argument::Spread(e) => e,
+                    });
                     let rejection = match arg0 {
                         Some(e) => match self.eval(e).and_then(|v| self.coerce_to_string(v)) {
                             Ok(_) => {
@@ -1360,7 +1360,7 @@ impl<'a> Interp<'a> {
                 // element (field or method) or a private accessor. A *class* receiver
                 // (`Class.#static`) is resolved by read_member's separate per-class storage,
                 // so it is not brand-checked here.
-                let key = crate::nbexec::private_storage_key(s);
+                let key = self.private_access_key(s);
                 if !self.is_callable(handle)
                     && self.realm.class_at(handle).is_none()
                     && !self.realm.has_own(handle, &key)
@@ -2761,7 +2761,7 @@ impl<'a> Interp<'a> {
         // (`set #x() {…}`) is stored under the `#`-prefixed key, so resolve that.
         let setter_key: Option<alloc::string::String> = match property {
             PropertyKey::Ident(s) | PropertyKey::Str(s) => Some(String::from(&**s)),
-            PropertyKey::Private(s) => Some(crate::nbexec::private_storage_key(s)),
+            PropertyKey::Private(s) => Some(self.private_access_key(s)),
             _ => None,
         };
         if let Some(skey) = setter_key {
@@ -2874,7 +2874,7 @@ impl<'a> Interp<'a> {
                 // (Field initialization writes via `set_property` directly, not this path,
                 // so the initial creation of a field is exempt; a class receiver, for
                 // static privates, is resolved via separate per-class storage.)
-                let key = crate::nbexec::private_storage_key(s);
+                let key = self.private_access_key(s);
                 if !self.is_callable(handle)
                     && self.realm.class_at(handle).is_none()
                     && !self.realm.has_own(handle, &key)
