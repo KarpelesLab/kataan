@@ -592,6 +592,135 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Records a `using` / `await using` declaration's resource in the current
+    /// lexical scope's dispose list (run, LIFO, when the scope is exited). Mirrors
+    /// `CreateDisposableResource` + `AddDisposableResource`:
+    ///
+    /// * A `null`/`undefined` resource adds a no-op disposer (`method` is
+    ///   `undefined`) — allowed for both hints (the sync-dispose null/undefined
+    ///   short-circuit and the async path both record nothing to call).
+    /// * Otherwise the resource must be an Object (a non-object primitive — number,
+    ///   string, boolean, symbol, bigint — is a **TypeError** at the declaration),
+    ///   and `GetDisposeMethod(V, hint)` is read **once**: for `await using` the
+    ///   `@@asyncDispose` method, falling back to `@@dispose`; for `using` the
+    ///   `@@dispose` method. A missing or non-callable method is a TypeError here
+    ///   (at the declaration), per spec.
+    pub(crate) fn record_using_resource(
+        &mut self,
+        value: NanBox,
+        is_await: bool,
+    ) -> Result<(), ExecError> {
+        // `null`/`undefined`: record a no-op disposer (no method read).
+        if matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            self.current
+                .add_disposer(value, NanBox::undefined(), is_await);
+            return Ok(());
+        }
+        // A non-object primitive cannot be a disposable resource.
+        if !self.is_object_value(value) {
+            return Err(self.type_error("using declaration value is not an object"));
+        }
+        let method = self.using_dispose_method(value, is_await)?;
+        self.current.add_disposer(value, method, is_await);
+        Ok(())
+    }
+
+    /// `GetDisposeMethod(V, hint)` for a `using`/`await using` declaration whose
+    /// resource is a non-null Object. For `await using` (async-dispose hint) the
+    /// `@@asyncDispose` method is read first, falling back to `@@dispose`; for
+    /// `using` (sync-dispose hint) only `@@dispose`. The chosen method must be
+    /// callable, else a TypeError. The relevant symbol property is read exactly
+    /// once (a getter fires once).
+    fn using_dispose_method(
+        &mut self,
+        value: NanBox,
+        is_await: bool,
+    ) -> Result<NanBox, ExecError> {
+        let Some(oh) = value.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("using declaration value is not an object"));
+        };
+        if is_await {
+            // `@@asyncDispose`, falling back to `@@dispose`.
+            let async_sym = self.well_known_symbol("asyncDispose");
+            let async_key = self.member_key(async_sym);
+            let m = self.read_member(oh, &async_key)?;
+            if !matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                if !self.is_callable_value(m) {
+                    return Err(self.type_error("@@asyncDispose is not callable"));
+                }
+                return Ok(m);
+            }
+            let sym = self.well_known_symbol("dispose");
+            let key = self.member_key(sym);
+            let m = self.read_member(oh, &key)?;
+            if matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                return Err(self.type_error("value is not an async disposable"));
+            }
+            if !self.is_callable_value(m) {
+                return Err(self.type_error("@@dispose is not callable"));
+            }
+            return Ok(m);
+        }
+        let sym = self.well_known_symbol("dispose");
+        let key = self.member_key(sym);
+        let m = self.read_member(oh, &key)?;
+        if matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Err(self.type_error("value is not disposable"));
+        }
+        if !self.is_callable_value(m) {
+            return Err(self.type_error("@@dispose is not callable"));
+        }
+        Ok(m)
+    }
+
+    /// Runs the recorded `using` disposers of `disposers` (the list taken from a
+    /// just-exited scope, in declaration order) in **reverse** (LIFO) order,
+    /// threading `completion` through them: `Ok(_)` if the scope is leaving
+    /// normally, `Err(ExecError::Throw)` if it is already unwinding a throw. A
+    /// throwing disposer is aggregated with the in-flight completion into a
+    /// `SuppressedError` chain (the newer error becomes `.error`, the prior
+    /// completion `.suppressed`); a non-throw abrupt completion from a disposer is
+    /// propagated as-is. An `await using` disposer's result is awaited **eagerly**
+    /// (driving the event loop via `await_value`) — see the module note.
+    pub(crate) fn dispose_resources(
+        &mut self,
+        disposers: alloc::vec::Vec<(NanBox, NanBox, bool)>,
+        completion: Result<NanBox, ExecError>,
+    ) -> Result<NanBox, ExecError> {
+        // Start from the incoming completion: a normal one, or the in-flight throw.
+        let (ok_value, mut pending): (NanBox, Option<NanBox>) = match completion {
+            Ok(v) => (v, None),
+            Err(ExecError::Throw(e)) => (NanBox::undefined(), Some(e)),
+            // A non-throw abrupt completion (engine-internal) is propagated without
+            // running disposers' aggregation against it.
+            Err(other) => return Err(other),
+        };
+        for (value, method, is_async) in disposers.into_iter().rev() {
+            if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                continue;
+            }
+            let result = self.call_with_this(method, value, &[]);
+            // For an `await using`, await the dispose result (eagerly).
+            let result = match result {
+                Ok(v) if is_async => self.await_value(v),
+                other => other,
+            };
+            if let Err(ExecError::Throw(e)) = result {
+                pending = Some(match pending {
+                    None => e,
+                    Some(prev) => self.make_suppressed_error(e, prev),
+                });
+            } else {
+                // Propagate a non-throw abrupt completion as-is.
+                result?;
+            }
+        }
+        match pending {
+            None => Ok(ok_value),
+            Some(e) => Err(ExecError::Throw(e)),
+        }
+    }
+
     /// Resolves the dispose method for a value added via `use`: for the sync
     /// stack the `[Symbol.dispose]` method; for the async stack the
     /// `[Symbol.asyncDispose]` method, falling back to `[Symbol.dispose]`. A value

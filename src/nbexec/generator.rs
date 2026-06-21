@@ -892,6 +892,49 @@ impl<'a> Interp<'a> {
     /// Executes one step of the generator machine: pops the top [`Step`] and
     /// processes it, pushing follow-up steps and/or leaving values on the value
     /// stack. Returns `Yield(v)` when a `yield` is reached.
+    /// Disposes the `using` / `await using` resources recorded in `self.current`
+    /// (a coroutine block / body scope leaving *normally*), in reverse order. A
+    /// scope with no disposers does nothing (the fast path). A throwing disposer
+    /// is surfaced as a `GenAbrupt::Throw`. An `await using` disposer's result is
+    /// awaited eagerly (via `await_value`) — the documented eager-async-dispose
+    /// model for the coroutine path.
+    fn gen_dispose_scope_resources(&mut self) -> Result<(), GenAbrupt> {
+        if !self.current.has_disposers() {
+            return Ok(());
+        }
+        let disposers = self.current.take_disposers();
+        match self.dispose_resources(disposers, Ok(NanBox::undefined())) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(GenAbrupt::from(e)),
+        }
+    }
+
+    /// Disposes the `using` resources of `self.current` while *unwinding* an
+    /// abrupt `completion`, returning the (possibly updated) completion. A
+    /// throwing disposer is aggregated into the completion: it suppresses a
+    /// pending throw (SuppressedError chain) or, against a non-throw completion
+    /// (`return`/`break`/`continue`), replaces it with the disposer's throw. A
+    /// scope with no disposers returns the completion unchanged (fast path).
+    fn gen_dispose_unwind(&mut self, completion: Completion) -> Completion {
+        if !self.current.has_disposers() {
+            return completion;
+        }
+        let disposers = self.current.take_disposers();
+        // Map the in-flight completion to a value-completion the disposal driver
+        // can thread: only a `Throw` participates in suppression; a
+        // `return`/`break`/`continue` is preserved unless a disposer throws.
+        let threaded = match &completion {
+            Completion::Throw(e) => Err(ExecError::Throw(*e)),
+            _ => Ok(NanBox::undefined()),
+        };
+        match self.dispose_resources(disposers, threaded) {
+            // Disposal did not throw: keep the original completion.
+            Ok(_) => completion,
+            // A disposer threw: it becomes the (possibly aggregated) completion.
+            Err(e) => Completion::Throw(throw_value(e)),
+        }
+    }
+
     fn gen_step(&mut self, stack: &mut Vec<Step<'a>>, values: &mut Vec<NanBox>) -> StepResult {
         let Some(step) = stack.pop() else {
             // The stack is empty: the body completed normally.
@@ -905,6 +948,11 @@ impl<'a> Interp<'a> {
                 label,
             } => {
                 if idx >= body.len() {
+                    // Block / body sequence finished normally: dispose any
+                    // `using` resources recorded in the just-completed scope
+                    // (`self.current`), in reverse order, before restoring the
+                    // enclosing scope. A throwing disposer becomes a throw.
+                    self.gen_dispose_scope_resources()?;
                     if let Some(s) = scope {
                         self.current = s;
                     }
@@ -1622,11 +1670,16 @@ impl<'a> Interp<'a> {
         &mut self,
         stack: &mut Vec<Step<'a>>,
         _values: &mut Vec<NanBox>,
-        completion: Completion,
+        mut completion: Completion,
     ) -> Result<Option<Result<GenStep, ExecError>>, ExecError> {
         loop {
             let Some(step) = stack.pop() else {
-                // Nothing caught it: the generator completes abnormally.
+                // Nothing caught it: the body itself is unwinding out. Dispose any
+                // body-level `using` resources (recorded in the frame scope,
+                // `self.current`) before the generator completes abnormally,
+                // aggregating a disposer throw into the completion.
+                completion = self.gen_dispose_unwind(completion);
+                // The generator completes abnormally.
                 return Ok(Some(match completion {
                     Completion::Return(v) => Ok(GenStep::Done(v)),
                     Completion::Throw(e) => Err(ExecError::Throw(e)),
@@ -1637,8 +1690,17 @@ impl<'a> Interp<'a> {
                 }));
             };
             match step {
-                Step::PopScope { scope } => self.current = scope,
+                Step::PopScope { scope } => {
+                    // Leaving this scope abruptly: dispose its `using` resources,
+                    // aggregating any disposer throw into the in-flight completion
+                    // (SuppressedError chain) before continuing to unwind.
+                    completion = self.gen_dispose_unwind(completion);
+                    self.current = scope;
+                }
                 Step::Seq { scope, label, .. } => {
+                    // The block scope (`self.current`) is leaving abruptly: dispose
+                    // its `using` resources, aggregating against the completion.
+                    completion = self.gen_dispose_unwind(completion);
                     if let Some(s) = scope {
                         self.current = s;
                     }
@@ -1844,8 +1906,17 @@ impl<'a> Interp<'a> {
         if !rest.is_empty() {
             stack.push(Step::VarTail { kind, rest });
         }
+        // A `using` / `await using` declarator must both bind the name *and*
+        // record the disposable resource (and resolve its dispose method) — work
+        // the stepped `DeclName` path does not do. Bind it in one shot via
+        // `exec_single_declarator` (which records the resource); any `await` in the
+        // initializer is resolved eagerly there, consistent with the engine's
+        // eager-async model.
+        let is_using = matches!(kind, VarDeclKind::Using | VarDeclKind::AwaitUsing);
         match (&d.target, &d.init) {
-            (BindingTarget::Ident(Ident { name, .. }), Some(init)) if expr_has_yield(init) => {
+            (BindingTarget::Ident(Ident { name, .. }), Some(init))
+                if expr_has_yield(init) && !is_using =>
+            {
                 let is_const = matches!(kind, VarDeclKind::Const);
                 stack.push(Step::DeclName { name, is_const });
                 self.gen_eval_expr(init, stack, values)

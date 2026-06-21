@@ -35,6 +35,15 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+                // Explicit-resource-management: dispose any body-level `using` /
+                // `await using` resources (the body runs directly in the
+                // function/program scope, so they were recorded in `self.current`).
+                // Disposal runs on all completion paths (value, return, throw); a
+                // body with no `using` does nothing (fast path).
+                if self.current.has_disposers() {
+                    let disposers = self.current.take_disposers();
+                    result = self.dispose_resources(disposers, result);
+                }
                 self.strict = saved_strict;
                 result
             }
@@ -304,8 +313,43 @@ impl<'a> Interp<'a> {
         let child = self.current.child();
         let saved = core::mem::replace(&mut self.current, child);
         let result = self.exec_seq(body);
+        // Explicit-resource-management: dispose any `using` / `await using`
+        // resources recorded in this block's scope, in reverse (LIFO) order, on
+        // *any* completion (normal, return, break, continue, or a thrown error).
+        // The fast path — a scope with no `using` declaration — does no work and
+        // behaves exactly as before.
+        let result = self.dispose_block_scope(result);
         self.current = saved;
         result
+    }
+
+    /// Disposes the `using` resources recorded in `self.current` (the just-run
+    /// block scope), threading `result` (a `Flow` completion) through them. A
+    /// scope with no recorded disposers is returned untouched (the fast path,
+    /// no allocation, no behavior change). The block's *value* completion is
+    /// preserved when disposal does not throw; a throwing disposer replaces the
+    /// completion with the (possibly SuppressedError-chained) throw.
+    fn dispose_block_scope(&mut self, result: Result<Flow, ExecError>) -> Result<Flow, ExecError> {
+        if !self.current.has_disposers() {
+            return result;
+        }
+        let disposers = self.current.take_disposers();
+        // Map the `Flow` completion to a value-completion the disposal driver can
+        // thread (a thrown error suppresses/aggregates; a non-throw flow's value
+        // is preserved and re-wrapped afterward).
+        let flow = match &result {
+            Ok(f) => Some(f.clone()),
+            Err(_) => None,
+        };
+        let as_value = match result {
+            Ok(_) => Ok(NanBox::undefined()),
+            Err(e) => Err(e),
+        };
+        match self.dispose_resources(disposers, as_value) {
+            // Disposal succeeded: restore the original (non-throw) flow.
+            Ok(_) => Ok(flow.unwrap_or(Flow::Normal(NanBox::undefined()))),
+            Err(e) => Err(e),
+        }
     }
 
     pub(crate) fn exec_block(&mut self, body: &'a [Stmt]) -> Result<Flow, ExecError> {
@@ -432,6 +476,25 @@ impl<'a> Interp<'a> {
             && let BindingTarget::Ident(Ident { name, .. }) = &d.target
         {
             self.current.declare_const(name, value);
+            return Ok(());
+        }
+        // A `using x = …` / `await using x = …` declaration binds `x` immutably
+        // (like `const`) AND records the value as an explicit-resource-management
+        // disposable in the current scope (run, LIFO, on scope exit). The dispose
+        // method is resolved now (a missing/non-callable method, or a non-object
+        // non-null value, is a TypeError at the declaration). The binding name is
+        // always a plain identifier (the grammar forbids destructuring here).
+        if matches!(
+            kind,
+            crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
+        ) {
+            let is_await = matches!(kind, crate::ast::VarDeclKind::AwaitUsing);
+            if let BindingTarget::Ident(Ident { name, .. }) = &d.target {
+                self.current.declare_const(name, value);
+            } else {
+                self.bind_pattern(&d.target, value)?;
+            }
+            self.record_using_resource(value, is_await)?;
             return Ok(());
         }
         self.bind_pattern(&d.target, value)?;
@@ -656,7 +719,21 @@ impl<'a> Interp<'a> {
             let saved = core::mem::replace(&mut self.current, child);
             let r = (|| {
                 match left {
-                    ForLeft::Decl { target, .. } => self.bind_pattern(target, item)?,
+                    ForLeft::Decl { kind, target, .. } => {
+                        self.bind_pattern(target, item)?;
+                        // A `for (using x of …)` / `for (await using x of …)`
+                        // head records `x` as a disposable, disposed at the end of
+                        // *this* iteration (in reverse order with any others).
+                        if matches!(
+                            kind,
+                            crate::ast::VarDeclKind::Using
+                                | crate::ast::VarDeclKind::AwaitUsing
+                        ) {
+                            let is_await =
+                                matches!(kind, crate::ast::VarDeclKind::AwaitUsing);
+                            self.record_using_resource(item, is_await)?;
+                        }
+                    }
                     // The head may be a plain reference or a destructuring pattern
                     // (`for ([a, b] of …)`, `for ({ x } of …)`).
                     ForLeft::Target(expr) => {
@@ -665,6 +742,9 @@ impl<'a> Interp<'a> {
                 }
                 self.exec(body)
             })();
+            // Dispose this iteration's `using` resource (any completion) before
+            // advancing the iterator. A non-`using` head leaves no disposers.
+            let r = self.dispose_block_scope(r);
             self.current = saved;
             match r {
                 Ok(flow) => match loop_action(flow, &label) {
@@ -701,7 +781,18 @@ impl<'a> Interp<'a> {
             let saved = core::mem::replace(&mut self.current, child);
             let r = (|| {
                 match left {
-                    ForLeft::Decl { target, .. } => self.bind_pattern(target, item)?,
+                    ForLeft::Decl { kind, target, .. } => {
+                        self.bind_pattern(target, item)?;
+                        if matches!(
+                            kind,
+                            crate::ast::VarDeclKind::Using
+                                | crate::ast::VarDeclKind::AwaitUsing
+                        ) {
+                            let is_await =
+                                matches!(kind, crate::ast::VarDeclKind::AwaitUsing);
+                            self.record_using_resource(item, is_await)?;
+                        }
+                    }
                     // The head may be a plain reference or a destructuring pattern
                     // (`for ([a, b] of …)`, `for ({ x } of …)`).
                     ForLeft::Target(expr) => {
@@ -710,6 +801,8 @@ impl<'a> Interp<'a> {
                 }
                 self.exec(body)
             })();
+            // Dispose this iteration's `using` resource (any completion).
+            let r = self.dispose_block_scope(r);
             self.current = saved;
             match loop_action(r?, &label) {
                 LoopAction::Next => {}
@@ -1201,6 +1294,10 @@ impl<'a> Interp<'a> {
             }
             Ok(Flow::Normal(NanBox::undefined()))
         })();
+        // A `for (using x = …; …)` head binds `x` once in the loop-header scope
+        // (`self.current` is still that scope here); dispose it on loop exit
+        // (any completion). The non-`using` head leaves no disposers (fast path).
+        let result = self.dispose_block_scope(result);
         self.current = saved;
         result
     }

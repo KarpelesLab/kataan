@@ -54,6 +54,7 @@ pub enum ExecError {
 }
 
 /// The control-flow outcome of a statement.
+#[derive(Clone)]
 pub(crate) enum Flow {
     /// Fell through normally, carrying the last expression value (for `run`).
     Normal(NanBox),

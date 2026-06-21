@@ -5734,6 +5734,16 @@ impl Compiler {
             }
             Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
             Stmt::Var(decl) => {
+                // `using` / `await using` declarations need scope-exit disposal
+                // semantics the bytecode VM does not model; bail to the
+                // tree-walker (`nbexec`), which implements them with full
+                // explicit-resource-management semantics.
+                if matches!(
+                    decl.kind,
+                    crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
+                ) {
+                    return Err(CompileError::Unsupported("using declaration"));
+                }
                 for d in &decl.declarations {
                     // `const Name = class {…}` was registered as a named class
                     // (so `new Name()` resolves); materialize its static side.
@@ -5891,9 +5901,18 @@ impl Compiler {
                 if *is_await {
                     return Err(CompileError::Unsupported("for await"));
                 }
-                let ForLeft::Decl { target, .. } = left else {
+                let ForLeft::Decl { kind, target, .. } = left else {
                     return Err(CompileError::Unsupported("for-of binding"));
                 };
+                // A `for (using x of …)` / `for (await using x of …)` head needs
+                // per-iteration explicit-resource-management disposal; bail to the
+                // tree-walker (`nbexec`).
+                if matches!(
+                    kind,
+                    crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
+                ) {
+                    return Err(CompileError::Unsupported("using in for-of head"));
+                }
                 self.scopes.push(alloc::collections::BTreeMap::new());
                 let src = self.expr(right)?;
                 let arr = self.alloc();
