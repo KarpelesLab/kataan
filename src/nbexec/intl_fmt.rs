@@ -2543,55 +2543,55 @@ impl<'a> Interp<'a> {
                 .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                 .map(|v| this.realm.to_number(v) as u8)
         };
-        let mut o = NumberFormatOptions {
-            style: match opt_str(self, "style").as_deref() {
-                Some("percent") => NumberStyle::Percent,
-                Some("currency") => NumberStyle::Currency,
-                Some("unit") => NumberStyle::Unit,
-                _ => NumberStyle::Decimal,
-            },
-            notation: match opt_str(self, "notation").as_deref() {
-                Some("scientific") => Notation::Scientific,
-                Some("engineering") => Notation::Engineering,
-                Some("compact") => Notation::Compact,
-                _ => Notation::Standard,
-            },
-            compact_display: match opt_str(self, "compactDisplay").as_deref() {
-                Some("long") => CompactDisplay::Long,
-                _ => CompactDisplay::Short,
-            },
-            sign_display: match opt_str(self, "signDisplay").as_deref() {
-                Some("always") => SignDisplay::Always,
-                Some("exceptZero") => SignDisplay::ExceptZero,
-                Some("negative") => SignDisplay::Negative,
-                Some("never") => SignDisplay::Never,
-                _ => SignDisplay::Auto,
-            },
-            currency_display: match opt_str(self, "currencyDisplay").as_deref() {
-                Some("code") => CurrencyDisplay::Code,
-                Some("name") => CurrencyDisplay::Name,
-                Some("narrowSymbol") => CurrencyDisplay::NarrowSymbol,
-                _ => CurrencyDisplay::Symbol,
-            },
-            unit_display: match opt_str(self, "unitDisplay").as_deref() {
-                Some("long") => UnitDisplay::Long,
-                Some("narrow") => UnitDisplay::Narrow,
-                _ => UnitDisplay::Short,
-            },
-            // ECMA-402's default rounding is half-expand (1.25 → 1.3), not banker's rounding.
-            rounding_mode: match opt_str(self, "roundingMode").as_deref() {
-                Some("ceil") => RoundingMode::Ceil,
-                Some("floor") => RoundingMode::Floor,
-                Some("expand") => RoundingMode::Expand,
-                Some("trunc") => RoundingMode::Trunc,
-                Some("halfCeil") => RoundingMode::HalfCeil,
-                Some("halfFloor") => RoundingMode::HalfFloor,
-                Some("halfExpand") => RoundingMode::HalfExpand,
-                Some("halfTrunc") => RoundingMode::HalfTrunc,
-                Some("halfEven") => RoundingMode::HalfEven,
-                _ => RoundingMode::HalfExpand,
-            },
-            ..Default::default()
+        // `NumberFormatOptions` is `#[non_exhaustive]` in intl 0.5, so it can't be
+        // built with a struct literal — start from `default()` and set fields.
+        let mut o = NumberFormatOptions::default();
+        o.style = match opt_str(self, "style").as_deref() {
+            Some("percent") => NumberStyle::Percent,
+            Some("currency") => NumberStyle::Currency,
+            Some("unit") => NumberStyle::Unit,
+            _ => NumberStyle::Decimal,
+        };
+        o.notation = match opt_str(self, "notation").as_deref() {
+            Some("scientific") => Notation::Scientific,
+            Some("engineering") => Notation::Engineering,
+            Some("compact") => Notation::Compact,
+            _ => Notation::Standard,
+        };
+        o.compact_display = match opt_str(self, "compactDisplay").as_deref() {
+            Some("long") => CompactDisplay::Long,
+            _ => CompactDisplay::Short,
+        };
+        o.sign_display = match opt_str(self, "signDisplay").as_deref() {
+            Some("always") => SignDisplay::Always,
+            Some("exceptZero") => SignDisplay::ExceptZero,
+            Some("negative") => SignDisplay::Negative,
+            Some("never") => SignDisplay::Never,
+            _ => SignDisplay::Auto,
+        };
+        o.currency_display = match opt_str(self, "currencyDisplay").as_deref() {
+            Some("code") => CurrencyDisplay::Code,
+            Some("name") => CurrencyDisplay::Name,
+            Some("narrowSymbol") => CurrencyDisplay::NarrowSymbol,
+            _ => CurrencyDisplay::Symbol,
+        };
+        o.unit_display = match opt_str(self, "unitDisplay").as_deref() {
+            Some("long") => UnitDisplay::Long,
+            Some("narrow") => UnitDisplay::Narrow,
+            _ => UnitDisplay::Short,
+        };
+        // ECMA-402's default rounding is half-expand (1.25 → 1.3), not banker's rounding.
+        o.rounding_mode = match opt_str(self, "roundingMode").as_deref() {
+            Some("ceil") => RoundingMode::Ceil,
+            Some("floor") => RoundingMode::Floor,
+            Some("expand") => RoundingMode::Expand,
+            Some("trunc") => RoundingMode::Trunc,
+            Some("halfCeil") => RoundingMode::HalfCeil,
+            Some("halfFloor") => RoundingMode::HalfFloor,
+            Some("halfExpand") => RoundingMode::HalfExpand,
+            Some("halfTrunc") => RoundingMode::HalfTrunc,
+            Some("halfEven") => RoundingMode::HalfEven,
+            _ => RoundingMode::HalfExpand,
         };
         if matches!(
             self.realm

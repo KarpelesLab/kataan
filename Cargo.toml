@@ -77,7 +77,13 @@ rsurl = { version = "0.0", optional = true, default-features = false, features =
 purecrypto = { version = "0.6", optional = true, default-features = false, features = ["rng", "hash", "cipher", "linux-getrandom"] }
 # Pure-Rust, no_std Unicode/Intl primitives (a pure-Rust ICU analog). `full`
 # selects supplementary planes so JS strings (full Unicode) are covered.
-intl = { version = "0.4", optional = true, default-features = false, features = ["full", "alloc", "case", "collation", "identifiers"] }
+# 0.5 gates each formatter behind its own feature (the 0.4 `full` no longer
+# pulls them in). Enable the Intl-service formatters the engine uses (`plural`
+# and `calendar` are always-on and need no feature).
+intl = { version = "0.5", optional = true, default-features = false, features = [
+    "full", "alloc", "case", "collation", "identifiers",
+    "number", "currency", "datetime", "list", "displaynames", "relative", "units", "locale",
+] }
 
 [lints.rust]
 # Keep the foundation documented and the API surface honest.
