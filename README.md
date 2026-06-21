@@ -17,18 +17,25 @@ tri-modal model proven out in the sibling projects
 >   objects/arrays, method calls with `call`/`apply`/`bind`, `new`/`new.target`,
 >   all loops + `for-of`/`for-in`/`switch`/`try`-`catch`-`finally`,
 >   closures (incl. mutual recursion), destructuring, rest/spread, **classes**
->   with `extends`/`super` and getters/setters, generators (incl. `yield*` and
->   `.throw()`), and `async`/`await` — falling back to the tree-walker for the
->   handful of constructs it doesn't yet compile.
+>   with `extends`/`super` and getters/setters, and **lazy, truly-suspendable
+>   generators and `async`/`await`** (`yield`/`next(v)`/`.throw()`, async
+>   generators, `for await`, and `await` resuming as a microtask with correct
+>   ordering) — faulting to the tree-walker for the handful of constructs it
+>   doesn't yet compile.
 >
-> A **dual-path Test262-style conformance corpus (520/520) passes on both
-> engines**, covering closures, classes/inheritance (incl. `extends` of native
-> errors), optional chaining, the iterator protocol, `Map`/`Set`/`WeakMap`,
-> `Symbol` (incl. `Symbol.hasInstance`), `BigInt`, `Promise` + async/await,
-> `Proxy`/`Reflect` (incl. the `ownKeys` trap driving `Object.keys`/`values`/
-> `entries`/`for-in`), typed arrays, `Date`, an in-house `RegExp`, and a large
-> standard library (Math, JSON, Object/Array/String/Number). Compiled bytecode can
-> be serialized, reloaded, and run without the source.
+> Conformance is measured against the **full upstream tc39/Test262** (~53k tests),
+> run in CI and gated by a known-failures ledger that only ever shrinks. The
+> current pass-rate is **≈ 89 %** of the ~43k tests run (the rest are subsystems
+> not yet implemented — ES modules, Temporal, Atomics/agents). Working areas
+> include closures, classes/inheritance, optional chaining, the iterator protocol,
+> `Map`/`Set`/`WeakMap`/`WeakRef`/`FinalizationRegistry`, `Symbol` (with a real
+> `Symbol.prototype`), `BigInt`, `Promise` (combinators, `withResolvers`, `try`) +
+> async/await, `Proxy`/`Reflect`, typed arrays (incl. `Uint8Array` base64/hex),
+> `Date`, an in-house `RegExp` (named groups, lookbehind, `u`/`v` flags, inline
+> modifiers, property escapes), real sparse-array holes + array property
+> descriptors, and a large, growing standard library (Math, JSON, Object/Array/
+> String/Number, and the ES2024/2025 additions). Compiled bytecode can be
+> serialized, reloaded, and run without the source.
 >
 > Three advanced tiers are real and tested, though each has named work remaining:
 >

@@ -3,8 +3,16 @@
 Kataan is a JavaScript engine written in pure Rust, usable three ways — a
 standalone binary, a Rust library, and a C library. This roadmap describes **the
 work that remains** to reach a fully complete, conformant, high-performance
-JS+WASM engine. Finished foundations are summarized once (below) and not
-re-litigated; everything after §1 is forward-looking.
+JS + WASM engine, and a runtime that stands beside Node.js / Bun / Deno. Finished
+foundations are summarized once (§1) and not re-litigated; everything after is
+forward-looking.
+
+> **Headline status (2026-06):** the official tc39/Test262 corpus (~53k tests)
+> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 89 %**
+> of the ~43k *ran* tests (the ~10k skipped are Temporal / Atomics / agents /
+> cross-realm — see §3.9). The two remaining headline language gaps are **ES
+> modules + dynamic `import()`** and the **Intl services**; the long tail is
+> per-builtin and per-construct edges (§3).
 
 ---
 
@@ -12,19 +20,22 @@ re-litigated; everything after §1 is forward-looking.
 
 - **Pure Rust, no foreign code on the critical path.** Crypto/TLS via
   [`purecrypto`](https://github.com/KarpelesLab/purecrypto), HTTP via
-  [`rsurl`](https://github.com/KarpelesLab/rsurl); regex, Intl-lite collation, GC,
-  and the WASM engine are all in-house.
+  [`rsurl`](https://github.com/KarpelesLab/rsurl); regex, Intl-lite, GC, and the
+  WASM engine are all in-house.
 - **`unsafe` is quarantined.** `unsafe_code = "deny"` (not `forbid`); only the
   `ffi` module and a small, audited set of VM/JIT/mmap hot-path primitives opt
   back in with a scoped `#[allow(unsafe_code)]` + safety comment.
-- **Specification fidelity.** Conformance is measured against Test262 (JS) and
-  the upstream WebAssembly spec suite (WASM); correctness is never knowingly
-  traded for speed without a flag.
+- **`no_std` core stays buildable.** `--no-default-features --features alloc`
+  must compile in CI; std-only APIs (`f64::fract`/`trunc`, clock, threads) never
+  leak into the language core. The full Test262 run uses the `std` build, so a
+  no_std break is invisible there — build the matrix.
+- **Specification fidelity, measured.** Conformance is the official Test262 (JS)
+  and the upstream WebAssembly spec suite (WASM); correctness is never knowingly
+  traded for speed without a flag. **Zero-regression rule:** the ledger only ever
+  shrinks; a change that fails any not-yet-ledgered test is reverted or fixed
+  before commit.
 - **Deployable, host-native bytecode + heap.** Compiled bytecode — and an
-  initialized heap — are first-class serializable artifacts: exportable,
-  content-addressed, and `mmap`-reloadable zero-copy on a matching host, with an
-  on-demand byte-swap conversion for a mismatched one (never a re-encode tax on
-  the common path). See §6.
+  initialized heap — are first-class serializable artifacts (§2.3 / §6).
 
 ---
 
@@ -32,284 +43,359 @@ re-litigated; everything after §1 is forward-looking.
 
 Treat this as done; build on it.
 
-- **Front end:** complete lexer + full ECMAScript parser + AST.
-- **Two execution engines that agree on every test:** a tree-walking interpreter
-  (`nbexec`, the corpus/default engine) and a **register bytecode VM** (`nbvm`,
-  the primary path for `kataan run` / `eval` / the C ABI), compiling nearly all of
-  the common language. A dual-path conformance corpus (**510/510**, a curated
-  Test262-style suite) runs on both.
+- **Front end:** complete lexer + full ECMAScript parser + AST, with parse-time
+  early-error validation (incl. regex literals).
+- **Two execution engines that agree:** a tree-walking interpreter (`nbexec`, the
+  reference/corpus engine) and a **register bytecode VM** (`nbvm`, the primary
+  path for `kataan run` / `eval` / the C ABI). `nbvm` compiles the common
+  language and **faults to `nbexec`** for constructs it doesn't lower (a clean
+  whole-program fallback via `execute_typed`). A curated dual-path corpus plus
+  754 in-crate unit tests gate every change.
 - **Object model in production:** NaN-boxed values, hidden classes/shapes +
-  transition tree, shape+slots objects, interned atoms, rope strings, inline-cache
-  slots, a generational handle table, and a tracing GC — all live behind `Realm`,
-  not a side experiment.
-- **Bytecode codec (`KTBC`)** with a host-native header (byte order + pointer
-  width), dedup constant pool, version/magic/truncation checks; survives
-  serialize → reload → run.
-- **D′ snapshot tier:** a verified codec that captures the live heap and
-  `mmap`-reloads it over the **moving/compacting GC**, across eleven reference
-  cell kinds (string, array, object, date, bigint, closure, collection, promise,
-  proxy, regexp, symbol), cross-kind cycles, insertion-order-preserving.
-- **Machine-code JIT (x86-64 / Linux, `jit`):** W^X executable memory via raw
-  syscalls; an **optimizing integer path** (four-pass optimizer + register
-  allocator) and a **float path** covering `+ - * / %`, comparisons, control flow,
-  and the SSE-expressible `Math` intrinsics; each op has an `eval_*` oracle for
-  differential testing.
-- **WASM engine (`no_std`):** binary decode + validate + stack interpreter for
-  the MVP plus sign-extension, saturating conversion, bulk-memory, multi-value,
-  and typed structured control; a `.wast`/WAT spec harness drives a spec-derived
-  corpus; the `WebAssembly` builtin exists.
-- **Stdlib breadth:** Object/Array/String/Number/Math/JSON, Map/Set/WeakMap,
-  Symbol, BigInt, Promise + (eager) async, Proxy/Reflect, partial typed arrays,
-  Date, RegExp, `Function`, `new.target`. C ABI `kt_eval` runs scripts end-to-end.
+  transition tree, interned atoms, rope strings, inline-cache slots, a
+  generational handle table, and a moving/compacting tracing GC — all behind
+  `Realm`.
+- **Lazy suspendable coroutines:** generators and `async`/`await` run on a real
+  explicit-stack suspension engine — `yield` truly suspends, `next(v)` injection
+  and `throw()`-into-`try{yield}` work, and `await` resumes as a **microtask**
+  with correct interleaving ordering. Async generators + `for await` + async
+  `yield*` (async-iterator protocol) work; remaining async gaps are exact
+  per-`await` step ordering in elaborate cases (§3.5).
+- **Array model with real holes:** a `NanBox::hole()` sentinel threads through
+  iteration, `in`/`hasOwnProperty`, `Object.keys`/`entries`, and the property
+  descriptor layer; `Object.defineProperty` on array indices + `length`
+  (ArraySetLength: non-writable length, configurable-stop shrink, freeze/seal)
+  works via a sparse attribute side-table that leaves the dense fast path
+  untouched.
+- **First-class prototype methods (mostly):** `Array.prototype.map.call(arrayLike)`,
+  extracting a method as a value (`const s = [].slice`), and `…prototype.X.call`
+  idioms work. **Exception:** `Array`/`Object` are still object-cells, so
+  `typeof Array === "object"` and `Array.apply`/`Array instanceof Function` are
+  wrong (§3.7).
+- **Bytecode codec (`KTBC`)** + **D′ snapshot tier** (`mmap`-reload over the
+  moving GC across the reference cell kinds, incl. non-enumerable/internal slots,
+  accessors, and `[[Prototype]]` links) + content-addressed, host-tagged artifact
+  store. See §2.3 for what remains.
+- **Machine-code JIT (x86-64 / Linux, `jit`):** W^X memory; optimizing integer
+  path + float path over the SSE-expressible `Math` intrinsics; per-op `eval_*`
+  differential oracle. See §2.1.
+- **WASM engine (`no_std`):** decode + validate + stack interpreter for the MVP +
+  sign-ext + sat-conversion + bulk-memory + multi-value + typed control; a
+  `.wast`/WAT harness; the `WebAssembly` builtin with `Module`/`Instance`/
+  `Global`/`Memory`/`Table`, host-function imports, and stateful instances. See
+  §2.2.
+- **Stdlib breadth:** Object/Array/String/Number/Math/JSON (incl. `rawJSON`/
+  `isRawJSON`), Map/Set/WeakMap/WeakSet (+ `getOrInsert`/`getOrInsertComputed`),
+  **WeakRef** + **FinalizationRegistry**, Symbol (+ real `Symbol.prototype`),
+  BigInt, **Promise** (+ combinators, `withResolvers`, `try`), Proxy/Reflect,
+  typed arrays (+ `Uint8Array` base64/hex, `from`/`subarray`), DataView, Date,
+  in-house RegExp (named groups, lookbehind, `u`/`v` flags, inline modifiers,
+  property escapes), `Error.isError`/`Error.prototype.stack`, `RegExp.escape`,
+  `Array.fromAsync`, `Math.sumPrecise`, Iterator helpers. C ABI `kt_eval` runs
+  scripts end-to-end.
 
 The rest of this document is the gap between that base and "complete."
 
 ---
 
-## 2. The three headline deliverables
+## 2. The three headline engine deliverables
 
-These are the load-bearing items that make Kataan more than a fast interpreter.
+These make Kataan more than a fast interpreter. They are *engine* capabilities
+(beyond what Node/Bun expose) and largely independent of the §3 conformance tail.
 
-### 2.1 Complete the machine-code JIT (for the *whole* VM, not just numbers)
+### 2.1 Complete the machine-code JIT (the *whole* VM, not just numbers)
 
 Today the JIT compiles integer/float numeric functions and bails to the
 interpreter for everything else. "Complete" means hot functions JIT regardless of
 what they touch.
 
-- **The re-entrancy + GC-safety substrate (the hard core).** Native code must be
-  able to call back into `Realm` primitives (property get/set, allocation, string
-  ops) and survive a moving GC mid-call. Concretely:
-  - a calling convention and **stack maps** so the GC can find/relocate live
-    object references held in JIT frames and registers across a safepoint;
-  - safepoints at allocation/call sites; pinning or re-loading of relocatable
-    handles after any call that can collect;
-  - a sound `&mut Realm` re-entry path (no aliasing UB when native code re-enters
-    the VM) — the current blocker that keeps object/string ops interpreter-only.
-- **Non-numeric op lowering:** property access through inline-cache slots (shape
-  guard → slot load, deopt on miss), array element load/store with the
-  element-kind fast paths, string/rope ops, closure/upvalue access, `this`/scope.
+- **GC-safe native re-entry substrate (the hard core):** a calling convention +
+  **stack maps** so the moving GC can find/relocate live references in JIT frames
+  and registers across a safepoint; safepoints at allocation/call sites; a sound
+  `&mut Realm` re-entry path (the current blocker that keeps object/string ops
+  interpreter-only).
+- **Non-numeric op lowering:** IC-slot property access (shape guard → slot load,
+  deopt on miss), array element load/store with element-kind fast paths,
+  string/rope ops, closure/upvalue/`this`/scope access.
 - **Calls in JITed code:** direct + polymorphic call sites, native-builtin calls,
   argument/return marshaling, exception propagation across native frames.
-- **Tiering & deopt:** a **baseline tier** (fast copy-and-patch / template
-  compile of bytecode, no optimization, with on-stack replacement for hot loops)
-  feeding a **profiling** layer; **deoptimization** back to bytecode when a
-  speculative guard fails (the mechanism that makes speculative type
-  specialization safe).
-- **Shared native backend:** factor codegen into a Cranelift-style backend
-  (register allocation, executable-memory mgmt, relocations) that both the JS JIT
-  and the WASM compiler (Track 2.2) lower into. Designed to target **native or
-  WASM output** (the sandbox fallback — JIT-by-emitting-WASM when hosted inside a
-  WASM sandbox that forbids native codegen).
-- **Portability of the JIT itself:** the current path is x86-64/Linux; the
-  backend abstraction is what makes aarch64 and other OSes additive.
+- **Tiering & deopt:** a **baseline tier** (copy-and-patch template compile, OSR
+  for hot loops) feeding a profiling layer; **deoptimization** back to bytecode
+  on a failed speculative guard.
+- **Shared native backend:** a Cranelift-style backend (regalloc, exec-memory,
+  relocations) that both the JS JIT and the WASM compiler (2.2) lower into,
+  targeting native **or WASM output** (the sandbox fallback).
+- **Portability:** the backend abstraction makes aarch64 / other OSes additive
+  (current path is x86-64/Linux only).
 
-Exit criteria: a hot function doing object/array/string work runs as native code,
-verified by differential execution against the interpreter and by the conformance
-corpus passing with the JIT forced on; deopt round-trips proven; no GC-safety
-holes under stress/fuzz.
+Exit: a hot object/array/string function runs as native code, differentially
+verified against the interpreter, conformance corpus green with the JIT forced
+on, deopt round-trips proven, no GC-safety holes under fuzz.
 
-### 2.2 A conformant (non-numeric) WASM engine + full upstream suite
+### 2.2 A conformant WASM engine + the full upstream suite
 
 Today the WASM engine passes a spec-*derived* corpus over the numeric/control
-core. "Complete" means the full standardized feature set and the **upstream
-WebAssembly spec test suite**.
+core. "Complete" means the full standardized feature set and the upstream spec
+test suite.
 
-- **Reference types & tables:** `funcref`/`externref`, `table.*` ops, multiple
-  tables, `call_indirect` type checks and traps, element segments (active /
-  passive / declarative), `ref.func`/`ref.null`/`ref.is_null`.
-- **The JS ↔ WASM boundary (the "non-numeric" surface):** *Done:* `validate`,
-  `instantiate` (→ `{module, instance}`), the `Module`/`Instance` constructors,
-  `compile` (→ `Promise<Module>`), host-function imports (JS callable from WASM),
-  **stateful instances** — mutable globals and linear memory persist across export
-  calls, each instance independent — and the **`WebAssembly.Global`** object (typed
-  value cell with a `.value` accessor, ToInt32/`BigInt` coercion, immutability
-  enforced), **`WebAssembly.Memory`** (`.buffer` ArrayBuffer + `byteLength`,
-  `grow(delta)` page accounting with content copy, `maximum` → RangeError), and
-  **`WebAssembly.Table`** (`.length`, `get`/`set` of function refs, `grow(delta,
-  init?)` → prior length, out-of-bounds + `maximum` → RangeError). *Remaining:*
-  making `Memory.buffer` a *live shared view* with typed arrays/DataView (blocked
-  on the separate typed-array ↔ ArrayBuffer backing-buffer work — today typed-array
-  views don't share an ArrayBuffer's bytes). **Imported globals** are wired
-  (`importObject[m][f]` from a `WebAssembly.Global` or a Number/BigInt, coerced to
-  the declared type), and a module's **exported globals** are exposed as
-  `WebAssembly.Global` objects (value + mutability; `instanceof` works for
-  `Global`/`Memory`/`Table`/`Module`). *Remaining* imports/exports wiring: imported
-  memories/tables, exposing a module's exported `Memory`/`Table`, `compileStreaming`/
-  `instantiateStreaming`, and the `externref` bridge. Traps already surface as JS
-  exceptions.
+- **Reference types & tables:** `funcref`/`externref`, `table.*`, multiple tables,
+  `call_indirect` type checks/traps, element segments (active/passive/declarative),
+  `ref.func`/`ref.null`/`ref.is_null`.
+- **JS ↔ WASM boundary — remaining:** make `Memory.buffer` a *live shared view*
+  with typed arrays/DataView (now unblocked — typed arrays share an ArrayBuffer's
+  bytes); imported memories/tables; exposing exported `Memory`/`Table`;
+  `compileStreaming`/`instantiateStreaming`; the `externref` bridge. (`validate`,
+  `instantiate`/`compile`, host-fn imports, stateful instances, `Global`/`Memory`/
+  `Table`, imported/exported globals, traps-as-exceptions are done.)
 - **Post-MVP proposals (prioritized):** SIMD (`v128`), threads + `Atomics` on
   shared memory, multi-memory, tail calls, extended-const, then GC types and
-  exception handling as they stabilize.
-- **Compilation, not just interpretation:** lower validated WASM through the
-  shared native backend (Track 2.1) for a real baseline/optimizing WASM tier, on
-  the **shared GC and heap** (linear memory as a GC-tracked byte array;
-  future WASM-GC objects on the same heap).
-- **The test gate:** wire the **official `wabt`/spec `.wast` suite** into CI (not
-  only the in-house corpus), tracking a pass-rate per proposal; fuzz the decoder
-  and validator.
+  exception handling.
+- **Compiling tier:** lower validated WASM through the shared backend (2.1) for a
+  real baseline/optimizing WASM tier on the shared GC + heap.
+- **Test gate:** wire the official `wabt`/spec `.wast` suite into CI (per-proposal
+  pass-rate); fuzz decoder + validator.
+- **WASI** (`wasi_snapshot_preview1` core) for running real `.wasm` CLIs.
 
-Exit criteria: the upstream spec suite passes for MVP + reference-types +
-bulk-memory + multi-value + sign-ext + sat-conversion (and a tracked, growing set
-of post-MVP proposals); JS↔WASM interop round-trips real modules; validator
-rejects malformed modules safely under fuzzing.
+Exit: the upstream spec suite passes for MVP + reference-types + bulk-memory +
+multi-value + sign-ext + sat-conversion (+ a growing post-MVP set); JS↔WASM
+round-trips real modules; validator rejects malformed modules under fuzz.
 
 ### 2.3 The mmap-able zero-copy D′ layout, fully complete
 
-Today the snapshot codec round-trips eleven cell kinds and `mmap`-reloads over the
+Snapshot codec round-trips the reference cell kinds and `mmap`-reloads over the
 moving GC. "Complete" means *any* live heap snapshots, reloads zero-copy, and
-**executes** — and the bytecode code-cache it shares is production-grade.
+**executes**, with a production-grade shared code-cache.
 
-- **Hidden-state cells.** *Done:* object capture now records **all own data
-  properties** — non-enumerable ones and the engine's internal `\0`-prefixed slots
-  — with a per-property hidden flag, so bound-function target/this/args, typed-array
-  kind, error `stack`, and the `constructor` back-reference round-trip
-  (`snapshots_preserve_non_enumerable_and_hidden_slots`), an object's
-  `[[Prototype]]` link round-trips so `Object.create(p)` / inheritance chains
-  resolve through the restored chain (`snapshots_preserve_prototype_links`), and
-  accessor (getter/setter) properties round-trip with their functions and
-  enumerability (`snapshots_preserve_accessor_properties`) — so object-cell fidelity
-  is now complete (data + non-enumerable + internal slots + accessors + prototype).
-  *Remaining:* generator/async suspension state (depends on Track 3 lazy frames);
-  the `ArrayBuffer` backing-buffer *identity* shared across typed-array views —
-  audit each remaining non-object `Cell` variant.
-- **End-to-end restore-and-execute.** *Done:* a restored closure runs and carries
-  its snapshotted captured state, both in place
-  (`snapshot_restores_an_executable_closure`) and **across runtimes** — snapshot in
-  one interpreter, serialize to bytes, drop it, then restore into a *fresh*
-  interpreter holding the same code and call the closure, which resumes from the
-  snapshotted state independent of the new runtime's own program instance
-  (`snapshot_reloads_into_a_fresh_runtime`) — the load → evict → reload scenario.
-  A **public library API** exposes this: `Interp::snapshot(&[roots]) -> bytes`
-  and `Interp::restore_snapshot(&bytes) -> Vec<Value>`, tested cross-runtime through
-  the supported surface alone (`public_snapshot_api_round_trips_across_runtimes`),
-  with a malformed snapshot rejected rather than panicked on. A **C-ABI binding** of
-  the same two calls is in — `kt_snapshot(source) -> bytes` and `kt_restore(bytes)
-  -> string` (panic-guarded, length-convention, header-documented; round-trip
-  tested through the C entry points). *Remaining:* persisting the bytes through the
-  content-addressed artifact store below.
-- **The shared, versioned, mmap-able artifact store (code-cache, §6):** *Started:*
-  a content-addressed store keys serialized snapshots by an FNV-1a hash of their
-  own bytes, so identical artifacts deduplicate and a fetch can re-verify the bytes
-  still hash to the requested address (`snapshot::store::{ArtifactStore,
-  content_address, address_hex}`; end-to-end capture → serialize → store → fetch →
-  deserialize → restore tested). **Source-hash + host-tag keying** is in
-  (`host_tag` encodes pointer width / byte order / arch; `host_keyed_address` and
-  `ArtifactStore::{put,get}_for_host` resolve a source to a per-host artifact, so a
-  host-native artifact never aliases another host's). *Remaining:*
-  lazy per-function bodies faulted in
-  on first call; **module-local atom remap** on load; IC slots load reset; the
-  **on-demand byte-swap conversion** path for a mismatched host (convert once,
-  re-cache, zero-copy thereafter); **read-only pages shareable across many
-  concurrent contexts/processes** (the "hundreds of bases" model — immutable
-  bytecode shared, each context owns its mutable heap/globals).
-- **Untrusted-load verifier.** Loading bytecode *is* executing it: a verifier
-  (bounds-checked jumps, constant/atom/register indices, stack-depth invariants)
-  for untrusted artifacts; trusted-cache fast path relies on version tag +
-  checksum. Safe-Rust means a bad index is a clean rejection, never UB.
-- **Heap-snapshot startup.** Skip initialization (not just parsing) by booting
-  from a snapshot of an initialized realm — the natural payoff once the above and
-  the moving GC's pointer-relocation pass are solid.
+- **Hidden-state cells — remaining:** generator/async **suspension state**
+  (explicit-stack frames are snapshottable now that they're reified — wire them
+  in); the `ArrayBuffer` backing-buffer **identity** shared across typed-array
+  views; audit each remaining non-object `Cell` variant.
+- **Restore-and-execute:** done for closures + cross-runtime, with public Rust
+  (`Interp::snapshot`/`restore_snapshot`) and C-ABI (`kt_snapshot`/`kt_restore`)
+  bindings. **Remaining:** persist through the content-addressed store below.
+- **Shared artifact store (code-cache, §6) — remaining:** lazy per-function bodies
+  faulted in on first call; module-local atom remap on load; IC-slot reset; the
+  **on-demand byte-swap conversion** for a mismatched host (convert once, re-cache,
+  zero-copy thereafter); **read-only pages shared across many concurrent
+  contexts/processes** ("hundreds of bases" — immutable bytecode shared, each
+  context owns its mutable heap).
+- **Untrusted-load verifier:** bounds-checked jumps/indices/stack-depth for
+  untrusted artifacts; trusted-cache fast path on version tag + checksum.
+- **Heap-snapshot startup:** boot from a snapshot of an initialized realm (skip
+  init, not just parsing) — the payoff once the above + GC relocation are solid.
 
-Exit criteria: an arbitrary initialized heap snapshots, reloads zero-copy on a
-matching host (and via one-time conversion on a mismatched one), and executes;
-the code-cache passes the load → run → evict → reload churn + cross-tenant dedup
-scenario; the verifier rejects malformed blobs under fuzzing.
+Exit: an arbitrary initialized heap snapshots, reloads zero-copy (or via one-time
+conversion) and executes; the code-cache passes the load → run → evict → reload +
+cross-tenant dedup churn; the verifier rejects malformed blobs under fuzz.
 
 ---
 
-## 3. Language conformance to "fully complete"
+## 3. Language conformance to 100 % Test262
 
-The corpus is curated (510 tests); completeness means the **full upstream
-Test262** for the language (non-Intl) at a high, tracked pass-rate, with the known
-semantic gaps closed.
+The instrument is the **full upstream Test262** via `tests/test262_official.rs`,
+gated by `tests/test262-status.txt`. Items are ordered roughly by ledger weight.
+"Done" gaps from earlier roadmaps (sparse holes, lazy generators/async,
+first-class prototypes, WeakRef/FinalizationRegistry, regex validation, the
+ES2024/25 builtin tail) are intentionally not relisted — see §1.
 
-- **Sparse arrays / holes.** The array model stores holes as `undefined`; a real
-  empty-slot representation (sentinel or presence bitmap) must thread through
-  literal construction, every iteration method, `in`/`hasOwnProperty`,
-  `Object.keys`/`entries`, and `join`/`toString`. (Currently `Object.keys` on a
-  hole array and `forEach`/`in` over holes are non-conformant.)
-- **Lazy, suspendable generators.** Generators run *eagerly* into a value buffer:
-  `.next(value)` injection and `.throw()` into a `try{ yield }catch` are
-  unsupported, and the suspension model can't interleave. Replace with a real
-  coroutine/state-machine so `yield` truly suspends.
-- **Lazy async / correct microtask interleaving.** `await` runs its continuation
-  synchronously instead of yielding to the caller as a microtask (values are
-  correct; ordering is not). Same suspendable-frame work as generators.
-- **First-class prototype methods.** `Array.prototype.map.call(arrayLike)` and
-  extracting a method as a value (`[].slice`) don't work — methods are built-in
-  dispatch, not function objects on real `…​.prototype` objects. `Array`/`Object`
-  are namespace objects, so `typeof Array === "object"` (should be `"function"`)
-  and `Array instanceof Function` is false. Needs real builtin prototype objects
-  with installed, callable method functions and `this`-generic algorithms.
-- **Remaining builtins / edges:** `Atomics` (+ `wait`/`notify`),
-  `SharedArrayBuffer`, resizable/growable `ArrayBuffer`, complete `%TypedArray%`
-  method set + `TypedArray.from`/`subarray`, `WeakRef`/`FinalizationRegistry` GC
-  cooperation, `Symbol.toPrimitive`/well-known-symbol coverage, tagged-template
-  and regex `d`/`v`-flag/named-group/lookaround completeness, JSON source-text
-  access.
-- **Intl-lite (`intl`):** flesh out `Intl.Collator`/`NumberFormat`/`DateTimeFormat`
-  /`PluralRules`/`Segmenter` + locale negotiation over the embedded trimmed CLDR
-  data.
-- **The gate:** run the **full upstream Test262** in CI with a tracked pass-rate
-  (target >95% of the non-Intl suite); fuzz parser, regex, JSON, and the VM.
+### 3.1 ES Modules + dynamic `import()` — the single biggest gap (~450+ ran, thousands skipped)
+
+`import()` parses but there is **no module loader**, and `flags:[module]` tests
+are skipped entirely. This is both a language feature and a runtime subsystem
+(§4.2). Needs:
+
+- A **module record / linking** pipeline: parse → instantiate (resolve imports,
+  allocate bindings, TDZ live bindings) → evaluate, with cycles and `import.meta`.
+- **Dynamic `import(specifier)`** returning a promise of the namespace, with the
+  host resolution hook the Test262 runner can drive (sibling `_FIXTURE.js` files).
+- **Top-level `await`**, **JSON modules**, import attributes (currently skipped).
+- Runner work: execute `flags:[module]` tests as modules with file-relative
+  resolution (moves a large block from *skipped* into *ran*).
+
+### 3.2 `class` edge cases (~550)
+
+Classes work broadly, but a long tail fails: private field/method/accessor **brand
+checks** in nested/shadowed/before-`super()` contexts, **static blocks** + static
+field init order, computed-key evaluation order + abrupt completions,
+`#x in obj` ergonomic-brand edges, `super` in field initializers / static
+contexts, and `new.target` in edge positions.
+
+### 3.3 Intl services (~525)
+
+`Intl.NumberFormat` (138) / `DateTimeFormat` (95) / `Locale` (77) /
+`DurationFormat` (67) / `ListFormat` (52) / `RelativeTimeFormat` (48) /
+`Segmenter` / `PluralRules` / `DisplayNames` / `Collator`. The constructors +
+option bags + locale negotiation are partly there; the failures are
+**formatting-correctness** edges (signDisplay, compact/notation, rounding modes,
+currency/unit, range formatting, `formatToParts`) over the embedded trimmed CLDR
+data. Regression-prone — fix per-service with the format tests as the gate.
+
+### 3.4 Direct `eval` + Annex B legacy semantics (~360)
+
+`language/eval-code/direct` (173) + `annexB/language` (186): Annex-B
+**function-in-block** hoisting (a block `function f(){}` creating a `var`-scoped
+binding), direct-eval variable/function declarations into the caller scope,
+`with`-scope interactions, and the legacy HTML-comment / octal-escape corners.
+
+### 3.5 Iteration, control, and assignment constructs (~350)
+
+- **`with` statement** (72): scope-object semantics + `@@unscopables`.
+- **Explicit Resource Management** — `using` / `await using` (64) + the
+  scope-exit **disposal** runtime (the `[Symbol.dispose]`/`[Symbol.asyncDispose]`
+  call on block exit; classes exist, scope disposal does not).
+- **`for-of` / `for-await-of`** (112): iterator-close on abrupt completion,
+  async-from-sync wrapping edges, destructuring-in-head corners.
+- **assignment / compound / logical-assignment** (110): destructuring assignment
+  targets, getter/setter ordering, `&&=`/`||=`/`??=` short-circuit edges.
+- **`super`** (34), **async-generator / generators / yield** (~135): the residual
+  exact-ordering and abrupt-completion cases the lazy engine doesn't yet mirror.
+
+### 3.6 Builtin edges (the long per-object tail)
+
+Each is "works, but fails spec edges": **Array** (280 — array-like generic
+algorithms, species, sort comparator/stability, copyWithin/splice on exotic
+receivers), **Object** (185 — descriptor/`defineProperty` corners, property
+enumeration order, `__proto__`), **RegExp** (204 — match/replace/split/`Symbol.*`
+protocol, sticky/global lastIndex, `d`-indices), **TypedArray** (~165 — full
+method set on exotic/resizable buffers, constructor coercion order), **Promise**
+(145 — combinator resolve-element identity, thenable adoption order, subclass
+species), **Proxy** (66 — per-trap invariant checks; see §3.7), **Iterator** (83 —
+helper edges, `Iterator.zip`/`zipKeyed`), **String** (54), **Function** (59 —
+`.length`/`.name`/`bind`/`toString`), **ArrayBuffer** (58 — transfer/resize),
+**JSON** (46 — `formatToParts`-style edges, source access).
+
+### 3.7 Cross-cutting object-model fixes (high leverage)
+
+- **`Array` / `Object` as functions.** They are object-cells with a `null`
+  `[[Prototype]]`, so `typeof Array === "object"`, `Array instanceof Function` is
+  false, and `Array.apply`/`.call`/`.bind` are missing. *Naively* setting their
+  `[[Prototype]]` to `%Function.prototype%` **broke array method resolution**
+  (the ctor object is entangled with `array_proto_intrinsic`) — needs careful
+  untangling, not a one-line `set_object_proto`.
+- **Trap-less Proxy forwarding through iteration.** Basic trapless passthrough
+  works (`get`/`has`/`set`/`delete`/`call`), but `[...new Proxy([1,2,3],{})]`
+  reads holes — the array-iterator / `iterate_values` fast path bypasses the
+  proxy's `[[Get]]`. Route iteration over a proxy through the per-index protocol.
+- **Static-method `.call` receiver.** `setup_static_methods` binds the
+  constructor as `this`; only the `this_aware` list (Promise combinators/`resolve`/
+  `reject`/`try`) honors a dynamic `.call` receiver. Generalize for other statics
+  whose receiver matters.
+
+### 3.8 Resizable / shared memory & atomics (skip-gated today)
+
+- **Resizable/growable `ArrayBuffer`:** length-tracking is partly in; the
+  TypedArray methods' out-of-bounds-on-shrink behavior remains.
+- **`SharedArrayBuffer` + `Atomics`** (`load`/`store`/`add`/…/`wait`/`notify`/
+  `waitAsync`) on shared memory, including the **agents** harness — a real
+  threading/worker substrate. Currently skip-gated; large.
+
+### 3.9 Whole subsystems currently skipped (each a project)
+
+These are removed from the *ran* denominator via `SKIP_FEATURES`; implementing any
+one both adds coverage and moves its tests from skipped → ran:
+
+- **Temporal** — the entire date/time subsystem (hundreds of tests).
+- **Decorators** — class/field decorators + `Symbol.metadata`.
+- **Tail-call optimization** (proper tail calls).
+- **Import attributes / assertions** (with §3.1).
+- **cross-realm** (`$262.createRealm`) and **IsHTMLDDA** (host-quirk `document.all`).
+
+### 3.10 The gate
+
+Keep the full Test262 nightly job; drive the ledger to empty. Fuzz parser, regex,
+JSON, and both VMs. Maintain the zero-regression rule and the no_std build matrix.
 
 ---
 
-## 4. Host runtime to a real runtime (`host`)
+## 4. Host runtime — parity with Node.js / Bun / Deno (`host`)
 
-- **Event loop & timers:** a complete in-house loop (mio-style readiness or std
-  threads), `setTimeout`/`setInterval`/`setImmediate` + `clear*`,
-  `process.nextTick`, microtask checkpoint integration.
-- **Modules:** ESM (static + dynamic `import`, `import.meta`, top-level `await`),
-  CommonJS interop, JSON modules, import maps / resolution.
-- **Web platform:** `TextEncoder`/`Decoder`, `atob`/`btoa`, `Buffer`,
-  `URL`/`URLSearchParams`, WHATWG streams, `structuredClone`,
-  `performance.now`/marks.
-- **`fetch`** (+ `Headers`/`Request`/`Response`/`Blob`/`FormData`) over `rsurl`
-  with `purecrypto` TLS; **`crypto`** (`getRandomValues`/`randomUUID`/`subtle`)
-  over `purecrypto`.
-- **Node-compat subset:** `fs`/`path`/`os`/`net`/`http(s)`/`events`/`stream`/
-  `util`/`process`/`Buffer` — a useful subset, gaps documented.
+The language engine is necessary but not sufficient to *replace* `node`/`bun`.
+This is the surface a real runtime exposes to scripts.
+
+### 4.1 Event loop & scheduling
+
+A complete in-house loop (readiness-based I/O or std threads): `setTimeout`/
+`setInterval`/`setImmediate` + `clear*`, `queueMicrotask`, `process.nextTick`,
+the microtask/macrotask checkpoint integrated with the Promise job queue,
+`AbortController`/`AbortSignal`, unref/ref semantics, and a clean exit when the
+loop drains.
+
+### 4.2 Module system & package resolution (with §3.1)
+
+ESM (static + dynamic `import`, `import.meta`, top-level await) **and** CommonJS
+interop (`require`, `module.exports`, the wrapper, cycle handling); Node-style
+resolution (`node_modules`, `package.json` `exports`/`imports`/`type`, conditional
+exports, `.mjs`/`.cjs`), the `node:` builtin prefix, JSON/`.wasm` imports, import
+maps. This is the gateway to running **real npm packages** — the practical bar for
+Node/Bun parity.
+
+### 4.3 Web platform globals
+
+`console` (full formatting), `TextEncoder`/`TextDecoder`, `atob`/`btoa`,
+`URL`/`URLSearchParams`, `structuredClone`, `performance.now`/marks/measures,
+`queueMicrotask`, WHATWG **streams** (Readable/Writable/Transform), `Blob`/`File`/
+`FormData`, `EventTarget`/`Event`, `MessageChannel`/`MessagePort`, `WebSocket`,
+`btoa` + base64 helpers, timers as globals.
+
+### 4.4 `fetch` + crypto (own crates)
+
+`fetch` (+ `Headers`/`Request`/`Response`/`Blob`/`FormData`, redirects, abort,
+streaming bodies) over `rsurl` with `purecrypto` TLS; **`crypto`**
+(`getRandomValues`/`randomUUID` done; `subtle` digest/HMAC/AES/RSA/ECDSA/keys)
+over `purecrypto`.
+
+### 4.5 Node-compat builtins
+
+A useful, documented subset, `node:`-prefixed: `fs` (sync + promises),
+`path`, `os`, `url`, `util` (`inspect`/`promisify`/`TextEncoder`), `events`
+(`EventEmitter`), `stream`, `buffer` (`Buffer`), `process` (`argv`/`env`/`cwd`/
+`exit`/`platform`/`hrtime`/`stdout`/`stderr`), `net`/`tls`/`http(s)`,
+`crypto`, `zlib`, `child_process`, `worker_threads` (shared with §3.8 agents),
+`assert`, `timers`. Gaps documented per module.
+
+### 4.6 CLI / runtime ergonomics (the Bun/Deno bar)
+
+`kataan run file.{js,mjs,cjs,ts?}`, a REPL, `--eval`/`-e`, reading from stdin,
+source-map-aware stack traces, a permissions/sandbox story, and ideally a
+**built-in test runner** + TS/JSX transpile-on-load (Bun/Deno's differentiators).
+TypeScript type-stripping (not checking) on import is the high-value, low-cost
+piece.
 
 ---
 
 ## 5. Performance frontier
 
-- **Interpreter pass:** IC tuning, array element-kind fast paths, string-rope
-  tuning, the generational/moving GC upgrades that bump-allocation `new` relies
-  on (the moving GC exists for D′; finish its generational nursery + write
-  barriers for throughput).
-- **Optimizing JIT (after the baseline tier in 2.1):** an SSA IR with inlining,
-  escape analysis, range/redundancy elimination, type-feedback-driven speculation
-  with guard-based deopt — lowering through the shared backend. The point where we
-  contend with V8 on compute-bound code.
+- **Interpreter:** IC tuning, array element-kind fast paths, rope tuning, finish
+  the generational nursery + write barriers on the existing moving GC for
+  bump-allocation throughput.
+- **Optimizing JIT (after the 2.1 baseline tier):** an SSA IR with inlining,
+  escape analysis, range/redundancy elimination, type-feedback speculation with
+  guard-based deopt — through the shared backend. The point where we contend with
+  V8 on compute-bound code.
 - **Benchmarks:** SunSpider/Kraken-style microbenchmarks + realistic scripts;
-  cold-start vs `node -e`; code-cache load/evict/reload throughput; per-object
-  memory vs equivalent V8 heaps.
+  cold-start vs `node -e` / `bun`; code-cache load/evict/reload throughput;
+  per-object memory vs V8/JSC heaps.
 
 ---
 
 ## 6. Design invariants that still constrain remaining work
 
-Kept from the original architecture because Tracks 2.1–2.3 must honor them.
-
 - **Own JS bytecode + VM; WASM is a *peer* engine sharing the backend, not a
-  compile target.** Routing JS through WASM would forfeit guard-based deopt — the
-  mechanism that makes a JS optimizing JIT fast. The two engines share the **GC +
-  heap, the native backend, the value/interop boundary, and the host runtime**;
-  the two bytecodes stay distinct (JS = dynamic/deopt-friendly, WASM = statically
-  typed). The one place emitting WASM *for JS* is correct: the sandbox fallback in
-  2.1.
-- **Serializable, host-native artifacts (the code-cache + heap snapshot).** A
-  serialized unit is position-independent (cross-referenced by index, never by
-  live pointer), with host-native integer encoding and an explicit, cheap,
-  on-demand byte-swap conversion for a mismatched host — *not* a slow canonical
-  encoding everyone pays for, and *not* a recompile. Versioned + integrity-checked
-  with two distinct mismatch paths: version/flags mismatch or bad checksum →
-  recompile; host-encoding mismatch, same version → convert. Atoms are
-  module-local and remapped on load; IC slots and shapes are runtime state, never
-  serialized; function bodies are lazy. The JS bytecode cache and the compiled-WASM
-  cache share **one** artifact store.
+  compile target.** Routing JS through WASM would forfeit guard-based deopt. The
+  engines share the GC + heap, the native backend, the value/interop boundary,
+  and the host runtime; the two bytecodes stay distinct. The one place emitting
+  WASM *for JS* is the sandbox fallback (2.1).
+- **Serializable, host-native artifacts.** Position-independent (indexed, never
+  live pointers), host-native integer encoding with a cheap on-demand byte-swap
+  for a mismatched host — not a slow canonical encoding, not a recompile.
+  Versioned + integrity-checked: version/flags mismatch or bad checksum →
+  recompile; host-encoding mismatch, same version → convert. Atoms module-local +
+  remapped on load; IC slots/shapes are runtime state, never serialized; function
+  bodies lazy. One artifact store for JS bytecode and compiled WASM.
+- **Two engines, one truth.** `nbvm` and `nbexec` must agree; `nbvm` faults
+  cleanly to `nbexec` rather than producing a wrong-but-silent result. A new
+  builtin landed only in `nbexec` is reached via that fallback — acceptable, but
+  note it.
 
 ---
 
@@ -317,23 +403,25 @@ Kept from the original architecture because Tracks 2.1–2.3 must honor them.
 
 Kataan is "complete" when:
 
-1. **JS:** the full upstream Test262 (non-Intl) passes at a high tracked rate on
-   both engines; the documented semantic gaps (holes, lazy generators/async,
-   first-class prototypes) are closed; `Atomics`/`SharedArrayBuffer`/typed-array
-   completeness and the host runtime land.
-2. **JIT:** hot functions JIT regardless of object/string/closure content, with a
+1. **JS:** the full upstream Test262 ledger is **empty** for every implemented
+   feature area, and the skip-gated subsystems (Temporal, Atomics/SAB + agents,
+   decorators, modules) are themselves implemented and passing — not merely
+   skipped.
+2. **Runtime:** real npm packages run; the module system, event loop, web-platform
+   globals, `fetch`/`crypto`, and the Node-compat subset (§4) cover common
+   programs; a CLI + REPL stand beside `node`/`bun` for everyday use.
+3. **JIT:** hot functions JIT regardless of object/string/closure content, with a
    baseline + optimizing tier, type-feedback speculation, sound deopt, and a
-   GC-safe native re-entry substrate — proven against the interpreter and under
-   fuzz.
-3. **WASM:** the upstream WebAssembly spec suite passes for MVP + reference-types
-   + the implemented proposals, with full JS↔WASM interop and a compiling tier on
-   the shared backend.
-4. **D′ / code-cache:** any initialized heap snapshots, `mmap`-reloads zero-copy
-   (or via one-time conversion), and executes; the content-addressed,
-   verifier-guarded, cross-context-shareable artifact store passes the
-   hundreds-of-bases churn scenario.
-5. **Always:** pure Rust, `unsafe` quarantined and audited; CI green across the
-   feature matrix; embeddable in <30 lines via the Rust and C APIs.
+   GC-safe native re-entry substrate — proven against the interpreter and fuzz.
+4. **WASM:** the upstream spec suite passes for MVP + reference-types + the
+   implemented proposals, with full JS↔WASM interop, WASI, and a compiling tier
+   on the shared backend.
+5. **D′ / code-cache:** any initialized heap snapshots, `mmap`-reloads zero-copy
+   (or via one-time conversion) and executes; the content-addressed,
+   verifier-guarded, cross-context-shareable store passes the hundreds-of-bases
+   churn scenario.
+6. **Always:** pure Rust, `unsafe` quarantined + audited; CI green across the
+   feature matrix incl. `no_std`; embeddable in <30 lines via the Rust and C APIs.
 
 ---
 
@@ -342,6 +430,8 @@ Kataan is "complete" when:
 - **`purecrypto`** — `crypto.subtle`/WebCrypto, `getRandomValues`, `randomUUID`,
   TLS. No foreign crypto.
 - **`rsurl`** — HTTP/HTTPS behind `fetch` and the Node `http(s)` compat layer.
+- **`intl`** — Unicode/Intl primitives (normalization, case mapping/folding, char
+  properties, collation) behind the Intl services (§3.3).
 
 Patterns shared: tri-modal lib/CLI/C-FFI packaging, `unsafe` quarantine,
 feature-gated layered modules, sans-I/O core, cargo-fuzz harnesses.
