@@ -8,11 +8,12 @@ foundations are summarized once (§1) and not re-litigated; everything after is
 forward-looking.
 
 > **Headline status (2026-06):** the official tc39/Test262 corpus (~53k tests)
-> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 89 %**
-> of the ~43k *ran* tests (the ~10k skipped are Temporal / Atomics / agents /
-> cross-realm — see §3.9). The two remaining headline language gaps are **ES
-> modules + dynamic `import()`** and the **Intl services**; the long tail is
-> per-builtin and per-construct edges (§3).
+> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 89.9 %**
+> of the ~44k *ran* tests (the ~9k skipped are Temporal / Atomics / agents /
+> cross-realm — see §3.9). **ES modules + dynamic `import()` now run** (the
+> module-flagged suite is no longer skipped — §3.1). The remaining headline
+> language gap is the **Intl services**; the long tail is per-builtin and
+> per-construct edges (§3).
 
 ---
 
@@ -67,6 +68,11 @@ Treat this as done; build on it.
   (ArraySetLength: non-writable length, configurable-stop shrink, freeze/seal)
   works via a sparse attribute side-table that leaves the dense fast path
   untouched.
+- **ES modules + dynamic `import()`:** module record / link / evaluate with live
+  bindings, re-exports, cycles, top-level `await`, namespace objects, and a
+  file-resolution host hook (§3.1 for residual edges). **Explicit resource
+  management:** `using` / `await using` dispose at scope exit (reverse order, all
+  completion paths, SuppressedError aggregation).
 - **First-class prototype methods (mostly):** `Array.prototype.map.call(arrayLike)`,
   extracting a method as a value (`const s = [].slice`), and `…prototype.X.call`
   idioms work. **Exception:** `Array`/`Object` are still object-cells, so
@@ -198,19 +204,26 @@ gated by `tests/test262-status.txt`. Items are ordered roughly by ledger weight.
 first-class prototypes, WeakRef/FinalizationRegistry, regex validation, the
 ES2024/25 builtin tail) are intentionally not relisted — see §1.
 
-### 3.1 ES Modules + dynamic `import()` — the single biggest gap (~450+ ran, thousands skipped)
+### 3.1 ES Modules + dynamic `import()` — **largely landed** (residual edges)
 
-`import()` parses but there is **no module loader**, and `flags:[module]` tests
-are skipped entirely. This is both a language feature and a runtime subsystem
-(§4.2). Needs:
+The module record / link / evaluate pipeline, live import bindings + TDZ,
+re-exports (`export {x} from`, `export *`, `export * as`, default), cycles,
+top-level `await`, `import.meta.url`, module namespace exotic objects, and
+**dynamic `import()`** (promise of the namespace) are implemented (tree-walker,
+`src/nbexec/module.rs`), and the runner now executes `flags:[module]` +
+dynamic-import tests with file-relative resolution. Most module early errors are
+parse-phase. **Residual:**
 
-- A **module record / linking** pipeline: parse → instantiate (resolve imports,
-  allocate bindings, TDZ live bindings) → evaluate, with cycles and `import.meta`.
-- **Dynamic `import(specifier)`** returning a promise of the namespace, with the
-  host resolution hook the Test262 runner can drive (sibling `_FIXTURE.js` files).
-- **Top-level `await`**, **JSON modules**, import attributes (currently skipped).
-- Runner work: execute `flags:[module]` tests as modules with file-relative
-  resolution (moves a large block from *skipped* into *ran*).
+- **`import.meta`** exposes only `url` (the full ordinary-object tests remain).
+- **Namespace `[[DefineOwnProperty]]`** exotic behavior; a couple of
+  ambiguous-binding-propagation edges.
+- **Top-level-await ordering** + the strict-mode-loss-after-`await` bug (shared
+  with the async/generator model — §3.5).
+- **`import.source` / `import.defer`** (source-phase + deferred-import proposals)
+  and **import attributes/assertions** — unimplemented (rejected as SyntaxError).
+- **Bytecode tier:** modules run on the tree-walker only; nbvm has no module
+  support (it faults to nbexec).
+- **CLI:** no first-class `kataan run x.mjs` module entry (§4.6).
 
 ### 3.2 `class` edge cases (~550)
 
@@ -239,10 +252,8 @@ binding), direct-eval variable/function declarations into the caller scope,
 
 ### 3.5 Iteration, control, and assignment constructs (~350)
 
-- **`with` statement** (72): scope-object semantics + `@@unscopables`.
-- **Explicit Resource Management** — `using` / `await using` (64) + the
-  scope-exit **disposal** runtime (the `[Symbol.dispose]`/`[Symbol.asyncDispose]`
-  call on block exit; classes exist, scope disposal does not).
+- **`with` statement** (72): scope-object semantics + `@@unscopables`. Touches
+  identifier resolution (core) — handle carefully.
 - **`for-of` / `for-await-of`** (112): iterator-close on abrupt completion,
   async-from-sync wrapping edges, destructuring-in-head corners.
 - **assignment / compound / logical-assignment** (110): destructuring assignment
