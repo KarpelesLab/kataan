@@ -350,6 +350,15 @@ impl<'a> Interp<'a> {
     /// (so top-level `await` and microtasks settle even on failure), and returns
     /// the entry's namespace object.
     pub fn evaluate_entry(&mut self, entry_key: &str) -> Result<NanBox, ExecError> {
+        // Make the entry module the last-resort referrer for a dynamic `import()`
+        // that runs in a *deferred* microtask (e.g. a `.then`/`await`
+        // continuation), after the synchronous module body — and thus after
+        // `active_module_key` has been restored — has returned. Without this a
+        // self-import like `import("./self.js")` from such a continuation would
+        // resolve against the process cwd.
+        if self.script_import_base.is_none() {
+            self.script_import_base = Some(entry_key.to_string());
+        }
         let r = self.evaluate_module(entry_key);
         // Drain microtasks/timers even on failure so a rejected top-level-await
         // promise's reactions run (matching `run`'s post-body event loop).
@@ -494,8 +503,17 @@ impl<'a> Interp<'a> {
                         None => reexports.push(ReExport::Star { key: dep }),
                     }
                 }
-                Stmt::Export(ExportDecl::Default { .. }) => {
-                    local_exports.insert("default".to_string(), DEFAULT_LOCAL.to_string());
+                Stmt::Export(ExportDecl::Default { declaration, .. }) => {
+                    // A *named* `export default function f`/`class C` exports the
+                    // `f`/`C` binding itself (so a later reassignment of `f` inside
+                    // the function is observed through the `default` export — a live
+                    // binding). An anonymous default binds the synthetic
+                    // `*default*` slot.
+                    let local = decl_name(declaration).map_or_else(
+                        || DEFAULT_LOCAL.to_string(),
+                        alloc::string::ToString::to_string,
+                    );
+                    local_exports.insert("default".to_string(), local);
                 }
                 Stmt::Export(ExportDecl::Decl { declaration, .. }) => {
                     for name in declared_names(declaration) {
@@ -664,20 +682,38 @@ impl<'a> Interp<'a> {
                 | Stmt::Export(ExportDecl::Default { declaration, .. }) => declaration,
                 _ => continue,
             };
-            if let Stmt::Function(func) = inner
-                && let Some(id) = &func.id
-            {
-                let value = self.make_function(
-                    &func.params,
-                    super::Body::Block(&func.body),
-                    func.is_async,
-                    func.is_generator,
-                );
-                self.set_fn_name(value, &id.name);
-                scope.declare(&id.name, value);
-                // `export default function f` also binds `*default*`.
-                if matches!(stmt, Stmt::Export(ExportDecl::Default { .. })) {
-                    scope.declare_const(DEFAULT_LOCAL, value);
+            if let Stmt::Function(func) = inner {
+                let is_default = matches!(stmt, Stmt::Export(ExportDecl::Default { .. }));
+                match &func.id {
+                    Some(id) => {
+                        let value = self.make_function(
+                            &func.params,
+                            super::Body::Block(&func.body),
+                            func.is_async,
+                            func.is_generator,
+                        );
+                        self.set_fn_name(value, &id.name);
+                        scope.declare(&id.name, value);
+                        // `export default function f` also binds `*default*`.
+                        if is_default {
+                            scope.declare_const(DEFAULT_LOCAL, value);
+                        }
+                    }
+                    // `export default function() {}` / `function*() {}` (anonymous)
+                    // is a HoistableDeclaration: instantiate it now under
+                    // `*default*` with the name "default", so an importer can call
+                    // the default export before this module's body has run.
+                    None if is_default => {
+                        let value = self.make_function(
+                            &func.params,
+                            super::Body::Block(&func.body),
+                            func.is_async,
+                            func.is_generator,
+                        );
+                        self.set_fn_name(value, "default");
+                        scope.declare_const(DEFAULT_LOCAL, value);
+                    }
+                    None => {}
                 }
             }
         }
@@ -754,12 +790,27 @@ impl<'a> Interp<'a> {
                 continue;
             }
             if let Ok(slot) = self.resolve_export(dep, name, &mut seen.clone()) {
-                if found.is_some() {
-                    return Err(self.syntax_error(&alloc::format!(
-                        "ambiguous export '{name}' (multiple `export *`)"
-                    )));
+                if let Some(prev) = &found {
+                    // Multiple `export *` paths are only *ambiguous* when they
+                    // resolve to **distinct** bindings. Two star re-exports that
+                    // ultimately denote the *same* slot (same scope + local) — or
+                    // the same materialised value, e.g. two `export * as ns from
+                    // "m"` of one module — are unambiguous (ResolveExport returns
+                    // that single binding).
+                    let same_slot = prev.0.ptr_eq(&slot.0) && prev.1 == slot.1;
+                    let same_value = {
+                        let a = prev.0.get(&prev.1);
+                        let b = slot.0.get(&slot.1);
+                        matches!((a, b), (Some(x), Some(y)) if x.as_handle() == y.as_handle() && x.as_handle().is_some())
+                    };
+                    if !same_slot && !same_value {
+                        return Err(self.syntax_error(&alloc::format!(
+                            "ambiguous export '{name}' (multiple `export *`)"
+                        )));
+                    }
+                } else {
+                    found = Some(slot);
                 }
-                found = Some(slot);
             }
         }
         if let Some(slot) = found {
@@ -829,6 +880,7 @@ impl<'a> Interp<'a> {
         let saved_meta = self.import_meta.replace(meta);
         let saved_this = core::mem::replace(&mut self.this_val, NanBox::undefined());
         let saved_annexb = core::mem::take(&mut self.annexb_block_fns);
+        let saved_active = self.active_module_key.replace(key.to_string());
 
         let result = self.exec_module_stmts(&program.body);
 
@@ -839,6 +891,7 @@ impl<'a> Interp<'a> {
         self.import_meta = saved_meta;
         self.this_val = saved_this;
         self.annexb_block_fns = saved_annexb;
+        self.active_module_key = saved_active;
         result
     }
 
@@ -874,29 +927,60 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             ExportDecl::Default { declaration, .. } => {
-                // `export default function/class …` declares a *named* binding
-                // too; `export default <expr>` binds the value under `*default*`.
+                // `export default function/class …` declares a *named* binding too
+                // (the `default` export resolves to it, set up in `parse_module`);
+                // `export default <expr>` binds the value under `*default*`.
                 match &**declaration {
-                    Stmt::Function(_) | Stmt::Class(_) => {
-                        // Execute the declaration so its name binds, then alias
-                        // `*default*` to that value (functions hoist; classes bind
-                        // on execution).
+                    // A *named* function/class declaration: execute it (it hoists /
+                    // binds its own name), then alias `*default*` to that value so
+                    // an anonymous-export observer still sees it.
+                    Stmt::Function(crate::ast::Function { id: Some(_), .. })
+                    | Stmt::Class(crate::ast::Class { id: Some(_), .. }) => {
                         self.exec(declaration)?;
-                        let name = decl_name(declaration);
-                        let value = name
+                        let value = decl_name(declaration)
                             .and_then(|n| self.current.get(n))
                             .unwrap_or_else(NanBox::undefined);
                         self.current.declare_const(DEFAULT_LOCAL, value);
                         Ok(())
                     }
+                    // An *anonymous* `export default function(){}` / `class {}`:
+                    // build the value as an expression and give it the name
+                    // `"default"` (NamedEvaluation), bound under `*default*`.
+                    Stmt::Function(func) => {
+                        let value = self.make_function(
+                            &func.params,
+                            super::Body::Block(&func.body),
+                            func.is_async,
+                            func.is_generator,
+                        );
+                        self.set_fn_name(value, "default");
+                        self.current.declare_const(DEFAULT_LOCAL, value);
+                        Ok(())
+                    }
+                    Stmt::Class(class) => {
+                        let value = self.make_class(class)?;
+                        self.set_fn_name(value, "default");
+                        self.current.declare_const(DEFAULT_LOCAL, value);
+                        Ok(())
+                    }
                     Stmt::Expr { expression, .. } => {
+                        // `export default <expr>`: an anonymous function/class/arrow
+                        // expression is named "default" by NamedEvaluation
+                        // (`set_fn_name` is a no-op on a value that already has a
+                        // name or is not a function/class).
                         let value = self.eval(expression)?;
+                        if matches!(
+                            &**expression,
+                            crate::ast::Expr::Function(crate::ast::Function { id: None, .. })
+                                | crate::ast::Expr::Class(crate::ast::Class { id: None, .. })
+                                | crate::ast::Expr::Arrow(_)
+                        ) {
+                            self.set_fn_name(value, "default");
+                        }
                         self.current.declare_const(DEFAULT_LOCAL, value);
                         Ok(())
                     }
                     other => {
-                        // A default-exported anonymous function/class arrives as a
-                        // declaration without an id; execute and capture nothing.
                         self.exec(other)?;
                         Ok(())
                     }
@@ -925,11 +1009,16 @@ impl<'a> Interp<'a> {
             r.namespace = Some(ns);
         }
         let names = self.export_names(key, &mut BTreeSet::new())?;
-        // Resolve every name to its slot now (so a missing one is a SyntaxError).
+        // Resolve every name to its slot. A name that resolves *ambiguously* (or
+        // is otherwise unresolvable — only reachable via `export *`) is **omitted**
+        // from the namespace per GetModuleNamespace, *not* an error. A direct
+        // `import { x }` of such a name is still rejected at link time (that path
+        // calls `resolve_export` separately and propagates the error).
         let mut slots: Vec<(String, Scope, String)> = Vec::new();
         for n in &names {
-            let (s, l) = self.resolve_export(key, n, &mut BTreeSet::new())?;
-            slots.push((n.clone(), s, l));
+            if let Ok((s, l)) = self.resolve_export(key, n, &mut BTreeSet::new()) {
+                slots.push((n.clone(), s, l));
+            }
         }
         // Snapshot the current values; namespace properties read the *current*
         // binding value. (A live read-through would need an accessor per name;
@@ -939,6 +1028,13 @@ impl<'a> Interp<'a> {
             let value = scope.get(local).unwrap_or_else(NanBox::undefined);
             self.realm.set_property(obj, name, value);
         }
+        // Record each export's backing slot so a later read of `ns.<name>`
+        // refreshes from the live binding (§28.3 — namespace properties are live).
+        let binding_map: BTreeMap<String, (Scope, String)> = slots
+            .iter()
+            .map(|(n, s, l)| (n.clone(), (s.clone(), l.clone())))
+            .collect();
+        self.module_namespaces.insert(obj.to_raw(), binding_map);
         // `@@toStringTag` = "Module", non-enumerable, non-writable.
         let tag_sym = self.well_known_symbol("toStringTag");
         let tag_key = self.member_key(tag_sym);
@@ -947,13 +1043,15 @@ impl<'a> Interp<'a> {
         self.realm.mark_hidden(obj, &tag_key);
         self.realm.set_readonly_property(obj, &tag_key);
         self.realm.set_non_configurable_property(obj, &tag_key);
-        // The exotic object is non-extensible with non-writable, non-configurable
-        // data properties.
+        // Per §28.3 a module namespace exotic object's export bindings are
+        // *writable* data properties (the binding value is live), but
+        // **non-configurable**, and the object itself is non-extensible. (They are
+        // not frozen — freezing would report `writable: false`, which the spec and
+        // the namespace conformance tests reject.)
         for (name, _, _) in &slots {
-            self.realm.set_readonly_property(obj, name);
             self.realm.set_non_configurable_property(obj, name);
         }
-        self.realm.freeze_object(obj);
+        self.realm.prevent_extensions(obj);
         Ok(ns)
     }
 
@@ -999,7 +1097,10 @@ impl<'a> Interp<'a> {
         if let Some(m) = self.modules.records.get(key).and_then(|r| r.meta) {
             return m;
         }
-        let obj = self.realm.new_object();
+        // `import.meta` is an ordinary object with a **null** `[[Prototype]]`
+        // (OrdinaryObjectCreate(null) per §16.2.1.6.3), so it inherits no
+        // `toString`/`valueOf`; `ToString(import.meta)` therefore throws.
+        let obj = self.realm.new_object_with_proto(None);
         let url = if key.starts_with("file://") || key.contains("://") {
             key.to_string()
         } else {
@@ -1031,10 +1132,14 @@ impl<'a> Interp<'a> {
             Some(crate::ast::Argument::Item(e)) => self.eval(e)?,
             _ => NanBox::undefined(),
         };
-        let spec_str = self.realm.to_display_string(spec);
         let referrer = self.current_module_key();
         let host = FileModuleHost;
         let outcome: Result<NanBox, ExecError> = (|this: &mut Self| {
+            // `ToString(specifier)` is part of the ImportCall steps, so a throwing
+            // `toString`/`Symbol.toPrimitive`/`valueOf` *rejects the promise*
+            // rather than propagating synchronously. Use the real ToString (not
+            // the lossy display form) so a user `toString` override is honoured.
+            let spec_str = this.coerce_to_string(spec)?;
             let dep = host
                 .resolve(&spec_str, referrer.as_deref())
                 .map_err(|e| this.type_error(&e))?;
@@ -1064,6 +1169,9 @@ impl<'a> Interp<'a> {
             .values()
             .find(|r| r.scope.ptr_eq(&self.current))
             .map(|r| r.key.clone())
+            // The active scope may be a nested function's, not the module's own;
+            // fall back to the module whose body is on the call stack.
+            .or_else(|| self.active_module_key.clone())
             .or_else(|| self.script_import_base.clone())
     }
 

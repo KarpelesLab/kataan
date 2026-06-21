@@ -74,6 +74,13 @@ pub struct Parser<'src> {
     paren_obj_arr_span: Option<Span>,
     /// Current recursive-descent nesting depth, bounded by [`MAX_PARSE_DEPTH`].
     depth: u32,
+    /// Whether the cursor is at the **module top level** — the direct statement
+    /// list of a Module (a `ModuleItem` position). `import` / `export`
+    /// declarations are only legal here; nested inside a block, a function body,
+    /// a control-flow body, or a `switch` case they are early Syntax Errors.
+    /// Set true only while [`Parser::parse_module`] parses the top list, and
+    /// cleared on entry to any nested statement context.
+    module_top_level: bool,
 }
 
 /// RAII guard that decrements [`Parser::depth`] when dropped, keeping the count
@@ -104,6 +111,7 @@ impl<'src> Parser<'src> {
             in_async: false,
             paren_obj_arr_span: None,
             depth: 0,
+            module_top_level: false,
         })
     }
 
@@ -1072,15 +1080,24 @@ impl<'src> Parser<'src> {
                             span: import_span.to(prop.span),
                         })
                     }
-                    "source" | "defer" if self.nth_kind(1) == TokenKind::LParen => {
-                        // `import.source(specifier)` / `import.defer(specifier)`.
-                        // Desugar to a call of the unbound `import` reference so
-                        // it errors at runtime, like a plain dynamic `import()`.
+                    kind @ ("source" | "defer") if self.nth_kind(1) == TokenKind::LParen => {
+                        // `import.source(specifier)` / `import.defer(specifier)` —
+                        // the source-phase / deferred-import proposals. Kept as a
+                        // call of the `import.<source|defer>` *member* (NOT a plain
+                        // `import()` call) so the evaluator can distinguish it; these
+                        // proposals are unimplemented, so it rejects with a
+                        // SyntaxError rather than loading the module.
                         self.bump(); // `source` / `defer`
+                        let member = Expr::Member {
+                            object: Box::new(import_ref),
+                            property: PropertyKey::Ident(kind.into()),
+                            optional: false,
+                            span: import_span.to(prop.span),
+                        };
                         let arguments = self.parse_dynamic_import_args()?;
                         let span = import_span.to(self.prev_span());
                         Ok(Expr::Call {
-                            callee: Box::new(import_ref),
+                            callee: Box::new(member),
                             arguments,
                             optional: false,
                             span,

@@ -33,6 +33,10 @@ impl<'src> Parser<'src> {
     /// later phase.)
     pub fn parse_program(source: &'src str) -> Result<Program> {
         let mut p = Parser::new(source)?;
+        // The program top level is a `ModuleItem` position (a top-level
+        // `import`/`export` makes the unit a module); nested `import`/`export`
+        // remain illegal. A pure script has no such tokens, so the flag is inert.
+        p.module_top_level = true;
         let body = p.parse_statement_list(TokenKind::Eof)?;
         p.expect(TokenKind::Eof)?;
         let source_type = if body
@@ -71,6 +75,9 @@ impl<'src> Parser<'src> {
         // The module body is the outermost async context, so top-level `await`
         // is an operator (not an identifier).
         p.in_async = true;
+        // The top statement list is the only `ModuleItem` position where `import`
+        // / `export` are legal.
+        p.module_top_level = true;
         let body = p.parse_statement_list(TokenKind::Eof)?;
         p.expect(TokenKind::Eof)?;
         let program = Program {
@@ -86,10 +93,19 @@ impl<'src> Parser<'src> {
     /// list are `StatementListItem`s, so declarations (`let`/`const`/`class`/…)
     /// are permitted here.
     fn parse_statement_list(&mut self, terminator: TokenKind) -> Result<Vec<Stmt>> {
+        // A brace-delimited list (block, function body, `switch` body) is a nested
+        // context, never the module top level, so `import` / `export` are illegal
+        // inside it. The `Eof`-terminated list is the program/module top level and
+        // keeps the flag as the caller set it.
+        let saved = self.module_top_level;
+        if terminator == TokenKind::RBrace {
+            self.module_top_level = false;
+        }
         let mut body = Vec::new();
         while !self.at(terminator) && !self.at(TokenKind::Eof) {
             body.push(self.parse_statement_item()?);
         }
+        self.module_top_level = saved;
         Ok(body)
     }
 
@@ -107,7 +123,13 @@ impl<'src> Parser<'src> {
     /// identifier `let` (an `ExpressionStatement`), not a `LexicalDeclaration`.
     pub(crate) fn parse_statement(&mut self) -> Result<Stmt> {
         let guard = self.enter_recursion()?;
-        guard.parser.parse_statement_inner(false)
+        // A single-statement position (control-flow / labeled body) is never the
+        // module top level, so `import` / `export` are not legal here.
+        let saved = guard.parser.module_top_level;
+        guard.parser.module_top_level = false;
+        let r = guard.parser.parse_statement_inner(false);
+        guard.parser.module_top_level = saved;
+        r
     }
 
     /// The body of the statement dispatchers, run inside the recursion guard.
@@ -900,6 +922,10 @@ impl<'src> Parser<'src> {
         let discriminant = self.without_no_in(Self::parse_expression)?;
         self.expect(TokenKind::RParen)?;
         self.expect(TokenKind::LBrace)?;
+        // A `switch` body is a nested context: `import`/`export` are illegal in a
+        // case clause.
+        let saved_top = self.module_top_level;
+        self.module_top_level = false;
         let mut cases = Vec::new();
         let mut seen_default = false;
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
@@ -924,6 +950,7 @@ impl<'src> Parser<'src> {
             });
         }
         let end = self.expect(TokenKind::RBrace)?.span;
+        self.module_top_level = saved_top;
         Ok(Stmt::Switch {
             discriminant: Box::new(discriminant),
             cases,

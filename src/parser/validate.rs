@@ -78,6 +78,9 @@ pub(crate) fn validate_program(program: &Program) -> Result<()> {
     for stmt in &program.body {
         v.stmt(stmt, &ctx)?;
     }
+    if v.is_module {
+        v.check_module_exports(&program.body)?;
+    }
     Ok(())
 }
 
@@ -1596,6 +1599,171 @@ impl Validator {
         self.check_lexical_scope_refs(&refs, true, strict)
     }
 
+    /// Module-body export early errors (§16.2.3.1):
+    /// - It is a Syntax Error if the **ExportedNames** of the module contain any
+    ///   duplicate entries (`export { x }; export { y as x };`,
+    ///   `export default 1; export default 2;`, …).
+    /// - It is a Syntax Error if any element of the **ExportedBindings** is not
+    ///   declared at the module top level (`export { undeclared };`). A re-export
+    ///   (`export { x } from "m"`) is *not* a binding requirement.
+    fn check_module_exports(&self, body: &[Stmt]) -> Result<()> {
+        use crate::ast::ExportDecl;
+
+        // At a *module* top level a `FunctionDeclaration` is a
+        // LexicallyDeclaredName (not var-scoped as in a script), so two top-level
+        // function declarations of the same name — or a function clashing with a
+        // let/const/class — are early errors. Collect every top-level lexical
+        // *binding* name (including module-top-level functions, and the names
+        // bound by an `export <decl>`) and reject duplicates.
+        let mut top_lex: Vec<(Box<str>, Span)> = Vec::new();
+        for stmt in body {
+            collect_module_top_lexical(stmt, &mut top_lex);
+        }
+        for i in 0..top_lex.len() {
+            for j in (i + 1)..top_lex.len() {
+                if top_lex[i].0 == top_lex[j].0 {
+                    return Err(self.err(
+                        top_lex[j].1,
+                        "duplicate top-level declaration in module",
+                    ));
+                }
+            }
+        }
+        // A module top-level LexicallyDeclaredName (let/const/class, and — unlike
+        // a script — a top-level function declaration) may not also be a
+        // VarDeclaredName (`var f; function f() {}` is a module early error).
+        let mut var_only: Vec<Box<str>> = Vec::new();
+        for stmt in body {
+            collect_vars_only(stmt, &mut var_only);
+        }
+        for (name, span) in &top_lex {
+            if var_only.iter().any(|v| v == name) {
+                return Err(self.err(
+                    *span,
+                    "a module top-level lexical declaration conflicts with a `var` of the same name",
+                ));
+            }
+        }
+
+        // The set of names bound at the module top level (VarDeclaredNames +
+        // LexicallyDeclaredNames + imported bindings) against which a local
+        // `export { x }` is checked.
+        let mut declared: Vec<Box<str>> = Vec::new();
+        let mut lexical: Vec<(Box<str>, Span, bool)> = Vec::new();
+        let mut vars: Vec<Box<str>> = Vec::new();
+        for stmt in body {
+            collect_top_level_decls(stmt, &mut lexical, &mut vars, true);
+            if let Stmt::Import(decl) = stmt {
+                for s in &decl.specifiers {
+                    let (name, span) = match s {
+                        crate::ast::ImportSpecifier::Default(id)
+                        | crate::ast::ImportSpecifier::Namespace(id) => {
+                            (id.name.clone(), id.span)
+                        }
+                        crate::ast::ImportSpecifier::Named { local, .. } => {
+                            (local.name.clone(), local.span)
+                        }
+                    };
+                    // Module code is always strict, so an imported binding may not
+                    // be named `eval` or `arguments` (a strict BindingIdentifier
+                    // early error).
+                    if &*name == "eval" || &*name == "arguments" {
+                        return Err(self.err(
+                            span,
+                            "an imported binding may not be named `eval` or `arguments` in strict (module) code",
+                        ));
+                    }
+                    declared.push(name);
+                }
+            }
+            // `export default <expr/anonymous decl>` introduces the synthetic
+            // binding `*default*`, which backs a local `default` export.
+            if let Stmt::Export(ExportDecl::Default { .. }) = stmt {
+                declared.push("*default*".into());
+            }
+        }
+        declared.extend(vars);
+        declared.extend(lexical.into_iter().map(|(n, _, _)| n));
+
+        let mut exported: Vec<(String, Span)> = Vec::new();
+        // A local export binding `name` (with the span to report) to validate
+        // against `declared`.
+        let mut bindings: Vec<(String, Span)> = Vec::new();
+        for stmt in body {
+            let Stmt::Export(decl) = stmt else { continue };
+            match decl {
+                ExportDecl::Default { span, .. } => {
+                    exported.push((String::from("default"), *span));
+                }
+                ExportDecl::Decl { declaration, span } => {
+                    let mut names: Vec<(Box<str>, Span, bool)> = Vec::new();
+                    let mut vsink: Vec<Box<str>> = Vec::new();
+                    collect_top_level_decls(declaration, &mut names, &mut vsink, true);
+                    for n in names.into_iter().map(|(n, _, _)| n).chain(vsink) {
+                        exported.push((n.to_string(), *span));
+                    }
+                }
+                ExportDecl::All {
+                    exported: Some(name),
+                    span,
+                    ..
+                } => exported.push((module_export_name_str(name), *span)),
+                // `export * from "m"` introduces no export name here.
+                ExportDecl::All { exported: None, .. } => {}
+                ExportDecl::Named {
+                    specifiers,
+                    source,
+                    ..
+                } => {
+                    for sp in specifiers {
+                        exported.push((module_export_name_str(&sp.exported), sp.span));
+                        // Only a *local* `export { x }` (no `from`) requires `x`
+                        // to be a declared binding; a re-export does not.
+                        if source.is_none() {
+                            match &sp.local {
+                                crate::ast::ModuleExportName::Ident(n) => {
+                                    bindings.push((n.to_string(), sp.span));
+                                }
+                                // `export { "str" }` without `from` references a
+                                // binding by a string name, which is never a valid
+                                // local identifier — a Syntax Error (a string
+                                // ModuleExportName is only legal as a re-export).
+                                crate::ast::ModuleExportName::Str(_) => {
+                                    return Err(self.err(
+                                        sp.span,
+                                        "a string module export name requires a `from` clause",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Duplicate ExportedNames.
+        for i in 0..exported.len() {
+            for j in (i + 1)..exported.len() {
+                if exported[i].0 == exported[j].0 {
+                    return Err(self.err(
+                        exported[j].1,
+                        "duplicate export name in module",
+                    ));
+                }
+            }
+        }
+        // Every local export binding must be declared somewhere in the module.
+        for (name, span) in &bindings {
+            if !declared.iter().any(|d| d.as_ref() == name.as_str()) {
+                return Err(self.err(
+                    *span,
+                    "export of an undeclared identifier",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// It is a Syntax Error if any element of the `LexicallyDeclaredNames` of a
     /// function body also occurs in the `BoundNames` of its parameters (a `let`,
     /// `const`, or `class` in the body may not shadow a parameter — e.g.
@@ -1789,8 +1957,80 @@ fn collect_top_level_decls(
             }
         }
         Stmt::Labeled { body, .. } => collect_top_level_decls(body, lexical, vars, top_level),
+        // An `export <declaration>` / `export default <decl>` contributes its
+        // inner declaration's bound names to the enclosing (module top-level)
+        // scope, so a duplicate `export function f` + `function f` (or two
+        // `export default function`s) is caught by the lexical-uniqueness check.
+        Stmt::Export(decl) => {
+            if let Some(inner) = export_inner_decl(decl) {
+                collect_top_level_decls(inner, lexical, vars, top_level);
+            }
+        }
         // `var` hoists out of nested non-function statements.
         other => collect_vars_only(other, vars),
+    }
+}
+
+/// Collects a module top-level statement's **lexically-declared binding names**
+/// for the module duplicate-declaration early error. Unlike a script, a module
+/// top-level `FunctionDeclaration` is a LexicallyDeclaredName, so it is included
+/// here (with `let`/`const`/`class`); plain `var`s are not (they may be
+/// redeclared). Descends through an `export <decl>` to its inner declaration.
+fn collect_module_top_lexical(stmt: &Stmt, out: &mut Vec<(Box<str>, Span)>) {
+    match stmt {
+        Stmt::Function(f) => {
+            if let Some(id) = &f.id {
+                out.push((id.name.clone(), id.span));
+            }
+        }
+        Stmt::Class(c) => {
+            if let Some(id) = &c.id {
+                out.push((id.name.clone(), id.span));
+            }
+        }
+        Stmt::Var(decl) if decl.kind != VarDeclKind::Var => {
+            for d in &decl.declarations {
+                let mut names = Vec::new();
+                collect_bound_names(&d.target, &mut names);
+                for (n, span) in names {
+                    out.push((n.into(), span));
+                }
+            }
+        }
+        Stmt::Export(decl) => {
+            if let Some(inner) = export_inner_decl(decl) {
+                collect_module_top_lexical(inner, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The string form of a `ModuleExportName` (identifier or string-literal name).
+fn module_export_name_str(n: &crate::ast::ModuleExportName) -> String {
+    match n {
+        crate::ast::ModuleExportName::Ident(s) | crate::ast::ModuleExportName::Str(s) => {
+            s.to_string()
+        }
+    }
+}
+
+/// The inner declaration statement of an `export <decl>` / `export default
+/// <decl>`, if the export wraps a `var`/`let`/`const`/function/class declaration
+/// (a re-export, named-specifier list, or `export default <expr>` has none).
+fn export_inner_decl(decl: &crate::ast::ExportDecl) -> Option<&Stmt> {
+    use crate::ast::ExportDecl;
+    match decl {
+        ExportDecl::Decl { declaration, .. } => Some(declaration),
+        ExportDecl::Default { declaration, .. } => match &**declaration {
+            // `export default function f`/`class C` (a *named* declaration) binds
+            // `f`/`C`; an anonymous default or a default *expression* binds no
+            // enclosing-scope lexical name (only the synthetic `*default*`).
+            s @ (Stmt::Function(crate::ast::Function { id: Some(_), .. })
+            | Stmt::Class(crate::ast::Class { id: Some(_), .. })) => Some(s),
+            _ => None,
+        },
+        ExportDecl::Named { .. } | ExportDecl::All { .. } => None,
     }
 }
 
@@ -2188,7 +2428,25 @@ fn contains_private_ref(e: &Expr) -> bool {
 /// target of a compound assignment: an identifier or a member access. (A private
 /// member access `obj.#x` is also a valid reference here.)
 fn is_simple_update_target(e: &Expr) -> bool {
-    matches!(e, Expr::Ident(_) | Expr::Member { .. })
+    match e {
+        Expr::Member { .. } => !is_import_meta(e),
+        Expr::Ident(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether `e` is the `import.meta` meta-property (parsed as a member access on
+/// the reserved `import` keyword). It is not a valid assignment / update target
+/// (its AssignmentTargetType is `invalid`).
+fn is_import_meta(e: &Expr) -> bool {
+    if let Expr::Member {
+        object, property, ..
+    } = e
+        && let (Expr::Ident(id), PropertyKey::Ident(name)) = (&**object, property)
+    {
+        return &*id.name == "import" && &**name == "meta";
+    }
+    false
 }
 
 /// Whether `e` is a valid target for a *simple* (`=`) assignment. This permits
@@ -2197,7 +2455,8 @@ fn is_simple_update_target(e: &Expr) -> bool {
 /// top-level [`Expr::Assign`] target.
 fn is_valid_assign_target(e: &Expr) -> bool {
     match e {
-        Expr::Ident(_) | Expr::Member { .. } => true,
+        Expr::Member { .. } => !is_import_meta(e),
+        Expr::Ident(_) => true,
         Expr::Array {
             elements,
             rest_trailing_comma,

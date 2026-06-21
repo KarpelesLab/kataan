@@ -460,6 +460,22 @@ pub struct Interp<'a> {
     /// for an ordinary script run.
     #[cfg(all(feature = "module", feature = "std"))]
     script_import_base: Option<String>,
+    /// Live-binding backing for **module namespace exotic objects**: a namespace
+    /// object's heap-handle (raw) maps each exported name to the
+    /// `(scope, local name)` slot it reflects. A property read of one of these
+    /// names refreshes from the slot so a post-materialisation mutation in the
+    /// exporting module is observed (`ns.x` is a *live* binding, per §28.3), while
+    /// the property itself stays an ordinary writable/non-configurable data
+    /// property so `getOwnPropertyDescriptor` still reports a value.
+    #[cfg(all(feature = "module", feature = "std"))]
+    module_namespaces: alloc::collections::BTreeMap<u64, alloc::collections::BTreeMap<String, (Scope, String)>>,
+    /// The key of the module whose body is currently executing, used as the
+    /// referrer for a dynamic `import()` when the active scope can't be matched to
+    /// a module record (e.g. the `import()` runs inside a nested function/arrow,
+    /// so `self.current` is the callee's scope rather than the module's). Saved /
+    /// restored around each module body. `None` outside module code.
+    #[cfg(all(feature = "module", feature = "std"))]
+    active_module_key: Option<String>,
 }
 
 /// A queued promise reaction: run `handler` with `value`, then settle `result`
@@ -1879,6 +1895,10 @@ impl<'a> Interp<'a> {
             import_meta: None,
             #[cfg(all(feature = "module", feature = "std"))]
             script_import_base: None,
+            #[cfg(all(feature = "module", feature = "std"))]
+            module_namespaces: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "module", feature = "std"))]
+            active_module_key: None,
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run

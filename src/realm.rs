@@ -1651,6 +1651,31 @@ impl Realm {
         None
     }
 
+    /// Whether `handle`'s prototype chain reaches the realm's `Object.prototype`
+    /// — i.e. whether it inherits `Object.prototype`'s accessors (notably the
+    /// `__proto__` getter/setter). A null-prototype object such as a module
+    /// namespace exotic or `Object.create(null)` does *not*, so `obj.__proto__`
+    /// on it is an ordinary (absent) property lookup yielding `undefined` rather
+    /// than the `[[Prototype]]` link.
+    pub fn inherits_object_proto(&self, handle: Handle) -> bool {
+        let Some(target) = self.default_object_proto else {
+            return true; // realm not fully wired; preserve legacy behaviour
+        };
+        let mut cur = self.object_proto(handle);
+        let mut guard = 0u32;
+        while let Some(h) = cur {
+            if h == target {
+                return true;
+            }
+            guard += 1;
+            if guard > 10_000 {
+                break;
+            }
+            cur = self.object_proto(h);
+        }
+        false
+    }
+
     /// Sets the `[[Prototype]]` of the object at `handle`.
     pub fn set_object_proto(&mut self, handle: Handle, proto: Option<Handle>) -> bool {
         if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {

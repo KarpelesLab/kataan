@@ -515,7 +515,20 @@ impl<'a> Interp<'a> {
                         return Ok(NanBox::boolean(result));
                     }
                     UnaryOp::Typeof => {
+                        // `typeof importedBinding` is *not* the unresolved-reference
+                        // shortcut: an imported binding exists (resolving live, and
+                        // possibly in TDZ), so `typeof` must read it (and may throw
+                        // for a `let`/`const`/`class` export not yet initialised).
+                        #[cfg(all(feature = "module", feature = "std"))]
+                        let is_import = if let Expr::Ident(id) = &**argument {
+                            self.module_imports.contains_key(&*id.name)
+                        } else {
+                            false
+                        };
+                        #[cfg(not(all(feature = "module", feature = "std")))]
+                        let is_import = false;
                         if let Expr::Ident(id) = &**argument
+                            && !is_import
                             && self.current.get(&id.name).is_none()
                             && self.with_binding(&id.name).is_none()
                             && !matches!(&*id.name, "undefined" | "NaN" | "Infinity")
@@ -635,6 +648,40 @@ impl<'a> Interp<'a> {
                     && id.name.as_ref() == "import"
                 {
                     return self.dynamic_import(arguments);
+                }
+                // `import.source(x)` / `import.defer(x)` — the source-phase and
+                // deferred-import proposals, unimplemented. Per the tests, ToString
+                // the specifier (a throw rejects with that), then return a promise
+                // rejected with a SyntaxError — NOT a plain dynamic import that would
+                // load the module.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Expr::Member { object, property, .. } = &**callee
+                    && matches!(&**object, Expr::Ident(id) if id.name.as_ref() == "import")
+                    && matches!(property, PropertyKey::Ident(p) if matches!(&**p, "source" | "defer"))
+                {
+                    let p = self.fresh_promise();
+                    let arg0 = arguments
+                        .first()
+                        .and_then(|a| match a {
+                            crate::ast::Argument::Item(e) => Some(e),
+                            crate::ast::Argument::Spread(e) => Some(e),
+                        });
+                    let rejection = match arg0 {
+                        Some(e) => match self.eval(e).and_then(|v| self.coerce_to_string(v)) {
+                            Ok(_) => {
+                                let m = self.new_str("source-phase / deferred import is not supported");
+                                self.make_error(N_SYNTAX_ERROR, Some(m))
+                            }
+                            Err(ExecError::Throw(t)) => t,
+                            Err(other) => return Err(other),
+                        },
+                        None => {
+                            let m = self.new_str("source-phase / deferred import is not supported");
+                            self.make_error(N_SYNTAX_ERROR, Some(m))
+                        }
+                    };
+                    self.settle(p, rejection, false);
+                    return Ok(NanBox::handle(p.to_raw()));
                 }
                 // `super(args)` — invoke the base constructor on the current
                 // instance.
@@ -1630,6 +1677,21 @@ impl<'a> Interp<'a> {
         handle: crate::heap::Handle,
         name: &str,
     ) -> Result<NanBox, ExecError> {
+        // A **module namespace** export is a *live* binding: read the current
+        // value from its backing slot (so a mutation in the exporting module that
+        // happens after the namespace was materialised is observed). The
+        // refreshed value is also written back so `getOwnPropertyDescriptor`
+        // reports it.
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some(map) = self.module_namespaces.get(&handle.to_raw())
+            && let Some((scope, local)) = map.get(name)
+        {
+            let value = scope.get(local).unwrap_or_else(NanBox::undefined);
+            // Refresh the stored data property (it is non-configurable but
+            // writable, so the engine-internal write is permitted).
+            self.realm.set_property(handle, name, value);
+            return Ok(value);
+        }
         // String index access (`"abc"[1]`) → the UTF-16 code unit at the index
         // (a lone surrogate preserved as a one-unit string).
         //
@@ -1859,7 +1921,13 @@ impl<'a> Interp<'a> {
         }
         // `obj.__proto__` reads the prototype link (unless shadowed by an own
         // data property of that name).
-        if name == "__proto__" && !self.realm.has_own(handle, "__proto__") {
+        // The `__proto__` magic only applies when the object actually inherits
+        // `Object.prototype`'s accessor; a null-proto object (module namespace,
+        // `Object.create(null)`) reads it as an ordinary absent property.
+        if name == "__proto__"
+            && !self.realm.has_own(handle, "__proto__")
+            && self.realm.inherits_object_proto(handle)
+        {
             return Ok(match self.realm.object_proto(handle) {
                 Some(p) => NanBox::handle(p.to_raw()),
                 None => NanBox::null(),
@@ -2472,6 +2540,18 @@ impl<'a> Interp<'a> {
         match target {
             Expr::Ident(id) => {
                 let name = &*id.name;
+                // An imported binding (`import { x } from "m"`) is an immutable
+                // indirect binding: assigning to it is a TypeError (module code is
+                // strict). The alias only applies when the name is not shadowed by
+                // a binding in the current scope chain — a same-named *local* of
+                // another module (e.g. a callee defined in a different module whose
+                // own `x` happens to match this module's import alias) is a normal,
+                // mutable binding.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if self.module_imports.contains_key(name) && self.current.get(name).is_none() {
+                    let m = self.new_str("Assignment to constant variable.");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 // A bare identifier inside `with (obj)` reads/writes the with-object's
                 // property when it provides the name (so `with(o){ x op= v }` and
                 // setters/getters work).
@@ -2566,6 +2646,18 @@ impl<'a> Interp<'a> {
         property: &'a PropertyKey,
         new: NanBox,
     ) -> Result<(), ExecError> {
+        // A **module namespace exotic object**'s `[[Set]]` always fails (§28.3.6):
+        // its bindings are not assignable through the namespace. In strict code
+        // (module code always is) the failed Set is a TypeError.
+        #[cfg(all(feature = "module", feature = "std"))]
+        if self.module_namespaces.contains_key(&handle.to_raw()) {
+            if self.strict {
+                return Err(self.type_error(
+                    "cannot assign to a read-only property of a module namespace object",
+                ));
+            }
+            return Ok(());
+        }
         // `regex.lastIndex = n` updates the RegExp's stateful search position
         // (honoring a non-writable descriptor installed via `defineProperty`).
         if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property
@@ -3463,10 +3555,18 @@ impl<'a> Interp<'a> {
             return Ok(self.realm.is_array(oh));
         }
         if self.current.get("Object").and_then(|v| v.as_handle()) == ctor.as_handle() {
-            // Any non-primitive heap value is an instance of `Object`.
-            return Ok(self.realm.string_value(oh).is_none()
-                && self.realm.symbol_at(oh).is_none()
-                && self.realm.bigint_at(oh).is_none());
+            // Heap primitives (string/symbol/bigint values) are not objects.
+            if self.realm.string_value(oh).is_some()
+                || self.realm.symbol_at(oh).is_some()
+                || self.realm.bigint_at(oh).is_some()
+            {
+                return Ok(false);
+            }
+            // OrdinaryHasInstance: an object is `instanceof Object` iff its
+            // `[[Prototype]]` chain reaches `Object.prototype`. A null-prototype
+            // object (module namespace, `Object.create(null)`) is therefore *not*
+            // an instance of `Object`.
+            return Ok(self.realm.inherits_object_proto(oh));
         }
         // Plain function constructors: walk the instance's `[[Prototype]]` chain for
         // the constructor's current `.prototype` (so `Object.create(C.prototype)` is an

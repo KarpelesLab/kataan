@@ -19,6 +19,12 @@ impl<'src> Parser<'src> {
 
     /// Parses an `import` declaration (the cursor is at `import`).
     pub(super) fn parse_import(&mut self) -> Result<Stmt> {
+        // An `import` declaration is a `ModuleItem`: legal only at the module top
+        // level. (Dynamic `import(…)` / `import.meta` are expressions, dispatched
+        // separately and allowed anywhere.)
+        if !self.module_top_level {
+            return Err(self.err("`import` is only allowed at the top level of a module"));
+        }
         let start = self.bump().span; // `import`
 
         // Bare side-effect import: `import "mod";`.
@@ -92,6 +98,11 @@ impl<'src> Parser<'src> {
 
     /// Parses an `export` declaration (the cursor is at `export`).
     pub(super) fn parse_export(&mut self) -> Result<Stmt> {
+        // An `export` declaration is a `ModuleItem`: legal only at the module top
+        // level, never nested in a block, function, control body, or `switch`.
+        if !self.module_top_level {
+            return Err(self.err("`export` is only allowed at the top level of a module"));
+        }
         let start = self.bump().span; // `export`
 
         // `export * [as name] from "mod";`
@@ -152,9 +163,26 @@ impl<'src> Parser<'src> {
             }));
         }
 
-        // `export <declaration>` — var/let/const/function/class. This is a
-        // declaration position, so a leading `let` is a `LexicalDeclaration`
-        // (parse it as a `StatementListItem`, not a single `Statement`).
+        // `export <declaration>` — only a `HoistableDeclaration`
+        // (function/generator/async/async-generator), a `ClassDeclaration`, a
+        // `VariableStatement` (`var`), or a `LexicalDeclaration` (`let`/`const`)
+        // may follow. Any other statement (`if`, `for`, `while`, `try`, a block,
+        // a labeled statement, a bare expression, a method/getter shorthand, …)
+        // is a SyntaxError at this position. Guard *before* parsing so we reject
+        // at the right place rather than accepting an arbitrary statement.
+        let decl_ok = matches!(
+            self.peek(),
+            TokenKind::Keyword(Kw::Function | Kw::Class | Kw::Var | Kw::Let | Kw::Const)
+        ) || (self.at(TokenKind::Keyword(Kw::Async))
+            && self.nth_kind(1) == TokenKind::Keyword(Kw::Function)
+            && !self.nth_newline(1));
+        if !decl_ok {
+            return Err(self.err(
+                "`export` must be followed by a declaration, `default`, `*`, or `{ … }`",
+            ));
+        }
+        // This is a declaration position, so a leading `let` is a
+        // `LexicalDeclaration` (parse it as a `StatementListItem`).
         let declaration = self.parse_statement_item()?;
         Ok(Stmt::Export(ExportDecl::Decl {
             span: start.to(declaration.span()),
@@ -200,8 +228,18 @@ impl<'src> Parser<'src> {
         match tok.kind {
             TokenKind::String => {
                 self.bump();
+                // A `ModuleExportName : StringLiteral` must be well-formed Unicode
+                // (no lone UTF-16 surrogate). Check the WTF-8 cooked bytes, which
+                // preserve surrogates, before the lossy `string_key` collapses them.
+                let bytes = cook::string(tok.text(self.source), tok.span)?;
+                if !crate::wtf8::is_well_formed_utf16(&bytes) {
+                    return Err(self.err_at(
+                        tok.span,
+                        "a module export name string literal may not contain a lone surrogate",
+                    ));
+                }
                 Ok(ModuleExportName::Str(
-                    cook::string_key(tok.text(self.source), tok.span)?.into(),
+                    crate::wtf8::to_string_lossy(&bytes).into(),
                 ))
             }
             TokenKind::Identifier => {

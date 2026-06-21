@@ -1152,7 +1152,12 @@ fn imports() {
 
 #[test]
 fn exports() {
-    assert_eq!(prog("export { a, b as c };"), "(export [a bas c])");
+    // `export { a, b as c }` requires `a` and `b` to be declared bindings (a
+    // module early error otherwise), so declare them in the program.
+    assert_eq!(
+        prog("var a, b; export { a, b as c };"),
+        "(var a b) (export [a bas c])"
+    );
     assert_eq!(prog("export { a } from \"m\";"), "(export [a] from \"m\")");
     assert_eq!(prog("export * from \"m\";"), "(export * from \"m\")");
     assert_eq!(

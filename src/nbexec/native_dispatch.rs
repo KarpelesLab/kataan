@@ -845,6 +845,11 @@ impl<'a> Interp<'a> {
             N_REFLECT_SET => {
                 {
                     let h = self.reflect_object_target(arg(0), "set")?;
+                    // A module namespace exotic object's `[[Set]]` always fails.
+                    #[cfg(all(feature = "module", feature = "std"))]
+                    if self.module_namespaces.contains_key(&h.to_raw()) {
+                        return Ok(NanBox::boolean(false));
+                    }
                     let key = self.coerce_property_key(arg(1))?;
                     let value = arg(2);
                     // The receiver defaults to the target; an explicit one (4th arg)
