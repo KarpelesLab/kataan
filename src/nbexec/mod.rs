@@ -1319,6 +1319,8 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_TYPED_ARRAY_TO_STRING_TAG
         // `Intl.DurationFormat.length === 0` (no required constructor parameters).
         | N_INTL_DURATION_FORMAT
+        // `Intl.ListFormat.length === 0` (locales/options are optional).
+        | N_INTL_LIST_FORMAT
         // `DisposableStack`/`AsyncDisposableStack`/`ShadowRealm` take no parameters.
         | N_DISPOSABLE_STACK
         | N_ASYNC_DISPOSABLE_STACK
@@ -2832,6 +2834,10 @@ impl<'a> Interp<'a> {
             self.realm
                 .set_property(intl, name, NanBox::handle(f.to_raw()));
         }
+        // ECMA-402: the service constructors are non-enumerable properties of `Intl`
+        // (`{ writable:true, enumerable:false, configurable:true }`). (Only
+        // `ListFormat` is corrected here to keep the change scoped to that service.)
+        self.realm.mark_hidden(intl, "ListFormat");
         // `Intl.Locale` — a constructor with no `supportedLocalesOf` static.
         {
             let f = self.new_named_native("Locale", N_INTL_LOCALE);

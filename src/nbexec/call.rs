@@ -1773,7 +1773,7 @@ impl<'a> Interp<'a> {
         }
         // `new Intl.ListFormat(locale, { type, style })` → an object with a `format(list)`.
         if id == N_INTL_LIST_FORMAT {
-            return Ok(self.make_list_format(args));
+            return self.make_list_format(args);
         }
         // `new Intl.RelativeTimeFormat(locale, { numeric, style })` → an object with `format`.
         if id == N_INTL_REL_TIME {

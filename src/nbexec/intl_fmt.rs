@@ -809,7 +809,7 @@ impl<'a> Interp<'a> {
     /// (a Symbol is a TypeError) and validates membership in `values` (a
     /// **RangeError** otherwise). `None` `default` with an absent option yields
     /// `None`.
-    fn get_string_option(
+    pub(crate) fn get_string_option(
         &mut self,
         opts: Option<Handle>,
         prop: &str,
@@ -1283,7 +1283,16 @@ impl<'a> Interp<'a> {
         let lv = self.new_str(&locale);
         self.realm.set_property(out, "locale", lv);
 
-        if kind == "number" {
+        if kind == "list" {
+            // `Intl.ListFormat.prototype.resolvedOptions()` — `{ locale, type, style }`
+            // in that order (Table: "Resolved Options of ListFormat instances").
+            let lt = get_str(self, "type").unwrap_or_else(|| String::from("conjunction"));
+            let ltv = self.new_str(&lt);
+            self.realm.set_property(out, "type", ltv);
+            let style = get_str(self, "style").unwrap_or_else(|| String::from("long"));
+            let stv = self.new_str(&style);
+            self.realm.set_property(out, "style", stv);
+        } else if kind == "number" {
             let ns = get_str(self, "numberingSystem").unwrap_or_else(|| String::from("latn"));
             let nsv = self.new_str(&ns);
             self.realm.set_property(out, "numberingSystem", nsv);
@@ -1599,31 +1608,173 @@ impl<'a> Interp<'a> {
         NanBox::handle(obj.to_raw())
     }
 
-    /// Builds an `Intl.ListFormat` instance: an object capturing the locale, `type`, and
-    /// `style` with a readable `format(list)` method.
-    pub(crate) fn make_list_format(&mut self, args: &[NanBox]) -> NanBox {
+    /// Builds an `Intl.ListFormat` instance (`InitializeListFormat`): canonicalizes
+    /// the requested locales, reads and validates the `localeMatcher`/`type`/`style`
+    /// options (in that order), and brands the object with `\0intl="list"` plus its
+    /// resolved `\0locale`/`type`/`style`. Used only by the `new`-form constructor;
+    /// a plain call (no `new`) throws a `TypeError` before reaching here.
+    pub(crate) fn make_list_format(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
-        let locale = args
-            .first()
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|h| self.realm.string_value(h))
-            .unwrap_or_else(|| String::from("en"));
+        let marker = self.new_str("list");
+        self.realm.set_hidden_property(obj, "\u{0}intl", marker);
+        // 1. CanonicalizeLocaleList(locales) — a malformed tag raises a RangeError.
+        let requested =
+            self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
+        let locale = requested
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| String::from("en-US"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
-        if let Some(opts) = args
-            .get(1)
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-        {
-            for key in ["type", "style"] {
-                if let Some(v) = self.realm.get_property(opts, key) {
-                    self.realm.set_hidden_property(obj, key, v);
+        // GetOptionsObject: `undefined` → no options; a non-object (other than
+        // undefined) is a TypeError; otherwise the object itself.
+        let opts_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
+        let opts = if matches!(opts_arg.unpack(), Unpacked::Undefined) {
+            None
+        } else if self.is_object_value(opts_arg) {
+            opts_arg.as_handle().map(Handle::from_raw)
+        } else {
+            return Err(self.type_error("Intl.ListFormat options must be an object"));
+        };
+        // Options are read in spec order: localeMatcher, then type, then style.
+        let _ = self.get_string_option(
+            opts,
+            "localeMatcher",
+            &["lookup", "best fit"],
+            Some("best fit"),
+        )?;
+        let list_type = self
+            .get_string_option(
+                opts,
+                "type",
+                &["conjunction", "disjunction", "unit"],
+                Some("conjunction"),
+            )?
+            .unwrap();
+        let style = self
+            .get_string_option(opts, "style", &["long", "short", "narrow"], Some("long"))?
+            .unwrap();
+        self.store_str(obj, "type", &Some(list_type));
+        self.store_str(obj, "style", &Some(style));
+        self.brand_intl_instance(obj, N_INTL_LIST_FORMAT);
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    /// `StringListFromIterable(iterable)`: `undefined` → an empty list; otherwise
+    /// iterate, requiring every yielded value to be a primitive String (else a
+    /// `TypeError`, after closing the iterator). Used by `format`/`formatToParts`.
+    pub(crate) fn string_list_from_iterable(
+        &mut self,
+        iterable: NanBox,
+    ) -> Result<Vec<String>, ExecError> {
+        if matches!(iterable.unpack(), Unpacked::Undefined) {
+            return Ok(Vec::new());
+        }
+        // Open the iterator once via the user `[Symbol.iterator]` when present, so
+        // a custom iterable's `next`/`return` observe the exact spec call sequence
+        // (and a non-string element closes it mid-stream). Built-in iterables
+        // (arrays/strings/Maps/Sets/generators) have no readable iterator method;
+        // they are drained eagerly and then validated element-by-element.
+        if let Some(ih) = self.for_of_get_iterator(iterable)? {
+            let mut out = Vec::new();
+            loop {
+                let next_fn = self.read_member(ih, "next")?;
+                let res = self.call_with_this(next_fn, NanBox::handle(ih.to_raw()), &[])?;
+                let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                    return Err(self.type_error("iterator result is not an object"));
+                };
+                let done = self.read_member(rh, "done")?;
+                if self.realm.truthy(done) {
+                    break;
+                }
+                let value = self.read_member(rh, "value")?;
+                match value.as_handle().map(Handle::from_raw) {
+                    Some(vh) if self.realm.type_of(vh) == Some("string") => {
+                        out.push(self.realm.string_value(vh).unwrap_or_default());
+                    }
+                    _ => {
+                        // Non-String element: close the iterator, then throw.
+                        let _ = self.iterator_close(ih);
+                        return Err(self.type_error(
+                            "Intl.ListFormat: list elements must all be strings",
+                        ));
+                    }
+                }
+                if out.len() > GEN_CAP {
+                    return Err(self.type_error("iterator did not terminate"));
+                }
+            }
+            return Ok(out);
+        }
+        // Built-in iterable (or a non-iterable, which `iterate_values` rejects with
+        // a TypeError): drain, then require each element to be a String.
+        let elems = self.iterate_values(iterable)?;
+        let mut out = Vec::with_capacity(elems.len());
+        for e in elems {
+            match e.as_handle().map(Handle::from_raw) {
+                Some(vh) if self.realm.type_of(vh) == Some("string") => {
+                    out.push(self.realm.string_value(vh).unwrap_or_default());
+                }
+                _ => {
+                    return Err(
+                        self.type_error("Intl.ListFormat: list elements must all be strings")
+                    );
                 }
             }
         }
-        self.brand_intl_instance(obj, N_INTL_LIST_FORMAT);
-        NanBox::handle(obj.to_raw())
+        Ok(out)
+    }
+
+    /// The resolved `(type, style)` of an `Intl.ListFormat` instance (defaults
+    /// `"conjunction"`/`"long"` when the slots are absent).
+    pub(crate) fn list_format_type_style(&self, fmt: Option<Handle>) -> (String, String) {
+        let get = |key: &str, dflt: &str| -> String {
+            fmt.and_then(|h| self.realm.get_property(h, key))
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_else(|| String::from(dflt))
+        };
+        (get("type", "conjunction"), get("style", "long"))
+    }
+
+    /// The `(literal-or-element, value)` parts of an `Intl.ListFormat` `format`/
+    /// `formatToParts` over `items`, for the given `type` and `style`. The English
+    /// CLDR patterns are hardcoded (the `intl` 0.4 crate exposes only and/or
+    /// connectors, not the per-`type`/`style` list patterns, nor `unit`); these
+    /// match the en-US output the conformance tests require.
+    pub(crate) fn list_format_parts(
+        &self,
+        items: &[String],
+        list_type: &str,
+        _style: &str,
+    ) -> Vec<(&'static str, String)> {
+        let n = items.len();
+        let mut parts: Vec<(&'static str, String)> = Vec::new();
+        if n == 0 {
+            return parts;
+        }
+        // en patterns. `pair` is the two-element connector; `start`/`middle`/`end`
+        // are the three-or-more connectors. (CLDR `listPattern` for `en`.)
+        let (pair, end): (&str, &str) = match list_type {
+            "disjunction" => (" or ", ", or "),
+            "unit" => (", ", ", "),
+            _ => (" and ", ", and "), // conjunction (default)
+        };
+        let middle = ", ";
+        for (i, it) in items.iter().enumerate() {
+            if i > 0 {
+                let lit = if n == 2 {
+                    pair
+                } else if i == n - 1 {
+                    end
+                } else {
+                    middle
+                };
+                parts.push(("literal", String::from(lit)));
+            }
+            parts.push(("element", it.clone()));
+        }
+        parts
     }
 
     /// Builds an `Intl.PluralRules` instance: an object capturing the locale and `type`

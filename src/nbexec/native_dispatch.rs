@@ -2218,63 +2218,40 @@ impl<'a> Interp<'a> {
             // `Intl.Collator(...)` / `Intl.PluralRules(...)` without `new`.
             N_INTL_COLLATOR => self.make_collator(args),
             N_INTL_PLURAL_RULES => self.make_plural_rules(args),
-            // `new Intl.ListFormat(locale, { type, style })` — an object with `.format`.
-            N_INTL_LIST_FORMAT => self.make_list_format(args),
-            // `Intl.ListFormat.prototype.format(list)` — joins with en-US conjunction /
-            // disjunction / unit patterns (Oxford comma for 3+ items).
+            // `Intl.ListFormat(...)` without `new` is a TypeError (ECMA-402
+            // sec-intl.listformat: "If NewTarget is undefined, throw a TypeError").
+            N_INTL_LIST_FORMAT => {
+                return Err(self.type_error("Constructor Intl.ListFormat requires 'new'"));
+            }
+            // `Intl.ListFormat.prototype.format(list)` — `StringListFromIterable`
+            // (every element must be a String), then joined per locale/type/style.
             N_INTL_LIST_FORMAT_FORMAT => {
                 let fmt = self.this_val.as_handle().map(Handle::from_raw);
-                let list_type = fmt
-                    .and_then(|h| self.realm.get_property(h, "type"))
-                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_else(|| String::from("conjunction"));
-                let items: Vec<String> = arg(0)
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|e| self.realm.to_display_string(*e))
-                    .collect();
-                // The crate handles conjunction/disjunction with locale-aware connectors;
-                // `type:"unit"` (no crate `ListStyle`) falls through to the hand-rolled join.
+                let (list_type, style) = self.list_format_type_style(fmt);
+                let items = self.string_list_from_iterable(arg(0))?;
+                // The `intl` crate supplies locale-aware conjunction/disjunction
+                // connectors (e.g. Spanish "y"/"o"); `unit` (and the non-intl
+                // build) use the hardcoded en list patterns.
                 #[cfg(feature = "intl")]
                 {
-                    let style = match list_type.as_str() {
+                    let crate_style = match list_type.as_str() {
                         "disjunction" => Some(intl::list::ListStyle::Or),
                         "conjunction" => Some(intl::list::ListStyle::And),
                         _ => None,
                     };
-                    if let Some(style) = style {
+                    if let Some(crate_style) = crate_style {
                         let locale = fmt
                             .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
                             .map(|v| self.realm.to_display_string(v))
                             .unwrap_or_else(|| String::from("en"));
                         let refs: Vec<&str> = items.iter().map(String::as_str).collect();
-                        return Ok(self.new_str(&intl::list::format_list(&locale, &refs, style)));
+                        return Ok(
+                            self.new_str(&intl::list::format_list(&locale, &refs, crate_style))
+                        );
                     }
                 }
-                let word = match list_type.as_str() {
-                    "disjunction" => "or",
-                    "unit" => "",
-                    _ => "and",
-                };
-                let out = match items.len() {
-                    0 => String::new(),
-                    1 => items[0].clone(),
-                    2 if word.is_empty() => alloc::format!("{}, {}", items[0], items[1]),
-                    2 => alloc::format!("{} {word} {}", items[0], items[1]),
-                    n => {
-                        let init = items[..n - 1].join(", ");
-                        let last = &items[n - 1];
-                        if word.is_empty() {
-                            alloc::format!("{init}, {last}")
-                        } else {
-                            alloc::format!("{init}, {word} {last}")
-                        }
-                    }
-                };
+                let parts = self.list_format_parts(&items, &list_type, &style);
+                let out: String = parts.into_iter().map(|(_, v)| v).collect();
                 self.new_str(&out)
             }
             // `Intl.RelativeTimeFormat(...)` without `new`.
@@ -2468,24 +2445,33 @@ impl<'a> Interp<'a> {
                 let fmt = self.this_val.as_handle().map(Handle::from_raw);
                 self.intl_resolved_options(fmt)
             }
-            // `Intl.X.supportedLocalesOf(locales)` — the requested locales this engine
-            // can serve. With no real locale data, every requested locale is accepted;
-            // the result is a fresh array of the (string) requests.
+            // `Intl.X.supportedLocalesOf(locales [, options])` — the requested
+            // locales this engine can serve. `CanonicalizeLocaleList(locales)`
+            // (a malformed tag is a RangeError); then `GetOptionsObject(options)`
+            // and `GetOption(options, "localeMatcher", …)` (RangeError on an
+            // invalid value). With no real CLDR available-locale data, every
+            // canonical request is reported as supported.
             N_INTL_SUPPORTED_LOCALES => {
-                let mut out = Vec::new();
-                let req = arg(0);
-                if let Some(rh) = req.as_handle().map(Handle::from_raw) {
-                    if let Some(elems) = self.realm.array_elements(rh).map(<[_]>::to_vec) {
-                        for e in elems {
-                            if e.as_handle().is_some_and(|r| {
-                                self.realm.string_value(Handle::from_raw(r)).is_some()
-                            }) {
-                                out.push(e);
-                            }
-                        }
-                    } else if self.realm.string_value(rh).is_some() {
-                        out.push(req); // a single locale string
-                    }
+                let requested = self.canonicalize_locale_list(arg(0))?;
+                // `options` is read (ToObject) and `localeMatcher` validated even
+                // though the result does not otherwise depend on it.
+                let opts_arg = arg(1);
+                if !matches!(opts_arg.unpack(), Unpacked::Undefined) {
+                    let opts = self
+                        .coerce_to_object(opts_arg)
+                        .as_handle()
+                        .map(Handle::from_raw);
+                    let _ = self.get_string_option(
+                        opts,
+                        "localeMatcher",
+                        &["lookup", "best fit"],
+                        Some("best fit"),
+                    )?;
+                }
+                let mut out = Vec::with_capacity(requested.len());
+                for tag in requested {
+                    let v = self.new_str(&tag);
+                    out.push(v);
                 }
                 NanBox::handle(self.realm.new_array(out).to_raw())
             }
@@ -2494,6 +2480,30 @@ impl<'a> Interp<'a> {
             // nan/infinity). en-US-ish; mirrors the `format` output's structure.
             N_INTL_FORMAT_TO_PARTS => {
                 let fmt = self.this_val.as_handle().map(Handle::from_raw);
+                // `Intl.ListFormat.prototype.formatToParts(list)` → an array of
+                // `{ type: "element" | "literal", value }` parts.
+                if let Some(h) = fmt
+                    && self
+                        .realm
+                        .get_property(h, "\u{0}intl")
+                        .map(|v| self.realm.to_display_string(v))
+                        .as_deref()
+                        == Some("list")
+                {
+                    let (list_type, style) = self.list_format_type_style(Some(h));
+                    let items = self.string_list_from_iterable(arg(0))?;
+                    let parts = self.list_format_parts(&items, &list_type, &style);
+                    let mut arr_elems = Vec::with_capacity(parts.len());
+                    for (ty, val) in parts {
+                        let o = self.realm.new_object();
+                        let tv = self.new_str(ty);
+                        self.realm.set_property(o, "type", tv);
+                        let vv = self.new_str(&val);
+                        self.realm.set_property(o, "value", vv);
+                        arr_elems.push(NanBox::handle(o.to_raw()));
+                    }
+                    return Ok(NanBox::handle(self.realm.new_array(arr_elems).to_raw()));
+                }
                 // A DateTimeFormat breaks into typed date/time parts (weekday/month/day/year/
                 // hour/minute/second/dayPeriod/era with `literal` separators).
                 if let Some(h) = fmt
