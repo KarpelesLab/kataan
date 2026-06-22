@@ -133,8 +133,7 @@ impl<'a> Interp<'a> {
                 let mut v = NanBox::undefined();
                 while self.eval_truthy(test)? {
                     let f = self.exec(body)?;
-                    update_loop_value(&mut v, &f);
-                    match loop_action(f, &label) {
+                    match loop_step(f, &label, &mut v) {
                         LoopAction::Next => {}
                         LoopAction::Stop => break,
                         LoopAction::Propagate(f) => return Ok(f),
@@ -147,8 +146,7 @@ impl<'a> Interp<'a> {
                 let mut v = NanBox::undefined();
                 loop {
                     let f = self.exec(body)?;
-                    update_loop_value(&mut v, &f);
-                    match loop_action(f, &label) {
+                    match loop_step(f, &label, &mut v) {
                         LoopAction::Next => {}
                         LoopAction::Stop => break,
                         LoopAction::Propagate(f) => return Ok(f),
@@ -180,12 +178,10 @@ impl<'a> Interp<'a> {
                 self.pending_label = None;
                 // A labeled statement consumes a matching `break label`.
                 Ok(match flow {
-                    // A consumed `break label` carries no value in this model;
-                    // report an empty completion so it doesn't overwrite a prior
-                    // non-empty value in an enclosing StatementList.
-                    Flow::Break(Some(l)) if l == *label.name => {
-                        Flow::Normal(NanBox::empty_completion())
-                    }
+                    // A consumed `break label` resolves the labelled statement to
+                    // the break's (UpdateEmpty) completion value — `x: { 1; break
+                    // x; }` evaluates to 1.
+                    Flow::Break(Some(l), v) if l == *label.name => Flow::Normal(v),
                     other => other,
                 })
             }
@@ -203,11 +199,16 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Flow::Return(v))
             }
-            Stmt::Break { label, .. } => {
-                Ok(Flow::Break(label.as_ref().map(|l| String::from(&*l.name))))
-            }
+            // A bare `break`/`continue` has an empty completion value; the
+            // enclosing StatementList's `UpdateEmpty` fills in the accumulated
+            // value (see `exec_seq`).
+            Stmt::Break { label, .. } => Ok(Flow::Break(
+                label.as_ref().map(|l| String::from(&*l.name)),
+                NanBox::empty_completion(),
+            )),
             Stmt::Continue { label, .. } => Ok(Flow::Continue(
                 label.as_ref().map(|l| String::from(&*l.name)),
+                NanBox::empty_completion(),
             )),
             Stmt::Throw { argument, .. } => {
                 let v = self.eval(argument)?;
@@ -447,7 +448,12 @@ impl<'a> Interp<'a> {
                         last = v;
                     }
                 }
-                other => return Ok(other),
+                // An abrupt `break`/`continue` carries the StatementList's
+                // accumulated value when its own is empty (UpdateEmpty), so a
+                // breakable/iteration statement can surface it.
+                Flow::Break(l, v) => return Ok(Flow::Break(l, update_empty(v, last))),
+                Flow::Continue(l, v) => return Ok(Flow::Continue(l, update_empty(v, last))),
+                ret @ Flow::Return(_) => return Ok(ret),
             }
         }
         Ok(Flow::Normal(last))
@@ -745,6 +751,7 @@ impl<'a> Interp<'a> {
         use crate::ast::ForLeft;
         let label = self.pending_label.take();
         let iterator = NanBox::handle(ih.to_raw());
+        let mut v = NanBox::undefined();
         loop {
             let next_fn = self.read_member(ih, "next")?;
             let res = self.call_with_this(next_fn, iterator, &[])?;
@@ -755,7 +762,7 @@ impl<'a> Interp<'a> {
             };
             let done = self.read_member(rh, "done")?;
             if self.realm.truthy(done) {
-                return Ok(Flow::Normal(NanBox::undefined()));
+                return Ok(Flow::Normal(v));
             }
             let item = self.read_member(rh, "value")?;
             let child = self.current.child();
@@ -788,11 +795,11 @@ impl<'a> Interp<'a> {
             let r = self.dispose_block_scope(r);
             self.current = saved;
             match r {
-                Ok(flow) => match loop_action(flow, &label) {
+                Ok(flow) => match loop_step(flow, &label, &mut v) {
                     LoopAction::Next => {}
                     LoopAction::Stop => {
                         self.iterator_close(ih)?;
-                        return Ok(Flow::Normal(NanBox::undefined()));
+                        return Ok(Flow::Normal(v));
                     }
                     LoopAction::Propagate(f) => {
                         self.iterator_close(ih)?;
@@ -817,6 +824,7 @@ impl<'a> Interp<'a> {
     ) -> Result<Flow, ExecError> {
         use crate::ast::ForLeft;
         let label = self.pending_label.take();
+        let mut v = NanBox::undefined();
         for item in items {
             let child = self.current.child();
             let saved = core::mem::replace(&mut self.current, child);
@@ -843,13 +851,13 @@ impl<'a> Interp<'a> {
             // Dispose this iteration's `using` resource (any completion).
             let r = self.dispose_block_scope(r);
             self.current = saved;
-            match loop_action(r?, &label) {
+            match loop_step(r?, &label, &mut v) {
                 LoopAction::Next => {}
                 LoopAction::Stop => break,
                 LoopAction::Propagate(f) => return Ok(f),
             }
         }
-        Ok(Flow::Normal(NanBox::undefined()))
+        Ok(Flow::Normal(v))
     }
 
     /// Reads the current value of an assignment target (identifier or member).
@@ -1262,9 +1270,10 @@ impl<'a> Interp<'a> {
             for case in &cases[start..] {
                 for stmt in &case.body {
                     match self.exec(stmt)? {
-                        // A plain `break` ends the switch, yielding V; everything
+                        // A plain `break` ends the switch, yielding UpdateEmpty of
+                        // its (possibly block-carried) value over V; everything
                         // else (labeled break, continue, return) bubbles out.
-                        Flow::Break(None) => return Ok(Flow::Normal(v)),
+                        Flow::Break(None, bv) => return Ok(Flow::Normal(update_empty(bv, v))),
                         Flow::Normal(sv) => {
                             if !sv.is_empty_completion() {
                                 v = sv;
@@ -1311,6 +1320,7 @@ impl<'a> Interp<'a> {
                 }
                 None => {}
             }
+            let mut v = NanBox::undefined();
             loop {
                 let go = match test {
                     Some(t) => self.eval_truthy(t)?,
@@ -1338,7 +1348,7 @@ impl<'a> Interp<'a> {
                     self.current = loop_scope;
                     f?
                 };
-                match loop_action(flow, &label) {
+                match loop_step(flow, &label, &mut v) {
                     LoopAction::Next => {}
                     LoopAction::Stop => break,
                     LoopAction::Propagate(f) => return Ok(f),
@@ -1347,7 +1357,7 @@ impl<'a> Interp<'a> {
                     self.eval(u)?;
                 }
             }
-            Ok(Flow::Normal(NanBox::undefined()))
+            Ok(Flow::Normal(v))
         })();
         // A `for (using x = …; …)` head binds `x` once in the loop-header scope
         // (`self.current` is still that scope here); dispose it on loop exit

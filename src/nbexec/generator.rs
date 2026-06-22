@@ -1265,7 +1265,7 @@ impl<'a> Interp<'a> {
             return match self.exec(stmt) {
                 Ok(Flow::Normal(_)) => Ok(StepOut::Continue),
                 Ok(Flow::Return(v)) => Err(GenAbrupt::Return(v)),
-                Ok(Flow::Break(l)) => {
+                Ok(Flow::Break(l, _)) => {
                     // A labeled break matching this statement's label is consumed.
                     if label.is_some() && l == *label {
                         Ok(StepOut::Continue)
@@ -1273,7 +1273,7 @@ impl<'a> Interp<'a> {
                         Err(GenAbrupt::Break(l))
                     }
                 }
-                Ok(Flow::Continue(l)) => Err(GenAbrupt::Continue(l)),
+                Ok(Flow::Continue(l, _)) => Err(GenAbrupt::Continue(l)),
                 Err(e) => Err(GenAbrupt::from(e)),
             };
         }
@@ -1484,8 +1484,8 @@ impl<'a> Interp<'a> {
             _ => match self.exec(stmt) {
                 Ok(Flow::Normal(_)) => Ok(StepOut::Continue),
                 Ok(Flow::Return(v)) => Err(GenAbrupt::Return(v)),
-                Ok(Flow::Break(l)) => Err(GenAbrupt::Break(l)),
-                Ok(Flow::Continue(l)) => Err(GenAbrupt::Continue(l)),
+                Ok(Flow::Break(l, _)) => Err(GenAbrupt::Break(l)),
+                Ok(Flow::Continue(l, _)) => Err(GenAbrupt::Continue(l)),
                 Err(e) => Err(GenAbrupt::from(e)),
             },
         }

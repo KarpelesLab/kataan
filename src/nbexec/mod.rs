@@ -60,10 +60,14 @@ pub(crate) enum Flow {
     Normal(NanBox),
     /// A `return` (value).
     Return(NanBox),
-    /// A `break`, optionally targeting a label.
-    Break(Option<String>),
-    /// A `continue`, optionally targeting a label.
-    Continue(Option<String>),
+    /// A `break`, optionally targeting a label. The carried `NanBox` is the
+    /// completion value propagated by `UpdateEmpty` (the empty-completion
+    /// sentinel for a bare `break`); it becomes the value of the breakable
+    /// statement the `break` resolves to (`x: { 1; break x; }` evaluates to 1).
+    Break(Option<String>, NanBox),
+    /// A `continue`, optionally targeting a label. Carries its `UpdateEmpty`
+    /// completion value like [`Flow::Break`].
+    Continue(Option<String>, NanBox),
 }
 
 /// What a loop should do with a `Flow` produced by its body, given the loop's
@@ -77,35 +81,56 @@ enum LoopAction {
     Propagate(Flow),
 }
 
-/// Classifies a body `Flow` for a loop carrying `label`.
-fn loop_action(flow: Flow, label: &Option<String>) -> LoopAction {
-    match flow {
-        Flow::Normal(_) => LoopAction::Next,
-        Flow::Continue(None) => LoopAction::Next,
-        Flow::Continue(Some(l)) if Some(&l) == label.as_ref() => LoopAction::Next,
-        Flow::Break(None) => LoopAction::Stop,
-        Flow::Break(Some(l)) if Some(&l) == label.as_ref() => LoopAction::Stop,
-        other => LoopAction::Propagate(other),
-    }
-}
-
-/// Folds an empty completion to `undefined` (spec `UpdateEmpty(_, undefined)`),
-/// used where a construct must never surface the empty-completion sentinel (an
-/// `if`, a function/program result, …). Non-`Normal` flows pass through.
+/// Folds an empty completion value to `undefined` (spec `UpdateEmpty(_,
+/// undefined)`), used where a construct must never surface the empty-completion
+/// sentinel (an `if`, `try`, `with`, …). Applies to the value carried by an
+/// abrupt `break`/`continue` too: e.g. the `break` in `if (c) { break; }`
+/// resolves with value `undefined`, not the surrounding list's value.
 fn empty_to_undefined(flow: Flow) -> Flow {
     match flow {
         Flow::Normal(v) if v.is_empty_completion() => Flow::Normal(NanBox::undefined()),
+        Flow::Break(l, v) if v.is_empty_completion() => Flow::Break(l, NanBox::undefined()),
+        Flow::Continue(l, v) if v.is_empty_completion() => Flow::Continue(l, NanBox::undefined()),
         other => other,
     }
 }
 
-/// UpdateEmpty for a loop's running value `v`: a non-empty `Normal` body
-/// completion replaces it; an empty completion or any abrupt flow leaves it.
-fn update_loop_value(v: &mut NanBox, flow: &Flow) {
-    if let Flow::Normal(bv) = flow
-        && !bv.is_empty_completion()
-    {
-        *v = *bv;
+/// Classifies a loop body's `flow` *and* threads its completion value into the
+/// loop's running value `v` (spec ForBodyEvaluation / loop evaluation):
+/// - a `Normal` or caught `continue` updates `v` when its value is non-empty;
+/// - a caught `break` sets `v` to `UpdateEmpty(break, v)` and stops;
+/// - anything else propagates unchanged.
+fn loop_step(flow: Flow, label: &Option<String>, v: &mut NanBox) -> LoopAction {
+    let matches = |l: &Option<String>| l.is_none() || l.as_deref() == label.as_deref();
+    match flow {
+        Flow::Normal(bv) => {
+            if !bv.is_empty_completion() {
+                *v = bv;
+            }
+            LoopAction::Next
+        }
+        Flow::Continue(l, bv) if matches(&l) => {
+            if !bv.is_empty_completion() {
+                *v = bv;
+            }
+            LoopAction::Next
+        }
+        Flow::Break(l, bv) if matches(&l) => {
+            *v = update_empty(bv, *v);
+            LoopAction::Stop
+        }
+        other => LoopAction::Propagate(other),
+    }
+}
+
+/// The spec `UpdateEmpty(completionValue, fallback)`: an empty completion value
+/// takes the surrounding StatementList's accumulated value, otherwise keeps its
+/// own.
+fn update_empty(value: NanBox, fallback: NanBox) -> NanBox {
+    if value.is_empty_completion() {
+        fallback
+    } else {
+        value
     }
 }
 
@@ -3841,7 +3866,7 @@ impl<'a> Interp<'a> {
                     self.run_event_loop()?;
                     return Ok(v);
                 }
-                Flow::Break(_) | Flow::Continue(_) => {}
+                Flow::Break(..) | Flow::Continue(..) => {}
             }
         }
         // Run the event loop (microtasks + `setTimeout`) before returning.
@@ -3899,7 +3924,7 @@ impl<'a> Interp<'a> {
                 // it cannot reach here; `break`/`continue` likewise. Treat any
                 // such residue as completing normally.
                 Flow::Return(v) => return Ok(v),
-                Flow::Break(_) | Flow::Continue(_) => {}
+                Flow::Break(..) | Flow::Continue(..) => {}
             }
         }
         Ok(last)
