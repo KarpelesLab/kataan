@@ -991,9 +991,27 @@ impl<'a> Interp<'a> {
             });
             match (ctor, &parent) {
                 (Some(ctor), _) => {
-                    // Own fields initialize before the constructor body, so a
-                    // constructor write isn't clobbered by a later field decl.
-                    self.init_instance_fields(class_id, instance)?;
+                    // A *derived* constructor (any superclass — class, native, or
+                    // function) runs its body with `this` in a temporal dead zone:
+                    // `super(...)` initializes `this` and runs this class's field
+                    // initializers. A *base* constructor binds `this` and runs its
+                    // fields up front, before the body.
+                    let is_derived = parent.is_some()
+                        || self.pending_super_native.is_some()
+                        || self.pending_super_fn.is_some();
+                    let (poisoned_this, saved_pending) = if is_derived {
+                        let inst = NanBox::handle(instance.to_raw());
+                        let sp = self.pending_this_init.replace((inst, class_id));
+                        (
+                            Some(core::mem::replace(&mut self.this_val, NanBox::tdz())),
+                            sp,
+                        )
+                    } else {
+                        // Own fields initialize before the body, so a constructor
+                        // write isn't clobbered by a later field decl.
+                        self.init_instance_fields(class_id, instance)?;
+                        (None, None)
+                    };
                     let scope = self.current.child();
                     let saved = core::mem::replace(&mut self.current, scope);
                     let r: Result<Option<NanBox>, ExecError> = (|| {
@@ -1031,7 +1049,31 @@ impl<'a> Interp<'a> {
                         Ok(returned)
                     })();
                     self.current = saved;
-                    r
+                    let r = r?;
+                    if is_derived {
+                        // `super()` clears `pending_this_init` (and sets `this`); if
+                        // it is still set, the body returned without calling super.
+                        let super_called = self.pending_this_init.is_none();
+                        self.this_val = poisoned_this.expect("derived poisoned this");
+                        self.pending_this_init = saved_pending;
+                        // A derived constructor must call `super()` before it
+                        // returns — but only when its completion value is empty
+                        // (no return, or `return undefined`): the `this` binding is
+                        // then required. A return of an object becomes the result
+                        // (bypassing `this`), and a return of a non-undefined
+                        // non-object is a TypeError handled by `construct` — neither
+                        // is a "must call super" ReferenceError.
+                        let ret_empty = r.is_none_or(|v| matches!(v.unpack(), Unpacked::Undefined));
+                        if !super_called && ret_empty {
+                            let m = self.new_str(
+                                "Must call super constructor before accessing 'this' or returning from derived constructor",
+                            );
+                            return Err(ExecError::Throw(
+                                self.make_error(N_REFERENCE_ERROR, Some(m)),
+                            ));
+                        }
+                    }
+                    Ok(r)
                 }
                 // No own constructor but a base: implicit `super(args)`, then
                 // this class's own field initializers.

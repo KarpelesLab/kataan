@@ -334,7 +334,19 @@ impl<'a> Interp<'a> {
                 let tagf = self.eval(tag)?;
                 self.call(tagf, &args)
             }
-            Expr::This(_) => Ok(self.this_val),
+            Expr::This(_) => {
+                // In a derived constructor, `this` is in its temporal dead zone
+                // until `super(...)` runs (ReferenceError if accessed before).
+                if self.this_val.is_tdz() {
+                    let m = self.new_str(
+                        "Must call super constructor before accessing 'this' or returning from derived constructor",
+                    );
+                    return Err(ExecError::Throw(
+                        self.make_error(N_REFERENCE_ERROR, Some(m)),
+                    ));
+                }
+                Ok(self.this_val)
+            }
             Expr::NewTarget(_) => Ok(self.new_target),
             Expr::Await { argument, .. } => {
                 let v = self.eval(argument)?;
@@ -710,28 +722,45 @@ impl<'a> Interp<'a> {
                 // instance.
                 if matches!(&**callee, Expr::Super(_)) {
                     let args = self.eval_args(arguments)?;
+                    // The instance + this class's id are stashed in
+                    // `pending_this_init` while `this` is in its TDZ (set by the
+                    // derived constructor). Calling `super()` a second time leaves
+                    // it `None` → ReferenceError.
+                    let Some((inst_val, derived_cid)) = self.pending_this_init else {
+                        let m = self.new_str("Super constructor may only be called once");
+                        return Err(ExecError::Throw(
+                            self.make_error(N_REFERENCE_ERROR, Some(m)),
+                        ));
+                    };
+                    let inst = inst_val.as_handle().map(Handle::from_raw);
+                    // Bind `this` and clear the pending marker BEFORE invoking the
+                    // parent constructor — the parent's body (a base class, or a
+                    // further-derived one after its own `super`) reads `this`, and
+                    // a second `super()` must now see `None` and error.
+                    self.this_val = inst_val;
+                    self.pending_this_init = None;
                     if let Some((pid, penv)) = self.pending_super.clone() {
-                        if let Some(raw) = self.this_val.as_handle() {
-                            self.run_constructor(pid, &penv, Handle::from_raw(raw), &args)?;
+                        if let Some(h) = inst {
+                            self.run_constructor(pid, &penv, h, &args)?;
                         }
-                        return Ok(NanBox::undefined());
+                    } else if let Some(nid) = self.pending_super_native {
+                        // `super(...)` reaching a native constructor (`extends Error`).
+                        if let Some(h) = inst {
+                            self.apply_native_super(nid, h, &args);
+                        }
+                    } else if let Some(fnp) = self.pending_super_fn {
+                        // `super(...)` reaching an ordinary-function superclass.
+                        self.call_with_this(fnp, inst_val, &args)?;
+                    } else {
+                        return Err(ExecError::Unsupported(
+                            "super outside a derived constructor",
+                        ));
                     }
-                    // `super(...)` reaching a native constructor (`extends Error`).
-                    if let Some(nid) = self.pending_super_native
-                        && let Some(raw) = self.this_val.as_handle()
-                    {
-                        self.apply_native_super(nid, Handle::from_raw(raw), &args);
-                        return Ok(NanBox::undefined());
+                    // This class's field initializers run *after* `super()` returns.
+                    if let Some(h) = inst {
+                        self.init_instance_fields(derived_cid, h)?;
                     }
-                    // `super(...)` reaching an ordinary-function superclass
-                    // (`extends fn`): call it with `this` = the new instance.
-                    if let Some(fnp) = self.pending_super_fn {
-                        self.call_with_this(fnp, self.this_val, &args)?;
-                        return Ok(NanBox::undefined());
-                    }
-                    return Err(ExecError::Unsupported(
-                        "super outside a derived constructor",
-                    ));
+                    return Ok(NanBox::undefined());
                 }
                 // `super.method(args)` — invoke the base-class method with the
                 // current `this`.

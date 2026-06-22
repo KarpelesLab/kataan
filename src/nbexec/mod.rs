@@ -474,6 +474,14 @@ pub struct Interp<'a> {
     /// Whether the currently-running method was entered as a static method, so
     /// `super.x` resolves against the superclass's static members.
     current_home_static: bool,
+    /// While a *derived* class constructor body runs before `super(...)`, holds
+    /// `(instanceValue, classId)`: `this` is in its temporal dead zone
+    /// (`this_val` is `tdz()`), and the stashed instance + class let `super(...)`
+    /// initialize `this` and run this class's field initializers on return.
+    /// `None` once `super` has run (or outside a derived constructor). A
+    /// derived constructor that completes with this still set never called
+    /// `super` — accessing `this` / the implicit return is a ReferenceError.
+    pending_this_init: Option<(NanBox, u32)>,
     /// While a *parameter default value* is being evaluated, the BoundNames of
     /// the enclosing function's formal parameters (plus `arguments` for a
     /// non-arrow). A sloppy direct `eval("var X")` running here is an
@@ -1934,6 +1942,7 @@ impl<'a> Interp<'a> {
             annexb_block_fns: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
+            pending_this_init: None,
             class_member_keys: Vec::new(),
             class_statics: Vec::new(),
             class_static_fields: Vec::new(),
