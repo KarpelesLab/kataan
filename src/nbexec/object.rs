@@ -2081,7 +2081,52 @@ impl<'a> Interp<'a> {
         Some(crate::wtf8::utf16_len(&bytes))
     }
 
+    /// `Set(O, key, value, true)` — a [[Set]] whose `Throw` is true regardless of
+    /// the caller's strictness (used by `Object.assign`, whose CopyDataProperties
+    /// step always throws on a failed write). `key_name` is the string form of the
+    /// key (the `\0sym:` sentinel for a symbol) for the writability predicate;
+    /// `key_box` is the value passed to the [[Set]] machinery.
+    pub(crate) fn set_or_throw(
+        &mut self,
+        target: crate::heap::Handle,
+        key_box: NanBox,
+        key_name: &str,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        // An own accessor takes precedence: its setter runs (and a frozen object's
+        // accessor is still writable through the setter), so delegate without the
+        // data-write gate. The `[[Set]]` path itself rejects a getter-only accessor.
+        let has_own_accessor = self.realm.accessor(target, key_name).is_some();
+        // A data write that OrdinarySet would reject (read-only / frozen property,
+        // or a new property on a non-extensible target) is a TypeError here even in
+        // sloppy mode. A property with a setter, or a writable slot, passes the
+        // predicate and is delegated to the normal [[Set]] (which runs setters,
+        // proxy traps, array-index and length handling).
+        if !has_own_accessor && !self.can_write_property(target, key_name) {
+            let add_to_non_extensible =
+                !self.realm.has_own(target, key_name) && !self.realm.is_extensible(target);
+            let m = if add_to_non_extensible {
+                self.new_str(&alloc::format!(
+                    "Cannot add property '{key_name}', object is not extensible"
+                ))
+            } else {
+                self.new_str(&alloc::format!(
+                    "Cannot assign to read only property '{key_name}'"
+                ))
+            };
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        self.assign_member_value(target, key_box, value)
+    }
+
     pub(crate) fn can_write_property(&self, handle: crate::heap::Handle, key: &str) -> bool {
+        // A string's index properties (`"abc"[0]`, or `new String("abc")[0]`) are
+        // non-writable own data properties, so a write to an in-range index fails.
+        if let Ok(i) = key.parse::<usize>()
+            && self.string_index_count(handle).is_some_and(|n| i < n)
+        {
+            return false;
+        }
         let add_to_non_extensible =
             !self.realm.has_own(handle, key) && !self.realm.is_extensible(handle);
         let readonly = self.realm.property_is_readonly(handle, key)

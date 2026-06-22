@@ -1244,8 +1244,9 @@ impl<'a> Interp<'a> {
                         {
                             for (i, ch) in s.chars().enumerate() {
                                 let cv = self.new_str(&alloc::format!("{ch}"));
-                                let kb = self.new_str(&alloc::format!("{i}"));
-                                self.assign_member_value(t, kb, cv)?;
+                                let name = alloc::format!("{i}");
+                                let kb = self.new_str(&name);
+                                self.set_or_throw(t, kb, &name, cv)?;
                             }
                             continue;
                         }
@@ -1254,8 +1255,9 @@ impl<'a> Interp<'a> {
                             // indexed elements.
                             if let Some(elems) = self.realm.elements_vec(sh) {
                                 for (i, e) in elems.iter().enumerate() {
-                                    let kb = self.new_str(&alloc::format!("{i}"));
-                                    self.assign_member_value(t, kb, *e)?;
+                                    let name = alloc::format!("{i}");
+                                    let kb = self.new_str(&name);
+                                    self.set_or_throw(t, kb, &name, *e)?;
                                 }
                                 continue;
                             }
@@ -1274,7 +1276,7 @@ impl<'a> Interp<'a> {
                                 } else {
                                     self.new_str(&k)
                                 };
-                                self.assign_member_value(t, kb, v)?;
+                                self.set_or_throw(t, kb, &k, v)?;
                             }
                         }
                     }
