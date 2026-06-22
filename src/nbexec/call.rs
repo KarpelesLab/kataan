@@ -1312,6 +1312,26 @@ impl<'a> Interp<'a> {
             }
             // Parameter binding is done; the body must not see the parameter set.
             self.eval_param_names = None;
+            // FunctionDeclarationInstantiation: when the formal parameters
+            // *contain expressions* (a default, or a computed key in a pattern),
+            // the body runs in a separate variable environment nested inside the
+            // parameter environment. Body `var`/lexical declarations then live in
+            // that child, invisible to closures created by parameter defaults
+            // (`((p = () => x) => { var x = 'inner'; })()` — `p` still sees the
+            // outer `x`). Per spec the new env is *seeded* with the parameter
+            // (and `arguments`) values so a body `var` that names a parameter
+            // starts from its value; the two environments are then independent.
+            if params_contain_expression(def.params) {
+                let body_scope = self.current.child();
+                for (name, value, is_const) in self.current.local_bindings() {
+                    if is_const {
+                        body_scope.declare_const(&name, value);
+                    } else {
+                        body_scope.declare(&name, value);
+                    }
+                }
+                self.current = body_scope;
+            }
             // A generator call does NOT run its body: it captures the
             // parameter-bound scope and ambient state into a suspended
             // [`generator::GenFrame`], returning a lazy generator object. The
@@ -2689,5 +2709,43 @@ impl<'a> Interp<'a> {
         // Re-append the `undefined` holes after the ordered defined values.
         elems.extend(core::iter::repeat_n(NanBox::undefined(), undefined_count));
         Ok(elems)
+    }
+}
+
+/// ECMAScript `ContainsExpression` for a formal parameter list: whether any
+/// parameter has a default initializer or a computed property key in a
+/// destructuring pattern. When true, a function's body runs in a variable
+/// environment distinct from its parameter environment (FunctionDeclaration-
+/// Instantiation), so a parameter-default closure and a body `var` of the same
+/// name are independent.
+fn params_contain_expression(params: &[crate::ast::Param]) -> bool {
+    params
+        .iter()
+        .any(|p| p.default.is_some() || target_contains_expression(&p.target))
+}
+
+/// `ContainsExpression` for a single binding target (recurses through nested
+/// array/object destructuring patterns).
+fn target_contains_expression(target: &crate::ast::BindingTarget) -> bool {
+    use crate::ast::{ArrayPatternElement, BindingTarget, PropertyKey};
+    match target {
+        BindingTarget::Ident(_) => false,
+        BindingTarget::Array(arr) => arr.elements.iter().any(|el| match el {
+            ArrayPatternElement::Hole => false,
+            ArrayPatternElement::Item {
+                target, default, ..
+            } => default.is_some() || target_contains_expression(target),
+            ArrayPatternElement::Rest { target, .. } => target_contains_expression(target),
+        }),
+        BindingTarget::Object(obj) => {
+            obj.properties.iter().any(|p| {
+                p.default.is_some()
+                    || matches!(p.key, PropertyKey::Computed(_))
+                    || target_contains_expression(&p.value)
+            }) || obj
+                .rest
+                .as_ref()
+                .is_some_and(|r| target_contains_expression(r))
+        }
     }
 }
