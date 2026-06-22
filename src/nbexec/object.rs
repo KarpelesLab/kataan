@@ -2030,6 +2030,38 @@ impl<'a> Interp<'a> {
         self.current.get(name)
     }
 
+    /// `O.[[OwnPropertyKeys]]()` as a list of key values (Strings then Symbols,
+    /// each in insertion / integer-ascending order), routed through a proxy's
+    /// `ownKeys` trap when present. Used by `Object.assign`'s CopyDataProperties.
+    pub(crate) fn own_property_keys_values(
+        &mut self,
+        handle: crate::heap::Handle,
+    ) -> Result<Vec<NanBox>, ExecError> {
+        // A proxy routes [[OwnPropertyKeys]] through its `ownKeys` trap; with no
+        // trap it forwards to the target's [[OwnPropertyKeys]] (the proxy cell
+        // itself has no physical keys).
+        if let Some((target, _)) = self.realm.proxy_at(handle) {
+            self.guard_revoked(handle)?;
+            if let Some(keys) = self.proxy_own_keys_raw(handle)? {
+                return Ok(keys);
+            }
+            return self.own_property_keys_values(target);
+        }
+        let mut out = Vec::new();
+        for k in self.realm.own_property_names(handle).unwrap_or_default() {
+            out.push(self.new_str(&k));
+        }
+        for k in self.realm.object_all_keys(handle) {
+            if let Some(idstr) = k.strip_prefix("\u{0}sym:")
+                && let Ok(id) = idstr.parse::<u64>()
+                && let Some(sh) = self.realm.symbol_for_id(id)
+            {
+                out.push(NanBox::handle(sh.to_raw()));
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn member_value(&self, handle: crate::heap::Handle, key: &str) -> NanBox {
         if let Some(v) = self.realm.get_property(handle, key) {
             return v;

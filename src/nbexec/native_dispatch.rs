@@ -1251,32 +1251,31 @@ impl<'a> Interp<'a> {
                             continue;
                         }
                         if let Some(sh) = src.as_handle().map(Handle::from_raw) {
-                            // An array (or typed-array view) source contributes its
-                            // indexed elements.
-                            if let Some(elems) = self.realm.elements_vec(sh) {
-                                for (i, e) in elems.iter().enumerate() {
-                                    let name = alloc::format!("{i}");
-                                    let kb = self.new_str(&name);
-                                    self.set_or_throw(t, kb, &name, *e)?;
+                            // Spec CopyDataProperties: take `from.[[OwnPropertyKeys]]()`
+                            // in String-then-Symbol order (a proxy's `ownKeys` trap is
+                            // honored), and for each key do `from.[[GetOwnProperty]]`
+                            // (skip a key reported absent, or non-enumerable), then
+                            // `Get` (so a getter / proxy `get` trap fires and its throw
+                            // propagates) and `Set(to, key, value, true)` onto the
+                            // target (which runs the target's setters and throws on a
+                            // read-only / frozen / non-extensible write).
+                            let keys = self.own_property_keys_values(sh)?;
+                            for key in keys {
+                                let name = self.member_key(key);
+                                let desc = self.descriptor_of(sh, &name)?;
+                                if matches!(desc.unpack(), Unpacked::Undefined) {
+                                    continue;
                                 }
-                                continue;
-                            }
-                            // Own enumerable string *and* symbol keys; values read via
-                            // `read_member` (so getters fire) and written via
-                            // `assign_member_value` ([[Set]], so the target's setters
-                            // run and a frozen/read-only property is honored).
-                            let keys = self.realm.object_keys_with_symbols(sh);
-                            for k in keys {
-                                let v = self.read_member(sh, &k)?;
-                                let kb = if let Some(idstr) = k.strip_prefix("\u{0}sym:")
-                                    && let Ok(id) = idstr.parse::<u64>()
-                                    && let Some(sym) = self.realm.symbol_for_id(id)
-                                {
-                                    NanBox::handle(sym.to_raw())
-                                } else {
-                                    self.new_str(&k)
-                                };
-                                self.set_or_throw(t, kb, &k, v)?;
+                                let enumerable = desc
+                                    .as_handle()
+                                    .map(Handle::from_raw)
+                                    .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                                    .is_some_and(|v| self.realm.truthy(v));
+                                if !enumerable {
+                                    continue;
+                                }
+                                let v = self.read_member(sh, &name)?;
+                                self.set_or_throw(t, key, &name, v)?;
                             }
                         }
                     }
