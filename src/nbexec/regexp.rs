@@ -849,7 +849,7 @@ impl<'a> Interp<'a> {
                 self.realm.set_regex_last_index(matcher, next);
             }
         }
-        Ok(self.make_generator(out))
+        Ok(self.make_builtin_iterator(out, "RegExp String Iterator"))
     }
 
     /// `AdvanceStringIndex(S, index, unicode)` over the `&str` subject. Returns the
