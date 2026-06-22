@@ -49,6 +49,16 @@ const TAG_TRUE: u64 = QNAN | 0x04;
 /// `undefined` so any accidental leak is harmless.
 const TAG_HOLE: u64 = QNAN | 0x05;
 
+/// The *empty completion* sentinel (the spec's `[[Value]]` = empty). It marks a
+/// statement that produced no completion value — a declaration, empty statement,
+/// `debugger`, or an abrupt-but-valueless boundary — so a `StatementList` /
+/// `switch` / loop can implement `UpdateEmpty` (an empty completion must not
+/// replace a preceding non-empty one). It never escapes to user code: it decodes
+/// (`unpack`/`is_undefined`/`to_boolean`/…) as `undefined`, so any accidental
+/// leak is harmless, and the eval boundary converts a trailing empty to
+/// `undefined`. Use [`is_empty_completion`](NanBox::is_empty_completion) to test.
+const TAG_EMPTY: u64 = QNAN | 0x06;
+
 /// The canonical quiet-NaN payload a `f64` NaN is normalized to, chosen so that
 /// `(bits & QNAN) != QNAN` (i.e. it still reads back as a number).
 const CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
@@ -98,6 +108,19 @@ impl NanBox {
     #[must_use]
     pub const fn is_hole(self) -> bool {
         self.0 == TAG_HOLE
+    }
+
+    /// The empty-completion sentinel (spec `[[Value]]` = empty). Internal to
+    /// statement evaluation; decodes as `undefined`. See `TAG_EMPTY`.
+    #[must_use]
+    pub const fn empty_completion() -> Self {
+        Self(TAG_EMPTY)
+    }
+
+    /// Whether this is the empty-completion sentinel.
+    #[must_use]
+    pub const fn is_empty_completion(self) -> bool {
+        self.0 == TAG_EMPTY
     }
 
     /// A boolean.
@@ -154,7 +177,7 @@ impl NanBox {
     /// (it decodes as `undefined`), so callers never observe the sentinel.
     #[must_use]
     pub const fn is_undefined(self) -> bool {
-        self.0 == TAG_UNDEFINED || self.0 == TAG_HOLE
+        self.0 == TAG_UNDEFINED || self.0 == TAG_HOLE || self.0 == TAG_EMPTY
     }
 
     /// Whether this is `null`.
@@ -206,7 +229,7 @@ impl NanBox {
             return Unpacked::Number(f64::from_bits(self.0));
         }
         match self.0 {
-            TAG_UNDEFINED | TAG_HOLE => Unpacked::Undefined,
+            TAG_UNDEFINED | TAG_HOLE | TAG_EMPTY => Unpacked::Undefined,
             TAG_NULL => Unpacked::Null,
             TAG_TRUE => Unpacked::Bool(true),
             TAG_FALSE => Unpacked::Bool(false),

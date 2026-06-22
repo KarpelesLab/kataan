@@ -89,6 +89,26 @@ fn loop_action(flow: Flow, label: &Option<String>) -> LoopAction {
     }
 }
 
+/// Folds an empty completion to `undefined` (spec `UpdateEmpty(_, undefined)`),
+/// used where a construct must never surface the empty-completion sentinel (an
+/// `if`, a function/program result, …). Non-`Normal` flows pass through.
+fn empty_to_undefined(flow: Flow) -> Flow {
+    match flow {
+        Flow::Normal(v) if v.is_empty_completion() => Flow::Normal(NanBox::undefined()),
+        other => other,
+    }
+}
+
+/// UpdateEmpty for a loop's running value `v`: a non-empty `Normal` body
+/// completion replaces it; an empty completion or any abrupt flow leaves it.
+fn update_loop_value(v: &mut NanBox, flow: &Flow) {
+    if let Flow::Normal(bv) = flow
+        && !bv.is_empty_completion()
+    {
+        *v = *bv;
+    }
+}
+
 /// The body of a registered function: a block, or a concise arrow expression.
 #[derive(Clone, Copy)]
 pub(crate) enum Body<'a> {
@@ -3809,7 +3829,14 @@ impl<'a> Interp<'a> {
         let mut last = NanBox::undefined();
         for stmt in &program.body {
             match self.exec(stmt)? {
-                Flow::Normal(v) => last = v,
+                // UpdateEmpty: an empty completion (declaration / empty statement)
+                // never replaces a preceding non-empty value; the script's value
+                // is the last non-empty statement value (undefined if none).
+                Flow::Normal(v) => {
+                    if !v.is_empty_completion() {
+                        last = v;
+                    }
+                }
                 Flow::Return(v) => {
                     self.run_event_loop()?;
                     return Ok(v);
@@ -3860,7 +3887,14 @@ impl<'a> Interp<'a> {
         let mut last = NanBox::undefined();
         for stmt in &program.body {
             match self.exec(stmt)? {
-                Flow::Normal(v) => last = v,
+                // UpdateEmpty + the `eval` rule that a trailing empty completion
+                // becomes `undefined`: track the last *non-empty* value (`last`
+                // starts at undefined, so an all-empty body yields undefined).
+                Flow::Normal(v) => {
+                    if !v.is_empty_completion() {
+                        last = v;
+                    }
+                }
                 // A `return` is a SyntaxError at parse time at the top level, so
                 // it cannot reach here; `break`/`continue` likewise. Treat any
                 // such residue as completing normally.

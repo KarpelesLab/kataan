@@ -70,11 +70,15 @@ impl<'a> Interp<'a> {
 
     pub(crate) fn exec_inner(&mut self, stmt: &'a Stmt) -> Result<Flow, ExecError> {
         match stmt {
-            Stmt::Empty { .. } => Ok(Flow::Normal(NanBox::undefined())),
+            // Declarations, the empty statement and `debugger` have an *empty*
+            // completion value (spec): they must not replace a preceding
+            // non-empty value in a StatementList / switch / block. `eval` reports
+            // the last non-empty value (see `exec_seq`'s UpdateEmpty).
+            Stmt::Empty { .. } => Ok(Flow::Normal(NanBox::empty_completion())),
             Stmt::Expr { expression, .. } => Ok(Flow::Normal(self.eval(expression)?)),
             Stmt::Var(decl) => {
                 self.exec_var(decl)?;
-                Ok(Flow::Normal(NanBox::undefined()))
+                Ok(Flow::Normal(NanBox::empty_completion()))
             }
             // Function declarations are bound by hoisting. For a *block-level*
             // declaration, Annex B.3.3 additionally updates the function-scope
@@ -94,14 +98,14 @@ impl<'a> Interp<'a> {
                 {
                     self.annexb_update_var(&id.name, value);
                 }
-                Ok(Flow::Normal(NanBox::undefined()))
+                Ok(Flow::Normal(NanBox::empty_completion()))
             }
             Stmt::Class(class) => {
                 let value = self.make_class(class)?;
                 if let Some(id) = &class.id {
                     self.current.declare(&id.name, value);
                 }
-                Ok(Flow::Normal(NanBox::undefined()))
+                Ok(Flow::Normal(NanBox::empty_completion()))
             }
             Stmt::Block { body, .. } => self.exec_block(body),
             Stmt::If {
@@ -110,29 +114,41 @@ impl<'a> Interp<'a> {
                 alternate,
                 ..
             } => {
-                if self.eval_truthy(test)? {
-                    self.exec_if_branch(consequent)
+                let r = if self.eval_truthy(test)? {
+                    self.exec_if_branch(consequent)?
                 } else if let Some(alt) = alternate {
-                    self.exec_if_branch(alt)
+                    self.exec_if_branch(alt)?
                 } else {
-                    Ok(Flow::Normal(NanBox::undefined()))
-                }
+                    Flow::Normal(NanBox::undefined())
+                };
+                // Spec: an `if` never yields an empty completion — a taken branch
+                // is `UpdateEmpty(branch, undefined)` and the not-taken case is
+                // `undefined`.
+                Ok(empty_to_undefined(r))
             }
             Stmt::While { test, body, .. } => {
                 let label = self.pending_label.take();
+                // Per spec the loop value is the last non-empty body completion,
+                // `undefined` if none — never empty.
+                let mut v = NanBox::undefined();
                 while self.eval_truthy(test)? {
-                    match loop_action(self.exec(body)?, &label) {
+                    let f = self.exec(body)?;
+                    update_loop_value(&mut v, &f);
+                    match loop_action(f, &label) {
                         LoopAction::Next => {}
                         LoopAction::Stop => break,
                         LoopAction::Propagate(f) => return Ok(f),
                     }
                 }
-                Ok(Flow::Normal(NanBox::undefined()))
+                Ok(Flow::Normal(v))
             }
             Stmt::DoWhile { body, test, .. } => {
                 let label = self.pending_label.take();
+                let mut v = NanBox::undefined();
                 loop {
-                    match loop_action(self.exec(body)?, &label) {
+                    let f = self.exec(body)?;
+                    update_loop_value(&mut v, &f);
+                    match loop_action(f, &label) {
                         LoopAction::Next => {}
                         LoopAction::Stop => break,
                         LoopAction::Propagate(f) => return Ok(f),
@@ -141,7 +157,7 @@ impl<'a> Interp<'a> {
                         break;
                     }
                 }
-                Ok(Flow::Normal(NanBox::undefined()))
+                Ok(Flow::Normal(v))
             }
             Stmt::Labeled { label, body, .. } => {
                 // The label is handed to a *directly* labeled loop (via `pending_label`)
@@ -164,7 +180,12 @@ impl<'a> Interp<'a> {
                 self.pending_label = None;
                 // A labeled statement consumes a matching `break label`.
                 Ok(match flow {
-                    Flow::Break(Some(l)) if l == *label.name => Flow::Normal(NanBox::undefined()),
+                    // A consumed `break label` carries no value in this model;
+                    // report an empty completion so it doesn't overwrite a prior
+                    // non-empty value in an enclosing StatementList.
+                    Flow::Break(Some(l)) if l == *label.name => {
+                        Flow::Normal(NanBox::empty_completion())
+                    }
                     other => other,
                 })
             }
@@ -208,7 +229,8 @@ impl<'a> Interp<'a> {
                 self.with_stack.push(obj);
                 let r = self.exec(body);
                 self.with_stack.pop();
-                r
+                // Spec: `with` yields `UpdateEmpty(C, undefined)`.
+                r.map(empty_to_undefined)
             }
             Stmt::Try {
                 block,
@@ -298,14 +320,17 @@ impl<'a> Interp<'a> {
             self.current = saved;
         }
         // `finally` runs regardless; an abrupt finally overrides the outcome.
-        if let Some(fin) = finalizer {
+        let outcome = if let Some(fin) = finalizer {
             match self.exec_scoped(fin) {
                 Ok(Flow::Normal(_)) => outcome,
                 other => other, // finally returned/broke/threw → that wins
             }
         } else {
             outcome
-        }
+        };
+        // Spec: a `try` completion is `UpdateEmpty(result, undefined)` — it never
+        // surfaces the empty-completion sentinel.
+        outcome.map(empty_to_undefined)
     }
 
     /// Runs a statement list in a fresh child scope.
@@ -402,22 +427,30 @@ impl<'a> Interp<'a> {
             {
                 self.annexb_update_var(&id.name, value);
             }
-            return Ok(Flow::Normal(NanBox::undefined()));
+            // A function declaration has an empty completion value.
+            return Ok(Flow::Normal(NanBox::empty_completion()));
         }
         self.exec(stmt)
     }
 
-    /// Executes a statement sequence in the current scope (with hoisting).
+    /// Executes a statement sequence in the current scope (with hoisting). The
+    /// block's completion value is the last *non-empty* statement value (spec
+    /// UpdateEmpty over the StatementList); an all-declaration / empty block
+    /// yields the empty-completion sentinel, which the caller folds away.
     pub(crate) fn exec_seq(&mut self, body: &'a [Stmt]) -> Result<Flow, ExecError> {
         self.hoist(body)?;
-        let mut last = Flow::Normal(NanBox::undefined());
+        let mut last = NanBox::empty_completion();
         for stmt in body {
             match self.exec(stmt)? {
-                Flow::Normal(v) => last = Flow::Normal(v),
+                Flow::Normal(v) => {
+                    if !v.is_empty_completion() {
+                        last = v;
+                    }
+                }
                 other => return Ok(other),
             }
         }
-        Ok(last)
+        Ok(Flow::Normal(last))
     }
 
     pub(crate) fn exec_var(&mut self, decl: &'a VarDecl) -> Result<(), ExecError> {
@@ -1222,18 +1255,26 @@ impl<'a> Interp<'a> {
             for case in cases {
                 self.hoist(&case.body)?;
             }
+            // Spec CaseBlockEvaluation: V starts undefined and tracks the last
+            // non-empty completion across the executed (fall-through) statements;
+            // a `break` returns that accumulated value (UpdateEmpty(break, V)).
+            let mut v = NanBox::undefined();
             for case in &cases[start..] {
                 for stmt in &case.body {
                     match self.exec(stmt)? {
-                        // A plain `break` ends the switch; everything else
-                        // (labeled break, continue, return) bubbles out.
-                        Flow::Break(None) => return Ok(Flow::Normal(NanBox::undefined())),
-                        Flow::Normal(_) => {}
+                        // A plain `break` ends the switch, yielding V; everything
+                        // else (labeled break, continue, return) bubbles out.
+                        Flow::Break(None) => return Ok(Flow::Normal(v)),
+                        Flow::Normal(sv) => {
+                            if !sv.is_empty_completion() {
+                                v = sv;
+                            }
+                        }
                         other => return Ok(other),
                     }
                 }
             }
-            Ok(Flow::Normal(NanBox::undefined()))
+            Ok(Flow::Normal(v))
         })();
         self.current = saved;
         result
