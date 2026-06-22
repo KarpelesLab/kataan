@@ -9,12 +9,6 @@ impl<'a> Interp<'a> {
     /// catchable `ReferenceError` when the reference is unresolvable. Shared by a
     /// bare-identifier read and the read step of a compound assignment.
     pub(crate) fn read_ident_ref(&mut self, name: &str) -> Result<NanBox, ExecError> {
-        match name {
-            "undefined" => return Ok(NanBox::undefined()),
-            "NaN" => return Ok(NanBox::number(f64::NAN)),
-            "Infinity" => return Ok(NanBox::number(f64::INFINITY)),
-            _ => {}
-        }
         // An imported binding (`import { x } from "m"`) resolves *live* through
         // the exporting module's own scope, so a later mutation of the export is
         // observed here. A reference before the source module has run leaves the
@@ -34,9 +28,17 @@ impl<'a> Interp<'a> {
             };
         }
         // A bare identifier inside `with (obj)` first resolves against the
-        // with-object's properties (via `[[Get]]`, so accessors fire).
+        // with-object's properties (via `[[Get]]`, so accessors fire) — this
+        // shadows even the `undefined`/`NaN`/`Infinity` global identifiers when
+        // the with-object provides them (`with ({ NaN: 1 }) { NaN }` is 1).
         if let Some(h) = self.with_binding(name) {
             return self.read_member(h, name);
+        }
+        match name {
+            "undefined" => return Ok(NanBox::undefined()),
+            "NaN" => return Ok(NanBox::number(f64::NAN)),
+            "Infinity" => return Ok(NanBox::number(f64::INFINITY)),
+            _ => {}
         }
         match self.current.get(name) {
             Some(v) => Ok(v),
@@ -490,6 +492,13 @@ impl<'a> Interp<'a> {
                                 // Deleting a resolvable lexical/var binding is a no-op
                                 // that returns `false` (bindings are non-deletable).
                                 result = false;
+                            } else if let Some(h) = self.with_binding(&id.name) {
+                                // A bare name that resolves through a `with` object's
+                                // environment deletes that object's property — not the
+                                // similarly-named global (`with (o) { delete p }`
+                                // removes `o.p`, leaving any global `p` intact).
+                                result = self.realm.delete_property(h, &id.name);
+                                is_property_delete = true;
                             } else if let Some(g) = self.global_object()
                                 && (self.realm.has_own(g, &id.name)
                                     || self.realm.accessor(g, &id.name).is_some())
