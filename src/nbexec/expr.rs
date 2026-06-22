@@ -41,6 +41,17 @@ impl<'a> Interp<'a> {
             _ => {}
         }
         match self.current.get(name) {
+            // A binding still in its temporal dead zone (a formal parameter
+            // referenced by its own / an earlier parameter's default before it is
+            // initialized — `(a = a) =>`, `(a = b, b) =>`) throws a ReferenceError.
+            Some(v) if v.is_tdz() => {
+                let msg = self.new_str(&alloc::format!(
+                    "Cannot access '{name}' before initialization"
+                ));
+                Err(ExecError::Throw(
+                    self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                ))
+            }
             Some(v) => Ok(v),
             // Not in the lexical scope chain: a property added directly to the
             // global object (`this.x = …` / `globalThis.x = …` at script level) is

@@ -59,6 +59,15 @@ const TAG_HOLE: u64 = QNAN | 0x05;
 /// `undefined`. Use [`is_empty_completion`](NanBox::is_empty_completion) to test.
 const TAG_EMPTY: u64 = QNAN | 0x06;
 
+/// The *temporal dead zone* sentinel: a binding that has been declared but not
+/// yet initialized (a formal parameter referenced by its own / an earlier
+/// parameter's default — `(a = a) =>`, `(a = b, b) =>`). A *source* read of a
+/// binding holding this throws a `ReferenceError`; it is overwritten with the
+/// real value as soon as the binding is initialized. Like the other sentinels it
+/// decodes as `undefined`, so an accidental leak is harmless. Use
+/// [`is_tdz`](NanBox::is_tdz) to test.
+const TAG_TDZ: u64 = QNAN | 0x07;
+
 /// The canonical quiet-NaN payload a `f64` NaN is normalized to, chosen so that
 /// `(bits & QNAN) != QNAN` (i.e. it still reads back as a number).
 const CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
@@ -123,6 +132,19 @@ impl NanBox {
         self.0 == TAG_EMPTY
     }
 
+    /// The temporal-dead-zone sentinel (declared-but-uninitialized binding).
+    /// Internal to scope handling; decodes as `undefined`. See `TAG_TDZ`.
+    #[must_use]
+    pub const fn tdz() -> Self {
+        Self(TAG_TDZ)
+    }
+
+    /// Whether this is the TDZ (uninitialized-binding) sentinel.
+    #[must_use]
+    pub const fn is_tdz(self) -> bool {
+        self.0 == TAG_TDZ
+    }
+
     /// A boolean.
     #[must_use]
     pub const fn boolean(b: bool) -> Self {
@@ -177,7 +199,7 @@ impl NanBox {
     /// (it decodes as `undefined`), so callers never observe the sentinel.
     #[must_use]
     pub const fn is_undefined(self) -> bool {
-        self.0 == TAG_UNDEFINED || self.0 == TAG_HOLE || self.0 == TAG_EMPTY
+        self.0 == TAG_UNDEFINED || self.0 == TAG_HOLE || self.0 == TAG_EMPTY || self.0 == TAG_TDZ
     }
 
     /// Whether this is `null`.
@@ -229,7 +251,7 @@ impl NanBox {
             return Unpacked::Number(f64::from_bits(self.0));
         }
         match self.0 {
-            TAG_UNDEFINED | TAG_HOLE | TAG_EMPTY => Unpacked::Undefined,
+            TAG_UNDEFINED | TAG_HOLE | TAG_EMPTY | TAG_TDZ => Unpacked::Undefined,
             TAG_NULL => Unpacked::Null,
             TAG_TRUE => Unpacked::Bool(true),
             TAG_FALSE => Unpacked::Bool(false),

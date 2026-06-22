@@ -1294,6 +1294,22 @@ impl<'a> Interp<'a> {
                 }
                 self.eval_param_names = Some(names);
             }
+            // Formal-parameter TDZ: when some parameter has a default (the only
+            // way a default can reference another parameter), declare every
+            // simple-ident parameter as uninitialized *before* any default runs,
+            // so a self or forward reference throws ReferenceError (`(a = a)`,
+            // `(a = b, b)`). `bind_pattern` below overwrites each with its real
+            // value left to right, lifting it out of the dead zone — so an earlier
+            // parameter is already initialized when a later default reads it.
+            if def.params.iter().any(|p| p.default.is_some()) {
+                for param in def.params {
+                    if !param.rest
+                        && let BindingTarget::Ident(id) = &param.target
+                    {
+                        self.current.declare(&id.name, NanBox::tdz());
+                    }
+                }
+            }
             for (i, param) in def.params.iter().enumerate() {
                 let value = if param.rest {
                     let rest = args[i.min(args.len())..].to_vec();
