@@ -1589,19 +1589,25 @@ impl<'a> Interp<'a> {
                     );
                 }
                 let key = self.coerce_property_key(arg(0))?;
-                let (getter, setter) = if id == N_OBJ_DEFINE_GETTER {
-                    (f, NanBox::undefined())
+                // DefinePropertyOrThrow(O, key, { [get|set]: f, enumerable: true,
+                // configurable: true }). Building a real descriptor object and
+                // routing through `apply_descriptor` gives the full semantics:
+                // a redefine on a non-extensible object or a non-configurable
+                // property throws a TypeError, and the half not named by the
+                // descriptor (an existing setter for `__defineGetter__`, or getter
+                // for `__defineSetter__`) is preserved by ValidateAndApply.
+                let desc = self.realm.new_object();
+                let field = if id == N_OBJ_DEFINE_GETTER {
+                    "get"
                 } else {
-                    (NanBox::undefined(), f)
+                    "set"
                 };
-                // DefinePropertyOrThrow with { [get|set], enumerable, configurable }.
-                let existing = self.realm.accessor(obj, &key);
-                let (g, s) = match (id, existing) {
-                    (N_OBJ_DEFINE_GETTER, Some((_, old_s))) => (getter, old_s),
-                    (N_OBJ_DEFINE_SETTER, Some((old_g, _))) => (old_g, setter),
-                    _ => (getter, setter),
-                };
-                self.realm.define_accessor(obj, &key, g, s);
+                self.realm.set_property(desc, field, f);
+                self.realm
+                    .set_property(desc, "enumerable", NanBox::boolean(true));
+                self.realm
+                    .set_property(desc, "configurable", NanBox::boolean(true));
+                self.apply_descriptor(obj, &key, desc, false)?;
                 NanBox::undefined()
             }
             // `Object.prototype.__lookupGetter__(P)` / `__lookupSetter__(P)`.
@@ -1609,24 +1615,39 @@ impl<'a> Interp<'a> {
                 let this = self.this_val;
                 let obj = self.require_object_coercible_to_object(this, "__lookupGetter__")?;
                 let key = self.coerce_property_key(arg(0))?;
-                // Walk the prototype chain for an accessor with the matching half.
-                let mut cur = Some(obj);
+                let want_getter = id == N_OBJ_LOOKUP_GETTER;
+                // Walk the prototype chain via the trap-aware `[[GetOwnProperty]]`
+                // and `[[GetPrototypeOf]]` (so a proxy's throwing trap propagates):
+                // at each level take its own descriptor; an accessor descriptor
+                // returns the requested half, a data descriptor (or chain end)
+                // returns undefined.
+                let mut cur = obj;
                 let mut result = NanBox::undefined();
-                while let Some(c) = cur {
-                    if let Some((g, s)) = self.realm.accessor(c, &key) {
-                        let half = if id == N_OBJ_LOOKUP_GETTER { g } else { s };
-                        if half
-                            .as_handle()
-                            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                        {
-                            result = half;
+                loop {
+                    let desc = self.descriptor_of(cur, &key)?;
+                    if !matches!(desc.unpack(), Unpacked::Undefined)
+                        && let Some(dh) = desc.as_handle().map(Handle::from_raw)
+                    {
+                        // An accessor descriptor carries `get`/`set` keys; a data
+                        // descriptor (`value`/`writable`) shadows inherited accessors.
+                        if self.realm.has_own(dh, "get") || self.realm.has_own(dh, "set") {
+                            let half = if want_getter { "get" } else { "set" };
+                            result = self
+                                .realm
+                                .get_property(dh, half)
+                                .unwrap_or(NanBox::undefined());
                         }
                         break;
                     }
-                    if self.realm.has_own(c, &key) {
-                        break; // a data property shadows any inherited accessor
+                    let proto = self.get_proto_of(cur)?;
+                    match proto
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .filter(|_| self.is_object_value(proto))
+                    {
+                        Some(p) => cur = p,
+                        None => break,
                     }
-                    cur = self.realm.object_proto(c);
                 }
                 result
             }

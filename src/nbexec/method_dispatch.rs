@@ -285,41 +285,14 @@ impl<'a> Interp<'a> {
                     && self.realm.property_is_enumerable(handle, &key);
                 return Ok(Some(NanBox::boolean(r)));
             }
-            // Legacy (Annex B) accessor helpers on Object.prototype.
-            "__defineGetter__" => {
-                let key = self.realm.to_display_string(arg(0));
-                let setter = self
-                    .realm
-                    .accessor(handle, &key)
-                    .map_or(NanBox::undefined(), |(_, s)| s);
-                self.realm.define_accessor(handle, &key, arg(1), setter);
-                return Ok(Some(NanBox::undefined()));
-            }
-            "__defineSetter__" => {
-                let key = self.realm.to_display_string(arg(0));
-                let getter = self
-                    .realm
-                    .accessor(handle, &key)
-                    .map_or(NanBox::undefined(), |(g, _)| g);
-                self.realm.define_accessor(handle, &key, getter, arg(1));
-                return Ok(Some(NanBox::undefined()));
-            }
-            "__lookupGetter__" | "__lookupSetter__" => {
-                let want_getter = method == "__lookupGetter__";
-                let key = self.realm.to_display_string(arg(0));
-                let mut cur = Some(handle);
-                while let Some(c) = cur {
-                    if let Some((g, s)) = self.realm.accessor(c, &key) {
-                        return Ok(Some(if want_getter { g } else { s }));
-                    }
-                    // An own data property shadows an inherited accessor.
-                    if self.realm.has_own(c, &key) {
-                        break;
-                    }
-                    cur = self.realm.object_proto(c);
-                }
-                return Ok(Some(NanBox::undefined()));
-            }
+            // The legacy (Annex B) accessor helpers `__defineGetter__` /
+            // `__defineSetter__` / `__lookupGetter__` / `__lookupSetter__` are NOT
+            // shortcut here: their spec semantics (callable check before key
+            // coercion, DefinePropertyOrThrow honoring extensibility /
+            // configurability, the lookup callable-half filter) live in the native
+            // `N_OBJ_*` handlers, so they fall through to the ordinary
+            // member-lookup + native-call path.
+
             // An error object (`name` + `message`, no own `toString`) renders as
             // `"Name: message"` (or just `"Name"` when the message is empty).
             "toString"
