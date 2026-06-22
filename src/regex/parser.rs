@@ -516,12 +516,28 @@ impl Parser {
             Some(c @ ('*' | '+' | '?')) => Err(RegexError::new(alloc::format!(
                 "nothing to repeat before `{c}`"
             ))),
-            // Under the `u` flag a bare `}`, `]`, or `{` is a Syntax Error (the
-            // strict grammar admits them only when escaped or as class/quantifier
-            // delimiters). Without `u`, Annex B treats them as literal
-            // PatternCharacters. A bare `{` is consumed here only when it did not
-            // open a quantifier (`parse_quantified` handled that case).
-            Some(c @ ('}' | ']' | '{')) if self.unicode => Err(RegexError::new(alloc::format!(
+            // A `{` at an atom position. Under the `u` flag a bare `{` is a
+            // Syntax Error outright. Without `u`, the Annex B InvalidBracedQuantifier
+            // production has higher precedence than the literal-`{` extension: a
+            // `{` that forms a valid braced-quantifier shape (`{n}`, `{n,}`,
+            // `{n,m}`) here has nothing to repeat and is a Syntax Error; any other
+            // `{` is a literal PatternCharacter (`/{a}/`, `/{/`).
+            Some('{') => {
+                if self.unicode {
+                    return Err(RegexError::new("lone `{` is not allowed in unicode mode"));
+                }
+                match self.try_parse_brace()? {
+                    Some(_) => Err(RegexError::new("nothing to repeat before `{`")),
+                    None => {
+                        self.pos += 1;
+                        Ok(Node::Char(u32::from('{')))
+                    }
+                }
+            }
+            // Under the `u` flag a bare `}` or `]` is a Syntax Error (the strict
+            // grammar admits them only when escaped or as class delimiters).
+            // Without `u`, Annex B treats them as literal PatternCharacters.
+            Some(c @ ('}' | ']')) if self.unicode => Err(RegexError::new(alloc::format!(
                 "lone `{c}` is not allowed in unicode mode"
             ))),
             Some(c) => {
