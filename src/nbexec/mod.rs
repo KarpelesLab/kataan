@@ -301,6 +301,12 @@ pub struct Interp<'a> {
     /// prototype / private-member / static builders read the stored key instead
     /// of re-evaluating the expression.
     class_member_keys: Vec<alloc::collections::BTreeMap<usize, String>>,
+    /// Lazily-created built-in iterator prototypes keyed by `@@toStringTag`
+    /// (`"Array Iterator"`, `"String Iterator"`, `"Map Iterator"`, …). Each is an
+    /// object chained to `%IteratorPrototype%` with an inherited `next` and the
+    /// tag, so `Object.getPrototypeOf(arr.values())` is a real
+    /// `%ArrayIteratorPrototype%` (reflection tests).
+    builtin_iter_protos: alloc::collections::BTreeMap<&'static str, Handle>,
     /// Per-class static members (`Class.foo`), parallel to `classes`.
     class_statics: Vec<alloc::collections::BTreeMap<String, NanBox>>,
     /// Per-class static *field* names in declaration order — the enumerable own
@@ -1944,6 +1950,7 @@ impl<'a> Interp<'a> {
             classes: Vec::new(),
             pending_this_init: None,
             class_member_keys: Vec::new(),
+            builtin_iter_protos: alloc::collections::BTreeMap::new(),
             class_statics: Vec::new(),
             class_static_fields: Vec::new(),
             class_static_get: Vec::new(),

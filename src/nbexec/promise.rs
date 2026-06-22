@@ -60,6 +60,67 @@ impl<'a> Interp<'a> {
         NanBox::handle(obj.to_raw())
     }
 
+    /// The lazily-created built-in iterator prototype for `@@toStringTag` `tag`
+    /// (`"Array Iterator"`, `"String Iterator"`, `"Map Iterator"`,
+    /// `"Set Iterator"`, `"RegExp String Iterator"`). It chains to
+    /// `%IteratorPrototype%` and carries an inherited `next` (the shared eager
+    /// iterator advance) plus the tag — so a built-in iterator's prototype is the
+    /// real `%XIteratorPrototype%` with `next` *on the prototype*, not the
+    /// instance (per spec / reflection tests).
+    pub(crate) fn builtin_iterator_proto(&mut self, tag: &'static str) -> Handle {
+        if let Some(&p) = self.builtin_iter_protos.get(tag) {
+            return p;
+        }
+        let proto = self.realm.new_object();
+        // Chain to `%IteratorPrototype%` (so the helper methods, `@@iterator`,
+        // and `@@dispose` are inherited).
+        if let Some(iter_proto) = self
+            .current
+            .get("Iterator")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_object_proto(proto, Some(iter_proto));
+        }
+        // `next` lives on the prototype (length 0, non-enumerable, writable,
+        // configurable) and reads the receiver's buffer/index slots.
+        let next = self.realm.new_native(N_GEN_ITER_NEXT);
+        self.install_fn_name_length(next, "next", 0);
+        self.realm
+            .set_property(proto, "next", NanBox::handle(next.to_raw()));
+        self.realm.mark_hidden(proto, "next");
+        // `Class.prototype[Symbol.toStringTag] = tag` (non-writable, non-enumerable,
+        // configurable) — `Object.prototype.toString` and the tests read it.
+        self.install_to_string_tag(proto, tag);
+        self.builtin_iter_protos.insert(tag, proto);
+        proto
+    }
+
+    /// Builds a built-in iterator over `values` whose `[[Prototype]]` is the
+    /// `%XIteratorPrototype%` for `tag` (so `next` is inherited, not an own
+    /// property). The receiver carries the same buffer/index slots a generator
+    /// uses, so the shared `next` (`gen_iter_next`) advances it.
+    pub(crate) fn make_builtin_iterator(
+        &mut self,
+        values: Vec<NanBox>,
+        tag: &'static str,
+    ) -> NanBox {
+        let proto = self.builtin_iterator_proto(tag);
+        let obj = self.realm.new_object();
+        self.realm.set_object_proto(obj, Some(proto));
+        let buf = self.realm.new_array(values);
+        self.realm
+            .set_hidden_property(obj, GEN_BUF, NanBox::handle(buf.to_raw()));
+        self.realm
+            .set_hidden_property(obj, GEN_IDX, NanBox::number(0.0));
+        self.realm
+            .set_hidden_property(obj, GEN_RET, NanBox::undefined());
+        NanBox::handle(obj.to_raw())
+    }
+
     // --- promises ---
 
     /// Settles the promise at `handle` (no-op if already settled), queuing its

@@ -868,7 +868,29 @@ impl<'a> Interp<'a> {
                                 return Ok(recv);
                             }
                             let vals = self.iterate_values(recv)?;
-                            return Ok(self.make_generator(vals));
+                            // Tag the iterator with the receiver's kind so its
+                            // prototype is the real `%ArrayIteratorPrototype%` /
+                            // `%StringIteratorPrototype%` / `%Map|SetIteratorPrototype%`.
+                            let tag = recv.as_handle().map(Handle::from_raw).and_then(|h| {
+                                if self.realm.array_elements(h).is_some()
+                                    || self.realm.is_array(h)
+                                    || self.realm.typed_kind(h).is_some()
+                                {
+                                    Some("Array Iterator")
+                                } else if self.realm.string_value(h).is_some() {
+                                    Some("String Iterator")
+                                } else {
+                                    match self.realm.collection_is_set(h) {
+                                        Some(true) => Some("Set Iterator"),
+                                        Some(false) => Some("Map Iterator"),
+                                        None => None,
+                                    }
+                                }
+                            });
+                            return Ok(match tag {
+                                Some(t) => self.make_builtin_iterator(vals, t),
+                                None => self.make_generator(vals),
+                            });
                         }
                     }
                     // Not a built-in method: read the member and call it.

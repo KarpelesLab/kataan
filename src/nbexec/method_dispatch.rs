@@ -3431,10 +3431,12 @@ impl<'a> Interp<'a> {
                 "keys" => {
                     let ks: Vec<NanBox> =
                         (0..elems.len()).map(|i| NanBox::number(i as f64)).collect();
-                    return Ok(Some(self.make_generator(ks)));
+                    return Ok(Some(self.make_builtin_iterator(ks, "Array Iterator")));
                 }
                 "values" => {
-                    return Ok(Some(self.make_generator(elems.clone())));
+                    return Ok(Some(
+                        self.make_builtin_iterator(elems.clone(), "Array Iterator"),
+                    ));
                 }
                 "entries" => {
                     let mut pairs = Vec::with_capacity(elems.len());
@@ -3444,7 +3446,7 @@ impl<'a> Interp<'a> {
                             .new_array(alloc::vec![NanBox::number(i as f64), *e]);
                         pairs.push(NanBox::handle(pair.to_raw()));
                     }
-                    return Ok(Some(self.make_generator(pairs)));
+                    return Ok(Some(self.make_builtin_iterator(pairs, "Array Iterator")));
                 }
                 "concat" => {
                     // A real-array receiver: run the shared, spec-conformant
@@ -3901,6 +3903,11 @@ impl<'a> Interp<'a> {
                 "keys" => {
                     // A real iterator object (with `.next`/`[Symbol.iterator]`), so
                     // `m.keys().next()` works — not just `for-of`.
+                    let tag = if self.realm.collection_is_set(handle) == Some(true) {
+                        "Set Iterator"
+                    } else {
+                        "Map Iterator"
+                    };
                     let keys: Vec<NanBox> = self
                         .realm
                         .collection_entries(handle)
@@ -3908,11 +3915,16 @@ impl<'a> Interp<'a> {
                         .into_iter()
                         .map(|(k, _)| k)
                         .collect();
-                    return Ok(Some(self.make_generator(keys)));
+                    return Ok(Some(self.make_builtin_iterator(keys, tag)));
                 }
                 "values" => {
                     // A Set yields its elements; a Map yields its values.
                     let is_set = self.realm.collection_is_set(handle) == Some(true);
+                    let tag = if is_set {
+                        "Set Iterator"
+                    } else {
+                        "Map Iterator"
+                    };
                     let vals: Vec<NanBox> = self
                         .realm
                         .collection_entries(handle)
@@ -3920,9 +3932,14 @@ impl<'a> Interp<'a> {
                         .into_iter()
                         .map(|(k, v)| if is_set { k } else { v })
                         .collect();
-                    return Ok(Some(self.make_generator(vals)));
+                    return Ok(Some(self.make_builtin_iterator(vals, tag)));
                 }
                 "entries" => {
+                    let tag = if self.realm.collection_is_set(handle) == Some(true) {
+                        "Set Iterator"
+                    } else {
+                        "Map Iterator"
+                    };
                     let pairs = self.realm.collection_entries(handle).unwrap_or_default();
                     let arr: Vec<NanBox> = pairs
                         .into_iter()
@@ -3930,7 +3947,7 @@ impl<'a> Interp<'a> {
                             NanBox::handle(self.realm.new_array(alloc::vec![k, v]).to_raw())
                         })
                         .collect();
-                    return Ok(Some(self.make_generator(arr)));
+                    return Ok(Some(self.make_builtin_iterator(arr, tag)));
                 }
                 // ES2025 Set composition (24.2.4). Each method reads a *Set Record*
                 // from its argument via `GetSetRecord` — `size` (a number, not NaN),
