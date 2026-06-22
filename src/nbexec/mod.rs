@@ -467,6 +467,15 @@ pub struct Interp<'a> {
     /// Whether the currently-running method was entered as a static method, so
     /// `super.x` resolves against the superclass's static members.
     current_home_static: bool,
+    /// While a *parameter default value* is being evaluated, the BoundNames of
+    /// the enclosing function's formal parameters (plus `arguments` for a
+    /// non-arrow). A sloppy direct `eval("var X")` running here is an
+    /// EvalDeclarationInstantiation early error (SyntaxError) when `X` is one of
+    /// these names — the function has a separate parameter environment that
+    /// already binds them (`function f(a = eval("var a")) {}`). `None` outside
+    /// parameter-default evaluation; cleared across function boundaries so a
+    /// nested call / the body never sees the outer parameter set.
+    eval_param_names: Option<Vec<String>>,
     /// A label attached to the next loop (for `break`/`continue label`).
     pending_label: Option<String>,
     /// The promise-reaction microtask queue, drained after the script.
@@ -1962,6 +1971,7 @@ impl<'a> Interp<'a> {
             current_home: None,
             current_lexical_home: None,
             current_home_object: None,
+            eval_param_names: None,
             current_home_static: false,
             pending_label: None,
             microtasks: Vec::new(),
@@ -3972,6 +3982,36 @@ impl<'a> Interp<'a> {
             direct && (self.current_home.is_some() || self.current_home_object.is_some());
         let program = self.parse_eval_program(source, allow_super_property, false)?;
         let code_strict = has_use_strict(&program.body);
+
+        // EvalDeclarationInstantiation early error: a *sloppy direct* eval being
+        // run while a parameter default is evaluated may not introduce a `var`
+        // (or function) binding that collides with a formal parameter name or
+        // `arguments` — the function's separate parameter environment already
+        // binds those (`function f(a = eval("var a")) {}` is a SyntaxError, and
+        // the body must not run). Strict eval gets its own var scope, so it is
+        // exempt; an indirect eval never runs in the parameter scope.
+        if direct
+            && !self.strict
+            && !code_strict
+            && let Some(param_names) = self.eval_param_names.take()
+        {
+            let mut var_names: Vec<&str> = Vec::new();
+            collect_var_names(&program.body, &mut var_names);
+            let mut block_fns: Vec<&str> = Vec::new();
+            collect_block_function_names(&program.body, &mut block_fns);
+            if var_names
+                .iter()
+                .chain(block_fns.iter())
+                .any(|n| param_names.iter().any(|p| p == n))
+            {
+                let m =
+                    self.new_str("Identifier declared by `var` in eval conflicts with a parameter");
+                return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
+            }
+            // Not a conflict: keep the parameter set live for any further nested
+            // direct eval within the same parameter default.
+            self.eval_param_names = Some(param_names);
+        }
 
         // Recursion guard shared with the tree-walk budget.
         if self.eval_depth >= self.realm.limits.max_eval_depth {

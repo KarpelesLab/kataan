@@ -1266,6 +1266,9 @@ impl<'a> Interp<'a> {
         if def.is_strict {
             self.strict = true;
         }
+        // Cleared for this call so a nested call / the body never inherits an
+        // outer function's parameter set; restored after the call returns.
+        let saved_eval_param_names = core::mem::take(&mut self.eval_param_names);
         let result = (|| {
             // A non-arrow function gets an `arguments` array-like of its call
             // arguments. (Arrows inherit the enclosing `arguments`.) Bound *before*
@@ -1274,6 +1277,22 @@ impl<'a> Interp<'a> {
             if !def.is_arrow {
                 let arguments = self.make_arguments_object(args, callee);
                 self.current.declare("arguments", arguments);
+            }
+            // While evaluating parameter defaults, expose the formal parameter
+            // BoundNames (+ `arguments`) so a sloppy direct `eval("var X")` whose
+            // `X` collides with one is an EvalDeclarationInstantiation early error
+            // (see `eval_string`). Only relevant when some parameter has a default.
+            if def.params.iter().any(|p| p.default.is_some()) {
+                let mut names: Vec<String> = Vec::new();
+                if !def.is_arrow {
+                    names.push(String::from("arguments"));
+                }
+                for p in def.params {
+                    let mut refs: Vec<&str> = Vec::new();
+                    collect_binding_idents(&p.target, &mut refs);
+                    names.extend(refs.into_iter().map(String::from));
+                }
+                self.eval_param_names = Some(names);
             }
             for (i, param) in def.params.iter().enumerate() {
                 let value = if param.rest {
@@ -1291,6 +1310,8 @@ impl<'a> Interp<'a> {
                 };
                 self.bind_pattern(&param.target, value)?;
             }
+            // Parameter binding is done; the body must not see the parameter set.
+            self.eval_param_names = None;
             // A generator call does NOT run its body: it captures the
             // parameter-bound scope and ambient state into a suspended
             // [`generator::GenFrame`], returning a lazy generator object. The
@@ -1347,6 +1368,7 @@ impl<'a> Interp<'a> {
         self.current_home_static = saved_home_static;
         self.new_target = saved_target;
         self.eval_depth = saved_eval_depth;
+        self.eval_param_names = saved_eval_param_names;
         self.strict = saved_strict;
         // An `async` (non-generator) function: now that the caller's ambient state
         // is restored, drive the coroutine's first synchronous burst (the body up
