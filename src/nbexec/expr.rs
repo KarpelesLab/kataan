@@ -2981,6 +2981,16 @@ impl<'a> Interp<'a> {
                     ));
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
+                // PrivateSet on a private *method* is a TypeError (methods are
+                // non-writable). Such a property is installed read-only, so an
+                // own read-only private key here is a method, not a field.
+                if self.realm.has_own(handle, &key) && self.realm.property_is_readonly(handle, &key)
+                {
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot write to private method or accessor #{s}"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
                 self.realm.set_property(handle, &key, new);
             }
         }

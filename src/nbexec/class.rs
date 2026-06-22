@@ -622,6 +622,11 @@ impl<'a> Interp<'a> {
                 match m.kind {
                     MethodKind::Method => {
                         self.realm.set_hidden_property(instance, &key, f);
+                        // A private method is non-writable (and non-configurable):
+                        // `obj.#method = …` / `obj.#method op= …` is a TypeError in
+                        // PrivateSet. Marking it read-only lets the private-write
+                        // path reject the store.
+                        self.realm.set_readonly_property(instance, &key);
                     }
                     MethodKind::Get => {
                         self.realm
