@@ -1096,6 +1096,16 @@ impl Parser {
             } else {
                 self.bump().map_or(c, |ch| ch as u32)
             };
+            // A character-class range whose low endpoint exceeds its high
+            // endpoint (`[b-a]`, `[z-a]`) is a Syntax Error in both Annex B and
+            // strict mode (NonemptyClassRanges early error). Both endpoints here
+            // are single characters (a class-escape endpoint takes the literal-
+            // dash path under Annex B, or already errored under `u`).
+            if c > hi {
+                return Err(RegexError::new(
+                    "character class range out of order (low greater than high)",
+                ));
+            }
             items.push(ClassItem::Range(c, hi));
         } else {
             items.push(ClassItem::Char(c));
