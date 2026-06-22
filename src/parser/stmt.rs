@@ -72,6 +72,7 @@ impl<'src> Parser<'src> {
         source: &'src str,
         allow_super_property: bool,
         allow_super_call: bool,
+        allow_new_target: bool,
     ) -> Result<Program> {
         let mut p = Parser::new(source)?;
         p.module_top_level = true;
@@ -90,7 +91,12 @@ impl<'src> Parser<'src> {
             source_type,
             span: Span::new(0, source.len() as u32),
         };
-        super::validate::validate_program_with(&program, allow_super_property, allow_super_call)?;
+        super::validate::validate_program_with(
+            &program,
+            allow_super_property,
+            allow_super_call,
+            allow_new_target,
+        )?;
         Ok(program)
     }
 

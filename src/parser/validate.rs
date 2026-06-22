@@ -52,7 +52,7 @@ use alloc::vec::Vec;
 
 /// Validates a parsed [`Program`], returning the first early error found.
 pub(crate) fn validate_program(program: &Program) -> Result<()> {
-    validate_program_with(program, false, false)
+    validate_program_with(program, false, false, false)
 }
 
 /// Validates an eval program that inherits a `super` context from the calling
@@ -64,6 +64,7 @@ pub(crate) fn validate_program_with(
     program: &Program,
     allow_super_property: bool,
     allow_super_call: bool,
+    allow_new_target: bool,
 ) -> Result<()> {
     let strict = program.source_type == SourceType::Module || body_is_strict(&program.body);
     let mut v = Validator {
@@ -75,6 +76,7 @@ pub(crate) fn validate_program_with(
     let ctx = Ctx {
         allow_super_property,
         allow_super_call,
+        allow_new_target,
         ..Ctx::top(strict)
     };
     v.check_top_level_scope(&program.body, strict)?;

@@ -445,6 +445,11 @@ impl<'a> Interp<'a> {
             let saved_lexical_home = self.current_lexical_home.replace(class_id);
             let saved_home_static = core::mem::replace(&mut self.current_home_static, true);
             let saved_home_obj = core::mem::take(&mut self.current_home_object);
+            // A static block / static field initializer is function code with a
+            // `[[NewTarget]]` of undefined: `new.target` inside (e.g. via a direct
+            // eval) is a valid token that evaluates to undefined.
+            let saved_nt_scope = core::mem::replace(&mut self.new_target_in_scope, true);
+            let saved_target = core::mem::replace(&mut self.new_target, NanBox::undefined());
             let r = (|| {
                 for (idx, member) in class.body.iter().enumerate() {
                     match member {
@@ -475,6 +480,8 @@ impl<'a> Interp<'a> {
             self.current_lexical_home = saved_lexical_home;
             self.current_home_static = saved_home_static;
             self.current_home_object = saved_home_obj;
+            self.new_target_in_scope = saved_nt_scope;
+            self.new_target = saved_target;
             r?;
         }
         Ok(class_val)
@@ -640,7 +647,12 @@ impl<'a> Interp<'a> {
             .take()
             .unwrap_or(NanBox::undefined());
         let saved_target = core::mem::replace(&mut self.new_target, nt);
+        // A constructor body (and its field initializers) is function code, so a
+        // direct `eval` inside it may use `new.target`. Construction does not flow
+        // through `invoke`, so mark `new.target` as lexically in scope here.
+        let saved_nt_scope = core::mem::replace(&mut self.new_target_in_scope, true);
         let result = self.run_constructor(class_id, env, instance, args);
+        self.new_target_in_scope = saved_nt_scope;
         self.this_val = saved_this;
         self.new_target = saved_target;
         let ret = result?;
@@ -928,6 +940,10 @@ impl<'a> Interp<'a> {
         let saved_lexical_home = self.current_lexical_home.replace(class_id);
         let saved_home_static = core::mem::replace(&mut self.current_home_static, false);
         let saved_home_obj = core::mem::take(&mut self.current_home_object);
+        // A field initializer is evaluated as its own function-like with
+        // `[[NewTarget]]` of undefined — so a `new.target` inside (e.g. via a
+        // direct eval) sees undefined, not the constructor reached via `new`.
+        let saved_target = core::mem::replace(&mut self.new_target, NanBox::undefined());
         let result = (|| {
             for member in &class.body {
                 if let ClassMember::Field(field) = member
@@ -956,6 +972,7 @@ impl<'a> Interp<'a> {
         self.current_lexical_home = saved_lexical_home;
         self.current_home_static = saved_home_static;
         self.current_home_object = saved_home_obj;
+        self.new_target = saved_target;
         result
     }
 

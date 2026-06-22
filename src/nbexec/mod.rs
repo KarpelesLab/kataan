@@ -358,6 +358,14 @@ pub struct Interp<'a> {
     with_stack: Vec<NanBox>,
     /// Current function-call nesting depth (recursion guard).
     call_depth: usize,
+    /// Whether `new.target` is lexically in scope at the current execution point —
+    /// true inside a non-arrow function/method/constructor body, a class field
+    /// initializer, or a static block; false at top-level script/module code. An
+    /// arrow inherits the enclosing value (it is transparent to `new.target`). A
+    /// *direct* `eval` uses this to decide whether `new.target` is a valid token in
+    /// the eval code (the dynamic call depth is wrong here because an arrow defined
+    /// at the top level is on the call stack but has no `new.target` in scope).
+    new_target_in_scope: bool,
     /// C2: current *tree-walk* recursion depth — `eval`/`exec` descend on the
     /// native stack for nested expressions/statements, and the precedence loop in
     /// the parser flattens `a + a + a + …` into a shallow AST that nonetheless
@@ -1965,6 +1973,7 @@ impl<'a> Interp<'a> {
             pending_class_name: None,
             with_stack: Vec::new(),
             call_depth: 0,
+            new_target_in_scope: false,
             eval_depth: 0,
             rng_state: math_random_seed(),
             this_val: NanBox::undefined(),
@@ -3920,15 +3929,17 @@ impl<'a> Interp<'a> {
         source: &str,
         allow_super_property: bool,
         allow_super_call: bool,
+        allow_new_target: bool,
     ) -> Result<&'a Program, ExecError> {
-        // The cache is keyed by source *and* the inherited `super` context: the
-        // same text `"super.x"` is a SyntaxError in one caller and valid in
-        // another, so they must not share a cached AST. A 2-byte flag prefix
-        // (outside the JS source grammar) keeps the key unambiguous.
+        // The cache is keyed by source *and* the inherited `super`/`new.target`
+        // context: the same text `"super.x"` / `"new.target"` is a SyntaxError in
+        // one caller and valid in another, so they must not share a cached AST. A
+        // 3-byte flag prefix (outside the JS source grammar) keeps it unambiguous.
         let key = alloc::format!(
-            "{}{}\0{source}",
+            "{}{}{}\0{source}",
             u8::from(allow_super_property),
             u8::from(allow_super_call),
+            u8::from(allow_new_target),
         );
         if let Some(p) = self.eval_programs.get(&key) {
             return Ok(p);
@@ -3937,6 +3948,7 @@ impl<'a> Interp<'a> {
             source,
             allow_super_property,
             allow_super_call,
+            allow_new_target,
         ) {
             Ok(program) => {
                 // The AST is fully owned (no borrow of `source`); leaking the box
@@ -4004,7 +4016,15 @@ impl<'a> Interp<'a> {
         // context that is not tracked separately, so it stays disallowed.)
         let allow_super_property =
             direct && (self.current_home.is_some() || self.current_home_object.is_some());
-        let program = self.parse_eval_program(source, allow_super_property, false)?;
+        // `new.target` is syntactically valid in a *direct* eval that is contained
+        // in function code (the eval inherits the caller's `[[NewTarget]]`).
+        // `new_target_in_scope` tracks this lexically — true inside a non-arrow
+        // function/constructor/field-initializer/static-block, transparently
+        // inherited by arrows — so a direct eval inside a top-level arrow (no
+        // `new.target` in scope) and any indirect eval keep `new.target` disallowed.
+        let allow_new_target = direct && self.new_target_in_scope;
+        let program =
+            self.parse_eval_program(source, allow_super_property, false, allow_new_target)?;
         let code_strict = has_use_strict(&program.body);
 
         // EvalDeclarationInstantiation early error: a *sloppy direct* eval being
@@ -4116,8 +4136,10 @@ impl<'a> Interp<'a> {
         };
         let source = alloc::format!("(function anonymous({params}\n) {{\n{body}\n}})");
 
-        // A `Function(…)` body is global-scoped — no inherited `super`.
-        let program = self.parse_eval_program(&source, false, false)?;
+        // A `Function(…)` body is global-scoped — no inherited `super`. (Its body
+        // is wrapped in a function expression, so `new.target` inside is enabled by
+        // the parser's own function-boundary handling, not this top-level flag.)
+        let program = self.parse_eval_program(&source, false, false, false)?;
         // The wrapper parses to a single parenthesized function-expression
         // statement; pull the `Function` node back out.
         let func = program.body.iter().find_map(|s| match s {

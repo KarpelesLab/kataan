@@ -1253,6 +1253,14 @@ impl<'a> Interp<'a> {
                 .unwrap_or(NanBox::undefined());
             core::mem::replace(&mut self.new_target, nt)
         };
+        // A non-arrow body brings `new.target` into lexical scope; an arrow is
+        // transparent and inherits the enclosing flag (so an arrow defined at the
+        // top level still has no `new.target` in scope).
+        let saved_nt_scope = if def.is_arrow {
+            self.new_target_in_scope
+        } else {
+            core::mem::replace(&mut self.new_target_in_scope, true)
+        };
         // C2: the tree-walk depth counter measures native recursion *within* one
         // function frame; reset it for the callee's body (deep function-call
         // recursion is bounded separately by `call_depth`) so genuine recursion is
@@ -1403,6 +1411,7 @@ impl<'a> Interp<'a> {
         self.current_lexical_home = saved_lexical_home;
         self.current_home_static = saved_home_static;
         self.new_target = saved_target;
+        self.new_target_in_scope = saved_nt_scope;
         self.eval_depth = saved_eval_depth;
         self.eval_param_names = saved_eval_param_names;
         self.strict = saved_strict;
