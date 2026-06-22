@@ -104,6 +104,27 @@ impl<'a> Interp<'a> {
         self.eval_prop_key(key)
     }
 
+    /// The property key for the member at `class.body[idx]` of class `cid`. A
+    /// *computed* key was pre-evaluated once at class definition (stored in
+    /// `class_member_keys`), so it is read back here rather than re-evaluated
+    /// (re-evaluation would repeat side effects); a static-string or private key
+    /// is evaluated directly (deterministic). Used by the lazily-built prototype
+    /// and the static-member installer so a computed key is evaluated exactly
+    /// once, in source order, at definition time.
+    pub(crate) fn class_member_key(
+        &mut self,
+        cid: u32,
+        idx: usize,
+        key: &'a PropertyKey,
+    ) -> Result<String, ExecError> {
+        if matches!(key, PropertyKey::Computed(_))
+            && let Some(k) = self.class_member_keys[cid as usize].get(&idx)
+        {
+            return Ok(k.clone());
+        }
+        self.eval_member_key_for_class(key, cid)
+    }
+
     /// Registers a class and allocates a class value capturing the current scope.
     pub(crate) fn make_class(&mut self, class: &'a Class) -> Result<NanBox, ExecError> {
         let class_id = self.classes.len() as u32;
@@ -120,6 +141,8 @@ impl<'a> Interp<'a> {
         let class_env = self.current.child();
         let handle = self.realm.new_class(class_id, class_env.clone());
         let class_val = NanBox::handle(handle.to_raw());
+        self.class_member_keys
+            .push(alloc::collections::BTreeMap::new());
         self.class_statics.push(alloc::collections::BTreeMap::new());
         self.class_static_fields.push(Vec::new());
         self.class_static_get
@@ -145,17 +168,43 @@ impl<'a> Interp<'a> {
             }
         }
         self.class_private_names.push(private_names);
+        // ClassDefinitionEvaluation: evaluate every *computed* member key once, in
+        // source order, BEFORE installing any member — so an undeclared / throwing
+        // key (`get [zzqq]() {}`, `[Symbol.foo]` where it's unresolvable) is a
+        // class-definition-time error and side effects run exactly once. The
+        // results are reused by the (otherwise lazy) prototype / private / static
+        // builders below instead of re-evaluating the expression.
+        {
+            let saved = core::mem::replace(&mut self.current, class_env.clone());
+            let r = (|| -> Result<(), ExecError> {
+                for (idx, member) in class.body.iter().enumerate() {
+                    let key = match member {
+                        ClassMember::Method(m) => &m.key,
+                        ClassMember::Field(field) => &field.key,
+                        ClassMember::StaticBlock { .. } => continue,
+                    };
+                    if matches!(key, PropertyKey::Computed(_)) {
+                        let k = self.eval_prop_key(key)?;
+                        self.class_member_keys[class_id as usize].insert(idx, k);
+                    }
+                }
+                Ok(())
+            })();
+            self.current = saved;
+            r?;
+        }
         // Build the static members (`static foo() {}` / `static x = …`).
         let mut statics = alloc::collections::BTreeMap::new();
         let mut static_fields = Vec::new();
         let mut static_getters = alloc::collections::BTreeMap::new();
         let mut static_setters = alloc::collections::BTreeMap::new();
-        for member in &class.body {
+        for (idx, member) in class.body.iter().enumerate() {
             match member {
                 ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
-                    // A computed key is evaluated at class-definition time; a throw
-                    // from it propagates (it does not silently skip the member).
-                    let key = self.eval_member_key_for_class(&m.key, class_id)?;
+                    // The computed key was pre-evaluated in source order above; a
+                    // throw from it already propagated (it does not silently skip
+                    // the member).
+                    let key = self.class_member_key(class_id, idx, &m.key)?;
                     // A static method's home is this class, entered statically, so
                     // `super.x` resolves against the superclass's static members.
                     let f = self.make_method(
@@ -176,7 +225,7 @@ impl<'a> Interp<'a> {
                     // initializer is evaluated *later* (in source order with static
                     // blocks, after the constructor object — with its name/methods —
                     // exists), with `this` = the class. Install a placeholder now.
-                    let key = self.eval_member_key_for_class(&field.key, class_id)?;
+                    let key = self.class_member_key(class_id, idx, &field.key)?;
                     if !static_fields.contains(&key) {
                         static_fields.push(key.clone());
                     }
@@ -191,7 +240,7 @@ impl<'a> Interp<'a> {
                 ClassMember::Method(m)
                     if m.is_static && matches!(m.kind, MethodKind::Get | MethodKind::Set) =>
                 {
-                    let key = self.eval_member_key_for_class(&m.key, class_id)?;
+                    let key = self.class_member_key(class_id, idx, &m.key)?;
                     let f = self.make_method(
                         &m.value.params,
                         Body::Block(&m.value.body),
@@ -397,7 +446,7 @@ impl<'a> Interp<'a> {
             let saved_home_static = core::mem::replace(&mut self.current_home_static, true);
             let saved_home_obj = core::mem::take(&mut self.current_home_object);
             let r = (|| {
-                for member in &class.body {
+                for (idx, member) in class.body.iter().enumerate() {
                     match member {
                         ClassMember::StaticBlock { body, .. } => {
                             for stmt in body {
@@ -405,7 +454,7 @@ impl<'a> Interp<'a> {
                             }
                         }
                         ClassMember::Field(field) if field.is_static => {
-                            let key = self.eval_member_key_for_class(&field.key, class_id)?;
+                            let key = self.class_member_key(class_id, idx, &field.key)?;
                             let v = match &field.value {
                                 Some(e) => self.eval(e)?,
                                 None => continue,
@@ -788,7 +837,7 @@ impl<'a> Interp<'a> {
         }
 
         // Install this class's own instance methods/accessors.
-        for member in &class.body {
+        for (idx, member) in class.body.iter().enumerate() {
             let ClassMember::Method(m) = member else {
                 continue;
             };
@@ -801,7 +850,10 @@ impl<'a> Interp<'a> {
                 continue;
             }
             let saved = core::mem::replace(&mut self.current, env.clone());
-            let key = self.eval_prop_key(&m.key);
+            // The computed key was pre-evaluated (and any throw raised) at class
+            // definition; read it back rather than re-evaluate. A non-computed key
+            // is a deterministic name lookup.
+            let key = self.class_member_key(class_id, idx, &m.key);
             let f = self.make_method(
                 &m.value.params,
                 Body::Block(&m.value.body),

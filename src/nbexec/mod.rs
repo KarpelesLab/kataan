@@ -294,6 +294,13 @@ pub struct Interp<'a> {
     functions: Vec<FnDef<'a>>,
     /// Class-AST table; a class cell holds an index into this.
     classes: Vec<&'a Class>,
+    /// Per-class evaluated *computed* member keys, by `class.body` index. Filled
+    /// eagerly at class definition (ClassDefinitionEvaluation evaluates every
+    /// computed `PropertyName` in source order, so a throwing key is a
+    /// definition-time error and side effects run exactly once); the lazy
+    /// prototype / private-member / static builders read the stored key instead
+    /// of re-evaluating the expression.
+    class_member_keys: Vec<alloc::collections::BTreeMap<usize, String>>,
     /// Per-class static members (`Class.foo`), parallel to `classes`.
     class_statics: Vec<alloc::collections::BTreeMap<String, NanBox>>,
     /// Per-class static *field* names in declaration order — the enumerable own
@@ -1927,6 +1934,7 @@ impl<'a> Interp<'a> {
             annexb_block_fns: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
+            class_member_keys: Vec::new(),
             class_statics: Vec::new(),
             class_static_fields: Vec::new(),
             class_static_get: Vec::new(),
