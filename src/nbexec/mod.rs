@@ -4064,8 +4064,17 @@ impl<'a> Interp<'a> {
             }
             var_names.extend_from_slice(&block_fn_names);
             let at_global = self.current.ptr_eq(&self.global_scope);
+            let global_obj = self.global_this.as_handle().map(Handle::from_raw);
             for name in var_names {
-                if !self.current.has_local(name) {
+                // At global scope a `var`/Annex-B name that *already* exists as a
+                // global-object own property IS that binding: don't shadow it with
+                // a fresh `undefined` scope binding (it must keep its current value
+                // and the property's attributes; an identifier read falls back to
+                // the global-object property — see `read_ident_ref`). This is the
+                // EvalDeclarationInstantiation "binding is not reinitialized" rule.
+                let global_has =
+                    at_global && global_obj.is_some_and(|g| self.realm.has_own(g, name));
+                if !self.current.has_local(name) && !global_has {
                     self.current.declare(name, NanBox::undefined());
                 }
                 // A global `var` reserves an own property on the global object
@@ -4073,10 +4082,17 @@ impl<'a> Interp<'a> {
                 // so `typeof x` / `this.x` see the hoisted binding. Don't clobber a
                 // pre-existing global property (e.g. a built-in of the same name).
                 if at_global
-                    && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
-                    && !self.realm.has_own(g, name)
+                    && !global_has
+                    && let Some(g) = global_obj
                 {
                     self.realm.set_property(g, name, NanBox::undefined());
+                    // A global `var`/function binding created by *script* code is
+                    // non-configurable (CreateGlobalVarBinding with deletable
+                    // false). Bindings created by global *eval* code are deletable
+                    // (configurable), so only lock script-scope ones.
+                    if !eval_code {
+                        self.realm.set_non_configurable_property(g, name);
+                    }
                 }
             }
         }
