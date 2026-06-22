@@ -5824,6 +5824,22 @@ impl Compiler {
                         self.materialize_class(&id.name, class)?;
                         continue;
                     }
+                    // A bare `var x;` (no initializer) that re-declares a name
+                    // already bound in this scope is a no-op: it must not reset
+                    // the binding's current value (`var x = 5; var x;` leaves `x`
+                    // as 5, and `function f(a){ var a; }` keeps the parameter).
+                    // Re-`declare`ing would otherwise allocate a fresh register
+                    // shadowing the existing one with `undefined`.
+                    if d.init.is_none()
+                        && matches!(decl.kind, crate::ast::VarDeclKind::Var)
+                        && let BindingTarget::Ident(id) = &d.target
+                        && self
+                            .scopes
+                            .last()
+                            .is_some_and(|s| s.contains_key(&*id.name))
+                    {
+                        continue;
+                    }
                     let value = match &d.init {
                         Some(e) => self.expr_named(e, &d.target)?,
                         None => self.constant(NanBox::undefined())?,
