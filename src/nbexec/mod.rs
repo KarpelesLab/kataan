@@ -3881,17 +3881,35 @@ impl<'a> Interp<'a> {
     /// program is owned by the interpreter for the rest of the run: it is boxed,
     /// leaked once to a `&'static Program` (which coerces to `&'a`), and cached by
     /// source so repeated `eval`/`Function` of the same string parse only once.
-    fn parse_eval_program(&mut self, source: &str) -> Result<&'a Program, ExecError> {
-        if let Some(p) = self.eval_programs.get(source) {
+    fn parse_eval_program(
+        &mut self,
+        source: &str,
+        allow_super_property: bool,
+        allow_super_call: bool,
+    ) -> Result<&'a Program, ExecError> {
+        // The cache is keyed by source *and* the inherited `super` context: the
+        // same text `"super.x"` is a SyntaxError in one caller and valid in
+        // another, so they must not share a cached AST. A 2-byte flag prefix
+        // (outside the JS source grammar) keeps the key unambiguous.
+        let key = alloc::format!(
+            "{}{}\0{source}",
+            u8::from(allow_super_property),
+            u8::from(allow_super_call),
+        );
+        if let Some(p) = self.eval_programs.get(&key) {
             return Ok(p);
         }
-        match crate::parser::Parser::parse_program(source) {
+        match crate::parser::Parser::parse_eval_program(
+            source,
+            allow_super_property,
+            allow_super_call,
+        ) {
             Ok(program) => {
                 // The AST is fully owned (no borrow of `source`); leaking the box
                 // yields a `'static` reference that coerces to `'a`.
                 let leaked: &'static Program =
                     alloc::boxed::Box::leak(alloc::boxed::Box::new(program));
-                self.eval_programs.insert(String::from(source), leaked);
+                self.eval_programs.insert(key, leaked);
                 Ok(leaked)
             }
             Err(e) => {
@@ -3944,7 +3962,15 @@ impl<'a> Interp<'a> {
     ///   own child scope for its lexical + var declarations, but still reads the
     ///   surrounding scope.
     fn eval_string(&mut self, source: &str, direct: bool) -> Result<NanBox, ExecError> {
-        let program = self.parse_eval_program(source)?;
+        // A direct eval inherits the caller's `super` context: `super.prop` is
+        // legal in the eval code when the calling code has a home object (a
+        // method / accessor / constructor / class field initializer / static
+        // block). An indirect eval always runs in the global scope, where
+        // `super` is never permitted. (`super(…)` needs a derived-constructor
+        // context that is not tracked separately, so it stays disallowed.)
+        let allow_super_property =
+            direct && (self.current_home.is_some() || self.current_home_object.is_some());
+        let program = self.parse_eval_program(source, allow_super_property, false)?;
         let code_strict = has_use_strict(&program.body);
 
         // Recursion guard shared with the tree-walk budget.
@@ -4026,7 +4052,8 @@ impl<'a> Interp<'a> {
         };
         let source = alloc::format!("(function anonymous({params}\n) {{\n{body}\n}})");
 
-        let program = self.parse_eval_program(&source)?;
+        // A `Function(…)` body is global-scoped — no inherited `super`.
+        let program = self.parse_eval_program(&source, false, false)?;
         // The wrapper parses to a single parenthesized function-expression
         // statement; pull the `Function` node back out.
         let func = program.body.iter().find_map(|s| match s {

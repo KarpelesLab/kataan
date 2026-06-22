@@ -59,6 +59,41 @@ impl<'src> Parser<'src> {
         Ok(program)
     }
 
+    /// Parses a **direct-eval** program that inherits a `super` context from the
+    /// calling code. Identical to [`Parser::parse_program`] except the static
+    /// `super`-reference check is relaxed per the caller's home-object context
+    /// (`allow_super_property` inside a method/accessor/constructor/field
+    /// initializer/static block; `allow_super_call` inside a derived-class
+    /// constructor).
+    ///
+    /// # Errors
+    /// Returns a parse-phase `SyntaxError` on malformed input.
+    pub fn parse_eval_program(
+        source: &'src str,
+        allow_super_property: bool,
+        allow_super_call: bool,
+    ) -> Result<Program> {
+        let mut p = Parser::new(source)?;
+        p.module_top_level = true;
+        let body = p.parse_statement_list(TokenKind::Eof)?;
+        p.expect(TokenKind::Eof)?;
+        let source_type = if body
+            .iter()
+            .any(|s| matches!(s, Stmt::Import(_) | Stmt::Export(_)))
+        {
+            SourceType::Module
+        } else {
+            SourceType::Script
+        };
+        let program = Program {
+            body,
+            source_type,
+            span: Span::new(0, source.len() as u32),
+        };
+        super::validate::validate_program_with(&program, allow_super_property, allow_super_call)?;
+        Ok(program)
+    }
+
     /// Parses a source as an ECMAScript **module** (the `Module` goal symbol):
     /// the top level is module-strict and permits top-level `await` (the module
     /// body is the outermost async context), and `import`/`export` declarations

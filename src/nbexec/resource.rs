@@ -939,8 +939,9 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("ShadowRealm.prototype.evaluate expects a string"));
         };
         // Parse first: a SyntaxError from parsing is surfaced to the caller realm
-        // *as a SyntaxError* (per the ShadowRealm spec), not wrapped.
-        let program = self.parse_eval_program(&source)?;
+        // *as a SyntaxError* (per the ShadowRealm spec), not wrapped. ShadowRealm
+        // code is global-scoped, so no inherited `super`.
+        let program = self.parse_eval_program(&source, false, false)?;
         // Evaluate the parsed program in the instance's persistent global scope (a
         // best-effort isolated environment that shares the intrinsics). A *runtime*
         // throw is wrapped as a TypeError per the spec.

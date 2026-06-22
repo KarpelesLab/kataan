@@ -52,6 +52,19 @@ use alloc::vec::Vec;
 
 /// Validates a parsed [`Program`], returning the first early error found.
 pub(crate) fn validate_program(program: &Program) -> Result<()> {
+    validate_program_with(program, false, false)
+}
+
+/// Validates an eval program that inherits a `super` context from the calling
+/// code (a *direct* eval inside a method / accessor / constructor / class field
+/// initializer / static block). `super.prop` / `super[…]` is permitted when
+/// `allow_super_property`, and `super(…)` when `allow_super_call`; otherwise this
+/// behaves exactly like [`validate_program`].
+pub(crate) fn validate_program_with(
+    program: &Program,
+    allow_super_property: bool,
+    allow_super_call: bool,
+) -> Result<()> {
     let strict = program.source_type == SourceType::Module || body_is_strict(&program.body);
     let mut v = Validator {
         private_scopes: Vec::new(),
@@ -59,7 +72,11 @@ pub(crate) fn validate_program(program: &Program) -> Result<()> {
         is_module: program.source_type == SourceType::Module,
         in_assign_target: false,
     };
-    let ctx = Ctx::top(strict);
+    let ctx = Ctx {
+        allow_super_property,
+        allow_super_call,
+        ..Ctx::top(strict)
+    };
     v.check_top_level_scope(&program.body, strict)?;
     // `using` / `await using` declarations are not permitted at the top level of
     // a *Script* (they are allowed in a Module, a block, or a function body).
