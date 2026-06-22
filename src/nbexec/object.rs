@@ -1252,6 +1252,8 @@ impl<'a> Interp<'a> {
             N_NUMBER => Some("Number"),
             N_STRING => Some("String"),
             N_BOOLEAN => Some("Boolean"),
+            N_SYMBOL => Some("Symbol"),
+            N_BIGINT => Some("BigInt"),
             _ => None,
         };
         if let Some(proto) = ctor_name
@@ -1353,8 +1355,15 @@ impl<'a> Interp<'a> {
                 let h = Handle::from_raw(raw);
                 if self.realm.string_value(h).is_some() {
                     self.make_primitive_wrapper(v, N_STRING)
+                } else if self.realm.symbol_at(h).is_some() {
+                    // ToObject(Symbol) → a Symbol wrapper object (its prototype
+                    // methods read the boxed symbol via `thisSymbolValue`).
+                    self.make_primitive_wrapper(v, N_SYMBOL)
+                } else if self.realm.bigint_at(h).is_some() {
+                    // ToObject(BigInt) → a BigInt wrapper object.
+                    self.make_primitive_wrapper(v, N_BIGINT)
                 } else {
-                    // An already-object value (object/array/function/symbol/bigint).
+                    // An already-object value (object/array/function).
                     v
                 }
             }
@@ -1754,11 +1763,21 @@ impl<'a> Interp<'a> {
         } else if is_callable_unwrapped {
             "Function"
         } else if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
-            // A boxed primitive wrapper reports its primitive's class.
+            // A boxed primitive wrapper reports its primitive's class — but only
+            // Number / Boolean / String have a builtin tag. A Symbol or BigInt
+            // wrapper has no [[NumberData]]-style slot, so its tag is "Object".
             match prim.unpack() {
                 Unpacked::Number(_) => "Number",
                 Unpacked::Bool(_) => "Boolean",
-                _ => "String",
+                Unpacked::Handle(praw)
+                    if self
+                        .realm
+                        .string_value(crate::heap::Handle::from_raw(praw))
+                        .is_some() =>
+                {
+                    "String"
+                }
+                _ => "Object",
             }
         } else if self.realm.string_value(h).is_some() {
             "String"
