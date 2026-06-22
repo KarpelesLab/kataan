@@ -378,6 +378,14 @@ impl<'a> Interp<'a> {
         if let Stmt::Function(func) = stmt
             && let Some(id) = &func.id
         {
+            // Annex B.3.4: the bare `if (x) function f(){}` declaration lives in
+            // its own synthetic block scope, exactly as if it were wrapped in
+            // `{ … }`. The closure must capture *that* block binding so a
+            // self-reference inside the body (`f = …`) mutates the block-scoped
+            // `f`, leaving the function-scope `var f` that B.3.3 additionally
+            // updates independent (the value is copied out, not aliased).
+            let block = self.current.child();
+            let saved = core::mem::replace(&mut self.current, block);
             let value = self.make_function(
                 &func.params,
                 Body::Block(&func.body),
@@ -385,6 +393,8 @@ impl<'a> Interp<'a> {
                 func.is_generator,
             );
             self.set_fn_name(value, &id.name);
+            self.current.declare(&id.name, value);
+            self.current = saved;
             if self
                 .annexb_block_fns
                 .iter()
