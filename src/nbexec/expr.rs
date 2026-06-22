@@ -2526,9 +2526,26 @@ impl<'a> Interp<'a> {
                 return Ok(rhs);
             };
             let handle = crate::heap::Handle::from_raw(raw);
+            let mut key = key;
             let new = if op == AssignOp::Assign {
+                // Plain `=`: ToPropertyKey is deferred to PutValue, i.e. *after* the
+                // RHS — so the key's `toString` runs after the RHS is evaluated.
                 self.eval(value)?
             } else {
+                // Compound `op=`: the LHS reference's GetValue runs before the RHS
+                // and performs ToPropertyKey on the key exactly once. For an object
+                // key, coerce now (a throwing or observable `toString` therefore
+                // runs before the RHS, and only once) and reuse the resulting
+                // primitive key for both the read and the write. Primitive keys
+                // (number / string / symbol) are left as-is so the array-index and
+                // typed-array fast paths in `read_member_value` still apply.
+                if key.as_handle().is_some_and(|raw| {
+                    let h = Handle::from_raw(raw);
+                    self.realm.symbol_at(h).is_none() && self.realm.string_value(h).is_none()
+                }) {
+                    let pk = self.coerce_property_key(key)?;
+                    key = self.new_str(&pk);
+                }
                 let current = self.read_member_value(handle, key)?;
                 let rhs = self.eval(value)?;
                 self.binary(compound_op(op)?, current, rhs)?
