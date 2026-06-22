@@ -1035,13 +1035,25 @@ impl Parser {
                         's' => items.push(ClassItem::Shorthand(Shorthand::Space)),
                         'S' => items.push(ClassItem::Shorthand(Shorthand::NotSpace)),
                         // `\p`/`\P` are property escapes only under `u`; otherwise
-                        // they are the literal `p`/`P` (Annex B IdentityEscape).
-                        'p' if self.unicode => items.push(ClassItem::Shorthand(
-                            Shorthand::Property(self.parse_property()?, false),
-                        )),
-                        'P' if self.unicode => items.push(ClassItem::Shorthand(
-                            Shorthand::Property(self.parse_property()?, true),
-                        )),
+                        // they are the literal `p`/`P` (Annex B IdentityEscape). A
+                        // property class is a *set*, so a following `-X` range (the
+                        // `-` is checked only after `{…}` is consumed, which the
+                        // single-char `is_class_escape` peek above cannot see) is a
+                        // Syntax Error: `[\p{Hex}-￿]`, `[\p{Hex}--]`.
+                        'p' if self.unicode => {
+                            items.push(ClassItem::Shorthand(Shorthand::Property(
+                                self.parse_property()?,
+                                false,
+                            )));
+                            self.reject_property_range_endpoint()?;
+                        }
+                        'P' if self.unicode => {
+                            items.push(ClassItem::Shorthand(Shorthand::Property(
+                                self.parse_property()?,
+                                true,
+                            )));
+                            self.reject_property_range_endpoint()?;
+                        }
                         'u' => {
                             let ch = self.parse_unicode_escape()?;
                             self.push_class_member(&mut items, ch)?;
@@ -1062,6 +1074,19 @@ impl Parser {
             }
         }
         Ok(Node::Class { neg, items })
+    }
+
+    /// After a `\p{…}` / `\P{…}` property class under `u`, a following `-X`
+    /// (where `X` is not the closing `]`) would make the property class a range
+    /// endpoint, which is a Syntax Error — a property class is a set, not a
+    /// single character. A trailing `-]` is a literal dash and is allowed.
+    fn reject_property_range_endpoint(&self) -> Result<(), RegexError> {
+        if self.peek() == Some('-') && self.chars.get(self.pos + 1).is_some_and(|&n| n != ']') {
+            return Err(RegexError::new(
+                "invalid character class range with a class-escape endpoint",
+            ));
+        }
+        Ok(())
     }
 
     /// Pushes `c` (a scalar code point) into a class, forming a range if a `-`
