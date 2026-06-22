@@ -877,7 +877,16 @@ impl<'a> Interp<'a> {
                                     || self.realm.typed_kind(h).is_some()
                                 {
                                     Some("Array Iterator")
-                                } else if self.realm.string_value(h).is_some() {
+                                } else if self.realm.string_value(h).is_some()
+                                    || self
+                                        .realm
+                                        .get_property(h, PRIM_WRAP_TYPE)
+                                        .and_then(|t| t.as_number())
+                                        == Some(f64::from(N_STRING))
+                                {
+                                    // A primitive string cell, or a boxed `String`
+                                    // wrapper (`new String("…")`) whose `[[StringData]]`
+                                    // lives in the `PRIM_WRAP` slot.
                                     Some("String Iterator")
                                 } else {
                                     match self.realm.collection_is_set(h) {
