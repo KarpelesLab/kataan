@@ -174,6 +174,10 @@ impl<'a> Interp<'a> {
     /// through its `getOwnPropertyDescriptor` trap (or forwarding to the target),
     /// else building the descriptor from the own property.
     pub(crate) fn descriptor_of(&mut self, obj: Handle, key: &str) -> Result<NanBox, ExecError> {
+        // A Deferred Module Namespace (`import defer`) evaluates its target on a
+        // `[[GetOwnProperty]]` with a String (non-"then") key.
+        #[cfg(all(feature = "module", feature = "std"))]
+        self.trigger_deferred_namespace(obj, key)?;
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "getOwnPropertyDescriptor")? {
@@ -1476,6 +1480,10 @@ impl<'a> Interp<'a> {
     /// `[[Delete]]` honoring a proxy's `deleteProperty` trap (and its invariants).
     /// Returns the boolean result. Used by `Reflect.deleteProperty`.
     pub(crate) fn delete_property_of(&mut self, obj: Handle, key: &str) -> Result<bool, ExecError> {
+        // A Deferred Module Namespace (`import defer`) evaluates its target on a
+        // `[[Delete]]` with a String (non-"then") key.
+        #[cfg(all(feature = "module", feature = "std"))]
+        self.trigger_deferred_namespace(obj, key)?;
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "deleteProperty")? {
@@ -2056,6 +2064,11 @@ impl<'a> Interp<'a> {
         &mut self,
         handle: crate::heap::Handle,
     ) -> Result<Vec<NanBox>, ExecError> {
+        // A Deferred Module Namespace (`import defer`) evaluates its target on any
+        // `[[OwnPropertyKeys]]` (Object.keys / getOwnProperty{Names,Symbols} /
+        // Reflect.ownKeys).
+        #[cfg(all(feature = "module", feature = "std"))]
+        self.force_deferred_namespace(handle)?;
         // A proxy routes [[OwnPropertyKeys]] through its `ownKeys` trap; with no
         // trap it forwards to the target's [[OwnPropertyKeys]] (the proxy cell
         // itself has no physical keys).

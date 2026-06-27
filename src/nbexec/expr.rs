@@ -442,6 +442,11 @@ impl<'a> Interp<'a> {
                                     _ => None,
                                 };
                                 if let Some(name) = name {
+                                    // A Deferred Module Namespace (`import defer`)
+                                    // evaluates its target on a `[[Delete]]` with a
+                                    // String (non-"then") key.
+                                    #[cfg(all(feature = "module", feature = "std"))]
+                                    self.trigger_deferred_namespace(h, &name)?;
                                     // Proxy `deleteProperty` trap, or forward.
                                     if let Some((target, handler)) = self.realm.proxy_at(h) {
                                         self.guard_revoked(h)?;
@@ -1759,6 +1764,10 @@ impl<'a> Interp<'a> {
         handle: crate::heap::Handle,
         name: &str,
     ) -> Result<NanBox, ExecError> {
+        // A Deferred Module Namespace (`import defer`) evaluates its target the
+        // first time one of its exports is read (import-defer proposal).
+        #[cfg(all(feature = "module", feature = "std"))]
+        self.trigger_deferred_namespace(handle, name)?;
         // A **module namespace** export is a *live* binding: read the current
         // value from its backing slot (so a mutation in the exporting module that
         // happens after the namespace was materialised is observed). The
@@ -3385,6 +3394,12 @@ impl<'a> Interp<'a> {
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
                 let key = self.member_key(a);
+                // A Deferred Module Namespace (`import defer`) evaluates its target
+                // on a `[[HasProperty]]` with a String (non-"then") key.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some(h) = b.as_handle().map(Handle::from_raw) {
+                    self.trigger_deferred_namespace(h, &key)?;
+                }
                 let present = match b.as_handle().map(Handle::from_raw) {
                     // Proxy `has` trap, or forward to the target.
                     Some(h) if self.realm.proxy_at(h).is_some() => {

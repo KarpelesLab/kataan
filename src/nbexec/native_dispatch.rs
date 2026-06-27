@@ -739,6 +739,8 @@ impl<'a> Interp<'a> {
                 };
                 let obj = Handle::from_raw(oraw);
                 let key = self.coerce_property_key(arg(1))?;
+                #[cfg(all(feature = "module", feature = "std"))]
+                self.trigger_deferred_namespace(obj, &key)?;
                 self.apply_descriptor(obj, &key, Handle::from_raw(draw), false)?;
                 arg(0)
             }
@@ -946,6 +948,8 @@ impl<'a> Interp<'a> {
                 // String keys (integer-indexed then insertion order), then own
                 // symbol keys — matching `[[OwnPropertyKeys]]`.
                 let h = self.reflect_object_target(arg(0), "ownKeys")?;
+                #[cfg(all(feature = "module", feature = "std"))]
+                self.force_deferred_namespace(h)?;
                 // A proxy drives `[[OwnPropertyKeys]]` through its `ownKeys` trap.
                 if let Some(keys) = self.proxy_own_keys_raw(h)? {
                     return Ok(NanBox::handle(self.realm.new_array(keys).to_raw()));
@@ -1108,6 +1112,10 @@ impl<'a> Interp<'a> {
                         self.type_error("Object.getOwnPropertyNames called on null or undefined")
                     );
                 }
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some(raw) = arg(0).as_handle() {
+                    self.force_deferred_namespace(Handle::from_raw(raw))?;
+                }
                 // A proxy drives `[[OwnPropertyKeys]]` through its `ownKeys` trap;
                 // keep the String keys.
                 if let Some(raw) = arg(0).as_handle()
@@ -1137,6 +1145,10 @@ impl<'a> Interp<'a> {
                     return Err(
                         self.type_error("Object.getOwnPropertySymbols called on null or undefined")
                     );
+                }
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some(raw) = arg(0).as_handle() {
+                    self.force_deferred_namespace(Handle::from_raw(raw))?;
                 }
                 // A proxy drives `[[OwnPropertyKeys]]` through its `ownKeys` trap;
                 // keep the Symbol keys.

@@ -15,6 +15,13 @@ use alloc::format;
 use alloc::vec::Vec;
 
 impl<'src> Parser<'src> {
+    /// Whether the current token is an `Identifier` whose name is exactly `word`
+    /// (used for the contextual `defer` phase keyword, which is not a reserved
+    /// word in the lexer).
+    fn at_contextual_ident(&self, word: &str) -> bool {
+        self.peek() == TokenKind::Identifier && self.ident_name(self.peek_tok()) == word
+    }
+
     // --- import ---------------------------------------------------------
 
     /// Parses an `import` declaration (the cursor is at `import`).
@@ -34,14 +41,26 @@ impl<'src> Parser<'src> {
             return Ok(Stmt::Import(ImportDecl {
                 specifiers: Vec::new(),
                 source,
+                deferred: false,
                 span: start.to(self.prev_span()),
             }));
         }
 
         let mut specifiers = Vec::new();
 
-        // Default binding, optionally followed by `, namespace|named`.
-        if self.at_binding_ident() {
+        // `import defer * as ns from "mod";` (import-defer proposal). `defer` is
+        // contextual: it is the *defer phase* only when immediately followed by a
+        // `*` namespace clause; everywhere else (`import defer from …`,
+        // `import defer, {x} from …`) it is an ordinary identifier (a default
+        // binding named `defer`). A `\u`-escaped spelling is not the keyword.
+        let deferred = self.at_contextual_ident("defer")
+            && !self.peek_tok().had_escape
+            && self.nth_kind(1) == TokenKind::Star;
+        if deferred {
+            self.bump(); // `defer`
+            self.parse_import_tail(&mut specifiers)?; // requires `* as ns`
+        } else if self.at_binding_ident() {
+            // Default binding, optionally followed by `, namespace|named`.
             let local = self.parse_binding_ident()?;
             specifiers.push(ImportSpecifier::Default(local));
             if self.eat(TokenKind::Comma) {
@@ -57,6 +76,7 @@ impl<'src> Parser<'src> {
         Ok(Stmt::Import(ImportDecl {
             specifiers,
             source,
+            deferred,
             span: start.to(self.prev_span()),
         }))
     }

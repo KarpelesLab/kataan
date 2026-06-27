@@ -12,6 +12,11 @@ pub struct ImportDecl {
     pub specifiers: Vec<ImportSpecifier>,
     /// The module specifier string.
     pub source: Box<str>,
+    /// `import defer * as ns from …` — the *defer* phase (import-defer proposal):
+    /// the module is loaded and linked but not evaluated until the namespace is
+    /// first accessed. Only ever set together with a single
+    /// [`ImportSpecifier::Namespace`].
+    pub deferred: bool,
     /// The span of the whole declaration.
     pub span: Span,
 }

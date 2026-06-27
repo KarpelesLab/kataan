@@ -577,6 +577,12 @@ pub struct Interp<'a> {
     #[cfg(all(feature = "module", feature = "std"))]
     module_namespaces:
         alloc::collections::BTreeMap<u64, alloc::collections::BTreeMap<String, (Scope, String)>>,
+    /// Deferred Module Namespace exotic objects (import-defer proposal): maps the
+    /// object handle to the resolved key of its still-unevaluated target module.
+    /// A property access naming one of the module's exports triggers synchronous
+    /// evaluation (the spec's deferred semantics) before the live read.
+    #[cfg(all(feature = "module", feature = "std"))]
+    deferred_namespaces: alloc::collections::BTreeMap<u64, String>,
     /// The key of the module whose body is currently executing, used as the
     /// referrer for a dynamic `import()` when the active scope can't be matched to
     /// a module record (e.g. the `import()` runs inside a nested function/arrow,
@@ -2045,6 +2051,8 @@ impl<'a> Interp<'a> {
             script_import_base: None,
             #[cfg(all(feature = "module", feature = "std"))]
             module_namespaces: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "module", feature = "std"))]
+            deferred_namespaces: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "module", feature = "std"))]
             active_module_key: None,
         };

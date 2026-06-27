@@ -237,6 +237,9 @@ struct ImportEntry {
     key: String,
     /// The specifier as written (for diagnostics).
     specifiers: Vec<ImportBind>,
+    /// `import defer * as ns from …` — this dependency is loaded and linked but
+    /// not eagerly evaluated; its namespace triggers evaluation on first access.
+    deferred: bool,
 }
 
 /// A single binding introduced by an import declaration.
@@ -286,6 +289,9 @@ struct ModuleRecord {
     import_aliases: Rc<BTreeMap<String, (Scope, String)>>,
     /// The lazily-built namespace exotic object.
     namespace: Option<NanBox>,
+    /// The lazily-built *deferred* namespace exotic object (import-defer): a
+    /// distinct object from `namespace`, with `@@toStringTag` "Deferred Module".
+    deferred_namespace: Option<NanBox>,
     /// `import.meta` for this module.
     meta: Option<NanBox>,
     status: Status,
@@ -464,6 +470,7 @@ impl<'a> Interp<'a> {
                     imports.push(ImportEntry {
                         key: dep,
                         specifiers: binds,
+                        deferred: decl.deferred,
                     });
                 }
                 Stmt::Export(ExportDecl::Named {
@@ -533,6 +540,7 @@ impl<'a> Interp<'a> {
             scope: Scope::root(),
             import_aliases: Rc::new(BTreeMap::new()),
             namespace: None,
+            deferred_namespace: None,
             meta: None,
             status: Status::New,
             eval_error: None,
@@ -591,6 +599,7 @@ impl<'a> Interp<'a> {
                     DepBinds {
                         dep: i.key.clone(),
                         binds,
+                        deferred: i.deferred,
                     }
                 })
                 .collect()
@@ -600,6 +609,7 @@ impl<'a> Interp<'a> {
         for DepBinds {
             dep: dep_key,
             binds,
+            deferred,
         } in &imports
         {
             for (local, kind) in binds {
@@ -617,8 +627,14 @@ impl<'a> Interp<'a> {
                     ImportKind::Namespace => {
                         // `import * as ns`: bind `ns` directly in this module's
                         // own scope to the dependency's namespace object (a
-                        // constant binding, not a live slot).
-                        let ns = self.namespace_object(dep_key)?;
+                        // constant binding, not a live slot). `import defer * as ns`
+                        // binds a *deferred* namespace that evaluates `dep_key` on
+                        // first access.
+                        let ns = if *deferred {
+                            self.deferred_namespace_object(dep_key)?
+                        } else {
+                            self.namespace_object(dep_key)?
+                        };
                         let r = &self.modules.records[key];
                         r.scope.declare_const(local, ns);
                     }
@@ -840,11 +856,16 @@ impl<'a> Interp<'a> {
             Some(Status::Linked) => {}
             _ => return Err(self.syntax_error(&alloc::format!("module {key} not linked"))),
         }
-        // Evaluate dependencies first (post-order).
+        // Evaluate dependencies first (post-order). A *deferred* import
+        // (`import defer`) is NOT in the eager evaluation list — its module is
+        // evaluated lazily when its namespace is first accessed. (Per spec only
+        // the deferred module's *async* transitive deps are pre-evaluated; the
+        // sync-only graphs the fixtures use have none.)
         let deps: Vec<String> = {
             let r = &self.modules.records[key];
             r.imports
                 .iter()
+                .filter(|i| !i.deferred)
                 .map(|i| i.key.clone())
                 .chain(r.reexports.iter().map(reexport_key))
                 .collect()
@@ -1012,6 +1033,48 @@ impl<'a> Interp<'a> {
         if let Some(r) = self.modules.records.get_mut(key) {
             r.namespace = Some(ns);
         }
+        self.populate_namespace(obj, key, false)?;
+        Ok(ns)
+    }
+
+    /// Builds (once, cached) the **Deferred Module Namespace** exotic object for
+    /// `key` (import-defer proposal). Structurally identical to the ordinary
+    /// namespace (live export bindings) but a distinct object with `@@toStringTag`
+    /// "Deferred Module"; until `key` is evaluated the handle is registered in
+    /// `deferred_namespaces` so the first export access triggers evaluation.
+    fn deferred_namespace_object(&mut self, key: &str) -> Result<NanBox, ExecError> {
+        if let Some(ns) = self.modules.records.get(key).and_then(|r| r.deferred_namespace) {
+            return Ok(ns);
+        }
+        let obj = self.realm.new_object_with_proto(None);
+        let ns = NanBox::handle(obj.to_raw());
+        if let Some(r) = self.modules.records.get_mut(key) {
+            r.deferred_namespace = Some(ns);
+        }
+        // Only arm the lazy-evaluation trigger when the module has not already
+        // run (a defer of an already-evaluated module is just a namespace view).
+        let already = matches!(
+            self.modules.records.get(key).map(|r| r.status),
+            Some(Status::Evaluated)
+        );
+        #[cfg(all(feature = "module", feature = "std"))]
+        if !already {
+            self.deferred_namespaces.insert(obj.to_raw(), key.to_string());
+        }
+        self.populate_namespace(obj, key, true)?;
+        Ok(ns)
+    }
+
+    /// Shared body of [`Self::namespace_object`] /
+    /// [`Self::deferred_namespace_object`]: resolves `key`'s exports into live
+    /// data properties on the already-allocated, already-cached `obj`, sets
+    /// `@@toStringTag` ("Module" or "Deferred Module"), and freezes the shape.
+    fn populate_namespace(
+        &mut self,
+        obj: crate::heap::Handle,
+        key: &str,
+        deferred: bool,
+    ) -> Result<(), ExecError> {
         let names = self.export_names(key, &mut BTreeSet::new())?;
         // Resolve every name to its slot. A name that resolves *ambiguously* (or
         // is otherwise unresolvable — only reachable via `export *`) is **omitted**
@@ -1039,10 +1102,11 @@ impl<'a> Interp<'a> {
             .map(|(n, s, l)| (n.clone(), (s.clone(), l.clone())))
             .collect();
         self.module_namespaces.insert(obj.to_raw(), binding_map);
-        // `@@toStringTag` = "Module", non-enumerable, non-writable.
+        // `@@toStringTag` = "Module" (or "Deferred Module" for a deferred
+        // namespace), non-enumerable, non-writable, non-configurable.
         let tag_sym = self.well_known_symbol("toStringTag");
         let tag_key = self.member_key(tag_sym);
-        let module_str = self.new_str("Module");
+        let module_str = self.new_str(if deferred { "Deferred Module" } else { "Module" });
         self.realm.set_property(obj, &tag_key, module_str);
         self.realm.mark_hidden(obj, &tag_key);
         self.realm.set_readonly_property(obj, &tag_key);
@@ -1056,7 +1120,39 @@ impl<'a> Interp<'a> {
             self.realm.set_non_configurable_property(obj, name);
         }
         self.realm.prevent_extensions(obj);
-        Ok(ns)
+        Ok(())
+    }
+
+    /// import-defer lazy trigger for a keyed operation ([[Get]], [[GetOwnProperty]],
+    /// [[HasProperty]], [[Delete]], [[DefineOwnProperty]]). If `handle` is an
+    /// armed Deferred Module Namespace, evaluate its target module *now* — unless
+    /// `name` is a Symbol key (the `\0sym:` sentinel) or the String `"then"` (the
+    /// thenable guard, so `await import.defer(...)` does not force evaluation).
+    /// An evaluation throw propagates (and is cached, so a re-access rethrows it).
+    pub(crate) fn trigger_deferred_namespace(
+        &mut self,
+        handle: crate::heap::Handle,
+        name: &str,
+    ) -> Result<(), ExecError> {
+        if name == "then" || name.starts_with("\u{0}sym:") {
+            return Ok(());
+        }
+        self.force_deferred_namespace(handle)
+    }
+
+    /// import-defer trigger for a whole-object operation ([[OwnPropertyKeys]]),
+    /// which always evaluates regardless of any key. A no-op unless `handle` is an
+    /// armed Deferred Module Namespace.
+    pub(crate) fn force_deferred_namespace(
+        &mut self,
+        handle: crate::heap::Handle,
+    ) -> Result<(), ExecError> {
+        let Some(dep) = self.deferred_namespaces.get(&handle.to_raw()).cloned() else {
+            return Ok(());
+        };
+        self.evaluate_module(&dep)?;
+        self.deferred_namespaces.remove(&handle.to_raw());
+        Ok(())
     }
 
     /// `GetExportedNames(module)` — the sorted set of export names a namespace
@@ -1198,6 +1294,7 @@ enum ImportKind {
 struct DepBinds {
     dep: String,
     binds: Vec<(String, ImportKind)>,
+    deferred: bool,
 }
 
 /// The resolved dependency key of a re-export.
