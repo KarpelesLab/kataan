@@ -1012,6 +1012,22 @@ impl<'src> Parser<'src> {
                 self.bump();
                 Ok(Expr::Ident(Ident::new(kw.as_str(), tok.span)))
             }
+            // The strict-mode future-reserved words are ordinary identifier
+            // references in sloppy code (mirroring `keyword_is_binding_ident`);
+            // strict-mode misuse is a static-semantics error caught by the
+            // validator (`is_strict_reserved_word`).
+            TokenKind::Keyword(
+                kw @ (Kw::Static
+                | Kw::Implements
+                | Kw::Interface
+                | Kw::Package
+                | Kw::Private
+                | Kw::Protected
+                | Kw::Public),
+            ) => {
+                self.bump();
+                Ok(Expr::Ident(Ident::new(kw.as_str(), tok.span)))
+            }
             // `yield` outside a generator and `await` outside an async body are
             // ordinary identifier references (in sloppy code; strict-mode misuse
             // is a static-semantics error caught by the validator). Inside a

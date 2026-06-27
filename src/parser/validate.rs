@@ -52,7 +52,7 @@ use alloc::vec::Vec;
 
 /// Validates a parsed [`Program`], returning the first early error found.
 pub(crate) fn validate_program(program: &Program) -> Result<()> {
-    validate_program_with(program, false, false, false)
+    validate_program_with(program, false, false, false, false)
 }
 
 /// Validates an eval program that inherits a `super` context from the calling
@@ -65,8 +65,14 @@ pub(crate) fn validate_program_with(
     allow_super_property: bool,
     allow_super_call: bool,
     allow_new_target: bool,
+    inherited_strict: bool,
 ) -> Result<()> {
-    let strict = program.source_type == SourceType::Module || body_is_strict(&program.body);
+    // A direct eval inside strict code is itself strict code even without its own
+    // `"use strict"` directive (`inherited_strict`); the early-error checks below
+    // (strict-reserved words, `with`, octal, duplicate params, …) must run.
+    let strict = inherited_strict
+        || program.source_type == SourceType::Module
+        || body_is_strict(&program.body);
     let mut v = Validator {
         private_scopes: Vec::new(),
         labels: Vec::new(),

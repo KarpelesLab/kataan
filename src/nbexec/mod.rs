@@ -3930,16 +3930,19 @@ impl<'a> Interp<'a> {
         allow_super_property: bool,
         allow_super_call: bool,
         allow_new_target: bool,
+        inherited_strict: bool,
     ) -> Result<&'a Program, ExecError> {
         // The cache is keyed by source *and* the inherited `super`/`new.target`
-        // context: the same text `"super.x"` / `"new.target"` is a SyntaxError in
-        // one caller and valid in another, so they must not share a cached AST. A
-        // 3-byte flag prefix (outside the JS source grammar) keeps it unambiguous.
+        // context *and* inherited strictness: the same text `"super.x"` /
+        // `"new.target"` / `"public = 1"` is a SyntaxError in one caller and valid
+        // in another, so they must not share a cached AST. A 4-byte flag prefix
+        // (outside the JS source grammar) keeps it unambiguous.
         let key = alloc::format!(
-            "{}{}{}\0{source}",
+            "{}{}{}{}\0{source}",
             u8::from(allow_super_property),
             u8::from(allow_super_call),
             u8::from(allow_new_target),
+            u8::from(inherited_strict),
         );
         if let Some(p) = self.eval_programs.get(&key) {
             return Ok(p);
@@ -3949,6 +3952,7 @@ impl<'a> Interp<'a> {
             allow_super_property,
             allow_super_call,
             allow_new_target,
+            inherited_strict,
         ) {
             Ok(program) => {
                 // The AST is fully owned (no borrow of `source`); leaking the box
@@ -4023,8 +4027,17 @@ impl<'a> Interp<'a> {
         // inherited by arrows — so a direct eval inside a top-level arrow (no
         // `new.target` in scope) and any indirect eval keep `new.target` disallowed.
         let allow_new_target = direct && self.new_target_in_scope;
-        let program =
-            self.parse_eval_program(source, allow_super_property, false, allow_new_target)?;
+        // A direct eval inside strict code is strict even without its own
+        // directive; an indirect eval starts sloppy (its strictness comes only
+        // from a `"use strict"` in the code itself).
+        let inherited_strict = direct && self.strict;
+        let program = self.parse_eval_program(
+            source,
+            allow_super_property,
+            false,
+            allow_new_target,
+            inherited_strict,
+        )?;
         let code_strict = has_use_strict(&program.body);
 
         // EvalDeclarationInstantiation early error: a *sloppy direct* eval being
@@ -4139,7 +4152,7 @@ impl<'a> Interp<'a> {
         // A `Function(…)` body is global-scoped — no inherited `super`. (Its body
         // is wrapped in a function expression, so `new.target` inside is enabled by
         // the parser's own function-boundary handling, not this top-level flag.)
-        let program = self.parse_eval_program(&source, false, false, false)?;
+        let program = self.parse_eval_program(&source, false, false, false, false)?;
         // The wrapper parses to a single parenthesized function-expression
         // statement; pull the `Function` node back out.
         let func = program.body.iter().find_map(|s| match s {

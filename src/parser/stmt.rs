@@ -73,6 +73,7 @@ impl<'src> Parser<'src> {
         allow_super_property: bool,
         allow_super_call: bool,
         allow_new_target: bool,
+        inherited_strict: bool,
     ) -> Result<Program> {
         let mut p = Parser::new(source)?;
         p.module_top_level = true;
@@ -96,6 +97,7 @@ impl<'src> Parser<'src> {
             allow_super_property,
             allow_super_call,
             allow_new_target,
+            inherited_strict,
         )?;
         Ok(program)
     }
