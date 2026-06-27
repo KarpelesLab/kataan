@@ -862,27 +862,60 @@ impl<'a> Interp<'a> {
             _ => {}
         }
         // --- ArrayBuffer.prototype.slice(begin?, end?) → a new ArrayBuffer copy ---
-        if method == "slice"
+        if (method == "slice" || method == "sliceToImmutable")
             && let Some(bh) = self.array_buffer_bytes(handle)
         {
             self.guard_detached_buffer(handle)?;
-            let bytes = self
+            // `len` is the byteLength captured *before* coercing the relative
+            // indices (a `valueOf` may resize/detach a resizable buffer).
+            let len = self.realm.bytes_len(bh).unwrap_or(0) as i64;
+            // ToIntegerOrInfinity(start)/(end) run user code (their `valueOf`),
+            // resolved against `len`; `end` defaults to `len`.
+            let rel = |n: f64| -> usize {
+                let n = n as i64;
+                usize::try_from(if n < 0 { (len + n).max(0) } else { n.min(len) }).unwrap_or(0)
+            };
+            let start_n = self.coerce_to_integer_or_infinity(arg(0))?;
+            let begin = rel(start_n);
+            let end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                len as usize
+            } else {
+                let end_n = self.coerce_to_integer_or_infinity(arg(1))?;
+                rel(end_n)
+            };
+            // A coercion may have detached the source — re-validate (TypeError).
+            self.guard_detached_buffer(handle)?;
+            let new_len = end.saturating_sub(begin);
+            let cur = self
                 .realm
                 .bytes_at(bh)
                 .map(<[u8]>::to_vec)
                 .unwrap_or_default();
-            let len = bytes.len() as i64;
-            let norm = |this: &mut Self, v: NanBox, default: i64| -> usize {
-                if matches!(v.unpack(), Unpacked::Undefined) {
-                    return default as usize;
+            // `sliceToImmutable` requires the resolved range to lie within the
+            // *current* byteLength (a resize during coercion that drops below the
+            // resolved end is a RangeError); plain `slice` instead clamps the copy
+            // and zero-fills any tail.
+            let count = if method == "sliceToImmutable" {
+                if end > cur.len() {
+                    let m = self.new_str(
+                        "ArrayBuffer.prototype.sliceToImmutable: range exceeds byteLength",
+                    );
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                 }
-                let n = this.realm.to_number(v) as i64;
-                usize::try_from(if n < 0 { (len + n).max(0) } else { n.min(len) }).unwrap_or(0)
+                new_len
+            } else {
+                new_len.min(cur.len().saturating_sub(begin))
             };
-            let begin = norm(self, arg(0), 0);
-            let end = norm(self, arg(1), len);
-            let sub = bytes.get(begin..end.max(begin)).unwrap_or(&[]);
-            let nb = self.make_array_buffer_from_bytes(sub);
+            // The result is always `new_len` bytes; copy at most `count` bytes from
+            // the current store, leaving any remainder zero.
+            let mut sub = alloc::vec![0u8; new_len];
+            sub[..count].copy_from_slice(cur.get(begin..begin + count).unwrap_or(&[]));
+            let nb = self.make_array_buffer_from_bytes(&sub);
+            // `sliceToImmutable` yields an immutable buffer.
+            if method == "sliceToImmutable" {
+                self.realm
+                    .set_hidden_property(nb, ARRAY_BUFFER_IMMUTABLE, NanBox::boolean(true));
+            }
             return Ok(Some(NanBox::handle(nb.to_raw())));
         }
         // --- ArrayBuffer.prototype.transfer(newLength?) / transferToFixedLength(newLength?)
@@ -890,17 +923,23 @@ impl<'a> Interp<'a> {
         // views are emptied). `transfer` preserves resizability (the new buffer keeps the
         // original's maxByteLength); `transferToFixedLength` always yields a fixed-length
         // buffer. (ArrayBufferCopyAndDetach.) ---
-        if (method == "transfer" || method == "transferToFixedLength")
+        if (method == "transfer"
+            || method == "transferToFixedLength"
+            || method == "transferToImmutable")
             && let Some(bh) = self.array_buffer_bytes(handle)
         {
-            // `newLength` is ToIndex-coerced first (before the detached check), so a
-            // poisoned `valueOf` / out-of-range length is observed in spec order.
+            // `newLength` is ToIndex-coerced first — before the immutable and
+            // detached checks — so a poisoned `valueOf` / out-of-range length is
+            // observed in spec order (ArrayBufferCopyAndDetach reads newLength
+            // before verifying mutability).
             let new_len = if matches!(arg(0).unpack(), Unpacked::Undefined) {
                 None
             } else {
-                let raw = self.realm.to_number(arg(0));
-                Some(self.validate_alloc_len(raw, "Invalid ArrayBuffer length")?)
+                Some(usize::try_from(self.coerce_to_index(arg(0))?).unwrap_or(usize::MAX))
             };
+            // An immutable buffer can never be transferred (it has no transferable
+            // data).
+            self.guard_immutable_buffer(handle)?;
             if self
                 .realm
                 .get_property(handle, ARRAY_BUFFER_DETACHED)
@@ -929,6 +968,11 @@ impl<'a> Interp<'a> {
                 self.realm
                     .set_hidden_property(nb, ARRAY_BUFFER_MAXLEN, NanBox::number(max as f64));
             }
+            // `transferToImmutable` marks the new (fixed-length) buffer immutable.
+            if method == "transferToImmutable" {
+                self.realm
+                    .set_hidden_property(nb, ARRAY_BUFFER_IMMUTABLE, NanBox::boolean(true));
+            }
             // Detach the original (empty its views, zero its store, flag it).
             self.detach_array_buffer(handle);
             return Ok(Some(NanBox::handle(nb.to_raw())));
@@ -938,6 +982,7 @@ impl<'a> Interp<'a> {
             && let Some(bytesv) = self.realm.get_property(handle, ARRAY_BUFFER_BYTES)
             && let Some(bh) = bytesv.as_handle().map(Handle::from_raw)
         {
+            self.guard_immutable_buffer(handle)?;
             self.guard_detached_buffer(handle)?;
             let Some(max) = self
                 .realm
@@ -969,6 +1014,12 @@ impl<'a> Interp<'a> {
             // ToIndex first: a negative/non-integer/over-2^53 offset is a
             // RangeError, a Symbol/BigInt offset a TypeError — *before* any
             // detached/bounds check or value coercion.
+            // A `set*` on a view over an immutable buffer is a TypeError verified
+            // *before* any argument coercion (the immutable-buffer tests assert no
+            // `valueOf` runs).
+            if is_set {
+                self.guard_view_immutable(handle)?;
+            }
             let requested = self.coerce_to_index(arg(0))?;
             let le = self.realm.truthy(arg(if is_set { 2 } else { 1 }));
             // (set) coerce the value next (its side effects/throw run before the
@@ -2468,6 +2519,9 @@ impl<'a> Interp<'a> {
                 // `0`/`len`; negatives count from the end. Each coercion can throw
                 // (a Symbol/abrupt valueOf), propagated here.
                 "fill" => {
+                    // A fill onto a view over an immutable buffer is a TypeError,
+                    // verified before any argument coercion runs.
+                    self.guard_view_immutable(handle)?;
                     // For a non-BigInt view a Number fill still goes through
                     // ToNumber (a Symbol value throws); `coerce_typed_array_write`
                     // handles the BigInt case. Coerce the value to a Number for a
@@ -2497,6 +2551,8 @@ impl<'a> Interp<'a> {
                 // in place (raw same-width byte move); negatives count from the end.
                 // Each relative index is ToIntegerOrInfinity (abrupt-propagating).
                 "copyWithin" => {
+                    // Immutable backing buffer → TypeError before argument coercion.
+                    self.guard_view_immutable(handle)?;
                     let target = self.typed_clamp_index_checked(arg(0), 0, tlen)?;
                     let start = self.typed_clamp_index_checked(arg(1), 0, tlen)?;
                     let end = self.typed_clamp_index_checked(arg(2), tlen, tlen)?;
@@ -2520,6 +2576,9 @@ impl<'a> Interp<'a> {
                 // Spec order: ToIntegerOrInfinity(offset) (negative → RangeError),
                 // then the typed-source or array-like-source branch.
                 "set" => {
+                    // A `set` onto a view over an immutable buffer is a TypeError,
+                    // verified before reading `source`/`offset`.
+                    self.guard_view_immutable(handle)?;
                     let target_is_bigint =
                         self.realm.typed_kind(handle).is_some_and(is_bigint_kind);
                     // Step 4-5: targetOffset = ToIntegerOrInfinity(offset); a
@@ -3149,6 +3208,9 @@ impl<'a> Interp<'a> {
                     if let Some(len) = self.realm.typed_len(handle) {
                         self.require_callable(f, "map callback")?;
                         let dest = self.typed_species_create(handle, len)?;
+                        // A species result over an immutable buffer fails before any
+                        // callback runs (the writes could never succeed).
+                        self.guard_view_immutable(dest)?;
                         for i in 0..len {
                             // ToNumber/ToBigInt of an out-of-bounds (shrunk) index
                             // yields `undefined`; the callback still runs per spec.
@@ -3433,6 +3495,8 @@ impl<'a> Interp<'a> {
                     return Ok(Some(self.array_concat(recv, args)?));
                 }
                 "reverse" => {
+                    // A typed-array view over an immutable buffer cannot be reordered.
+                    self.guard_view_immutable(handle)?;
                     // Reverses in place and returns the same array (or typed-array view).
                     let mut out = elems.clone();
                     out.reverse();
@@ -3743,6 +3807,9 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::boolean(true)));
                 }
                 "sort" => {
+                    // A typed-array view over an immutable buffer cannot be sorted
+                    // in place (checked before the comparator runs).
+                    self.guard_view_immutable(handle)?;
                     // Sorts in place and returns the same array. A typed array sorts
                     // numerically by default (a plain array lexicographically).
                     let numeric = self.realm.typed_kind(handle).is_some();

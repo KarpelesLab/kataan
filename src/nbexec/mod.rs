@@ -1314,7 +1314,14 @@ const FUNCTION_PROTO_METHODS: &[&str] = &["call", "apply", "bind", "toString"];
 /// `ArrayBuffer.prototype` methods exposed as first-class own functions (dispatched
 /// through [`N_AB_PROTO_FN`] → `call_method`). `slice`/`resize`/`transfer`/
 /// `transferToFixedLength` each require an `[[ArrayBufferData]]` `this`.
-const AB_PROTO_METHODS: &[&str] = &["slice", "resize", "transfer", "transferToFixedLength"];
+const AB_PROTO_METHODS: &[&str] = &[
+    "slice",
+    "resize",
+    "transfer",
+    "transferToFixedLength",
+    "transferToImmutable",
+    "sliceToImmutable",
+];
 
 const DATA_VIEW_METHODS: &[&str] = &[
     "getInt8",
@@ -1367,13 +1374,13 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "toLocaleDateString" | "toLocaleTimeString"
         // Annex B.2.4 `Date.prototype.getYear` (length 0).
         | "getYear"
-        // `ArrayBuffer.prototype.transfer`/`transferToFixedLength` — `length` 0
-        // (the optional `newLength` is not counted).
-        | "transfer" | "transferToFixedLength"
+        // `ArrayBuffer.prototype.transfer`/`transferToFixedLength`/
+        // `transferToImmutable` — `length` 0 (the optional `newLength` is not counted).
+        | "transfer" | "transferToFixedLength" | "transferToImmutable"
         // `Date.now()` takes no arguments.
         | "now" => 0,
         // Two-argument methods.
-        "slice" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
+        "slice" | "sliceToImmutable" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
         | "replaceAll" | "padStart" | "padEnd" | "with" | "setInt8" | "setUint8" | "asIntN"
         | "asUintN" | "setMonth" | "setUTCMonth" | "setSeconds" | "setUTCSeconds" | "subarray"
         // `Map.prototype.getOrInsert(key, value)` / `getOrInsertComputed(key, fn)`.
@@ -1681,6 +1688,10 @@ const ARRAY_BUFFER_DETACHED: &str = "\u{0}abdetached";
 /// An `ArrayBuffer`'s `maxByteLength` — present iff it was constructed resizable (via
 /// `new ArrayBuffer(n, { maxByteLength })`), bounding `resize`.
 const ARRAY_BUFFER_MAXLEN: &str = "\u{0}abmaxlen";
+/// Marks an `ArrayBuffer` as immutable (produced by `transferToImmutable` /
+/// `sliceToImmutable`): its bytes may not be modified, and it cannot be resized
+/// or transferred. The `immutable` getter reports `true` (unless detached).
+const ARRAY_BUFFER_IMMUTABLE: &str = "\u{0}abimmutable";
 const DATA_VIEW_BUF: &str = "\u{0}dvbuf";
 const DATA_VIEW_OFF: &str = "\u{0}dvoff";
 /// An explicit `DataView` byteLength (the 3rd constructor arg); absent → the rest
@@ -2528,7 +2539,7 @@ impl<'a> Interp<'a> {
             let (accessor_id, accessors): (u16, &[&str]) = if name == "ArrayBuffer" {
                 (
                     N_AB_ACCESSOR,
-                    &["byteLength", "maxByteLength", "resizable", "detached"],
+                    &["byteLength", "maxByteLength", "resizable", "detached", "immutable"],
                 )
             } else {
                 (

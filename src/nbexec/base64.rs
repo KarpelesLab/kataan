@@ -573,6 +573,9 @@ impl<'a> Interp<'a> {
         // `lastChunkHandling` (their getters may run code / detach), then take the
         // byte witness (rejecting a detached buffer) before decoding into it.
         let h = self.validate_uint8array("setFromBase64")?;
+        // A target backed by an immutable buffer is a TypeError, verified before
+        // reading the string or the options getters.
+        self.guard_view_immutable(h)?;
         let Some(units) = self.require_string_arg(string) else {
             return Err(self.type_error("setFromBase64 requires a string argument"));
         };
@@ -597,6 +600,8 @@ impl<'a> Interp<'a> {
         // No options/getters here, so the byte witness (detach check) can be taken
         // immediately after validating the receiver and the string argument.
         let h = self.validate_uint8array("setFromHex")?;
+        // Immutable target → TypeError, before reading the string argument.
+        self.guard_view_immutable(h)?;
         let Some(units) = self.require_string_arg(string) else {
             return Err(self.type_error("setFromHex requires a string argument"));
         };

@@ -238,6 +238,9 @@ impl<'a> Interp<'a> {
         // Number throws TypeError) — even for an out-of-bounds index, where the
         // store itself is a no-op but the coercion's side effects/throw still run.
         let value = self.coerce_typed_array_write(handle, value)?;
+        // A write through a typed-array view over an immutable buffer is a
+        // TypeError (after value coercion). No-op for a plain array.
+        self.guard_view_immutable(handle)?;
         self.realm.set_element(handle, i, value);
         Ok(())
     }
@@ -286,6 +289,44 @@ impl<'a> Interp<'a> {
         {
             let m = self.new_str("Cannot perform operation on a detached ArrayBuffer");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        Ok(())
+    }
+
+    /// Whether the `ArrayBuffer` `buf` is immutable (produced by
+    /// `transferToImmutable` / `sliceToImmutable`). False for a non-buffer.
+    pub(crate) fn is_immutable_buffer(&self, buf: Handle) -> bool {
+        self.realm
+            .get_property(buf, ARRAY_BUFFER_IMMUTABLE)
+            .is_some()
+    }
+
+    /// Throws a `TypeError` if the `ArrayBuffer` `buf` is immutable — every
+    /// operation that would modify, resize, or transfer its bytes is rejected.
+    pub(crate) fn guard_immutable_buffer(&mut self, buf: Handle) -> Result<(), ExecError> {
+        if self.is_immutable_buffer(buf) {
+            let m = self.new_str("Cannot modify an immutable ArrayBuffer");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        Ok(())
+    }
+
+    /// Throws a `TypeError` if the view (`DataView` or typed array) `handle` is
+    /// backed by an immutable `ArrayBuffer`. Used at the entry of every mutating
+    /// view operation, *before* argument coercion, so a poisoned `valueOf` is not
+    /// observed when the write is forbidden. A non-view, or a view over a mutable
+    /// buffer, passes.
+    pub(crate) fn guard_view_immutable(&mut self, handle: Handle) -> Result<(), ExecError> {
+        // A typed array exposes its buffer via `typed_array_object`; a `DataView`
+        // stores it under `DATA_VIEW_BUF`.
+        let buf = self.realm.typed_array_object(handle).or_else(|| {
+            self.realm
+                .get_property(handle, DATA_VIEW_BUF)
+                .and_then(|b| b.as_handle())
+                .map(Handle::from_raw)
+        });
+        if let Some(buf) = buf {
+            return self.guard_immutable_buffer(buf);
         }
         Ok(())
     }
@@ -443,6 +484,9 @@ impl<'a> Interp<'a> {
         // TypedArraySpeciesCreate(O, «len») then write the produced elements
         // through (coercing to the result's kind).
         let rh = self.typed_species_create(recv, elems.len())?;
+        // A species ctor that returns a view over an immutable buffer makes the
+        // populating writes fail — a TypeError after the result is constructed.
+        self.guard_view_immutable(rh)?;
         self.realm.typed_set_from_numbers(rh, 0, &elems);
         Ok(NanBox::handle(rh.to_raw()))
     }

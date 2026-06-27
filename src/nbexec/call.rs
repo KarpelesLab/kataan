@@ -631,6 +631,11 @@ impl<'a> Interp<'a> {
                 return Ok(match name.as_str() {
                     "detached" => NanBox::boolean(detached),
                     "resizable" => NanBox::boolean(max.is_some()),
+                    // `immutable`: true iff the buffer is immutable and not detached.
+                    "immutable" => NanBox::boolean(
+                        !detached
+                            && self.realm.get_property(h, ARRAY_BUFFER_IMMUTABLE).is_some(),
+                    ),
                     "byteLength" => {
                         if detached {
                             NanBox::number(0.0)

@@ -1803,6 +1803,9 @@ impl<'a> Interp<'a> {
                 };
                 let view = self.construct(ctor, &[NanBox::number(items.len() as f64)])?;
                 if let Some(vh) = view.as_handle().map(Handle::from_raw) {
+                    // A custom ctor returning a view over an immutable buffer makes
+                    // the populating element writes fail with a TypeError.
+                    self.guard_view_immutable(vh)?;
                     self.realm.typed_set_from_numbers(vh, 0, &items);
                     self.link_view_proto_to_ctor(vh, ctor);
                 }
@@ -1816,6 +1819,7 @@ impl<'a> Interp<'a> {
                 }
                 let view = self.construct(ctor, &[NanBox::number(args.len() as f64)])?;
                 if let Some(vh) = view.as_handle().map(Handle::from_raw) {
+                    self.guard_view_immutable(vh)?;
                     self.realm.typed_set_from_numbers(vh, 0, args);
                     self.link_view_proto_to_ctor(vh, ctor);
                 }

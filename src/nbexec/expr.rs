@@ -1555,6 +1555,9 @@ impl<'a> Interp<'a> {
                 } else {
                     self.coerce_to_number(new)?
                 };
+                // A write through a view over an immutable buffer is a TypeError
+                // (after the value coercion, per TypedArraySetElement).
+                self.guard_view_immutable(handle)?;
                 let is_neg_zero = n == 0.0 && n.is_sign_negative();
                 if !is_neg_zero
                     && n == (n as i64) as f64
