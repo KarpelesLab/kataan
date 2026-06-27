@@ -515,6 +515,8 @@ impl<'a> Interp<'a> {
         let executor = self
             .realm
             .new_bound_native(N_PROMISE_CAPABILITY_EXECUTOR, state);
+        // GetCapabilitiesExecutor is an anonymous function of length 2.
+        self.install_fn_name_length(executor, "", 2);
         let promise = self.construct(c, &[NanBox::handle(executor.to_raw())])?;
         let resolve = self
             .realm
@@ -760,6 +762,71 @@ impl<'a> Interp<'a> {
         Ok(NanBox::undefined())
     }
 
+    /// `Promise.allKeyed` Resolve Element: stores `value` at the captured key of
+    /// the result object (pre-created, so order is preserved).
+    pub(crate) fn promise_all_keyed_element(
+        &mut self,
+        state: Handle,
+        value: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        if self.element_already_called(state) {
+            return Ok(NanBox::undefined());
+        }
+        let (remaining, container, cap, _) = self.state_parts(state);
+        let key = self
+            .realm
+            .get_property(state, PCOMB_INDEX)
+            .unwrap_or(NanBox::undefined());
+        if let Some(obj) = container.as_handle().map(Handle::from_raw) {
+            let name = self.member_key(key);
+            self.set_or_throw(obj, key, &name, value)?;
+        }
+        let n = self.cell_get(remaining) - 1.0;
+        self.cell_set(remaining, n);
+        if n == 0.0 {
+            self.capability_resolve(&cap, container)?;
+        }
+        Ok(NanBox::undefined())
+    }
+
+    /// `Promise.allSettledKeyed` Fulfill / Reject Element: stores a
+    /// `{status, value|reason}` record at the captured key.
+    pub(crate) fn promise_allsettled_keyed_element(
+        &mut self,
+        state: Handle,
+        value: NanBox,
+        fulfilled: bool,
+    ) -> Result<NanBox, ExecError> {
+        if self.element_already_called(state) {
+            return Ok(NanBox::undefined());
+        }
+        let (remaining, container, cap, _) = self.state_parts(state);
+        let key = self
+            .realm
+            .get_property(state, PCOMB_INDEX)
+            .unwrap_or(NanBox::undefined());
+        let record = self.realm.new_object();
+        if fulfilled {
+            let s = self.new_str("fulfilled");
+            self.realm.set_property(record, "status", s);
+            self.realm.set_property(record, "value", value);
+        } else {
+            let s = self.new_str("rejected");
+            self.realm.set_property(record, "status", s);
+            self.realm.set_property(record, "reason", value);
+        }
+        if let Some(obj) = container.as_handle().map(Handle::from_raw) {
+            let name = self.member_key(key);
+            self.set_or_throw(obj, key, &name, NanBox::handle(record.to_raw()))?;
+        }
+        let n = self.cell_get(remaining) - 1.0;
+        self.cell_set(remaining, n);
+        if n == 0.0 {
+            self.capability_resolve(&cap, container)?;
+        }
+        Ok(NanBox::undefined())
+    }
+
     /// Builds an `AggregateError` whose `errors` is `errors_arr`.
     fn make_aggregate_error(&mut self, errors_arr: NanBox) -> NanBox {
         let msg = self.new_str("All promises were rejected");
@@ -803,6 +870,83 @@ impl<'a> Interp<'a> {
         let cap = self.new_promise_capability(c)?;
         let result = self.perform_promise_all_inner(c, iterable, &cap, true);
         self.finish_combinator(cap, result)
+    }
+
+    /// `Promise.allKeyed(obj)` / `Promise.allSettledKeyed(obj)` (this = `C`) —
+    /// the *await-dictionary* proposal. Like `all` / `allSettled`, but the input
+    /// is an object whose own *enumerable* keys (String then Symbol, in
+    /// `[[OwnPropertyKeys]]` order) name the results: the returned promise
+    /// fulfils with a **null-prototype** object carrying the same keys.
+    pub(crate) fn perform_promise_all_keyed(
+        &mut self,
+        c: NanBox,
+        obj: NanBox,
+        settled: bool,
+    ) -> Result<NanBox, ExecError> {
+        let cap = self.new_promise_capability(c)?;
+        let result = self.perform_promise_all_keyed_inner(c, obj, &cap, settled);
+        self.finish_combinator(cap, result)
+    }
+
+    fn perform_promise_all_keyed_inner(
+        &mut self,
+        c: NanBox,
+        obj: NanBox,
+        cap: &PromiseCapability,
+        settled: bool,
+    ) -> Result<NanBox, ExecError> {
+        let promise_resolve = self.combinator_resolve_fn(c)?;
+        if !self.is_object_value(obj) {
+            return Err(self.type_error("Promise.allKeyed called on a non-object"));
+        }
+        let oh = obj.as_handle().map(Handle::from_raw).unwrap();
+        // `[[OwnPropertyKeys]]` (String then Symbol order; a proxy `ownKeys` trap
+        // is honored), then `[[GetOwnProperty]]` per key — skip a key reported
+        // absent or non-enumerable.
+        let mut entries: Vec<(NanBox, String)> = Vec::new();
+        for key in self.own_property_keys_values(oh)? {
+            let name = self.member_key(key);
+            let desc = self.descriptor_of(oh, &name)?;
+            if matches!(desc.unpack(), Unpacked::Undefined) {
+                continue;
+            }
+            let enumerable = desc
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                .is_some_and(|v| self.realm.truthy(v));
+            if enumerable {
+                entries.push((key, name));
+            }
+        }
+        // The result is a fresh null-prototype object. Pre-create every key (in
+        // input order) so a later out-of-order settlement updates the value in
+        // place without disturbing key order.
+        let result = self.realm.new_object_with_proto(None);
+        let result_box = NanBox::handle(result.to_raw());
+        for (key, name) in &entries {
+            self.set_or_throw(result, *key, name, NanBox::undefined())?;
+        }
+        let remaining = self.count_cell((entries.len() + 1) as f64);
+        for (key, name) in entries {
+            let value = self.read_member(oh, &name)?;
+            let next = self.call_with_this(promise_resolve, c, &[value])?;
+            let state = self.combinator_state(remaining, result_box, cap, key);
+            if settled {
+                let on_f = self.make_element_fn(N_PROMISE_ALLSETTLEDKEYED_FULFILL, state);
+                let on_r = self.make_element_fn(N_PROMISE_ALLSETTLEDKEYED_REJECT, state);
+                self.invoke_then(next, on_f, on_r)?;
+            } else {
+                let on_f = self.make_element_fn(N_PROMISE_ALLKEYED_ELEMENT, state);
+                self.invoke_then(next, on_f, cap.reject)?;
+            }
+        }
+        let n = self.cell_get(remaining) - 1.0;
+        self.cell_set(remaining, n);
+        if n == 0.0 {
+            self.capability_resolve(cap, result_box)?;
+        }
+        Ok(cap.promise)
     }
 
     /// Shared `all` / `allSettled` body. On an abrupt completion the caller

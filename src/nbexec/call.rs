@@ -832,7 +832,8 @@ impl<'a> Interp<'a> {
                     // plain `Promise.all(…)` call (`this` = the constructor itself).
                     let this_aware = matches!(
                         name.as_str(),
-                        "all" | "race" | "allSettled" | "any" | "resolve" | "reject" | "try"
+                        "all" | "race" | "allSettled" | "any" | "allKeyed"
+                            | "allSettledKeyed" | "resolve" | "reject" | "try"
                     );
                     // For a `this`-aware static, a non-object receiver (number,
                     // string, boolean, symbol, null, undefined — including a detached
@@ -842,6 +843,21 @@ impl<'a> Interp<'a> {
                     if this_aware && !self.is_object_value(this_val) {
                         return Err(self
                             .type_error(&alloc::format!("Promise.{name} called on a non-object")));
+                    }
+                    // The combinators run `NewPromiseCapability(C)` unconditionally,
+                    // which requires `C` (the receiver) to be a constructor — a
+                    // non-constructor object (e.g. `Promise.all.call(eval)`) is a
+                    // TypeError. We special-case it here because we know this is the
+                    // genuine `Promise` combinator (not an unrelated same-named method,
+                    // which the name-dispatch guard in `call_method` cannot tell apart).
+                    let is_combinator = matches!(
+                        name.as_str(),
+                        "all" | "race" | "allSettled" | "any" | "allKeyed" | "allSettledKeyed"
+                    );
+                    if is_combinator && !self.is_constructor(this_val) {
+                        return Err(self.type_error(&alloc::format!(
+                            "Promise.{name} called on a non-constructor"
+                        )));
                     }
                     let recv = if this_aware { this_val } else { ctor };
                     return Ok(self
@@ -1044,6 +1060,15 @@ impl<'a> Interp<'a> {
                     return self.promise_allsettled_element(target, arg0, false);
                 }
                 N_PROMISE_ANY_ELEMENT => return self.promise_any_element(target, arg0),
+                N_PROMISE_ALLKEYED_ELEMENT => {
+                    return self.promise_all_keyed_element(target, arg0);
+                }
+                N_PROMISE_ALLSETTLEDKEYED_FULFILL => {
+                    return self.promise_allsettled_keyed_element(target, arg0, true);
+                }
+                N_PROMISE_ALLSETTLEDKEYED_REJECT => {
+                    return self.promise_allsettled_keyed_element(target, arg0, false);
+                }
                 N_PROMISE_THEN_FINALLY => return self.promise_finally_thunk(target, arg0, true),
                 N_PROMISE_CATCH_FINALLY => return self.promise_finally_thunk(target, arg0, false),
                 // Value/throw thunks: ignore the (one) argument and return/throw the

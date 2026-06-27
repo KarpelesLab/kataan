@@ -1823,6 +1823,13 @@ const N_PROMISE_ALLSETTLED_REJECT: u16 = 642;
 /// `Promise.any` Reject Element: records its rejection reason and, when the last
 /// input rejects, rejects the capability with an `AggregateError`.
 const N_PROMISE_ANY_ELEMENT: u16 = 643;
+/// `Promise.allKeyed` Resolve Element (await-dictionary proposal): records its
+/// value at the captured *key* of the result object.
+const N_PROMISE_ALLKEYED_ELEMENT: u16 = 672;
+/// `Promise.allSettledKeyed` Fulfill / Reject Elements: record
+/// `{status, value|reason}` at the captured key.
+const N_PROMISE_ALLSETTLEDKEYED_FULFILL: u16 = 673;
+const N_PROMISE_ALLSETTLEDKEYED_REJECT: u16 = 674;
 /// `Promise.prototype.finally` Then Finally / Catch Finally functions: run the
 /// captured `onFinally()`, then thread the original value/reason through
 /// `C.resolve(result).then(valueThunk)`.
@@ -3709,6 +3716,8 @@ impl<'a> Interp<'a> {
                 "race",
                 "allSettled",
                 "any",
+                "allKeyed",
+                "allSettledKeyed",
                 "withResolvers",
                 "try",
             ],

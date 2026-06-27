@@ -1522,12 +1522,18 @@ impl<'a> Interp<'a> {
         // Invoke(p,"then")), so call counts, resolve-function identity, species,
         // and AggregateError all hold. Gated on the receiver being a constructor so
         // an unrelated object's same-named method is not hijacked.
-        if matches!(method, "all" | "race" | "allSettled" | "any") && self.is_constructor(recv) {
+        if matches!(
+            method,
+            "all" | "race" | "allSettled" | "any" | "allKeyed" | "allSettledKeyed"
+        ) && self.is_constructor(recv)
+        {
             return match method {
                 "all" => Ok(Some(self.perform_promise_all(recv, arg(0))?)),
                 "allSettled" => Ok(Some(self.perform_promise_all_settled(recv, arg(0))?)),
                 "race" => Ok(Some(self.perform_promise_race(recv, arg(0))?)),
                 "any" => Ok(Some(self.perform_promise_any(recv, arg(0))?)),
+                "allKeyed" => Ok(Some(self.perform_promise_all_keyed(recv, arg(0), false)?)),
+                "allSettledKeyed" => Ok(Some(self.perform_promise_all_keyed(recv, arg(0), true)?)),
                 _ => unreachable!(),
             };
         }
