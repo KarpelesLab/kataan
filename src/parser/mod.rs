@@ -1200,11 +1200,18 @@ impl<'src> Parser<'src> {
                 elements.push(ArrayElement::Hole);
                 continue;
             }
+            // An array literal's contents are `[+In]` even inside a `for` header
+            // (where `no_in` is set to disambiguate `for (x in y)`): a default
+            // initializer like `[ x = 'a' in {} ]` must accept `in`.
             let is_spread = self.eat(TokenKind::DotDotDot);
             if is_spread {
-                elements.push(ArrayElement::Spread(self.parse_assignment()?));
+                elements.push(ArrayElement::Spread(
+                    self.without_no_in(Self::parse_assignment)?,
+                ));
             } else {
-                elements.push(ArrayElement::Item(self.parse_assignment()?));
+                elements.push(ArrayElement::Item(
+                    self.without_no_in(Self::parse_assignment)?,
+                ));
             }
             if !self.at(TokenKind::RBracket) {
                 if is_spread {
@@ -1224,8 +1231,11 @@ impl<'src> Parser<'src> {
     fn parse_object(&mut self) -> Result<Expr> {
         let start = self.expect(TokenKind::LBrace)?.span;
         let mut members = Vec::new();
+        // An object literal's contents are `[+In]` even inside a `for` header
+        // (where `no_in` is set): a value/default like `{ x: y = 'a' in {} }` or
+        // shorthand `{ x = 'a' in {} }` must accept `in`.
         while !self.at(TokenKind::RBrace) {
-            members.push(self.parse_object_member()?);
+            members.push(self.without_no_in(Self::parse_object_member)?);
             if !self.at(TokenKind::RBrace) {
                 self.expect(TokenKind::Comma)?;
             }
