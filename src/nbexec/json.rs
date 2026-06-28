@@ -555,6 +555,11 @@ impl<'a> Interp<'a> {
                     *pos += 1;
                 }
                 Some(&ch) => {
+                    // A JSONString may not contain an unescaped control character
+                    // (U+0000–U+001F); they must be written as `\n`, `\uXXXX`, etc.
+                    if (ch as u32) < 0x20 {
+                        return Err(self.json_error("Bad control character in string literal in JSON"));
+                    }
                     let mut buf = [0u8; 4];
                     out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                     *pos += 1;
