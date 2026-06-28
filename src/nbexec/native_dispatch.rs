@@ -2867,42 +2867,50 @@ impl<'a> Interp<'a> {
                 self.new_str(&s)
             }
             N_OBJ_PROTO_HASOWN => {
+                // ToPropertyKey(V) then ToObject(this) — the latter throws for a
+                // null/undefined receiver and boxes a primitive.
                 let key = self.member_key(arg(0));
-                match self.this_val.as_handle().map(Handle::from_raw) {
-                    Some(h) => NanBox::boolean(self.realm.has_own(h, &key)),
-                    None => NanBox::boolean(false),
-                }
+                let this = self.this_val;
+                let h = self.require_object_coercible_to_object(this, "hasOwnProperty")?;
+                NanBox::boolean(self.realm.has_own(h, &key))
             }
             N_OBJ_PROTO_PROPISENUM => {
                 let key = self.member_key(arg(0));
+                let this = self.this_val;
+                let h = self.require_object_coercible_to_object(this, "propertyIsEnumerable")?;
                 // An own *and* enumerable property. `property_is_enumerable` works
                 // for inline objects *and* aux-backed cells (arrays/functions/
                 // classes), where `object_keys` returns `None` and would wrongly
                 // report every aux property non-enumerable.
-                let enumerable = self
-                    .this_val
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .is_some_and(|h| {
-                        self.realm.has_own(h, &key) && self.realm.property_is_enumerable(h, &key)
-                    });
+                let enumerable =
+                    self.realm.has_own(h, &key) && self.realm.property_is_enumerable(h, &key);
                 NanBox::boolean(enumerable)
             }
             N_OBJ_PROTO_ISPROTOTYPEOF => {
-                // True if `this` appears in arg(0)'s prototype chain.
-                let target = self.this_val.as_handle().map(Handle::from_raw);
-                let mut cur = arg(0)
+                // Spec order: if V is not an object, return false; *then* ToObject
+                // (this) (which throws for a null/undefined receiver). So
+                // `isPrototypeOf.call(null, 5)` is false, but
+                // `isPrototypeOf.call(null, {})` throws.
+                let found = if let Some(v) = arg(0)
                     .as_handle()
                     .map(Handle::from_raw)
-                    .and_then(|h| self.realm.object_proto(h));
-                let mut found = false;
-                while let Some(p) = cur {
-                    if Some(p) == target {
-                        found = true;
-                        break;
+                    .filter(|_| self.is_object_value(arg(0)))
+                {
+                    let this = self.this_val;
+                    let target = self.require_object_coercible_to_object(this, "isPrototypeOf")?;
+                    let mut cur = self.realm.object_proto(v);
+                    let mut f = false;
+                    while let Some(p) = cur {
+                        if p == target {
+                            f = true;
+                            break;
+                        }
+                        cur = self.realm.object_proto(p);
                     }
-                    cur = self.realm.object_proto(p);
-                }
+                    f
+                } else {
+                    false
+                };
                 NanBox::boolean(found)
             }
             // `btoa(s)`: each code unit must be a byte (0–255) → base64.
