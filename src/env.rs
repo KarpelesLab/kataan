@@ -40,6 +40,15 @@ struct ScopeData {
     /// `nbexec`). `None` until the first `using` is recorded, so an ordinary
     /// scope carries no extra allocation (the fast path).
     disposers: Option<alloc::vec::Vec<(NanBox, NanBox, bool)>>,
+    /// The object environment record of a `with (obj)` statement, set ONLY on the
+    /// child scope that the `with` body runs in (`None` on every other frame).
+    /// Resolution interleaves this frame's object with the surrounding lexical
+    /// frames (see `Interp::with_binding`), so an inner local binding shadows the
+    /// object and the object shadows an outer binding. Because the body runs in
+    /// this child, a closure created inside a `with` captures the object
+    /// naturally — `with` is *lexically* scoped: a function defined elsewhere and
+    /// merely *called* inside the `with` does not see the object.
+    with_obj: Option<NanBox>,
 }
 
 impl Scope {
@@ -51,6 +60,7 @@ impl Scope {
             consts: alloc::collections::BTreeSet::new(),
             parent: None,
             disposers: None,
+            with_obj: None,
         })))
     }
 
@@ -62,7 +72,25 @@ impl Scope {
             consts: alloc::collections::BTreeSet::new(),
             parent: Some(self.clone()),
             disposers: None,
+            with_obj: None,
         })))
+    }
+
+    /// A new child scope that enters a `with (obj)` object environment. The body
+    /// of a `with` statement runs in this child so the object is captured
+    /// lexically by any closure created inside it.
+    #[must_use]
+    pub fn child_with(&self, obj: NanBox) -> Self {
+        let child = self.child();
+        child.0.borrow_mut().with_obj = Some(obj);
+        child
+    }
+
+    /// The `with` object introduced *at this frame* (`None` unless this is the
+    /// child scope of a `with` statement).
+    #[must_use]
+    pub fn with_obj(&self) -> Option<NanBox> {
+        self.0.borrow().with_obj
     }
 
     /// Declares (or redeclares) `name` in *this* scope.
@@ -192,6 +220,12 @@ impl Scope {
                 }
             }
         }
+        // A `with` object is rooted by the scope that introduced it.
+        if let Some(obj) = &data.with_obj {
+            if let Some(raw) = obj.as_handle() {
+                visit(Handle::from_raw(raw));
+            }
+        }
         if let Some(p) = &data.parent {
             p.for_each_handle(visit);
         }
@@ -216,6 +250,11 @@ impl Scope {
                 if let Some(raw) = method.as_handle() {
                     *method = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
                 }
+            }
+        }
+        if let Some(obj) = &mut data.with_obj {
+            if let Some(raw) = obj.as_handle() {
+                *obj = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
             }
         }
         if let Some(p) = &data.parent {

@@ -227,9 +227,12 @@ impl<'a> Interp<'a> {
                 } else {
                     self.coerce_to_object(obj)
                 };
-                self.with_stack.push(obj);
+                // The body runs in a child scope carrying the `with` object, so a
+                // closure created inside it captures the object lexically.
+                let child = self.current.child_with(obj);
+                let saved = core::mem::replace(&mut self.current, child);
                 let r = self.exec(body);
-                self.with_stack.pop();
+                self.current = saved;
                 // Spec: `with` yields `UpdateEmpty(C, undefined)`.
                 r.map(empty_to_undefined)
             }
@@ -1100,33 +1103,49 @@ impl<'a> Interp<'a> {
     /// object's `@@unscopables`. Returns the object handle, or `None` to fall back
     /// to the lexical scope chain.
     pub(crate) fn with_binding(&mut self, name: &str) -> Option<Handle> {
-        if self.with_stack.is_empty() {
-            return None;
-        }
-        for obj in self.with_stack.clone().into_iter().rev() {
-            let Some(h) = obj.as_handle().map(Handle::from_raw) else {
-                continue;
-            };
-            if !self.has_property_chain(h, name) {
-                continue;
+        // Walk the scope chain from innermost outward, interleaving lexical frames
+        // with `with` object frames. A local binding shadows an enclosing `with`
+        // object; a `with` object shadows a binding further out. The first frame
+        // that either binds `name` locally or whose `with` object provides it wins.
+        let mut frame = Some(self.current.clone());
+        while let Some(s) = frame {
+            if s.has_local(name) {
+                // An inner lexical binding shadows any outer `with` object.
+                return None;
             }
-            // `@@unscopables`: a truthy entry blocks the binding (the lexical scope
-            // shows through instead).
-            let unscopables_sym = self.well_known_symbol("unscopables");
-            let unscopables_key = self.member_key(unscopables_sym);
-            let unscopables = self
-                .read_member(h, &unscopables_key)
-                .ok()
-                .and_then(|v| v.as_handle().map(Handle::from_raw));
-            if let Some(u) = unscopables
-                && let Ok(blocked) = self.read_member(u, name)
-                && self.realm.truthy(blocked)
+            if let Some(obj) = s.with_obj()
+                && let Some(h) = obj.as_handle().map(Handle::from_raw)
+                && let Some(found) = self.with_frame_provides(h, name)
             {
-                continue;
+                return Some(found);
             }
-            return Some(h);
+            frame = s.parent();
         }
         None
+    }
+
+    /// Whether the `with` object `h` provides `name` as an environment binding:
+    /// `HasProperty(name)` and not blocked by a truthy `@@unscopables[name]`.
+    /// `Some(h)` if it provides it; `None` to keep looking further out.
+    fn with_frame_provides(&mut self, h: Handle, name: &str) -> Option<Handle> {
+        if !self.has_property_chain(h, name) {
+            return None;
+        }
+        // `@@unscopables`: a truthy entry blocks the binding (the lexical scope
+        // shows through instead).
+        let unscopables_sym = self.well_known_symbol("unscopables");
+        let unscopables_key = self.member_key(unscopables_sym);
+        let unscopables = self
+            .read_member(h, &unscopables_key)
+            .ok()
+            .and_then(|v| v.as_handle().map(Handle::from_raw));
+        if let Some(u) = unscopables
+            && let Ok(blocked) = self.read_member(u, name)
+            && self.realm.truthy(blocked)
+        {
+            return None;
+        }
+        Some(h)
     }
 
     /// Whether `target` is a *simple* assignment leaf (an identifier or member

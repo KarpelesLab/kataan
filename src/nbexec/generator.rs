@@ -1468,15 +1468,17 @@ impl<'a> Interp<'a> {
                 } else {
                     self.coerce_to_object(obj)
                 };
-                self.with_stack.push(obj);
-                // A WithPop step restores the with-stack afterwards.
+                // Run the body in a child scope carrying the `with` object (so the
+                // object is captured lexically). A PopScope step restores the
+                // parent scope for the suspended case.
+                let child = self.current.child_with(obj);
+                let saved = core::mem::replace(&mut self.current, child);
                 stack.push(Step::PopScope {
-                    scope: self.current.clone(),
+                    scope: saved.clone(),
                 });
                 let r = self.gen_exec_stmt(body, stack, values, &None);
-                // NB: with-stack popping for the suspended case is a known
-                // limitation; pop eagerly on the synchronous path.
-                self.with_stack.pop();
+                // Restore eagerly on the synchronous path.
+                self.current = saved;
                 r
             }
             // Yield-bearing forms not otherwise handled fall back to one-shot

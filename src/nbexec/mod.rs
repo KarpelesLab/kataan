@@ -352,10 +352,6 @@ pub struct Interp<'a> {
     /// receive. `make_class` consumes it so the class's `name` is set *before*
     /// static initializers run (which may read `this.name` / the class name).
     pending_class_name: Option<&'a str>,
-    /// Active `with (obj) …` object environment records, innermost last. A bare
-    /// identifier first consults these objects (respecting `@@unscopables`) before
-    /// the lexical scope chain.
-    with_stack: Vec<NanBox>,
     /// Current function-call nesting depth (recursion guard).
     call_depth: usize,
     /// Whether `new.target` is lexically in scope at the current execution point —
@@ -1995,7 +1991,6 @@ impl<'a> Interp<'a> {
             class_lexical_parent: Vec::new(),
             class_private_names: Vec::new(),
             pending_class_name: None,
-            with_stack: Vec::new(),
             call_depth: 0,
             new_target_in_scope: false,
             eval_depth: 0,
