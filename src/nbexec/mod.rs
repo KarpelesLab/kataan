@@ -2725,6 +2725,24 @@ impl<'a> Interp<'a> {
             this.current
                 .declare(global_name, NanBox::handle(obj.to_raw()));
         };
+        // Like `install_namespace`, but the global itself is a real callable
+        // function cell carrying `ctor_id` (so `typeof Array === "function"`,
+        // `Array instanceof Function`, `[[Prototype]] === Function.prototype`,
+        // and `Object.prototype.toString` report `[object Function]`). Used for
+        // the constructor globals `Object`/`Array`, which are otherwise dispatched
+        // by global-binding identity in `call`/`construct`.
+        let install_ctor_namespace =
+            |this: &mut Self, global_name: &str, ctor_id: u16, methods: &[(&str, u16)]| {
+                let obj = this.new_named_native(global_name, ctor_id);
+                for (name, id) in methods {
+                    let f = this.new_named_native(name, *id);
+                    this.realm
+                        .set_property(obj, name, NanBox::handle(f.to_raw()));
+                    this.realm.mark_hidden(obj, name);
+                }
+                this.current
+                    .declare(global_name, NanBox::handle(obj.to_raw()));
+            };
         install_namespace(
             self,
             "Math",
@@ -2842,9 +2860,10 @@ impl<'a> Interp<'a> {
                 ("isRawJSON", N_JSON_IS_RAW),
             ],
         );
-        install_namespace(
+        install_ctor_namespace(
             self,
             "Object",
+            N_BASE_OBJECT,
             &[
                 ("keys", N_OBJECT_KEYS),
                 ("values", N_OBJECT_VALUES),
@@ -2871,9 +2890,10 @@ impl<'a> Interp<'a> {
                 ("groupBy", N_OBJECT_GROUP_BY),
             ],
         );
-        install_namespace(
+        install_ctor_namespace(
             self,
             "Array",
+            N_BASE_ARRAY,
             &[
                 ("isArray", N_ARRAY_IS_ARRAY),
                 ("from", N_ARRAY_FROM),
@@ -3248,7 +3268,11 @@ impl<'a> Interp<'a> {
         {
             self.realm
                 .set_property(obj_ns, "prototype", NanBox::handle(obj_proto.to_raw()));
-            self.realm.mark_hidden(obj_ns, "prototype"); // non-enumerable
+            // `Object.prototype` is `{ writable:false, enumerable:false,
+            // configurable:false }` like every built-in constructor's `prototype`.
+            self.realm.mark_hidden(obj_ns, "prototype");
+            self.realm.set_readonly_property(obj_ns, "prototype");
+            self.realm.set_non_configurable_property(obj_ns, "prototype");
             // `({}).constructor === Object` (non-enumerable, inherited via the
             // default object prototype), and `Object.name === "Object"`.
             self.realm.set_hidden_property(
