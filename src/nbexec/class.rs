@@ -955,6 +955,7 @@ impl<'a> Interp<'a> {
                     && !field.is_static
                 {
                     // A computed field name (`[expr] = v`) is evaluated here.
+                    let is_private = matches!(&field.key, PropertyKey::Private(_));
                     let key = match &field.key {
                         PropertyKey::Computed(e) => {
                             let k = self.eval(e)?;
@@ -968,6 +969,27 @@ impl<'a> Interp<'a> {
                         Some(e) => self.eval(e)?,
                         None => NanBox::undefined(),
                     };
+                    if is_private {
+                        // `PrivateFieldAdd` on a **non-extensible** object is a
+                        // TypeError (the `nonextensible-applies-to-private`
+                        // semantics) — e.g. a base constructor returned a frozen
+                        // object or a module namespace. Private fields are *not*
+                        // string-keyed properties, so they never force a deferred
+                        // module namespace.
+                        if !self.realm.is_extensible(instance) {
+                            let m = self.new_str(
+                                "Cannot add private field to a non-extensible object",
+                            );
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
+                        self.realm.set_property(instance, &key, v);
+                        continue;
+                    }
+                    // A class field is a CreateDataPropertyOrThrow ([[DefineOwnProperty]])
+                    // on the instance; if the instance is a Deferred Module Namespace
+                    // (e.g. a base constructor returned one) that forces evaluation.
+                    #[cfg(all(feature = "module", feature = "std"))]
+                    self.trigger_deferred_namespace(instance, &key)?;
                     self.realm.set_property(instance, &key, v);
                 }
             }
@@ -979,6 +1001,20 @@ impl<'a> Interp<'a> {
         self.current_home_object = saved_home_obj;
         self.new_target = saved_target;
         result
+    }
+
+    /// A constructor's `return value` overrides the new instance only when it is
+    /// an **Object** (per `[[Construct]]` / `SuperCall`). Returns that object's
+    /// handle, or `None` for `undefined` / a primitive (incl. string/bigint/symbol
+    /// wrapper handles, which are primitives here).
+    pub(crate) fn constructor_return_handle(&self, ret: Option<NanBox>) -> Option<Handle> {
+        ret.and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .filter(|h| {
+                self.realm.string_value(*h).is_none()
+                    && self.realm.bigint_at(*h).is_none()
+                    && self.realm.symbol_at(*h).is_none()
+            })
     }
 
     pub(crate) fn run_constructor(
@@ -1098,10 +1134,12 @@ impl<'a> Interp<'a> {
                     Ok(r)
                 }
                 // No own constructor but a base: implicit `super(args)`, then
-                // this class's own field initializers.
+                // this class's own field initializers. A super constructor that
+                // returns an Object rebinds `this`, so the fields target it.
                 (None, Some((pid, penv))) => {
                     let ret = self.run_constructor(*pid, &penv.clone(), instance, args)?;
-                    self.init_instance_fields(class_id, instance)?;
+                    let target = self.constructor_return_handle(ret).unwrap_or(instance);
+                    self.init_instance_fields(class_id, target)?;
                     Ok(ret)
                 }
                 (None, None) => {
@@ -1111,13 +1149,21 @@ impl<'a> Interp<'a> {
                     // error message is forwarded.
                     if let Some(nid) = native_parent {
                         self.apply_native_super(nid, instance, args);
+                        self.init_instance_fields(class_id, instance)?;
+                        Ok(None)
                     } else if let Some(fnp) = fn_parent {
                         // Constructor-less class extending a function: implicit
                         // `super(...args)` calls the function with `this` = instance.
-                        self.call_with_this(fnp, NanBox::handle(instance.to_raw()), args)?;
+                        // A returned Object becomes the result and the field target.
+                        let ret = self.call_with_this(fnp, NanBox::handle(instance.to_raw()), args)?;
+                        let returned = self.constructor_return_handle(Some(ret));
+                        let target = returned.unwrap_or(instance);
+                        self.init_instance_fields(class_id, target)?;
+                        Ok(returned.map(|h| NanBox::handle(h.to_raw())))
+                    } else {
+                        self.init_instance_fields(class_id, instance)?;
+                        Ok(None)
                     }
-                    self.init_instance_fields(class_id, instance)?;
-                    Ok(None)
                 }
             }
         })();
@@ -1273,8 +1319,11 @@ impl<'a> Interp<'a> {
             }
             cur = self.resolve_super(class, &penv)?;
         }
-        // No inherited setter — the write lands on the receiver (`this`).
+        // No inherited setter — the write lands on the receiver (`this`). A
+        // Deferred Module Namespace receiver forces evaluation ([[Set]]/[[Define]]).
         if let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {
+            #[cfg(all(feature = "module", feature = "std"))]
+            self.trigger_deferred_namespace(th, name)?;
             self.realm.set_property(th, name, value);
         }
         Ok(())

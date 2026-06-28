@@ -226,7 +226,11 @@ enum Status {
     Loaded,
     /// Environment allocated and imports wired.
     Linked,
-    /// Body has run (or is running — set before evaluation to break cycles).
+    /// Body is currently running (set before evaluation to break cycles). A
+    /// deferred-namespace access of a module in this state is a TypeError
+    /// (import-defer: the module's bindings are not yet initialized).
+    Evaluating,
+    /// Body has finished running (successfully or with a captured `eval_error`).
     Evaluated,
 }
 
@@ -846,8 +850,12 @@ impl<'a> Interp<'a> {
     /// does not re-enter it.
     fn evaluate_module(&mut self, key: &str) -> Result<(), ExecError> {
         match self.modules.records.get(key).map(|r| r.status) {
-            Some(Status::Evaluated) => {
+            Some(Status::Evaluating | Status::Evaluated) => {
                 // Re-entrant (cycle) or already done; rethrow a prior failure.
+                // (A still-`Evaluating` module is on the stack — a normal import
+                // cycle, which proceeds; the import-defer "accessed while
+                // evaluating" TypeError is enforced in `force_deferred_namespace`,
+                // not here.)
                 if let Some(err) = self.modules.records.get(key).and_then(|r| r.eval_error) {
                     return Err(ExecError::Throw(err));
                 }
@@ -870,18 +878,20 @@ impl<'a> Interp<'a> {
                 .chain(r.reexports.iter().map(reexport_key))
                 .collect()
         };
-        // Mark Evaluated up front to break cycles.
+        // Mark Evaluating up front to break cycles (and so a deferred-namespace
+        // access of this in-flight module throws a TypeError).
         if let Some(r) = self.modules.records.get_mut(key) {
-            r.status = Status::Evaluated;
+            r.status = Status::Evaluating;
         }
         for dep in &deps {
             self.evaluate_module(dep)?;
         }
         let result = self.run_module_body(key);
-        if let Err(ExecError::Throw(v)) = &result
-            && let Some(r) = self.modules.records.get_mut(key)
-        {
-            r.eval_error = Some(*v);
+        if let Some(r) = self.modules.records.get_mut(key) {
+            r.status = Status::Evaluated;
+            if let Err(ExecError::Throw(v)) = &result {
+                r.eval_error = Some(*v);
+            }
         }
         result
     }
@@ -1140,6 +1150,41 @@ impl<'a> Interp<'a> {
         self.force_deferred_namespace(handle)
     }
 
+    /// import-defer trigger for a *chained* operation ([[Get]] / [[HasProperty]],
+    /// including a `super` home object): walk `handle`'s prototype chain and
+    /// evaluate the first Deferred Module Namespace reached. A closer object that
+    /// owns `name` shadows it (the chain stops before the namespace, so no
+    /// trigger). Symbol keys and `"then"` never trigger. Cheap no-op when no
+    /// deferred namespace is armed (the common case).
+    pub(crate) fn trigger_deferred_in_chain(
+        &mut self,
+        handle: crate::heap::Handle,
+        name: &str,
+    ) -> Result<(), ExecError> {
+        if self.deferred_namespaces.is_empty()
+            || name == "then"
+            || name.starts_with("\u{0}sym:")
+        {
+            return Ok(());
+        }
+        let mut cur = Some(handle);
+        let mut guard = 0usize;
+        while let Some(h) = cur {
+            if self.deferred_namespaces.contains_key(&h.to_raw()) {
+                return self.force_deferred_namespace(h);
+            }
+            if self.realm.has_own(h, name) {
+                return Ok(());
+            }
+            guard += 1;
+            if guard > 100_000 {
+                break;
+            }
+            cur = self.realm.object_proto(h);
+        }
+        Ok(())
+    }
+
     /// import-defer trigger for a whole-object operation ([[OwnPropertyKeys]]),
     /// which always evaluates regardless of any key. A no-op unless `handle` is an
     /// armed Deferred Module Namespace.
@@ -1150,9 +1195,72 @@ impl<'a> Interp<'a> {
         let Some(dep) = self.deferred_namespaces.get(&handle.to_raw()).cloned() else {
             return Ok(());
         };
+        // Accessing a deferred namespace whose synchronous evaluation would
+        // require running a module that is *currently* on the evaluation stack
+        // (a cycle reached through the deferred edge) is a TypeError — those
+        // bindings are not yet initialized (import-defer). We must detect this
+        // over the whole transitive (non-deferred) closure *before* evaluating
+        // anything, so no side effects of the subgraph run.
+        if self.deferred_closure_has_evaluating(&dep) {
+            return Err(self.type_error(
+                "Cannot access a deferred module namespace while the module is being evaluated",
+            ));
+        }
         self.evaluate_module(&dep)?;
         self.deferred_namespaces.remove(&handle.to_raw());
+        // The deferred namespace's data properties were snapshotted at creation
+        // time — before the module ran, so each held `undefined`. Now that the
+        // module has evaluated, refresh them from their live bindings so a
+        // *non-read* access (`getOwnPropertyDescriptor`, `ownKeys`) reports the
+        // real values. (`read_member` refreshes on its own per-read; this covers
+        // the trap paths that read the stored property directly.)
+        if let Some(map) = self.module_namespaces.get(&handle.to_raw()) {
+            let refreshed: Vec<(String, NanBox)> = map
+                .iter()
+                .map(|(name, (scope, local))| {
+                    (name.clone(), scope.get(local).unwrap_or_else(NanBox::undefined))
+                })
+                .collect();
+            for (name, value) in refreshed {
+                self.realm.set_property(handle, &name, value);
+            }
+        }
         Ok(())
+    }
+
+    /// True if any module in `key`'s transitive *non-deferred* dependency
+    /// closure (the set `evaluate_module` would synchronously run) is currently
+    /// `Evaluating` — i.e. on the active evaluation stack. Used to reject a
+    /// deferred-namespace force that would re-enter an in-flight module.
+    fn deferred_closure_has_evaluating(&self, key: &str) -> bool {
+        let mut stack = alloc::vec![key.to_string()];
+        let mut seen = BTreeSet::new();
+        while let Some(k) = stack.pop() {
+            if !seen.insert(k.clone()) {
+                continue;
+            }
+            let Some(r) = self.modules.records.get(&k) else {
+                continue;
+            };
+            if r.status == Status::Evaluating {
+                return true;
+            }
+            // Don't descend into an already-evaluated module: its subgraph ran
+            // to completion and is no longer on the stack.
+            if r.status == Status::Evaluated {
+                continue;
+            }
+            for dep in r
+                .imports
+                .iter()
+                .filter(|i| !i.deferred)
+                .map(|i| i.key.clone())
+                .chain(r.reexports.iter().map(reexport_key))
+            {
+                stack.push(dep);
+            }
+        }
+        false
     }
 
     /// `GetExportedNames(module)` — the sorted set of export names a namespace
@@ -1247,6 +1355,43 @@ impl<'a> Interp<'a> {
             this.link_module(&dep)?;
             this.evaluate_module(&dep)?;
             this.namespace_object(&dep)
+        })(self);
+        match outcome {
+            Ok(ns) => self.settle(promise, ns, true),
+            Err(ExecError::Throw(v)) => self.settle(promise, v, false),
+            Err(other) => {
+                let m = self.new_str(&alloc::format!("dynamic import failed: {other:?}"));
+                let err = self.make_error(N_SYNTAX_ERROR, Some(m));
+                self.settle(promise, err, false);
+            }
+        }
+        Ok(NanBox::handle(promise.to_raw()))
+    }
+
+    /// Evaluates `import.defer(specifier)` (import-defer proposal): loads and
+    /// links the module but does *not* evaluate it, and returns a promise
+    /// fulfilled with its **Deferred Module Namespace** (which evaluates lazily on
+    /// first access — identical object to the static `import defer * as ns`).
+    pub(crate) fn dynamic_import_deferred(
+        &mut self,
+        arguments: &'a [crate::ast::Argument],
+    ) -> Result<NanBox, ExecError> {
+        let promise = self.fresh_promise();
+        let spec = match arguments.first() {
+            Some(crate::ast::Argument::Item(e)) => self.eval(e)?,
+            _ => NanBox::undefined(),
+        };
+        let referrer = self.current_module_key();
+        let host = FileModuleHost;
+        let outcome: Result<NanBox, ExecError> = (|this: &mut Self| {
+            let spec_str = this.coerce_to_string(spec)?;
+            let dep = host
+                .resolve(&spec_str, referrer.as_deref())
+                .map_err(|e| this.type_error(&e))?;
+            this.load_module(&dep, &host)?;
+            this.link_module(&dep)?;
+            // Deliberately NOT evaluated — deferred until first namespace access.
+            this.deferred_namespace_object(&dep)
         })(self);
         match outcome {
             Ok(ns) => self.settle(promise, ns, true),

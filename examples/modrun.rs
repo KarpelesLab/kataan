@@ -26,7 +26,12 @@ fn main() {
         }
     }
 
-    let is_async = src.contains("flags:") && src.contains("async");
+    // `async` must appear in the `flags: [...]` list specifically (not anywhere
+    // in the source, which would false-match e.g. an `async function` test).
+    let is_async = src
+        .lines()
+        .find(|l| l.trim_start().starts_with("flags:"))
+        .is_some_and(|l| l.contains("async"));
     // Crude `includes: [a.js, b.js]` extraction (flow style only — enough here).
     let mut includes: Vec<String> = Vec::new();
     if let Some(i) = src.find("includes:") {

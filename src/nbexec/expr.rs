@@ -689,17 +689,27 @@ impl<'a> Interp<'a> {
                 {
                     return self.dynamic_import(arguments);
                 }
-                // `import.source(x)` / `import.defer(x)` — the source-phase and
-                // deferred-import proposals, unimplemented. Per the tests, ToString
-                // the specifier (a throw rejects with that), then return a promise
-                // rejected with a SyntaxError — NOT a plain dynamic import that would
-                // load the module.
+                // `import.defer(x)` — the import-defer proposal: load + link but do
+                // not evaluate, returning a promise of the Deferred Module
+                // Namespace (which evaluates lazily on first access).
                 #[cfg(all(feature = "module", feature = "std"))]
                 if let Expr::Member {
                     object, property, ..
                 } = &**callee
                     && matches!(&**object, Expr::Ident(id) if id.name.as_ref() == "import")
-                    && matches!(property, PropertyKey::Ident(p) if matches!(&**p, "source" | "defer"))
+                    && matches!(property, PropertyKey::Ident(p) if &**p == "defer")
+                {
+                    return self.dynamic_import_deferred(arguments);
+                }
+                // `import.source(x)` — the source-phase proposal, unimplemented.
+                // ToString the specifier (a throw rejects with that), then return a
+                // promise rejected with a SyntaxError — NOT a plain dynamic import.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Expr::Member {
+                    object, property, ..
+                } = &**callee
+                    && matches!(&**object, Expr::Ident(id) if id.name.as_ref() == "import")
+                    && matches!(property, PropertyKey::Ident(p) if &**p == "source")
                 {
                     let p = self.fresh_promise();
                     let arg0 = arguments.first().map(|a| match a {
@@ -744,25 +754,41 @@ impl<'a> Interp<'a> {
                     // a second `super()` must now see `None` and error.
                     self.this_val = inst_val;
                     self.pending_this_init = None;
-                    if let Some((pid, penv)) = self.pending_super.clone() {
-                        if let Some(h) = inst {
-                            self.run_constructor(pid, &penv, h, &args)?;
+                    // If the super constructor returns an Object, that object
+                    // becomes the derived `this` (`SuperCall` → `BindThisValue`),
+                    // replacing the freshly-allocated instance — and this class's
+                    // field initializers then run on it.
+                    let returned = if let Some((pid, penv)) = self.pending_super.clone() {
+                        match inst {
+                            Some(h) => self.run_constructor(pid, &penv, h, &args)?,
+                            None => None,
                         }
                     } else if let Some(nid) = self.pending_super_native {
                         // `super(...)` reaching a native constructor (`extends Error`).
                         if let Some(h) = inst {
                             self.apply_native_super(nid, h, &args);
                         }
+                        None
                     } else if let Some(fnp) = self.pending_super_fn {
-                        // `super(...)` reaching an ordinary-function superclass.
-                        self.call_with_this(fnp, inst_val, &args)?;
+                        // `super(...)` reaching an ordinary-function superclass:
+                        // `[[Construct]]` — its object return overrides `this`.
+                        Some(self.call_with_this(fnp, inst_val, &args)?)
                     } else {
                         return Err(ExecError::Unsupported(
                             "super outside a derived constructor",
                         ));
-                    }
+                    };
+                    // A returned *object* (not a primitive wrapper handle) rebinds
+                    // `this`; the field initializers below then target it.
+                    let this_handle = match self.constructor_return_handle(returned) {
+                        Some(h) => {
+                            self.this_val = NanBox::handle(h.to_raw());
+                            Some(h)
+                        }
+                        None => inst,
+                    };
                     // This class's field initializers run *after* `super()` returns.
-                    if let Some(h) = inst {
+                    if let Some(h) = this_handle {
                         self.init_instance_fields(derived_cid, h)?;
                     }
                     return Ok(NanBox::undefined());
@@ -1237,7 +1263,11 @@ impl<'a> Interp<'a> {
                             return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
                         }
                         let key = self.eval(key_expr)?;
-                        let name = self.realm.to_display_string(key);
+                        // `ToPropertyKey`: a Symbol key must become its sentinel
+                        // form (so `super[Symbol.x]` reads the real symbol-keyed
+                        // property — and, for a deferred namespace, does *not*
+                        // trigger evaluation), not a `"Symbol(…)"` display string.
+                        let name = self.coerce_property_key(key)?;
                         return self.resolve_super_member(&name);
                     }
                     let name = match property {
@@ -1765,9 +1795,10 @@ impl<'a> Interp<'a> {
         name: &str,
     ) -> Result<NanBox, ExecError> {
         // A Deferred Module Namespace (`import defer`) evaluates its target the
-        // first time one of its exports is read (import-defer proposal).
+        // first time one of its exports is read — directly or as a prototype /
+        // `super` home object (import-defer proposal).
         #[cfg(all(feature = "module", feature = "std"))]
-        self.trigger_deferred_namespace(handle, name)?;
+        self.trigger_deferred_in_chain(handle, name)?;
         // A **module namespace** export is a *live* binding: read the current
         // value from its backing slot (so a mutation in the exporting module that
         // happens after the namespace was materialised is observed). The
@@ -3395,10 +3426,11 @@ impl<'a> Interp<'a> {
                 }
                 let key = self.member_key(a);
                 // A Deferred Module Namespace (`import defer`) evaluates its target
-                // on a `[[HasProperty]]` with a String (non-"then") key.
+                // on a `[[HasProperty]]` with a String (non-"then") key — directly
+                // or anywhere in the prototype chain.
                 #[cfg(all(feature = "module", feature = "std"))]
                 if let Some(h) = b.as_handle().map(Handle::from_raw) {
-                    self.trigger_deferred_namespace(h, &key)?;
+                    self.trigger_deferred_in_chain(h, &key)?;
                 }
                 let present = match b.as_handle().map(Handle::from_raw) {
                     // Proxy `has` trap, or forward to the target.
