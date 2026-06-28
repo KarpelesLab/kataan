@@ -185,6 +185,7 @@ pub(crate) fn parse(
         depth: 0,
         unicode,
         unicode_sets,
+        in_negated_class: false,
         branch_path: Vec::new(),
         next_alt_id: 0,
         decl_paths: Vec::new(),
@@ -237,6 +238,11 @@ struct Parser {
     /// classes (set operations, nested classes, `\q{…}` strings). Implies
     /// `unicode`.
     unicode_sets: bool,
+    /// Whether the current parse position is inside a negated character class
+    /// (`[^…]`, propagated through nesting). A *property of strings* (`\p{…}`
+    /// naming e.g. `Basic_Emoji`) may not appear in a negated class — it is an
+    /// early `SyntaxError` there.
+    in_negated_class: bool,
     /// The current alternation path: `(alt_id, branch_index)` for each enclosing
     /// `Disjunction`. Two named groups may share a name only when they are in
     /// mutually-exclusive alternatives — i.e. some common `alt_id` selects a
@@ -827,10 +833,10 @@ impl Parser {
             // `\p` / `\P` are Unicode property escapes only under the `u` flag.
             // Without it they are an IdentityEscape (Annex B): the literal `p`/`P`.
             'p' if self.unicode => {
-                class_shorthand(Shorthand::Property(self.parse_property()?, false))
+                class_shorthand(Shorthand::Property(self.parse_property(false)?, false))
             }
             'P' if self.unicode => {
-                class_shorthand(Shorthand::Property(self.parse_property()?, true))
+                class_shorthand(Shorthand::Property(self.parse_property(true)?, true))
             }
             // `\cX` — a control escape (`X` an ASCII letter → U+0001..=U+001A).
             // Under `u`, anything else after `\c` is a Syntax Error; without it
@@ -870,7 +876,7 @@ impl Parser {
     /// (`\p{Script=Greek}`). An unrecognised property/value, a malformed body, or
     /// an empty name/value is rejected with a `RegexError` so the caller raises a
     /// `SyntaxError` — the corpus's negative parse tests rely on this.
-    fn parse_property(&mut self) -> Result<super::props::PropEscape, RegexError> {
+    fn parse_property(&mut self, negated: bool) -> Result<super::props::PropEscape, RegexError> {
         if !self.eat('{') {
             return Err(RegexError::new("expected `{` after `\\p`"));
         }
@@ -908,15 +914,27 @@ impl Parser {
                 }
             }
         };
+        let v_mode = self.unicode_sets;
+        let in_neg_class = self.in_negated_class;
         resolved.ok_or_else(|| {
-            // A lone `\p{…}` naming a *property of strings* is well-formed (valid
-            // only in a `v`-mode class) but unimplemented here — defer it rather
-            // than reject the literal at parse. Every other unresolved escape — a
-            // bogus name, an ES-unsupported Unicode property, a binary property
-            // given a value, a non-binary property used without one, loose
-            // (non-exact) matching — is a genuine `SyntaxError`.
+            // A lone `\p{…}` naming a *property of strings* (e.g. `Basic_Emoji`)
+            // is valid only in `v` mode and only un-negated: negating it (`\P`),
+            // placing it in a negated `[^…]` class, or using it without the `v`
+            // flag (e.g. under `u`) is an early `SyntaxError`. In a valid position
+            // it is well-formed but matching is unimplemented here, so defer it to
+            // runtime rather than reject the literal at parse (a never-matched such
+            // literal keeps working). Every other unresolved escape — a bogus name,
+            // an ES-unsupported Unicode property, a binary property given a value,
+            // a non-binary property used without one, loose matching — is a genuine
+            // `SyntaxError`.
             if is_lone && super::props::is_property_of_strings(&name) {
-                RegexError::unsupported("unsupported `\\p{…}` property of strings")
+                if negated || in_neg_class || !v_mode {
+                    RegexError::new(
+                        "a property of strings is only valid, un-negated, with the `v` flag",
+                    )
+                } else {
+                    RegexError::unsupported("unsupported `\\p{…}` property of strings")
+                }
             } else {
                 RegexError::new("invalid `\\p{…}` property escape")
             }
@@ -1042,14 +1060,14 @@ impl Parser {
                         // Syntax Error: `[\p{Hex}-￿]`, `[\p{Hex}--]`.
                         'p' if self.unicode => {
                             items.push(ClassItem::Shorthand(Shorthand::Property(
-                                self.parse_property()?,
+                                self.parse_property(false)?,
                                 false,
                             )));
                             self.reject_property_range_endpoint()?;
                         }
                         'P' if self.unicode => {
                             items.push(ClassItem::Shorthand(Shorthand::Property(
-                                self.parse_property()?,
+                                self.parse_property(true)?,
                                 true,
                             )));
                             self.reject_property_range_endpoint()?;
@@ -1157,7 +1175,13 @@ impl Parser {
     fn parse_class_set_inner(&mut self) -> Result<Node, RegexError> {
         self.pos += 1; // `[`
         let neg = self.eat('^');
-        let set = self.parse_class_set_expression()?;
+        // A property of strings may not appear in a negated class (propagated
+        // through nesting): track it while parsing the class body.
+        let saved_neg_class = self.in_negated_class;
+        self.in_negated_class = saved_neg_class || neg;
+        let set = self.parse_class_set_expression();
+        self.in_negated_class = saved_neg_class;
+        let set = set?;
         if !self.eat(']') {
             return Err(RegexError::new("unterminated character class `[`"));
         }
@@ -1316,7 +1340,7 @@ impl Parser {
             }
             'p' | 'P' => {
                 self.pos += 1; // `p`/`P`
-                let prop = self.parse_property()?;
+                let prop = self.parse_property(e == 'P')?;
                 Ok(ClassSetExpr::Items(alloc::vec![ClassItem::Shorthand(
                     Shorthand::Property(prop, e == 'P'),
                 )]))
