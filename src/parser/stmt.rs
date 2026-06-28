@@ -768,7 +768,18 @@ impl<'src> Parser<'src> {
             return self.parse_for_using_head();
         }
 
-        if let Some(kind) = var_kind(self.peek()) {
+        // `let` heads a lexical declaration in a `for` header only when followed
+        // by a binding (`let x`, `let [`, `let {`); otherwise (sloppy code) it is
+        // an ordinary `LeftHandSideExpression` identifier — `for (let in obj)`,
+        // `for (let.x of y)`. (`var`/`const` always require a binding.) Strict-mode
+        // misuse of bare `let` is caught later by the identifier-reference
+        // validator. `let [` is always a declaration per the grammar lookahead.
+        let kind = var_kind(self.peek()).filter(|k| {
+            *k != VarDeclKind::Let
+                || matches!(self.nth_kind(1), TokenKind::LBracket | TokenKind::LBrace)
+                || self.nth_is_binding_ident(1)
+        });
+        if let Some(kind) = kind {
             let kw = self.bump();
             let target = self.parse_binding_target()?;
             if self.eat(TokenKind::Keyword(Kw::In)) {
