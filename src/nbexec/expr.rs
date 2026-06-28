@@ -2854,20 +2854,29 @@ impl<'a> Interp<'a> {
         {
             return self.regex_write_last_index(handle, new);
         }
-        // `obj.__proto__ = proto` updates the prototype link (like
-        // `Object.setPrototypeOf`); a non-object, non-null value is ignored.
+        // `obj.__proto__ = proto` invokes the inherited `set __proto__` accessor
+        // (Annex B), which performs `O.[[SetPrototypeOf]]` like
+        // `Object.setPrototypeOf` — a non-object, non-null value is ignored, and a
+        // failed set (non-extensible object, or a prototype cycle) throws a
+        // TypeError. The magic only applies when the object actually inherits
+        // `Object.prototype`'s accessor and has no own `__proto__` data property;
+        // otherwise the write falls through to an ordinary property assignment.
         if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property
             && &**s == "__proto__"
+            && !self.realm.has_own(handle, "__proto__")
+            && self.realm.inherits_object_proto(handle)
         {
-            match new.unpack() {
-                Unpacked::Null => {
-                    self.realm.set_object_proto(handle, None);
-                }
-                _ => {
-                    if let Some(p) = new.as_handle().map(Handle::from_raw) {
-                        self.realm.set_object_proto(handle, Some(p));
-                    }
-                }
+            let proto = match new.unpack() {
+                Unpacked::Null => Some(None),
+                _ if self.is_object_value(new) => Some(new.as_handle().map(Handle::from_raw)),
+                _ => None,
+            };
+            if let Some(p) = proto
+                && !self.set_proto_of(handle, p)?
+            {
+                return Err(self.type_error(
+                    "Object.prototype.__proto__: cannot set prototype of this object",
+                ));
             }
             return Ok(());
         }

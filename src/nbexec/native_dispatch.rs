@@ -1702,15 +1702,21 @@ impl<'a> Interp<'a> {
                     .map(Handle::from_raw)
                     .filter(|_| self.is_object_value(this))
                 {
-                    match v.unpack() {
-                        Unpacked::Null => {
-                            self.set_proto_of(oh, None)?;
-                        }
-                        _ if self.is_object_value(v) => {
-                            let p = v.as_handle().map(Handle::from_raw);
-                            self.set_proto_of(oh, p)?;
-                        }
-                        _ => {}
+                    // Per spec, a failed [[SetPrototypeOf]] (a non-extensible
+                    // object, or a change that would create a prototype cycle)
+                    // throws a TypeError. The setter only acts when V is Null or an
+                    // Object; any other value is silently ignored.
+                    let proto = match v.unpack() {
+                        Unpacked::Null => Some(None),
+                        _ if self.is_object_value(v) => Some(v.as_handle().map(Handle::from_raw)),
+                        _ => None,
+                    };
+                    if let Some(p) = proto
+                        && !self.set_proto_of(oh, p)?
+                    {
+                        return Err(self.type_error(
+                            "Object.prototype.__proto__: cannot set prototype of this object",
+                        ));
                     }
                 }
                 NanBox::undefined()
