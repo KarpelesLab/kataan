@@ -1488,6 +1488,34 @@ impl<'a> Interp<'a> {
             }
             return Ok(Some(NanBox::handle(map.to_raw())));
         }
+        // `Promise.resolve` / `Promise.reject` invoked with a *custom* constructor
+        // receiver (`Promise.resolve.call(C)`, a subclass, or a foreign thenable
+        // constructor) go through `NewPromiseCapability(C)` per spec — so `C` is
+        // constructed with a spec-shaped executor (length 2, name ""). The native
+        // `%Promise%` keeps its fast path below.
+        if matches!(method, "resolve" | "reject")
+            && self.realm.native_at(handle) != Some(N_PROMISE)
+            && self.is_constructor(recv)
+        {
+            // PromiseResolve is idempotent: a promise whose `.constructor` is `C`
+            // is returned unchanged.
+            if method == "resolve"
+                && let Some(raw) = arg(0).as_handle()
+                && self.realm.promise_state(Handle::from_raw(raw)).is_some()
+            {
+                let ctor = self.read_member(Handle::from_raw(raw), "constructor")?;
+                if ctor.as_handle() == recv.as_handle() {
+                    return Ok(Some(arg(0)));
+                }
+            }
+            let cap = self.new_promise_capability(recv)?;
+            if method == "resolve" {
+                self.call(cap.resolve, &[arg(0)])?;
+            } else {
+                self.call(cap.reject, &[arg(0)])?;
+            }
+            return Ok(Some(cap.promise));
+        }
         // --- `Promise.resolve` / `Promise.reject` statics (on the constructor) ---
         if self.realm.native_at(handle) == Some(N_PROMISE) {
             match method {
