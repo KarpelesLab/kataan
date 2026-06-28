@@ -121,6 +121,19 @@ impl Scope {
         self.0.borrow().vars.contains_key(name)
     }
 
+    /// The scope frame that currently binds `name` (the innermost one whose own
+    /// bindings include it), walking outward. `None` if no lexical frame binds it
+    /// (e.g. it lives only as a global-object property). Used to capture a
+    /// declarative reference *before* a side-effecting RHS, so a binding created
+    /// mid-RHS (by direct `eval`) cannot hijack the write target.
+    #[must_use]
+    pub fn owner_frame(&self, name: &str) -> Option<Scope> {
+        if self.has_local(name) {
+            return Some(self.clone());
+        }
+        self.parent().and_then(|p| p.owner_frame(name))
+    }
+
     /// Looks up `name`, walking outward through enclosing scopes.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<NanBox> {

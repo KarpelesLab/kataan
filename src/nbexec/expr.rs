@@ -2660,6 +2660,55 @@ impl<'a> Interp<'a> {
             self.assign_member(handle, property, new)?;
             return Ok(new);
         }
+        // A *compound* assignment to a bare identifier follows spec reference
+        // order: evaluate `lref` and read `lval = GetValue(lref)` *before* the
+        // RHS, then `PutValue(lref, …)` using that same reference. Capturing the
+        // binding's scope frame up front matters when the RHS has a side effect
+        // that introduces a more-local binding of the same name — e.g. a direct
+        // `eval("var x = …")` inside the RHS: the write must still target the
+        // originally-resolved (outer) binding, and the new local only shows
+        // through to *later* reads.
+        if op != AssignOp::Assign && let Expr::Ident(id) = target {
+            let name = &*id.name;
+            // A `with`-object binding (captured before the RHS so the object's
+            // current value is read first and a setter fires on write).
+            if let Some(h) = self.with_binding(name) {
+                let current = self.read_member(h, name)?;
+                let rhs = self.eval(value)?;
+                let new = self.binary(compound_op(op)?, current, rhs)?;
+                let key = self.new_str(name);
+                self.assign_member_value(h, key, new)?;
+                return Ok(new);
+            }
+            // An imported binding is immutable (module code is strict): error
+            // before running the RHS, matching the plain-assign path.
+            #[cfg(all(feature = "module", feature = "std"))]
+            if self.module_imports.contains_key(name) && self.current.get(name).is_none() {
+                let m = self.new_str("Assignment to constant variable.");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            if self.current.is_const(name) {
+                let m = self.new_str("Assignment to constant variable.");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            // Capture the declarative reference (owning scope frame) *now*.
+            let frame = self.current.owner_frame(name);
+            let current = self.read_ident_ref(name)?;
+            let rhs = self.eval(value)?;
+            let new = self.binary(compound_op(op)?, current, rhs)?;
+            if let Some(fr) = frame {
+                fr.declare(name, new);
+            } else if !self.current.set(name, new) {
+                if self.strict {
+                    let m = self.new_str(&alloc::format!("{name} is not defined"));
+                    return Err(ExecError::Throw(
+                        self.make_error(N_REFERENCE_ERROR, Some(m)),
+                    ));
+                }
+                self.declare_sloppy_global(name, new);
+            }
+            return Ok(new);
+        }
         // For `name = class {}`, hand the LHS name to `make_class` so an anonymous
         // class's `name` is set before its static initializers run.
         if op == AssignOp::Assign
