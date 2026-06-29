@@ -1337,8 +1337,11 @@ impl<'a> Interp<'a> {
         if self.current_home.is_none()
             && let Some(home) = self.current_home_object
         {
+            // GetSuperBase = HomeObject.[[GetPrototypeOf]](); ? RequireObjectCoercible
+            // throws a TypeError when the home object's prototype is null (e.g.
+            // `Object.setPrototypeOf(obj, null)` before `super.x` in `obj.method`).
             let Some(proto) = self.realm.object_proto(home) else {
-                return Ok(NanBox::undefined());
+                return Err(self.type_error("Cannot read property of null (super)"));
             };
             if let Some((getter, _)) = self.realm.accessor(proto, name) {
                 if matches!(getter.unpack(), Unpacked::Undefined) {
