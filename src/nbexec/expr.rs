@@ -485,7 +485,11 @@ impl<'a> Interp<'a> {
                                                 }
                                             }
                                         } else {
-                                            self.realm.delete_property(target, &name);
+                                            // No `deleteProperty` trap: forward
+                                            // `[[Delete]]` to the target — which may
+                                            // itself be a proxy, so recurse rather than
+                                            // doing an ordinary delete on it.
+                                            result = self.delete_property_of(target, &name)?;
                                         }
                                     } else if self.realm.typed_kind(h).is_some()
                                         && let Some(n) = canonical_numeric_index(&name)
@@ -3490,58 +3494,13 @@ impl<'a> Interp<'a> {
                 if let Some(h) = b.as_handle().map(Handle::from_raw) {
                     self.trigger_deferred_in_chain(h, &key)?;
                 }
+                // The full `[[HasProperty]]`: a proxy `has` trap (or forwarding to
+                // the target — which may itself be a proxy), typed-array integer
+                // indices, and an ordinary own-or-inherited (accessor-aware) chain
+                // walk. Delegating keeps the `in` operator consistent with member
+                // lookup instead of re-deriving (and previously mis-deriving) it.
                 let present = match b.as_handle().map(Handle::from_raw) {
-                    // Proxy `has` trap, or forward to the target.
-                    Some(h) if self.realm.proxy_at(h).is_some() => {
-                        let (target, handler) = self.realm.proxy_at(h).unwrap();
-                        self.guard_revoked(h)?;
-                        if let Some(trap) = self.proxy_trap(handler, "has")? {
-                            let kb = self.new_str(&key);
-                            let r = self.call(trap, &[NanBox::handle(target.to_raw()), kb])?;
-                            self.realm.truthy(r)
-                        } else {
-                            self.realm.has_own(target, &key) || self.realm.is_array(target)
-                        }
-                    }
-                    // Integer-indexed exotic `[[HasProperty]]`: for a typed array, a
-                    // canonical numeric index reports `IsValidIntegerIndex` and the
-                    // prototype chain is **not** consulted; any other key falls through
-                    // to ordinary `[[HasProperty]]` (own + inherited).
-                    Some(h)
-                        if self.realm.typed_kind(h).is_some()
-                            && canonical_numeric_index(&key).is_some() =>
-                    {
-                        let n = canonical_numeric_index(&key).unwrap();
-                        let detached = self.typed_array_detached(h);
-                        let is_neg_zero = n == 0.0 && n.is_sign_negative();
-                        !detached
-                            && !is_neg_zero
-                            && n == (n as i64) as f64
-                            && n >= 0.0
-                            && self
-                                .realm
-                                .typed_len(h)
-                                .is_some_and(|len| (n as usize) < len)
-                    }
-                    Some(h) => {
-                        // `key in obj` is true for an own *or inherited* property
-                        // (walk the prototype chain); arrays also report in-bounds
-                        // indices and `length`.
-                        let in_chain = || {
-                            let mut cur = Some(h);
-                            while let Some(c) = cur {
-                                if self.realm.has_own(c, &key) {
-                                    return true;
-                                }
-                                cur = self.realm.object_proto(c);
-                            }
-                            false
-                        };
-                        // `has_own` already reports an array's in-range non-hole
-                        // indices and `length`, so the chain walk suffices (a hole
-                        // is absent unless inherited).
-                        in_chain()
-                    }
+                    Some(h) => self.has_property_proxied(h, &key)?,
                     None => false,
                 };
                 NanBox::boolean(present)
