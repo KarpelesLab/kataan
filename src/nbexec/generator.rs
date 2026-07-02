@@ -249,6 +249,12 @@ enum Step<'a> {
     /// stays there as the expression's result); begin destructuring it into
     /// `target` without disturbing that result.
     DestructureStart { target: &'a Expr },
+    /// A member destructuring leaf `obj[key] = value` whose computed `key` may
+    /// yield: the base object is on the value stack; evaluate `key`, then assign.
+    DestructureMemberKey { key: &'a Expr, value: NanBox },
+    /// Complete `obj[key] = value`: the base object and (on top) the key are on the
+    /// value stack; assign `value` through them.
+    DestructureMemberSet { value: NanBox },
 }
 
 /// A completion threaded through the unwinder.
@@ -1506,6 +1512,21 @@ impl<'a> Interp<'a> {
                 });
                 Ok(StepOut::Continue)
             }
+            Step::DestructureMemberKey { key, value } => {
+                // The base object is on the value stack (kept there); evaluate the
+                // computed key on top of it, then assign.
+                stack.push(Step::DestructureMemberSet { value });
+                self.gen_eval_expr(key, stack, values)
+            }
+            Step::DestructureMemberSet { value } => {
+                let key = values.pop().unwrap_or(NanBox::undefined());
+                let objval = values.pop().unwrap_or(NanBox::undefined());
+                if let Some(raw) = objval.as_handle() {
+                    self.assign_member_value(Handle::from_raw(raw), key, value)
+                        .map_err(GenAbrupt::from)?;
+                }
+                Ok(StepOut::Continue)
+            }
             Step::AssignName { name } => {
                 let v = *values.last().unwrap_or(&NanBox::undefined());
                 self.assign_to_name(name, v).map_err(GenAbrupt::from)?;
@@ -1945,7 +1966,19 @@ impl<'a> Interp<'a> {
                     Ok(StepOut::Continue)
                 }
             }
-            // A leaf target (identifier or member reference).
+            // A member leaf whose computed key (or base) contains a yield, e.g.
+            // `[ x[yield] ] = vals` — evaluate base then key step-by-step, then
+            // assign. A plain / static member leaf has no reachable yield and takes
+            // the fast path below.
+            Expr::Member {
+                object,
+                property: PropertyKey::Computed(key),
+                ..
+            } if expr_has_yield(object) || expr_has_yield(key) => {
+                stack.push(Step::DestructureMemberKey { key, value });
+                self.gen_eval_expr(object, stack, values)
+            }
+            // A leaf target (identifier or static member reference).
             _ => {
                 self.assign_to(target, value).map_err(GenAbrupt::from)?;
                 Ok(StepOut::Continue)
