@@ -219,6 +219,36 @@ enum Step<'a> {
         idx: usize,
         target: Handle,
     },
+    /// Destructure `value` into assignment `target` (an array/object pattern, a
+    /// defaulted target, or a leaf) — a `yield` in a default initializer suspends.
+    /// The iterator pull / property reads themselves are synchronous.
+    Destructure {
+        target: &'a Expr,
+        value: NanBox,
+    },
+    /// Destructure `elements[idx..]` of an array pattern from the pre-iterated
+    /// `items`; `i` is the source index consumed so far (holes advance it).
+    DestructureArrayElem {
+        elements: &'a [ArrayElement],
+        idx: usize,
+        i: usize,
+        items: Vec<NanBox>,
+    },
+    /// Destructure `members[idx..]` of an object pattern from source object `src`;
+    /// `used` records keys already consumed (for a `...rest`).
+    DestructureObjectMember {
+        members: &'a [ObjectMember],
+        idx: usize,
+        src: Handle,
+        used: Vec<String>,
+    },
+    /// A defaulted destructuring target whose default value (just evaluated, on the
+    /// value stack) replaces an `undefined` source; then destructure `inner`.
+    DestructureDefault { inner: &'a Expr },
+    /// Top of a destructuring assignment: the RHS value is on the value stack (and
+    /// stays there as the expression's result); begin destructuring it into
+    /// `target` without disturbing that result.
+    DestructureStart { target: &'a Expr },
 }
 
 /// A completion threaded through the unwinder.
@@ -1355,6 +1385,127 @@ impl<'a> Interp<'a> {
                 });
                 Ok(StepOut::Continue)
             }
+            Step::DestructureStart { target } => {
+                // The RHS result is on top of the value stack; leave it there and
+                // destructure a copy into `target`.
+                let rval = *values.last().unwrap_or(&NanBox::undefined());
+                stack.push(Step::Destructure {
+                    target,
+                    value: rval,
+                });
+                Ok(StepOut::Continue)
+            }
+            Step::Destructure { target, value } => {
+                self.gen_destructure(target, value, stack, values)
+            }
+            Step::DestructureArrayElem {
+                elements,
+                idx,
+                i,
+                items,
+            } => {
+                if idx >= elements.len() {
+                    return Ok(StepOut::Continue);
+                }
+                match &elements[idx] {
+                    ArrayElement::Hole => {
+                        stack.push(Step::DestructureArrayElem {
+                            elements,
+                            idx: idx + 1,
+                            i: i + 1,
+                            items,
+                        });
+                        Ok(StepOut::Continue)
+                    }
+                    ArrayElement::Item(e) => {
+                        let v = items.get(i).copied().unwrap_or(NanBox::undefined());
+                        stack.push(Step::DestructureArrayElem {
+                            elements,
+                            idx: idx + 1,
+                            i: i + 1,
+                            items,
+                        });
+                        stack.push(Step::Destructure { target: e, value: v });
+                        Ok(StepOut::Continue)
+                    }
+                    ArrayElement::Spread(e) => {
+                        let rest = items[i.min(items.len())..].to_vec();
+                        let h = NanBox::handle(self.realm.new_array(rest).to_raw());
+                        stack.push(Step::DestructureArrayElem {
+                            elements,
+                            idx: idx + 1,
+                            i: items.len(),
+                            items,
+                        });
+                        stack.push(Step::Destructure { target: e, value: h });
+                        Ok(StepOut::Continue)
+                    }
+                }
+            }
+            Step::DestructureObjectMember {
+                members,
+                idx,
+                src,
+                mut used,
+            } => {
+                if idx >= members.len() {
+                    return Ok(StepOut::Continue);
+                }
+                match &members[idx] {
+                    ObjectMember::Property {
+                        key, value: tgt, ..
+                    } => {
+                        let k = self.eval_prop_key(key).map_err(GenAbrupt::from)?;
+                        let v = self.read_member(src, &k).map_err(GenAbrupt::from)?;
+                        used.push(k);
+                        stack.push(Step::DestructureObjectMember {
+                            members,
+                            idx: idx + 1,
+                            src,
+                            used,
+                        });
+                        stack.push(Step::Destructure { target: tgt, value: v });
+                        Ok(StepOut::Continue)
+                    }
+                    ObjectMember::Spread { value: tgt, .. } => {
+                        let obj = self.realm.new_object();
+                        for k in self.realm.object_keys(src).unwrap_or_default() {
+                            if !used.contains(&k) {
+                                let pv = self.read_member(src, &k).map_err(GenAbrupt::from)?;
+                                self.realm.set_property(obj, &k, pv);
+                            }
+                        }
+                        let h = NanBox::handle(obj.to_raw());
+                        stack.push(Step::DestructureObjectMember {
+                            members,
+                            idx: idx + 1,
+                            src,
+                            used,
+                        });
+                        stack.push(Step::Destructure { target: tgt, value: h });
+                        Ok(StepOut::Continue)
+                    }
+                    ObjectMember::Accessor { .. } => {
+                        stack.push(Step::DestructureObjectMember {
+                            members,
+                            idx: idx + 1,
+                            src,
+                            used,
+                        });
+                        Ok(StepOut::Continue)
+                    }
+                }
+            }
+            Step::DestructureDefault { inner } => {
+                // The default value (evaluated because the source was `undefined`)
+                // is on top of the value stack.
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                stack.push(Step::Destructure {
+                    target: inner,
+                    value: v,
+                });
+                Ok(StepOut::Continue)
+            }
             Step::AssignName { name } => {
                 let v = *values.last().unwrap_or(&NanBox::undefined());
                 self.assign_to_name(name, v).map_err(GenAbrupt::from)?;
@@ -1737,6 +1888,71 @@ impl<'a> Interp<'a> {
     /// Lowers an expression that may contain a `yield` into machine steps that
     /// leave its value on the value stack. A yield-free expression is evaluated
     /// in one shot via the ordinary `eval`.
+    /// One level of destructuring-assignment evaluation for the step-machine,
+    /// mirroring [`Interp::assign_destructure`] but reified so a `yield` in a
+    /// default initializer suspends. The iterator pull and property reads are
+    /// synchronous (they cannot contain a reachable yield in the covered cases).
+    fn gen_destructure(
+        &mut self,
+        target: &'a Expr,
+        value: NanBox,
+        stack: &mut Vec<Step<'a>>,
+        values: &mut Vec<NanBox>,
+    ) -> StepResult {
+        match target {
+            Expr::Array { elements, .. } => {
+                let items = self.iterate_values(value).map_err(GenAbrupt::from)?;
+                stack.push(Step::DestructureArrayElem {
+                    elements,
+                    idx: 0,
+                    i: 0,
+                    items,
+                });
+                Ok(StepOut::Continue)
+            }
+            Expr::Object { members, .. } => {
+                if matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    let m = self.new_str("Cannot destructure 'null' or 'undefined' as an object");
+                    return Err(GenAbrupt::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                let src = self
+                    .require_object_coercible_to_object(value, "destructuring")
+                    .map_err(GenAbrupt::from)?;
+                stack.push(Step::DestructureObjectMember {
+                    members,
+                    idx: 0,
+                    src,
+                    used: Vec::new(),
+                });
+                Ok(StepOut::Continue)
+            }
+            // A defaulted target (`a = <default>`): use the default (which may
+            // yield) only when the source value is `undefined`.
+            Expr::Assign {
+                op: crate::ast::AssignOp::Assign,
+                target: inner,
+                value: default_expr,
+                ..
+            } => {
+                if matches!(value.unpack(), Unpacked::Undefined) {
+                    stack.push(Step::DestructureDefault { inner });
+                    self.gen_eval_expr(default_expr, stack, values)
+                } else {
+                    stack.push(Step::Destructure {
+                        target: inner,
+                        value,
+                    });
+                    Ok(StepOut::Continue)
+                }
+            }
+            // A leaf target (identifier or member reference).
+            _ => {
+                self.assign_to(target, value).map_err(GenAbrupt::from)?;
+                Ok(StepOut::Continue)
+            }
+        }
+    }
+
     fn gen_eval_expr(
         &mut self,
         expr: &'a Expr,
@@ -1799,6 +2015,18 @@ impl<'a> Interp<'a> {
                 if let Expr::Ident(Ident { name, .. }) = &**target {
                     stack.push(Step::AssignName { name });
                 }
+                self.gen_eval_expr(value, stack, values)
+            }
+            // `[ x = yield ] = rhs` / `{ x = yield } = rhs` — destructuring
+            // assignment where a `yield` hides in a default initializer (or the
+            // RHS). Evaluate the RHS, then destructure step-by-step so a default's
+            // yield suspends. The RHS value is left on the stack as the result.
+            Expr::Assign {
+                op, target, value, ..
+            } if matches!(op, crate::ast::AssignOp::Assign)
+                && matches!(&**target, Expr::Array { .. } | Expr::Object { .. }) =>
+            {
+                stack.push(Step::DestructureStart { target });
                 self.gen_eval_expr(value, stack, values)
             }
             // `left <op> right` where a yield hides in an operand. The `#x in obj`
