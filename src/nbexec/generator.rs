@@ -255,6 +255,12 @@ enum Step<'a> {
     /// Complete `obj[key] = value`: the base object and (on top) the key are on the
     /// value stack; assign `value` through them.
     DestructureMemberSet { value: NanBox },
+    /// Run a `for-of`/`for-in` loop body after its (possibly yield-suspending)
+    /// per-iteration target binding has completed.
+    RunLoopBody {
+        body: &'a Stmt,
+        label: Option<String>,
+    },
 }
 
 /// A completion threaded through the unwinder.
@@ -849,8 +855,17 @@ fn stmt_has_yield(s: &Stmt) -> bool {
             let _ = (right, body);
             true
         }
-        Stmt::ForIn { right, body, .. } | Stmt::ForOf { right, body, .. } => {
-            expr_has_yield(right) || stmt_has_yield(body)
+        Stmt::ForIn {
+            left, right, body, ..
+        }
+        | Stmt::ForOf {
+            left, right, body, ..
+        } => {
+            // A yield can also hide in an assignment-target pattern's default/key
+            // (`for ([ x = yield ] of …)`), which is bound per iteration.
+            matches!(left, ForLeft::Target(e) if expr_has_yield(e))
+                || expr_has_yield(right)
+                || stmt_has_yield(body)
         }
         Stmt::While { test, body, .. } => expr_has_yield(test) || stmt_has_yield(body),
         Stmt::DoWhile { body, test, .. } => stmt_has_yield(body) || expr_has_yield(test),
@@ -1184,6 +1199,19 @@ impl<'a> Interp<'a> {
                 let child = self.current.child();
                 let prev = core::mem::replace(&mut self.current, child);
                 stack.push(Step::PopScope { scope: prev });
+                // `for ([ x = yield ] of …)` — an assignment-target pattern whose
+                // default/key yields: destructure through the step-machine (so the
+                // yield suspends), then run the body via a deferred step.
+                if let ForLeft::Target(expr) = left
+                    && expr_has_yield(expr)
+                {
+                    stack.push(Step::RunLoopBody { body, label });
+                    stack.push(Step::Destructure {
+                        target: expr,
+                        value: item,
+                    });
+                    return Ok(StepOut::Continue);
+                }
                 match left {
                     ForLeft::Decl { target, .. } => {
                         self.bind_pattern(target, item).map_err(GenAbrupt::from)?;
@@ -1526,6 +1554,9 @@ impl<'a> Interp<'a> {
                         .map_err(GenAbrupt::from)?;
                 }
                 Ok(StepOut::Continue)
+            }
+            Step::RunLoopBody { body, label } => {
+                self.gen_exec_loop_body(body, stack, values, &label)
             }
             Step::AssignName { name } => {
                 let v = *values.last().unwrap_or(&NanBox::undefined());
