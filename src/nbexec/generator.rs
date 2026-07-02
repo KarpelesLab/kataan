@@ -28,8 +28,8 @@
 
 use super::*;
 use crate::ast::{
-    Argument, BindingTarget, CatchClause, Expr, ForInit, ForLeft, Ident, LogicalOp, Stmt,
-    SwitchCase, VarDeclKind,
+    Argument, ArrayElement, BindingTarget, CatchClause, Expr, ForInit, ForLeft, Ident, LogicalOp,
+    Stmt, SwitchCase, VarDeclKind,
 };
 
 /// How a generator is being resumed.
@@ -181,6 +181,21 @@ enum Step<'a> {
     EvalThen { expr: &'a Expr },
     /// Combine the top two stack values with `op` (left below, right on top).
     BinaryOp { op: crate::ast::BinaryOp },
+    /// Build an array literal: `elements[idx..]` remain to evaluate; `acc` holds
+    /// the values gathered so far. On reaching the end a new array is pushed.
+    ArrayLit {
+        elements: &'a [ArrayElement],
+        idx: usize,
+        acc: Vec<NanBox>,
+    },
+    /// Append the top value to an array-literal accumulator (spreading it when the
+    /// element was `...spread`), then continue with the next element.
+    ArrayLitAppend {
+        elements: &'a [ArrayElement],
+        idx: usize,
+        acc: Vec<NanBox>,
+        spread: bool,
+    },
 }
 
 /// A completion threaded through the unwinder.
@@ -1166,6 +1181,67 @@ impl<'a> Interp<'a> {
                 values.push(v);
                 Ok(StepOut::Continue)
             }
+            Step::ArrayLit {
+                elements,
+                idx,
+                acc,
+            } => {
+                if idx >= elements.len() {
+                    let h = self.realm.new_array(acc);
+                    values.push(NanBox::handle(h.to_raw()));
+                    return Ok(StepOut::Continue);
+                }
+                match &elements[idx] {
+                    ArrayElement::Hole => {
+                        let mut acc = acc;
+                        acc.push(NanBox::hole());
+                        stack.push(Step::ArrayLit {
+                            elements,
+                            idx: idx + 1,
+                            acc,
+                        });
+                        Ok(StepOut::Continue)
+                    }
+                    ArrayElement::Item(e) => {
+                        stack.push(Step::ArrayLitAppend {
+                            elements,
+                            idx,
+                            acc,
+                            spread: false,
+                        });
+                        self.gen_eval_expr(e, stack, values)
+                    }
+                    ArrayElement::Spread(e) => {
+                        stack.push(Step::ArrayLitAppend {
+                            elements,
+                            idx,
+                            acc,
+                            spread: true,
+                        });
+                        self.gen_eval_expr(e, stack, values)
+                    }
+                }
+            }
+            Step::ArrayLitAppend {
+                elements,
+                idx,
+                mut acc,
+                spread,
+            } => {
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                if spread {
+                    let items = self.iterate_values(v).map_err(GenAbrupt::from)?;
+                    acc.extend(items);
+                } else {
+                    acc.push(v);
+                }
+                stack.push(Step::ArrayLit {
+                    elements,
+                    idx: idx + 1,
+                    acc,
+                });
+                Ok(StepOut::Continue)
+            }
             Step::AssignName { name } => {
                 let v = *values.last().unwrap_or(&NanBox::undefined());
                 self.assign_to_name(name, v).map_err(GenAbrupt::from)?;
@@ -1623,11 +1699,21 @@ impl<'a> Interp<'a> {
                 stack.push(Step::EvalThen { expr: right });
                 self.gen_eval_expr(left, stack, values)
             }
-            // Any other yield-bearing expression shape (e.g. `a + (yield b)`,
-            // calls/arrays with a yield argument) is not individually reified;
-            // fall back to one-shot eval. The yield-free fast path above means
-            // this only runs for genuinely yield-bearing complex operands, which
-            // are a documented follow-up.
+            // `[a, yield b, ...yield c]` — evaluate each element step-by-step so a
+            // yield in any position (including a spread operand) suspends.
+            Expr::Array { elements, .. } => {
+                stack.push(Step::ArrayLit {
+                    elements,
+                    idx: 0,
+                    acc: Vec::new(),
+                });
+                Ok(StepOut::Continue)
+            }
+            // Any other yield-bearing expression shape (e.g. `f(yield b)`,
+            // a member/computed access, compound/destructuring assignment) is not
+            // individually reified; fall back to one-shot eval. The yield-free fast
+            // path above means this only runs for genuinely yield-bearing complex
+            // operands, which are a documented follow-up.
             _ => {
                 let v = self.eval(expr).map_err(GenAbrupt::from)?;
                 values.push(v);
