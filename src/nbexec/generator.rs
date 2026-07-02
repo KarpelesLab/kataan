@@ -29,7 +29,7 @@
 use super::*;
 use crate::ast::{
     Argument, ArrayElement, BindingTarget, CatchClause, Expr, ForInit, ForLeft, Ident, LogicalOp,
-    Stmt, SwitchCase, VarDeclKind,
+    ObjectMember, PropertyKey, Stmt, SwitchCase, VarDeclKind,
 };
 
 /// How a generator is being resumed.
@@ -195,6 +195,29 @@ enum Step<'a> {
         idx: usize,
         acc: Vec<NanBox>,
         spread: bool,
+    },
+    /// Build an object literal step-by-step onto `target`: `members[idx..]` remain.
+    /// Only entered for objects whose members are all data properties (static key,
+    /// non-function value) or spreads — see `object_lit_steppable`.
+    ObjectLit {
+        members: &'a [ObjectMember],
+        idx: usize,
+        target: Handle,
+    },
+    /// Set the just-evaluated value (top of stack) as own property `key` of
+    /// `target`, then continue with the next object-literal member.
+    ObjectLitSet {
+        members: &'a [ObjectMember],
+        idx: usize,
+        target: Handle,
+        key: String,
+    },
+    /// Spread the just-evaluated value (top of stack) into `target`
+    /// (CopyDataProperties), then continue with the next member.
+    ObjectLitSpread {
+        members: &'a [ObjectMember],
+        idx: usize,
+        target: Handle,
     },
 }
 
@@ -903,6 +926,34 @@ fn key_has_yield(k: &crate::ast::PropertyKey) -> bool {
     matches!(k, crate::ast::PropertyKey::Computed(e) if expr_has_yield(e))
 }
 
+/// Whether an object literal can be built by the generator step-machine: every
+/// member must be a spread or a plain data property with a *static* key and a
+/// *non-function* value (and not the `__proto__:` prototype setter). Methods,
+/// accessors, computed keys, function-valued props, and `__proto__` need
+/// name/home/proto handling — and never reach a `yield` in their own value — so
+/// such objects defer to the one-shot `eval` fast path instead.
+fn object_lit_steppable(members: &[ObjectMember]) -> bool {
+    members.iter().all(|m| match m {
+        ObjectMember::Spread { .. } => true,
+        ObjectMember::Property {
+            key,
+            value,
+            shorthand,
+            ..
+        } => {
+            let static_key = !matches!(key, PropertyKey::Computed(_));
+            let fn_valued = matches!(
+                &**value,
+                Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_)
+            );
+            let proto_setter = !shorthand
+                && matches!(key, PropertyKey::Ident(s) if &**s == "__proto__");
+            static_key && !fn_valued && !proto_setter
+        }
+        ObjectMember::Accessor { .. } => false,
+    })
+}
+
 // --- the stepping machine ----------------------------------------------------
 
 impl<'a> Interp<'a> {
@@ -1239,6 +1290,68 @@ impl<'a> Interp<'a> {
                     elements,
                     idx: idx + 1,
                     acc,
+                });
+                Ok(StepOut::Continue)
+            }
+            Step::ObjectLit {
+                members,
+                idx,
+                target,
+            } => {
+                if idx >= members.len() {
+                    values.push(NanBox::handle(target.to_raw()));
+                    return Ok(StepOut::Continue);
+                }
+                match &members[idx] {
+                    ObjectMember::Property { key, value, .. } => {
+                        // `object_lit_steppable` guarantees a static key here.
+                        let k = self.eval_prop_key(key).map_err(GenAbrupt::from)?;
+                        stack.push(Step::ObjectLitSet {
+                            members,
+                            idx,
+                            target,
+                            key: k,
+                        });
+                        self.gen_eval_expr(value, stack, values)
+                    }
+                    ObjectMember::Spread { value, .. } => {
+                        stack.push(Step::ObjectLitSpread {
+                            members,
+                            idx,
+                            target,
+                        });
+                        self.gen_eval_expr(value, stack, values)
+                    }
+                    // Excluded by `object_lit_steppable`.
+                    ObjectMember::Accessor { .. } => unreachable!(),
+                }
+            }
+            Step::ObjectLitSet {
+                members,
+                idx,
+                target,
+                key,
+            } => {
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                self.realm.set_property(target, &key, v);
+                stack.push(Step::ObjectLit {
+                    members,
+                    idx: idx + 1,
+                    target,
+                });
+                Ok(StepOut::Continue)
+            }
+            Step::ObjectLitSpread {
+                members,
+                idx,
+                target,
+            } => {
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                self.object_spread_into(target, v).map_err(GenAbrupt::from)?;
+                stack.push(Step::ObjectLit {
+                    members,
+                    idx: idx + 1,
+                    target,
                 });
                 Ok(StepOut::Continue)
             }
@@ -1706,6 +1819,21 @@ impl<'a> Interp<'a> {
                     elements,
                     idx: 0,
                     acc: Vec::new(),
+                });
+                Ok(StepOut::Continue)
+            }
+            // `{ a: yield b, ...yield s }` — step through members so a yield in a
+            // data value or spread operand suspends. Restricted to plain
+            // data-property (static key, non-function value) and spread members;
+            // methods/accessors/computed-keys/`__proto__`/function-valued props
+            // (which need name/home/proto handling and never reach a yield in their
+            // own value) defer to the one-shot fast path below.
+            Expr::Object { members, .. } if object_lit_steppable(members) => {
+                let target = self.realm.new_object();
+                stack.push(Step::ObjectLit {
+                    members,
+                    idx: 0,
+                    target,
                 });
                 Ok(StepOut::Continue)
             }

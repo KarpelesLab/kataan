@@ -1165,32 +1165,7 @@ impl<'a> Interp<'a> {
                         // `{ ...src }` — copy own enumerable properties.
                         ObjectMember::Spread { value, .. } => {
                             let src = self.eval(value)?;
-                            if let Some(sh) = src.as_handle().map(Handle::from_raw) {
-                                // Spreading an array/string copies its indexed
-                                // elements as `"0"`, `"1"`, … properties.
-                                if let Some(elems) =
-                                    self.realm.array_elements(sh).map(<[_]>::to_vec)
-                                {
-                                    for (i, e) in elems.iter().enumerate() {
-                                        self.realm.set_property(handle, &alloc::format!("{i}"), *e);
-                                    }
-                                } else if let Some(s) = self.realm.string_value(sh) {
-                                    for (i, c) in s.chars().enumerate() {
-                                        let cv = self.new_str(&alloc::string::String::from(c));
-                                        self.realm.set_property(handle, &alloc::format!("{i}"), cv);
-                                    }
-                                } else {
-                                    // Own enumerable string + symbol keys (and
-                                    // accessor getters); the raw key preserves
-                                    // symbol identity.
-                                    let keys = self.realm.object_keys_with_symbols(sh);
-                                    for key in keys {
-                                        // `read_member` invokes a getter where present.
-                                        let pv = self.read_member(sh, &key)?;
-                                        self.realm.set_property(handle, &key, pv);
-                                    }
-                                }
-                            }
+                            self.object_spread_into(handle, src)?;
                         }
                         // `{ get x() {} }` / `{ set x(v) {} }`.
                         ObjectMember::Accessor {
@@ -1537,6 +1512,38 @@ impl<'a> Interp<'a> {
         }
         let name = self.member_key(key);
         self.read_member(handle, &name)
+    }
+
+    /// `{ ...src }` — copy `src`'s own enumerable properties onto `target`
+    /// (CopyDataProperties). Spreading an array/string copies its indexed elements
+    /// as `"0"`, `"1"`, … properties; any other object copies its own enumerable
+    /// string + symbol keys (invoking getters); a primitive is a no-op. Shared by
+    /// the object-literal evaluator and the generator step-machine.
+    pub(crate) fn object_spread_into(
+        &mut self,
+        target: crate::heap::Handle,
+        src: NanBox,
+    ) -> Result<(), ExecError> {
+        if let Some(sh) = src.as_handle().map(Handle::from_raw) {
+            if let Some(elems) = self.realm.array_elements(sh).map(<[_]>::to_vec) {
+                for (i, e) in elems.iter().enumerate() {
+                    self.realm.set_property(target, &alloc::format!("{i}"), *e);
+                }
+            } else if let Some(s) = self.realm.string_value(sh) {
+                for (i, c) in s.chars().enumerate() {
+                    let cv = self.new_str(&alloc::string::String::from(c));
+                    self.realm.set_property(target, &alloc::format!("{i}"), cv);
+                }
+            } else {
+                let keys = self.realm.object_keys_with_symbols(sh);
+                for key in keys {
+                    // `read_member` invokes a getter where present.
+                    let pv = self.read_member(sh, &key)?;
+                    self.realm.set_property(target, &key, pv);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Assigns a member by an already-evaluated key value (used when the target's
