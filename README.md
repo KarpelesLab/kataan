@@ -1,5 +1,10 @@
 # Kataan
 
+[![CI](https://github.com/KarpelesLab/kataan/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/kataan/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/kataan.svg)](https://crates.io/crates/kataan)
+[![docs.rs](https://docs.rs/kataan/badge.svg)](https://docs.rs/kataan)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A high-performance **JavaScript (ECMAScript) engine written in pure Rust**, with
 no foreign code on the critical path. Kataan is usable three ways — as a Rust
 library, as a C library, and as a standalone command-line tool — the same
