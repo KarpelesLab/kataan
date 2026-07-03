@@ -53,9 +53,7 @@ fn main() {
             prelude.push('\n');
         }
     }
-    if is_async
-        && let Some(s) = harness.get("doneprintHandle.js")
-    {
+    if is_async && let Some(s) = harness.get("doneprintHandle.js") {
         prelude.push_str(s);
         prelude.push('\n');
     }
