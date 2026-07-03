@@ -47,6 +47,10 @@ pub(crate) enum Resumption {
 pub(crate) enum GenStep {
     /// Hit a `yield`; the operand is the surfaced value (`{value, done:false}`).
     Yielded(NanBox),
+    /// Hit a `yield*` over a sync iterator: the operand is the inner iterator's
+    /// result object, passed through *verbatim* (GeneratorYield(innerResult)) — so
+    /// its lazy `value` getter is read by the outer consumer, never by `yield*`.
+    YieldedResult(NanBox),
     /// Ran to completion / `return`; the operand is the result (`{value, done:true}`).
     Done(NanBox),
     /// (Async only) parked at `await`; the operand is the awaited value, on whose
@@ -276,6 +280,9 @@ enum Completion {
 enum StepOut {
     Continue,
     Yield(NanBox),
+    /// A sync `yield*` step surfacing the inner iterator's result object verbatim
+    /// (see [`GenStep::YieldedResult`]).
+    YieldResult(NanBox),
     /// An async coroutine reached `await <value>`: the operand is the awaited
     /// value (a promise or plain value). The driver parks the frame and schedules
     /// a microtask resumption on its settlement.
@@ -405,6 +412,8 @@ impl<'a> Interp<'a> {
         let result: Result<NanBox, ExecError> = loop {
             match self.run_generator(id, how) {
                 Ok(GenStep::Yielded(v)) => break Ok(self.gen_result(v, false)),
+                // A sync `yield*` passes the inner result object through verbatim.
+                Ok(GenStep::YieldedResult(v)) => break Ok(v),
                 Ok(GenStep::Done(v)) => break Ok(self.gen_result(v, true)),
                 Ok(GenStep::Awaited(v)) => {
                     match self.await_value(v) {
@@ -524,7 +533,7 @@ impl<'a> Interp<'a> {
                 );
             }
             // A generator suspension cannot arise in an async (non-generator) body.
-            Ok(GenStep::Yielded(_)) => {
+            Ok(GenStep::Yielded(_)) | Ok(GenStep::YieldedResult(_)) => {
                 if let Some(p) = promise {
                     self.resolve_with(p, NanBox::undefined());
                 }
@@ -633,7 +642,7 @@ impl<'a> Interp<'a> {
             }
             // `Yielded` (generator suspension) and `Awaited` (async suspension)
             // both keep the frame alive for a later resume.
-            Ok(GenStep::Yielded(_)) | Ok(GenStep::Awaited(_)) => {}
+            Ok(GenStep::Yielded(_)) | Ok(GenStep::YieldedResult(_)) | Ok(GenStep::Awaited(_)) => {}
         }
         outcome
     }
@@ -716,6 +725,10 @@ impl<'a> Interp<'a> {
                     self.store_machine(id, stack, values);
                     return Ok(GenStep::Yielded(v));
                 }
+                Ok(StepOut::YieldResult(v)) => {
+                    self.store_machine(id, stack, values);
+                    return Ok(GenStep::YieldedResult(v));
+                }
                 Ok(StepOut::Await(v)) => {
                     self.store_machine(id, stack, values);
                     return Ok(GenStep::Awaited(v));
@@ -757,6 +770,7 @@ impl<'a> Interp<'a> {
             match self.gen_step(&mut stack, &mut values) {
                 Ok(StepOut::Continue) => {}
                 Ok(StepOut::Yield(v)) => break Ok(GenStep::Yielded(v)),
+                Ok(StepOut::YieldResult(v)) => break Ok(GenStep::YieldedResult(v)),
                 Ok(StepOut::Await(v)) => break Ok(GenStep::Awaited(v)),
                 Err(GenAbrupt::Throw(e)) => pending = Some(Completion::Throw(e)),
                 Err(GenAbrupt::Return(v)) => pending = Some(Completion::Return(v)),
@@ -2569,21 +2583,32 @@ impl<'a> Interp<'a> {
                 self.make_type_error("iterator result is not an object"),
             ));
         };
+        // IteratorComplete reads `done` first; `value` (IteratorValue) is read only
+        // when the delegation completes — it must NOT be accessed for an incomplete
+        // result (its getter has observable side effects).
         let done = self.read_member(rh, "done").map_err(GenAbrupt::from)?;
-        let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
         if self.realm.truthy(done) {
             // Delegation finished. For a forwarded `return`, the outer generator
             // returns the inner return value; otherwise the `yield*` expression
             // evaluates to it.
+            let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
             if matches!(how, Resumption::Return(_)) {
                 return Err(GenAbrupt::Return(value));
             }
             values.push(value);
             Ok(StepOut::Continue)
         } else {
-            // Surface the inner value and stay in delegation.
+            // Stay in delegation. A *sync* `yield*` does GeneratorYield(innerResult)
+            // — it surfaces the inner result object verbatim (its `value` getter is
+            // read by the outer consumer). An *async* `yield*` (AsyncGeneratorYield)
+            // unwraps the value and re-wraps per its own protocol, so read it here.
             stack.push(Step::YieldStar { iter });
-            Ok(StepOut::Yield(value))
+            if self.gen_is_async {
+                let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
+                Ok(StepOut::Yield(value))
+            } else {
+                Ok(StepOut::YieldResult(res))
+            }
         }
     }
 
