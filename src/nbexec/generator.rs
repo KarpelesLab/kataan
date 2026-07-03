@@ -2551,10 +2551,13 @@ impl<'a> Interp<'a> {
                 // No inner `return`: the delegation completes, the `yield*` value
                 // is the forwarded value, and the outer `return` continues.
                 Resumption::Return(v) => return Err(GenAbrupt::Return(v)),
-                // No inner `throw`: per spec, close the iterator and throw a
-                // TypeError into the outer generator.
+                // No inner `throw`: per spec (14.4.14 5.b.iii), IteratorClose the
+                // inner iterator with a *normal* completion first — giving it a
+                // chance to clean up — then throw a TypeError. If `return` itself is
+                // abrupt (getting or calling it throws, or it returns a non-object),
+                // that abrupt completion propagates *instead of* the TypeError.
                 Resumption::Throw(_) => {
-                    let _ = self.iterator_close(iter);
+                    self.iterator_close(iter).map_err(GenAbrupt::from)?;
                     return Err(GenAbrupt::Throw(
                         self.make_type_error("The iterator does not provide a 'throw' method"),
                     ));
