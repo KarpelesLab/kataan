@@ -633,8 +633,7 @@ impl<'a> Interp<'a> {
                     "resizable" => NanBox::boolean(max.is_some()),
                     // `immutable`: true iff the buffer is immutable and not detached.
                     "immutable" => NanBox::boolean(
-                        !detached
-                            && self.realm.get_property(h, ARRAY_BUFFER_IMMUTABLE).is_some(),
+                        !detached && self.realm.get_property(h, ARRAY_BUFFER_IMMUTABLE).is_some(),
                     ),
                     "byteLength" => {
                         if detached {
@@ -837,8 +836,15 @@ impl<'a> Interp<'a> {
                     // plain `Promise.all(…)` call (`this` = the constructor itself).
                     let this_aware = matches!(
                         name.as_str(),
-                        "all" | "race" | "allSettled" | "any" | "allKeyed"
-                            | "allSettledKeyed" | "resolve" | "reject" | "try"
+                        "all"
+                            | "race"
+                            | "allSettled"
+                            | "any"
+                            | "allKeyed"
+                            | "allSettledKeyed"
+                            | "resolve"
+                            | "reject"
+                            | "try"
                     );
                     // For a `this`-aware static, a non-object receiver (number,
                     // string, boolean, symbol, null, undefined — including a detached

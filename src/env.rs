@@ -234,10 +234,10 @@ impl Scope {
             }
         }
         // A `with` object is rooted by the scope that introduced it.
-        if let Some(obj) = &data.with_obj {
-            if let Some(raw) = obj.as_handle() {
-                visit(Handle::from_raw(raw));
-            }
+        if let Some(obj) = &data.with_obj
+            && let Some(raw) = obj.as_handle()
+        {
+            visit(Handle::from_raw(raw));
         }
         if let Some(p) = &data.parent {
             p.for_each_handle(visit);
@@ -265,10 +265,10 @@ impl Scope {
                 }
             }
         }
-        if let Some(obj) = &mut data.with_obj {
-            if let Some(raw) = obj.as_handle() {
-                *obj = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
-            }
+        if let Some(obj) = &mut data.with_obj
+            && let Some(raw) = obj.as_handle()
+        {
+            *obj = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
         }
         if let Some(p) = &data.parent {
             p.relocate_handles(forward);

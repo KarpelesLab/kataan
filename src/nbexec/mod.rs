@@ -2542,7 +2542,13 @@ impl<'a> Interp<'a> {
             let (accessor_id, accessors): (u16, &[&str]) = if name == "ArrayBuffer" {
                 (
                     N_AB_ACCESSOR,
-                    &["byteLength", "maxByteLength", "resizable", "detached", "immutable"],
+                    &[
+                        "byteLength",
+                        "maxByteLength",
+                        "resizable",
+                        "detached",
+                        "immutable",
+                    ],
                 )
             } else {
                 (
@@ -3267,7 +3273,8 @@ impl<'a> Interp<'a> {
             // configurable:false }` like every built-in constructor's `prototype`.
             self.realm.mark_hidden(obj_ns, "prototype");
             self.realm.set_readonly_property(obj_ns, "prototype");
-            self.realm.set_non_configurable_property(obj_ns, "prototype");
+            self.realm
+                .set_non_configurable_property(obj_ns, "prototype");
             // `({}).constructor === Object` (non-enumerable, inherited via the
             // default object prototype), and `Object.name === "Object"`.
             self.realm.set_hidden_property(

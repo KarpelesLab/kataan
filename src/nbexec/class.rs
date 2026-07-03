@@ -977,9 +977,8 @@ impl<'a> Interp<'a> {
                         // string-keyed properties, so they never force a deferred
                         // module namespace.
                         if !self.realm.is_extensible(instance) {
-                            let m = self.new_str(
-                                "Cannot add private field to a non-extensible object",
-                            );
+                            let m =
+                                self.new_str("Cannot add private field to a non-extensible object");
                             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                         }
                         self.realm.set_property(instance, &key, v);
@@ -1155,7 +1154,8 @@ impl<'a> Interp<'a> {
                         // Constructor-less class extending a function: implicit
                         // `super(...args)` calls the function with `this` = instance.
                         // A returned Object becomes the result and the field target.
-                        let ret = self.call_with_this(fnp, NanBox::handle(instance.to_raw()), args)?;
+                        let ret =
+                            self.call_with_this(fnp, NanBox::handle(instance.to_raw()), args)?;
                         let returned = self.constructor_return_handle(Some(ret));
                         let target = returned.unwrap_or(instance);
                         self.init_instance_fields(class_id, target)?;

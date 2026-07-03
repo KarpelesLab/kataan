@@ -34,17 +34,16 @@ fn main() {
         .is_some_and(|l| l.contains("async"));
     // Crude `includes: [a.js, b.js]` extraction (flow style only — enough here).
     let mut includes: Vec<String> = Vec::new();
-    if let Some(i) = src.find("includes:") {
-        if let Some(lb) = src[i..].find('[') {
-            if let Some(rb) = src[i + lb..].find(']') {
-                let list = &src[i + lb + 1..i + lb + rb];
-                includes = list
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
-        }
+    if let Some(i) = src.find("includes:")
+        && let Some(lb) = src[i..].find('[')
+        && let Some(rb) = src[i + lb..].find(']')
+    {
+        let list = &src[i + lb + 1..i + lb + rb];
+        includes = list
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
 
     let mut prelude = String::from(HOST_PRELUDE);
@@ -54,11 +53,11 @@ fn main() {
             prelude.push('\n');
         }
     }
-    if is_async {
-        if let Some(s) = harness.get("doneprintHandle.js") {
-            prelude.push_str(s);
-            prelude.push('\n');
-        }
+    if is_async
+        && let Some(s) = harness.get("doneprintHandle.js")
+    {
+        prelude.push_str(s);
+        prelude.push('\n');
     }
     for inc in &includes {
         if let Some(s) = harness.get(inc) {

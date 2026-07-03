@@ -1053,7 +1053,12 @@ impl<'a> Interp<'a> {
     /// "Deferred Module"; until `key` is evaluated the handle is registered in
     /// `deferred_namespaces` so the first export access triggers evaluation.
     fn deferred_namespace_object(&mut self, key: &str) -> Result<NanBox, ExecError> {
-        if let Some(ns) = self.modules.records.get(key).and_then(|r| r.deferred_namespace) {
+        if let Some(ns) = self
+            .modules
+            .records
+            .get(key)
+            .and_then(|r| r.deferred_namespace)
+        {
             return Ok(ns);
         }
         let obj = self.realm.new_object_with_proto(None);
@@ -1069,7 +1074,8 @@ impl<'a> Interp<'a> {
         );
         #[cfg(all(feature = "module", feature = "std"))]
         if !already {
-            self.deferred_namespaces.insert(obj.to_raw(), key.to_string());
+            self.deferred_namespaces
+                .insert(obj.to_raw(), key.to_string());
         }
         self.populate_namespace(obj, key, true)?;
         Ok(ns)
@@ -1116,7 +1122,11 @@ impl<'a> Interp<'a> {
         // namespace), non-enumerable, non-writable, non-configurable.
         let tag_sym = self.well_known_symbol("toStringTag");
         let tag_key = self.member_key(tag_sym);
-        let module_str = self.new_str(if deferred { "Deferred Module" } else { "Module" });
+        let module_str = self.new_str(if deferred {
+            "Deferred Module"
+        } else {
+            "Module"
+        });
         self.realm.set_property(obj, &tag_key, module_str);
         self.realm.mark_hidden(obj, &tag_key);
         self.realm.set_readonly_property(obj, &tag_key);
@@ -1161,10 +1171,7 @@ impl<'a> Interp<'a> {
         handle: crate::heap::Handle,
         name: &str,
     ) -> Result<(), ExecError> {
-        if self.deferred_namespaces.is_empty()
-            || name == "then"
-            || name.starts_with("\u{0}sym:")
-        {
+        if self.deferred_namespaces.is_empty() || name == "then" || name.starts_with("\u{0}sym:") {
             return Ok(());
         }
         let mut cur = Some(handle);
@@ -1218,7 +1225,10 @@ impl<'a> Interp<'a> {
             let refreshed: Vec<(String, NanBox)> = map
                 .iter()
                 .map(|(name, (scope, local))| {
-                    (name.clone(), scope.get(local).unwrap_or_else(NanBox::undefined))
+                    (
+                        name.clone(),
+                        scope.get(local).unwrap_or_else(NanBox::undefined),
+                    )
                 })
                 .collect();
             for (name, value) in refreshed {

@@ -1612,7 +1612,9 @@ impl<'a> Interp<'a> {
                 "race" => Ok(Some(self.perform_promise_race(recv, arg(0))?)),
                 "any" => Ok(Some(self.perform_promise_any(recv, arg(0))?)),
                 "allKeyed" => Ok(Some(self.perform_promise_all_keyed(recv, arg(0), false)?)),
-                "allSettledKeyed" => Ok(Some(self.perform_promise_all_keyed(recv, arg(0), true)?)),
+                "allSettledKeyed" => {
+                    Ok(Some(self.perform_promise_all_keyed(recv, arg(0), true)?))
+                }
                 _ => unreachable!(),
             };
         }

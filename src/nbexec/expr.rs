@@ -2679,7 +2679,9 @@ impl<'a> Interp<'a> {
         // `eval("var x = …")` inside the RHS: the write must still target the
         // originally-resolved (outer) binding, and the new local only shows
         // through to *later* reads.
-        if op != AssignOp::Assign && let Expr::Ident(id) = target {
+        if op != AssignOp::Assign
+            && let Expr::Ident(id) = target
+        {
             let name = &*id.name;
             // A `with`-object binding (captured before the RHS so the object's
             // current value is read first and a setter fires on write).

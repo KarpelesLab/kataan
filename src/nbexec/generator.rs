@@ -226,10 +226,7 @@ enum Step<'a> {
     /// Destructure `value` into assignment `target` (an array/object pattern, a
     /// defaulted target, or a leaf) — a `yield` in a default initializer suspends.
     /// The iterator pull / property reads themselves are synchronous.
-    Destructure {
-        target: &'a Expr,
-        value: NanBox,
-    },
+    Destructure { target: &'a Expr, value: NanBox },
     /// Destructure `elements[idx..]` of an array pattern from the pre-iterated
     /// `items`; `i` is the source index consumed so far (holes advance it).
     DestructureArrayElem {
@@ -1011,8 +1008,8 @@ fn object_lit_steppable(members: &[ObjectMember]) -> bool {
                 &**value,
                 Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_)
             );
-            let proto_setter = !shorthand
-                && matches!(key, PropertyKey::Ident(s) if &**s == "__proto__");
+            let proto_setter =
+                !shorthand && matches!(key, PropertyKey::Ident(s) if &**s == "__proto__");
             static_key && !fn_valued && !proto_setter
         }
         ObjectMember::Accessor { .. } => false,
@@ -1310,11 +1307,7 @@ impl<'a> Interp<'a> {
                 values.push(v);
                 Ok(StepOut::Continue)
             }
-            Step::ArrayLit {
-                elements,
-                idx,
-                acc,
-            } => {
+            Step::ArrayLit { elements, idx, acc } => {
                 if idx >= elements.len() {
                     let h = self.realm.new_array(acc);
                     values.push(NanBox::handle(h.to_raw()));
@@ -1425,7 +1418,8 @@ impl<'a> Interp<'a> {
                 target,
             } => {
                 let v = values.pop().unwrap_or(NanBox::undefined());
-                self.object_spread_into(target, v).map_err(GenAbrupt::from)?;
+                self.object_spread_into(target, v)
+                    .map_err(GenAbrupt::from)?;
                 stack.push(Step::ObjectLit {
                     members,
                     idx: idx + 1,
@@ -1473,7 +1467,10 @@ impl<'a> Interp<'a> {
                             i: i + 1,
                             items,
                         });
-                        stack.push(Step::Destructure { target: e, value: v });
+                        stack.push(Step::Destructure {
+                            target: e,
+                            value: v,
+                        });
                         Ok(StepOut::Continue)
                     }
                     ArrayElement::Spread(e) => {
@@ -1485,7 +1482,10 @@ impl<'a> Interp<'a> {
                             i: items.len(),
                             items,
                         });
-                        stack.push(Step::Destructure { target: e, value: h });
+                        stack.push(Step::Destructure {
+                            target: e,
+                            value: h,
+                        });
                         Ok(StepOut::Continue)
                     }
                 }
@@ -1512,7 +1512,10 @@ impl<'a> Interp<'a> {
                             src,
                             used,
                         });
-                        stack.push(Step::Destructure { target: tgt, value: v });
+                        stack.push(Step::Destructure {
+                            target: tgt,
+                            value: v,
+                        });
                         Ok(StepOut::Continue)
                     }
                     ObjectMember::Spread { value: tgt, .. } => {
@@ -1530,7 +1533,10 @@ impl<'a> Interp<'a> {
                             src,
                             used,
                         });
-                        stack.push(Step::Destructure { target: tgt, value: h });
+                        stack.push(Step::Destructure {
+                            target: tgt,
+                            value: h,
+                        });
                         Ok(StepOut::Continue)
                     }
                     ObjectMember::Accessor { .. } => {
