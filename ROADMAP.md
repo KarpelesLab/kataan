@@ -323,6 +323,64 @@ JSON, and both VMs. Maintain the zero-regression rule and the no_std build matri
 The language engine is necessary but not sufficient to *replace* `node`/`bun`.
 This is the surface a real runtime exposes to scripts.
 
+### 4.0 Embedding & host-function registration API (the foundation)
+
+The bidirectional surface an embedder uses to extend the engine from Rust or C —
+and the layer §4.1–4.5's own globals should be (re)built on, so runtime builtins
+and third-party host code travel one path. Today this is the biggest embedding
+gap: natives are dispatched by a fixed `u16` sentinel id in `call_native` (no
+dynamic registration, no per-instance state), and the C ABI is eval-only
+(`kt_eval`/`kt_compile`). This makes host code first-class. It is a prerequisite
+for §4.1–4.5 and for the `<30 lines` embeddability claim in §7.
+
+- **Dynamic native registry.** A host-function id range above the built-in
+  sentinels, each id mapping to a boxed
+  `dyn FnMut(&mut Ctx, this, &[Value]) -> Result<Value, Value>` held in a new
+  `Cell::HostFn`, routed through `call_native` / `construct` (and faulted to from
+  `nbvm` like any native, per §6 "two engines, one truth"). Created from a
+  closure, attachable to any object or the global with spec-shaped own
+  `name`/`length`.
+- **Rust API.** `interp.register_fn(name, |cx, args| …)` plus a `Ctx` handle
+  exposing `cx.global()`, object/array/typed-array/error builders, primitive
+  marshaling (a `TryFrom<Value>` / `Into<Value>` trait family for the common Rust
+  scalars, `String`, `Vec`, `Option`, and byte buffers), `cx.get`/`cx.set`,
+  `cx.throw(value)`, and `cx.call(fn, this, args)` / `cx.construct(...)` to
+  re-enter JS. Returning `Err(value)` raises it as a JS exception; a Rust
+  `panic!` is caught at the boundary and converted to a JS `Error` — it never
+  unwinds across an FFI or engine frame.
+- **Handle scopes & the moving GC.** Host-held values must survive collection: a
+  rooted **handle scope** (an N-API `napi_handle_scope` analog) pins every
+  `Value` the host borrows and unpins on drop, with escapable + persistent/global
+  handles for values kept across calls. This is the one hard constraint (§6): the
+  compacting collector may relocate any un-rooted handle, so the raw `Handle` is
+  never exposed to host code directly.
+- **C ABI (N-API-shaped, ABI-stable).** Opaque `kt_ctx` / `kt_value`;
+  `kt_register_function(ctx, name, cb, userdata)` with a fixed callback signature
+  `kt_value (*)(kt_ctx*, kt_value this_, int argc, const kt_value* argv, void* userdata)`;
+  value constructors/accessors (`kt_new_number`/`kt_new_string_utf8`/
+  `kt_new_object`/`kt_new_array`/`kt_get_property`/`kt_set_property`/
+  `kt_to_number`/`kt_get_utf8`/…), `kt_throw`, `kt_call`, and handle-scope
+  open/close — a versioned mirror of the Rust API, so a C host reaches parity
+  without linking Rust types.
+- **Host-backed exotic objects & constructors.** Register host constructors
+  (`[[Construct]]`) and objects carrying opaque native state (`Box<dyn Any>` per
+  instance, à la N-API `napi_wrap`) with a **finalizer** callback run when the
+  instance is collected — the hook native resource cleanup (file handles,
+  sockets) needs.
+- **Async interop.** A host function may return a promise: `cx.promise()` hands
+  back a `(Value, Resolver)` the host settles later from a timer/IO completion,
+  integrated with §4.1's loop; plus an adapter so an `async` Rust closure becomes
+  a promise-returning JS function.
+- **Reentrancy & limits.** Host callbacks run under the same call-depth and
+  resource limits (`Limits`); nested `cx.call` shares the microtask/job queue;
+  errors from re-entered JS surface back to the host as `Err(Value)`.
+
+Milestone order: (1) dynamic native registry + `Cell::HostFn` + Rust
+`register_fn` + value marshaling + handle scope; (2) builders + reentrant
+`call`/`construct` + `throw`; (3) the C ABI mirror; (4) promises/async +
+host constructors/finalizers. Once (1)–(2) land, migrate a couple of existing
+sentinel builtins onto the registry to prove the path end-to-end.
+
 ### 4.1 Event loop & scheduling
 
 A complete in-house loop (readiness-based I/O or std threads): `setTimeout`/
@@ -407,6 +465,12 @@ piece.
   cleanly to `nbexec` rather than producing a wrong-but-silent result. A new
   builtin landed only in `nbexec` is reached via that fallback — acceptable, but
   note it.
+- **No raw handles across the host boundary.** The GC compacts, so any JS value
+  held by host (Rust/C) code between engine calls must be rooted through a handle
+  scope or a persistent handle (§4.0), never a bare relocatable `Handle`. Host
+  callbacks are called at engine safepoints and must not stash un-rooted values;
+  a Rust `panic` / C longjmp must be trapped at the boundary and turned into a JS
+  throw rather than unwinding through engine frames.
 
 ---
 
@@ -432,7 +496,10 @@ Kataan is "complete" when:
    verifier-guarded, cross-context-shareable store passes the hundreds-of-bases
    churn scenario.
 6. **Always:** pure Rust, `unsafe` quarantined + audited; CI green across the
-   feature matrix incl. `no_std`; embeddable in <30 lines via the Rust and C APIs.
+   feature matrix incl. `no_std`; embeddable in <30 lines via the Rust and C APIs
+   — including the §4.0 host-function registration API (register native
+   functions/constructors, marshal values through rooted handle scopes, throw and
+   re-enter JS) that the runtime globals themselves are built on.
 
 ---
 
