@@ -3530,6 +3530,13 @@ impl<'a> Interp<'a> {
                 );
                 self.realm.mark_hidden(proto, accessor);
             }
+            // `grow` (growable SABs) and `slice` (returns a new SAB) — bound natives
+            // re-dispatched through `call_method`, like the ArrayBuffer methods.
+            for m in ["grow", "slice"] {
+                let f = self.readable_ab_method(m);
+                self.realm.set_property(proto, m, f);
+                self.realm.mark_hidden(proto, m);
+            }
             let tag_sym = self.well_known_symbol("toStringTag");
             let tag_key = self.member_key(tag_sym);
             let tag_val = self.new_str("SharedArrayBuffer");

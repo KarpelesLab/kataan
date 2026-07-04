@@ -8203,3 +8203,53 @@ fn shared_array_buffer_core() {
         "99"
     );
 }
+
+#[test]
+fn shared_array_buffer_grow_and_slice() {
+    // grow (growable SABs only, increase-only, data-preserving) and slice
+    // (returns a *SharedArrayBuffer*, leaving ArrayBuffer.slice unchanged).
+    assert_eq!(
+        run("var s=new SharedArrayBuffer(8,{maxByteLength:16});s.grow(12);s.byteLength"),
+        "12"
+    );
+    assert_eq!(
+        run(
+            "var s=new SharedArrayBuffer(8,{maxByteLength:16});var a=new Int32Array(s);a[0]=77;s.grow(16);new Int32Array(s)[0]+','+s.byteLength"
+        ),
+        "77,16"
+    );
+    assert_eq!(
+        run(
+            "var s=new SharedArrayBuffer(8,{maxByteLength:16});try{s.grow(4);'no'}catch(e){e.constructor.name}"
+        ),
+        "RangeError"
+    );
+    assert_eq!(
+        run(
+            "var s=new SharedArrayBuffer(8,{maxByteLength:16});try{s.grow(20);'no'}catch(e){e.constructor.name}"
+        ),
+        "RangeError"
+    );
+    assert_eq!(
+        run("var s=new SharedArrayBuffer(8);try{s.grow(16);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "var s=new SharedArrayBuffer(8);var a=new Uint8Array(s);a[2]=5;var s2=s.slice(2,4);new Uint8Array(s2)[0]+','+s2.byteLength"
+        ),
+        "5,2"
+    );
+    assert_eq!(
+        run("Object.prototype.toString.call(new SharedArrayBuffer(8).slice(0,4))"),
+        "[object SharedArrayBuffer]"
+    );
+    assert_eq!(
+        run("new SharedArrayBuffer(8).slice(0,4) instanceof SharedArrayBuffer"),
+        "true"
+    );
+    assert_eq!(
+        run("Object.prototype.toString.call(new ArrayBuffer(8).slice(0,4))"),
+        "[object ArrayBuffer]"
+    );
+}

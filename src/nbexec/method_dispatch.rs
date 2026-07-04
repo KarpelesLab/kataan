@@ -946,6 +946,30 @@ impl<'a> Interp<'a> {
                 self.realm
                     .set_hidden_property(nb, ARRAY_BUFFER_IMMUTABLE, NanBox::boolean(true));
             }
+            // `SharedArrayBuffer.prototype.slice` yields a *SharedArrayBuffer*: carry
+            // the brand over and link the copy to `%SharedArrayBuffer.prototype%`.
+            if self
+                .realm
+                .get_property(handle, SHARED_ARRAY_BUFFER_BRAND)
+                .is_some()
+            {
+                self.realm.set_hidden_property(
+                    nb,
+                    SHARED_ARRAY_BUFFER_BRAND,
+                    NanBox::boolean(true),
+                );
+                if let Some(proto) = self
+                    .current
+                    .get("SharedArrayBuffer")
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+                    .and_then(|c| self.realm.get_property(c, "prototype"))
+                    .and_then(|p| p.as_handle())
+                    .map(Handle::from_raw)
+                {
+                    self.realm.set_object_proto(nb, Some(proto));
+                }
+            }
             return Ok(Some(NanBox::handle(nb.to_raw())));
         }
         // --- ArrayBuffer.prototype.transfer(newLength?) / transferToFixedLength(newLength?)
@@ -1025,6 +1049,33 @@ impl<'a> Interp<'a> {
             let new_len = self.realm.to_number(arg(0)).max(0.0) as usize;
             if new_len > max {
                 let m = self.new_str("ArrayBuffer.prototype.resize: length exceeds maxByteLength");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            self.realm.resize_buffer(bh, new_len);
+            return Ok(Some(NanBox::undefined()));
+        }
+        // --- SharedArrayBuffer.prototype.grow(newByteLength) (growable SABs only) ---
+        if method == "grow"
+            && self
+                .realm
+                .get_property(handle, SHARED_ARRAY_BUFFER_BRAND)
+                .is_some()
+            && let Some(bh) = self.array_buffer_bytes(handle)
+        {
+            let Some(max) = self
+                .realm
+                .get_property(handle, ARRAY_BUFFER_MAXLEN)
+                .map(|m| self.realm.to_number(m) as usize)
+            else {
+                let m = self.new_str("SharedArrayBuffer.prototype.grow: buffer is not growable");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            };
+            let cur = self.realm.bytes_len(bh).unwrap_or(0);
+            // `grow` only ever increases the length (a shrink is a RangeError), up to
+            // maxByteLength.
+            let new_len = self.realm.to_number(arg(0)).max(0.0) as usize;
+            if new_len < cur || new_len > max {
+                let m = self.new_str("SharedArrayBuffer.prototype.grow: invalid new length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
             self.realm.resize_buffer(bh, new_len);
