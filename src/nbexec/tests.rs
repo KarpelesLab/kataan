@@ -5716,3 +5716,31 @@ fn proxy_object_rest_destructuring() {
         r#"{"p":1,"q":2}"#
     );
 }
+
+#[test]
+fn proxy_json_and_descriptors() {
+    // JSON.stringify enumerates a proxy through its ownKeys/get protocol; a
+    // proxy over an array serializes as an array (IsArray unwraps the proxy).
+    assert_eq!(
+        run("JSON.stringify(new Proxy({a:1,b:2},{}))"),
+        r#"{"a":1,"b":2}"#
+    );
+    assert_eq!(run("JSON.stringify(new Proxy([1,2,3],{}))"), "[1,2,3]");
+    assert_eq!(
+        run("JSON.stringify({x:new Proxy([1,2],{}),y:new Proxy({z:3},{})})"),
+        r#"{"x":[1,2],"y":{"z":3}}"#
+    );
+    // An ownKeys trap restricts the serialized keys.
+    assert_eq!(
+        run(
+            "JSON.stringify(new Proxy({a:1,b:2},{ownKeys(){return ['a'];},\
+             getOwnPropertyDescriptor(t,k){return {value:t[k],enumerable:true,configurable:true};}}))"
+        ),
+        r#"{"a":1}"#
+    );
+    // Object.getOwnPropertyDescriptors drives the proxy's [[GetOwnProperty]].
+    assert_eq!(
+        run("JSON.stringify(Object.getOwnPropertyDescriptors(new Proxy({a:1},{})))"),
+        r#"{"a":{"value":1,"writable":true,"enumerable":true,"configurable":true}}"#
+    );
+}

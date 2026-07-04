@@ -1080,19 +1080,34 @@ impl<'a> Interp<'a> {
             N_OBJECT_GET_OWN_DESCS => {
                 let out = self.realm.new_object();
                 if let Some(obj) = arg(0).as_handle().map(Handle::from_raw) {
-                    let mut keys = self.realm.own_property_names(obj).unwrap_or_default();
-                    keys.extend(self.realm.object_accessor_keys(obj));
-                    // Symbol-keyed properties (stored under their `\0sym:` internal name)
-                    // get a descriptor too, set under the symbol key on the result.
-                    keys.extend(
-                        self.realm
-                            .object_all_keys(obj)
-                            .into_iter()
-                            .filter(|k| k.starts_with("\u{0}sym:")),
-                    );
-                    for k in keys {
-                        if let Some(d) = self.build_descriptor(obj, &k) {
-                            self.realm.set_property(out, &k, d);
+                    if self.realm.proxy_at(obj).is_some() {
+                        // A proxy: `[[OwnPropertyKeys]]` (ownKeys trap or trapless
+                        // forward) then `[[GetOwnProperty]]` per key via
+                        // `descriptor_of` (the `getOwnPropertyDescriptor` trap +
+                        // FromPropertyDescriptor). Both String and Symbol keys.
+                        for key in self.own_property_keys_values(obj)? {
+                            let name = self.member_key(key);
+                            let d = self.descriptor_of(obj, &name)?;
+                            if !matches!(d.unpack(), Unpacked::Undefined) {
+                                self.realm.set_property(out, &name, d);
+                            }
+                        }
+                    } else {
+                        let mut keys = self.realm.own_property_names(obj).unwrap_or_default();
+                        keys.extend(self.realm.object_accessor_keys(obj));
+                        // Symbol-keyed properties (stored under their `\0sym:` internal
+                        // name) get a descriptor too, set under the symbol key on the
+                        // result.
+                        keys.extend(
+                            self.realm
+                                .object_all_keys(obj)
+                                .into_iter()
+                                .filter(|k| k.starts_with("\u{0}sym:")),
+                        );
+                        for k in keys {
+                            if let Some(d) = self.build_descriptor(obj, &k) {
+                                self.realm.set_property(out, &k, d);
+                            }
                         }
                     }
                 }

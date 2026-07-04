@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function parameter, or generator step) run the same proxy-aware
   CopyDataProperties, sharing one `copy_data_properties` helper; this also fixes
   symbol own keys being dropped from object rest on ordinary objects.
+- *(proxy)* `JSON.stringify` enumerates a proxy through its `ownKeys`/
+  `getOwnPropertyDescriptor`/`get` protocol (a proxy over an array serializes as
+  an array via `IsArray`), and `Object.getOwnPropertyDescriptors` drives the
+  proxy's `[[GetOwnProperty]]` — both previously returned `{}` (ROADMAP §3.7).
 
 ## [0.0.6](https://github.com/KarpelesLab/kataan/compare/v0.0.5...v0.0.6) - 2026-07-04
 

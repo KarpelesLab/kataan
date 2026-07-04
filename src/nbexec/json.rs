@@ -258,10 +258,11 @@ impl<'a> Interp<'a> {
                 if self.is_callable(h) || self.realm.class_at(h).is_some() {
                     return Ok(None);
                 }
-                // Array vs object. A typed array is NOT an Array exotic, so it
-                // serializes as an object keyed by its indices (`{"0":1,…}`), per
-                // `JSON.stringify`.
-                if self.realm.is_array(h) {
+                // Array vs object, via `IsArray` (which unwraps a proxy chain to
+                // its target — a proxy over an array serializes as an array). A
+                // typed array is NOT an Array exotic, so it serializes as an
+                // object keyed by its indices (`{"0":1,…}`), per `JSON.stringify`.
+                if self.is_array_unwrap_proxy(value)? {
                     self.serialize_json_array(h, replacer_fn, property_list, gap, indent, stack)
                         .map(Some)
                 } else {
@@ -297,6 +298,32 @@ impl<'a> Interp<'a> {
             None => {
                 if let Some(len) = self.realm.typed_len(h) {
                     (0..len).map(|i| alloc::format!("{i}")).collect()
+                } else if self.realm.proxy_at(h).is_some() {
+                    // A proxy drives `[[OwnPropertyKeys]]` (the `ownKeys` trap, or
+                    // trapless forwarding to the target) then filters to own
+                    // enumerable **string** keys via `[[GetOwnProperty]]` (symbols
+                    // never appear in JSON). Values are read later through the
+                    // proxy's `get` trap by `serialize_json_property`.
+                    let mut ks = Vec::new();
+                    for key in self.own_property_keys_values(h)? {
+                        let name = self.member_key(key);
+                        if name.starts_with('\u{0}') {
+                            continue; // a symbol key (internal `\0sym:` form)
+                        }
+                        let desc = self.descriptor_of(h, &name)?;
+                        if matches!(desc.unpack(), Unpacked::Undefined) {
+                            continue;
+                        }
+                        let enumerable = desc
+                            .as_handle()
+                            .map(Handle::from_raw)
+                            .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                            .is_some_and(|v| self.realm.truthy(v));
+                        if enumerable {
+                            ks.push(name);
+                        }
+                    }
+                    ks
                 } else {
                     self.realm.object_keys(h).unwrap_or_default()
                 }
@@ -351,6 +378,17 @@ impl<'a> Interp<'a> {
         let new_indent = alloc::format!("{indent}{gap}");
         let len = if self.realm.typed_kind(h).is_some() {
             self.realm.typed_len(h).unwrap_or(0)
+        } else if self.realm.proxy_at(h).is_some() {
+            // A proxy over an array: `LengthOfArrayLike` = ToLength(Get(h,"length")),
+            // read through the proxy's `get` trap.
+            let lv = self.read_member(h, "length")?;
+            let ln = self.coerce_to_number(lv)?;
+            let n = self.realm.to_number(ln);
+            if n.is_finite() && n > 0.0 {
+                (n as usize).min(self.realm.limits.max_array_len)
+            } else {
+                0
+            }
         } else {
             self.realm.array_length(h).unwrap_or(0)
         };
