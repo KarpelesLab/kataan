@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(with)* the `with` object-environment `HasBinding` is a proxy-aware
+  `HasProperty`, so `with (new Proxy(o, {has(){…}})) { name }` consults the `has`
+  trap (a trapless proxy forwards to its target) instead of throwing a spurious
+  ReferenceError; `@@unscopables` still applies (ROADMAP §3.5).
 - *(array)* sparse-array holes are absent to `in` / `HasProperty`: the proxy-
   aware `[[HasProperty]]` used a bare `i < length` test that reported a hole as
   present, so `1 in [2,,3]`, `0 in new Array(3)`, `[2,,3].hasOwnProperty(1)`,

@@ -1123,7 +1123,12 @@ impl<'a> Interp<'a> {
     /// `HasProperty(name)` and not blocked by a truthy `@@unscopables[name]`.
     /// `Some(h)` if it provides it; `None` to keep looking further out.
     fn with_frame_provides(&mut self, h: Handle, name: &str) -> Option<Handle> {
-        if !self.has_property_chain(h, name) {
+        // HasBinding for an object environment record is `HasProperty(bindings,
+        // N)` — proxy-aware, so `with (new Proxy(o, {has(){…}}))` consults the
+        // `has` trap to decide whether `N` is a binding (a trapless proxy forwards
+        // to its target). `has_property` walks the prototype chain like the old
+        // `has_property_chain` but additionally routes through the proxy protocol.
+        if !self.has_property(h, name) {
             return None;
         }
         // `@@unscopables`: a truthy entry blocks the binding (the lexical scope

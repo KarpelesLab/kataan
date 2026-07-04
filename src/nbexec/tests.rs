@@ -5924,3 +5924,26 @@ fn flat_flatmap_array_species_create() {
     // A hole in a mapped array is skipped when flattened.
     assert_eq!(run("JSON.stringify([1].flatMap(x=>[x,,x*2]))"), "[1,2]");
 }
+
+#[test]
+fn with_statement_consults_proxy_has_trap() {
+    // The `with` object environment's HasBinding is a proxy-aware HasProperty, so
+    // a `has` trap decides whether a name is a binding (and `get`/`set` traps run).
+    assert_eq!(
+        run("var p=new Proxy({x:5},{has(t,k){return k==='x'},get(){return 42}});with(p){x}"),
+        "42"
+    );
+    assert_eq!(
+        run("var attr=7;var p=new Proxy({},{has(){return false}});with(p){attr}"),
+        "7"
+    );
+    // A trapless proxy forwards HasProperty to its target.
+    assert_eq!(run("var p=new Proxy({y:9},{});with(p){y}"), "9");
+    // @@unscopables still blocks a binding the proxy would otherwise provide.
+    assert_eq!(
+        run("var a=1;var p=new Proxy({a:5,[Symbol.unscopables]:{a:true}},{});with(p){a}"),
+        "1"
+    );
+    // Plain-object `with` unaffected.
+    assert_eq!(run("var o={a:1,b:2};with(o){a+b}"), "3");
+}

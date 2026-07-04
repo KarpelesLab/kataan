@@ -1909,17 +1909,6 @@ impl<'a> Interp<'a> {
 
     /// Whether `handle` has `name` as an own or inherited property (walks the
     /// prototype chain; includes accessors).
-    pub(crate) fn has_property_chain(&self, handle: Handle, name: &str) -> bool {
-        let mut cur = Some(handle);
-        while let Some(c) = cur {
-            if self.realm.has_own(c, name) || self.realm.accessor(c, name).is_some() {
-                return true;
-            }
-            cur = self.realm.object_proto(c);
-        }
-        false
-    }
-
     /// `ToObject(v)` for the spec sites that require an Object argument and must
     /// reject `null`/`undefined` with a TypeError (e.g. the *Properties* argument
     /// of `Object.create`/`Object.defineProperties`). An object passes through; a
