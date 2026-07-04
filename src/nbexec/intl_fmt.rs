@@ -2901,10 +2901,15 @@ impl<'a> Interp<'a> {
                 return body;
             }
             let formatted = intl::number::format(&locale, n, &opts);
-            // `currencySign: "accounting"` parenthesizes a negative currency amount,
-            // preserving the crate's locale-correct symbol/separators (so non-en
-            // locales like de-DE are not forced onto the en-US hand-rolled path).
-            if formatted.starts_with('-')
+            // `currencySign: "accounting"` renders a negative currency amount in the
+            // locale's accounting pattern. That pattern is CLDR-locale data: the
+            // en family parenthesizes (`($5.00)`), but many locales (e.g. de-DE:
+            // `-987,00 $`) just keep the minus. The intl crate has no currencySign
+            // field, so approximate the parenthesizing locales (en) here and leave
+            // the rest on the crate's minus output.
+            let en_family = locale == "en" || locale.starts_with("en-");
+            if en_family
+                && formatted.starts_with('-')
                 && self
                     .realm
                     .get_property(handle, "currencySign")
