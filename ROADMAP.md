@@ -419,15 +419,20 @@ property access (`get`/`set`/`has`/`has_own`/`delete`/`own_keys`), value
 inspection (`type_of`/`is_callable`/`is_object`/`is_array`), array reads
 (`array_len`/`array_get`), argument coercion (`to_number`/`to_string`/
 `to_boolean`), error builders (`type_error`/`range_error`/`error`), promise
-creation (`resolved_promise`/`rejected_promise`/`is_promise`), and reentrant
-`call` to re-enter JS; `Err(value)` raises a catchable JS exception.
+creation (`resolved_promise`/`rejected_promise`/`is_promise`), reentrant `call`
+and `construct` to re-enter JS; `Err(value)` raises a catchable JS exception.
 Self-reentrancy onto the same host function is a clean `TypeError` (the `FnMut` is
-taken out of its slot for the call). See `examples/embed_host_fn.rs`.
-**Remaining for §4.0:** a rooted **handle scope** (host values held across calls),
-`construct` + host-backed exotic objects/finalizers, panic-trapping at the
-boundary, the **C ABI** mirror, the async *continuation* half (a `Resolver` the
-host settles later from a timer/IO completion), `nbvm` host-native fault-through,
-and migrating a sentinel builtin onto the registry.
+taken out of its slot for the call). **Host constructors have landed:**
+`register_constructor` / `register_global_constructor` make a host function
+constructable — `new HostCtor(...)` binds a fresh `this` (its `[[Prototype]]` is
+the auto-created `HostCtor.prototype`), runs the closure, and applies the
+constructor return rule, so `instanceof` and prototype methods work. See
+`examples/embed_host_fn.rs`. **Remaining for §4.0:** a rooted **handle scope**
+(host values held across calls), host-backed exotic objects carrying opaque
+native state **+ finalizers**, panic-trapping at the boundary, the **C ABI**
+mirror, the async *continuation* half (a `Resolver` the host settles later from a
+timer/IO completion), `nbvm` host-native fault-through, and migrating a sentinel
+builtin onto the registry.
 
 ### 4.1 Event loop & scheduling
 
