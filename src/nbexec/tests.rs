@@ -516,6 +516,74 @@ fn intl_segmenter_real_grapheme_clusters() {
     );
 }
 
+/// `Intl.Segmenter.resolvedOptions()` reports `{locale, granularity}`, and the
+/// object `segment()` returns supports `containing(index)`.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_segmenter_resolved_options_and_containing() {
+    assert_eq!(
+        run("new Intl.Segmenter('en',{granularity:'word'}).resolvedOptions().granularity"),
+        "word",
+    );
+    assert_eq!(
+        run("new Intl.Segmenter('en').resolvedOptions().granularity"),
+        "grapheme",
+    );
+    assert_eq!(
+        run("Object.keys(new Intl.Segmenter('en').resolvedOptions()).join(',')"),
+        "locale,granularity",
+    );
+    let s = "new Intl.Segmenter('en',{granularity:'word'}).segment('hello world')";
+    assert_eq!(run(&alloc::format!("{s}.containing(2).segment")), "hello");
+    assert_eq!(run(&alloc::format!("{s}.containing(6).segment")), "world");
+    assert_eq!(
+        run(&alloc::format!("{s}.containing(100)===undefined")),
+        "true",
+    );
+}
+
+/// `String.prototype.localeCompare` honors the `numeric`/`sensitivity` options.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_locale_compare_options() {
+    assert_eq!(
+        run("'10'.localeCompare('9',undefined,{numeric:true})>0"),
+        "true"
+    );
+    assert_eq!(run("'10'.localeCompare('9')<0"), "true"); // default: code-point
+    assert_eq!(
+        run("'a10'.localeCompare('a9',undefined,{numeric:true})>0"),
+        "true"
+    );
+    assert_eq!(
+        run("'A'.localeCompare('a',undefined,{sensitivity:'base'})"),
+        "0"
+    );
+}
+
+/// `Number.prototype.toLocaleString` applies every NumberFormat option.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_number_to_locale_string_all_options() {
+    assert_eq!(
+        run("(1234567).toLocaleString('en-US',{notation:'compact'})"),
+        "1.2M"
+    );
+    assert_eq!(
+        run("(5).toLocaleString('en-US',{style:'unit',unit:'kilometer-per-hour'})"),
+        "5\u{a0}km/h"
+    );
+    assert_eq!(
+        run("(1).toLocaleString('en-US',{minimumSignificantDigits:3})"),
+        "1.00"
+    );
+    assert_eq!(run("(1234567).toLocaleString('en-US')"), "1,234,567"); // default unchanged
+    assert_eq!(
+        run("try{(5).toLocaleString('en-US',{style:'bad'});'no'}catch(e){e.constructor.name}"),
+        "RangeError"
+    );
+}
+
 /// With the `intl` crate, `Intl.PluralRules` applies real CLDR rules — Polish has the
 /// `few`/`many` categories the en-only fallback can't express.
 #[cfg(feature = "intl")]
