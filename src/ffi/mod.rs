@@ -605,9 +605,123 @@ unsafe fn copy_out(data: &[u8], out: *mut c_char, out_len: *mut usize) -> KtStat
     KtStatus::Ok
 }
 
+// --- Value layer -----------------------------------------------------------
+//
+// The ABI-stable JS value and its pure constructors/inspectors (touch no engine
+// state, so they need no `unsafe`). The context/callback bridge that lets C code
+// build heap values and register functions layers on top (later §4.0 work).
+
+/// An ABI-stable JavaScript value handed across the C boundary: the raw
+/// [`NanBox`](crate::nanbox::NanBox) encoding. Opaque to C callers, who construct
+/// and inspect it only through the `kt_value_*` functions.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct KtValue(pub u64);
+
+impl KtValue {
+    #[inline]
+    fn nan(self) -> crate::nanbox::NanBox {
+        crate::nanbox::NanBox::from_bits(self.0)
+    }
+    #[inline]
+    fn of(v: crate::nanbox::NanBox) -> Self {
+        KtValue(v.to_bits())
+    }
+}
+
+/// The JS `undefined` value.
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_undefined() -> KtValue {
+    KtValue::of(crate::nanbox::NanBox::undefined())
+}
+
+/// The JS `null` value.
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_null() -> KtValue {
+    KtValue::of(crate::nanbox::NanBox::null())
+}
+
+/// A JS Number.
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_number(n: f64) -> KtValue {
+    KtValue::of(crate::nanbox::NanBox::number(n))
+}
+
+/// A JS Boolean.
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_boolean(b: bool) -> KtValue {
+    KtValue::of(crate::nanbox::NanBox::boolean(b))
+}
+
+/// Whether `v` is a Number.
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_is_number(v: KtValue) -> bool {
+    v.nan().is_number()
+}
+
+/// The numeric value of `v` (`NaN` if `v` is not a Number — gate on
+/// [`kt_value_is_number`]).
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_as_number(v: KtValue) -> f64 {
+    v.nan().as_number().unwrap_or(f64::NAN)
+}
+
+/// Whether `v` is a Boolean.
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_is_boolean(v: KtValue) -> bool {
+    v.nan().as_boolean().is_some()
+}
+
+/// The boolean value of `v` (`false` if `v` is not a Boolean).
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_as_boolean(v: KtValue) -> bool {
+    v.nan().as_boolean().unwrap_or(false)
+}
+
+/// Whether `v` is exactly `undefined`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_is_undefined(v: KtValue) -> bool {
+    v.0 == crate::nanbox::NanBox::undefined().to_bits()
+}
+
+/// Whether `v` is exactly `null`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_is_null(v: KtValue) -> bool {
+    v.0 == crate::nanbox::NanBox::null().to_bits()
+}
+
+/// Whether `v` is a heap reference (object/array/function/string/…) rather than
+/// an inline primitive.
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_value_is_object(v: KtValue) -> bool {
+    v.nan().is_handle()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_layer_round_trips() {
+        // Constructors + inspectors agree, and the u64 encoding survives a copy
+        // (the ABI-stable representation a C host passes by value).
+        let n = kt_value_number(42.5);
+        assert!(kt_value_is_number(n));
+        assert!(!kt_value_is_boolean(n));
+        assert!(!kt_value_is_object(n));
+        assert_eq!(kt_value_as_number(n), 42.5);
+        assert_eq!(kt_value_as_number(KtValue(n.0)), 42.5);
+
+        let b = kt_value_boolean(true);
+        assert!(kt_value_is_boolean(b));
+        assert!(kt_value_as_boolean(b));
+        assert!(!kt_value_is_number(b));
+
+        assert!(kt_value_is_undefined(kt_value_undefined()));
+        assert!(kt_value_is_null(kt_value_null()));
+        assert!(!kt_value_is_null(kt_value_undefined()));
+        assert!(!kt_value_is_number(kt_value_undefined()));
+    }
 
     #[test]
     fn version_string_is_nul_terminated() {

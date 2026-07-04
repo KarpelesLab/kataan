@@ -20,6 +20,8 @@
 #define KATAAN_H
 
 #include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -140,6 +142,29 @@ int kt_snapshot(const char *source, size_t source_len, char *out, size_t *out_le
  * the same code.)
  */
 int kt_restore(const char *snapshot, size_t snapshot_len, char *out, size_t *out_len);
+
+/*
+ * --- Value layer -----------------------------------------------------------
+ *
+ * KtValue is an ABI-stable JavaScript value passed by copy (the engine's NaN-box
+ * encoding). Construct and inspect it only through these functions; the numeric
+ * layout is opaque. These are pure (they touch no engine state). The context and
+ * function-registration bridge builds on this layer.
+ */
+typedef struct { uint64_t bits; } KtValue;
+
+KtValue kt_value_undefined(void);
+KtValue kt_value_null(void);
+KtValue kt_value_number(double n);
+KtValue kt_value_boolean(bool b);
+
+bool   kt_value_is_number(KtValue v);
+double kt_value_as_number(KtValue v);
+bool   kt_value_is_boolean(KtValue v);
+bool   kt_value_as_boolean(KtValue v);
+bool   kt_value_is_undefined(KtValue v);
+bool   kt_value_is_null(KtValue v);
+bool   kt_value_is_object(KtValue v);
 
 #ifdef __cplusplus
 }
