@@ -1139,7 +1139,11 @@ impl<'a> Interp<'a> {
         for (name, _, _) in &slots {
             self.realm.set_non_configurable_property(obj, name);
         }
-        self.realm.prevent_extensions(obj);
+        // A module namespace is **sealed** (non-extensible + every property
+        // non-configurable) but not frozen (its bindings stay writable). Mark the
+        // seal flag so `Object.isSealed(ns)` computes `true` (not just
+        // `preventExtensions`, which would leave the flag unset).
+        self.realm.seal_object(obj);
         Ok(())
     }
 
