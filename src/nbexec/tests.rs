@@ -5538,6 +5538,31 @@ fn host_fn_value_inspection_and_array_access() {
 }
 
 #[test]
+fn host_fn_property_api_has_delete_keys() {
+    // A host fn exercising has / has_own / delete / own_keys on an object.
+    let program = Parser::parse_program("var o = { a: 1, b: 2 }; probe(o)").expect("parse");
+    let mut interp = Interp::new();
+    interp.register_global_fn("probe", 1, |cx, _t, args| {
+        let o = args.first().copied().unwrap_or(cx.undefined());
+        // Inherited (`toString`) is found by `has` but not `has_own`.
+        let has_inherited = cx.has(o, "toString");
+        let has_own_inherited = cx.has_own(o, "toString");
+        let keys_before = cx.own_keys(o).join(",");
+        let deleted = cx.delete(o, "a");
+        let has_a_after = cx.has(o, "a");
+        let keys_after = cx.own_keys(o).join(",");
+        Ok(cx.string(&alloc::format!(
+            "{has_inherited}/{has_own_inherited}/{keys_before}/{deleted}/{has_a_after}/{keys_after}"
+        )))
+    });
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(
+        interp.realm().to_display_string(v),
+        "true/false/a,b/true/false/b"
+    );
+}
+
+#[test]
 fn host_fn_throw_is_catchable() {
     let program =
         Parser::parse_program("try { boom(); 'no' } catch (e) { e.message }").expect("parse");

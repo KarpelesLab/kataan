@@ -811,6 +811,42 @@ impl<'c, 'a> Ctx<'c, 'a> {
             _ => NanBox::undefined(),
         }
     }
+
+    /// `HasProperty(obj, key)` — whether `obj` or its prototype chain has `key`
+    /// (the `in` operator; runs proxy `has` traps). A non-object `obj` is `false`.
+    pub fn has(&mut self, obj: NanBox, key: &str) -> bool {
+        obj.as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| self.interp.has_property(h, key))
+    }
+
+    /// Whether `obj` has an *own* property `key` (`Object.hasOwn`); a non-object
+    /// `obj` is `false`.
+    #[must_use]
+    pub fn has_own(&self, obj: NanBox, key: &str) -> bool {
+        obj.as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| self.interp.realm.has_own(h, key))
+    }
+
+    /// Deletes own property `key` of `obj` (`delete obj[key]`), returning whether
+    /// the property is gone afterward. A non-object `obj` is a vacuous `true`.
+    pub fn delete(&mut self, obj: NanBox, key: &str) -> bool {
+        match obj.as_handle().map(Handle::from_raw) {
+            Some(h) => self.interp.realm.delete_property(h, key),
+            None => true,
+        }
+    }
+
+    /// The own string-keyed property names of `obj`, in ordinary ownKeys order
+    /// (integer indices ascending, then insertion order); empty if not an object.
+    #[must_use]
+    pub fn own_keys(&self, obj: NanBox) -> Vec<String> {
+        obj.as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.interp.realm.own_property_names(h))
+            .unwrap_or_default()
+    }
 }
 
 /// A queued promise reaction: run `handler` with `value`, then settle `result`
