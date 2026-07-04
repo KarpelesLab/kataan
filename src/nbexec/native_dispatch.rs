@@ -1257,9 +1257,18 @@ impl<'a> Interp<'a> {
                         .collect();
                     return Ok(NanBox::handle(self.realm.new_array(boxed).to_raw()));
                 }
-                let names = arg(0)
-                    .as_handle()
-                    .and_then(|raw| self.realm.own_property_names(Handle::from_raw(raw)))
+                // A proxy *without* an `ownKeys` trap forwards `[[OwnPropertyKeys]]`
+                // to its target (recursing through nested proxies) — so its own
+                // string keys are the target's, not the (empty) proxy object's.
+                let mut src = arg(0).as_handle().map(Handle::from_raw);
+                while let Some(h) = src {
+                    match self.realm.proxy_at(h) {
+                        Some((target, _)) => src = Some(target),
+                        None => break,
+                    }
+                }
+                let names = src
+                    .and_then(|h| self.realm.own_property_names(h))
                     .unwrap_or_default();
                 let boxed: Vec<NanBox> = names.iter().map(|k| self.new_str(k)).collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
