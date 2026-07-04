@@ -1397,6 +1397,9 @@ const WASM_TABLE_MAX: &str = "\u{0}tmax";
 // to a free id so the 12th typed-array kind, `Float16Array`, can take
 // `N_TYPED_ARRAY_BASE + 11 = 179` and keep the kind ids contiguous.)
 const N_OBJ_PROTO_TOSTRING: u16 = 675;
+/// `%Segments.prototype%.containing(index)` — a bound native on the object
+/// returned by `Intl.Segmenter.prototype.segment`.
+const N_INTL_SEGMENTS_CONTAINING: u16 = 676;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
 const N_OBJ_PROTO_HASOWN: u16 = 181;
 const N_OBJ_PROTO_ISPROTOTYPEOF: u16 = 182;

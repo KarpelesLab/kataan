@@ -2489,7 +2489,14 @@ impl<'a> Interp<'a> {
                     }
                     elems.push(NanBox::handle(o.to_raw()));
                 }
-                NanBox::handle(self.realm.new_array(elems).to_raw())
+                let arr = self.realm.new_array(elems);
+                // Attach `containing(index)` (a bound native over this segments
+                // array) so `segments.containing(i)` works, alongside iteration.
+                let containing = self.realm.new_bound_native(N_INTL_SEGMENTS_CONTAINING, arr);
+                self.install_fn_name_length(containing, "containing", 1);
+                self.realm
+                    .set_property(arr, "containing", NanBox::handle(containing.to_raw()));
+                NanBox::handle(arr.to_raw())
             }
             // `Intl.Collator.prototype.compare(a, b)` — code-point order (no locale
             // tailoring), so a negative/zero/positive result orders `a` vs `b`.

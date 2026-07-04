@@ -1027,6 +1027,44 @@ impl<'a> Interp<'a> {
             }
             let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
             match id {
+                // `Segments.prototype.containing(index)`: `target` is the segments
+                // array; return the segment-data object whose `[index, index+len)`
+                // range covers `index` (undefined out of range / non-integer).
+                N_INTL_SEGMENTS_CONTAINING => {
+                    let idx = self.realm.to_number(arg0);
+                    let mut result = NanBox::undefined();
+                    if idx.is_finite() && idx >= 0.0 {
+                        let idx = idx as usize;
+                        if let Some(elems) = self.realm.array_elements(target).map(<[_]>::to_vec) {
+                            // Segments are contiguous and ordered; the containing one
+                            // is the last whose `index <= idx`, provided `idx` is
+                            // within the input length.
+                            let input_len = elems
+                                .first()
+                                .and_then(|e| e.as_handle())
+                                .map(Handle::from_raw)
+                                .and_then(|h| self.realm.get_property(h, "input"))
+                                .and_then(|v| v.as_handle())
+                                .map(Handle::from_raw)
+                                .and_then(|ih| self.realm.string_value(ih))
+                                .map_or(0, |s| s.encode_utf16().count());
+                            if idx < input_len {
+                                for e in &elems {
+                                    let start = e
+                                        .as_handle()
+                                        .map(Handle::from_raw)
+                                        .and_then(|h| self.realm.get_property(h, "index"))
+                                        .and_then(|v| v.as_number())
+                                        .unwrap_or(-1.0);
+                                    if start >= 0.0 && start as usize <= idx {
+                                        result = *e;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(result);
+                }
                 N_RESOLVE => self.resolve_with(target, arg0),
                 N_REJECT => self.settle(target, arg0, false),
                 // The `revoke` function from `Proxy.revocable`.
