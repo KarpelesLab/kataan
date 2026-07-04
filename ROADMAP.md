@@ -426,13 +426,14 @@ taken out of its slot for the call). **Host constructors have landed:**
 `register_constructor` / `register_global_constructor` make a host function
 constructable — `new HostCtor(...)` binds a fresh `this` (its `[[Prototype]]` is
 the auto-created `HostCtor.prototype`), runs the closure, and applies the
-constructor return rule, so `instanceof` and prototype methods work. See
+constructor return rule, so `instanceof` and prototype methods work. A **panic in
+host code is trapped** at the boundary (`catch_unwind`, std) and surfaces as a
+catchable JS `Error` rather than unwinding across engine frames. See
 `examples/embed_host_fn.rs`. **Remaining for §4.0:** a rooted **handle scope**
 (host values held across calls), host-backed exotic objects carrying opaque
-native state **+ finalizers**, panic-trapping at the boundary, the **C ABI**
-mirror, the async *continuation* half (a `Resolver` the host settles later from a
-timer/IO completion), `nbvm` host-native fault-through, and migrating a sentinel
-builtin onto the registry.
+native state **+ finalizers**, the **C ABI** mirror, the async *continuation* half
+(a `Resolver` the host settles later from a timer/IO completion), `nbvm`
+host-native fault-through, and migrating a sentinel builtin onto the registry.
 
 ### 4.1 Event loop & scheduling
 
