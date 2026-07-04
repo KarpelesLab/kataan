@@ -1309,6 +1309,12 @@ impl<'a> Interp<'a> {
             let m = self.new_str("invalid numberingSystem");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
+        // Absent an explicit option, resolve the locale's CLDR default (as for
+        // NumberFormat) so e.g. a `fa` DateTimeFormat renders native digits.
+        let nu = match nu {
+            Some(ns) => Some(ns),
+            None => Some(self.default_numbering_for_locale(obj)),
+        };
         self.store_str(obj, "numberingSystem", &nu);
         // hour12 (boolean) and hourCycle (enum).
         let hour12 = self.get_bool_option(opts, "hour12", None)?;
@@ -2883,7 +2889,32 @@ impl<'a> Interp<'a> {
         for (_, v) in self.datetime_parts(handle, ms) {
             s.push_str(&v);
         }
-        s
+        self.apply_numbering_digits(handle, s)
+    }
+
+    /// Rewrites the ASCII digits of `s` into the format object's resolved
+    /// `numberingSystem` (see [`numbering_system_digit_base`]); non-digit code
+    /// points (separators, letters) are untouched. Shared by NumberFormat and
+    /// DateTimeFormat.
+    pub(crate) fn apply_numbering_digits(&mut self, handle: Handle, s: String) -> String {
+        let nu = self
+            .realm
+            .get_property(handle, "numberingSystem")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
+        match numbering_system_digit_base(&nu) {
+            Some(base) => s
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_digit() {
+                        char::from_u32(base + (c as u32 - '0' as u32)).unwrap_or(c)
+                    } else {
+                        c
+                    }
+                })
+                .collect(),
+            None => s,
+        }
     }
 
     /// Builds the `intl` crate's `NumberFormatOptions` from an `Intl.NumberFormat` instance's

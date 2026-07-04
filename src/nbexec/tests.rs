@@ -8320,3 +8320,33 @@ fn intl_default_numbering_system_from_locale() {
         "deva"
     );
 }
+
+#[test]
+#[cfg(feature = "intl")]
+fn intl_datetime_numbering_system() {
+    // DateTimeFormat renders its digits in the resolved numbering system (explicit
+    // option and the locale's CLDR default), separators untouched; latn unchanged.
+    let d = "new Date(2020,5,15)";
+    assert_eq!(
+        run(&format!(
+            "new Intl.DateTimeFormat('en',{{numberingSystem:'arab',year:'numeric',month:'numeric',day:'numeric'}}).format({d})"
+        )),
+        "\u{0666}/\u{0661}\u{0665}/\u{0662}\u{0660}\u{0662}\u{0660}"
+    );
+    assert_eq!(
+        run(&format!(
+            "new Intl.DateTimeFormat('fa',{{year:'numeric',month:'numeric',day:'numeric',calendar:'gregory'}}).format({d})"
+        )),
+        "\u{06f2}\u{06f0}\u{06f2}\u{06f0}/\u{06f6}/\u{06f1}\u{06f5}"
+    );
+    assert_eq!(
+        run("new Intl.DateTimeFormat('fa').resolvedOptions().numberingSystem"),
+        "arabext"
+    );
+    assert_eq!(
+        run(&format!(
+            "new Intl.DateTimeFormat('en',{{year:'numeric',month:'numeric',day:'numeric'}}).format({d})"
+        )),
+        "6/15/2020"
+    );
+}
