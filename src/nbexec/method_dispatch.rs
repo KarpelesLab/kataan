@@ -828,14 +828,23 @@ impl<'a> Interp<'a> {
             // with `ToString(subs[i])`. `template.raw` is treated as an array-like
             // (length + indexed reads), not necessarily a real array.
             Some(N_STRING) if method == "raw" => {
+                // `cooked = ToObject(template)` — throwing ToObject: a `null` /
+                // `undefined` template is a TypeError (not `Object()`'s fresh
+                // object). A primitive boxes to its wrapper.
+                if matches!(arg(0).unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    return Err(self.type_error("Cannot convert undefined or null to object"));
+                }
                 let cooked = self.coerce_to_object(arg(0));
                 let Some(ch) = cooked.as_handle().map(Handle::from_raw) else {
                     return Err(self.type_error("Cannot convert undefined or null to object"));
                 };
-                let raw_v = self
-                    .realm
-                    .get_property(ch, "raw")
-                    .unwrap_or(NanBox::undefined());
+                // `raw = ToObject(Get(cooked, "raw"))`: `Get` fires an inherited
+                // getter (a throw propagates), and a `null`/`undefined` `raw` is a
+                // TypeError.
+                let raw_v = self.read_member(ch, "raw")?;
+                if matches!(raw_v.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    return Err(self.type_error("Cannot convert undefined or null to object"));
+                }
                 let raw_obj = self.coerce_to_object(raw_v);
                 let Some(rh) = raw_obj.as_handle().map(Handle::from_raw) else {
                     return Err(self.type_error("Cannot convert undefined or null to object"));

@@ -6079,3 +6079,29 @@ fn string_replace_coerces_replacement_via_tostring() {
     assert_eq!(run("'a.b'.replace('.','-')"), "a-b");
     assert_eq!(run("'abc'.replaceAll('b','[$&]')"), "a[b]c");
 }
+
+#[test]
+fn string_raw_validates_template_and_raw() {
+    // ToObject(template) + ToObject(Get(template,"raw")) are throwing ToObject,
+    // and the `raw` Get fires an inherited getter (throw propagates).
+    assert_eq!(run("String.raw`a${1}b`"), "a1b");
+    assert_eq!(
+        run("try{String.raw(5);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("try{String.raw({});'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("try{String.raw(null);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("try{String.raw({get raw(){throw 'x'}});'no'}catch(e){e}"),
+        "x"
+    );
+    // Manual raw objects and array-like raw still work.
+    assert_eq!(run("String.raw({raw:['a','b','c']},1,2)"), "a1b2c");
+    assert_eq!(run("String.raw({raw:{length:2,0:'x',1:'y'}},9)"), "x9y");
+}

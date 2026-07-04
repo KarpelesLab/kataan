@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(string)* `String.raw` uses throwing `ToObject` on the template and on
+  `Get(template, "raw")` (a `null`/`undefined` or a non-object `raw` throws
+  TypeError), and reads `raw` via `Get` so an inherited getter fires and its
+  throw propagates — previously all silently succeeded (ROADMAP §3.6).
 - *(string)* `String.prototype.replace`/`replaceAll` `ToString` the replacement
   value and the function-replacer's result (a custom `toString`/`@@toPrimitive`
   runs and a thrown value propagates) instead of rendering `"[object Object]"`
