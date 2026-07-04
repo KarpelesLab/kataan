@@ -47,6 +47,88 @@ impl<'a> Interp<'a> {
                 }
                 return self.call_with_this(iso, obj, &[]);
             }
+            // `Atomics.*` — single-agent read-modify-write / load / store over an
+            // integer `TypedArray`. `isLockFree(n)` is a pure size check; the rest
+            // validate the array kind + in-range index, then act atomically (trivial
+            // without concurrent agents).
+            N_ATOMICS_IS_LOCK_FREE => {
+                let n = self.realm.to_number(arg(0));
+                // An integer byte width of 1/2/4/8 is lock-free (no `f64::fract` in
+                // the no_std core, so test integrality with an int round-trip).
+                let is_int = n.is_finite() && n == (n as i64) as f64;
+                NanBox::boolean(is_int && matches!(n as i64, 1 | 2 | 4 | 8))
+            }
+            N_ATOMICS_ADD
+            | N_ATOMICS_SUB
+            | N_ATOMICS_AND
+            | N_ATOMICS_OR
+            | N_ATOMICS_XOR
+            | N_ATOMICS_EXCHANGE
+            | N_ATOMICS_COMPARE_EXCHANGE
+            | N_ATOMICS_LOAD
+            | N_ATOMICS_STORE => {
+                let Some(ta) = arg(0).as_handle().map(Handle::from_raw) else {
+                    return Err(self.type_error("Atomics operand must be an integer TypedArray"));
+                };
+                let Some(kind) = self.realm.typed_kind(ta) else {
+                    return Err(self.type_error("Atomics operand must be an integer TypedArray"));
+                };
+                // Allowed: Int8/Uint8/Int16/Uint16/Int32/Uint32/BigInt64/BigUint64
+                // (not Uint8Clamped=2, Float32=7, Float64=8, Float16=11).
+                if matches!(kind, 2 | 7 | 8 | 11) {
+                    return Err(self.type_error("Atomics operand must be an integer TypedArray"));
+                }
+                if crate::nbexec::is_bigint_kind(kind) {
+                    return Err(
+                        self.type_error("Atomics on BigInt typed arrays is not yet supported")
+                    );
+                }
+                let len = self.realm.array_length(ta).unwrap_or(0);
+                let idx_f = self.coerce_to_integer_or_infinity(arg(1))?;
+                if !(idx_f.is_finite() && idx_f >= 0.0 && (idx_f as usize) < len) {
+                    let m = self.new_str("Atomics index out of range");
+                    return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                }
+                let idx = idx_f as usize;
+                let old = self
+                    .realm
+                    .typed_get(ta, idx)
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0);
+                if id == N_ATOMICS_LOAD {
+                    return Ok(NanBox::number(old));
+                }
+                // The value operand (index 2 for RMW/store; 2=expected,3=replacement
+                // for compareExchange) is ToIntegerOrInfinity'd.
+                if id == N_ATOMICS_COMPARE_EXCHANGE {
+                    let expected = self.coerce_to_integer_or_infinity(arg(2))?;
+                    let replacement = self.coerce_to_integer_or_infinity(arg(3))?;
+                    // Compare against the stored (already type-coerced) value.
+                    let expected_stored = coerce_typed(u16::from(kind), expected);
+                    if old == expected_stored {
+                        self.realm.typed_set(ta, idx, NanBox::number(replacement));
+                    }
+                    return Ok(NanBox::number(old));
+                }
+                let v = self.coerce_to_integer_or_infinity(arg(2))?;
+                let new = match id {
+                    N_ATOMICS_STORE | N_ATOMICS_EXCHANGE => v,
+                    N_ATOMICS_ADD => old + v,
+                    N_ATOMICS_SUB => old - v,
+                    // Bitwise ops act on the two's-complement integer value.
+                    N_ATOMICS_AND => ((old as i64) & (v as i64)) as f64,
+                    N_ATOMICS_OR => ((old as i64) | (v as i64)) as f64,
+                    N_ATOMICS_XOR => ((old as i64) ^ (v as i64)) as f64,
+                    _ => old,
+                };
+                self.realm.typed_set(ta, idx, NanBox::number(new));
+                // `store` returns the coerced value it wrote; the rest return the old.
+                if id == N_ATOMICS_STORE {
+                    NanBox::number(coerce_typed(u16::from(kind), v))
+                } else {
+                    NanBox::number(old)
+                }
+            }
             N_MATH_MAX => {
                 // ToNumber every argument first (in order, propagating any abrupt
                 // completion), then reduce — so each element's `valueOf` runs even

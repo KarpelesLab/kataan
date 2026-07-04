@@ -1410,6 +1410,18 @@ const N_OBJ_PROTO_TOSTRING: u16 = 675;
 /// `%Segments.prototype%.containing(index)` — a bound native on the object
 /// returned by `Intl.Segmenter.prototype.segment`.
 const N_INTL_SEGMENTS_CONTAINING: u16 = 676;
+/// `Atomics.*` methods (single-agent semantics over an integer `TypedArray`;
+/// atomicity is trivial without concurrent agents).
+const N_ATOMICS_ADD: u16 = 677;
+const N_ATOMICS_SUB: u16 = 678;
+const N_ATOMICS_AND: u16 = 679;
+const N_ATOMICS_OR: u16 = 680;
+const N_ATOMICS_XOR: u16 = 681;
+const N_ATOMICS_EXCHANGE: u16 = 682;
+const N_ATOMICS_COMPARE_EXCHANGE: u16 = 683;
+const N_ATOMICS_LOAD: u16 = 684;
+const N_ATOMICS_STORE: u16 = 685;
+const N_ATOMICS_IS_LOCK_FREE: u16 = 686;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
 const N_OBJ_PROTO_HASOWN: u16 = 181;
 const N_OBJ_PROTO_ISPROTOTYPEOF: u16 = 182;
@@ -3253,6 +3265,32 @@ impl<'a> Interp<'a> {
             self.realm.set_readonly_property(math, &tag_key);
         }
         install_namespace(self, "console", &[("log", N_CONSOLE_LOG)]);
+        // `Atomics` — single-agent read-modify-write over an integer `TypedArray`.
+        install_namespace(
+            self,
+            "Atomics",
+            &[
+                ("add", N_ATOMICS_ADD),
+                ("sub", N_ATOMICS_SUB),
+                ("and", N_ATOMICS_AND),
+                ("or", N_ATOMICS_OR),
+                ("xor", N_ATOMICS_XOR),
+                ("exchange", N_ATOMICS_EXCHANGE),
+                ("compareExchange", N_ATOMICS_COMPARE_EXCHANGE),
+                ("load", N_ATOMICS_LOAD),
+                ("store", N_ATOMICS_STORE),
+                ("isLockFree", N_ATOMICS_IS_LOCK_FREE),
+            ],
+        );
+        if let Some(ah) = self.current.get("Atomics").and_then(NanBox::as_handle) {
+            let atomics = Handle::from_raw(ah);
+            let tag_sym = self.well_known_symbol("toStringTag");
+            let tag_key = self.member_key(tag_sym);
+            let tag_val = self.new_str("Atomics");
+            self.realm.set_property(atomics, &tag_key, tag_val);
+            self.realm.mark_hidden(atomics, &tag_key);
+            self.realm.set_readonly_property(atomics, &tag_key);
+        }
         // `Promise` is a native constructor (`new Promise(executor)`); its
         // `.resolve`/`.reject` statics are dispatched in `call_method`.
         let promise_ctor = self.new_named_native("Promise", N_PROMISE);

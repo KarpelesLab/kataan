@@ -8084,3 +8084,66 @@ fn float16_array_read_write_and_rounding() {
     // The moved Object.prototype.toString id is unaffected.
     assert_eq!(run("({}).toString()"), "[object Object]");
 }
+
+#[test]
+fn atomics_single_agent_integer_ops() {
+    // Single-agent Atomics over an integer TypedArray: RMW returns the old value,
+    // store returns (and wraps) the written value, load reads, isLockFree checks
+    // the byte size, and non-integer arrays / OOB indices / non-arrays throw.
+    assert_eq!(
+        run("var a=new Int32Array(1);a[0]=5;Atomics.add(a,0,3)+','+a[0]"),
+        "5,8"
+    );
+    assert_eq!(
+        run("var a=new Int32Array(1);a[0]=10;Atomics.sub(a,0,4)+','+a[0]"),
+        "10,6"
+    );
+    assert_eq!(
+        run("var a=new Int32Array(1);a[0]=12;Atomics.and(a,0,10)+','+a[0]"),
+        "12,8"
+    );
+    assert_eq!(
+        run("var a=new Int32Array(1);a[0]=12;Atomics.or(a,0,3);a[0]"),
+        "15"
+    );
+    assert_eq!(
+        run("var a=new Int32Array(1);a[0]=12;Atomics.xor(a,0,10);a[0]"),
+        "6"
+    );
+    assert_eq!(
+        run("var a=new Int32Array(1);a[0]=7;Atomics.exchange(a,0,99)+','+a[0]"),
+        "7,99"
+    );
+    assert_eq!(
+        run("var a=new Int32Array(1);a[0]=5;Atomics.compareExchange(a,0,5,50)+','+a[0]"),
+        "5,50"
+    );
+    assert_eq!(
+        run("var a=new Int32Array(1);a[0]=5;Atomics.compareExchange(a,0,9,50)+','+a[0]"),
+        "5,5"
+    );
+    assert_eq!(
+        run("var a=new Uint8Array(1);Atomics.store(a,0,256)+','+a[0]"),
+        "0,0"
+    ); // wraps
+    assert_eq!(
+        run("var a=new Uint8Array(1);a[0]=42;Atomics.load(a,0)"),
+        "42"
+    );
+    assert_eq!(
+        run("[Atomics.isLockFree(4),Atomics.isLockFree(3)].join(',')"),
+        "true,false"
+    );
+    assert_eq!(
+        run("try{Atomics.add(new Float64Array(1),0,1);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("try{Atomics.load(new Int32Array(2),5);'no'}catch(e){e.constructor.name}"),
+        "RangeError"
+    );
+    assert_eq!(
+        run("Object.prototype.toString.call(Atomics)"),
+        "[object Atomics]"
+    );
+}
