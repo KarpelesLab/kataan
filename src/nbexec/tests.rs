@@ -7176,3 +7176,35 @@ fn annexb_legacy_octal_string_escapes() {
         "0"
     );
 }
+
+#[test]
+fn regex_legacy_octal_escapes() {
+    // Annex B legacy octal escapes in a non-`u` regex: `\101` = char 65 ('A').
+    // A numeric escape is a backreference only when it names an existing group
+    // (pre-scanned total group count); otherwise it is a legacy octal escape.
+    assert_eq!(
+        run("/\\101/.test('A')+','+/\\101/.test('101')"),
+        "true,false"
+    );
+    assert_eq!(run("/\\12/.test('\\n')"), "true"); // octal 12 = newline
+    assert_eq!(run("/\\1/.test('\\x01')"), "true"); // no group → octal 1
+    assert_eq!(run("/\\8/.test('8')+','+/\\9/.test('9')"), "true,true"); // not octal
+    // A backreference still works (existing or forward group).
+    assert_eq!(
+        run("/(a)\\1/.test('aa')+','+/(a)\\1/.test('ab')"),
+        "true,false"
+    );
+    assert_eq!(run("/(a)(b)\\2/.test('abb')"), "true");
+    // Inside a class `\101` is octal (no backreferences there); ranges decode both ends.
+    assert_eq!(
+        run("/[\\101]/.test('A')+','+/[\\101]/.test('1')"),
+        "true,false"
+    );
+    assert_eq!(
+        run("/[\\101-\\103]/.test('B')+','+/[\\101-\\103]/.test('D')"),
+        "true,false"
+    );
+    // `\0` NUL and word-boundary `\b` are unaffected.
+    assert_eq!(run("/\\0/.test('\\0')"), "true");
+    assert_eq!(run("/\\bword\\b/.test('a word')"), "true");
+}

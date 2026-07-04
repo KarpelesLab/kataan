@@ -177,10 +177,14 @@ pub(crate) fn parse(
     // named backreference only when the pattern declares a named group (else it
     // is the Annex B identity escape `k`, with `<name>` matched literally).
     let has_named = unicode || scan_has_named_group(&chars);
+    // Total capture groups, pre-scanned so a numeric escape (`\1`, `\101`) can be
+    // resolved to a backreference vs an Annex B legacy octal escape at parse time.
+    let total_groups = scan_group_count(&chars);
     let mut p = Parser {
         chars,
         pos: 0,
         group_count: 0,
+        total_groups,
         group_names: Vec::new(),
         depth: 0,
         unicode,
@@ -228,6 +232,10 @@ struct Parser {
     chars: Vec<char>,
     pos: usize,
     group_count: usize,
+    /// Total capture groups in the whole pattern (pre-scanned), so a numeric
+    /// escape can be classified backreference-vs-legacy-octal even for a forward
+    /// reference.
+    total_groups: usize,
     group_names: Vec<(usize, alloc::string::String)>,
     /// Current group/lookaround nesting depth, bounded by `MAX_PARSE_DEPTH`.
     depth: u32,
@@ -272,6 +280,36 @@ struct Parser {
 /// Pre-scans for `(?<name>…)` group syntax (a `(?<` not immediately followed by
 /// `=` or `!`, which would be a lookbehind). Determines whether `\k<…>` is a
 /// named backreference (Annex B: only when a named group is present).
+/// Counts the capturing groups in the pattern (a plain `(` or a named `(?<name>`,
+/// but not the `(?:`/`(?=`/`(?!`/`(?<=`/`(?<!` non-capturing forms). Pre-scanned so
+/// a numeric escape can be resolved to a backreference vs an Annex B legacy octal
+/// escape *at parse time*, even for a forward reference.
+fn scan_group_count(chars: &[char]) -> usize {
+    let mut i = 0;
+    let mut in_class = false;
+    let mut count = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '(' if !in_class
+                && (chars.get(i + 1) != Some(&'?')
+                    || (chars.get(i + 2) == Some(&'<')
+                        && !matches!(chars.get(i + 3), Some('=') | Some('!')))) =>
+            {
+                count += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    count
+}
+
 fn scan_has_named_group(chars: &[char]) -> bool {
     let mut i = 0;
     let mut in_class = false;
@@ -804,18 +842,53 @@ impl Parser {
             // `u` flag; without it, an out-of-range reference falls back to Annex
             // B legacy-octal/literal handling (see `decimal_escape_fallback`).
             d if d.is_ascii_digit() && d != '0' => {
-                let mut n = (d as u8 - b'0') as usize;
-                // Multi-digit references are read whole only under `u` (where the
-                // grammar has no Annex B legacy-octal ambiguity); in non-`u` mode
-                // a single digit is kept to preserve the historical behavior.
                 if self.unicode {
+                    // Under `u` there is no legacy-octal ambiguity: read the whole
+                    // `DecimalEscape` as a backreference (validated post-parse).
+                    let mut n = (d as u8 - b'0') as usize;
                     while let Some(nd) = self.peek().and_then(|c| c.to_digit(10)) {
                         n = n.saturating_mul(10).saturating_add(nd as usize);
                         self.pos += 1;
                     }
+                    self.numeric_refs.push(n);
+                    Node::Backref(n)
+                } else {
+                    // Non-`u` (Annex B): read the full `DecimalDigits`. If the value
+                    // names an existing group it is a backreference; otherwise it is
+                    // a `LegacyOctalEscapeSequence` — decode the leading octal digits
+                    // (a leading 1-3 takes up to three, 4-7 up to two; ≤ 255) and
+                    // rewind so any remaining digits re-parse as literals. `\8`/`\9`
+                    // are never octal, so an out-of-range `\8` is the literal `8`.
+                    let after_first = self.pos; // just past `d`
+                    let mut n = (d as u8 - b'0') as usize;
+                    while let Some(nd) = self.peek().and_then(|c| c.to_digit(10)) {
+                        n = n.saturating_mul(10).saturating_add(nd as usize);
+                        self.pos += 1;
+                    }
+                    if n <= self.total_groups {
+                        self.numeric_refs.push(n);
+                        Node::Backref(n)
+                    } else if d >= '8' {
+                        // NonOctalDecimalEscape `\8`/`\9`: rewind to the literal digit.
+                        self.pos = after_first;
+                        Node::Char(d as u32)
+                    } else {
+                        let max = if d <= '3' { 2 } else { 1 };
+                        let mut val = d as u32 - '0' as u32;
+                        let mut extra = 0;
+                        while extra < max {
+                            match self.chars.get(after_first + extra) {
+                                Some(&od @ '0'..='7') => {
+                                    val = val * 8 + (od as u32 - '0' as u32);
+                                    extra += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        self.pos = after_first + extra;
+                        Node::Char(val)
+                    }
                 }
-                self.numeric_refs.push(n);
-                Node::Backref(n)
             }
             // `\k<name>` — a named backreference (resolved at compile time), but
             // only when the pattern contains named-group syntax (or the `u` flag
@@ -1085,6 +1158,12 @@ impl Parser {
                         'b' => {
                             self.push_class_member(&mut items, 0x08)?;
                         }
+                        // Annex B legacy octal escape (non-`u`): a class has no
+                        // backreferences, so `\0`-`\7` are always octal (≤ 255).
+                        d @ '0'..='7' if !self.unicode => {
+                            let val = self.read_legacy_octal(d);
+                            self.push_class_member(&mut items, val)?;
+                        }
                         other => {
                             self.push_class_member(&mut items, escape_char(other) as u32)?;
                         }
@@ -1116,6 +1195,26 @@ impl Parser {
     /// and another member follow. Returns `Err` for an invalid range whose high
     /// endpoint is a class escape under the `u` flag (`[a-\d]`); in Annex B
     /// (non-`u`) sloppy mode that `-` is a literal dash and never errors.
+    /// Reads a legacy octal escape whose first octal digit `first` was already
+    /// consumed: takes up to the max additional octal digits (a leading `0`-`3`
+    /// admits two more, `4`-`7` one more) and returns the value (≤ 255). Annex B.
+    fn read_legacy_octal(&mut self, first: char) -> u32 {
+        let max = if first <= '3' { 2 } else { 1 };
+        let mut val = first as u32 - '0' as u32;
+        let mut extra = 0;
+        while extra < max {
+            match self.peek() {
+                Some(od @ '0'..='7') => {
+                    val = val * 8 + (od as u32 - '0' as u32);
+                    self.pos += 1;
+                    extra += 1;
+                }
+                _ => break,
+            }
+        }
+        val
+    }
+
     fn push_class_member(&mut self, items: &mut Vec<ClassItem>, c: u32) -> Result<(), RegexError> {
         if self.peek() == Some('-') && self.chars.get(self.pos + 1).is_some_and(|&n| n != ']') {
             // Under `u`, a class escape (`\d`, `\w`, … or `\p`/`\P`) on the right
@@ -1138,6 +1237,9 @@ impl Parser {
                 match self.bump() {
                     Some('u') => self.parse_unicode_escape().unwrap_or(c),
                     Some('x') => self.parse_hex_escape(2).unwrap_or(c),
+                    // Annex B legacy octal (non-`u`) as a range high endpoint.
+                    Some(d @ '0'..='7') if !self.unicode => self.read_legacy_octal(d),
+                    Some('b') => 0x08, // `\b` is a backspace inside a class.
                     Some(e) => escape_char(e) as u32,
                     None => '\\' as u32,
                 }
