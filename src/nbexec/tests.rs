@@ -7861,3 +7861,42 @@ fn array_from_async_subclass_uses_dense_storage() {
         "1,2,3\n"
     );
 }
+
+#[test]
+fn float16_array_read_write_and_rounding() {
+    // Float16Array (ES2025): construction, name/size, exact IEEE-754 half rounding,
+    // and the generic typed-array methods over the new kind.
+    assert_eq!(run("typeof Float16Array"), "function");
+    assert_eq!(run("Float16Array.BYTES_PER_ELEMENT"), "2");
+    assert_eq!(run("Float16Array.name"), "Float16Array");
+    assert_eq!(
+        run("var a=new Float16Array(3);a[0]=1.5;a[1]=2.25;a[0]+','+a[1]+','+a[2]"),
+        "1.5,2.25,0"
+    );
+    // f16 cannot represent 1.0001 (rounds to 1) but holds its max 65504 exactly.
+    assert_eq!(run("var a=new Float16Array(1);a[0]=1.0001;a[0]"), "1");
+    assert_eq!(run("var a=new Float16Array(1);a[0]=65504;a[0]"), "65504");
+    assert_eq!(
+        run("var a=new Float16Array(1);a[0]=0.1;a[0]"),
+        "0.0999755859375"
+    );
+    assert_eq!(
+        run("Float16Array.from([1,2,3]).map(x=>x*2).join(',')"),
+        "2,4,6"
+    );
+    assert_eq!(
+        run("new Float16Array([1,2,3,4]).subarray(1,3).join(',')"),
+        "2,3"
+    );
+    assert_eq!(
+        run("var a=new Float16Array(new ArrayBuffer(4));a[0]=3.5;a[0]+'/'+a.length"),
+        "3.5/2"
+    );
+    assert_eq!(run("new Float16Array(1) instanceof Float16Array"), "true");
+    assert_eq!(
+        run("Object.prototype.toString.call(new Float16Array(1))"),
+        "[object Float16Array]"
+    );
+    // The moved Object.prototype.toString id is unaffected.
+    assert_eq!(run("({}).toString()"), "[object Object]");
+}

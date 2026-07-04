@@ -1236,7 +1236,7 @@ const N_TYPED_ARRAY_BASE: u16 = 168;
 /// and 10 hold **BigInt** elements (8 bytes, signed i64 / unsigned u64); the
 /// element read/write paths special-case them (see [`encode_typed_element`] /
 /// [`decode_typed_element`] and the BigInt coercion in [`Realm::typed_set`]).
-const TYPED_ARRAY_KINDS: [(&str, u8); 11] = [
+const TYPED_ARRAY_KINDS: [(&str, u8); 12] = [
     ("Int8Array", 1),
     ("Uint8Array", 1),
     ("Uint8ClampedArray", 1),
@@ -1248,6 +1248,10 @@ const TYPED_ARRAY_KINDS: [(&str, u8); 11] = [
     ("Float64Array", 8),
     ("BigInt64Array", 8),
     ("BigUint64Array", 8),
+    // Kind 11: IEEE-754 half precision (ES2025). Not contiguous with the other
+    // float kinds, but the encode/decode paths dispatch by index, so its position
+    // after the BigInt kinds is fine (`is_bigint_typed_kind` only matches 9/10).
+    ("Float16Array", 2),
 ];
 /// Whether typed-array `kind` index holds BigInt elements (9 = `BigInt64Array`,
 /// 10 = `BigUint64Array`).
@@ -1317,8 +1321,10 @@ const WASM_MEM_MAX: &str = "\u{0}mmax";
 /// Hidden slots on a `WebAssembly.Table`: its element (function-ref) array and max.
 const WASM_TABLE_ELEMS: &str = "\u{0}telems";
 const WASM_TABLE_MAX: &str = "\u{0}tmax";
-// `Object.prototype.*` methods (the receiver arrives as `this`).
-const N_OBJ_PROTO_TOSTRING: u16 = 179;
+// `Object.prototype.*` methods (the receiver arrives as `this`). (Moved off 179
+// to a free id so the 12th typed-array kind, `Float16Array`, can take
+// `N_TYPED_ARRAY_BASE + 11 = 179` and keep the kind ids contiguous.)
+const N_OBJ_PROTO_TOSTRING: u16 = 675;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
 const N_OBJ_PROTO_HASOWN: u16 = 181;
 const N_OBJ_PROTO_ISPROTOTYPEOF: u16 = 182;
@@ -5782,8 +5788,9 @@ fn wasm_extern_kind(kind: u8) -> &'static str {
 
 pub(crate) fn coerce_typed(kind: u16, n: f64) -> f64 {
     match kind {
-        7 => f64::from(n as f32), // Float32
-        8 => n,                   // Float64
+        7 => f64::from(n as f32),             // Float32
+        8 => n,                               // Float64
+        11 => f16_to_f64(f64_to_f16_bits(n)), // Float16 (round to nearest f16)
         2 => {
             // Uint8Clamped: clamp to 0..=255 with round-half-to-even (core only).
             if n.is_nan() || n <= 0.0 {
@@ -6234,6 +6241,10 @@ pub(crate) fn encode_typed_element(kind: u8, v: f64) -> ([u8; 8], usize) {
             out.copy_from_slice(&v.to_le_bytes()); // Float64
             8
         }
+        11 => {
+            out[..2].copy_from_slice(&f64_to_f16_bits(v).to_le_bytes()); // Float16
+            2
+        }
         _ => 0,
     };
     (out, n)
@@ -6252,6 +6263,7 @@ pub(crate) fn decode_typed_element(kind: u8, bytes: &[u8]) -> f64 {
         6 => f64::from(u32::from_le_bytes([b(0), b(1), b(2), b(3)])), // Uint32
         7 => f64::from(f32::from_le_bytes([b(0), b(1), b(2), b(3)])), // Float32
         8 => f64::from_le_bytes([b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7)]), // Float64
+        11 => f16_to_f64(u16::from_le_bytes([b(0), b(1)])),           // Float16
         // BigInt kinds (9/10) do not decode to an f64 — use `decode_bigint_element`.
         _ => 0.0,
     }

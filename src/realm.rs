@@ -49,7 +49,8 @@ pub(crate) const PROMISE_STATE_SLOT: &str = "\u{0}PromiseState";
 /// `TYPED_ARRAY_KINDS` table: Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32,
 /// Uint32, Float32, Float64, BigInt64, BigUint64). A `kind` outside the table
 /// reads as size 1.
-const TYPED_ELEM_SIZE: [usize; 11] = [1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8];
+// Indexed by kind (see `TYPED_ARRAY_KINDS`); kind 11 = `Float16Array` (2 bytes).
+const TYPED_ELEM_SIZE: [usize; 12] = [1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8, 2];
 
 /// The byte size of one element of typed-array `kind`.
 #[must_use]
