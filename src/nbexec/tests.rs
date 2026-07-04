@@ -5947,3 +5947,41 @@ fn with_statement_consults_proxy_has_trap() {
     // Plain-object `with` unaffected.
     assert_eq!(run("var o={a:1,b:2};with(o){a+b}"), "3");
 }
+
+#[test]
+fn reflect_set_proxy_target_returns_trap_boolean() {
+    // Reflect.set on a proxy target returns the [[Set]] boolean: a falsy `set`
+    // trap result is `false` (not a throw), a truthy one is `true`.
+    assert_eq!(
+        run("Reflect.set(new Proxy({},{set(){return false}}),'a','x')"),
+        "false"
+    );
+    assert_eq!(
+        run("Reflect.set(new Proxy({},{set(){return null}}),'a','x')"),
+        "false"
+    );
+    assert_eq!(
+        run("Reflect.set(new Proxy({},{set(){return 0}}),'a','x')"),
+        "false"
+    );
+    assert_eq!(
+        run("Reflect.set(new Proxy({},{set(t,k,v){t[k]=v;return true}}),'a','x')"),
+        "true"
+    );
+    // A trap-less proxy whose target is itself a proxy forwards [[Set]] to it.
+    assert_eq!(
+        run(
+            "var log=[];var inner=new Proxy({},{set(t,k,v){log.push(k);t[k]=v;return true}});\
+             var outer=new Proxy(inner,{});Reflect.set(outer,'z',1);log.join(',')"
+        ),
+        "z"
+    );
+    // Truthy trap over a non-writable target property (same value) succeeds.
+    assert_eq!(
+        run(
+            "var tg={};Object.defineProperty(tg,'a',{value:1,writable:false,configurable:false});\
+             Reflect.set(new Proxy(tg,{set(){return true}}),'a',1)"
+        ),
+        "true"
+    );
+}

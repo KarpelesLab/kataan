@@ -928,9 +928,11 @@ impl<'a> Interp<'a> {
                     if self.realm.proxy_at(rh).is_some() {
                         if receiver.as_handle() == Some(h.to_raw()) {
                             // receiver == target: `[[Set]]` on the proxy *is* the
-                            // set trap (or trapless forward).
-                            self.assign_member_value(rh, arg(1), value)?;
-                            return Ok(NanBox::boolean(true));
+                            // set trap (or trapless forward) — return its actual
+                            // boolean result (a falsy trap result is `false`, not a
+                            // throw, for `Reflect.set`).
+                            let ok = self.proxy_set_bool(rh, &key, value, receiver)?;
+                            return Ok(NanBox::boolean(ok));
                         }
                         // receiver != target (the canonical passthrough
                         // `set(t,k,v,r){ Reflect.set(t,k,v,r) }`): the write goes to

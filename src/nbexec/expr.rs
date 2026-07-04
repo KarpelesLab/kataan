@@ -1553,6 +1553,45 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// A proxy's `[[Set]]` returning the **boolean** result (for `Reflect.set`,
+    /// which reports success/failure rather than throwing on a falsy trap
+    /// result): invokes the `set` trap with `receiver`, or forwards trapless to
+    /// the target's `[[Set]]` (recursing if the target is itself a proxy). A
+    /// truthy trap result is subject to the success invariants (which *do*
+    /// throw). An ordinary (non-proxy) forward target performs the set and
+    /// reports success.
+    pub(crate) fn proxy_set_bool(
+        &mut self,
+        handle: crate::heap::Handle,
+        key: &str,
+        value: NanBox,
+        receiver: NanBox,
+    ) -> Result<bool, ExecError> {
+        let Some((target, handler)) = self.realm.proxy_at(handle) else {
+            // Reached an ordinary object via a trapless forward: perform the set.
+            let key_box = self.new_str(key);
+            self.assign_member_value(handle, key_box, value)?;
+            return Ok(true);
+        };
+        self.guard_revoked(handle)?;
+        if let Some(trap) = self.proxy_trap(handler, "set")? {
+            let key_box = self.new_str(key);
+            let handler_box = NanBox::handle(handler.to_raw());
+            let r = self.call_with_this(
+                trap,
+                handler_box,
+                &[NanBox::handle(target.to_raw()), key_box, value, receiver],
+            )?;
+            if !self.realm.truthy(r) {
+                return Ok(false);
+            }
+            self.proxy_set_invariant_check(target, key, value)?;
+            return Ok(true);
+        }
+        // No `set` trap: forward `[[Set]]` to the target with the same receiver.
+        self.proxy_set_bool(target, key, value, receiver)
+    }
+
     /// Assigns a member by an already-evaluated key value (used when the target's
     /// computed key must be resolved before the RHS, per spec evaluation order).
     /// Mirrors `assign_member`'s proxy / array-index / setter / length handling.
