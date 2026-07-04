@@ -3810,6 +3810,20 @@ impl<'a> Interp<'a> {
             self.get_string_option(opts, "caseFirst", &["upper", "lower", "false"], None)?;
         let numeric = self.get_bool_option(opts, "numeric", None)?;
         let numbering = self.get_string_option(opts, "numberingSystem", &[], None)?;
+        // calendar/collation/numberingSystem must each match the UTS-35 `type`
+        // value production (they take arbitrary keyword values, not a fixed list).
+        for (val, name) in [
+            (&calendar, "calendar"),
+            (&collation, "collation"),
+            (&numbering, "numberingSystem"),
+        ] {
+            if let Some(v) = val
+                && !is_unicode_type_value(v)
+            {
+                let m = self.new_str(&alloc::format!("invalid {name}"));
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+        }
 
         let mut parsed = ParsedLocale::from_canonical(&canon);
         if let Some(l) = &language {
