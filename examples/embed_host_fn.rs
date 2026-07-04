@@ -3,9 +3,10 @@
 //!
 //! Usage: `cargo run --example embed_host_fn`
 //!
-//! Shows the whole `register_fn` surface end to end: building values, reading
-//! arguments and `this`, throwing a catchable JS error, and re-entering JS by
-//! calling a script-supplied callback.
+//! Shows the `register_fn` surface end to end: building values, reading
+//! arguments and `this`, throwing a catchable JS error, re-entering JS by
+//! calling a script-supplied callback or `construct`ing a class, and
+//! introspecting values (`type_of`/`is_array`/`array_get`/`own_keys`).
 
 use kataan::parser::Parser;
 use kataan::{Ctx, Interp, NanBox};
@@ -48,12 +49,47 @@ fn main() {
         Ok(cx.new_array(acc))
     });
 
+    // 4. Introspect any value with the inspection / array / property API.
+    interp.register_global_fn("describe", 1, |cx: &mut Ctx, _this, args| {
+        let v = args.first().copied().unwrap_or(cx.undefined());
+        let s = if cx.is_array(v) {
+            let n = cx.array_len(v).unwrap_or(0);
+            let mut sum = 0.0;
+            for i in 0..n {
+                let e = cx.array_get(v, i);
+                sum += cx.to_number(e).unwrap_or(0.0);
+            }
+            format!("array of {n}, sum {sum}")
+        } else if cx.is_object(v) {
+            format!("object with keys [{}]", cx.own_keys(v).join(", "))
+        } else {
+            format!("{} {}", cx.type_of(v), cx.to_string(v)?)
+        };
+        Ok(cx.string(&s))
+    });
+
+    // 5. Construct a script-supplied class, then read a field back through [[Get]].
+    interp.register_global_fn("originOf", 1, |cx: &mut Ctx, _this, args| {
+        let ctor = args.first().copied().unwrap_or(cx.undefined());
+        if !cx.is_constructor(ctor) {
+            return Err(cx.type_error("originOf expects a constructor"));
+        }
+        let zero = cx.number(0.0);
+        let p = cx.construct(ctor, &[zero, zero])?;
+        cx.get(p, "x")
+    });
+
     let src = r#"
         var out = [];
         out.push("hypot(3,4) = " + hypot(3, 4));
         out.push("parseHex('0xff') = " + JSON.stringify(parseHex("0xff")));
         try { parseHex("nope"); } catch (e) { out.push("threw: " + e.message); }
         out.push("times(sq,5) = " + JSON.stringify(times(function (i) { return i * i; }, 5)));
+        out.push("describe([1,2,3]) = " + describe([1, 2, 3]));
+        out.push("describe({a:1,b:2}) = " + describe({ a: 1, b: 2 }));
+        out.push("describe('hi') = " + describe("hi"));
+        class Point { constructor(x, y) { this.x = x; this.y = y; } }
+        out.push("originOf(Point) = " + originOf(Point));
         out.join("\n");
     "#;
 
