@@ -2687,7 +2687,10 @@ impl<'a> Interp<'a> {
                     .map(|v| self.realm.to_display_string(v))
                     .unwrap_or_default();
                 if !matches!(sd.as_str(), "never" | "exceptZero") && !body.starts_with('-') {
-                    return alloc::format!("-{body}");
+                    // `signDisplay: "always"` formatted `+0` as "+0"; -0 takes the
+                    // negative sign, so drop a leading "+" before prepending "-".
+                    let mag = body.strip_prefix('+').unwrap_or(&body);
+                    return alloc::format!("-{mag}");
                 }
                 return body;
             }

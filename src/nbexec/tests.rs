@@ -7282,3 +7282,30 @@ fn intl_formatter_subclassing() {
         "99,true"
     );
 }
+
+#[test]
+fn intl_number_format_signdisplay_negative_zero() {
+    // `signDisplay: "always"` on -0 is "-0" (not "-+0"): the negative sign
+    // replaces the positive one the +0 formatting produced.
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US',{signDisplay:'always'}).format(-0)"),
+        "-0"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US',{signDisplay:'always'}).format(0)"),
+        "+0"
+    );
+    assert_eq!(run("new Intl.NumberFormat('en-US').format(-0)"), "-0");
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US',{signDisplay:'never'}).format(-0)"),
+        "0"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US',{signDisplay:'exceptZero'}).format(-0)"),
+        "0"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US',{signDisplay:'always'}).format(-5)"),
+        "-5"
+    );
+}
