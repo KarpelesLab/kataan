@@ -6328,3 +6328,44 @@ fn arraybuffer_slice_species_constructor() {
         "4,true"
     );
 }
+
+#[test]
+fn sort_indexed_properties_precise() {
+    // Array.prototype.sort on an array with accessor/hole indices runs
+    // SortIndexedProperties: index getters fire on read, setters on write-back,
+    // and trailing holes are deleted.
+    assert_eq!(
+        run(
+            "var log=[];var a=[3,1,2];Object.defineProperty(a,'1',{get(){log.push('g1');return 1},set(v){},configurable:true});a.sort();JSON.stringify(log)"
+        ),
+        r#"["g1"]"#
+    );
+    assert_eq!(
+        run(
+            "var log=[];var a=[3,1,2];Object.defineProperty(a,'0',{get(){return 5},set(v){log.push('s0:'+v)},configurable:true});a.sort();JSON.stringify(log)"
+        ),
+        r#"["s0:1"]"#
+    );
+    // A trailing hole is deleted (present count < length).
+    assert_eq!(
+        run("var a=[3,,1];a.sort();(2 in a)+','+a.length+','+a.join(',')"),
+        "false,3,1,3,"
+    );
+    // Holes/undefined sort after present defined values; the extra hole is deleted.
+    assert_eq!(
+        run("var a=[3,,1,undefined,2];a.sort();a.join(',')+'|'+a.length+'|'+(4 in a)"),
+        "1,2,3,,|5|false"
+    );
+    // comparefn validation happens on the precise path too.
+    assert_eq!(
+        run("var a=[3,,1];try{a.sort(5);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    // Dense arrays and typed arrays keep the fast path.
+    assert_eq!(run("JSON.stringify([3,1,2].sort())"), "[1,2,3]");
+    assert_eq!(run("JSON.stringify([10,2,1].sort((a,b)=>a-b))"), "[1,2,10]");
+    assert_eq!(
+        run("Array.from(new Uint8Array([3,1,2]).sort()).join(',')"),
+        "1,2,3"
+    );
+}

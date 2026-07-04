@@ -1905,6 +1905,19 @@ impl Realm {
         }
     }
 
+    /// Whether the array at `handle` carries *any* index override — a sparse
+    /// attribute/accessor side-table entry, or being frozen/sealed. An O(1) gate
+    /// so a plain dense array keeps its fast paths (e.g. `sort` reads/writes the
+    /// element store directly) while an array with accessor indices takes the
+    /// spec-precise `[[Get]]`/`[[Set]]` path.
+    #[must_use]
+    pub fn array_has_index_overrides(&self, handle: Handle) -> bool {
+        let raw = handle.to_raw();
+        self.frozen_arrays.contains(&raw)
+            || self.sealed_arrays.contains(&raw)
+            || self.aux_props.contains_key(&raw)
+    }
+
     /// Whether the array index `i` carries a *non-default* own attribute or an
     /// accessor — i.e. a `defineProperty` once demoted its writability/enumerability/
     /// configurability or installed a getter/setter, so an `arr[i] = v` write cannot

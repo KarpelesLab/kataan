@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(array)* `Array.prototype.sort` runs the spec-precise `SortIndexedProperties`
+  when the array has hole or accessor-override indices: it collects present
+  elements via `[[Get]]` (index getters fire), sorts them, writes the sorted
+  values back via `[[Set]]` (setters fire), and `DeletePropertyOrThrow`s the
+  trailing indices. Dense arrays and typed arrays keep the fast in-memory sort
+  (ROADMAP §3.6).
 - *(arraybuffer)* `ArrayBuffer[Symbol.species]` getter is installed (returns
   `this`, so a subclass inherits it), and `ArrayBuffer.prototype.slice` allocates
   its result via `SpeciesConstructor(O, %ArrayBuffer%)` — a subclass instance for

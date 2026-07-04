@@ -3924,6 +3924,47 @@ impl<'a> Interp<'a> {
                     // Sorts in place and returns the same array. A typed array sorts
                     // numerically by default (a plain array lexicographically).
                     let numeric = self.realm.typed_kind(handle).is_some();
+                    // A plain array with hole or accessor-override indices runs the
+                    // spec-precise `SortIndexedProperties`: collect every *present*
+                    // element via `[[Get]]` (index getters fire), sort, write the
+                    // sorted values back via `[[Set]]` (setters fire), then
+                    // `DeletePropertyOrThrow` the trailing indices. An ordinary
+                    // dense array (and every typed array) keeps the fast in-memory
+                    // sort over its element store.
+                    if !numeric
+                        && let Some(len) = self.realm.array_length(handle)
+                        && (self.realm.array_has_index_overrides(handle)
+                            || elems.iter().any(|e| e.is_hole()))
+                    {
+                        // Validate the comparefn up front (before any element access).
+                        if !matches!(arg(0).unpack(), Unpacked::Undefined)
+                            && !self.is_callable_value(arg(0))
+                        {
+                            return Err(self.type_error("comparefn must be a function"));
+                        }
+                        // Collect present elements: `HasProperty` then `[[Get]]`.
+                        let mut items = Vec::new();
+                        for i in 0..len {
+                            let key = alloc::format!("{i}");
+                            if self.has_property(handle, &key) {
+                                items.push(self.read_member(handle, &key)?);
+                            }
+                        }
+                        let count = items.len();
+                        let sorted = self.sort_array(items, arg(0), false)?;
+                        // Write the sorted values back via `[[Set]]` (fires setters),
+                        // then delete the trailing indices.
+                        for (i, v) in sorted.into_iter().enumerate() {
+                            let key = alloc::format!("{i}");
+                            let kb = self.new_str(&key);
+                            self.set_or_throw(handle, kb, &key, v)?;
+                        }
+                        for i in count..len {
+                            let key = alloc::format!("{i}");
+                            self.delete_property_of(handle, &key)?;
+                        }
+                        return Ok(Some(NanBox::handle(handle.to_raw())));
+                    }
                     let sorted = self.sort_array(elems, arg(0), numeric)?;
                     self.write_back_elements(handle, sorted);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
