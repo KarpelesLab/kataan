@@ -889,6 +889,23 @@ impl<'c, 'a> Ctx<'c, 'a> {
             .construct(callee, args)
             .map_err(|e| self.interp.exec_error_value(e))
     }
+
+    /// Full `[[Set]]` of `obj[key] = value` (`OrdinarySet`): invokes an own or
+    /// inherited accessor **setter**, honors non-writable data properties, and
+    /// runs a proxy `set` trap — unlike [`set`](Self::set), which writes an own
+    /// data property directly. A non-object `obj` is a no-op.
+    ///
+    /// # Errors
+    /// The thrown value if a setter (or proxy trap) along the chain throws.
+    pub fn set_property(&mut self, obj: NanBox, key: &str, value: NanBox) -> Result<(), NanBox> {
+        let Some(h) = obj.as_handle().map(Handle::from_raw) else {
+            return Ok(());
+        };
+        let key_box = self.interp.new_str(key);
+        self.interp
+            .assign_member_value(h, key_box, value)
+            .map_err(|e| self.interp.exec_error_value(e))
+    }
 }
 
 /// A queued promise reaction: run `handler` with `value`, then settle `result`

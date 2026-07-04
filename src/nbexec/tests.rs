@@ -5563,6 +5563,28 @@ fn host_fn_property_api_has_delete_keys() {
 }
 
 #[test]
+fn host_fn_set_property_invokes_setter() {
+    // cx.set_property runs an inherited accessor setter (full [[Set]]); cx.set
+    // writes an own data property, shadowing the accessor.
+    let program = Parser::parse_program(
+        "var log = [];\
+         var o = Object.create({ set v(x) { log.push('setter:' + x); } });\
+         writeVia(o); \
+         log.join(',') + '|own=' + Object.prototype.hasOwnProperty.call(o, 'v')",
+    )
+    .expect("parse");
+    let mut interp = Interp::new();
+    interp.register_global_fn("writeVia", 1, |cx, _t, args| {
+        let o = args.first().copied().unwrap_or(cx.undefined());
+        let five = cx.number(5.0);
+        cx.set_property(o, "v", five)?; // runs the inherited setter, no own prop
+        Ok(cx.undefined())
+    });
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "setter:5|own=false");
+}
+
+#[test]
 fn host_fn_construct_reenters_js() {
     // A host fn `new`s a JS class via cx.construct and reads back a field, and
     // reports is_constructor for a class vs a plain function.
