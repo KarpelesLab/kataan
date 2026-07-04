@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/KarpelesLab/kataan/compare/v0.0.6...v0.0.7) - 2026-07-04
+
+### Added
+
+- *(promise)* Promise[Symbol.species] getter → subclass then/catch chaining (§3.6)
+- *(promise)* Promise subclassing — class P extends Promise (§3.6)
+
+### Fixed
+
+- *(string)* String-exotic getOwnPropertyDescriptor + getOwnPropertyNames (§3.6)
+- *(string)* String index properties are enumerable (propertyIsEnumerable) (§3.6)
+- *(string)* String exotic objects expose own index/length to has_own (§3.6)
+- *(bigint)* a BigInt primitive's [[Prototype]] is %BigInt.prototype% (§3.6)
+- *(typedarray)* array-like constructor uses ToLength (empty, not RangeError) (§3.6)
+- *(array)* toSpliced coerces start/deleteCount via ToIntegerOrInfinity (§3.6)
+- *(array)* slice coerces start/end via ToIntegerOrInfinity (§3.6)
+- *(array)* fill/flat/copyWithin coerce index args via ToIntegerOrInfinity (§3.6)
+- *(array)* splice coerces start/deleteCount via ToIntegerOrInfinity (§3.6)
+- *(array)* copyWithin runs spec-precise algorithm for hole/accessor arrays (§3.6)
+- *(array)* reverse runs spec-precise algorithm for hole/accessor arrays (§3.6)
+- *(array)* sort runs spec-precise SortIndexedProperties for hole/accessor arrays (§3.6)
+- *(arraybuffer)* slice allocates via SpeciesConstructor (§3.6)
+- *(arraybuffer)* install ArrayBuffer[Symbol.species] getter (§3.6)
+- *(proxy)* Reflect.set trapless chain to an ordinary getter-only accessor → false (§3.6)
+- *(string)* split ToStrings separator before limit-0; nbvm faults object sep (§3.6)
+- *(string)* String.raw validates template/raw with throwing ToObject (§3.6)
+- *(string)* replace/replaceAll ToString the replacement value (§3.6)
+- *(functions)* Function constructor ToString's its arguments (§3.6)
+- *(proxy)* computed [[Set]] runs parent.[[Set]] through a proxy/setter proto (§3.6)
+- *(proxy)* Reflect.set on a proxy target returns the real [[Set]] boolean (§3.6)
+- *(with)* with-statement HasBinding consults the proxy has trap (§3.5)
+- *(array)* flat/flatMap use ArraySpeciesCreate + CreateDataPropertyOrThrow (§3.6)
+- *(array)* flat/flatMap skip absent array-like indices (HasProperty) (§3.6)
+- *(array)* array holes are absent to `in`/HasProperty; flat skips holes (§3.6)
+- *(array)* Array.of honors a constructor this (§3.7)
+- *(proxy)* Reflect.set with a proxy receiver writes via [[DefineOwnProperty]] (§3.6)
+- *(proxy)* a proxy write target runs its own [[Set]], not the cell gate (§3.6)
+- *(proxy)* Reflect.ownKeys forwards trapless [[OwnPropertyKeys]] to target (§3.7)
+- *(proxy)* JSON.stringify + getOwnPropertyDescriptors enumerate proxies (§3.7)
+- *(proxy)* object-rest patterns run proxy-aware CopyDataProperties (§3.7)
+- *(proxy)* object spread enumerates a proxy source via its traps (§3.7)
+- *(proxy)* route HasProperty through the proxy trap in array-like iteration (§3.7)
+
+### Other
+
+- record the puremp BigInt-backend migration (CHANGELOG + ROADMAP §8)
+- *(bignum)* back BigInt with puremp::Int (§8 reused-crate)
+- fix string_exotic_own test — `in` on a string primitive throws
+- *(test262)* remove 33 now-passing ledger entries (array precise mutators + ArrayBuffer species)
+- *(test262)* remove 30 now-passing ledger entries (Promise subclassing + species)
+- fix public->private intra-doc link in promise_state
+- *(roadmap)* note puremp as the BigInt-layer backend candidate (§8)
+- lower MSRV to Rust 1.88
+- *(test262)* remove 31 more now-passing ledger entries (49 total this batch)
+- *(test262)* remove 18 now-passing ledger entries (proxy/Array.of/JSON)
+- *(roadmap)* record proxy-conformance progress + refresh pass-rate (§3.7)
+
 ### Added
 
 - *(promise)* `class P extends Promise {}` subclassing — `super(executor)` now
