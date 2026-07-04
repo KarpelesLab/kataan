@@ -193,74 +193,84 @@ impl<'a> Interp<'a> {
             self.current = saved;
             r?;
         }
-        // Build the static members (`static foo() {}` / `static x = …`).
+        // Build the static members (`static foo() {}` / `static x = …`) with the
+        // class scope current, so a static method captures `class_env` — the same
+        // scope the class name is bound into below — and can therefore reference
+        // the class by name (`static m() { return NamedExpr.other() }`), matching
+        // instance methods (which are built over `class_env` in `class_prototype`).
+        let saved_static_env = core::mem::replace(&mut self.current, class_env.clone());
         let mut statics = alloc::collections::BTreeMap::new();
         let mut static_fields = Vec::new();
         let mut static_getters = alloc::collections::BTreeMap::new();
         let mut static_setters = alloc::collections::BTreeMap::new();
-        for (idx, member) in class.body.iter().enumerate() {
-            match member {
-                ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
-                    // The computed key was pre-evaluated in source order above; a
-                    // throw from it already propagated (it does not silently skip
-                    // the member).
-                    let key = self.class_member_key(class_id, idx, &m.key)?;
-                    // A static method's home is this class, entered statically, so
-                    // `super.x` resolves against the superclass's static members.
-                    let f = self.make_method(
-                        &m.value.params,
-                        Body::Block(&m.value.body),
-                        m.value.is_async,
-                        m.value.is_generator,
-                        Some(class_id),
-                        true,
-                    );
-                    if let Some(n) = self.method_display_name(&key, MethodKind::Method) {
-                        self.install_method_meta(f, &n, &m.value.params);
+        let static_build = (|| -> Result<(), ExecError> {
+            for (idx, member) in class.body.iter().enumerate() {
+                match member {
+                    ClassMember::Method(m) if m.is_static && m.kind == MethodKind::Method => {
+                        // The computed key was pre-evaluated in source order above; a
+                        // throw from it already propagated (it does not silently skip
+                        // the member).
+                        let key = self.class_member_key(class_id, idx, &m.key)?;
+                        // A static method's home is this class, entered statically, so
+                        // `super.x` resolves against the superclass's static members.
+                        let f = self.make_method(
+                            &m.value.params,
+                            Body::Block(&m.value.body),
+                            m.value.is_async,
+                            m.value.is_generator,
+                            Some(class_id),
+                            true,
+                        );
+                        if let Some(n) = self.method_display_name(&key, MethodKind::Method) {
+                            self.install_method_meta(f, &n, &m.value.params);
+                        }
+                        statics.insert(key, f);
                     }
-                    statics.insert(key, f);
+                    ClassMember::Field(field) if field.is_static => {
+                        // A static field is installed as an enumerable own key, but its
+                        // initializer is evaluated *later* (in source order with static
+                        // blocks, after the constructor object — with its name/methods —
+                        // exists), with `this` = the class. Install a placeholder now.
+                        let key = self.class_member_key(class_id, idx, &field.key)?;
+                        if !static_fields.contains(&key) {
+                            static_fields.push(key.clone());
+                        }
+                        // Install a placeholder, but do NOT clobber an earlier static
+                        // *method*/accessor of the same name: per spec all methods are
+                        // installed before any static field initializer runs, so a field
+                        // initializer like `static g = this.g()` must still see the
+                        // method `g` until the field's own initializer overwrites it.
+                        statics.entry(key).or_insert(NanBox::undefined());
+                    }
+                    // `static get x() {}` / `static set x(v) {}` — accessors.
+                    ClassMember::Method(m)
+                        if m.is_static && matches!(m.kind, MethodKind::Get | MethodKind::Set) =>
+                    {
+                        let key = self.class_member_key(class_id, idx, &m.key)?;
+                        let f = self.make_method(
+                            &m.value.params,
+                            Body::Block(&m.value.body),
+                            false,
+                            false,
+                            Some(class_id),
+                            true,
+                        );
+                        if let Some(n) = self.method_display_name(&key, m.kind) {
+                            self.install_method_meta(f, &n, &m.value.params);
+                        }
+                        if m.kind == MethodKind::Get {
+                            static_getters.insert(key, f);
+                        } else {
+                            static_setters.insert(key, f);
+                        }
+                    }
+                    _ => {}
                 }
-                ClassMember::Field(field) if field.is_static => {
-                    // A static field is installed as an enumerable own key, but its
-                    // initializer is evaluated *later* (in source order with static
-                    // blocks, after the constructor object — with its name/methods —
-                    // exists), with `this` = the class. Install a placeholder now.
-                    let key = self.class_member_key(class_id, idx, &field.key)?;
-                    if !static_fields.contains(&key) {
-                        static_fields.push(key.clone());
-                    }
-                    // Install a placeholder, but do NOT clobber an earlier static
-                    // *method*/accessor of the same name: per spec all methods are
-                    // installed before any static field initializer runs, so a field
-                    // initializer like `static g = this.g()` must still see the
-                    // method `g` until the field's own initializer overwrites it.
-                    statics.entry(key).or_insert(NanBox::undefined());
-                }
-                // `static get x() {}` / `static set x(v) {}` — accessors.
-                ClassMember::Method(m)
-                    if m.is_static && matches!(m.kind, MethodKind::Get | MethodKind::Set) =>
-                {
-                    let key = self.class_member_key(class_id, idx, &m.key)?;
-                    let f = self.make_method(
-                        &m.value.params,
-                        Body::Block(&m.value.body),
-                        false,
-                        false,
-                        Some(class_id),
-                        true,
-                    );
-                    if let Some(n) = self.method_display_name(&key, m.kind) {
-                        self.install_method_meta(f, &n, &m.value.params);
-                    }
-                    if m.kind == MethodKind::Get {
-                        static_getters.insert(key, f);
-                    } else {
-                        static_setters.insert(key, f);
-                    }
-                }
-                _ => {}
             }
-        }
+            Ok(())
+        })();
+        self.current = saved_static_env;
+        static_build?;
         // Fill the reserved side-table slots (created above, in place so nested
         // classes defined during member evaluation cannot shift the indices).
         self.class_statics[class_id as usize] = statics;

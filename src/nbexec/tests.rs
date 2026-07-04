@@ -7042,3 +7042,27 @@ fn class_name_inner_binding_is_const() {
         "done"
     );
 }
+
+#[test]
+fn static_method_sees_class_name() {
+    // A static method captures the class scope, so a named class expression can
+    // reference itself by name from a static method (matching instance methods).
+    assert_eq!(
+        run("var f=class Rec{static typ(){return typeof Rec}};f.typ()"),
+        "function"
+    );
+    assert_eq!(
+        run("var f=class Rec{static go(n){return n<=0?'done':Rec.go(n-1)}};f.go(3)"),
+        "done"
+    );
+    // The self-name is still the immutable const inside a static method.
+    assert_eq!(
+        run(
+            "var f=class Rec{static m(){try{Rec=1;return 'assigned'}catch(e){return e.constructor.name}}};f.m()"
+        ),
+        "TypeError"
+    );
+    // Outer bindings still chain through; a static field initializer sees the name.
+    assert_eq!(run("var y=99;class C{static m(){return y}}C.m()"), "99");
+    assert_eq!(run("class Q{static x=Q.name}Q.x"), "Q");
+}
