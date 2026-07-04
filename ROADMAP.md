@@ -7,8 +7,8 @@ JS + WASM engine, and a runtime that stands beside Node.js / Bun / Deno. Finishe
 foundations are summarized once (§1) and not re-litigated; everything after is
 forward-looking.
 
-> **Headline status (2026-06):** the official tc39/Test262 corpus (~53k tests)
-> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 89.9 %**
+> **Headline status (2026-07):** the official tc39/Test262 corpus (~53k tests)
+> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 93.1 %**
 > of the ~44k *ran* tests (the ~9k skipped are Temporal / Atomics / agents /
 > cross-realm — see §3.9). **ES modules + dynamic `import()` now run** (the
 > module-flagged suite is no longer skipped — §3.1). The remaining headline
@@ -283,14 +283,24 @@ helper edges, `Iterator.zip`/`zipKeyed`), **String** (54), **Function** (59 —
   `[[Prototype]]` to `%Function.prototype%` **broke array method resolution**
   (the ctor object is entangled with `array_proto_intrinsic`) — needs careful
   untangling, not a one-line `set_object_proto`.
-- **Trap-less Proxy forwarding through iteration.** Basic trapless passthrough
-  works (`get`/`has`/`set`/`delete`/`call`), but `[...new Proxy([1,2,3],{})]`
-  reads holes — the array-iterator / `iterate_values` fast path bypasses the
-  proxy's `[[Get]]`. Route iteration over a proxy through the per-index protocol.
+- **Trap-less Proxy forwarding through iteration — largely landed.**
+  `[...new Proxy([1,2,3],{})]`, `Array.from(proxy)`, generic
+  `Array.prototype.*.call(proxy)`, object spread/rest (`{...proxy}` / `{...r} =`),
+  `JSON.stringify`, `Object.getOwnPropertyDescriptors`, `Reflect.ownKeys`, and
+  `with (proxy)` now route through the proxy protocol (a shared
+  `copy_data_properties` for CopyDataProperties; `has_property` delegates to the
+  proxy-aware `has_property_proxied`). Proxy as a **write target**
+  (`Object.assign`) and `Reflect.set` with a **proxy receiver** run the proper
+  `[[Set]]`/`[[DefineOwnProperty]]`. **Remaining:** OrdinarySet must run
+  `parent.[[Set]]`, so an array/object index write whose own slot is absent and
+  whose **prototype is a proxy/accessor** does not yet fire that trap
+  (`Proxy/set/call-parameters-prototype-*`); the per-trap invariant edges in
+  `Proxy/set`/`has`/`getOwnPropertyDescriptor`.
 - **Static-method `.call` receiver.** `setup_static_methods` binds the
   constructor as `this`; only the `this_aware` list (Promise combinators/`resolve`/
   `reject`/`try`) honors a dynamic `.call` receiver. Generalize for other statics
-  whose receiver matters.
+  whose receiver matters. (`Array.of` now honors a constructor receiver via
+  `this_val`, like `Array.from`.)
 
 ### 3.8 Resizable / shared memory & atomics (skip-gated today)
 
