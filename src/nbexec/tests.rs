@@ -8288,3 +8288,35 @@ fn intl_numbering_system_digit_substitution() {
         "arab"
     );
 }
+
+#[test]
+#[cfg(feature = "intl")]
+fn intl_default_numbering_system_from_locale() {
+    // Absent an explicit option, NumberFormat resolves the locale's CLDR default
+    // numbering system (via the intl crate's per-locale data) instead of always
+    // latn — so e.g. Persian renders Extended Arabic-Indic digits.
+    assert_eq!(
+        run("new Intl.NumberFormat('fa').resolvedOptions().numberingSystem"),
+        "arabext"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('fa').format(123)"),
+        "\u{06f1}\u{06f2}\u{06f3}"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en').resolvedOptions().numberingSystem"),
+        "latn"
+    );
+    assert_eq!(run("new Intl.NumberFormat('en').format(1234)"), "1,234");
+    assert_eq!(
+        run("new Intl.NumberFormat('de-DE').format(1234.5)"),
+        "1.234,5"
+    );
+    // An explicit option still wins.
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en',{numberingSystem:'deva'}).resolvedOptions().numberingSystem"
+        ),
+        "deva"
+    );
+}

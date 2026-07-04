@@ -42,6 +42,42 @@ fn numbering_system_digit_base(nu: &str) -> Option<u32> {
     })
 }
 
+/// The numbering-system name for a native zero digit `c` (the reverse of
+/// [`numbering_system_digit_base`]) — used to name the CLDR default numbering
+/// system a locale resolves to, detected from the digit the `intl` crate emits.
+#[cfg(feature = "intl")]
+fn numbering_system_name_from_zero(c: char) -> Option<&'static str> {
+    Some(match c as u32 {
+        0x0030 => "latn",
+        0x0660 => "arab",
+        0x06F0 => "arabext",
+        0x1B50 => "bali",
+        0x09E6 => "beng",
+        0x0966 => "deva",
+        0xFF10 => "fullwide",
+        0x0AE6 => "gujr",
+        0x0A66 => "guru",
+        0x17E0 => "khmr",
+        0x0CE6 => "knda",
+        0x0ED0 => "laoo",
+        0x1946 => "limb",
+        0x0D66 => "mlym",
+        0x1810 => "mong",
+        0x1040 => "mymr",
+        0x0B66 => "orya",
+        0x104A0 => "osma",
+        0xA8D0 => "saur",
+        0x1BB0 => "sund",
+        0x19D0 => "talu",
+        0x0BE6 => "tamldec",
+        0x0C66 => "telu",
+        0x0E50 => "thai",
+        0x0F20 => "tibt",
+        0xA620 => "vaii",
+        _ => return None,
+    })
+}
+
 /// Whether `s` matches the UTS-35 `type` value production: one or more
 /// `alphanum{3,8}` subtags joined by `-` (used for `ca`/`nu` option validation).
 fn is_unicode_type_value(s: &str) -> bool {
@@ -979,6 +1015,12 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
         }
+        // Absent an explicit option, resolve the locale's CLDR default numbering
+        // system (e.g. `ar` → `arab`, `fa` → `arabext`) rather than always `latn`.
+        let nu = match nu {
+            Some(ns) => Some(ns),
+            None => Some(self.default_numbering_for_locale(obj)),
+        };
         self.store_str(obj, "numberingSystem", &nu);
 
         // --- SetNumberFormatUnitOptions ---
@@ -2990,6 +3032,29 @@ impl<'a> Interp<'a> {
                 .collect(),
             None => s,
         }
+    }
+
+    /// The CLDR default numbering-system *name* for the format object's resolved
+    /// locale — detected from the native zero digit the `intl` crate emits for that
+    /// locale (so its per-locale table, with regional exceptions, is authoritative).
+    /// `latn` when there is no `intl` data or the system is unrecognized.
+    fn default_numbering_for_locale(&mut self, obj: Handle) -> String {
+        #[cfg(feature = "intl")]
+        {
+            let locale = self
+                .realm
+                .get_property(obj, "\u{0}locale")
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_else(|| String::from("en"));
+            let zero = intl::number::format_decimal_native(&locale, 0.0);
+            if let Some(c) = zero.chars().next()
+                && let Some(name) = numbering_system_name_from_zero(c)
+            {
+                return String::from(name);
+            }
+        }
+        let _ = obj;
+        String::from("latn")
     }
 
     fn intl_format_number_inner(&mut self, handle: Handle, n: f64) -> String {
