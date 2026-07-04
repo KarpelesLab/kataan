@@ -2807,6 +2807,31 @@ impl<'a> Interp<'a> {
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_else(|| String::from("en"));
             let mut opts = self.number_format_options(handle);
+            // `roundingIncrement`: round to the nearest `increment × 10^-maxFrac`
+            // step (the intl crate has no such option). Only when > 1 (the default);
+            // a basic half-away-from-zero rounding covers the common cases.
+            let n = {
+                let inc = self
+                    .realm
+                    .get_property(handle, "roundingIncrement")
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(1.0);
+                if inc > 1.0 && n.is_finite() {
+                    let max_frac = self
+                        .realm
+                        .get_property(handle, "maximumFractionDigits")
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0);
+                    let step = inc * 10f64.powi(-(max_frac as i32));
+                    if step > 0.0 {
+                        (n / step).round() * step
+                    } else {
+                        n
+                    }
+                } else {
+                    n
+                }
+            };
             // `trailingZeroDisplay: "stripIfInteger"`: an integer value drops its
             // forced trailing fraction (and significant) zeros. The intl crate has
             // no such option, so lower the minimum digit counts for this value.

@@ -7456,3 +7456,32 @@ fn intl_number_format_trailing_zero_display() {
     );
     assert_eq!(run("new Intl.NumberFormat('en').format(1234.5)"), "1,234.5");
 }
+
+#[test]
+fn intl_number_format_rounding_increment() {
+    // roundingIncrement rounds to the nearest increment × 10^-maxFrac step.
+    let f = "{maximumFractionDigits:2,minimumFractionDigits:2,roundingIncrement:";
+    assert_eq!(
+        run(&format!("new Intl.NumberFormat('en',{f}5}}).format(1.23)")),
+        "1.25"
+    );
+    assert_eq!(
+        run(&format!("new Intl.NumberFormat('en',{f}5}}).format(1.27)")),
+        "1.25"
+    );
+    assert_eq!(
+        run(&format!("new Intl.NumberFormat('en',{f}25}}).format(1.30)")),
+        "1.25"
+    );
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en',{maximumFractionDigits:0,minimumFractionDigits:0,roundingIncrement:10}).format(143)"
+        ),
+        "140"
+    );
+    // No roundingIncrement (default 1) is unaffected.
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{maximumFractionDigits:2}).format(1.234)"),
+        "1.23"
+    );
+}
