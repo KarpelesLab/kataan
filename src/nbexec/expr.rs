@@ -1470,15 +1470,14 @@ impl<'a> Interp<'a> {
             // Private names (`this.#x`) are stored under a `#`-prefixed key.
             PropertyKey::Private(s) => {
                 // `obj.#x` where obj's class did not declare `#x` is a TypeError, not
-                // `undefined`. An instance holder carries the brand as an own private
-                // element (field or method) or a private accessor. A *class* receiver
-                // (`Class.#static`) is resolved by read_member's separate per-class storage,
-                // so it is not brand-checked here.
+                // `undefined`. The holder carries the brand as an OWN private element:
+                // an instance field/method/accessor, or — for `Class.#static` — a
+                // static private in the class's own statics. Static privates are
+                // **not inherited**, so a subclass constructor (whose `[[Prototype]]`
+                // is the base class) that lacks the own element throws even though a
+                // plain `read_member` would walk up to the base's static private.
                 let key = self.private_access_key(s);
-                if !self.is_callable(handle)
-                    && self.realm.class_at(handle).is_none()
-                    && !self.realm.has_own(handle, &key)
-                    && self.realm.accessor(handle, &key).is_none()
+                if !self.realm.has_own(handle, &key) && self.realm.accessor(handle, &key).is_none()
                 {
                     let m = self.new_str(&alloc::format!(
                         "Cannot read private member #{s} from an object whose class did not declare it"

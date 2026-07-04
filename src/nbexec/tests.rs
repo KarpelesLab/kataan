@@ -6960,3 +6960,48 @@ fn private_methods_install_after_super() {
         "true,false"
     );
 }
+
+#[test]
+fn static_private_not_inherited_by_subclass() {
+    // Static private methods/getters/fields are OWN to their class and NOT
+    // inherited: accessing one on a subclass constructor (whose [[Prototype]] is
+    // the base) is a TypeError, even though the base holds the element.
+    assert_eq!(
+        run("class A{static #m(){return 42}static call(){return A.#m()}}A.call()"),
+        "42"
+    );
+    assert_eq!(
+        run(
+            "class A{static #m(){return 1}static call(o){return o.#m()}}class B extends A{}try{A.call(B)}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "class A{static get #x(){return 1}static get(o){return o.#x}}class B extends A{}try{A.get(B)}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "class A{static #f=1;static get(o){return o.#f}}class B extends A{}try{A.get(B)}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    // The declaring class itself still resolves it.
+    assert_eq!(
+        run("class A{static #m(){return 5}static call(o){return o.#m()}}A.call(A)"),
+        "5"
+    );
+    // Instance privates unaffected.
+    assert_eq!(
+        run("class A{#m(){return 42}call(){return this.#m()}}new A().call()"),
+        "42"
+    );
+    assert_eq!(
+        run(
+            "class A{#m(){return 1}call(o){return o.#m()}}try{new A().call({})}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+}
