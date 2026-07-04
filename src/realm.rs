@@ -2722,6 +2722,10 @@ impl Realm {
                 || c.as_native().is_some()
                 || c.as_bound_native().is_some()
                 || c.as_class().is_some()
+                // A registered host function carries auxiliary named properties
+                // too (its `prototype` when `register_constructor`ed, and any own
+                // props an embedder sets on it).
+                || matches!(c, Cell::HostFn(_))
                 || matches!(c, Cell::TypedArray { .. })
                 // A RegExp instance carries no inline object part, but a script may
                 // set own properties on it (`re.exec = fn`, a custom `lastIndex`

@@ -75,6 +75,10 @@ impl<'a> Interp<'a> {
             }
             return is_native_constructor(id);
         }
+        // A registered host function constructs iff it was `register_constructor`ed.
+        if let Some(id) = self.realm.host_fn_at(handle) {
+            return self.host_fn_is_constructor(id);
+        }
         false
     }
 
@@ -1778,6 +1782,32 @@ impl<'a> Interp<'a> {
                 self.realm.set_object_proto(arr, Some(proto));
             }
             return Ok(NanBox::handle(arr.to_raw()));
+        }
+        // `new hostCtor(...)` — a host function registered via
+        // `register_constructor`: bind a fresh object (whose `[[Prototype]]` is
+        // newTarget's `.prototype`) as `this`, run the closure, and apply the
+        // constructor return rule (an object result wins; else the fresh `this`).
+        if let Some(hid) = self.realm.host_fn_at(handle)
+            && self.host_fn_is_constructor(hid)
+        {
+            let nt = self.reflect_new_target.take().unwrap_or(callee);
+            let nt_handle = nt.as_handle().map(Handle::from_raw).unwrap_or(handle);
+            let proto = self
+                .realm
+                .get_property(nt_handle, "prototype")
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw);
+            let instance = self.realm.new_object_with_proto(proto);
+            let this = NanBox::handle(instance.to_raw());
+            self.realm.set_hidden_property(instance, CTOR_KEY, callee);
+            let ret = self.call_with_this(callee, this, args)?;
+            if let Some(rh) = ret.as_handle().map(Handle::from_raw)
+                && self.is_object_value(ret)
+                && !self.is_callable(rh)
+            {
+                return Ok(ret);
+            }
+            return Ok(this);
         }
         let Some(id) = self.realm.native_at(handle) else {
             // A callable that is not a constructor — e.g. a built-in method such as

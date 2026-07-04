@@ -606,6 +606,10 @@ pub struct HostFn {
     name: String,
     length: u32,
     call: HostCallback,
+    /// Whether `new f(...)` is allowed: `register_constructor` sets this, so the
+    /// closure runs as a `[[Construct]]` (with a fresh `this`); a plain
+    /// `register_fn` leaves it `false` and `new f()` is a `TypeError`.
+    is_constructor: bool,
 }
 
 /// The boxed Rust closure backing a [`HostFn`]: it receives a [`Ctx`] handle,
@@ -4255,14 +4259,65 @@ impl<'a> Interp<'a> {
     where
         F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
     {
+        self.register_host_fn(name, length, false, f)
+    }
+
+    /// Registers a host **constructor** — like [`register_fn`](Self::register_fn),
+    /// but `new f(...args)` is allowed: the closure runs with a fresh object as
+    /// `this` (its `[[Prototype]]` is `f.prototype`) and, per the constructor
+    /// return rule, the result is that object unless the closure returns another
+    /// object. The function object gets a writable own `prototype` whose
+    /// `constructor` points back at it, so `instanceof` and inherited methods work.
+    /// A plain call `f(...)` (no `new`) still runs the closure normally.
+    pub fn register_constructor<F>(&mut self, name: &str, length: u32, f: F) -> NanBox
+    where
+        F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+    {
+        let ctor = self.register_host_fn(name, length, true, f);
+        // Give it a `prototype` object with a back-reference `constructor`.
+        if let Some(ch) = ctor.as_handle().map(Handle::from_raw) {
+            let proto = self.realm.new_object();
+            self.realm.set_hidden_property(proto, "constructor", ctor);
+            self.realm
+                .set_property(ch, "prototype", NanBox::handle(proto.to_raw()));
+        }
+        ctor
+    }
+
+    /// [`register_constructor`](Self::register_constructor) plus
+    /// [`declare_global`](Self::declare_global): registers the host constructor and
+    /// binds it as a global named `name`.
+    pub fn register_global_constructor<F>(&mut self, name: &str, length: u32, f: F) -> NanBox
+    where
+        F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+    {
+        let v = self.register_constructor(name, length, f);
+        self.declare_global(name, v);
+        v
+    }
+
+    fn register_host_fn<F>(&mut self, name: &str, length: u32, is_constructor: bool, f: F) -> NanBox
+    where
+        F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+    {
         let id = self.host_fns.len() as u32;
         self.host_fns.push(Some(HostFn {
             name: String::from(name),
             length,
             call: alloc::boxed::Box::new(f),
+            is_constructor,
         }));
         let h = self.realm.new_host_fn(id);
         NanBox::handle(h.to_raw())
+    }
+
+    /// Whether the host function with registry index `id` was registered as a
+    /// constructor (`register_constructor`).
+    pub(crate) fn host_fn_is_constructor(&self, id: u32) -> bool {
+        self.host_fns
+            .get(id as usize)
+            .and_then(|s| s.as_ref())
+            .is_some_and(|hf| hf.is_constructor)
     }
 
     /// [`register_fn`](Self::register_fn) plus [`declare_global`](Self::declare_global):

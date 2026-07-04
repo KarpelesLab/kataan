@@ -5563,6 +5563,56 @@ fn host_fn_property_api_has_delete_keys() {
 }
 
 #[test]
+fn host_fn_register_constructor() {
+    // A host constructor: `new Vec2(x,y)` binds a fresh `this`, the closure sets
+    // fields, instanceof works via the auto-created prototype, and a prototype
+    // method sees the instance.
+    let mut interp = Interp::new();
+    interp.register_global_constructor("Vec2", 2, |cx, this, args| {
+        let x = cx.to_number(args.first().copied().unwrap_or(cx.undefined()))?;
+        let y = cx.to_number(args.get(1).copied().unwrap_or(cx.undefined()))?;
+        let xv = cx.number(x);
+        cx.set(this, "x", xv);
+        let yv = cx.number(y);
+        cx.set(this, "y", yv);
+        Ok(cx.undefined())
+    });
+    let program = Parser::parse_program(
+        "Vec2.prototype.sum = function () { return this.x + this.y; };\
+         var v = new Vec2(3, 4);\
+         [v.x, v.y, v.sum(), v instanceof Vec2, v.constructor === Vec2, typeof Vec2].join(',')",
+    )
+    .expect("parse");
+    let val = interp.run(&program).expect("exec");
+    assert_eq!(
+        interp.realm().to_display_string(val),
+        "3,4,7,true,true,function"
+    );
+}
+
+#[test]
+fn host_fn_register_constructor_return_object_and_plain_call() {
+    // The constructor return rule: a returned object replaces `this`. And a plain
+    // `register_fn` remains non-constructable (`new` → TypeError).
+    let mut interp = Interp::new();
+    interp.register_global_constructor("Boxed", 1, |cx, _this, args| {
+        let obj = cx.new_object();
+        let v = args.first().copied().unwrap_or(cx.undefined());
+        cx.set(obj, "wrapped", v);
+        Ok(obj) // returned object wins over the fresh `this`
+    });
+    interp.register_global_fn("plain", 0, |cx, _t, _a| Ok(cx.undefined()));
+    let program = Parser::parse_program(
+        "var b = new Boxed(42);\
+         var threw = false; try { new plain(); } catch (e) { threw = e instanceof TypeError; }\
+         b.wrapped + ',' + threw",
+    )
+    .expect("parse");
+    let val = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(val), "42,true");
+}
+
+#[test]
 fn host_fn_set_property_invokes_setter() {
     // cx.set_property runs an inherited accessor setter (full [[Set]]); cx.set
     // writes an own data property, shadowing the accessor.

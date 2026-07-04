@@ -3948,7 +3948,9 @@ impl<'a> Interp<'a> {
         // instance, and reassigning `C.prototype` is reflected). `Get(C,"prototype")`
         // must be an Object — otherwise OrdinaryHasInstance is a TypeError (e.g.
         // `C.prototype = undefined`).
-        if self.realm.function_at(ch).is_some() {
+        // A registered host constructor (`register_constructor`) walks the same
+        // way: its instances have `[[Prototype]] = hostFn.prototype`.
+        if self.realm.function_at(ch).is_some() || self.realm.host_fn_at(ch).is_some() {
             let proto_val = self.read_member(ch, "prototype")?;
             let Some(proto) = proto_val
                 .as_handle()
