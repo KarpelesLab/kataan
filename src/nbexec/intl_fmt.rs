@@ -1758,10 +1758,24 @@ impl<'a> Interp<'a> {
             let tz = get_str(self, "timeZone").unwrap_or_else(|| String::from("UTC"));
             let tzv = self.new_str(&tz);
             self.realm.set_property(out, "timeZone", tzv);
+            // When an hour field is present, resolvedOptions always reports
+            // hourCycle + hour12 — the explicit option, else a default resolved from
+            // hour12 or the locale (en-family defaults to 12-hour, else 24-hour).
+            let hour_present = get_str(self, "hour").is_some();
+            let explicit_h12 = fmt
+                .and_then(|h| self.realm.get_property(h, "hour12"))
+                .and_then(|v| v.as_boolean());
             if let Some(hc) = get_str(self, "hourCycle") {
                 let v = self.new_str(&hc);
                 self.realm.set_property(out, "hourCycle", v);
                 let h12 = matches!(hc.as_str(), "h11" | "h12");
+                self.realm.set_property(out, "hour12", NanBox::boolean(h12));
+            } else if hour_present {
+                let loc = get_str(self, "\u{0}locale").unwrap_or_default();
+                let h12 = explicit_h12.unwrap_or_else(|| loc == "en" || loc.starts_with("en-"));
+                let hc = if h12 { "h12" } else { "h23" };
+                let v = self.new_str(hc);
+                self.realm.set_property(out, "hourCycle", v);
                 self.realm.set_property(out, "hour12", NanBox::boolean(h12));
             } else if let Some(h) = fmt.and_then(|h| self.realm.get_property(h, "hour12")) {
                 self.realm.set_property(out, "hour12", h);
