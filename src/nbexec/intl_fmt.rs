@@ -3705,6 +3705,37 @@ impl<'a> Interp<'a> {
             percent = true;
             s = &s[..s.len() - '%'.len_utf8()];
         }
+        // `unit`/`compact` append a suffix after the number: strip it here and emit
+        // it as its own part(s) so the numeric decomposition below sees only digits
+        // (`5 m` → integer "5" + literal " " + unit "m"; `1.2M` → …fraction + compact
+        // "M"). The numeric prefix is the leading run of digits/group/decimal chars.
+        let notation = self
+            .realm
+            .get_property(handle, "notation")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
+        let mut suffix_parts: Vec<(&'static str, String)> = Vec::new();
+        if style == "unit" || notation == "compact" {
+            let num_end = s
+                .find(|c: char| !(c.is_ascii_digit() || c == ',' || c == '.'))
+                .unwrap_or(s.len());
+            let suffix = &s[num_end..];
+            if !suffix.is_empty() {
+                let part_kind = if style == "unit" { "unit" } else { "compact" };
+                // A leading separator (space/NBSP) is a `literal`; the rest is the
+                // unit/compact token.
+                let sep_end = suffix
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(suffix.len());
+                if sep_end > 0 {
+                    suffix_parts.push(("literal", String::from(&suffix[..sep_end])));
+                }
+                if sep_end < suffix.len() {
+                    suffix_parts.push((part_kind, String::from(&suffix[sep_end..])));
+                }
+            }
+            s = &s[..num_end];
+        }
         if s == "NaN" {
             entries.push(("nan", String::from("NaN")));
         } else if s == "∞" {
@@ -3728,6 +3759,7 @@ impl<'a> Interp<'a> {
         if percent {
             entries.push(("percentSign", String::from("%")));
         }
+        entries.extend(suffix_parts);
         entries
     }
 
