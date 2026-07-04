@@ -536,6 +536,10 @@ Kataan is "complete" when:
 - **`rsurl`** — HTTP/HTTPS behind `fetch` and the Node `http(s)` compat layer.
 - **`intl`** — Unicode/Intl primitives (normalization, case mapping/folding, char
   properties, collation) behind the Intl services (§3.3).
+- **`puremp`** — multi-precision maths (bignum, …). Candidate backend for the
+  `BigInt` layer, currently the in-house `src/bignum.rs`; migrating it here
+  follows the reused-crate pattern (needs an API-parity pass + the full BigInt
+  Test262 subset green before/after).
 
 Patterns shared: tri-modal lib/CLI/C-FFI packaging, `unsafe` quarantine,
 feature-gated layered modules, sans-I/O core, cargo-fuzz harnesses.
