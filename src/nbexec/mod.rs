@@ -5283,7 +5283,7 @@ fn split_units(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
 
 /// Computes `[start, end)` char indices for `slice`, handling negative indices
 /// (from the end) and an `undefined` end (to the length), clamped to `[0, len]`.
-fn slice_bounds(start: f64, end_arg: NanBox, realm: &Realm, len: usize) -> (usize, usize) {
+fn slice_bounds(start: f64, end: Option<f64>, len: usize) -> (usize, usize) {
     let clamp = |n: f64| -> usize {
         if n < 0.0 {
             (len as f64 + n).max(0.0) as usize
@@ -5292,10 +5292,7 @@ fn slice_bounds(start: f64, end_arg: NanBox, realm: &Realm, len: usize) -> (usiz
         }
     };
     let a = clamp(start);
-    let b = match end_arg.unpack() {
-        Unpacked::Undefined => len,
-        _ => clamp(realm.to_number(end_arg)),
-    };
+    let b = end.map_or(len, clamp);
     (a, b.max(a))
 }
 

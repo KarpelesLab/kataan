@@ -3506,12 +3506,15 @@ impl<'a> Interp<'a> {
                         }
                         return Ok(Some(NanBox::handle(dest.to_raw())));
                     }
-                    let (a, b) = slice_bounds(
-                        self.realm.to_number(arg(0)),
-                        arg(1),
-                        &self.realm,
-                        elems.len(),
-                    );
+                    // `start`/`end` are `ToIntegerOrInfinity` (object args coerce
+                    // via `valueOf`, throws propagate); `end` defaults to `len`.
+                    let start_n = self.coerce_to_integer_or_infinity(arg(0))?;
+                    let end_n = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                        None
+                    } else {
+                        Some(self.coerce_to_integer_or_infinity(arg(1))?)
+                    };
+                    let (a, b) = slice_bounds(start_n, end_n, elems.len());
                     let count = b.saturating_sub(a);
                     // `A = ArraySpeciesCreate(O, count)`, then
                     // `CreateDataPropertyOrThrow` each *present* element (holes are

@@ -6496,3 +6496,23 @@ fn array_index_args_use_tointegerorinfinity() {
         "c"
     );
 }
+
+#[test]
+fn slice_args_use_tointegerorinfinity() {
+    // slice's start/end coerce via ToIntegerOrInfinity (valueOf); throws propagate.
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4].slice({valueOf:()=>1}))"),
+        "[2,3,4]"
+    );
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4].slice(0,{valueOf:()=>2}))"),
+        "[1,2]"
+    );
+    assert_eq!(
+        run("try{[1,2,3].slice({valueOf:()=>{throw 's'}});'no'}catch(e){e}"),
+        "s"
+    );
+    assert_eq!(run("JSON.stringify([1,2,3,4,5].slice(-2))"), "[4,5]");
+    assert_eq!(run("JSON.stringify([1,2,3,4].slice(1,3))"), "[2,3]");
+    assert_eq!(run("JSON.stringify([1,2,3].slice())"), "[1,2,3]");
+}
