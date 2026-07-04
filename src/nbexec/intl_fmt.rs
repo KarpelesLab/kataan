@@ -3799,6 +3799,9 @@ impl<'a> Interp<'a> {
         let language = self.get_string_option(opts, "language", &[], None)?;
         let script = self.get_string_option(opts, "script", &[], None)?;
         let region = self.get_string_option(opts, "region", &[], None)?;
+        // `variants` is read after region, before the Unicode-extension keys (spec
+        // option-evaluation order); applied to the tag's variant subtags.
+        let variants = self.get_string_option(opts, "variants", &[], None)?;
         let calendar = self.get_string_option(opts, "calendar", &[], None)?;
         let collation = self.get_string_option(opts, "collation", &[], None)?;
         let hour_cycle =
@@ -3817,6 +3820,24 @@ impl<'a> Interp<'a> {
         }
         if let Some(r) = &region {
             parsed.region = Some(r.to_ascii_uppercase());
+        }
+        if let Some(v) = &variants {
+            // A `-`-joined sequence of `variant` subtags (each alnum{5,8}, or a
+            // digit followed by alnum{3}); validated, lowercased, sorted, unique.
+            let mut vs: Vec<String> = Vec::new();
+            for sub in v.split('-') {
+                let s = sub.to_ascii_lowercase();
+                let alnum = s.bytes().all(|b| b.is_ascii_alphanumeric());
+                let ok = ((5..=8).contains(&s.len()) && alnum)
+                    || (s.len() == 4 && s.as_bytes()[0].is_ascii_digit() && alnum);
+                if !ok || vs.contains(&s) {
+                    let m = self.new_str("invalid variants");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                vs.push(s);
+            }
+            vs.sort();
+            parsed.variants = vs;
         }
         if let Some(c) = &calendar {
             parsed.set_keyword("ca", c);
