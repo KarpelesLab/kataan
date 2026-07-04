@@ -1422,6 +1422,11 @@ const N_ATOMICS_COMPARE_EXCHANGE: u16 = 683;
 const N_ATOMICS_LOAD: u16 = 684;
 const N_ATOMICS_STORE: u16 = 685;
 const N_ATOMICS_IS_LOCK_FREE: u16 = 686;
+/// `SharedArrayBuffer` — a growable byte store (single-agent: no cross-agent
+/// sharing, so it behaves as an `ArrayBuffer` that only ever grows). Its bytes
+/// live in the same `ARRAY_BUFFER_BYTES` slot, so typed arrays and `Atomics`
+/// operate over it unchanged.
+const N_SHARED_ARRAY_BUFFER: u16 = 687;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
 const N_OBJ_PROTO_HASOWN: u16 = 181;
 const N_OBJ_PROTO_ISPROTOTYPEOF: u16 = 182;
@@ -1950,6 +1955,7 @@ fn is_native_constructor(id: u16) -> bool {
             | N_REGEXP
             | N_FUNCTION
             | N_ARRAY_BUFFER
+            | N_SHARED_ARRAY_BUFFER
             | N_DATA_VIEW
             | N_WASM_MODULE
             | N_WASM_INSTANCE
@@ -2141,6 +2147,9 @@ const ARRAY_BUFFER_MAXLEN: &str = "\u{0}abmaxlen";
 /// `sliceToImmutable`): its bytes may not be modified, and it cannot be resized
 /// or transferred. The `immutable` getter reports `true` (unless detached).
 const ARRAY_BUFFER_IMMUTABLE: &str = "\u{0}abimmutable";
+/// Marks a buffer as a `SharedArrayBuffer` (vs a plain `ArrayBuffer`): drives its
+/// `[Symbol.toStringTag]`, the `growable`/`maxByteLength` accessors, and `grow`.
+const SHARED_ARRAY_BUFFER_BRAND: &str = "\u{0}sab";
 const DATA_VIEW_BUF: &str = "\u{0}dvbuf";
 const DATA_VIEW_OFF: &str = "\u{0}dvoff";
 /// An explicit `DataView` byteLength (the 3rd constructor arg); absent → the rest
@@ -3494,6 +3503,45 @@ impl<'a> Interp<'a> {
                     .set_hidden_property(f, "isView", NanBox::handle(isview.to_raw()));
             }
             self.current.declare(name, NanBox::handle(f.to_raw()));
+        }
+        // `SharedArrayBuffer` — installed additively (its byte store, typed-array
+        // and `Atomics` integration reuse the `ArrayBuffer` machinery; only the
+        // prototype's accessor names + `[Symbol.toStringTag]` differ).
+        {
+            let sab_ctor = self.new_named_native("SharedArrayBuffer", N_SHARED_ARRAY_BUFFER);
+            self.current
+                .declare("SharedArrayBuffer", NanBox::handle(sab_ctor.to_raw()));
+            let proto = self.realm.new_object_with_proto(self.object_prototype());
+            self.realm
+                .set_hidden_property(proto, "constructor", NanBox::handle(sab_ctor.to_raw()));
+            // The `byteLength` / `maxByteLength` / `growable` accessors share the
+            // ArrayBuffer getter (`N_AB_ACCESSOR`), which validates the receiver via
+            // its `ARRAY_BUFFER_BYTES` slot — so a read on `SharedArrayBuffer
+            // .prototype` itself throws, but an instance read works.
+            for accessor in ["byteLength", "maxByteLength", "growable"] {
+                let name_h = self.realm.new_string(accessor);
+                let getter = self.realm.new_bound_native(N_AB_ACCESSOR, name_h);
+                self.install_fn_name_length(getter, &alloc::format!("get {accessor}"), 0);
+                self.realm.define_accessor(
+                    proto,
+                    accessor,
+                    NanBox::handle(getter.to_raw()),
+                    NanBox::undefined(),
+                );
+                self.realm.mark_hidden(proto, accessor);
+            }
+            let tag_sym = self.well_known_symbol("toStringTag");
+            let tag_key = self.member_key(tag_sym);
+            let tag_val = self.new_str("SharedArrayBuffer");
+            self.realm.set_property(proto, &tag_key, tag_val);
+            self.realm.mark_hidden(proto, &tag_key);
+            self.realm.set_readonly_property(proto, &tag_key);
+            self.realm
+                .set_property(sab_ctor, "prototype", NanBox::handle(proto.to_raw()));
+            self.realm.mark_hidden(sab_ctor, "prototype");
+            self.realm.set_readonly_property(sab_ctor, "prototype");
+            self.realm
+                .set_non_configurable_property(sab_ctor, "prototype");
         }
         // The `Iterator` global — the `%Iterator%` abstract constructor. Direct
         // `new Iterator()` / `Iterator()` throw (abstract); `Iterator.from(x)`

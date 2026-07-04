@@ -640,7 +640,9 @@ impl<'a> Interp<'a> {
                 let max = self.realm.get_property(h, ARRAY_BUFFER_MAXLEN);
                 return Ok(match name.as_str() {
                     "detached" => NanBox::boolean(detached),
-                    "resizable" => NanBox::boolean(max.is_some()),
+                    // `resizable` (ArrayBuffer) / `growable` (SharedArrayBuffer):
+                    // both are true iff a `maxByteLength` was recorded.
+                    "resizable" | "growable" => NanBox::boolean(max.is_some()),
                     // `immutable`: true iff the buffer is immutable and not detached.
                     "immutable" => NanBox::boolean(
                         !detached && self.realm.get_property(h, ARRAY_BUFFER_IMMUTABLE).is_some(),
@@ -2291,6 +2293,52 @@ impl<'a> Interp<'a> {
                     ARRAY_BUFFER_MAXLEN,
                     NanBox::number(max as f64),
                 );
+            }
+            return Ok(NanBox::handle(buf.to_raw()));
+        }
+        // `new SharedArrayBuffer(n, { maxByteLength? })` — a zeroed byte store that,
+        // single-agent, behaves like an ArrayBuffer that only grows. Shares the
+        // `make_array_buffer` machinery (so typed arrays / `Atomics` work over it),
+        // marked with `SHARED_ARRAY_BUFFER_BRAND` and linked to `%SharedArrayBuffer
+        // .prototype%`.
+        if id == N_SHARED_ARRAY_BUFFER {
+            let raw = args.first().map_or(0.0, |v| self.realm.to_number(*v));
+            let n = self.validate_alloc_len(raw, "Invalid SharedArrayBuffer length")?;
+            let buf = self.make_array_buffer(n);
+            self.realm
+                .set_hidden_property(buf, SHARED_ARRAY_BUFFER_BRAND, NanBox::boolean(true));
+            // `{ maxByteLength }` makes it growable up to `max`.
+            if let Some(opts) = args
+                .get(1)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                && let Some(maxv) = self.realm.get_property(opts, "maxByteLength")
+            {
+                let max = self.realm.to_number(maxv).max(0.0) as usize;
+                if max < n {
+                    let m = self.new_str("SharedArrayBuffer maxByteLength is smaller than length");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                self.realm.set_hidden_property(
+                    buf,
+                    ARRAY_BUFFER_MAXLEN,
+                    NanBox::number(max as f64),
+                );
+            }
+            // Link to `%SharedArrayBuffer.prototype%` (or newTarget's for a subclass).
+            let proto = if native_new_target.as_handle() != callee.as_handle() {
+                self.instance_proto(native_new_target, callee, None)
+            } else {
+                self.current
+                    .get("SharedArrayBuffer")
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+                    .and_then(|c| self.realm.get_property(c, "prototype"))
+                    .and_then(|p| p.as_handle())
+                    .map(Handle::from_raw)
+            };
+            if let Some(proto) = proto {
+                self.realm.set_object_proto(buf, Some(proto));
             }
             return Ok(NanBox::handle(buf.to_raw()));
         }

@@ -8147,3 +8147,59 @@ fn atomics_single_agent_integer_ops() {
         "[object Atomics]"
     );
 }
+
+#[test]
+fn shared_array_buffer_core() {
+    // SharedArrayBuffer (single-agent): construction + byteLength, the
+    // growable/maxByteLength accessors, typed-array + Atomics + DataView backing,
+    // the [Symbol.toStringTag], and a slot-requiring accessor read on the
+    // prototype throwing.
+    assert_eq!(run("new SharedArrayBuffer(16).byteLength"), "16");
+    assert_eq!(
+        run("Object.prototype.toString.call(new SharedArrayBuffer(8))"),
+        "[object SharedArrayBuffer]"
+    );
+    assert_eq!(
+        run("var s=new SharedArrayBuffer(8);var a=new Int32Array(s);a[0]=42;a[0]"),
+        "42"
+    );
+    assert_eq!(
+        run(
+            "var s=new SharedArrayBuffer(8);var a=new Int32Array(s);Atomics.store(a,0,5);Atomics.add(a,0,3)+','+a[0]"
+        ),
+        "5,8"
+    );
+    assert_eq!(run("new SharedArrayBuffer(8).growable"), "false");
+    assert_eq!(
+        run("new SharedArrayBuffer(8,{maxByteLength:16}).growable"),
+        "true"
+    );
+    assert_eq!(
+        run("new SharedArrayBuffer(8,{maxByteLength:16}).maxByteLength"),
+        "16"
+    );
+    assert_eq!(
+        run("new SharedArrayBuffer(8).constructor===SharedArrayBuffer"),
+        "true"
+    );
+    assert_eq!(
+        run("new SharedArrayBuffer(8) instanceof SharedArrayBuffer"),
+        "true"
+    );
+    assert_eq!(
+        run("SharedArrayBuffer.name+','+SharedArrayBuffer.length"),
+        "SharedArrayBuffer,1"
+    );
+    assert_eq!(
+        run("try{SharedArrayBuffer.prototype.byteLength;'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("try{new SharedArrayBuffer(16,{maxByteLength:8});'no'}catch(e){e.constructor.name}"),
+        "RangeError"
+    );
+    assert_eq!(
+        run("var s=new SharedArrayBuffer(8);var d=new DataView(s);d.setInt32(0,99);d.getInt32(0)"),
+        "99"
+    );
+}
