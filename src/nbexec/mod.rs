@@ -3178,20 +3178,16 @@ impl<'a> Interp<'a> {
                 .set_hidden_property(f, "supportedLocalesOf", NanBox::handle(sl.to_raw()));
             self.realm
                 .set_property(intl, name, NanBox::handle(f.to_raw()));
+            // ECMA-402: every service constructor is a non-enumerable property of
+            // `Intl` (`{ writable:true, enumerable:false, configurable:true }`).
+            self.realm.mark_hidden(intl, name);
         }
-        // ECMA-402: the service constructors are non-enumerable properties of `Intl`
-        // (`{ writable:true, enumerable:false, configurable:true }`). (Only
-        // `ListFormat`/`RelativeTimeFormat` are corrected here to keep the change
-        // scoped to those services.)
-        self.realm.mark_hidden(intl, "ListFormat");
-        self.realm.mark_hidden(intl, "RelativeTimeFormat");
-        self.realm.mark_hidden(intl, "DurationFormat");
-        self.realm.mark_hidden(intl, "PluralRules");
         // `Intl.Locale` — a constructor with no `supportedLocalesOf` static.
         {
             let f = self.new_named_native("Locale", N_INTL_LOCALE);
             self.realm
                 .set_property(intl, "Locale", NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(intl, "Locale");
         }
         // `Intl.getCanonicalLocales` / `Intl.supportedValuesOf` — namespace functions.
         for (name, id) in [

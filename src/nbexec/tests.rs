@@ -7208,3 +7208,28 @@ fn regex_legacy_octal_escapes() {
     assert_eq!(run("/\\0/.test('\\0')"), "true");
     assert_eq!(run("/\\bword\\b/.test('a word')"), "true");
 }
+
+#[test]
+fn intl_service_constructors_non_enumerable() {
+    // ECMA-402: every Intl service constructor is a non-enumerable property of
+    // Intl (writable:true, enumerable:false, configurable:true), so
+    // Object.keys(Intl) is empty.
+    assert_eq!(run("JSON.stringify(Object.keys(Intl))"), "[]");
+    assert_eq!(
+        run(
+            "['NumberFormat','DateTimeFormat','Collator','PluralRules','ListFormat','RelativeTimeFormat','DisplayNames','Segmenter','Locale'].every(n=>!Object.getOwnPropertyDescriptor(Intl,n).enumerable)"
+        ),
+        "true"
+    );
+    assert_eq!(
+        run(
+            "var d=Object.getOwnPropertyDescriptor(Intl,'NumberFormat');d.writable+','+d.configurable"
+        ),
+        "true,true"
+    );
+    // The constructors still work.
+    assert_eq!(
+        run("typeof new Intl.NumberFormat('en-US').format"),
+        "function"
+    );
+}
