@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(embed)* host-function registration API — `Interp::register_fn` /
+  `register_global_fn` + `Ctx` (ROADMAP §4.0 milestone 1): register a Rust
+  closure as a first-class JS function with spec-shaped `name`/`length`, build
+  values, read/write properties, throw catchable errors, coerce arguments, and
+  re-enter JS. Backed by a new `Cell::HostFn` registry cell; self-reentrancy is
+  a clean `TypeError`.
+
 ## [0.0.5](https://github.com/KarpelesLab/kataan/compare/v0.0.4...v0.0.5) - 2026-07-03
 
 ### Added

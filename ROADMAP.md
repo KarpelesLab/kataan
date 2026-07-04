@@ -381,6 +381,22 @@ Milestone order: (1) dynamic native registry + `Cell::HostFn` + Rust
 host constructors/finalizers. Once (1)–(2) land, migrate a couple of existing
 sentinel builtins onto the registry to prove the path end-to-end.
 
+**Status:** the Rust core of (1) + most of (2) has **landed** (tree-walker). A
+`Cell::HostFn(u32)` names an entry in an `Interp` host-function registry;
+`Interp::register_fn(name, length, closure)` / `register_global_fn` create a
+first-class callable (spec-shaped own `name`/`length`, `typeof === "function"`,
+`Function.prototype.toString` shape, `new` → `TypeError`). The closure receives
+a `Ctx` with value builders (`number`/`string`/`new_object`/`new_array`/…),
+property `get`/`set`, argument coercion (`to_number`/`to_string`/`to_boolean`),
+error builders (`type_error`/`range_error`/`error`), and reentrant `call` to
+re-enter JS; `Err(value)` raises a catchable JS exception. Self-reentrancy onto
+the same host function is a clean `TypeError` (the `FnMut` is taken out of its
+slot for the call). See `examples/embed_host_fn.rs`. **Remaining for §4.0:** a
+rooted **handle scope** (host values held across calls), `construct` +
+host-backed exotic objects/finalizers, panic-trapping at the boundary, the
+**C ABI** mirror, async/promise interop, `nbvm` host-native fault-through, and
+migrating a sentinel builtin onto the registry.
+
 ### 4.1 Event loop & scheduling
 
 A complete in-house loop (readiness-based I/O or std threads): `setTimeout`/

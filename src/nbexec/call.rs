@@ -3,6 +3,7 @@ use super::*;
 impl<'a> Interp<'a> {
     pub(crate) fn is_callable(&self, handle: Handle) -> bool {
         self.realm.native_at(handle).is_some()
+            || self.realm.host_fn_at(handle).is_some()
             || self.realm.function_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
             // A bound function (`fn.bind(...)`) is callable.
@@ -187,6 +188,11 @@ impl<'a> Interp<'a> {
             let r = self.call_native(id, args);
             self.this_val = saved;
             return r;
+        }
+        // A dynamically-registered host function (`register_fn`, ROADMAP §4.0):
+        // invoke its Rust closure through the host boundary.
+        if let Some(id) = self.realm.host_fn_at(handle) {
+            return self.call_host_fn(id, this_val, args);
         }
         // A bound native (promise resolve/reject) carries its target.
         if let Some((id, target)) = self.realm.bound_native_at(handle) {

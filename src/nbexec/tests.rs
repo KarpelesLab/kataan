@@ -5466,3 +5466,146 @@ fn typed_array_aliasing_sees_bulk_writes() {
         "ffffffff"
     );
 }
+
+// --- Host-function registration API (`register_fn`, ROADMAP §4.0) -----------
+
+#[test]
+fn host_fn_basic_call_and_return() {
+    let program = Parser::parse_program("addOne(41)").expect("parse");
+    let mut interp = Interp::new();
+    interp.register_global_fn("addOne", 1, |cx, _this, args| {
+        let n = cx.to_number(args.first().copied().unwrap_or(cx.undefined()))?;
+        Ok(cx.number(n + 1.0))
+    });
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "42");
+}
+
+#[test]
+fn host_fn_typeof_name_length() {
+    fn check(src: &str) -> String {
+        let program = Parser::parse_program(src).expect("parse");
+        let mut interp = Interp::new();
+        interp.register_global_fn("greet", 2, |cx, _t, _a| Ok(cx.undefined()));
+        let v = interp.run(&program).expect("exec");
+        interp.realm().to_display_string(v)
+    }
+    assert_eq!(check("typeof greet"), "function");
+    assert_eq!(check("greet.name"), "greet");
+    assert_eq!(check("greet.length"), "2");
+    // `Function.prototype.toString` shape for a native.
+    assert_eq!(
+        check("greet.toString()"),
+        "function greet() { [native code] }"
+    );
+}
+
+#[test]
+fn host_fn_throw_is_catchable() {
+    let program =
+        Parser::parse_program("try { boom(); 'no' } catch (e) { e.message }").expect("parse");
+    let mut interp = Interp::new();
+    interp.register_global_fn("boom", 0, |cx, _t, _a| Err(cx.type_error("kaboom")));
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "kaboom");
+}
+
+#[test]
+fn host_fn_receives_this_and_args() {
+    // Installed as a method so `this` is the receiver object.
+    let program =
+        Parser::parse_program("var o = { x: 10 }; o.sum = theSum; o.sum(1, 2, 3)").expect("parse");
+    let mut interp = Interp::new();
+    interp.register_global_fn("theSum", 0, |cx, this, args| {
+        let base = cx.get(this, "x")?;
+        let mut total = cx.to_number(base)?;
+        for a in args {
+            total += cx.to_number(*a)?;
+        }
+        Ok(cx.number(total))
+    });
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "16");
+}
+
+#[test]
+fn host_fn_can_build_objects_and_arrays() {
+    let program =
+        Parser::parse_program("var p = makePair(3, 4); JSON.stringify(p)").expect("parse");
+    let mut interp = Interp::new();
+    interp.register_global_fn("makePair", 2, |cx, _t, args| {
+        let a = args.first().copied().unwrap_or(cx.undefined());
+        let b = args.get(1).copied().unwrap_or(cx.undefined());
+        let obj = cx.new_object();
+        cx.set(obj, "first", a);
+        cx.set(obj, "second", b);
+        let arr = cx.new_array(alloc::vec![a, b]);
+        cx.set(obj, "both", arr);
+        Ok(obj)
+    });
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(
+        interp.realm().to_display_string(v),
+        r#"{"first":3,"second":4,"both":[3,4]}"#
+    );
+}
+
+#[test]
+fn host_fn_can_reenter_js() {
+    // The host function calls a JS callback passed as an argument (ctx.call).
+    let program =
+        Parser::parse_program("applyTwice(function (n) { return n * 2 }, 5)").expect("parse");
+    let mut interp = Interp::new();
+    interp.register_global_fn("applyTwice", 2, |cx, _t, args| {
+        let f = args.first().copied().unwrap_or(cx.undefined());
+        let x = args.get(1).copied().unwrap_or(cx.undefined());
+        let once = cx.call(f, cx.undefined(), &[x])?;
+        cx.call(f, cx.undefined(), &[once])
+    });
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "20");
+}
+
+#[test]
+fn host_fn_mutable_state_persists_across_calls() {
+    let program = Parser::parse_program("counter(); counter(); counter()").expect("parse");
+    let mut interp = Interp::new();
+    let mut n = 0.0_f64;
+    interp.register_global_fn("counter", 0, move |cx, _t, _a| {
+        n += 1.0;
+        Ok(cx.number(n))
+    });
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "3");
+}
+
+#[test]
+fn host_fn_new_is_type_error() {
+    let program =
+        Parser::parse_program("try { new plain(); 'no' } catch (e) { e instanceof TypeError }")
+            .expect("parse");
+    let mut interp = Interp::new();
+    interp.register_global_fn("plain", 0, |cx, _t, _a| Ok(cx.undefined()));
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "true");
+}
+
+#[test]
+fn host_fn_self_reentrancy_throws() {
+    // A host function that calls *itself* while a call is in flight gets a
+    // clean TypeError rather than aliasing its own &mut closure.
+    let program = Parser::parse_program(
+        "try { recur(); 'no' } catch (e) { String(e).indexOf('re-entrant') >= 0 }",
+    )
+    .expect("parse");
+    let mut interp = Interp::new();
+    // Capture the function value so the closure can call back into itself.
+    let self_val = interp.register_fn("recur", 0, |cx, _t, _a| {
+        let g = cx.global();
+        let me = cx.get(g, "recur")?;
+        cx.call(me, cx.undefined(), &[])
+    });
+    interp.declare_global("recur", self_val);
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "true");
+}

@@ -176,6 +176,10 @@ pub mod ffi;
 
 pub use error::{Error, Result};
 pub use limits::{Limits, WasmLimits};
+pub use nanbox::NanBox;
+// The embedding surface (`ROADMAP.md` §4.0): register Rust closures as JS
+// functions (`Interp::register_fn`) and talk back to the engine through `Ctx`.
+pub use nbexec::{Ctx, HostCallback, Interp};
 
 /// The crate version, from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

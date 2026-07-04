@@ -586,6 +586,186 @@ pub struct Interp<'a> {
     /// restored around each module body. `None` outside module code.
     #[cfg(all(feature = "module", feature = "std"))]
     active_module_key: Option<String>,
+    /// Dynamically-registered **host** native functions (`ROADMAP.md` §4.0),
+    /// indexed by the [`Cell::HostFn`](crate::cell::Cell::HostFn) id that names
+    /// them. Each slot is `None` while its closure is *taken out* for the
+    /// duration of a call (so a re-entrant call to the *same* host function is
+    /// detected rather than aliasing a `&mut` closure); it is restored when the
+    /// call returns. The boxed closures are runtime state — they capture Rust
+    /// data the GC cannot trace and are not serialized (a snapshot drops them,
+    /// like IC slots), which is why they live here rather than in the heap.
+    host_fns: Vec<Option<HostFn>>,
+}
+
+/// A dynamically-registered host (native) function: the Rust closure
+/// [`Interp::register_fn`] wraps, plus the spec-shaped own `name`/`length` the
+/// function object reports. Called from JS exactly like a built-in, receiving a
+/// [`Ctx`] to build values, read/write properties, throw, and re-enter JS
+/// (`ROADMAP.md` §4.0).
+pub struct HostFn {
+    name: String,
+    length: u32,
+    call: HostCallback,
+}
+
+/// The boxed Rust closure backing a [`HostFn`]: it receives a [`Ctx`] handle,
+/// the call's `this` value, and the argument list, and returns either a result
+/// value or a value to `throw` (raised as a JS exception). It is `'static`
+/// (captured state must outlive the interpreter's runs) and `FnMut` (it may hold
+/// mutable host state between calls).
+pub type HostCallback =
+    alloc::boxed::Box<dyn FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox>>;
+
+/// The context handle a registered host function ([`Interp::register_fn`]) uses
+/// to talk back to the engine: construct values, read/write properties, throw
+/// JS errors, coerce arguments, and re-enter JS by calling other functions
+/// (`ROADMAP.md` §4.0). It borrows the interpreter for the duration of one host
+/// call; values it hands out are ordinary [`NanBox`] handles that stay valid
+/// while the call runs (the host must not stash a bare handle across calls — a
+/// rooted handle scope for that is future §4.0 work).
+pub struct Ctx<'c, 'a> {
+    interp: &'c mut Interp<'a>,
+}
+
+impl<'c, 'a> Ctx<'c, 'a> {
+    /// The JS `undefined` value.
+    #[must_use]
+    pub fn undefined(&self) -> NanBox {
+        NanBox::undefined()
+    }
+
+    /// The JS `null` value.
+    #[must_use]
+    pub fn null(&self) -> NanBox {
+        NanBox::null()
+    }
+
+    /// A JS Number.
+    #[must_use]
+    pub fn number(&self, n: f64) -> NanBox {
+        NanBox::number(n)
+    }
+
+    /// A JS Boolean.
+    #[must_use]
+    pub fn boolean(&self, b: bool) -> NanBox {
+        NanBox::boolean(b)
+    }
+
+    /// A JS String (heap-allocated, rope-backed).
+    pub fn string(&mut self, s: &str) -> NanBox {
+        self.interp.new_str(s)
+    }
+
+    /// A fresh empty ordinary object (`{}` with `%Object.prototype%`).
+    pub fn new_object(&mut self) -> NanBox {
+        let h = self.interp.realm.new_object();
+        NanBox::handle(h.to_raw())
+    }
+
+    /// A fresh dense array with the given `elements`.
+    pub fn new_array(&mut self, elements: Vec<NanBox>) -> NanBox {
+        let h = self.interp.realm.new_array(elements);
+        NanBox::handle(h.to_raw())
+    }
+
+    /// The realm's global object (`globalThis`).
+    #[must_use]
+    pub fn global(&self) -> NanBox {
+        self.interp.global_this
+    }
+
+    /// Reads property `key` of `obj` (walking the prototype chain), coercing a
+    /// primitive receiver to its wrapper first (ordinary `[[Get]]`). A `null` /
+    /// `undefined` receiver reads `undefined`.
+    ///
+    /// # Errors
+    /// The thrown value if a getter (or proxy trap) along the chain throws.
+    pub fn get(&mut self, obj: NanBox, key: &str) -> Result<NanBox, NanBox> {
+        let recv = self.interp.coerce_to_object(obj);
+        let Some(h) = recv.as_handle().map(Handle::from_raw) else {
+            return Ok(NanBox::undefined());
+        };
+        self.interp
+            .read_member(h, key)
+            .map_err(|e| self.interp.exec_error_value(e))
+    }
+
+    /// Sets an own data property `key` of the object `obj` to `value`. A
+    /// non-object `obj` is a no-op. (This writes an own data property directly;
+    /// inherited setters are not invoked — a full `[[Set]]` is future work.)
+    pub fn set(&mut self, obj: NanBox, key: &str, value: NanBox) {
+        if let Some(h) = obj.as_handle().map(Handle::from_raw) {
+            self.interp.realm.set_property(h, key, value);
+        }
+    }
+
+    /// Builds (but does not raise) a `TypeError` with `message`. Return it as
+    /// `Err(..)` from the host closure to throw it.
+    pub fn type_error(&mut self, message: &str) -> NanBox {
+        let m = self.interp.new_str(message);
+        self.interp.make_error(N_TYPE_ERROR, Some(m))
+    }
+
+    /// Builds (but does not raise) a `RangeError` with `message`.
+    pub fn range_error(&mut self, message: &str) -> NanBox {
+        let m = self.interp.new_str(message);
+        self.interp.make_error(N_RANGE_ERROR, Some(m))
+    }
+
+    /// Builds (but does not raise) a plain `Error` with `message`.
+    pub fn error(&mut self, message: &str) -> NanBox {
+        let m = self.interp.new_str(message);
+        self.interp.make_error(N_ERROR_BASE, Some(m))
+    }
+
+    /// `ToNumber(v)` — the JS numeric coercion (calls `valueOf`/`toString` for an
+    /// object, parses a string, …).
+    ///
+    /// # Errors
+    /// The thrown value if coercion throws (e.g. a `BigInt`, a `Symbol`, or a
+    /// throwing `valueOf`).
+    pub fn to_number(&mut self, v: NanBox) -> Result<f64, NanBox> {
+        let n = self
+            .interp
+            .coerce_to_number(v)
+            .map_err(|e| self.interp.exec_error_value(e))?;
+        Ok(self.interp.realm.to_number(n))
+    }
+
+    /// `ToString(v)` — the JS string coercion.
+    ///
+    /// # Errors
+    /// The thrown value if coercion throws (e.g. a `Symbol`, or a throwing
+    /// `toString`).
+    pub fn to_string(&mut self, v: NanBox) -> Result<String, NanBox> {
+        self.interp
+            .coerce_to_string(v)
+            .map_err(|e| self.interp.exec_error_value(e))
+    }
+
+    /// `ToBoolean(v)` — JS truthiness.
+    #[must_use]
+    pub fn to_boolean(&self, v: NanBox) -> bool {
+        self.interp.realm.truthy(v)
+    }
+
+    /// Calls the JS function `callee` with the given `this` and `args`,
+    /// re-entering the engine. Works for user functions, natives, other host
+    /// functions, bound functions, and callable proxies.
+    ///
+    /// # Errors
+    /// The thrown value if `callee` is not callable or the call throws.
+    pub fn call(
+        &mut self,
+        callee: NanBox,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, NanBox> {
+        self.interp
+            .call_with_this(callee, this, args)
+            .map_err(|e| self.interp.exec_error_value(e))
+    }
 }
 
 /// A queued promise reaction: run `handler` with `value`, then settle `result`
@@ -2050,6 +2230,7 @@ impl<'a> Interp<'a> {
             deferred_namespaces: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "module", feature = "std"))]
             active_module_key: None,
+            host_fns: Vec::new(),
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run
@@ -3877,6 +4058,116 @@ impl<'a> Interp<'a> {
         self.current.declare(name, value);
         if let Some(g) = self.global_this.as_handle().map(Handle::from_raw) {
             self.realm.set_property(g, name, value);
+        }
+    }
+
+    /// Registers a Rust closure as a **host native function** and returns it as a
+    /// callable JS value (`ROADMAP.md` §4.0 — the embedding foundation).
+    ///
+    /// The returned value is a first-class function: it can be bound to a global
+    /// (see [`register_global_fn`](Self::register_global_fn)), installed as an
+    /// object property, passed to JS, or called via `.call`/`.apply`. Reading its
+    /// `name` yields `name`, its `length` yields `length` (the declared arity),
+    /// and `typeof` it is `"function"`.
+    ///
+    /// The closure receives a [`Ctx`] (to build values, read/write properties,
+    /// throw, and re-enter JS), the call's `this`, and the arguments. Returning
+    /// `Ok(v)` resolves the call to `v`; returning `Err(v)` raises `v` as a JS
+    /// exception the script can `catch`. A host function is **not re-entrant onto
+    /// itself**: if it (directly or transitively) calls back into the *same*
+    /// registered function while a call is in flight, that inner call throws a
+    /// `TypeError` rather than aliasing the `FnMut` — distinct host functions may
+    /// freely call one another.
+    ///
+    /// Note (§6 "two engines, one truth"): the bytecode VM (`nbvm`) has no host
+    /// registry of its own; a program that calls a host function faults to this
+    /// interpreter, exactly as it does for any native.
+    pub fn register_fn<F>(&mut self, name: &str, length: u32, f: F) -> NanBox
+    where
+        F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+    {
+        let id = self.host_fns.len() as u32;
+        self.host_fns.push(Some(HostFn {
+            name: String::from(name),
+            length,
+            call: alloc::boxed::Box::new(f),
+        }));
+        let h = self.realm.new_host_fn(id);
+        NanBox::handle(h.to_raw())
+    }
+
+    /// [`register_fn`](Self::register_fn) plus [`declare_global`](Self::declare_global):
+    /// registers the closure and binds it as a global named `name`, so a
+    /// subsequently-`run` script can call it directly.
+    pub fn register_global_fn<F>(&mut self, name: &str, length: u32, f: F) -> NanBox
+    where
+        F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+    {
+        let v = self.register_fn(name, length, f);
+        self.declare_global(name, v);
+        v
+    }
+
+    /// Invokes the host function with registry index `id` (a
+    /// [`Cell::HostFn`](crate::cell::Cell::HostFn)), passing `this` and `args`.
+    ///
+    /// The closure is *taken out* of its slot for the duration of the call so a
+    /// re-entrant call onto the same function is a clean `TypeError` (see
+    /// [`register_fn`](Self::register_fn)) rather than a double `&mut` borrow, and
+    /// restored when the call returns (including on a thrown error).
+    pub(crate) fn call_host_fn(
+        &mut self,
+        id: u32,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let taken = self.host_fns.get_mut(id as usize).and_then(Option::take);
+        let Some(mut hf) = taken else {
+            // Either an unknown id (should not happen for a live cell) or a
+            // re-entrant call onto a host function already on the stack.
+            return Err(self.type_error("host function is not re-entrant"));
+        };
+        let mut ctx = Ctx { interp: self };
+        let r = (hf.call)(&mut ctx, this, args);
+        // `ctx` is no longer used, so the `&mut self` borrow is free; restore the
+        // closure to its slot for the next call.
+        self.host_fns[id as usize] = Some(hf);
+        match r {
+            Ok(v) => Ok(v),
+            Err(v) => Err(ExecError::Throw(v)),
+        }
+    }
+
+    /// The declared `(name, length)` of the host function at registry index `id`,
+    /// used to synthesize its `name`/`length` own properties on read. Available
+    /// even while the closure is taken out for an in-flight call.
+    pub(crate) fn host_fn_meta(&self, id: u32) -> Option<(&str, u32)> {
+        self.host_fns
+            .get(id as usize)
+            .and_then(Option::as_ref)
+            .map(|hf| (hf.name.as_str(), hf.length))
+    }
+
+    /// Converts an [`ExecError`] into the JS value it represents, for the host
+    /// boundary (which speaks `Result<NanBox, NanBox>`): a `Throw` carries its
+    /// value directly; the internal variants are materialized as the error object
+    /// a script would observe.
+    pub(crate) fn exec_error_value(&mut self, e: ExecError) -> NanBox {
+        match e {
+            ExecError::Throw(v) => v,
+            ExecError::NotCallable => {
+                let m = self.new_str("is not a function");
+                self.make_error(N_TYPE_ERROR, Some(m))
+            }
+            ExecError::NotDefined(name) => {
+                let m = self.new_str(&alloc::format!("{name} is not defined"));
+                self.make_error(N_REFERENCE_ERROR, Some(m))
+            }
+            ExecError::Unsupported(s) => {
+                let m = self.new_str(s);
+                self.make_error(N_ERROR_BASE, Some(m))
+            }
+            ExecError::OptShortCircuit => NanBox::undefined(),
         }
     }
 

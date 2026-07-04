@@ -2098,6 +2098,20 @@ impl<'a> Interp<'a> {
                 self.new_str(def.name)
             });
         }
+        // A dynamically-registered host function (`register_fn`, ROADMAP §4.0)
+        // reports the declared `name`/`length` its registry entry carries.
+        if matches!(name, "length" | "name")
+            && !self.realm.has_own(handle, name)
+            && let Some(id) = self.realm.host_fn_at(handle)
+            && let Some((fn_name, len)) = self.host_fn_meta(id)
+        {
+            return Ok(if name == "length" {
+                NanBox::number(f64::from(len))
+            } else {
+                let fn_name = String::from(fn_name);
+                self.new_str(&fn_name)
+            });
+        }
         // A built-in function's `name` and `length`. Plain natives carry `name` in
         // their aux object (resolved above / via `member_value`) but no physical
         // `length`; first-class prototype/static methods (bound natives) carry
@@ -3575,6 +3589,7 @@ impl<'a> Interp<'a> {
             return self.instance_of(obj, target);
         }
         let is_ctor = self.realm.native_at(ch).is_some()
+            || self.realm.host_fn_at(ch).is_some()
             || self.realm.function_at(ch).is_some()
             || self.realm.class_at(ch).is_some()
             || self.realm.bound_native_at(ch).is_some()

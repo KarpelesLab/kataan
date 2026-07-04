@@ -1077,6 +1077,19 @@ impl Realm {
         self.heap.alloc(Cell::Native(id))
     }
 
+    /// Allocates a **host** (dynamically-registered) native function naming the
+    /// registry entry `id` (see `Interp::register_fn`, `ROADMAP.md` §4.0).
+    pub fn new_host_fn(&mut self, id: u32) -> Handle {
+        self.heap.alloc(Cell::HostFn(id))
+    }
+
+    /// The host-function registry index at `handle`, or `None` if the cell is
+    /// not a host function.
+    #[must_use]
+    pub fn host_fn_at(&self, handle: Handle) -> Option<u32> {
+        self.heap.get(handle)?.as_host_fn()
+    }
+
     /// Allocates a class value (a class-table index plus its captured scope).
     pub fn new_class(&mut self, class_id: u32, env: crate::env::Scope) -> Handle {
         self.heap.alloc(Cell::Class { class_id, env })
@@ -1586,6 +1599,7 @@ impl Realm {
             self.heap.get(handle),
             Some(
                 Cell::Native(_)
+                    | Cell::HostFn(_)
                     | Cell::BoundNative { .. }
                     | Cell::Function { .. }
                     | Cell::Class { .. }
@@ -2388,6 +2402,7 @@ impl Realm {
                 Cell::Function { .. }
                     | Cell::Class { .. }
                     | Cell::Native(_)
+                    | Cell::HostFn(_)
                     | Cell::BoundNative { .. }
             )
         )
@@ -2415,6 +2430,7 @@ impl Realm {
                 Cell::Function { .. }
                     | Cell::Class { .. }
                     | Cell::Native(_)
+                    | Cell::HostFn(_)
                     | Cell::BoundNative { .. }
             )
         )
@@ -3274,7 +3290,7 @@ impl Realm {
                 // — and a class as `class Name { }`. The name is read from the own
                 // `name` property when materialized (else empty). This keeps `"" + fn`
                 // / `String(fn)` consistent with `fn.toString()`.
-                Some(Cell::Function { .. } | Cell::Native(_)) => {
+                Some(Cell::Function { .. } | Cell::Native(_) | Cell::HostFn(_)) => {
                     let h = Handle::from_raw(raw);
                     let name = self
                         .get_property(h, "name")

@@ -194,6 +194,13 @@ pub enum Cell {
     /// A built-in (native) function, identified by an id the interpreter maps to
     /// a Rust implementation.
     Native(u16),
+    /// A **host** (dynamically-registered) native function: an index into the
+    /// interpreter's host-function registry (`Interp::register_fn`, `ROADMAP.md`
+    /// §4.0). Like [`Cell::Native`] it is a plain id — the boxed Rust closure it
+    /// names lives in the interpreter, not the heap, so the moving GC relocates a
+    /// trivial cell and the closure is never traced. The id space is disjoint
+    /// from the built-in `u16` sentinels (this is a `u32` registry index).
+    HostFn(u32),
     /// A native function bound to a heap value (e.g. a promise's resolve/reject,
     /// which carry the promise they settle).
     BoundNative {
@@ -447,6 +454,7 @@ impl Cell {
             Cell::Str(_) => "string",
             Cell::Function { .. }
             | Cell::Native(_)
+            | Cell::HostFn(_)
             | Cell::BoundNative { .. }
             | Cell::Class { .. } => "function",
             Cell::Symbol { .. } => "symbol",
@@ -470,6 +478,15 @@ impl Cell {
     pub fn as_symbol(&self) -> Option<(&str, u64)> {
         match self {
             Cell::Symbol { description, id } => Some((description, *id)),
+            _ => None,
+        }
+    }
+
+    /// The host-function registry index, if this cell is a host function.
+    #[must_use]
+    pub fn as_host_fn(&self) -> Option<u32> {
+        match self {
+            Cell::HostFn(id) => Some(*id),
             _ => None,
         }
     }
@@ -573,6 +590,7 @@ impl Trace for Cell {
             // reference no handles.
             Cell::Str(_)
             | Cell::Native(_)
+            | Cell::HostFn(_)
             | Cell::Date(_)
             | Cell::RegExp { .. }
             | Cell::Symbol { .. }
@@ -626,6 +644,7 @@ impl crate::gc::Relocate for Cell {
             }
             Cell::Str(_)
             | Cell::Native(_)
+            | Cell::HostFn(_)
             | Cell::Date(_)
             | Cell::RegExp { .. }
             | Cell::Symbol { .. }
