@@ -5846,3 +5846,25 @@ fn array_of_honors_constructor_receiver() {
     assert_eq!(run("JSON.stringify(Array.of(1,2,3))"), "[1,2,3]");
     assert_eq!(run("var of=Array.of;JSON.stringify(of(5,6))"), "[5,6]");
 }
+
+#[test]
+fn sparse_array_holes_in_haspropety_and_flat() {
+    // `in` / HasProperty treat an array hole as absent (elision, delete, and
+    // `new Array(n)` all create holes).
+    assert_eq!(run("1 in [2,,3]"), "false");
+    assert_eq!(run("var a=[2,9,3];delete a[1];1 in a"), "false");
+    assert_eq!(run("0 in new Array(3)"), "false");
+    assert_eq!(run("[2,,3].hasOwnProperty(1)"), "false");
+    // Generic iteration that probes presence with HasProperty skips holes.
+    assert_eq!(run("var c=0;[2,,3].forEach(()=>c++);c"), "2");
+    assert_eq!(
+        run("var r=[1,,3].map(x=>x*2);(1 in r)+','+r.length"),
+        "false,3"
+    );
+    // Array.prototype.flat/flatMap skip holes (FlattenIntoArray uses HasProperty).
+    assert_eq!(run("[1,[2,,3]].flat().join(',')"), "1,2,3");
+    assert_eq!(run("var r=[1,,2].flat();r.length+','+r.join(',')"), "2,1,2");
+    assert_eq!(run("[1,2,3].flatMap(x=>x===2?[]:[x]).join(',')"), "1,3");
+    // Object.keys unaffected (already hole-aware).
+    assert_eq!(run("JSON.stringify(Object.keys([2,,3]))"), r#"["0","2"]"#);
+}

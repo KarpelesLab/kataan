@@ -1867,15 +1867,12 @@ impl<'a> Interp<'a> {
                 // itself walks its chain, possibly through further proxies).
                 return self.has_property_proxied(target, key);
             }
-            // An own data/accessor property, or an in-range array index / `length`.
-            let here = if let Some(len) = self.realm.array_length(c) {
-                key == "length"
-                    || key.parse::<usize>().is_ok_and(|i| i < len)
-                    || self.realm.has_own(c, key)
-                    || self.realm.accessor(c, key).is_some()
-            } else {
-                self.realm.has_own(c, key) || self.realm.accessor(c, key).is_some()
-            };
+            // An own data/accessor property. `has_own` is hole-aware for arrays —
+            // it reports `length` and every in-range **non-hole** index (a hole is
+            // absent), so a bare `i < len` must NOT be used here or `[2,,3]` would
+            // report index 1 (a hole) as present in `in` / `HasProperty` and in the
+            // generic array-like iteration that probes presence with this.
+            let here = self.realm.has_own(c, key) || self.realm.accessor(c, key).is_some();
             if here {
                 return Ok(true);
             }

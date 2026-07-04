@@ -723,6 +723,11 @@ impl<'a> Interp<'a> {
         }
         let mut out = Vec::new();
         for e in elems {
+            // FlattenIntoArray only processes *present* elements: a hole
+            // (`HasProperty` false) is skipped, so the flattened result is dense.
+            if e.is_hole() {
+                continue;
+            }
             if depth > 0
                 && let Some(inner) = e
                     .as_handle()
