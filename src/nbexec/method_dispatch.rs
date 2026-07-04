@@ -2293,7 +2293,36 @@ impl<'a> Interp<'a> {
                     // ToString(that) — unwraps a String wrapper and runs a user
                     // toString (abrupt-propagating), rather than the raw display form.
                     let other = self.coerce_to_string(arg(0))?;
-                    let cmp = match s.as_str().cmp(other.as_str()) {
+                    // With an `options` argument, honor `numeric`/`sensitivity` via the
+                    // UCA collator (so `"10".localeCompare("9",u,{numeric:true}) > 0`);
+                    // the no-options default stays plain code-point order.
+                    #[cfg(feature = "intl")]
+                    let ord = if let Some(opts) = arg(2).as_handle().map(Handle::from_raw) {
+                        use intl::unicode::collate::{AlternateHandling, Collator, Strength};
+                        let strength = match self
+                            .realm
+                            .get_property(opts, "sensitivity")
+                            .map(|v| self.realm.to_display_string(v))
+                            .as_deref()
+                        {
+                            Some("base") => Strength::Primary,
+                            Some("accent") => Strength::Secondary,
+                            _ => Strength::Tertiary,
+                        };
+                        let numeric = matches!(
+                            self.realm.get_property(opts, "numeric").map(|v| v.unpack()),
+                            Some(Unpacked::Bool(true))
+                        );
+                        Collator::new(AlternateHandling::Shifted)
+                            .with_strength(strength)
+                            .with_numeric(numeric)
+                            .compare(&s, &other)
+                    } else {
+                        s.as_str().cmp(other.as_str())
+                    };
+                    #[cfg(not(feature = "intl"))]
+                    let ord = s.as_str().cmp(other.as_str());
+                    let cmp = match ord {
                         core::cmp::Ordering::Less => -1.0,
                         core::cmp::Ordering::Equal => 0.0,
                         core::cmp::Ordering::Greater => 1.0,
