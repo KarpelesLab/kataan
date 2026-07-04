@@ -14,8 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hidden `[[PromiseState]]` cell that `promise_state` follows, so construction,
   the static combinators (`P.resolve`/`all`/`race`/`allSettled`/…), `then`/`catch`,
   `await`, and microtask delivery all work on a subclass instance (a non-callable
-  executor is a TypeError). Species-based `.then` chaining is still pending
-  (ROADMAP §3.6 Promise).
+  executor is a TypeError).
+- *(promise)* `Promise[Symbol.species]` — Promise now carries the shared species
+  getter (returns `this`), so `Promise[Symbol.species] === Promise`, a subclass
+  inherits it (`class P extends Promise {}` → `P[Symbol.species] === P`), and
+  `then`/`catch` produce subclass instances via SpeciesConstructor (an explicit
+  `@@species` override is still honored) (ROADMAP §3.6 Promise).
 
 ### Fixed
 

@@ -3752,6 +3752,11 @@ impl<'a> Interp<'a> {
         // (the receiver constructor). `{ get, set: undefined, enumerable: false,
         // configurable: true }` per ECMA-262 23.1.2.5.
         self.install_ctor_species("Array");
+        // `get Promise[Symbol.species]` → `this`, so `Promise[Symbol.species]` is
+        // `Promise` and a subclass inherits it (`class P extends Promise {}` →
+        // `P[Symbol.species] === P`), which is what `then`/combinators use as the
+        // dependent-promise constructor (SpeciesConstructor).
+        self.install_ctor_species("Promise");
         self.install_proto_to_string_tag("WeakMap", "WeakMap");
         self.install_proto_to_string_tag("WeakSet", "WeakSet");
         self.install_proto_to_string_tag("Promise", "Promise");

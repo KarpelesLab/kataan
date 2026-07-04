@@ -6230,3 +6230,39 @@ fn promise_subclass_async_delivery() {
         "all:1,2\n"
     );
 }
+
+#[test]
+fn promise_symbol_species() {
+    // Promise carries `get [Symbol.species]` (returns `this`), so a subclass
+    // inherits it and `then`/`catch` produce subclass instances via
+    // SpeciesConstructor.
+    assert_eq!(run("Promise[Symbol.species]===Promise"), "true");
+    assert_eq!(
+        run("class P extends Promise{};P[Symbol.species]===P"),
+        "true"
+    );
+    assert_eq!(
+        run("class P extends Promise{};P.resolve(1).then(x=>x) instanceof P"),
+        "true"
+    );
+    assert_eq!(
+        run("class P extends Promise{};P.reject(1).catch(x=>x) instanceof P"),
+        "true"
+    );
+    // An explicit `@@species` override is honored.
+    assert_eq!(
+        run(
+            "class P extends Promise{static get [Symbol.species](){return Promise}};\
+             var r=P.resolve(1).then(x=>x);(r instanceof Promise)+','+(r instanceof P)"
+        ),
+        "true,false"
+    );
+    // The accessor shape: { get, set: undefined, enumerable: false, configurable: true }.
+    assert_eq!(
+        run(
+            "var d=Object.getOwnPropertyDescriptor(Promise,Symbol.species);\
+             (typeof d.get)+','+(d.set===undefined)+','+d.enumerable+','+d.configurable"
+        ),
+        "function,true,false,true"
+    );
+}
