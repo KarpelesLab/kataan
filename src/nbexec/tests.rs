@@ -6726,3 +6726,36 @@ fn error_subclass_constructor_is_the_subclass() {
         "true"
     );
 }
+
+#[test]
+fn weakref_and_finalization_registry_subclassing() {
+    // `class W extends WeakRef {}`: super() validates + stamps the target, and
+    // W.prototype links to WeakRef.prototype (so deref / brand / @@toStringTag work).
+    assert_eq!(
+        run(
+            "class W extends WeakRef{}var o={};var w=new W(o);(w instanceof W)+','+(w instanceof WeakRef)+','+(w.deref()===o)"
+        ),
+        "true,true,true"
+    );
+    assert_eq!(
+        run("class W extends WeakRef{}try{new W(5);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("class W extends WeakRef{}Object.prototype.toString.call(new W({}))"),
+        "[object WeakRef]"
+    );
+    // FinalizationRegistry subclassing: super() validates the callback + brands.
+    assert_eq!(
+        run(
+            "class F extends FinalizationRegistry{}var f=new F(()=>{});var o={},t={};f.register(o,5,t);f.unregister(t);(f instanceof F)+','+(f instanceof FinalizationRegistry)"
+        ),
+        "true,true"
+    );
+    assert_eq!(
+        run("class F extends FinalizationRegistry{}try{new F(5);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    // Direct construction unaffected.
+    assert_eq!(run("var o={};new WeakRef(o).deref()===o"), "true");
+}

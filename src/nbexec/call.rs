@@ -2681,6 +2681,40 @@ impl<'a> Interp<'a> {
             self.init_shadow_realm_super(instance);
             return Ok(());
         }
+        // `class W extends WeakRef {}`: `super(target)` validates the (weakly
+        // holdable) target and stamps the internal slot onto the (class-proto-
+        // linked) instance, so `deref()` and the brand check resolve.
+        if native_id == N_WEAKREF {
+            let target = args.first().copied().unwrap_or(NanBox::undefined());
+            if !self.can_be_held_weakly(target) {
+                return Err(
+                    self.type_error("WeakRef: target must be an object or a non-registered symbol")
+                );
+            }
+            self.realm
+                .set_hidden_property(instance, WEAKREF_TARGET, target);
+            return Ok(());
+        }
+        // `class F extends FinalizationRegistry {}`: `super(cleanupCallback)`
+        // validates the callback and brands the instance with an empty cell list.
+        if native_id == N_FINALIZATION_REGISTRY {
+            let cb = args.first().copied().unwrap_or(NanBox::undefined());
+            if !cb
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|h| self.is_callable(h))
+            {
+                return Err(
+                    self.type_error("FinalizationRegistry: cleanup callback must be callable")
+                );
+            }
+            self.realm
+                .set_hidden_property(instance, FINREG_TAG, NanBox::boolean(true));
+            let cells = self.realm.new_array(Vec::new());
+            self.realm
+                .set_hidden_property(instance, FINREG_CELLS, NanBox::handle(cells.to_raw()));
+            return Ok(());
+        }
         // `class S extends SuppressedError {}`: apply error/suppressed/message.
         if native_id == N_SUPPRESSED_ERROR {
             self.init_suppressed_error_super(instance, args);

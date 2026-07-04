@@ -743,6 +743,8 @@ impl<'a> Interp<'a> {
             "Set",
             "WeakMap",
             "WeakSet",
+            "WeakRef",
+            "FinalizationRegistry",
             "Date",
             "RegExp",
             "Number",
