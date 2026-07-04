@@ -1549,6 +1549,27 @@ impl Realm {
     /// All own string property names (including non-enumerable ones such as
     /// methods, but not private `#` fields) — for `Object.getOwnPropertyNames`.
     pub fn own_property_names(&self, handle: Handle) -> Option<Vec<alloc::string::String>> {
+        // A **String exotic object**'s `[[OwnPropertyKeys]]`: the index keys
+        // `"0".."length-1"` (ascending), then `"length"`, then any wrapper named
+        // own properties (a `defineProperty` on a `new String(...)`).
+        if let Some(slen) = self.string_object_len(handle) {
+            let mut names: Vec<alloc::string::String> =
+                (0..slen).map(|i| alloc::format!("{i}")).collect();
+            names.push(alloc::string::String::from("length"));
+            if let Some(obj) = self.heap.get(handle).and_then(Cell::as_object) {
+                for k in obj.ordered_keys() {
+                    if k.starts_with('#')
+                        || k.starts_with('\u{0}')
+                        || k == "length"
+                        || k.parse::<usize>().is_ok_and(|i| i < slen)
+                    {
+                        continue;
+                    }
+                    names.push(alloc::string::String::from(k));
+                }
+            }
+            return Some(names);
+        }
         if let Some(obj) = self.heap.get(handle)?.as_object() {
             // `[[OwnPropertyKeys]]` order: integer indices ascending, then the rest in
             // insertion order (so `getOwnPropertyNames`/`Reflect.ownKeys` match `keys`).

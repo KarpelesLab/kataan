@@ -62,6 +62,34 @@ impl<'a> Interp<'a> {
     /// Builds the property descriptor object for own property `key` of `obj`
     /// (accessor or data), or `None` if `key` is not an own property.
     pub(crate) fn build_descriptor(&mut self, obj: Handle, key: &str) -> Option<NanBox> {
+        // A **String exotic object**'s own index / `length` (StringGetOwnProperty):
+        // an index `"0".."length-1"` is `{ value: char, writable: false,
+        // enumerable: true, configurable: false }`; `length` is
+        // `{ value: len, writable: false, enumerable: false, configurable: false }`.
+        // A wrapper's named own props fall through to the generic path below.
+        if let Some(slen) = self.string_index_count(obj) {
+            let build = |this: &mut Self, value: NanBox, enumerable: bool| {
+                let d = this.realm.new_object();
+                this.realm.set_property(d, "value", value);
+                this.realm
+                    .set_property(d, "writable", NanBox::boolean(false));
+                this.realm
+                    .set_property(d, "enumerable", NanBox::boolean(enumerable));
+                this.realm
+                    .set_property(d, "configurable", NanBox::boolean(false));
+                NanBox::handle(d.to_raw())
+            };
+            if key == "length" {
+                return Some(build(self, NanBox::number(slen as f64), false));
+            }
+            if let Ok(i) = key.parse::<usize>()
+                && alloc::format!("{i}") == key
+                && i < slen
+            {
+                let ch = self.read_member(obj, key).ok()?;
+                return Some(build(self, ch, true));
+            }
+        }
         // An array index / `length` is a data property (not stored as a named slot):
         // an in-range index is writable, enumerable, configurable; `length` is
         // writable but non-enumerable and non-configurable.

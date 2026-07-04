@@ -6633,3 +6633,42 @@ fn string_exotic_property_is_enumerable() {
     );
     assert_eq!(run("({a:1}).propertyIsEnumerable('a')"), "true");
 }
+
+#[test]
+fn string_exotic_descriptors_and_own_names() {
+    // getOwnPropertyDescriptor gives the spec String descriptor; getOwnPropertyNames
+    // lists indices then length.
+    assert_eq!(
+        run("JSON.stringify(Object.getOwnPropertyDescriptor('abc',0))"),
+        r#"{"value":"a","writable":false,"enumerable":true,"configurable":false}"#
+    );
+    assert_eq!(
+        run("JSON.stringify(Object.getOwnPropertyDescriptor('abc','length'))"),
+        r#"{"value":3,"writable":false,"enumerable":false,"configurable":false}"#
+    );
+    assert_eq!(run("Object.getOwnPropertyDescriptor('abc',5)"), "undefined");
+    assert_eq!(
+        run("JSON.stringify(Object.getOwnPropertyNames('abc'))"),
+        r#"["0","1","2","length"]"#
+    );
+    assert_eq!(
+        run("JSON.stringify(Object.getOwnPropertyNames(new String('ab')))"),
+        r#"["0","1","length"]"#
+    );
+    // A wrapper's named own props come after the exotic keys.
+    assert_eq!(
+        run(
+            "var s=new String('x');Object.defineProperty(s,'foo',{value:1});JSON.stringify(Object.getOwnPropertyNames(s))"
+        ),
+        r#"["0","length","foo"]"#
+    );
+    // Arrays and plain objects unaffected.
+    assert_eq!(
+        run("JSON.stringify(Object.getOwnPropertyNames([1,2]))"),
+        r#"["0","1","length"]"#
+    );
+    assert_eq!(
+        run("JSON.stringify(Object.getOwnPropertyNames({a:1,b:2}))"),
+        r#"["a","b"]"#
+    );
+}
