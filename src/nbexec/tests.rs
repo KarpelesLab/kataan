@@ -7619,21 +7619,22 @@ fn intl_display_names_of_fallback() {
 fn array_from_async_subclass_uses_dense_storage() {
     // `C.fromAsync(...)` (subclass constructor `this`) must CreateDataPropertyOrThrow
     // each element into the dense store, like C.from — a raw set_property stashed
-    // them as named props that join/reduce missed.
+    // them as named props that join/reduce missed. (Observed after the microtask
+    // drain via console.log, since fromAsync returns a promise.)
     assert_eq!(
-        run(
-            "var r;(async()=>{class A extends Array{}var a=await Array.fromAsync.call(A,[1,2,3]);r=(a instanceof A)+','+a.join(',')+','+a.reduce((x,y)=>x+y,0)})();r"
+        out(
+            "class A extends Array{}Array.fromAsync.call(A,[1,2,3]).then(a=>console.log((a instanceof A)+','+a.join(',')+','+a.reduce((x,y)=>x+y,0)))"
         ),
-        "true,1,2,3,6"
+        "true,1,2,3,6\n"
     );
     assert_eq!(
-        run(
-            "var r;(async()=>{class A extends Array{}var a=await Array.fromAsync.call(A,[1,2],x=>x*10);r=a.join(',')})();r"
+        out(
+            "class A extends Array{}Array.fromAsync.call(A,[1,2],x=>x*10).then(a=>console.log(a.join(',')))"
         ),
-        "10,20"
+        "10,20\n"
     );
     assert_eq!(
-        run("var r;(async()=>{r=(await Array.fromAsync([1,2,3])).join(',')})();r"),
-        "1,2,3"
+        out("Array.fromAsync([1,2,3]).then(a=>console.log(a.join(',')))"),
+        "1,2,3\n"
     );
 }
