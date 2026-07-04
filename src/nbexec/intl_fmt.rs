@@ -166,6 +166,26 @@ fn numbering_system_name_from_zero(c: char) -> Option<&'static str> {
     })
 }
 
+/// `WeekdayToString` for `Intl.Locale`'s `firstDayOfWeek`: a weekday name
+/// (`mon`…`sun`) or the 1–7 numeric form (1 = Monday) maps to the canonical name;
+/// anything else is invalid.
+fn weekday_to_string(s: &str) -> Option<String> {
+    Some(String::from(match s {
+        "1" => "mon",
+        "2" => "tue",
+        "3" => "wed",
+        "4" => "thu",
+        "5" => "fri",
+        "6" => "sat",
+        // Both 0 and 7 canonicalize to Sunday.
+        "0" | "7" => "sun",
+        // A non-numeric value is used verbatim if it is a valid `-u-fw` type
+        // sequence (weekday names plus experimental calendars like `primidi`).
+        other if is_unicode_type_value(other) => return Some(String::from(other)),
+        _ => return None,
+    }))
+}
+
 /// Whether `s` matches the UTS-35 `type` value production: one or more
 /// `alphanum{3,8}` subtags joined by `-` (used for `ca`/`nu` option validation).
 fn is_unicode_type_value(s: &str) -> bool {
@@ -608,6 +628,7 @@ const LOCALE_ACCESSORS: &[&str] = &[
     "calendar",
     "caseFirst",
     "collation",
+    "firstDayOfWeek",
     "hourCycle",
     "language",
     "numberingSystem",
@@ -3769,6 +3790,18 @@ impl<'a> Interp<'a> {
             self.get_string_option(opts, "caseFirst", &["upper", "lower", "false"], None)?;
         let numeric = self.get_bool_option(opts, "numeric", None)?;
         let numbering = self.get_string_option(opts, "numberingSystem", &[], None)?;
+        // `firstDayOfWeek` (ES2024): a weekday name (mon…sun) or 1–7 (1=Monday),
+        // resolved via WeekdayToString and applied as the `-u-fw` keyword.
+        let first_day = self.get_string_option(opts, "firstDayOfWeek", &[], None)?;
+        let first_day = if let Some(fd) = &first_day {
+            let Some(w) = weekday_to_string(fd) else {
+                let m = self.new_str("invalid firstDayOfWeek");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            };
+            Some(w)
+        } else {
+            None
+        };
         // language/script/region subtags each have a fixed shape (UTS-35): a
         // language is alpha{2,3} or alpha{5,8}; a script is alpha{4}; a region is
         // alpha{2} or digit{3}. A malformed value is a RangeError.
@@ -3856,6 +3889,9 @@ impl<'a> Interp<'a> {
         if let Some(n) = &numbering {
             parsed.set_keyword("nu", n);
         }
+        if let Some(fw) = &first_day {
+            parsed.set_keyword("fw", fw);
+        }
         let final_tag = parsed.to_tag();
         let obj = self.realm.new_object();
         let tagv = self.new_str(&final_tag);
@@ -3876,6 +3912,7 @@ impl<'a> Interp<'a> {
         store(self, "\u{0}loc_hc", parsed.keyword("hc"));
         store(self, "\u{0}loc_kf", parsed.keyword("kf"));
         store(self, "\u{0}loc_nu", parsed.keyword("nu"));
+        store(self, "\u{0}loc_fw", parsed.keyword("fw"));
         // `numeric` is the boolean form of the `kn` keyword.
         let kn = parsed.keyword("kn");
         let numeric_val = matches!(kn, Some("true") | Some(""));
@@ -3914,6 +3951,7 @@ impl<'a> Interp<'a> {
             "caseFirst" => read(self, "\u{0}loc_kf"),
             "numberingSystem" => read(self, "\u{0}loc_nu"),
             "numeric" => read(self, "\u{0}loc_numeric"),
+            "firstDayOfWeek" => read(self, "\u{0}loc_fw"),
             _ => NanBox::undefined(),
         })
     }
