@@ -1406,8 +1406,8 @@ impl Realm {
 
     /// The shared promise state at `handle`, if it is a promise — or a **Promise
     /// subclass** instance (`class P extends Promise`), whose backing
-    /// `Cell::Promise` is stored in the hidden [`PROMISE_STATE_SLOT`] so every
-    /// promise operation (then/resolve/reject/combinators/microtasks) works on it.
+    /// `Cell::Promise` is stored in a hidden internal slot so every promise
+    /// operation (then/resolve/reject/combinators/microtasks) works on it.
     #[must_use]
     pub fn promise_state(
         &self,
