@@ -7005,3 +7005,40 @@ fn static_private_not_inherited_by_subclass() {
         "TypeError"
     );
 }
+
+#[test]
+fn class_name_inner_binding_is_const() {
+    // The class name is an immutable inner binding: reassigning it inside the
+    // class body is a TypeError (both class expressions and declarations).
+    assert_eq!(
+        run(
+            "var C=class Foo{m(){try{Foo=1;return 'assigned'}catch(e){return e.constructor.name}}};new C().m()"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "class Bar{m(){try{Bar=1;return 'assigned'}catch(e){return e.constructor.name}}}new Bar().m()"
+        ),
+        "TypeError"
+    );
+    // A static initializer sees the same immutable binding.
+    assert_eq!(
+        run(
+            "class Q{static x=(()=>{try{Q=1;return 'assigned'}catch(e){return e.constructor.name}})()}Q.x"
+        ),
+        "TypeError"
+    );
+    // The class name is still readable, and the OUTER declaration binding stays mutable.
+    assert_eq!(run("class Baz{m(){return Baz.name}}new Baz().m()"), "Baz");
+    assert_eq!(run("class D{};D=5;D"), "5");
+    // Self-reference (recursion) still works.
+    assert_eq!(
+        run("class F{static go(n){return n<=0?0:1+F.go(n-1)}}F.go(3)"),
+        "3"
+    );
+    assert_eq!(
+        run("var f=class Rec{go(n){return n<=0?'done':this.go(n-1)}};new f().go(2)"),
+        "done"
+    );
+}

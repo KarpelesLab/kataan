@@ -416,10 +416,11 @@ impl<'a> Interp<'a> {
             }
         }
         // Bind the class's own name in its methods' scope (a named class
-        // expression sees itself; the binding is read-only in spec but not
-        // enforced here).
+        // expression sees itself). The inner binding is an immutable `const`, so
+        // reassigning it inside the class body (`class C { m() { C = 1; } }`) is a
+        // TypeError (the outer declaration binding, if any, stays mutable).
         if let Some(id) = &class.id {
-            class_env.declare(&id.name, class_val);
+            class_env.declare_const(&id.name, class_val);
         }
         // Run static initialization — `static field = …` initializers and
         // `static { … }` blocks — in source order, *after* the constructor object
@@ -433,7 +434,9 @@ impl<'a> Interp<'a> {
         if has_static_init {
             let scope = self.current.child();
             if let Some(id) = &class.id {
-                scope.declare(&id.name, class_val);
+                // The class-name binding a static initializer/block sees is the
+                // same immutable inner `const`.
+                scope.declare_const(&id.name, class_val);
             }
             let saved = core::mem::replace(&mut self.current, scope);
             let saved_this = core::mem::replace(&mut self.this_val, class_val);
