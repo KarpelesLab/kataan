@@ -2491,10 +2491,38 @@ impl Realm {
         )
     }
 
+    /// The UTF-16 length of a String object — a `Cell::Str` primitive, or a
+    /// String **wrapper** boxing one under the internal `\0prim` (PRIM_WRAP)
+    /// slot — or `None` if `handle` is not a String object. Used to recognize a
+    /// String exotic object's own `length` and index (`"0".."length-1"`)
+    /// properties.
+    fn string_object_len(&self, handle: Handle) -> Option<usize> {
+        let sh = match self.get_property(handle, "\u{0}prim") {
+            Some(prim) => Handle::from_raw(prim.as_handle()?),
+            None => handle,
+        };
+        Some(crate::wtf8::utf16_len(&self.string_bytes(sh)?))
+    }
+
     /// Whether the object at `handle` has an own property `key` (including
     /// accessors) — the `in` operator.
     #[must_use]
     pub fn has_own(&self, handle: Handle, key: &str) -> bool {
+        // A **String exotic object** (a String primitive or wrapper) has own
+        // `length` and index (`"0".."length-1"`) properties (StringGetOwnProperty),
+        // so `"abc".hasOwnProperty(0)` / `0 in new String("abc")` are true. A
+        // wrapper may also carry named own props, so fall through on a miss.
+        if let Some(slen) = self.string_object_len(handle) {
+            if key == "length" {
+                return true;
+            }
+            if let Ok(i) = key.parse::<usize>()
+                && alloc::format!("{i}") == key
+                && i < slen
+            {
+                return true;
+            }
+        }
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
             return o.contains(key) || o.accessor(key).is_some();
         }

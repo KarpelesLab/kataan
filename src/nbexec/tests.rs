@@ -6583,3 +6583,27 @@ fn bigint_primitive_prototype_chain() {
     );
     assert_eq!(run("(255n).toString(16)"), "ff");
 }
+
+#[test]
+fn string_exotic_own_index_and_length() {
+    // A String object (primitive or wrapper) has own `length` and index
+    // "0".."length-1" properties (StringGetOwnProperty), so hasOwnProperty / `in`
+    // recognize them.
+    assert_eq!(run("'abc'.hasOwnProperty(0)"), "true");
+    assert_eq!(run("'abc'.hasOwnProperty('2')"), "true");
+    assert_eq!(run("'abc'.hasOwnProperty('length')"), "true");
+    assert_eq!(run("'abc'.hasOwnProperty(5)"), "false");
+    assert_eq!(run("new String('abc').hasOwnProperty(1)"), "true");
+    assert_eq!(run("var s=new String('ab');0 in s"), "true");
+    assert_eq!(run("2 in 'ab'"), "false");
+    // A Number wrapper is not a String; arrays and plain objects unaffected.
+    assert_eq!(run("new Number(5).hasOwnProperty(0)"), "false");
+    assert_eq!(
+        run("[1,2,3].hasOwnProperty(1)+','+[1,,3].hasOwnProperty(1)"),
+        "true,false"
+    );
+    assert_eq!(
+        run("({a:1}).hasOwnProperty('a')+','+({a:1}).hasOwnProperty('b')"),
+        "true,false"
+    );
+}
