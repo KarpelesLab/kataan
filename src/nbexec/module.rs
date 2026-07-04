@@ -769,9 +769,28 @@ impl<'a> Interp<'a> {
         let Some(record) = self.modules.records.get(key) else {
             return Err(self.syntax_error(&alloc::format!("module not loaded: {key}")));
         };
-        // 1. A local export.
-        if let Some(local) = record.local_exports.get(name) {
-            return Ok((record.scope.clone(), local.clone()));
+        // 1. A local export. But if the exported local name is itself an *imported*
+        //    binding (`import { x } from m; export { x }` — or a default/renamed
+        //    import re-exported), it has no real slot in this module's scope; follow
+        //    the import to its source instead. (A namespace import re-exported IS a
+        //    real const slot, so it falls through to the scope.)
+        if let Some(local) = record.local_exports.get(name).cloned() {
+            let via_import = record.imports.iter().find_map(|imp| {
+                imp.specifiers.iter().find_map(|spec| match spec {
+                    ImportBind::Named { imported, local: l } if *l == local => {
+                        Some((imp.key.clone(), imported.clone()))
+                    }
+                    ImportBind::Default(l) if *l == local => {
+                        Some((imp.key.clone(), "default".to_string()))
+                    }
+                    _ => None,
+                })
+            });
+            let own_scope = record.scope.clone();
+            if let Some((dep, imported)) = via_import {
+                return self.resolve_export(&dep, &imported, seen);
+            }
+            return Ok((own_scope, local));
         }
         // 2. A direct re-export `export { local as name } from "m"`.
         let named: Vec<(String, String)> = record
