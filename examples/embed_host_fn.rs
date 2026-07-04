@@ -5,8 +5,9 @@
 //!
 //! Shows the `register_fn` surface end to end: building values, reading
 //! arguments and `this`, throwing a catchable JS error, re-entering JS by
-//! calling a script-supplied callback or `construct`ing a class, and
-//! introspecting values (`type_of`/`is_array`/`array_get`/`own_keys`).
+//! calling a script-supplied callback or `construct`ing a class, introspecting
+//! values (`type_of`/`is_array`/`array_get`/`own_keys`), and attaching opaque
+//! Rust state to a JS object with `set_native_state`/`native_state` (napi_wrap).
 
 use kataan::parser::Parser;
 use kataan::{Ctx, Interp, NanBox};
@@ -79,6 +80,21 @@ fn main() {
         cx.get(p, "x")
     });
 
+    // 6. napi_wrap-style native state: `makeCounter()` returns a JS object with an
+    // opaque Rust `u32` attached; `bump(c)` reads and increments it. (The state is
+    // dropped as a finalizer when the object is GC'd.)
+    interp.register_global_fn("makeCounter", 0, |cx: &mut Ctx, _this, _args| {
+        let o = cx.new_object();
+        cx.set_native_state(o, 0u32);
+        Ok(o)
+    });
+    interp.register_global_fn("bump", 1, |cx: &mut Ctx, _this, args| {
+        let o = args.first().copied().unwrap_or(cx.undefined());
+        let next = cx.native_state::<u32>(o).copied().unwrap_or(0) + 1;
+        cx.set_native_state(o, next);
+        Ok(cx.number(f64::from(next)))
+    });
+
     let src = r#"
         var out = [];
         out.push("hypot(3,4) = " + hypot(3, 4));
@@ -90,6 +106,8 @@ fn main() {
         out.push("describe('hi') = " + describe("hi"));
         class Point { constructor(x, y) { this.x = x; this.y = y; } }
         out.push("originOf(Point) = " + originOf(Point));
+        var c = makeCounter();
+        out.push("counter = " + bump(c) + "," + bump(c) + "," + bump(c));
         out.join("\n");
     "#;
 
