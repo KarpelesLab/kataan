@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   array-like iteration, so `[...new Proxy([1,2,3],{})]`, `Array.from(proxy)`,
   and `Array.prototype.*.call(proxy, …)` observe the proxied elements instead
   of reading holes (ROADMAP §3.7).
+- *(proxy)* object spread (`{...proxy}`, CopyDataProperties) enumerates a proxy
+  source through its `ownKeys`/`getOwnPropertyDescriptor`/`get` traps (strings
+  and symbols, enumerable only) instead of copying nothing (ROADMAP §3.7).
 
 ## [0.0.6](https://github.com/KarpelesLab/kataan/compare/v0.0.5...v0.0.6) - 2026-07-04
 

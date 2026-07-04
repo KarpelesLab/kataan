@@ -1534,6 +1534,31 @@ impl<'a> Interp<'a> {
                     let cv = self.new_str(&alloc::string::String::from(c));
                     self.realm.set_property(target, &alloc::format!("{i}"), cv);
                 }
+            } else if self.realm.proxy_at(sh).is_some() {
+                // A **proxy** source runs full CopyDataProperties through the
+                // proxy protocol (like `Object.assign`): `[[OwnPropertyKeys]]`
+                // via the `ownKeys` trap, each key's `[[GetOwnProperty]]` for the
+                // enumerable flag, then `[[Get]]` (so a `get` trap fires). The
+                // plain `object_keys_with_symbols` path below reads the proxy
+                // *cell's* keys (none), which is why spread otherwise saw `{}`.
+                let keys = self.own_property_keys_values(sh)?;
+                for key in keys {
+                    let name = self.member_key(key);
+                    let desc = self.descriptor_of(sh, &name)?;
+                    if matches!(desc.unpack(), Unpacked::Undefined) {
+                        continue;
+                    }
+                    let enumerable = desc
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                        .is_some_and(|v| self.realm.truthy(v));
+                    if !enumerable {
+                        continue;
+                    }
+                    let pv = self.read_member(sh, &name)?;
+                    self.realm.set_property(target, &name, pv);
+                }
             } else {
                 let keys = self.realm.object_keys_with_symbols(sh);
                 for key in keys {

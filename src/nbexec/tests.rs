@@ -5654,3 +5654,31 @@ fn proxy_of_array_generic_methods() {
         "1"
     );
 }
+
+#[test]
+fn proxy_object_spread_copies_own_enumerable() {
+    // `{...proxy}` (CopyDataProperties) must enumerate the proxy's own keys
+    // through the ownKeys/getOwnPropertyDescriptor/get protocol.
+    assert_eq!(
+        run("JSON.stringify({...new Proxy({a:1,b:2},{})})"),
+        r#"{"a":1,"b":2}"#
+    );
+    // A proxy over an array spreads its indices (length is non-enumerable).
+    assert_eq!(
+        run("JSON.stringify({...new Proxy([1,2,3],{})})"),
+        r#"{"0":1,"1":2,"2":3}"#
+    );
+    // Non-enumerable own properties are skipped; the get trap fires per key.
+    assert_eq!(
+        run(
+            "var b={};Object.defineProperty(b,'h',{value:9,enumerable:false});b.x=1;\
+             JSON.stringify({...new Proxy(b,{})})"
+        ),
+        r#"{"x":1}"#
+    );
+    // Symbol keys are copied too.
+    assert_eq!(
+        run("var s=Symbol();var o={[s]:42,a:1};var out={...new Proxy(o,{})};out[s]+','+out.a"),
+        "42,1"
+    );
+}
