@@ -2470,12 +2470,22 @@ impl<'a> Interp<'a> {
                     }
                     src = Some(elems);
                 } else {
+                    // `len = ? LengthOfArrayLike(O)` = ToLength(Get(O, "length")):
+                    // ToIntegerOrInfinity (a Symbol length is a TypeError; a
+                    // throwing `valueOf` propagates), then a NaN / negative / absent
+                    // `length` clamps to **0** (so `new Uint8Array({})` is an empty
+                    // array, not a RangeError). A length beyond the allocatable cap
+                    // is a RangeError.
                     let len_val = self.read_member(h, "length")?;
-                    // ToLength: ToNumber (fallible — a Symbol length is a TypeError),
-                    // then validate it as an allocatable length.
-                    let len_num = self.coerce_to_number(len_val)?;
-                    let raw = self.realm.to_number(len_num);
-                    let len = self.validate_alloc_len(raw, "Invalid typed array length")?;
+                    let len_f = self.coerce_to_integer_or_infinity(len_val)?;
+                    let len = if len_f <= 0.0 {
+                        0
+                    } else if len_f > self.realm.limits.max_array_len as f64 {
+                        let m = self.new_str("Invalid typed array length");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    } else {
+                        len_f as usize
+                    };
                     let bigint = is_bigint_kind(kind);
                     let mut elems = Vec::with_capacity(len);
                     for i in 0..len {

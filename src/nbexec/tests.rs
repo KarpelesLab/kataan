@@ -6537,3 +6537,31 @@ fn to_spliced_args_use_tointegerorinfinity() {
         r#"[1,"x",3,4]"#
     );
 }
+
+#[test]
+fn typed_array_from_array_like_uses_tolength() {
+    // `new TypedArray(object)` with no @@iterator reads ToLength(Get(O,"length")):
+    // an absent/NaN/negative length clamps to 0 (empty), not a RangeError.
+    assert_eq!(run("new Uint8Array({}).length"), "0");
+    assert_eq!(run("new Uint8Array({valueOf:()=>3}).length"), "0");
+    assert_eq!(run("new Uint8Array({length:-1}).length"), "0");
+    assert_eq!(run("new Uint8Array({length:NaN}).length"), "0");
+    assert_eq!(
+        run("Array.from(new Uint8Array({length:3,0:9})).join(',')"),
+        "9,0,0"
+    );
+    assert_eq!(
+        run("Array.from(new Uint8Array({length:{valueOf:()=>2},0:1,1:2})).join(',')"),
+        "1,2"
+    );
+    // A Symbol length is a TypeError; the numeric-length path still RangeErrors.
+    assert_eq!(
+        run("try{new Uint8Array({length:Symbol()});'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(run("new Uint8Array(3).length"), "3");
+    assert_eq!(
+        run("try{new Uint8Array(-1);'no'}catch(e){e.constructor.name}"),
+        "RangeError"
+    );
+}
