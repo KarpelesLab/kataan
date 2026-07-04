@@ -2895,8 +2895,13 @@ impl<'a> Interp<'a> {
                 }
                 "splice" => {
                     let len = elems.len();
+                    // `relativeStart = ToIntegerOrInfinity(start)` then
+                    // `ToIntegerOrInfinity(deleteCount)` — object args coerce via
+                    // `valueOf`/`@@toPrimitive` (not the string form), and a throwing
+                    // coercion propagates. `f64 as usize` saturates so `Infinity`
+                    // clamps to the length.
                     let start = {
-                        let s = self.realm.to_number(arg(0));
+                        let s = self.coerce_to_integer_or_infinity(arg(0))?;
                         if s < 0.0 {
                             (len as f64 + s).max(0.0) as usize
                         } else {
@@ -2906,7 +2911,8 @@ impl<'a> Interp<'a> {
                     let delete = if args.len() < 2 {
                         len - start
                     } else {
-                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(len - start)
+                        (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize)
+                            .min(len - start)
                     };
                     let removed: Vec<NanBox> = elems[start..start + delete].to_vec();
                     // The removed array is `ArraySpeciesCreate(O, deleteCount)`

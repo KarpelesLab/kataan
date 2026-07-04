@@ -6429,3 +6429,36 @@ fn copy_within_precise_for_hole_accessor_arrays() {
         "[1,2,3,3,4]"
     );
 }
+
+#[test]
+fn splice_coerces_args_with_tointegerorinfinity() {
+    // splice's start/deleteCount are ToIntegerOrInfinity (valueOf, not toString);
+    // a throwing coercion propagates; Infinity clamps to the length.
+    assert_eq!(
+        run(
+            "var x=[0,1,2,3];var a=x.splice(0,{valueOf:()=>3,toString:()=>0});a.length+'|'+JSON.stringify(a)"
+        ),
+        "3|[0,1,2]"
+    );
+    assert_eq!(
+        run("var x=[0,1,2,3];x.splice({valueOf:()=>1},2);JSON.stringify(x)"),
+        "[0,3]"
+    );
+    assert_eq!(
+        run("var x=[1,2,3];try{x.splice({valueOf:()=>{throw 'e'}},1);'no'}catch(e){e}"),
+        "e"
+    );
+    assert_eq!(
+        run("var x=[1,2,3,4];x.splice(1,Infinity);JSON.stringify(x)"),
+        "[1]"
+    );
+    // Ordinary splice unaffected.
+    assert_eq!(
+        run("var a=[1,2,3,4,5];a.splice(1,2,'a','b','c');JSON.stringify(a)"),
+        r#"[1,"a","b","c",4,5]"#
+    );
+    assert_eq!(
+        run("var a=[1,2,3,4,5];JSON.stringify(a.splice(-2,1))"),
+        "[4]"
+    );
+}
