@@ -1352,7 +1352,12 @@ impl<'a> Interp<'a> {
         let lv = self.new_str(&locale);
         self.realm.set_property(out, "locale", lv);
 
-        if kind == "display" {
+        if kind == "segmenter" {
+            // `Intl.Segmenter.prototype.resolvedOptions()` — `{ locale, granularity }`.
+            let gran = get_str(self, "granularity").unwrap_or_else(|| String::from("grapheme"));
+            let gv = self.new_str(&gran);
+            self.realm.set_property(out, "granularity", gv);
+        } else if kind == "display" {
             // `Intl.DisplayNames.prototype.resolvedOptions()` — `{ locale, style,
             // type, fallback[, languageDisplay] }` (Table: "Resolved Options of
             // DisplayNames instances").
@@ -2328,14 +2333,28 @@ impl<'a> Interp<'a> {
     /// `segment(input)` method.
     pub(crate) fn make_segmenter(&mut self, args: &[NanBox]) -> NanBox {
         let obj = self.realm.new_object();
-        if let Some(opts) = args
+        // Resolve + store the locale (best-effort; the constructor path validates).
+        let locale = self
+            .canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))
+            .ok()
+            .and_then(|r| r.into_iter().next())
+            .unwrap_or_else(|| String::from("en"));
+        let locv = self.new_str(&locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
+        // `granularity` (default "grapheme"), stored so `resolvedOptions` reports it.
+        let gran = args
             .get(1)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
-            && let Some(v) = self.realm.get_property(opts, "granularity")
-        {
-            self.realm.set_hidden_property(obj, "granularity", v);
-        }
+            .and_then(|opts| self.realm.get_property(opts, "granularity"))
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("grapheme"));
+        let granv = self.new_str(&gran);
+        self.realm.set_hidden_property(obj, "granularity", granv);
+        // Mark the service kind so `resolvedOptions` reports the Segmenter shape.
+        let kindv = self.new_str("segmenter");
+        self.realm.set_hidden_property(obj, "\u{0}intl", kindv);
         self.brand_intl_instance(obj, N_INTL_SEGMENTER);
         NanBox::handle(obj.to_raw())
     }
