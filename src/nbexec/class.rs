@@ -714,20 +714,15 @@ impl<'a> Interp<'a> {
                 return Some(h);
             }
         }
-        // The Intl service constructors live under the `Intl` namespace, not the
-        // global scope, so `class M extends Intl.NumberFormat {}` resolves the base
-        // by id to link `M.prototype` to `Intl.NumberFormat.prototype`.
+        // `class M extends Intl.NumberFormat {}` resolves the base by id (the Intl
+        // constructors live under the `Intl` namespace, not the global scope) so
+        // `M.prototype` links to `Intl.NumberFormat.prototype`. Only NumberFormat /
+        // DateTimeFormat are resolved here — the ones whose `super()` init is wired
+        // in `apply_native_super`; the other Intl services would link a prototype
+        // without initializing their internal slots.
         let intl_name = match id {
             N_INTL_NUMBER_FORMAT => "NumberFormat",
             N_INTL_DATETIME_FORMAT => "DateTimeFormat",
-            N_INTL_COLLATOR => "Collator",
-            N_INTL_PLURAL_RULES => "PluralRules",
-            N_INTL_LIST_FORMAT => "ListFormat",
-            N_INTL_REL_TIME => "RelativeTimeFormat",
-            N_INTL_DISPLAY_NAMES => "DisplayNames",
-            N_INTL_SEGMENTER => "Segmenter",
-            N_INTL_DURATION_FORMAT => "DurationFormat",
-            N_INTL_LOCALE => "Locale",
             _ => return None,
         };
         self.intl_ctor_handle(intl_name)
