@@ -3701,6 +3701,39 @@ impl<'a> Interp<'a> {
         handle: Handle,
         value: NanBox,
     ) -> Vec<(&'static str, String)> {
+        let mut parts = self.number_handle_parts_inner(handle, value);
+        // Apply the numbering system to each part's digits (see
+        // `intl_format_number`); non-digit parts (group/decimal/currency) are
+        // untouched since they carry no ASCII digits.
+        let nu = self
+            .realm
+            .get_property(handle, "numberingSystem")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
+        if let Some(base) = numbering_system_digit_base(&nu) {
+            for (_, v) in &mut parts {
+                if v.chars().any(|c| c.is_ascii_digit()) {
+                    *v = v
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_digit() {
+                                char::from_u32(base + (c as u32 - '0' as u32)).unwrap_or(c)
+                            } else {
+                                c
+                            }
+                        })
+                        .collect();
+                }
+            }
+        }
+        parts
+    }
+
+    fn number_handle_parts_inner(
+        &mut self,
+        handle: Handle,
+        value: NanBox,
+    ) -> Vec<(&'static str, String)> {
         #[cfg(feature = "intl")]
         if !self.number_uses_handrolled(handle) {
             let n = self.realm.to_number(value);
