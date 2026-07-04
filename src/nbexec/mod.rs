@@ -1854,14 +1854,15 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_MAP_SIZE
         | N_SET_SIZE
         | N_TYPED_ARRAY_TO_STRING_TAG
-        // `Intl.DurationFormat.length === 0` (no required constructor parameters).
+        // Intl services with optional `locales`/`options` all have `length === 0`.
         | N_INTL_DURATION_FORMAT
-        // `Intl.ListFormat.length === 0` (locales/options are optional).
         | N_INTL_LIST_FORMAT
-        // `Intl.RelativeTimeFormat.length === 0` (locales/options are optional).
         | N_INTL_REL_TIME
-        // `Intl.PluralRules.length === 0` (locales/options are optional).
         | N_INTL_PLURAL_RULES
+        | N_INTL_NUMBER_FORMAT
+        | N_INTL_DATETIME_FORMAT
+        | N_INTL_COLLATOR
+        | N_INTL_SEGMENTER
         // `DisposableStack`/`AsyncDisposableStack`/`ShadowRealm` take no parameters.
         | N_DISPOSABLE_STACK
         | N_ASYNC_DISPOSABLE_STACK
