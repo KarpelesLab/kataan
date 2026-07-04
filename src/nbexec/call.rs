@@ -2956,6 +2956,9 @@ impl<'a> Interp<'a> {
                         -1.0
                     } else if a > b || a.is_nan() {
                         1.0
+                    } else if a == 0.0 && b == 0.0 && a.is_sign_negative() != b.is_sign_negative() {
+                        // `CompareTypedArrayElements`: -0 sorts before +0.
+                        if a.is_sign_negative() { -1.0 } else { 1.0 }
                     } else {
                         0.0
                     }
