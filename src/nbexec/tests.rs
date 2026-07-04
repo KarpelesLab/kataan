@@ -6369,3 +6369,25 @@ fn sort_indexed_properties_precise() {
         "1,2,3"
     );
 }
+
+#[test]
+fn reverse_precise_for_hole_accessor_arrays() {
+    // reverse on a hole/accessor array fires index getters/setters and preserves
+    // holes by move-and-delete; dense/typed arrays keep the fast path.
+    assert_eq!(
+        run(
+            "var log=[];var a=[1,2,3];Object.defineProperty(a,'0',{get(){log.push('g0');return 1},set(v){log.push('s0:'+v)},configurable:true,enumerable:true});a.reverse();JSON.stringify(log)"
+        ),
+        r#"["g0","s0:3"]"#
+    );
+    assert_eq!(
+        run("var a=[1,,3];a.reverse();a.join(',')+'|'+(0 in a)+(1 in a)+(2 in a)"),
+        "3,,1|truefalsetrue"
+    );
+    assert_eq!(run("JSON.stringify([1,2,3,4].reverse())"), "[4,3,2,1]");
+    assert_eq!(run("JSON.stringify([1,2,3,4,5].reverse())"), "[5,4,3,2,1]");
+    assert_eq!(
+        run("Array.from(new Uint8Array([1,2,3]).reverse()).join(',')"),
+        "3,2,1"
+    );
+}

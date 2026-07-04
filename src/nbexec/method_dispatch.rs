@@ -3561,6 +3561,51 @@ impl<'a> Interp<'a> {
                 "reverse" => {
                     // A typed-array view over an immutable buffer cannot be reordered.
                     self.guard_view_immutable(handle)?;
+                    // A plain array with hole/accessor-override indices runs the
+                    // spec-precise reverse over `HasProperty`/`[[Get]]`/`[[Set]]`/
+                    // `DeletePropertyOrThrow` (so index getters/setters fire and
+                    // holes are preserved by move-and-delete); a dense array / typed
+                    // array reverses its element store directly.
+                    if self.realm.typed_kind(handle).is_none()
+                        && let Some(len) = self.realm.array_length(handle)
+                        && (self.realm.array_has_index_overrides(handle)
+                            || elems.iter().any(|e| e.is_hole()))
+                    {
+                        for lower in 0..len / 2 {
+                            let upper = len - lower - 1;
+                            let (lk, uk) = (alloc::format!("{lower}"), alloc::format!("{upper}"));
+                            let lo_exists = self.has_property(handle, &lk);
+                            let lo = if lo_exists {
+                                self.read_member(handle, &lk)?
+                            } else {
+                                NanBox::undefined()
+                            };
+                            let up_exists = self.has_property(handle, &uk);
+                            let up = if up_exists {
+                                self.read_member(handle, &uk)?
+                            } else {
+                                NanBox::undefined()
+                            };
+                            let lkb = self.new_str(&lk);
+                            let ukb = self.new_str(&uk);
+                            match (lo_exists, up_exists) {
+                                (true, true) => {
+                                    self.set_or_throw(handle, lkb, &lk, up)?;
+                                    self.set_or_throw(handle, ukb, &uk, lo)?;
+                                }
+                                (false, true) => {
+                                    self.set_or_throw(handle, lkb, &lk, up)?;
+                                    self.delete_property_of(handle, &uk)?;
+                                }
+                                (true, false) => {
+                                    self.delete_property_of(handle, &lk)?;
+                                    self.set_or_throw(handle, ukb, &uk, lo)?;
+                                }
+                                (false, false) => {}
+                            }
+                        }
+                        return Ok(Some(NanBox::handle(handle.to_raw())));
+                    }
                     // Reverses in place and returns the same array (or typed-array view).
                     let mut out = elems.clone();
                     out.reverse();
