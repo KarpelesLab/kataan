@@ -2400,6 +2400,17 @@ impl<'a> Interp<'a> {
     /// TypeError; an invalid option value is a RangeError.
     pub(crate) fn make_plural_rules(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
+        self.init_plural_rules(obj, args)?;
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    /// Initializes an existing object as an `Intl.PluralRules` (used by both the
+    /// `new`-form constructor and `super()` in a subclass — see `apply_native_super`).
+    pub(crate) fn init_plural_rules(
+        &mut self,
+        obj: Handle,
+        args: &[NanBox],
+    ) -> Result<(), ExecError> {
         // Mark the instance kind so `resolvedOptions` reports the PluralRules shape.
         let kindv = self.new_str("plural");
         self.realm.set_hidden_property(obj, "\u{0}intl", kindv);
@@ -2453,7 +2464,7 @@ impl<'a> Interp<'a> {
         self.store_str(obj, "notation", &Some(notation));
         // SetNumberFormatDigitOptions (shared with Intl.NumberFormat).
         self.set_number_format_digit_options(obj, opts)?;
-        Ok(NanBox::handle(obj.to_raw()))
+        Ok(())
     }
 
     /// The plural category name (`"zero"`/`"one"`/`"two"`/`"few"`/`"many"`/`"other"`)

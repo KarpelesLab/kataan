@@ -2826,6 +2826,12 @@ impl<'a> Interp<'a> {
             self.init_intl_formatter_state(instance, native_id, args)?;
             return Ok(());
         }
+        // `class S extends Intl.PluralRules {}`: `super()` initializes the
+        // PluralRules slots on the (already subclass-proto-linked) instance.
+        if native_id == N_INTL_PLURAL_RULES {
+            self.init_plural_rules(instance, args)?;
+            return Ok(());
+        }
         // `Symbol` and `BigInt` are callable but have no `[[Construct]]`: extending
         // them is allowed, but `new Subclass()` runs `super()` into a non-existent
         // constructor — a TypeError (`Symbol is not a constructor`).

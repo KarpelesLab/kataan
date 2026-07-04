@@ -723,6 +723,7 @@ impl<'a> Interp<'a> {
         let intl_name = match id {
             N_INTL_NUMBER_FORMAT => "NumberFormat",
             N_INTL_DATETIME_FORMAT => "DateTimeFormat",
+            N_INTL_PLURAL_RULES => "PluralRules",
             _ => return None,
         };
         self.intl_ctor_handle(intl_name)
