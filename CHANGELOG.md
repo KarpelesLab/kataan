@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/KarpelesLab/kataan/compare/v0.0.5...v0.0.6) - 2026-07-04
+
+### Added
+
+- *(embed)* host-function registration API — register_fn + Ctx (§4.0 M1)
+
+### Other
+
+- *(roadmap)* plan the host-function registration / embedding API (§4.0)
+- add CI, crates.io, docs.rs, and MIT license badges to README
+
 ### Added
 
 - *(embed)* host-function registration API — `Interp::register_fn` /
