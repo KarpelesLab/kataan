@@ -438,11 +438,15 @@ it (never exposing a raw `Handle`). **Async continuation has landed** on top of
 it: `Ctx::deferred()` returns a promise plus a token, and
 `Interp::resolve_deferred`/`reject_deferred(token, value)` settle it later from a
 host timer/IO completion and drain the microtask queue — the capability's
-resolve/reject are pinned (persistent) until settled. See
-`examples/embed_host_fn.rs`. **Remaining for §4.0:** host-backed exotic objects
-carrying opaque native state **+ finalizers** (GC-sweep integration), the **C
-ABI** mirror, `nbvm` host-native fault-through (only reachable once the VM is the
-primary path), and migrating a sentinel builtin onto the registry.
+resolve/reject are pinned (persistent) until settled. **Host-backed native state
++ finalizers have landed:** `Ctx::set_native_state(obj, T)` / `native_state::<T>`
+wrap opaque Rust state onto a JS object (à la `napi_wrap`) via a weak
+`host_native_state` table — pruned in `ephemeron_prune` when the object is
+collected (running the state's Rust `Drop` as its finalizer) and forwarded on
+compaction. See `examples/embed_host_fn.rs`. **Remaining for §4.0:** the **C ABI**
+mirror (a full N-API-shaped FFI surface), `nbvm` host-native fault-through (only
+reachable once the VM is the primary path), and migrating a sentinel builtin onto
+the registry. The Rust embedding API is otherwise feature-complete.
 
 ### 4.1 Event loop & scheduling
 
