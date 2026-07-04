@@ -3769,6 +3769,32 @@ impl<'a> Interp<'a> {
             self.get_string_option(opts, "caseFirst", &["upper", "lower", "false"], None)?;
         let numeric = self.get_bool_option(opts, "numeric", None)?;
         let numbering = self.get_string_option(opts, "numberingSystem", &[], None)?;
+        // language/script/region subtags each have a fixed shape (UTS-35): a
+        // language is alpha{2,3} or alpha{5,8}; a script is alpha{4}; a region is
+        // alpha{2} or digit{3}. A malformed value is a RangeError.
+        if let Some(l) = &language {
+            let n = l.len();
+            let ok = ((2..=3).contains(&n) || (5..=8).contains(&n))
+                && l.bytes().all(|b| b.is_ascii_alphabetic());
+            if !ok {
+                let m = self.new_str("invalid language");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+        }
+        if let Some(s) = &script
+            && !(s.len() == 4 && s.bytes().all(|b| b.is_ascii_alphabetic()))
+        {
+            let m = self.new_str("invalid script");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        if let Some(r) = &region {
+            let alpha2 = r.len() == 2 && r.bytes().all(|b| b.is_ascii_alphabetic());
+            let digit3 = r.len() == 3 && r.bytes().all(|b| b.is_ascii_digit());
+            if !alpha2 && !digit3 {
+                let m = self.new_str("invalid region");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+        }
         // calendar/collation/numberingSystem must each match the UTS-35 `type`
         // value production (they take arbitrary keyword values, not a fixed list).
         for (val, name) in [
