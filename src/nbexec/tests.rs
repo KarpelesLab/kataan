@@ -7351,3 +7351,38 @@ fn intl_number_format_range() {
         "startRange|shared|endRange"
     );
 }
+
+#[test]
+fn intl_display_names_type_required() {
+    // Intl.DisplayNames requires a valid `type` option (absent → TypeError,
+    // invalid → RangeError); a primitive options argument is a TypeError.
+    assert_eq!(
+        run("try{new Intl.DisplayNames('en',{});'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("try{new Intl.DisplayNames('en');'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("try{new Intl.DisplayNames('en',{type:'bogus'});'no'}catch(e){e.constructor.name}"),
+        "RangeError"
+    );
+    assert_eq!(
+        run("try{new Intl.DisplayNames('en',5);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    // A valid type works.
+    assert_eq!(
+        run("new Intl.DisplayNames('en',{type:'language'}).of('fr')"),
+        "French"
+    );
+    assert_eq!(
+        run("new Intl.DisplayNames('en',{type:'region'}).of('US')"),
+        "United States"
+    );
+    assert_eq!(
+        run("new Intl.DisplayNames('en',{type:'currency'}).of('USD')"),
+        "US Dollar"
+    );
+}

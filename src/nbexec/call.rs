@@ -1899,7 +1899,7 @@ impl<'a> Interp<'a> {
         }
         // `new Intl.DisplayNames(locale, { type })` → an object with an `of(code)` method.
         if id == N_INTL_DISPLAY_NAMES {
-            return Ok(self.make_display_names(args));
+            return self.make_display_names(args);
         }
         // `new Intl.Segmenter(locale, { granularity })` → an object with a `segment(s)` method.
         if id == N_INTL_SEGMENTER {

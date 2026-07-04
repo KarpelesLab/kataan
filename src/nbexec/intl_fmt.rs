@@ -1865,7 +1865,7 @@ impl<'a> Interp<'a> {
 
     /// Builds an `Intl.DisplayNames` instance: an object capturing `type` with a readable
     /// `of(code)` method.
-    pub(crate) fn make_display_names(&mut self, args: &[NanBox]) -> NanBox {
+    pub(crate) fn make_display_names(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
         let locale = args
             .first()
@@ -1875,19 +1875,46 @@ impl<'a> Interp<'a> {
             .unwrap_or_else(|| String::from("en"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
-        if let Some(opts) = args
-            .get(1)
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-        {
-            for key in ["type", "style", "fallback"] {
+        // `options = ? GetOptionsObject(options)` — a primitive other than
+        // `undefined` is a TypeError; `undefined` yields an (empty) options object.
+        let opts = match args.get(1).copied() {
+            Some(v) if !matches!(v.unpack(), Unpacked::Undefined) => {
+                if !self.is_object_value(v) {
+                    return Err(self.type_error("Intl.DisplayNames: options must be an object"));
+                }
+                v.as_handle().map(Handle::from_raw)
+            }
+            _ => None,
+        };
+        // `type` is a **required** option (its absence — including when `options`
+        // is undefined — is a TypeError); it must be one of the valid types.
+        let type_s = self.get_string_option(
+            opts,
+            "type",
+            &[
+                "language",
+                "region",
+                "script",
+                "currency",
+                "calendar",
+                "dateTimeField",
+            ],
+            None,
+        )?;
+        let Some(type_s) = type_s else {
+            return Err(self.type_error("Intl.DisplayNames: the `type` option is required"));
+        };
+        let tv = self.new_str(&type_s);
+        self.realm.set_hidden_property(obj, "type", tv);
+        if let Some(opts) = opts {
+            for key in ["style", "fallback"] {
                 if let Some(v) = self.realm.get_property(opts, key) {
                     self.realm.set_hidden_property(obj, key, v);
                 }
             }
         }
         self.brand_intl_instance(obj, N_INTL_DISPLAY_NAMES);
-        NanBox::handle(obj.to_raw())
+        Ok(NanBox::handle(obj.to_raw()))
     }
 
     /// Builds an `Intl.Collator` instance: an object capturing the locale and

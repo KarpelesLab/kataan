@@ -2403,7 +2403,7 @@ impl<'a> Interp<'a> {
                 self.new_str(&out)
             }
             // `Intl.DisplayNames(...)` without `new`.
-            N_INTL_DISPLAY_NAMES => self.make_display_names(args),
+            N_INTL_DISPLAY_NAMES => self.make_display_names(args)?,
             // `Intl.DisplayNames.prototype.of(code)`.
             N_INTL_DISPLAY_NAMES_OF => {
                 let fmt = self.this_val.as_handle().map(Handle::from_raw);
