@@ -1520,12 +1520,10 @@ impl<'a> Interp<'a> {
                     }
                     ObjectMember::Spread { value: tgt, .. } => {
                         let obj = self.realm.new_object();
-                        for k in self.realm.object_keys(src).unwrap_or_default() {
-                            if !used.contains(&k) {
-                                let pv = self.read_member(src, &k).map_err(GenAbrupt::from)?;
-                                self.realm.set_property(obj, &k, pv);
-                            }
-                        }
+                        // CopyDataProperties (proxy-aware, symbol-aware) with the
+                        // already-destructured keys excluded.
+                        self.copy_data_properties(obj, src, &used)
+                            .map_err(GenAbrupt::from)?;
                         let h = NanBox::handle(obj.to_raw());
                         stack.push(Step::DestructureObjectMember {
                             members,

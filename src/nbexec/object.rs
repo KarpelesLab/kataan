@@ -2077,6 +2077,43 @@ impl<'a> Interp<'a> {
         Ok(out)
     }
 
+    /// CopyDataProperties(`target`, `source`, `excluded`) — the spec operation
+    /// shared by object spread (`{...src}`) and object-rest patterns
+    /// (`{...rest}` in a binding or assignment target). Copies every own
+    /// **enumerable** property of `source` — String **and** Symbol keys, routed
+    /// through the proxy `ownKeys`/`getOwnPropertyDescriptor`/`get` protocol when
+    /// `source` is a proxy — whose key (in internal [`member_key`] form) is not
+    /// in `excluded`, installing each as a plain data property on `target`. A
+    /// getter / `get` trap fires exactly once per key and its throw propagates.
+    pub(crate) fn copy_data_properties(
+        &mut self,
+        target: crate::heap::Handle,
+        source: crate::heap::Handle,
+        excluded: &[String],
+    ) -> Result<(), ExecError> {
+        for key in self.own_property_keys_values(source)? {
+            let name = self.member_key(key);
+            if excluded.contains(&name) {
+                continue;
+            }
+            let desc = self.descriptor_of(source, &name)?;
+            if matches!(desc.unpack(), Unpacked::Undefined) {
+                continue;
+            }
+            let enumerable = desc
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                .is_some_and(|v| self.realm.truthy(v));
+            if !enumerable {
+                continue;
+            }
+            let v = self.read_member(source, &name)?;
+            self.realm.set_property(target, &name, v);
+        }
+        Ok(())
+    }
+
     pub(crate) fn member_value(&self, handle: crate::heap::Handle, key: &str) -> NanBox {
         if let Some(v) = self.realm.get_property(handle, key) {
             return v;

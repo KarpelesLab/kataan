@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(proxy)* object spread (`{...proxy}`, CopyDataProperties) enumerates a proxy
   source through its `ownKeys`/`getOwnPropertyDescriptor`/`get` traps (strings
   and symbols, enumerable only) instead of copying nothing (ROADMAP §3.7).
+- *(proxy)* object-rest patterns (`{...rest}` in a binding, assignment target,
+  function parameter, or generator step) run the same proxy-aware
+  CopyDataProperties, sharing one `copy_data_properties` helper; this also fixes
+  symbol own keys being dropped from object rest on ordinary objects.
 
 ## [0.0.6](https://github.com/KarpelesLab/kataan/compare/v0.0.5...v0.0.6) - 2026-07-04
 

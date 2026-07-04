@@ -5682,3 +5682,37 @@ fn proxy_object_spread_copies_own_enumerable() {
         "42,1"
     );
 }
+
+#[test]
+fn proxy_object_rest_destructuring() {
+    // Object-rest patterns (binding, assignment target, param, generator) run
+    // CopyDataProperties through the proxy protocol, and copy symbol keys.
+    assert_eq!(
+        run("var {...r} = new Proxy({a:1,b:2},{}); JSON.stringify(r)"),
+        r#"{"a":1,"b":2}"#
+    );
+    assert_eq!(
+        run("var {a, ...rest} = new Proxy({a:1,b:2,c:3},{}); a + '|' + JSON.stringify(rest)"),
+        r#"1|{"b":2,"c":3}"#
+    );
+    assert_eq!(
+        run("function f({...p}){ return JSON.stringify(p); } f(new Proxy({x:1,y:2},{}))"),
+        r#"{"x":1,"y":2}"#
+    );
+    assert_eq!(
+        run("var g; ({...g} = new Proxy({m:5},{})); JSON.stringify(g)"),
+        r#"{"m":5}"#
+    );
+    // A symbol own key is copied by object rest (was previously dropped).
+    assert_eq!(
+        run("var s=Symbol(); var {...q} = {[s]:7, a:1}; q[s] + ',' + q.a"),
+        "7,1"
+    );
+    // Generator with yield through an object-rest destructuring over a proxy.
+    assert_eq!(
+        run(
+            "function* gen(){ var {...z} = new Proxy({p:1,q:2},{}); yield z; } JSON.stringify(gen().next().value)"
+        ),
+        r#"{"p":1,"q":2}"#
+    );
+}

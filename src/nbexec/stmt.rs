@@ -693,15 +693,10 @@ impl<'a> Interp<'a> {
                 if let Some(rest) = &pat.rest {
                     let obj = self.realm.new_object();
                     if let Some(h) = src {
-                        for k in self.realm.object_keys(h).unwrap_or_default() {
-                            if !used.contains(&k) {
-                                // Read through `read_member` so an own getter fires
-                                // (exactly once); the rest object always gets a plain
-                                // enumerable, writable, configurable data property.
-                                let pv = self.read_member(h, &k)?;
-                                self.realm.set_property(obj, &k, pv);
-                            }
-                        }
+                        // CopyDataProperties with the already-bound keys excluded —
+                        // proxy-aware and symbol-aware (an own getter / `get` trap
+                        // fires once; every copied key becomes a plain data property).
+                        self.copy_data_properties(obj, h, &used)?;
                     }
                     self.bind_pattern(rest, NanBox::handle(obj.to_raw()))?;
                 }
@@ -1051,14 +1046,9 @@ impl<'a> Interp<'a> {
                         }
                         ObjectMember::Spread { value: tgt, .. } => {
                             let obj = self.realm.new_object();
-                            for k in self.realm.object_keys(src).unwrap_or_default() {
-                                if !used.contains(&k) {
-                                    // `read_member` fires an own getter (once);
-                                    // the rest object gets a plain data property.
-                                    let pv = self.read_member(src, &k)?;
-                                    self.realm.set_property(obj, &k, pv);
-                                }
-                            }
+                            // CopyDataProperties with the already-destructured keys
+                            // excluded — proxy-aware and symbol-aware.
+                            self.copy_data_properties(obj, src, &used)?;
                             self.assign_destructure(tgt, NanBox::handle(obj.to_raw()))?;
                         }
                         ObjectMember::Accessor { .. } => {}
