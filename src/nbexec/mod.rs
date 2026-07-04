@@ -913,6 +913,32 @@ impl<'c, 'a> Ctx<'c, 'a> {
             .unwrap_or(NanBox::undefined())
     }
 
+    /// Creates a **deferred** promise for async host work: returns the promise to
+    /// hand back to JS, plus a `token` the host settles later from a timer/IO
+    /// completion via [`Interp::resolve_deferred`] / [`Interp::reject_deferred`].
+    /// The promise's resolve/reject functions are pinned (a persistent handle)
+    /// until it settles, so they survive GC across the wait.
+    ///
+    /// # Errors
+    /// Propagates a failure building the promise capability.
+    pub fn deferred(&mut self) -> Result<(NanBox, u32), NanBox> {
+        let ctor = self
+            .interp
+            .current
+            .get("Promise")
+            .unwrap_or(NanBox::undefined());
+        let cap = self
+            .interp
+            .new_promise_capability(ctor)
+            .map_err(|e| self.interp.exec_error_value(e))?;
+        let arr = self
+            .interp
+            .realm
+            .new_array(alloc::vec![cap.resolve, cap.reject]);
+        let token = self.interp.realm.persist(NanBox::handle(arr.to_raw()));
+        Ok((cap.promise, token))
+    }
+
     /// Releases a persistent handle so its value is no longer pinned.
     pub fn release_persistent(&mut self, idx: u32) {
         self.interp.realm.release_persistent(idx);
@@ -4357,6 +4383,44 @@ impl<'a> Interp<'a> {
     /// Releases a persistent handle so its value is no longer a GC root.
     pub fn release_persistent(&mut self, idx: u32) {
         self.realm.release_persistent(idx);
+    }
+
+    /// Resolves a deferred promise (from [`Ctx::deferred`]) with `value`, then
+    /// drains the microtask queue so its `then` reactions run. Releases the token;
+    /// an unknown/already-settled token is a no-op.
+    ///
+    /// # Errors
+    /// A thrown value from a reaction that escapes to the top level.
+    pub fn resolve_deferred(&mut self, token: u32, value: NanBox) -> Result<(), NanBox> {
+        self.settle_deferred(token, value, true)
+    }
+
+    /// Rejects a deferred promise (from [`Ctx::deferred`]) with `reason`, then
+    /// drains the microtask queue. Releases the token.
+    ///
+    /// # Errors
+    /// A thrown value from a reaction that escapes to the top level.
+    pub fn reject_deferred(&mut self, token: u32, reason: NanBox) -> Result<(), NanBox> {
+        self.settle_deferred(token, reason, false)
+    }
+
+    fn settle_deferred(&mut self, token: u32, value: NanBox, fulfill: bool) -> Result<(), NanBox> {
+        let Some(cap) = self.realm.persistent(token) else {
+            return Ok(());
+        };
+        // The token pins a `[resolve, reject]` array; pick the matching function.
+        let f = cap
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
+            .and_then(|e| e.get(usize::from(!fulfill)).copied());
+        self.realm.release_persistent(token);
+        if let Some(f) = f {
+            self.call_with_this(f, NanBox::undefined(), &[value])
+                .map_err(|e| self.exec_error_value(e))?;
+        }
+        self.drain_microtasks()
+            .map_err(|e| self.exec_error_value(e))
     }
 
     /// Whether the host function with registry index `id` was registered as a

@@ -5563,6 +5563,47 @@ fn host_fn_property_api_has_delete_keys() {
 }
 
 #[test]
+fn host_deferred_promise_settled_later() {
+    use core::cell::RefCell;
+    // A host fn hands JS a deferred promise; the host settles it from "outside"
+    // after the run, and the reaction runs on the drained microtask queue.
+    let token: alloc::rc::Rc<RefCell<Option<u32>>> = alloc::rc::Rc::new(RefCell::new(None));
+    let mut interp = Interp::new();
+    let tc = token.clone();
+    interp.register_global_fn("later", 0, move |cx, _t, _a| {
+        let (promise, tok) = cx.deferred()?;
+        *tc.borrow_mut() = Some(tok);
+        Ok(promise)
+    });
+    // All programs must outlive the interp (its lifetime param binds them), so
+    // parse them up front.
+    let p_attach = Parser::parse_program(
+        "globalThis.__out='pending'; later().then(v=>{globalThis.__out='got:'+v}); 'ok'",
+    )
+    .expect("parse");
+    let p_read = Parser::parse_program("globalThis.__out").expect("parse");
+
+    // Attach a reaction; it must not run yet (promise still pending).
+    let v = interp.run(&p_attach).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "ok");
+    let v = interp.run(&p_read).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "pending");
+    // Host settles the deferred promise from "outside"; the reaction drains.
+    let tok = token.borrow().unwrap();
+    interp
+        .resolve_deferred(tok, NanBox::number(42.0))
+        .expect("settle");
+    let v = interp.run(&p_read).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "got:42");
+    // The token is released — a second settle is a harmless no-op.
+    interp
+        .resolve_deferred(tok, NanBox::number(7.0))
+        .expect("noop");
+    let v = interp.run(&p_read).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "got:42");
+}
+
+#[test]
 fn host_fn_persistent_handle_across_calls() {
     // A host fn pins an object in one call and reads it back in a later call via a
     // persistent handle — surviving the GC that runs between them.
