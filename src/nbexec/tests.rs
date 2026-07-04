@@ -6391,3 +6391,41 @@ fn reverse_precise_for_hole_accessor_arrays() {
         "3,2,1"
     );
 }
+
+#[test]
+fn copy_within_precise_for_hole_accessor_arrays() {
+    // copyWithin on a hole/accessor array copies through [[Get]]/[[Set]]/Delete
+    // (getters/setters fire, holes propagate) with the correct overlap direction.
+    assert_eq!(
+        run(
+            "var log=[];var a=[1,2,3,4];Object.defineProperty(a,'3',{get(){log.push('g3');return 4},configurable:true,enumerable:true});\
+             Object.defineProperty(a,'0',{set(v){log.push('s0:'+v)},get(){return 1},configurable:true,enumerable:true});\
+             a.copyWithin(0,3);JSON.stringify(log)"
+        ),
+        r#"["g3","s0:4"]"#
+    );
+    assert_eq!(
+        run("var a=[1,2,3,4,5];delete a[3];a.copyWithin(0,3);a.join(',')+'|'+(0 in a)"),
+        ",5,3,,5|false"
+    );
+    // Overlapping copy is not clobbered (backward direction).
+    assert_eq!(
+        run(
+            "var a=[1,2,3,4,5];Object.defineProperty(a,'0',{value:1,writable:true,enumerable:true,configurable:true});JSON.stringify(a.copyWithin(1,0,3))"
+        ),
+        "[1,1,2,3,5]"
+    );
+    // Dense fast path unchanged.
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4,5].copyWithin(0,3))"),
+        "[4,5,3,4,5]"
+    );
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4,5].copyWithin(1,0,3))"),
+        "[1,1,2,3,5]"
+    );
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4,5].copyWithin(-2,-3,-1))"),
+        "[1,2,3,3,4]"
+    );
+}

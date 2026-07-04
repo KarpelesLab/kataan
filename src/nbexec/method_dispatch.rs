@@ -3697,6 +3697,34 @@ impl<'a> Interp<'a> {
                     } else {
                         norm(self.realm.to_number(arg(2)))
                     };
+                    // A hole/accessor array copies through `[[Get]]`/`[[Set]]`/
+                    // `Delete` (getters/setters fire, holes propagate), choosing the
+                    // copy *direction* so overlapping ranges are not clobbered.
+                    if self.realm.array_has_index_overrides(handle)
+                        || elems.iter().any(|e| e.is_hole())
+                    {
+                        let count = (end - start).min(len - target).max(0);
+                        let (mut from, mut to, dir) = if start < target && target < start + count {
+                            (start + count - 1, target + count - 1, -1i64)
+                        } else {
+                            (start, target, 1i64)
+                        };
+                        let mut c = count;
+                        while c > 0 {
+                            let (fk, tk) = (alloc::format!("{from}"), alloc::format!("{to}"));
+                            if self.has_property(handle, &fk) {
+                                let v = self.read_member(handle, &fk)?;
+                                let tkb = self.new_str(&tk);
+                                self.set_or_throw(handle, tkb, &tk, v)?;
+                            } else {
+                                self.delete_property_of(handle, &tk)?;
+                            }
+                            from += dir;
+                            to += dir;
+                            c -= 1;
+                        }
+                        return Ok(Some(NanBox::handle(handle.to_raw())));
+                    }
                     let slice: Vec<NanBox> =
                         elems[start as usize..end.max(start) as usize].to_vec();
                     for (k, v) in slice.into_iter().enumerate() {
