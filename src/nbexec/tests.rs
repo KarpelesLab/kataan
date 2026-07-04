@@ -7146,3 +7146,33 @@ fn regex_backspace_in_char_class() {
         "true,true"
     );
 }
+
+#[test]
+fn annexb_legacy_octal_string_escapes() {
+    // Annex B B.1.2 legacy octal string escapes (sloppy mode).
+    assert_eq!(run("'\\101'"), "A"); // octal 101 = 65
+    assert_eq!(run("'\\7'.charCodeAt(0)"), "7");
+    assert_eq!(run("'\\12'.charCodeAt(0)"), "10"); // octal 12 = newline
+    assert_eq!(run("'\\377'.charCodeAt(0)"), "255");
+    assert_eq!(run("'\\0'.charCodeAt(0)"), "0");
+    // A leading 0-3 admits 3 digits; a leading 4-7, two (so \400 = \40 + "0").
+    assert_eq!(
+        run("var s='\\400';s.length+','+s.charCodeAt(0)+','+s.charCodeAt(1)"),
+        "2,32,48"
+    );
+    // \0 followed by a digit is octal 0 (NUL) then the literal digit.
+    assert_eq!(
+        run("var s='\\08';s.length+','+s.charCodeAt(0)+','+s.charCodeAt(1)"),
+        "2,0,56"
+    );
+    // \8 and \9 are not octal; strict mode rejects legacy octal; \0 stays valid.
+    assert_eq!(run("'\\8'"), "8");
+    assert_eq!(
+        run("try{eval(\"'use strict';'\\\\101'\");'no'}catch(e){e.constructor.name}"),
+        "SyntaxError"
+    );
+    assert_eq!(
+        run("(function(){'use strict';return '\\0'.charCodeAt(0)})()"),
+        "0"
+    );
+}

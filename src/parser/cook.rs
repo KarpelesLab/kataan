@@ -240,6 +240,25 @@ pub(super) fn decode_escapes(body: &str, span: Span) -> Result<Vec<u8>> {
             'f' => out.push(0x0C),
             'v' => out.push(0x0B),
             '0' if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => out.push(0),
+            // Legacy octal escape (Annex B B.1.2). Only reached in sloppy mode — a
+            // strict-mode string with such an escape is rejected before cooking. A
+            // leading `0`–`3` admits up to three octal digits; a leading `4`–`7`,
+            // two (value ≤ 255). `\8` / `\9` are not octal (the identity branch).
+            '0'..='7' => {
+                let mut val = esc as u32 - '0' as u32;
+                let max_more = if esc <= '3' { 2 } else { 1 };
+                for _ in 0..max_more {
+                    match chars.peek() {
+                        Some(&d @ '0'..='7') => {
+                            chars.next();
+                            val = val * 8 + (d as u32 - '0' as u32);
+                        }
+                        _ => break,
+                    }
+                }
+                // `val` ≤ 0o377 = 255, so it is a valid Latin-1 code point.
+                push_char(&mut out, char::from_u32(val).unwrap_or('\0'));
+            }
             'x' => {
                 let hi = hex_digit(chars.next(), span)?;
                 let lo = hex_digit(chars.next(), span)?;
