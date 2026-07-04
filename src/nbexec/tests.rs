@@ -6565,3 +6565,21 @@ fn typed_array_from_array_like_uses_tolength() {
         "RangeError"
     );
 }
+
+#[test]
+fn bigint_primitive_prototype_chain() {
+    // A BigInt primitive's [[Prototype]] is %BigInt.prototype%, so property reads
+    // resolve through it (fixing Object.prototype.toString and getPrototypeOf).
+    assert_eq!(run("Object.prototype.toString.call(1n)"), "[object BigInt]");
+    assert_eq!(
+        run("Object.prototype.toString.call(10n)"),
+        "[object BigInt]"
+    );
+    assert_eq!(run("Object.getPrototypeOf(1n)===BigInt.prototype"), "true");
+    // Symbol primitive still works; a non-string @@toStringTag falls back to Object.
+    assert_eq!(
+        run("Object.prototype.toString.call(Symbol())"),
+        "[object Symbol]"
+    );
+    assert_eq!(run("(255n).toString(16)"), "ff");
+}

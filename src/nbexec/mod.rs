@@ -3684,6 +3684,10 @@ impl<'a> Interp<'a> {
             self.realm.set_property(bi_proto, &tag_key, tag_val);
             self.realm.mark_hidden(bi_proto, &tag_key);
             self.realm.set_readonly_property(bi_proto, &tag_key);
+            // Record `%BigInt.prototype%` as the `[[Prototype]]` of every BigInt
+            // primitive, so a property read on `1n` (e.g. `@@toStringTag`,
+            // `toString`, `valueOf`) resolves through the chain.
+            self.realm.set_bigint_proto_intrinsic(bi_proto);
         }
         self.setup_regexp_prototype();
         self.setup_first_class_prototype("Function", FUNCTION_PROTO_METHODS);

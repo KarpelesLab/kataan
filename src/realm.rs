@@ -161,6 +161,9 @@ pub struct Realm {
     /// `Object.getPrototypeOf(Symbol())` resolves to `Symbol.prototype`. Symbol
     /// primitives are immutable, so this is never overridden per-instance.
     symbol_proto_intrinsic: Option<Handle>,
+    /// The realm's `%BigInt.prototype%` intrinsic — the `[[Prototype]]` of
+    /// every `Cell::BigInt` primitive (BigInt primitives are immutable).
+    bigint_proto_intrinsic: Option<Handle>,
     /// The lazily-materialized `.prototype` objects of the `Intl` service
     /// constructors (`Intl.NumberFormat`, `Intl.Collator`, …, `Intl.Locale`,
     /// `Intl.DurationFormat`), keyed by the constructor's native dispatch id. Each
@@ -239,6 +242,7 @@ impl Realm {
             function_proto_intrinsic: None,
             array_proto_intrinsic: None,
             symbol_proto_intrinsic: None,
+            bigint_proto_intrinsic: None,
             intl_protos: alloc::collections::BTreeMap::new(),
             legacy_regexp: LegacyRegExpState::default(),
             limits,
@@ -294,6 +298,12 @@ impl Realm {
     /// for every `Cell::Symbol` primitive.
     pub fn set_symbol_proto_intrinsic(&mut self, handle: Handle) {
         self.symbol_proto_intrinsic = Some(handle);
+    }
+
+    /// Records the realm's `%BigInt.prototype%` intrinsic — the `[[Prototype]]`
+    /// for every `Cell::BigInt` primitive.
+    pub fn set_bigint_proto_intrinsic(&mut self, handle: Handle) {
+        self.bigint_proto_intrinsic = Some(handle);
     }
 
     /// The shared abstract `%TypedArray%` intrinsic constructor, if installed.
@@ -1670,6 +1680,12 @@ impl Realm {
         // A Symbol primitive's `[[Prototype]]` is `%Symbol.prototype%`.
         if matches!(self.heap.get(handle), Some(Cell::Symbol { .. })) {
             return self.symbol_proto_intrinsic;
+        }
+        // A BigInt primitive's `[[Prototype]]` is `%BigInt.prototype%` (so
+        // `Object.prototype.toString.call(1n)` reads its `@@toStringTag` →
+        // "BigInt", and `(1n).toString`/`valueOf` resolve).
+        if matches!(self.heap.get(handle), Some(Cell::BigInt(_))) {
+            return self.bigint_proto_intrinsic;
         }
         // An ordinary/native callable with no explicit override and no inline
         // object part has `[[Prototype]] === %Function.prototype%` (unless it was
