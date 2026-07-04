@@ -3545,7 +3545,18 @@ impl<'a> Interp<'a> {
                     return Ok(Some(a_v));
                 }
                 // Iterators: `keys()` over indices, `values()` over elements,
-                // `entries()` over `[index, element]` pairs (eager generators).
+                // `entries()` over `[index, element]` pairs. A **typed array** gets
+                // a live iterator (re-reads its length/elements, observing a
+                // resizable-buffer resize or element write mid-iteration); a plain
+                // array uses a snapshot.
+                "keys" | "values" | "entries" if self.realm.typed_kind(handle).is_some() => {
+                    let kind = match method {
+                        "keys" => 0,
+                        "entries" => 2,
+                        _ => 1,
+                    };
+                    return Ok(Some(self.make_live_typed_iterator(handle, kind)));
+                }
                 "keys" => {
                     let ks: Vec<NanBox> =
                         (0..elems.len()).map(|i| NanBox::number(i as f64)).collect();

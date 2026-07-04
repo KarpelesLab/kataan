@@ -1816,6 +1816,12 @@ const GEN_COLL: &str = "\u{0}gcoll";
 const GEN_KIND: &str = "\u{0}gkind";
 const GEN_LASTKEY: &str = "\u{0}glast";
 const GEN_DONE: &str = "\u{0}gdone";
+/// Hidden slot on a **live** typed-array iterator: the typed-array handle. Its
+/// `next()` re-reads the live length (`typed_len`) and each element by index, so
+/// growing/shrinking the backing resizable buffer — or writing an element —
+/// mid-iteration is observed (`GEN_IDX` holds the cursor, `GEN_KIND` the 0/1/2
+/// keys/values/entries selector).
+const GEN_TA: &str = "\u{0}gta";
 /// Hidden slot on a *lazy* generator object: the index of its suspended
 /// [`generator::GenFrame`] in `Interp::gen_frames`.
 const GEN_FRAME: &str = "\u{0}gframe";

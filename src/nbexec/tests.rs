@@ -7066,3 +7066,51 @@ fn static_method_sees_class_name() {
     assert_eq!(run("var y=99;class C{static m(){return y}}C.m()"), "99");
     assert_eq!(run("class Q{static x=Q.name}Q.x"), "Q");
 }
+
+#[test]
+fn live_typed_array_iteration() {
+    // Typed-array iterators are live: a resizable-buffer resize or an element
+    // write mid-iteration is observed (per %ArrayIteratorPrototype% re-reading
+    // the live length/elements). Plain arrays keep their snapshot fast path.
+    assert_eq!(
+        run(
+            "var rab=new ArrayBuffer(4,{maxByteLength:16});var ta=new Uint8Array(rab);ta[0]=1;ta[1]=2;ta[2]=3;ta[3]=4;\
+             var out=[];var i=0;for(var x of ta){out.push(x);if(i===0)rab.resize(8);i++}out.join(',')"
+        ),
+        "1,2,3,4,0,0,0,0"
+    );
+    assert_eq!(
+        run(
+            "var rab=new ArrayBuffer(8,{maxByteLength:16});var ta=new Uint8Array(rab);for(var k=0;k<8;k++)ta[k]=k;\
+             var out=[];var i=0;for(var x of ta){out.push(x);if(i===2)rab.resize(4);i++}out.join(',')"
+        ),
+        "0,1,2,3"
+    );
+    assert_eq!(
+        run(
+            "var ta=new Uint8Array([1,2,3,4]);var out=[];var i=0;for(var x of ta){out.push(x);if(i===0)ta[2]=64;i++}out.join(',')"
+        ),
+        "1,2,64,4"
+    );
+    // keys/values/entries + manual next + own-iterable, and spread, still work.
+    assert_eq!(
+        run("[...new Uint8Array([9,8,7]).keys()].join(',')"),
+        "0,1,2"
+    );
+    assert_eq!(
+        run("JSON.stringify([...new Uint8Array([5,6]).entries()])"),
+        "[[0,5],[1,6]]"
+    );
+    assert_eq!(
+        run("var it=new Uint8Array([1]).values();it[Symbol.iterator]()===it"),
+        "true"
+    );
+    assert_eq!(run("[...new Float64Array([1.5,2.5])].join(',')"), "1.5,2.5");
+    // Plain arrays unchanged (snapshot fast path).
+    assert_eq!(
+        run(
+            "var a=[1,2,3];var out=[];var i=0;for(var x of a){out.push(x);if(i===0)a.push(99);i++}out.join(',')"
+        ),
+        "1,2,3"
+    );
+}

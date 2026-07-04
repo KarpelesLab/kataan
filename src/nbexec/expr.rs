@@ -900,8 +900,15 @@ impl<'a> Interp<'a> {
                                 self.realm.get_property(h, GEN_BUF).is_some()
                                     || self.realm.get_property(h, GEN_FRAME).is_some()
                                     || self.realm.get_property(h, GEN_COLL).is_some()
+                                    || self.realm.get_property(h, GEN_TA).is_some()
                             }) {
                                 return Ok(recv);
+                            }
+                            // A typed array yields a **live** values iterator.
+                            if let Some(h) = recv.as_handle().map(Handle::from_raw)
+                                && self.realm.typed_kind(h).is_some()
+                            {
+                                return Ok(self.make_live_typed_iterator(h, 1));
                             }
                             // A non-weak Map/Set yields a **live** iterator (a Set
                             // over its values, a Map over its entries), so

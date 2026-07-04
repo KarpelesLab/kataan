@@ -235,6 +235,15 @@ impl<'a> Interp<'a> {
         {
             return self.live_collection_iter_next(h, coll);
         }
+        // A **live** typed-array iterator (has `GEN_TA`) re-reads its live length.
+        if let Some(ta) = self
+            .realm
+            .get_property(h, GEN_TA)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            return self.live_typed_iter_next(h, ta);
+        }
         let Some(buf) = self
             .realm
             .get_property(h, GEN_BUF)
@@ -334,6 +343,52 @@ impl<'a> Interp<'a> {
     /// A fresh 2-element `[key, value]` array for a Map/Set `entries()` result.
     fn new_iter_pair(&mut self, k: NanBox, v: NanBox) -> NanBox {
         NanBox::handle(self.realm.new_array(alloc::vec![k, v]).to_raw())
+    }
+
+    /// `next()` for a **live** typed-array iterator (see `make_live_typed_iterator`):
+    /// re-reads the live length each step, so a resizable-buffer resize or an
+    /// element write mid-iteration is observed. Iterates canonical integer indices
+    /// `0..length`; an index that falls out of the (possibly shrunk) view yields
+    /// `undefined`.
+    pub(crate) fn live_typed_iter_next(
+        &mut self,
+        h: Handle,
+        ta: Handle,
+    ) -> Result<NanBox, ExecError> {
+        let kind = self
+            .realm
+            .get_property(h, GEN_KIND)
+            .and_then(|n| n.as_number())
+            .unwrap_or(0.0) as u8;
+        let idx = self
+            .realm
+            .get_property(h, GEN_IDX)
+            .and_then(|n| n.as_number())
+            .unwrap_or(0.0) as usize;
+        // The live length (tracks a resizable backing buffer); `None`/0 for a
+        // detached or out-of-bounds view ends the iteration.
+        let len = self.realm.typed_len(ta).unwrap_or(0);
+        if idx >= len {
+            return Ok(self.iter_result(NanBox::undefined(), true));
+        }
+        self.realm
+            .set_hidden_property(h, GEN_IDX, NanBox::number((idx + 1) as f64));
+        let value = match kind {
+            0 => NanBox::number(idx as f64), // keys
+            2 => {
+                // entries: [index, element]
+                let e = self
+                    .realm
+                    .typed_get(ta, idx)
+                    .unwrap_or_else(NanBox::undefined);
+                self.new_iter_pair(NanBox::number(idx as f64), e)
+            }
+            _ => self
+                .realm
+                .typed_get(ta, idx)
+                .unwrap_or_else(NanBox::undefined),
+        };
+        Ok(self.iter_result(value, false))
     }
 
     /// The eager-generator iterator's `return(v)`: mark exhausted, report done.
@@ -1790,6 +1845,12 @@ impl<'a> Interp<'a> {
             };
             let kind = if is_set { 1 } else { 2 };
             let it = self.make_live_collection_iterator(h, kind, tag);
+            return Ok(it.as_handle().map(Handle::from_raw));
+        }
+        // A typed array gets a **live** iterator (values), so `for-of` observes a
+        // resizable-buffer resize or element write mid-iteration.
+        if self.realm.typed_kind(h).is_some() {
+            let it = self.make_live_typed_iterator(h, 1);
             return Ok(it.as_handle().map(Handle::from_raw));
         }
         if self.realm.array_elements(h).is_some()
