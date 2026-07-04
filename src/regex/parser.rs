@@ -1080,6 +1080,11 @@ impl Parser {
                             let ch = self.parse_hex_escape(2)?;
                             self.push_class_member(&mut items, ch)?;
                         }
+                        // Inside a character class, `\b` is a backspace (U+0008),
+                        // not a word boundary (ClassEscape :: `b`).
+                        'b' => {
+                            self.push_class_member(&mut items, 0x08)?;
+                        }
                         other => {
                             self.push_class_member(&mut items, escape_char(other) as u32)?;
                         }

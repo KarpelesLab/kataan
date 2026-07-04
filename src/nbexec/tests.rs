@@ -7128,3 +7128,21 @@ fn annexb_html_like_comments() {
     assert_eq!(run("1 // c\n+2"), "3");
     assert_eq!(run("1 /* c */ +2"), "3");
 }
+
+#[test]
+fn regex_backspace_in_char_class() {
+    // Inside a character class `\b` is a backspace (U+0008), not a word boundary.
+    assert_eq!(run("/[\\b]/.test('\\b')"), "true");
+    assert_eq!(run("/[\\b]/.test('b')"), "false");
+    assert_eq!(
+        run("/[a\\bc]/.test('\\b')+','+/[a\\bc]/.test('a')"),
+        "true,true"
+    );
+    // Outside a class, `\b` is still a word boundary.
+    assert_eq!(run("/\\bword\\b/.test('a word here')"), "true");
+    // Other class escapes unaffected.
+    assert_eq!(
+        run("/[\\n\\t]/.test('\\n')+','+/[\\n\\t]/.test('\\t')"),
+        "true,true"
+    );
+}
