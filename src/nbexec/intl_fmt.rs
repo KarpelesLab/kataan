@@ -2824,9 +2824,6 @@ impl<'a> Interp<'a> {
         };
         get(self, "style").as_deref() == Some("unit")
             || get(self, "notation").as_deref() == Some("compact")
-            // Accounting currency sign (parenthesized negatives) is composed on the
-            // hand-rolled path (the intl crate emits a minus sign).
-            || get(self, "currencySign").as_deref() == Some("accounting")
     }
 
     /// Formats `n` per an `Intl.NumberFormat` instance. With the `intl` crate, all styles
@@ -2903,7 +2900,21 @@ impl<'a> Interp<'a> {
                 }
                 return body;
             }
-            return intl::number::format(&locale, n, &opts);
+            let formatted = intl::number::format(&locale, n, &opts);
+            // `currencySign: "accounting"` parenthesizes a negative currency amount,
+            // preserving the crate's locale-correct symbol/separators (so non-en
+            // locales like de-DE are not forced onto the en-US hand-rolled path).
+            if formatted.starts_with('-')
+                && self
+                    .realm
+                    .get_property(handle, "currencySign")
+                    .map(|v| self.realm.to_display_string(v))
+                    .as_deref()
+                    == Some("accounting")
+            {
+                return alloc::format!("({})", &formatted[1..]);
+            }
+            return formatted;
         }
         let opt_str = |this: &mut Self, k: &str| -> Option<String> {
             this.realm
