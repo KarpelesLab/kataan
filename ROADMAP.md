@@ -8,22 +8,33 @@ foundations are summarized once (§1) and not re-litigated; everything after is
 forward-looking.
 
 > **Headline status (2026-07):** the official tc39/Test262 corpus (~53k tests)
-> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 93.8 %**
+> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 93.9 %**
 > of the ~44k *ran* tests (the ~9k skipped are Temporal / Atomics / agents /
 > cross-realm — see §3.9). **ES modules + dynamic `import()` now run** (the
 > module-flagged suite is no longer skipped — §3.1). The remaining headline
-> language gap is the **Intl services** (now mostly the CLDR locale-*data* output
-> in the external `intl` crate — the structure, subclassing, `formatRange`, and
-> many formatting behaviors are done); the long tail is per-builtin and
-> per-construct edges (§3).
+> language gap is the **Intl services** (now almost entirely the CLDR locale-*data*
+> output in the external `intl` crate — unit long/narrow forms, compact-long,
+> DurationFormat unit styles, likely-subtags; the *structure* — subclassing,
+> `formatRange`, `formatToParts` incl. unit/compact, `resolvedOptions`, Segmenter
+> `containing`, `localeCompare`/`toLocaleString`/`Date.toLocale*` option plumbing —
+> is done); the long tail is per-builtin and per-construct edges (§3).
 >
 > Recently converted (ledger-verified): the **live-iteration** cluster (Set/Map +
 > typed-array observe mutation mid-iteration), the **class element** cluster
 > (private-method timing, static-privates-not-inherited, class-name `const`),
 > **Annex B web-compat** (HTML comments + legacy octal in strings/regex),
 > **String exotic** own-property surface, **BigInt** on the reused `puremp`
-> backend, and full **subclassing** across the builtins (incl. Promise / ArrayBuffer /
-> WeakRef / AggregateError / Intl `NumberFormat`/`DateTimeFormat`).
+> backend, full **subclassing** across the builtins (incl. Promise / ArrayBuffer /
+> WeakRef / AggregateError / Intl `NumberFormat`/`DateTimeFormat`), the **module**
+> cluster (cross-module/circular import-closure, re-export-of-import, namespace
+> `isSealed`), the **Intl.Segmenter** surface, the **`toLocaleString` family**
+> (Number/Date route through the real formatters), **`Float16Array`** (ES2025), and
+> a **feature-complete §4.0 Rust embedding API** (register_fn/constructor, handle
+> scope, async continuation, native-state + finalizers) with the **C ABI value
+> layer** begun. Systematic probing of every builtin/Intl/module area has been
+> exhausted at the *structural* level — what remains is CLDR-data, threading
+> (Atomics/agents), Temporal, the async-generator microtask rewrite, and the C ABI
+> context/callback bridge.
 
 ---
 
