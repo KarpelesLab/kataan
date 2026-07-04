@@ -1533,10 +1533,12 @@ impl<'a> Interp<'a> {
             let sens = get_str(self, "sensitivity").unwrap_or_else(|| String::from("variant"));
             let sv = self.new_str(&sens);
             self.realm.set_property(out, "sensitivity", sv);
+            // ignorePunctuation defaults to the locale default: `true` for Thai,
+            // `false` elsewhere.
             let ip = fmt
                 .and_then(|h| self.realm.get_property(h, "ignorePunctuation"))
                 .and_then(|v| v.as_boolean())
-                .unwrap_or(false);
+                .unwrap_or_else(|| locale == "th" || locale.starts_with("th-"));
             self.realm
                 .set_property(out, "ignorePunctuation", NanBox::boolean(ip));
             let coll = get_str(self, "collation").unwrap_or_else(|| String::from("default"));
