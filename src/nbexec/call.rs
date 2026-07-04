@@ -1223,6 +1223,14 @@ impl<'a> Interp<'a> {
     ) -> Result<NanBox, ExecError> {
         let call_scope = captured.child();
         let saved = core::mem::replace(&mut self.current, call_scope);
+        // A function defined in a module carries that module's import aliases in
+        // its captured scope chain; restore them so a named import read inside the
+        // body resolves even when the function is called from another module (or
+        // across an import cycle). Only swap when the closure is a module function.
+        #[cfg(all(feature = "module", feature = "std"))]
+        let saved_module_imports = captured
+            .module_imports()
+            .map(|mi| core::mem::replace(&mut self.module_imports, mi));
         // The callee body opens a new variable environment (set by `hoist_with`);
         // remember the caller's so it is restored on return.
         let saved_var_scope = self.var_scope.clone();
@@ -1450,6 +1458,10 @@ impl<'a> Interp<'a> {
             self.run_body(def.body)
         })();
         self.current = saved;
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some(mi) = saved_module_imports {
+            self.module_imports = mi;
+        }
         self.var_scope = saved_var_scope;
         self.annexb_block_fns = saved_annexb;
         self.this_val = saved_this;

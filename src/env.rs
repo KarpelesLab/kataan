@@ -49,6 +49,14 @@ struct ScopeData {
     /// naturally — `with` is *lexically* scoped: a function defined elsewhere and
     /// merely *called* inside the `with` does not see the object.
     with_obj: Option<NanBox>,
+    /// Set ONLY on a module's top-level scope: that module's import-alias table
+    /// (`local name → (exporting module scope, exported local name)`). A function
+    /// defined in the module captures this scope, so `Interp::invoke_inner` can
+    /// restore the correct `module_imports` when the function runs — even when
+    /// called from *another* module — by walking the closure's scope chain to the
+    /// nearest module frame (`Scope::module_imports`). `None` on ordinary frames.
+    #[allow(clippy::type_complexity)]
+    module_imports: Option<Rc<BTreeMap<String, (Scope, String)>>>,
 }
 
 impl Scope {
@@ -61,6 +69,7 @@ impl Scope {
             parent: None,
             disposers: None,
             with_obj: None,
+            module_imports: None,
         })))
     }
 
@@ -73,6 +82,7 @@ impl Scope {
             parent: Some(self.clone()),
             disposers: None,
             with_obj: None,
+            module_imports: None,
         })))
     }
 
@@ -91,6 +101,29 @@ impl Scope {
     #[must_use]
     pub fn with_obj(&self) -> Option<NanBox> {
         self.0.borrow().with_obj
+    }
+
+    /// Records this frame as a module's top-level scope carrying `imports` (its
+    /// import-alias table). Set once, at link time.
+    #[allow(clippy::type_complexity)]
+    pub fn set_module_imports(&self, imports: Rc<BTreeMap<String, (Scope, String)>>) {
+        self.0.borrow_mut().module_imports = Some(imports);
+    }
+
+    /// The import-alias table of the nearest enclosing module scope (this frame or
+    /// an ancestor), or `None` if this scope chain is not inside a module — used to
+    /// restore `module_imports` when a module function runs (so a named import read
+    /// inside it resolves even when it is called from another module).
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn module_imports(&self) -> Option<Rc<BTreeMap<String, (Scope, String)>>> {
+        let data = self.0.borrow();
+        if let Some(mi) = &data.module_imports {
+            return Some(mi.clone());
+        }
+        let parent = data.parent.clone();
+        drop(data);
+        parent.and_then(|p| p.module_imports())
     }
 
     /// Declares (or redeclares) `name` in *this* scope.

@@ -677,7 +677,11 @@ impl<'a> Interp<'a> {
 
         let aliases = Rc::new(aliases);
         if let Some(r) = self.modules.records.get_mut(key) {
-            r.import_aliases = aliases;
+            r.import_aliases = aliases.clone();
+            // Tag the module's top-level scope with its imports so a function
+            // defined here restores the right aliases when it runs (even when
+            // called from another module) — see `Scope::module_imports`.
+            r.scope.set_module_imports(aliases);
         }
         // Instantiate this module's top-level function declarations into its
         // scope *now*, at link time (the spec's InitializeEnvironment step). A
