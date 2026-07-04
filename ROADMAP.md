@@ -434,11 +434,15 @@ returns a stable slot index the host holds across calls, `persistent(idx)` reads
 it back (reflecting relocation), `release_persistent(idx)` frees it — backed by a
 `host_persistent` table that is both a GC root and forwarded on compaction, so a
 pinned value survives collection and stays valid when the moving collector relocates
-it (never exposing a raw `Handle`). See `examples/embed_host_fn.rs`. **Remaining
-for §4.0:** host-backed exotic objects carrying opaque native state **+
-finalizers**, the **C ABI** mirror, the async *continuation* half (a `Resolver`
-the host settles later, now unblocked by the handle scope), `nbvm`
-host-native fault-through, and migrating a sentinel builtin onto the registry.
+it (never exposing a raw `Handle`). **Async continuation has landed** on top of
+it: `Ctx::deferred()` returns a promise plus a token, and
+`Interp::resolve_deferred`/`reject_deferred(token, value)` settle it later from a
+host timer/IO completion and drain the microtask queue — the capability's
+resolve/reject are pinned (persistent) until settled. See
+`examples/embed_host_fn.rs`. **Remaining for §4.0:** host-backed exotic objects
+carrying opaque native state **+ finalizers** (GC-sweep integration), the **C
+ABI** mirror, `nbvm` host-native fault-through (only reachable once the VM is the
+primary path), and migrating a sentinel builtin onto the registry.
 
 ### 4.1 Event loop & scheduling
 
