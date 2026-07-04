@@ -2177,6 +2177,15 @@ impl<'a> Interp<'a> {
         key_name: &str,
         value: NanBox,
     ) -> Result<(), ExecError> {
+        // A **proxy** performs its own `[[Set]]` (the `set` trap, or trapless
+        // forwarding to the target with the proxy as receiver); the ordinary
+        // data-write gate below inspects the proxy *cell* — which has no own keys
+        // and reads as non-extensible — so it would wrongly reject every write
+        // (e.g. `Object.assign(new Proxy({},{}), {x:1})`). Delegate straight to
+        // `[[Set]]`, which enforces the real invariants.
+        if self.realm.proxy_at(target).is_some() {
+            return self.assign_member_value(target, key_box, value);
+        }
         // An own accessor takes precedence: its setter runs (and a frozen object's
         // accessor is still writable through the setter), so delegate without the
         // data-write gate. The `[[Set]]` path itself rejects a getter-only accessor.

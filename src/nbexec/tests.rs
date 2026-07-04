@@ -5764,3 +5764,26 @@ fn proxy_reflect_ownkeys_trapless_forwards() {
         r#"["x","y"]"#
     );
 }
+
+#[test]
+fn proxy_as_set_target_delegates() {
+    // Object.assign onto a trap-less proxy target forwards writes to the target
+    // (was throwing "object is not extensible" from the cell-level gate).
+    assert_eq!(
+        run("var p=new Proxy({},{});Object.assign(p,{x:1,y:2});p.x+','+p.y"),
+        "1,2"
+    );
+    // A set trap on the target fires (receiver forwarding aside).
+    assert_eq!(
+        run(
+            "var log=[];var p=new Proxy({},{set(t,k,v,r){log.push(k);t[k]=v;return true;}});\
+             Object.assign(p,{a:1,b:2});log.join(',')"
+        ),
+        "a,b"
+    );
+    // A genuinely frozen (non-proxy) target still throws.
+    assert_eq!(
+        run("try{Object.assign(Object.freeze({}),{x:1});'no'}catch(e){e instanceof TypeError}"),
+        "true"
+    );
+}

@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proxy's `[[GetOwnProperty]]` — both previously returned `{}` (ROADMAP §3.7).
 - *(proxy)* `Reflect.ownKeys` on a trap-less proxy forwards `[[OwnPropertyKeys]]`
   to the target instead of returning `[]` (ROADMAP §3.7).
+- *(proxy)* a proxy used as a write *target* (`Object.assign(new Proxy({},{}),
+  …)`) runs its own `[[Set]]` (set trap / trapless forward) instead of the
+  cell-level extensibility gate wrongly throwing "object is not extensible"
+  (ROADMAP §3.6).
 
 ## [0.0.6](https://github.com/KarpelesLab/kataan/compare/v0.0.5...v0.0.6) - 2026-07-04
 
