@@ -7114,3 +7114,17 @@ fn live_typed_array_iteration() {
         "1,2,3"
     );
 }
+
+#[test]
+fn annexb_html_like_comments() {
+    // Annex B B.1.3: `<!--` opens a single-line comment anywhere; `-->` opens one
+    // at a line start (or input start). `x-->0` (postfix decrement) is unaffected.
+    assert_eq!(run("var y=1; <!-- comment\ny+5"), "6");
+    assert_eq!(run("var z=10;\n--> comment\nz*2"), "20");
+    assert_eq!(run("--> leading comment\n42"), "42");
+    assert_eq!(run("var x=3; (x-->0)+','+x"), "true,2");
+    assert_eq!(run("var a=5; (a --> 0)+','+a"), "true,4");
+    assert_eq!(run("var q=1;<!--\nq=99;\nq"), "99");
+    assert_eq!(run("1 // c\n+2"), "3");
+    assert_eq!(run("1 /* c */ +2"), "3");
+}

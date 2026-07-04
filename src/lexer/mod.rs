@@ -265,6 +265,30 @@ impl<'src> Lexer<'src> {
                     Some(b'*') => newline |= self.skip_block_comment()?,
                     _ => return Ok(newline),
                 },
+                // Annex B B.1.3 HTML-like comments (script/web reality). `<!--`
+                // opens a single-line comment anywhere; `-->` opens one only at a
+                // *line start* — a line terminator (tracked by `newline`) or the
+                // input start (no significant token yet) precedes it, so `x-->0`
+                // (postfix `--` then `>`) is unaffected.
+                b'<' if self.peek_at(1) == Some(b'!')
+                    && self.peek_at(2) == Some(b'-')
+                    && self.peek_at(3) == Some(b'-') =>
+                {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    self.skip_rest_of_line();
+                }
+                b'-' if (newline || self.prev_significant.is_none())
+                    && self.peek_at(1) == Some(b'-')
+                    && self.peek_at(2) == Some(b'>') =>
+                {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    self.skip_rest_of_line();
+                }
                 // Non-ASCII whitespace / line terminators (NBSP, BOM, U+2028,
                 // U+2029, the Zs category…). Decode one char to classify.
                 _ if c >= 0x80 => {
@@ -287,6 +311,12 @@ impl<'src> Lexer<'src> {
         // Consume `//` then everything up to (not including) a line terminator.
         self.advance();
         self.advance();
+        self.skip_rest_of_line();
+    }
+
+    /// Consumes everything up to (not including) the next line terminator — the
+    /// shared body of `//` and the Annex B `<!--` / `-->` HTML-like comments.
+    fn skip_rest_of_line(&mut self) {
         while let Some(c) = self.peek() {
             if c == b'\n' || c == b'\r' {
                 break;
