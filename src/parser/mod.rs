@@ -101,7 +101,13 @@ impl<'src> Parser<'src> {
     /// Creates a parser over `source`, tokenizing it up front. Returns a
     /// lexical [`Error`] if the source does not tokenize.
     pub fn new(source: &'src str) -> Result<Self> {
-        let tokens = Lexer::new(source).tokenize()?;
+        Self::with_goal(source, false)
+    }
+
+    /// Like [`Parser::new`] but for the given goal — a `module` parser lexes
+    /// without the script-only Annex B HTML-like comments.
+    pub fn with_goal(source: &'src str, module: bool) -> Result<Self> {
+        let tokens = Lexer::with_goal(source, module).tokenize()?;
         Ok(Self {
             source,
             tokens,

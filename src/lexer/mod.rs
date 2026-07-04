@@ -94,12 +94,23 @@ pub struct Lexer<'src> {
     /// Set while scanning an identifier (or private name) that contained a
     /// `\u` escape; consumed and cleared by [`Lexer::make`].
     cur_had_escape: bool,
+    /// Whether the source is being lexed as a **Module** (vs a Script). Annex B
+    /// HTML-like comments (`<!--`/`-->`) are a script-only web-compat feature and
+    /// are NOT recognized in module code.
+    module: bool,
 }
 
 impl<'src> Lexer<'src> {
-    /// Creates a lexer over `source`.
+    /// Creates a lexer over `source` (Script goal — Annex B HTML comments on).
     #[must_use]
     pub fn new(source: &'src str) -> Self {
+        Self::with_goal(source, false)
+    }
+
+    /// Creates a lexer over `source` for the given goal (`module` disables the
+    /// script-only Annex B HTML-like comments).
+    #[must_use]
+    pub fn with_goal(source: &'src str, module: bool) -> Self {
         Self {
             source,
             bytes: source.as_bytes(),
@@ -109,6 +120,7 @@ impl<'src> Lexer<'src> {
             last_rbrace_closed_block: false,
             func_stmt_stack: Vec::new(),
             cur_had_escape: false,
+            module,
         }
     }
 
@@ -270,7 +282,8 @@ impl<'src> Lexer<'src> {
                 // *line start* — a line terminator (tracked by `newline`) or the
                 // input start (no significant token yet) precedes it, so `x-->0`
                 // (postfix `--` then `>`) is unaffected.
-                b'<' if self.peek_at(1) == Some(b'!')
+                b'<' if !self.module
+                    && self.peek_at(1) == Some(b'!')
                     && self.peek_at(2) == Some(b'-')
                     && self.peek_at(3) == Some(b'-') =>
                 {
@@ -280,7 +293,8 @@ impl<'src> Lexer<'src> {
                     self.advance();
                     self.skip_rest_of_line();
                 }
-                b'-' if (newline || self.prev_significant.is_none())
+                b'-' if !self.module
+                    && (newline || self.prev_significant.is_none())
                     && self.peek_at(1) == Some(b'-')
                     && self.peek_at(2) == Some(b'>') =>
                 {

@@ -114,7 +114,7 @@ impl<'src> Parser<'src> {
     /// # Errors
     /// Returns a parse-phase `SyntaxError` on malformed input.
     pub fn parse_module(source: &'src str) -> Result<Program> {
-        let mut p = Parser::new(source)?;
+        let mut p = Parser::with_goal(source, true)?;
         // The module body is the outermost async context, so top-level `await`
         // is an operator (not an identifier).
         p.in_async = true;

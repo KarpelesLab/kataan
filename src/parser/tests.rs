@@ -1377,3 +1377,19 @@ fn private_name_only_valid_as_in_lhs() {
     // An undeclared private name in the (otherwise legal) `in` LHS still errors.
     assert!(Parser::parse_program("class C { m(o){ return #nope in o; } }").is_err());
 }
+
+#[test]
+fn html_comments_are_script_only() {
+    use crate::parser::Parser;
+    // Script goal: `<!--` opens a comment, so the statement is just `x`.
+    assert!(Parser::parse_program("x <!-- comment\n").is_ok());
+    // Script goal: `-->` at a line start opens a comment.
+    assert!(Parser::parse_program("-->\nx").is_ok());
+    // Module goal: HTML-like comments are NOT recognized. `x <!-- y` lexes as
+    // `x < ! -- y` (a valid-ish expression sequence), NOT a comment, so a token
+    // that would only parse under the comment interpretation fails.
+    // `-->` at the top of a module is `-- > ...` → a parse error (no operand).
+    assert!(Parser::parse_module("--> x").is_err());
+    // A script accepts the same `-->` line as a comment.
+    assert!(Parser::parse_program("--> x").is_ok());
+}
