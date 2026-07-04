@@ -945,31 +945,15 @@ impl<'a> Interp<'a> {
                 NanBox::boolean(self.delete_property_of(target, &key)?)
             }
             N_REFLECT_OWN_KEYS => {
-                // String keys (integer-indexed then insertion order), then own
-                // symbol keys — matching `[[OwnPropertyKeys]]`.
+                // `[[OwnPropertyKeys]]`: String keys (integer-indexed then
+                // insertion order) then own symbol keys. `own_property_keys_values`
+                // drives a proxy's `ownKeys` trap — or, for a trapless proxy,
+                // forwards to the target — where the raw cell has no physical keys.
                 let h = self.reflect_object_target(arg(0), "ownKeys")?;
                 #[cfg(all(feature = "module", feature = "std"))]
                 self.force_deferred_namespace(h)?;
-                // A proxy drives `[[OwnPropertyKeys]]` through its `ownKeys` trap.
-                if let Some(keys) = self.proxy_own_keys_raw(h)? {
-                    return Ok(NanBox::handle(self.realm.new_array(keys).to_raw()));
-                }
-                let mut boxed = Vec::new();
-                {
-                    for k in self.realm.own_property_names(h).unwrap_or_default() {
-                        boxed.push(self.new_str(&k));
-                    }
-                    // All own symbol keys (including non-enumerable ones) come last.
-                    for k in self.realm.object_all_keys(h) {
-                        if let Some(idstr) = k.strip_prefix("\u{0}sym:")
-                            && let Ok(id) = idstr.parse::<u64>()
-                            && let Some(sh) = self.realm.symbol_for_id(id)
-                        {
-                            boxed.push(NanBox::handle(sh.to_raw()));
-                        }
-                    }
-                }
-                NanBox::handle(self.realm.new_array(boxed).to_raw())
+                let keys = self.own_property_keys_values(h)?;
+                NanBox::handle(self.realm.new_array(keys).to_raw())
             }
             // `Reflect.defineProperty(obj, key, desc)` → bool.
             N_REFLECT_DEFINE_PROP => {

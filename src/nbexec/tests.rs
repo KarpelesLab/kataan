@@ -5744,3 +5744,23 @@ fn proxy_json_and_descriptors() {
         r#"{"a":{"value":1,"writable":true,"enumerable":true,"configurable":true}}"#
     );
 }
+
+#[test]
+fn proxy_reflect_ownkeys_trapless_forwards() {
+    // Reflect.ownKeys on a trap-less proxy forwards [[OwnPropertyKeys]] to the
+    // target (was returning []).
+    assert_eq!(
+        run("JSON.stringify(Reflect.ownKeys(new Proxy({a:1,b:2},{})))"),
+        r#"["a","b"]"#
+    );
+    // An array proxy reports indices then "length".
+    assert_eq!(
+        run("JSON.stringify(Reflect.ownKeys(new Proxy([9,8],{})))"),
+        r#"["0","1","length"]"#
+    );
+    // A defined ownKeys trap still drives the result.
+    assert_eq!(
+        run("JSON.stringify(Reflect.ownKeys(new Proxy({a:1},{ownKeys(){return ['x','y'];}})))"),
+        r#"["x","y"]"#
+    );
+}
