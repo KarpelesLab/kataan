@@ -428,11 +428,16 @@ constructable — `new HostCtor(...)` binds a fresh `this` (its `[[Prototype]]` 
 the auto-created `HostCtor.prototype`), runs the closure, and applies the
 constructor return rule, so `instanceof` and prototype methods work. A **panic in
 host code is trapped** at the boundary (`catch_unwind`, std) and surfaces as a
-catchable JS `Error` rather than unwinding across engine frames. See
-`examples/embed_host_fn.rs`. **Remaining for §4.0:** a rooted **handle scope**
-(host values held across calls), host-backed exotic objects carrying opaque
-native state **+ finalizers**, the **C ABI** mirror, the async *continuation* half
-(a `Resolver` the host settles later from a timer/IO completion), `nbvm`
+catchable JS `Error` rather than unwinding across engine frames. The rooted
+**handle scope has landed** (§6's one hard constraint): `Ctx::persist(value)`
+returns a stable slot index the host holds across calls, `persistent(idx)` reads
+it back (reflecting relocation), `release_persistent(idx)` frees it — backed by a
+`host_persistent` table that is both a GC root and forwarded on compaction, so a
+pinned value survives collection and stays valid when the moving collector relocates
+it (never exposing a raw `Handle`). See `examples/embed_host_fn.rs`. **Remaining
+for §4.0:** host-backed exotic objects carrying opaque native state **+
+finalizers**, the **C ABI** mirror, the async *continuation* half (a `Resolver`
+the host settles later, now unblocked by the handle scope), `nbvm`
 host-native fault-through, and migrating a sentinel builtin onto the registry.
 
 ### 4.1 Event loop & scheduling
