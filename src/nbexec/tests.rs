@@ -6157,3 +6157,76 @@ fn reflect_set_trapless_chain_to_ordinary_getter_only() {
         "1"
     );
 }
+
+#[test]
+fn promise_subclass_construction_and_statics() {
+    // `class P extends Promise {}`: super(executor) runs the executor with a
+    // callable resolve/reject and gives the instance promise state (via a hidden
+    // backing-cell slot), so construction, static combinators, then/catch, and
+    // await all work.
+    assert_eq!(
+        run(
+            "class P extends Promise{};var g=[];new P((res,rej)=>{g.push(typeof res,typeof rej)});g.join(',')"
+        ),
+        "function,function"
+    );
+    assert_eq!(
+        run("class P extends Promise{};P.resolve(1) instanceof P"),
+        "true"
+    );
+    assert_eq!(
+        run("class P extends Promise{};P.all([]) instanceof P"),
+        "true"
+    );
+    assert_eq!(
+        run("class P extends Promise{};P.race([P.resolve(1)]) instanceof P"),
+        "true"
+    );
+    assert_eq!(
+        run("class P extends Promise{};P.allSettled([]) instanceof P"),
+        "true"
+    );
+    // A non-callable executor is a TypeError.
+    assert_eq!(
+        run("class P extends Promise{};try{new P(5);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    // Plain Promise unaffected.
+    assert_eq!(run("Promise.resolve(1) instanceof Promise"), "true");
+}
+
+#[test]
+fn promise_subclass_async_delivery() {
+    // Resolution/rejection/await on a subclass promise deliver values through the
+    // microtask queue (observed via console.log output after the drain).
+    let out = |src: &str| {
+        let program = Parser::parse_program(src).expect("parse");
+        let mut interp = Interp::new();
+        interp.run(&program).expect("exec");
+        String::from(interp.output())
+    };
+    assert_eq!(
+        out("class P extends Promise{};P.resolve(5).then(x=>console.log('r:'+x));"),
+        "r:5\n"
+    );
+    assert_eq!(
+        out("class P extends Promise{};new P(res=>res(10)).then(x=>console.log('n:'+x));"),
+        "n:10\n"
+    );
+    assert_eq!(
+        out("class P extends Promise{};P.reject('e').catch(x=>console.log('c:'+x));"),
+        "c:e\n"
+    );
+    assert_eq!(
+        out(
+            "class P extends Promise{};(async()=>{var v=await P.resolve(99);console.log('a:'+v);})();"
+        ),
+        "a:99\n"
+    );
+    assert_eq!(
+        out(
+            "class P extends Promise{};P.all([P.resolve(1),P.resolve(2)]).then(a=>console.log('all:'+a));"
+        ),
+        "all:1,2\n"
+    );
+}

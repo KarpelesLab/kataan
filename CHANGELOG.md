@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(promise)* `class P extends Promise {}` subclassing — `super(executor)` now
+  runs the executor and backs the (ordinary-object) subclass instance with a
+  hidden `[[PromiseState]]` cell that `promise_state` follows, so construction,
+  the static combinators (`P.resolve`/`all`/`race`/`allSettled`/…), `then`/`catch`,
+  `await`, and microtask delivery all work on a subclass instance (a non-callable
+  executor is a TypeError). Species-based `.then` chaining is still pending
+  (ROADMAP §3.6 Promise).
+
 ### Fixed
 
 - *(string)* `String.prototype.split` runs `ToString(separator)` before the

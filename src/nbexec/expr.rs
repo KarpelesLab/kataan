@@ -770,7 +770,7 @@ impl<'a> Interp<'a> {
                     } else if let Some(nid) = self.pending_super_native {
                         // `super(...)` reaching a native constructor (`extends Error`).
                         if let Some(h) = inst {
-                            self.apply_native_super(nid, h, &args);
+                            self.apply_native_super(nid, h, &args)?;
                         }
                         None
                     } else if let Some(fnp) = self.pending_super_fn {

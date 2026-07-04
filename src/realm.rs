@@ -38,6 +38,13 @@ use crate::shape::Shape;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
+/// Hidden `[[PromiseState]]` slot for a **Promise subclass** instance
+/// (`class P extends Promise`): its value is the handle of the backing
+/// `Cell::Promise` that carries the real settlement state, which
+/// [`Realm::promise_state`] follows so every promise operation works on the
+/// subclass instance. `\u{0}`-prefixed like every other internal slot key.
+pub(crate) const PROMISE_STATE_SLOT: &str = "\u{0}PromiseState";
+
 /// Bytes-per-element for each typed-array `kind` (index into the engine's
 /// `TYPED_ARRAY_KINDS` table: Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32,
 /// Uint32, Float32, Float64, BigInt64, BigUint64). A `kind` outside the table
@@ -1397,13 +1404,24 @@ impl Realm {
             ))))
     }
 
-    /// The shared promise state at `handle`, if it is a promise.
+    /// The shared promise state at `handle`, if it is a promise — or a **Promise
+    /// subclass** instance (`class P extends Promise`), whose backing
+    /// `Cell::Promise` is stored in the hidden [`PROMISE_STATE_SLOT`] so every
+    /// promise operation (then/resolve/reject/combinators/microtasks) works on it.
     #[must_use]
     pub fn promise_state(
         &self,
         handle: Handle,
     ) -> Option<alloc::rc::Rc<core::cell::RefCell<crate::cell::PromiseState>>> {
-        self.heap.get(handle)?.as_promise().cloned()
+        if let Some(p) = self.heap.get(handle)?.as_promise() {
+            return Some(p.clone());
+        }
+        // A subclass instance: follow the internal slot to its backing promise cell.
+        let inner = self.get_property(handle, PROMISE_STATE_SLOT)?.as_handle()?;
+        self.heap
+            .get(Handle::from_raw(inner))?
+            .as_promise()
+            .cloned()
     }
 
     /// The string at `handle` as a `String`, or `None` if it is not a string

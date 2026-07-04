@@ -2652,24 +2652,64 @@ impl<'a> Interp<'a> {
     /// Builds an error object `{ name, message }` for the constructor `id`.
     /// Applies a native superclass constructor's effect to `instance` for
     /// `super(...)` in a class that `extends` a native (e.g. `extends Error`).
-    pub(crate) fn apply_native_super(&mut self, native_id: u16, instance: Handle, args: &[NanBox]) {
+    pub(crate) fn apply_native_super(
+        &mut self,
+        native_id: u16,
+        instance: Handle,
+        args: &[NanBox],
+    ) -> Result<(), ExecError> {
         // `class S extends DisposableStack {}` (or the async variant): `super()`
         // stamps the internal-slot brand + an empty disposer list and
         // `disposed = false` onto the (already-allocated, class-proto-linked)
         // instance object — the analog of the native `construct_*` initialization.
         if native_id == N_DISPOSABLE_STACK || native_id == N_ASYNC_DISPOSABLE_STACK {
             self.init_disposable_stack_super(native_id == N_ASYNC_DISPOSABLE_STACK, instance);
-            return;
+            return Ok(());
         }
         // `class S extends ShadowRealm {}`: brand + allocate the persistent scope.
         if native_id == N_SHADOW_REALM {
             self.init_shadow_realm_super(instance);
-            return;
+            return Ok(());
         }
         // `class S extends SuppressedError {}`: apply error/suppressed/message.
         if native_id == N_SUPPRESSED_ERROR {
             self.init_suppressed_error_super(instance, args);
-            return;
+            return Ok(());
+        }
+        // `class P extends Promise {}`: `super(executor)` initializes the promise
+        // machinery on the (already class-proto-linked) instance. The instance is
+        // an ordinary object, so it can't hold the `Rc<PromiseState>` directly —
+        // back it with a fresh `Cell::Promise` stored in a hidden `[[PromiseState]]`
+        // slot that `Realm::promise_state` follows, then bind resolve/reject to the
+        // backing cell and run the executor (a throw rejects, per the spec).
+        if native_id == N_PROMISE {
+            let executor = args.first().copied().unwrap_or(NanBox::undefined());
+            if !self.is_callable_value(executor) {
+                return Err(self.type_error("Promise executor is not a function"));
+            }
+            let backing = self.fresh_promise();
+            self.realm.set_hidden_property(
+                instance,
+                crate::realm::PROMISE_STATE_SLOT,
+                NanBox::handle(backing.to_raw()),
+            );
+            let resolve = self.realm.new_bound_native(N_RESOLVE, backing);
+            let reject = self.realm.new_bound_native(N_REJECT, backing);
+            self.install_fn_name_length(resolve, "", 1);
+            self.install_fn_name_length(reject, "", 1);
+            let r = self.call(
+                executor,
+                &[
+                    NanBox::handle(resolve.to_raw()),
+                    NanBox::handle(reject.to_raw()),
+                ],
+            );
+            if let Err(ExecError::Throw(e)) = r {
+                self.settle(backing, e, false);
+            } else {
+                r?;
+            }
+            return Ok(());
         }
         // Error family: set `message` and the default `name` (a `this.name = …`
         // after `super()` may override it).
@@ -2706,6 +2746,7 @@ impl<'a> Interp<'a> {
                 self.realm.mark_hidden(instance, "cause");
             }
         }
+        Ok(())
     }
 
     /// Sorts `elems` with a JS comparator (a negative result orders `a` before

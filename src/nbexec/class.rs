@@ -1147,7 +1147,7 @@ impl<'a> Interp<'a> {
                     // `super(...args)` into the native constructor, so e.g. the
                     // error message is forwarded.
                     if let Some(nid) = native_parent {
-                        self.apply_native_super(nid, instance, args);
+                        self.apply_native_super(nid, instance, args)?;
                         self.init_instance_fields(class_id, instance)?;
                         Ok(None)
                     } else if let Some(fnp) = fn_parent {
