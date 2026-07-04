@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `then`/`catch` produce subclass instances via SpeciesConstructor (an explicit
   `@@species` override is still honored) (ROADMAP §3.6 Promise).
 
+### Changed
+
+- *(bignum)* `BigInt` is now backed by [`puremp`](https://crates.io/crates/puremp)
+  (the Karpelès Lab pure-Rust multi-precision maths crate) instead of the
+  in-house arbitrary-precision integer: `src/bignum.rs` is a thin wrapper
+  (`pub struct BigInt(puremp::Int)`) preserving the prior API, so `Cell::BigInt`
+  and every call site are unchanged. Added `default-features = false,
+  features = ["int"]` (no_std + `alloc`, MSRV 1.88). Truncated `div_rem`,
+  two's-complement bit ops, `mod_2k` (BigInt64Array wrapping), and `write_radix`
+  map directly; verified against the full bignum test module and the BigInt
+  Test262 semantics (ROADMAP §8).
+
 ### Fixed
 
 - *(array)* `Array.prototype.sort` runs the spec-precise `SortIndexedProperties`
