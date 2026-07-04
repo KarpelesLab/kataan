@@ -5787,3 +5787,41 @@ fn proxy_as_set_target_delegates() {
         "true"
     );
 }
+
+#[test]
+fn proxy_reflect_set_receiver_semantics() {
+    // The canonical passthrough set trap `set(t,k,v,r){return Reflect.set(t,k,v,r)}`
+    // (receiver = the proxy) writes to the target via [[DefineOwnProperty]] on the
+    // receiver, without recursing into the set trap.
+    assert_eq!(
+        run("var q=new Proxy({},{set(t,k,v,r){return Reflect.set(t,k,v,r);}});q.z=9;q.z"),
+        "9"
+    );
+    assert_eq!(
+        run(
+            "var n=0;var p=new Proxy({},{set(t,k,v,r){n++;return Reflect.set(t,k,v,r);}});\
+             p.a=1;p.a+','+n"
+        ),
+        "1,1"
+    );
+    // Reflect.set on a proxy target (receiver defaults to the proxy) works.
+    assert_eq!(run("var p=new Proxy({},{});Reflect.set(p,'x',5);p.x"), "5");
+    // An ordinary receiver still receives the write.
+    assert_eq!(run("var o={};Reflect.set({},'k',7,o);o.k"), "7");
+    // A non-writable data property on the target rejects the receiver write.
+    assert_eq!(
+        run(
+            "var t={};Object.defineProperty(t,'r',{value:1,writable:false});\
+             var p=new Proxy(t,{});Reflect.set(t,'r',2,p)"
+        ),
+        "false"
+    );
+    // A setter found on the chain runs with the receiver as `this`.
+    assert_eq!(
+        run(
+            "var got;var p;var t={set v(x){got=(this===p);}};p=new Proxy(t,{});\
+             Reflect.set(t,'v',3,p);got"
+        ),
+        "true"
+    );
+}

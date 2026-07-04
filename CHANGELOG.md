@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   …)`) runs its own `[[Set]]` (set trap / trapless forward) instead of the
   cell-level extensibility gate wrongly throwing "object is not extensible"
   (ROADMAP §3.6).
+- *(proxy)* `Reflect.set` with a **proxy receiver** — the ubiquitous passthrough
+  `set(t,k,v,r){ return Reflect.set(t,k,v,r) }` — now writes to the receiver via
+  `[[DefineOwnProperty]]` per OrdinarySetWithOwnDescriptor (not `[[Set]]`, which
+  recursed / hit the cell gate), so the write persists; non-writable/accessor
+  targets reject and an ordinary receiver is unchanged (ROADMAP §3.6).
 
 ## [0.0.6](https://github.com/KarpelesLab/kataan/compare/v0.0.5...v0.0.6) - 2026-07-04
 

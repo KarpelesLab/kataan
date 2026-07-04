@@ -916,13 +916,56 @@ impl<'a> Interp<'a> {
                         }
                         cur = self.realm.object_proto(c);
                     }
-                    // No setter: write the data property on the receiver (via
-                    // `assign_member_value`, so array indices/`length` behave right).
+                    // No setter: write the data property on the receiver.
                     // A disallowed write (read-only / non-extensible) returns false.
                     let Some(rh) = receiver.as_handle() else {
                         return Ok(NanBox::boolean(false));
                     };
                     let rh = Handle::from_raw(rh);
+                    // A **proxy** receiver: the cell-level `can_write_property` gate
+                    // reads it as non-extensible and would reject every write, so
+                    // route through the proxy protocol per OrdinarySetWithOwnDescriptor.
+                    if self.realm.proxy_at(rh).is_some() {
+                        if receiver.as_handle() == Some(h.to_raw()) {
+                            // receiver == target: `[[Set]]` on the proxy *is* the
+                            // set trap (or trapless forward).
+                            self.assign_member_value(rh, arg(1), value)?;
+                            return Ok(NanBox::boolean(true));
+                        }
+                        // receiver != target (the canonical passthrough
+                        // `set(t,k,v,r){ Reflect.set(t,k,v,r) }`): the write goes to
+                        // the receiver via `[[DefineOwnProperty]]` (CreateDataProperty
+                        // / value update) — NOT `[[Set]]`, which would re-enter the
+                        // set trap and recurse forever.
+                        let existing = self.descriptor_of(rh, &key)?;
+                        let desc = self.realm.new_object();
+                        self.realm.set_property(desc, "value", value);
+                        if let Some(dh) = existing.as_handle().map(Handle::from_raw) {
+                            // An existing accessor, or a non-writable data property,
+                            // rejects the set.
+                            let is_accessor = self.realm.get_property(dh, "get").is_some()
+                                || self.realm.get_property(dh, "set").is_some();
+                            let writable = self
+                                .realm
+                                .get_property(dh, "writable")
+                                .is_some_and(|v| self.realm.truthy(v));
+                            if is_accessor || !writable {
+                                return Ok(NanBox::boolean(false));
+                            }
+                            // Update just the value (leave the other attributes).
+                        } else {
+                            // CreateDataProperty: value + writable/enumerable/
+                            // configurable = true.
+                            self.realm
+                                .set_property(desc, "writable", NanBox::boolean(true));
+                            self.realm
+                                .set_property(desc, "enumerable", NanBox::boolean(true));
+                            self.realm
+                                .set_property(desc, "configurable", NanBox::boolean(true));
+                        }
+                        let ok = self.apply_descriptor(rh, &key, desc, true)?;
+                        return Ok(NanBox::boolean(ok));
+                    }
                     if !self.can_write_property(rh, &key) {
                         return Ok(NanBox::boolean(false));
                     }
