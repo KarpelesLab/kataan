@@ -1745,17 +1745,19 @@ impl<'a> Interp<'a> {
             let tzv = self.new_str(&tzd);
             self.realm.set_property(out, "trailingZeroDisplay", tzv);
         } else {
-            // DateTimeFormat resolvedOptions.
-            let ns = get_str(self, "numberingSystem").unwrap_or_else(|| String::from("latn"));
-            let nsv = self.new_str(&ns);
-            self.realm.set_property(out, "numberingSystem", nsv);
+            // DateTimeFormat resolvedOptions — property order per spec:
+            // locale, calendar, numberingSystem, timeZone, hourCycle, hour12,
+            // weekday, era, year, month, day, dayPeriod, hour, minute, second,
+            // fractionalSecondDigits, timeZoneName, then dateStyle/timeStyle.
             let cal = get_str(self, "calendar").unwrap_or_else(|| String::from("gregory"));
             let cv = self.new_str(&cal);
             self.realm.set_property(out, "calendar", cv);
+            let ns = get_str(self, "numberingSystem").unwrap_or_else(|| String::from("latn"));
+            let nsv = self.new_str(&ns);
+            self.realm.set_property(out, "numberingSystem", nsv);
             let tz = get_str(self, "timeZone").unwrap_or_else(|| String::from("UTC"));
             let tzv = self.new_str(&tz);
             self.realm.set_property(out, "timeZone", tzv);
-            // Component options that were set, plus hourCycle/hour12.
             if let Some(hc) = get_str(self, "hourCycle") {
                 let v = self.new_str(&hc);
                 self.realm.set_property(out, "hourCycle", v);
@@ -1774,18 +1776,22 @@ impl<'a> Interp<'a> {
                 "hour",
                 "minute",
                 "second",
-                "timeZoneName",
-                "dateStyle",
-                "timeStyle",
             ] {
                 if let Some(v) = get_str(self, key) {
                     let vv = self.new_str(&v);
                     self.realm.set_property(out, key, vv);
                 }
             }
+            // fractionalSecondDigits precedes timeZoneName in the spec order.
             if let Some(v) = get_num(self, "fractionalSecondDigits") {
                 self.realm
                     .set_property(out, "fractionalSecondDigits", NanBox::number(v));
+            }
+            for key in ["timeZoneName", "dateStyle", "timeStyle"] {
+                if let Some(v) = get_str(self, key) {
+                    let vv = self.new_str(&v);
+                    self.realm.set_property(out, key, vv);
+                }
             }
         }
         NanBox::handle(out.to_raw())
