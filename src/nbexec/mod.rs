@@ -847,6 +847,30 @@ impl<'c, 'a> Ctx<'c, 'a> {
             .and_then(|h| self.interp.realm.own_property_names(h))
             .unwrap_or_default()
     }
+
+    /// A promise resolved with `value` (`Promise.resolve(value)`): an existing
+    /// promise is returned as-is and a thenable is adopted; any other value
+    /// fulfills the new promise. Lets an async host function hand JS a promise.
+    pub fn resolved_promise(&mut self, value: NanBox) -> NanBox {
+        let p = self.interp.promise_resolve(value);
+        NanBox::handle(p.to_raw())
+    }
+
+    /// A promise already rejected with `reason` (`Promise.reject(reason)`).
+    pub fn rejected_promise(&mut self, reason: NanBox) -> NanBox {
+        let p = self.interp.fresh_promise();
+        self.interp.settle(p, reason, false);
+        NanBox::handle(p.to_raw())
+    }
+
+    /// Whether `v` is a promise object (a genuine promise with `[[PromiseState]]`,
+    /// not merely a thenable).
+    #[must_use]
+    pub fn is_promise(&self, v: NanBox) -> bool {
+        v.as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| self.interp.realm.promise_state(h).is_some())
+    }
 }
 
 /// A queued promise reaction: run `handler` with `value`, then settle `result`

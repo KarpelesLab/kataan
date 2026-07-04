@@ -5563,6 +5563,38 @@ fn host_fn_property_api_has_delete_keys() {
 }
 
 #[test]
+fn host_fn_returns_promises() {
+    // A host fn returns a resolved / rejected promise; JS observes them via
+    // then/catch after the microtask drain, and is_promise inspects the value.
+    let mut interp = Interp::new();
+    interp.register_global_fn("asyncOk", 1, |cx, _t, args| {
+        let v = args.first().copied().unwrap_or(cx.undefined());
+        Ok(cx.resolved_promise(v))
+    });
+    interp.register_global_fn("asyncFail", 1, |cx, _t, args| {
+        let v = args.first().copied().unwrap_or(cx.undefined());
+        Ok(cx.rejected_promise(v))
+    });
+    interp.register_global_fn("isP", 1, |cx, _t, args| {
+        let v = args.first().copied().unwrap_or(cx.undefined());
+        Ok(cx.boolean(cx.is_promise(v)))
+    });
+    let program = Parser::parse_program(
+        "var log=[];\
+         asyncOk(7).then(v=>log.push('ok:'+v));\
+         asyncFail('bad').catch(e=>log.push('rej:'+e));\
+         log.push('sync:'+isP(asyncOk(1))+','+isP(5));\
+         log",
+    )
+    .expect("parse");
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(
+        interp.realm().to_display_string(v),
+        "sync:true,false,ok:7,rej:bad"
+    );
+}
+
+#[test]
 fn host_fn_throw_is_catchable() {
     let program =
         Parser::parse_program("try { boom(); 'no' } catch (e) { e.message }").expect("parse");
