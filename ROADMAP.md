@@ -8,12 +8,22 @@ foundations are summarized once (§1) and not re-litigated; everything after is
 forward-looking.
 
 > **Headline status (2026-07):** the official tc39/Test262 corpus (~53k tests)
-> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 93.1 %**
+> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 93.8 %**
 > of the ~44k *ran* tests (the ~9k skipped are Temporal / Atomics / agents /
 > cross-realm — see §3.9). **ES modules + dynamic `import()` now run** (the
 > module-flagged suite is no longer skipped — §3.1). The remaining headline
-> language gap is the **Intl services**; the long tail is per-builtin and
+> language gap is the **Intl services** (now mostly the CLDR locale-*data* output
+> in the external `intl` crate — the structure, subclassing, `formatRange`, and
+> many formatting behaviors are done); the long tail is per-builtin and
 > per-construct edges (§3).
+>
+> Recently converted (ledger-verified): the **live-iteration** cluster (Set/Map +
+> typed-array observe mutation mid-iteration), the **class element** cluster
+> (private-method timing, static-privates-not-inherited, class-name `const`),
+> **Annex B web-compat** (HTML comments + legacy octal in strings/regex),
+> **String exotic** own-property surface, **BigInt** on the reused `puremp`
+> backend, and full **subclassing** across the builtins (incl. Promise / ArrayBuffer /
+> WeakRef / AggregateError / Intl `NumberFormat`/`DateTimeFormat`).
 
 ---
 
@@ -263,7 +273,15 @@ binding), direct-eval variable/function declarations into the caller scope,
 
 ### 3.6 Builtin edges (the long per-object tail)
 
-Each is "works, but fails spec edges": **Array** (280 — array-like generic
+*Landed this cycle (ledger-verified):* the **Array** precise mutators
+(sort/reverse/copyWithin run `[[Get]]`/`[[Set]]`/`Delete` on hole/accessor
+arrays) + the index-arg **coercion** cluster (`ToIntegerOrInfinity` on
+splice/fill/flat/slice/toSpliced) + `C.from`/`C.fromAsync` dense storage;
+**String** exotic own-property surface (hasOwnProperty / `in` /
+propertyIsEnumerable / descriptors / for-in over index keys); **BigInt** primitive
+`[[Prototype]]`; **live** Set/Map/typed-array iteration; and much of **Proxy** §3.7.
+
+Each remaining is "works, but fails spec edges": **Array** (array-like generic
 algorithms, species, sort comparator/stability, copyWithin/splice on exotic
 receivers), **Object** (185 — descriptor/`defineProperty` corners, property
 enumeration order, `__proto__`), **RegExp** (204 — match/replace/split/`Symbol.*`
