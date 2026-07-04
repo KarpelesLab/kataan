@@ -7309,3 +7309,45 @@ fn intl_number_format_signdisplay_negative_zero() {
         "-5"
     );
 }
+
+#[test]
+fn intl_number_format_range() {
+    // formatRange formats each endpoint and joins with an en-dash; x===y collapses.
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US').formatRange(3,5)"),
+        "3\u{2013}5"
+    );
+    assert_eq!(run("new Intl.NumberFormat('en-US').formatRange(5,5)"), "5");
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).formatRange(3,5)"),
+        "$3.00\u{2013}$5.00"
+    );
+    // Both arguments are required and finite.
+    assert_eq!(
+        run("try{new Intl.NumberFormat('en').formatRange(NaN,5);'no'}catch(e){e.constructor.name}"),
+        "RangeError"
+    );
+    assert_eq!(
+        run(
+            "try{new Intl.NumberFormat('en').formatRange(1,undefined);'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    // Structural: length 2, name, not a constructor, brand-checked receiver.
+    assert_eq!(run("Intl.NumberFormat.prototype.formatRange.length"), "2");
+    assert_eq!(
+        run("Intl.NumberFormat.prototype.formatRange.name"),
+        "formatRange"
+    );
+    assert_eq!(
+        run(
+            "try{Intl.NumberFormat.prototype.formatRange.call({},1,2);'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    // formatRangeToParts tags each endpoint's source.
+    assert_eq!(
+        run("new Intl.NumberFormat('en').formatRangeToParts(3,5).map(x=>x.source).join('|')"),
+        "startRange|shared|endRange"
+    );
+}

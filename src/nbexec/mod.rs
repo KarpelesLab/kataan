@@ -862,6 +862,10 @@ const N_EVAL: u16 = 216;
 const N_INTL_RESOLVED_OPTIONS: u16 = 217;
 const N_INTL_SUPPORTED_LOCALES: u16 = 218;
 const N_INTL_FORMAT_TO_PARTS: u16 = 219;
+/// `Intl.NumberFormat/DateTimeFormat.prototype.formatRange(x, y)` and
+/// `formatRangeToParts(x, y)` (high, collision-free ids).
+const N_INTL_FORMAT_RANGE: u16 = 900;
+const N_INTL_FORMAT_RANGE_TO_PARTS: u16 = 901;
 /// A readable static method bound to a `[constructor, name]` pair (so a detached call
 /// still routes to the constructor's `call_method` static dispatch).
 const N_STATIC_METHOD: u16 = 220;

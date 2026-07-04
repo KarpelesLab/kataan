@@ -378,14 +378,24 @@ const INTL_SERVICES: &[IntlService] = &[
         ctor_id: N_INTL_NUMBER_FORMAT,
         tag: "Intl.NumberFormat",
         marker: "\u{0}brand_nf",
-        methods: &["resolvedOptions", "formatToParts"],
+        methods: &[
+            "resolvedOptions",
+            "formatToParts",
+            "formatRange",
+            "formatRangeToParts",
+        ],
         bound_accessor: Some(("format", "format")),
     },
     IntlService {
         ctor_id: N_INTL_DATETIME_FORMAT,
         tag: "Intl.DateTimeFormat",
         marker: "\u{0}brand_dtf",
-        methods: &["resolvedOptions", "formatToParts"],
+        methods: &[
+            "resolvedOptions",
+            "formatToParts",
+            "formatRange",
+            "formatRangeToParts",
+        ],
         bound_accessor: Some(("format", "format")),
     },
     IntlService {
@@ -455,6 +465,7 @@ fn intl_method_arity(ctor_id: u16, name: &str) -> u32 {
         (_, "resolvedOptions") => 0,
         (N_INTL_REL_TIME, "format" | "formatToParts") => 2,
         (N_INTL_PLURAL_RULES, "selectRange") => 2,
+        (_, "formatRange" | "formatRangeToParts") => 2,
         _ => 1,
     }
 }
@@ -466,6 +477,8 @@ impl<'a> Interp<'a> {
             "format" => N_INTL_FORMAT,
             "resolvedOptions" => N_INTL_RESOLVED_OPTIONS,
             "formatToParts" | "format_to_parts" => N_INTL_FORMAT_TO_PARTS,
+            "formatRange" => N_INTL_FORMAT_RANGE,
+            "formatRangeToParts" => N_INTL_FORMAT_RANGE_TO_PARTS,
             "compare" => N_INTL_COMPARE,
             "select" => N_INTL_PLURAL_SELECT,
             "selectRange" => N_INTL_PLURAL_SELECT_RANGE,
@@ -1645,6 +1658,85 @@ impl<'a> Interp<'a> {
         out.push_str(&grouped);
         out.push_str(&suffix);
         out
+    }
+
+    /// The `[[NumberFormat]]`/`[[DateTimeFormat]]` instance for a `formatRange`
+    /// call, plus its two coerced numeric endpoints. Per spec both `start`/`end`
+    /// are **required** (`undefined` → TypeError) and must not be `NaN`
+    /// (→ RangeError); a `start > end` is allowed. Returns `(instance, x, y)`.
+    fn intl_range_operands(
+        &mut self,
+        this: NanBox,
+        start: NanBox,
+        end: NanBox,
+    ) -> Result<(Handle, f64, f64), ExecError> {
+        let Some(inst) = this
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|h| self.realm.get_property(*h, "\u{0}intl").is_some())
+        else {
+            return Err(self.type_error("formatRange called on an incompatible receiver"));
+        };
+        if matches!(start.unpack(), Unpacked::Undefined)
+            || matches!(end.unpack(), Unpacked::Undefined)
+        {
+            return Err(self.type_error("formatRange requires two defined arguments"));
+        }
+        let x = self.coerce_to_number(start)?;
+        let y = self.coerce_to_number(end)?;
+        let (x, y) = (self.realm.to_number(x), self.realm.to_number(y));
+        if x.is_nan() || y.is_nan() {
+            let m = self.new_str("formatRange arguments must not be NaN");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok((inst, x, y))
+    }
+
+    /// `Intl.NumberFormat/DateTimeFormat.prototype.formatRange(x, y)`: formats each
+    /// endpoint and joins them with an en-dash range separator (a basic
+    /// `FormatNumericRange`; `x === y` collapses to the single formatted value).
+    pub(crate) fn intl_format_range(
+        &mut self,
+        this: NanBox,
+        start: NanBox,
+        end: NanBox,
+    ) -> Result<String, ExecError> {
+        let (inst, x, y) = self.intl_range_operands(this, start, end)?;
+        let fx = self.intl_format_value(inst, NanBox::number(x));
+        if x == y {
+            return Ok(fx);
+        }
+        let fy = self.intl_format_value(inst, NanBox::number(y));
+        Ok(alloc::format!("{fx}\u{2013}{fy}"))
+    }
+
+    /// `formatRangeToParts(x, y)` → an array of `{ type, value, source }` parts.
+    pub(crate) fn intl_format_range_to_parts(
+        &mut self,
+        this: NanBox,
+        start: NanBox,
+        end: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let (inst, x, y) = self.intl_range_operands(this, start, end)?;
+        let fx = self.intl_format_value(inst, NanBox::number(x));
+        let mut parts: Vec<(&str, String, &str)> = alloc::vec![("literal", fx, "startRange")];
+        if x != y {
+            let fy = self.intl_format_value(inst, NanBox::number(y));
+            parts.push(("literal", String::from("\u{2013}"), "shared"));
+            parts.push(("literal", fy, "endRange"));
+        }
+        let mut elems = Vec::with_capacity(parts.len());
+        for (ty, val, src) in parts {
+            let o = self.realm.new_object();
+            let tv = self.new_str(ty);
+            let vv = self.new_str(&val);
+            let sv = self.new_str(src);
+            self.realm.set_property(o, "type", tv);
+            self.realm.set_property(o, "value", vv);
+            self.realm.set_property(o, "source", sv);
+            elems.push(NanBox::handle(o.to_raw()));
+        }
+        Ok(NanBox::handle(self.realm.new_array(elems).to_raw()))
     }
 
     pub(crate) fn intl_format_value(&mut self, handle: Handle, value: NanBox) -> String {

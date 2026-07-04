@@ -2562,6 +2562,17 @@ impl<'a> Interp<'a> {
                     self.new_str(&s)
                 }
             }
+            // `nf.formatRange(x, y)` / `dtf.formatRange(x, y)` — a formatted numeric
+            // (or date) range. Both endpoints are required and must be finite.
+            N_INTL_FORMAT_RANGE => {
+                let this = self.this_val;
+                let s = self.intl_format_range(this, arg(0), arg(1))?;
+                self.new_str(&s)
+            }
+            N_INTL_FORMAT_RANGE_TO_PARTS => {
+                let this = self.this_val;
+                return self.intl_format_range_to_parts(this, arg(0), arg(1));
+            }
             // `nf.resolvedOptions()` — the resolved configuration of the formatter.
             N_INTL_RESOLVED_OPTIONS => {
                 let fmt = self.this_val.as_handle().map(Handle::from_raw);
