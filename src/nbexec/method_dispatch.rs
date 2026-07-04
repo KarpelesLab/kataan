@@ -4083,13 +4083,14 @@ impl<'a> Interp<'a> {
                 "toSpliced" => {
                     let len = elems.len() as i64;
                     let start = {
-                        let s = self.realm.to_number(arg(0)) as i64;
+                        let s = self.coerce_to_integer_or_infinity(arg(0))? as i64;
                         if s < 0 { (len + s).max(0) } else { s.min(len) }
                     } as usize;
                     let del = if args.len() < 2 {
                         elems.len() - start
                     } else {
-                        (self.realm.to_number(arg(1)).max(0.0) as usize).min(elems.len() - start)
+                        (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize)
+                            .min(elems.len() - start)
                     };
                     let mut out: Vec<NanBox> = elems[..start].to_vec();
                     out.extend_from_slice(&args[2.min(args.len())..]);

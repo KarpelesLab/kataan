@@ -6516,3 +6516,24 @@ fn slice_args_use_tointegerorinfinity() {
     assert_eq!(run("JSON.stringify([1,2,3,4].slice(1,3))"), "[2,3]");
     assert_eq!(run("JSON.stringify([1,2,3].slice())"), "[1,2,3]");
 }
+
+#[test]
+fn to_spliced_args_use_tointegerorinfinity() {
+    // toSpliced (dense path) coerces start/deleteCount via ToIntegerOrInfinity.
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4].toSpliced({valueOf:()=>1},1,'x'))"),
+        r#"[1,"x",3,4]"#
+    );
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4].toSpliced(0,{valueOf:()=>2}))"),
+        "[3,4]"
+    );
+    assert_eq!(
+        run("try{[1,2,3].toSpliced({valueOf:()=>{throw 't'}},1);'no'}catch(e){e}"),
+        "t"
+    );
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4].toSpliced(1,1,'x'))"),
+        r#"[1,"x",3,4]"#
+    );
+}
