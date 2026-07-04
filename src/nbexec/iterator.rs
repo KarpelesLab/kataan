@@ -1856,8 +1856,35 @@ impl<'a> Interp<'a> {
             let it = self.make_live_typed_iterator(h, 1);
             return Ok(it.as_handle().map(Handle::from_raw));
         }
-        if self.realm.array_elements(h).is_some()
-            || self.realm.string_value(h).is_some()
+        // A real array takes the fast path (direct backing-store read) *only* when
+        // its `[Symbol.iterator]` is still the intrinsic `Array.prototype.values`.
+        // A user override (`Array.prototype[Symbol.iterator] = function* …` or a
+        // per-instance one) must go through the iterator protocol, per spec.
+        if self.realm.array_elements(h).is_some() {
+            let resolved = self.find_iterator_fn(h)?;
+            let default_iter = self
+                .realm
+                .array_proto_intrinsic()
+                .and_then(|p| self.realm.get_property(p, "values"));
+            let is_default = matches!((resolved, default_iter), (Some(r), Some(d))
+                if r.as_handle().is_some() && r.as_handle() == d.as_handle());
+            if is_default {
+                return Ok(None);
+            }
+            if let Some(f) = resolved
+                && f.as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|fh| self.is_callable(fh))
+            {
+                let iterator = self.call_with_this(f, v, &[])?;
+                return match iterator.as_handle().map(Handle::from_raw) {
+                    Some(ih) => Ok(Some(ih)),
+                    None => Err(ExecError::Throw(self.new_str("iterator is not an object"))),
+                };
+            }
+            return Ok(None);
+        }
+        if self.realm.string_value(h).is_some()
             || self.realm.collection_entries(h).is_some()
             || self.realm.get_property(h, GEN_BUF).is_some()
         {
