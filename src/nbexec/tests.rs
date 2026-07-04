@@ -6266,3 +6266,29 @@ fn promise_symbol_species() {
         "function,true,false,true"
     );
 }
+
+#[test]
+fn arraybuffer_symbol_species() {
+    // ArrayBuffer carries `get [Symbol.species]` (returns `this`); a subclass
+    // inherits it; the accessor shape matches the spec.
+    assert_eq!(run("ArrayBuffer[Symbol.species]===ArrayBuffer"), "true");
+    assert_eq!(
+        run("class B extends ArrayBuffer{};B[Symbol.species]===B"),
+        "true"
+    );
+    assert_eq!(
+        run(
+            "var d=Object.getOwnPropertyDescriptor(ArrayBuffer,Symbol.species);\
+             (typeof d.get)+','+(d.set===undefined)+','+d.enumerable+','+d.configurable"
+        ),
+        "function,true,false,true"
+    );
+    // `slice` honors an explicit species override.
+    assert_eq!(
+        run(
+            "class B extends ArrayBuffer{static get [Symbol.species](){return ArrayBuffer}};\
+             new B(8).slice(0,4) instanceof ArrayBuffer"
+        ),
+        "true"
+    );
+}

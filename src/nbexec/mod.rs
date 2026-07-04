@@ -3757,6 +3757,10 @@ impl<'a> Interp<'a> {
         // `P[Symbol.species] === P`), which is what `then`/combinators use as the
         // dependent-promise constructor (SpeciesConstructor).
         self.install_ctor_species("Promise");
+        // `get ArrayBuffer[Symbol.species]` → `this`, used by
+        // `ArrayBuffer.prototype.slice` (SpeciesConstructor). TypedArrays inherit
+        // theirs from the shared `%TypedArray%` intrinsic.
+        self.install_ctor_species("ArrayBuffer");
         self.install_proto_to_string_tag("WeakMap", "WeakMap");
         self.install_proto_to_string_tag("WeakSet", "WeakSet");
         self.install_proto_to_string_tag("Promise", "Promise");
