@@ -6594,8 +6594,15 @@ fn string_exotic_own_index_and_length() {
     assert_eq!(run("'abc'.hasOwnProperty('length')"), "true");
     assert_eq!(run("'abc'.hasOwnProperty(5)"), "false");
     assert_eq!(run("new String('abc').hasOwnProperty(1)"), "true");
-    assert_eq!(run("var s=new String('ab');0 in s"), "true");
-    assert_eq!(run("2 in 'ab'"), "false");
+    assert_eq!(
+        run("var s=new String('ab');(0 in s)+','+(2 in s)"),
+        "true,false"
+    );
+    // `in` on a string *primitive* is a TypeError (the RHS must be an object).
+    assert_eq!(
+        run("try{2 in 'ab';'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
     // A Number wrapper is not a String; arrays and plain objects unaffected.
     assert_eq!(run("new Number(5).hasOwnProperty(0)"), "false");
     assert_eq!(
