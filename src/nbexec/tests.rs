@@ -3677,9 +3677,11 @@ fn date_string_methods() {
         run("new Date(0).toUTCString()"),
         "Thu, 01 Jan 1970 00:00:00 GMT"
     );
+    // toLocaleString now routes through a real DateTimeFormat: the en-US default
+    // is 12-hour with a narrow no-break space (U+202F) before the day period.
     assert_eq!(
         run("new Date(Date.UTC(2020,5,15,10,30,45)).toLocaleString()"),
-        "6/15/2020, 10:30:45"
+        "6/15/2020, 10:30:45\u{202f}AM"
     );
     assert_eq!(
         run("new Date(Date.UTC(2020,5,15)).toLocaleDateString()"),

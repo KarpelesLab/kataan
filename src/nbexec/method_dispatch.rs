@@ -1308,6 +1308,27 @@ impl<'a> Interp<'a> {
                     if !ms.is_finite() {
                         return Ok(Some(self.new_str("Invalid Date")));
                     }
+                    // The locale-aware variants route through a real DateTimeFormat
+                    // (with ToDateTimeOptions per-method defaults), so every option
+                    // applies — dateStyle/timeStyle, explicit components, hourCycle, …
+                    #[cfg(feature = "intl")]
+                    if matches!(
+                        method,
+                        "toLocaleDateString" | "toLocaleTimeString" | "toLocaleString"
+                    ) {
+                        let (want_date, want_time) = match method {
+                            "toLocaleDateString" => (true, false),
+                            "toLocaleTimeString" => (false, true),
+                            _ => (true, true),
+                        };
+                        let opts = self.date_time_options(arg(1), want_date, want_time)?;
+                        let fmt_args = [arg(0), NanBox::handle(opts.to_raw())];
+                        let inst = self.make_intl_formatter(N_INTL_DATETIME_FORMAT, &fmt_args)?;
+                        if let Some(h) = inst.as_handle().map(Handle::from_raw) {
+                            let s = self.format_intl_datetime(h, ms);
+                            return Ok(Some(self.new_str(&s)));
+                        }
+                    }
                     let wd = WEEKDAYS[((day.rem_euclid(7) + 4).rem_euclid(7)) as usize];
                     let mn = MONTHS[(mo - 1) as usize];
                     let (hh, mi, ss) = (tod / 3_600_000, tod / 60_000 % 60, tod / 1000 % 60);

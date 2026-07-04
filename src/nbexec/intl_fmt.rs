@@ -2716,6 +2716,89 @@ impl<'a> Interp<'a> {
         parts
     }
 
+    /// `ToDateTimeOptions` for `Date.prototype.toLocale{,Date,Time}String`: builds
+    /// a fresh options object from the user's `options`, adding the per-method
+    /// component defaults (numeric year/month/day for a date-required call, and
+    /// numeric hour/minute/second for a time-required call) when the user gave no
+    /// matching component and no `dateStyle`/`timeStyle`.
+    #[cfg(feature = "intl")]
+    pub(crate) fn date_time_options(
+        &mut self,
+        user: NanBox,
+        want_date: bool,
+        want_time: bool,
+    ) -> Result<Handle, ExecError> {
+        let uh = user.as_handle().map(Handle::from_raw);
+        let present = |this: &mut Self, keys: &[&str]| -> bool {
+            uh.is_some_and(|h| {
+                keys.iter().any(|k| {
+                    this.realm
+                        .get_property(h, k)
+                        .is_some_and(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                })
+            })
+        };
+        let has_date = present(self, &["weekday", "year", "month", "day"]);
+        let has_time = present(
+            self,
+            &[
+                "dayPeriod",
+                "hour",
+                "minute",
+                "second",
+                "fractionalSecondDigits",
+            ],
+        );
+        let has_style = present(self, &["dateStyle", "timeStyle"]);
+        let obj = self.realm.new_object();
+        if let Some(h) = uh {
+            for key in [
+                "localeMatcher",
+                "weekday",
+                "era",
+                "year",
+                "month",
+                "day",
+                "dayPeriod",
+                "hour",
+                "minute",
+                "second",
+                "fractionalSecondDigits",
+                "timeZoneName",
+                "hour12",
+                "hourCycle",
+                "timeZone",
+                "calendar",
+                "numberingSystem",
+                "dateStyle",
+                "timeStyle",
+                "formatMatcher",
+            ] {
+                if let Some(v) = self
+                    .realm
+                    .get_property(h, key)
+                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                {
+                    self.realm.set_property(obj, key, v);
+                }
+            }
+        }
+        if !has_style {
+            let num = self.new_str("numeric");
+            if want_date && !has_date {
+                for k in ["year", "month", "day"] {
+                    self.realm.set_property(obj, k, num);
+                }
+            }
+            if want_time && !has_time {
+                for k in ["hour", "minute", "second"] {
+                    self.realm.set_property(obj, k, num);
+                }
+            }
+        }
+        Ok(obj)
+    }
+
     /// The `Intl.DateTimeFormat` rendering of `ms` as a flat string (joins
     /// [`datetime_parts`](Self::datetime_parts)).
     pub(crate) fn format_intl_datetime(&mut self, handle: Handle, ms: f64) -> String {
