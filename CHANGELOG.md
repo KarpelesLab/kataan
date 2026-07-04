@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(array)* `Array.of` honors a constructor `this` (`Array.of.call(C, …)` /
+  subclass `C.of(…)`) — `Construct(C, «len»)` + `CreateDataPropertyOrThrow` —
+  instead of always building a plain `%Array%` (ROADMAP §3.7).
 - *(proxy)* route HasProperty through the proxy `has` trap in generic
   array-like iteration, so `[...new Proxy([1,2,3],{})]`, `Array.from(proxy)`,
   and `Array.prototype.*.call(proxy, …)` observe the proxied elements instead

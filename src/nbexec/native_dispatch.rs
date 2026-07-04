@@ -1545,7 +1545,32 @@ impl<'a> Interp<'a> {
             N_UINT8_SET_FROM_HEX => self.uint8_set_from_hex(arg(0))?,
             N_UINT8_FROM_BASE64 => self.uint8_from_base64(arg(0), arg(1))?,
             N_UINT8_FROM_HEX => self.uint8_from_hex(arg(0))?,
-            N_ARRAY_OF => NanBox::handle(self.realm.new_array(args.to_vec()).to_raw()),
+            N_ARRAY_OF => {
+                // `Array.of(...items)`: when called with a constructor `this`
+                // (`Array.of.call(C, …)` or a subclass `C.of(…)`), the result is
+                // `Construct(C, «len»)` populated with `CreateDataPropertyOrThrow`
+                // then `Set(A, "length", len)`; a default `%Array%` /
+                // non-constructor `this` builds a plain dense array. Mirrors the
+                // `Array.from` receiver handling.
+                let this_c = self.this_val;
+                let is_array_ctor =
+                    self.current.get("Array").and_then(|v| v.as_handle()) == this_c.as_handle();
+                if self.is_constructor_value(this_c) && !is_array_ctor {
+                    let len = args.len();
+                    let target = self.construct(this_c, &[NanBox::number(len as f64)])?;
+                    let Some(th) = target.as_handle().map(Handle::from_raw) else {
+                        return Err(self
+                            .type_error("Array.of requires its 'this' value to return an object"));
+                    };
+                    for (i, e) in args.iter().enumerate() {
+                        self.create_data_property_or_throw(th, i, *e)?;
+                    }
+                    let len_key = self.new_str("length");
+                    self.assign_member_value(th, len_key, NanBox::number(len as f64))?;
+                    return Ok(target);
+                }
+                NanBox::handle(self.realm.new_array(args.to_vec()).to_raw())
+            }
             // `%IteratorPrototype%[Symbol.iterator]()` — an iterator is its own
             // iterable: return the receiver.
             N_ITERATOR_PROTO_SELF => self.this_val,

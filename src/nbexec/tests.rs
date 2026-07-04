@@ -5825,3 +5825,24 @@ fn proxy_reflect_set_receiver_semantics() {
         "true"
     );
 }
+
+#[test]
+fn array_of_honors_constructor_receiver() {
+    // Array.of with a constructor `this` builds via Construct + CreateDataProperty.
+    assert_eq!(
+        run("class S extends Array{}; var r=Array.of.call(S,1,2,3); (r instanceof S)+','+r.length"),
+        "true,3"
+    );
+    assert_eq!(
+        run("class S extends Array{}; var r=S.of(9,8); (r instanceof S)+','+r[0]"),
+        "true,9"
+    );
+    // A custom constructor receives the element count and the defined elements.
+    assert_eq!(
+        run("var seen;var r=Array.of.call(function(n){seen=n;},10,20);seen+','+r[0]+','+r[1]"),
+        "2,10,20"
+    );
+    // Default Array / non-constructor receiver still builds a plain array.
+    assert_eq!(run("JSON.stringify(Array.of(1,2,3))"), "[1,2,3]");
+    assert_eq!(run("var of=Array.of;JSON.stringify(of(5,6))"), "[5,6]");
+}
