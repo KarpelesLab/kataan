@@ -3784,6 +3784,12 @@ impl<'a> Interp<'a> {
     /// Unicode extension, and stores the resolved components behind hidden slots for
     /// the prototype accessors. Returns a branded `Intl.Locale` instance.
     pub(crate) fn make_locale(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        let obj = self.realm.new_object();
+        self.init_locale(obj, args)?;
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    pub(crate) fn init_locale(&mut self, obj: Handle, args: &[NanBox]) -> Result<(), ExecError> {
         let tag_arg = args.first().copied().unwrap_or(NanBox::undefined());
         // A `Locale` argument contributes its `[[Locale]]` tag; otherwise ToString
         // (undefined/symbol throw via the usual coercion / TypeError below).
@@ -3926,7 +3932,6 @@ impl<'a> Interp<'a> {
             parsed.set_keyword("fw", fw);
         }
         let final_tag = parsed.to_tag();
-        let obj = self.realm.new_object();
         let tagv = self.new_str(&final_tag);
         self.realm.set_hidden_property(obj, "\u{0}locale_tag", tagv);
         // Stash the resolved components so the accessors read them cheaply.
@@ -3957,7 +3962,7 @@ impl<'a> Interp<'a> {
         if let Some(proto) = self.intl_locale_prototype() {
             self.realm.set_object_proto(obj, Some(proto));
         }
-        Ok(NanBox::handle(obj.to_raw()))
+        Ok(())
     }
 
     /// Dispatches an `Intl.Locale` `get` accessor: brand-checks `this`, then returns

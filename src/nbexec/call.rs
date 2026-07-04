@@ -2831,6 +2831,7 @@ impl<'a> Interp<'a> {
                 | N_INTL_LIST_FORMAT
                 | N_INTL_REL_TIME
                 | N_INTL_SEGMENTER
+                | N_INTL_LOCALE
         );
         if intl_init {
             let subclass_proto = self.realm.object_proto(instance);
@@ -2842,6 +2843,7 @@ impl<'a> Interp<'a> {
                 N_INTL_LIST_FORMAT => self.init_list_format(instance, args)?,
                 N_INTL_REL_TIME => self.init_relative_time_format(instance, args)?,
                 N_INTL_SEGMENTER => self.init_segmenter(instance, args),
+                N_INTL_LOCALE => self.init_locale(instance, args)?,
                 _ => unreachable!(),
             }
             if let Some(p) = subclass_proto {

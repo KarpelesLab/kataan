@@ -727,6 +727,7 @@ impl<'a> Interp<'a> {
             N_INTL_LIST_FORMAT => "ListFormat",
             N_INTL_REL_TIME => "RelativeTimeFormat",
             N_INTL_SEGMENTER => "Segmenter",
+            N_INTL_LOCALE => "Locale",
             _ => return None,
         };
         self.intl_ctor_handle(intl_name)
