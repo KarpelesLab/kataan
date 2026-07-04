@@ -6759,3 +6759,38 @@ fn weakref_and_finalization_registry_subclassing() {
     // Direct construction unaffected.
     assert_eq!(run("var o={};new WeakRef(o).deref()===o"), "true");
 }
+
+#[test]
+fn aggregate_error_and_non_constructor_subclassing() {
+    // AggregateError subclass: super(errors, message) drains the errors iterable
+    // into an own `errors` array and takes the message second.
+    assert_eq!(
+        run(
+            "class A extends AggregateError{}var a=new A([1,2,3],'m');(a instanceof A)+','+a.errors.join(',')+','+a.message"
+        ),
+        "true,1,2,3,m"
+    );
+    assert_eq!(
+        run("class A extends AggregateError{}new A(new Set([9,8])).errors.join(',')"),
+        "9,8"
+    );
+    assert_eq!(
+        run("class A extends AggregateError{}try{new A(5);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    // Symbol/BigInt are callable but not constructors: `new Subclass()` throws.
+    assert_eq!(
+        run("class S extends Symbol{}try{new S();'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("class B extends BigInt{}try{new B();'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    // Direct AggregateError and ordinary error subclassing unaffected.
+    assert_eq!(
+        run("var a=new AggregateError([1,2],'x');a.errors.join(',')+','+a.message"),
+        "1,2,x"
+    );
+    assert_eq!(run("class E extends Error{}new E('m').message"), "m");
+}

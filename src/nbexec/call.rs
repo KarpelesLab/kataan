@@ -2681,6 +2681,15 @@ impl<'a> Interp<'a> {
             self.init_shadow_realm_super(instance);
             return Ok(());
         }
+        // `Symbol` and `BigInt` are callable but have no `[[Construct]]`: extending
+        // them is allowed, but `new Subclass()` runs `super()` into a non-existent
+        // constructor — a TypeError (`Symbol is not a constructor`).
+        if native_id == N_SYMBOL {
+            return Err(self.type_error("Symbol is not a constructor"));
+        }
+        if native_id == N_BIGINT {
+            return Err(self.type_error("BigInt is not a constructor"));
+        }
         // `class W extends WeakRef {}`: `super(target)` validates the (weakly
         // holdable) target and stamps the internal slot onto the (class-proto-
         // linked) instance, so `deref()` and the brand check resolve.
@@ -2765,9 +2774,26 @@ impl<'a> Interp<'a> {
             let name = ERROR_NAMES[(native_id - N_ERROR_BASE) as usize];
             let name_v = self.new_str(name);
             self.realm.set_property(instance, "name", name_v);
-            let msg = match args.first() {
+            // `AggregateError(errors, message, options)` takes its message *second*
+            // and exposes an own `.errors` array drained from the first argument;
+            // every other error takes `(message, options)`.
+            let is_aggregate = native_id == N_ERROR_BASE + 5;
+            let (msg_arg, opts_arg) = if is_aggregate {
+                (args.get(1).copied(), args.get(2))
+            } else {
+                (args.first().copied(), args.get(1))
+            };
+            if is_aggregate {
+                let errors = args.first().copied().unwrap_or(NanBox::undefined());
+                let list = self.iterate_values(errors)?;
+                let arr = self.realm.new_array(list);
+                self.realm
+                    .set_property(instance, "errors", NanBox::handle(arr.to_raw()));
+                self.realm.mark_hidden(instance, "errors");
+            }
+            let msg = match msg_arg {
                 Some(m) if !matches!(m.unpack(), Unpacked::Undefined) => {
-                    let s = self.realm.to_display_string(*m);
+                    let s = self.realm.to_display_string(m);
                     self.new_str(&s)
                 }
                 _ => self.new_str(""),
@@ -2778,7 +2804,7 @@ impl<'a> Interp<'a> {
             self.realm.mark_hidden(instance, "message");
             // ES2022 `cause`: `new Error(msg, { cause })` installs a non-enumerable
             // `cause` when the options argument has such a property (even if undefined).
-            if let Some(opts) = args.get(1)
+            if let Some(opts) = opts_arg
                 && let Some(raw) = opts.as_handle()
                 && self.realm.has_own(Handle::from_raw(raw), "cause")
             {
