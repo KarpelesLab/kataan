@@ -5501,6 +5501,43 @@ fn host_fn_typeof_name_length() {
 }
 
 #[test]
+fn host_fn_value_inspection_and_array_access() {
+    // A host fn that inspects its argument via the Ctx introspection API and, for
+    // an Array, sums its elements through array_len/array_get.
+    let program = Parser::parse_program(
+        "inspect([10,20,30]) + '|' + inspect('hi') + '|' + inspect(fn) + '|' + inspect({})",
+    )
+    .expect("parse");
+    let mut interp = Interp::new();
+    interp.register_global_fn("fn", 0, |cx, _t, _a| Ok(cx.undefined()));
+    interp.register_global_fn("inspect", 1, |cx, _t, args| {
+        let v = args.first().copied().unwrap_or(cx.undefined());
+        if cx.is_array(v) {
+            let n = cx.array_len(v).unwrap_or(0);
+            let mut sum = 0.0;
+            for i in 0..n {
+                let e = cx.array_get(v, i);
+                sum += cx.to_number(e)?;
+            }
+            return Ok(cx.string(&alloc::format!("array[{n}]={sum}")));
+        }
+        let s = alloc::format!(
+            "{}/callable={}/object={}",
+            cx.type_of(v),
+            cx.is_callable(v),
+            cx.is_object(v)
+        );
+        Ok(cx.string(&s))
+    });
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(
+        interp.realm().to_display_string(v),
+        "array[3]=60|string/callable=false/object=false|\
+         function/callable=true/object=true|object/callable=false/object=true"
+    );
+}
+
+#[test]
 fn host_fn_throw_is_catchable() {
     let program =
         Parser::parse_program("try { boom(); 'no' } catch (e) { e.message }").expect("parse");

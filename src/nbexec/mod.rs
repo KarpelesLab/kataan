@@ -766,6 +766,51 @@ impl<'c, 'a> Ctx<'c, 'a> {
             .call_with_this(callee, this, args)
             .map_err(|e| self.interp.exec_error_value(e))
     }
+
+    /// The JS `typeof` of `v` (`"undefined"`, `"boolean"`, `"number"`, `"string"`,
+    /// `"symbol"`, `"bigint"`, `"object"`, or `"function"`).
+    #[must_use]
+    pub fn type_of(&self, v: NanBox) -> &'static str {
+        self.interp.realm.type_of_value(v)
+    }
+
+    /// Whether `v` is a callable function (an ordinary function, a native, a bound
+    /// function, a class constructor, or a callable proxy).
+    #[must_use]
+    pub fn is_callable(&self, v: NanBox) -> bool {
+        self.interp.is_callable_value(v)
+    }
+
+    /// Whether `v` is an object (not a primitive, `null`, or `undefined`).
+    #[must_use]
+    pub fn is_object(&self, v: NanBox) -> bool {
+        self.interp.is_object_value(v)
+    }
+
+    /// Whether `v` is an `Array` exotic object (`Array.isArray(v)`).
+    #[must_use]
+    pub fn is_array(&self, v: NanBox) -> bool {
+        v.as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| self.interp.realm.is_array(h))
+    }
+
+    /// The `length` of the Array `arr`, or `None` if `arr` is not an Array.
+    #[must_use]
+    pub fn array_len(&self, arr: NanBox) -> Option<usize> {
+        arr.as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.interp.realm.array_length(h))
+    }
+
+    /// The element at index `i` of the Array `arr` (`undefined` when `arr` is not
+    /// an Array or `i` is out of range). Present holes read as `undefined`.
+    pub fn array_get(&mut self, arr: NanBox, i: usize) -> NanBox {
+        match arr.as_handle().map(Handle::from_raw) {
+            Some(h) if self.interp.realm.is_array(h) => self.interp.realm.get_element(h, i),
+            _ => NanBox::undefined(),
+        }
+    }
 }
 
 /// A queued promise reaction: run `handler` with `value`, then settle `result`
