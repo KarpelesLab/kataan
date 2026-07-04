@@ -1644,6 +1644,16 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // A String object's own enumerable keys are its indices `"0".."length-1"`
+        // (`length` is non-enumerable), so `for (k in "abc")` yields "0","1","2".
+        if let Some(slen) = self.string_index_count(h) {
+            for i in 0..slen {
+                let k = alloc::format!("{i}");
+                if seen.insert(k.clone()) {
+                    out.push(self.new_str(&k));
+                }
+            }
+        }
         let mut cur = Some(h);
         while let Some(c) = cur {
             // Plain objects keep keys in the cell; arrays/functions keep named

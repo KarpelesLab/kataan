@@ -6672,3 +6672,26 @@ fn string_exotic_descriptors_and_own_names() {
         r#"["a","b"]"#
     );
 }
+
+#[test]
+fn for_in_enumerates_string_indices() {
+    // for-in over a String object yields its index keys "0".."length-1"
+    // (`length` is non-enumerable); a wrapper's named own props follow.
+    assert_eq!(
+        run("var k=[];for(var i in 'abc')k.push(i);JSON.stringify(k)"),
+        r#"["0","1","2"]"#
+    );
+    assert_eq!(
+        run("var s=new String('ab');s.x=1;var k=[];for(var i in s)k.push(i);JSON.stringify(k)"),
+        r#"["0","1","x"]"#
+    );
+    // Arrays and plain objects unaffected.
+    assert_eq!(
+        run("var k=[];for(var i in [10,20])k.push(i);JSON.stringify(k)"),
+        r#"["0","1"]"#
+    );
+    assert_eq!(
+        run("var k=[];for(var i in {a:1,b:2})k.push(i);JSON.stringify(k)"),
+        r#"["a","b"]"#
+    );
+}
