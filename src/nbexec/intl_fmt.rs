@@ -1352,7 +1352,27 @@ impl<'a> Interp<'a> {
         let lv = self.new_str(&locale);
         self.realm.set_property(out, "locale", lv);
 
-        if kind == "list" {
+        if kind == "display" {
+            // `Intl.DisplayNames.prototype.resolvedOptions()` — `{ locale, style,
+            // type, fallback[, languageDisplay] }` (Table: "Resolved Options of
+            // DisplayNames instances").
+            let style = get_str(self, "style").unwrap_or_else(|| String::from("long"));
+            let stv = self.new_str(&style);
+            self.realm.set_property(out, "style", stv);
+            if let Some(t) = get_str(self, "type") {
+                let tv = self.new_str(&t);
+                self.realm.set_property(out, "type", tv);
+            }
+            let fallback = get_str(self, "fallback").unwrap_or_else(|| String::from("code"));
+            let fv = self.new_str(&fallback);
+            self.realm.set_property(out, "fallback", fv);
+            if get_str(self, "type").as_deref() == Some("language") {
+                let ld =
+                    get_str(self, "languageDisplay").unwrap_or_else(|| String::from("dialect"));
+                let ldv = self.new_str(&ld);
+                self.realm.set_property(out, "languageDisplay", ldv);
+            }
+        } else if kind == "list" {
             // `Intl.ListFormat.prototype.resolvedOptions()` — `{ locale, type, style }`
             // in that order (Table: "Resolved Options of ListFormat instances").
             let lt = get_str(self, "type").unwrap_or_else(|| String::from("conjunction"));
@@ -1916,12 +1936,24 @@ impl<'a> Interp<'a> {
         };
         let tv = self.new_str(&type_s);
         self.realm.set_hidden_property(obj, "type", tv);
-        if let Some(opts) = opts {
-            for key in ["style", "fallback"] {
-                if let Some(v) = self.realm.get_property(opts, key) {
-                    self.realm.set_hidden_property(obj, key, v);
-                }
-            }
+        // Mark the service kind so `resolvedOptions` reports the DisplayNames shape.
+        let kindv = self.new_str("display");
+        self.realm.set_hidden_property(obj, "\u{0}intl", kindv);
+        // `style` (default "long"), `fallback` (default "code"), and — for a
+        // language type — `languageDisplay` (default "dialect"), validated + stored.
+        let style =
+            self.get_string_option(opts, "style", &["narrow", "short", "long"], Some("long"))?;
+        self.store_str(obj, "style", &style);
+        let fallback = self.get_string_option(opts, "fallback", &["code", "none"], Some("code"))?;
+        self.store_str(obj, "fallback", &fallback);
+        if type_s == "language" {
+            let ld = self.get_string_option(
+                opts,
+                "languageDisplay",
+                &["dialect", "standard"],
+                Some("dialect"),
+            )?;
+            self.store_str(obj, "languageDisplay", &ld);
         }
         self.brand_intl_instance(obj, N_INTL_DISPLAY_NAMES);
         Ok(NanBox::handle(obj.to_raw()))

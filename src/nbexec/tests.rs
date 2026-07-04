@@ -7544,3 +7544,46 @@ fn intl_number_format_signdisplay_negative_mode() {
         "-0"
     );
 }
+
+#[test]
+fn intl_display_names_resolved_options() {
+    // resolvedOptions reports { locale, style, type, fallback[, languageDisplay] }
+    // with the defaults (style "long", fallback "code", languageDisplay "dialect").
+    assert_eq!(
+        run(
+            "var o=new Intl.DisplayNames('en',{type:'region'}).resolvedOptions();o.type+','+o.style+','+o.fallback"
+        ),
+        "region,long,code"
+    );
+    assert_eq!(
+        run("new Intl.DisplayNames('en',{type:'language'}).resolvedOptions().languageDisplay"),
+        "dialect"
+    );
+    assert_eq!(
+        run(
+            "var o=new Intl.DisplayNames('en',{type:'region',style:'short',fallback:'none'}).resolvedOptions();o.style+','+o.fallback"
+        ),
+        "short,none"
+    );
+    assert_eq!(
+        run("Object.keys(new Intl.DisplayNames('en',{type:'region'}).resolvedOptions()).join(',')"),
+        "locale,style,type,fallback"
+    );
+    // Invalid style/fallback are RangeErrors.
+    assert_eq!(
+        run(
+            "try{new Intl.DisplayNames('en',{type:'region',style:'bogus'});'no'}catch(e){e.constructor.name}"
+        ),
+        "RangeError"
+    );
+    assert_eq!(
+        run(
+            "try{new Intl.DisplayNames('en',{type:'region',fallback:'bogus'});'no'}catch(e){e.constructor.name}"
+        ),
+        "RangeError"
+    );
+    assert_eq!(
+        run("new Intl.DisplayNames('en',{type:'region'}).of('US')"),
+        "United States"
+    );
+}
