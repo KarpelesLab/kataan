@@ -84,6 +84,7 @@ intl = { version = "0.5", optional = true, default-features = false, features = 
     "full", "alloc", "case", "collation", "identifiers",
     "number", "currency", "datetime", "list", "displaynames", "relative", "units", "locale",
 ] }
+puremp = { version = "0.2", default-features = false, features = ["int"] }
 
 [lints.rust]
 # Keep the foundation documented and the API surface honest.
