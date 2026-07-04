@@ -1501,7 +1501,10 @@ impl<'a> Interp<'a> {
                         );
                     };
                     for (i, e) in items.iter().enumerate() {
-                        self.realm.set_property(th, &alloc::format!("{i}"), *e);
+                        // `CreateDataPropertyOrThrow(A, i, e)` — routes array indices
+                        // into the dense element store (a raw `set_property` would
+                        // stash them as named props that `join`/dense reads miss).
+                        self.create_data_property_or_throw(th, i, *e)?;
                     }
                     let len_key = self.new_str("length");
                     self.assign_member_value(th, len_key, NanBox::number(len as f64))?;

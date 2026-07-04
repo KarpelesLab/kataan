@@ -6794,3 +6794,36 @@ fn aggregate_error_and_non_constructor_subclassing() {
     );
     assert_eq!(run("class E extends Error{}new E('m').message"), "m");
 }
+
+#[test]
+fn array_from_subclass_uses_dense_storage() {
+    // `C.from(...)` (subclass constructor `this`) must CreateDataPropertyOrThrow
+    // each element so it lands in the dense element store — a raw set_property
+    // stashed them as named props that join/reduce/spread (dense reads) missed.
+    assert_eq!(
+        run("class A extends Array{}A.from([1,2,3]).join(',')"),
+        "1,2,3"
+    );
+    assert_eq!(
+        run("class A extends Array{}A.from([1,2,3],x=>x*2).join(',')"),
+        "2,4,6"
+    );
+    assert_eq!(
+        run("class A extends Array{}A.from(new Set([5,6,7])).join(',')"),
+        "5,6,7"
+    );
+    assert_eq!(
+        run("class A extends Array{}A.from([1,2,3,4]).reduce((a,b)=>a+b,0)"),
+        "10"
+    );
+    assert_eq!(
+        run("class A extends Array{}[...A.from([1,2,3])].join(',')"),
+        "1,2,3"
+    );
+    assert_eq!(
+        run("class A extends Array{}var a=A.from([1,2]);(a instanceof A)+','+Array.isArray(a)"),
+        "true,true"
+    );
+    // Plain Array.from unaffected.
+    assert_eq!(run("Array.from([1,2,3]).join(',')"), "1,2,3");
+}
