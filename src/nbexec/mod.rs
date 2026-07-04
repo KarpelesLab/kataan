@@ -4351,14 +4351,34 @@ impl<'a> Interp<'a> {
             // re-entrant call onto a host function already on the stack.
             return Err(self.type_error("host function is not re-entrant"));
         };
-        let mut ctx = Ctx { interp: self };
-        let r = (hf.call)(&mut ctx, this, args);
-        // `ctx` is no longer used, so the `&mut self` borrow is free; restore the
-        // closure to its slot for the next call.
+        // Trap a panic from host code at the boundary so it becomes a catchable JS
+        // `Error` instead of unwinding across engine frames (and leaving the
+        // registry slot empty). `AssertUnwindSafe`: the `&mut` state is ours and we
+        // restore invariants (the slot) before re-entering the engine. The `ctx`
+        // (which holds the `&mut self` borrow) is scoped to this block so the borrow
+        // is released before the slot is restored below.
+        let caught = {
+            let mut ctx = Ctx { interp: self };
+            #[cfg(feature = "std")]
+            {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (hf.call)(&mut ctx, this, args)
+                }))
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                Ok::<Result<NanBox, NanBox>, ()>((hf.call)(&mut ctx, this, args))
+            }
+        };
+        // The `&mut self` borrow is free; restore the closure to its slot.
         self.host_fns[id as usize] = Some(hf);
-        match r {
-            Ok(v) => Ok(v),
-            Err(v) => Err(ExecError::Throw(v)),
+        match caught {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(v)) => Err(ExecError::Throw(v)),
+            Err(_panic) => {
+                let m = self.new_str("host function panicked");
+                Err(ExecError::Throw(self.make_error(N_ERROR_BASE, Some(m))))
+            }
         }
     }
 

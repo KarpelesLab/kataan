@@ -5563,6 +5563,26 @@ fn host_fn_property_api_has_delete_keys() {
 }
 
 #[test]
+#[cfg(feature = "std")]
+fn host_fn_panic_is_trapped_as_error() {
+    // A panicking host closure becomes a catchable JS Error rather than unwinding
+    // across the engine, and the registry is not corrupted (a later call works).
+    let mut interp = Interp::new();
+    interp.register_global_fn("boom", 0, |_cx, _t, _a| panic!("host kaboom"));
+    interp.register_global_fn("ok", 0, |cx, _t, _a| Ok(cx.number(42.0)));
+    // (The trapped panic's message is captured by the test harness and shown only
+    // if this test fails.)
+    let program = Parser::parse_program(
+        "var caught = false;\
+         try { boom(); } catch (e) { caught = e instanceof Error; }\
+         caught + ',' + ok()",
+    )
+    .expect("parse");
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "true,42");
+}
+
+#[test]
 fn host_fn_register_constructor() {
     // A host constructor: `new Vec2(x,y)` binds a fresh `this`, the closure sets
     // fields, instanceof works via the auto-created prototype, and a prototype
