@@ -8253,3 +8253,38 @@ fn shared_array_buffer_grow_and_slice() {
         "[object ArrayBuffer]"
     );
 }
+
+#[test]
+#[cfg(feature = "intl")]
+fn intl_numbering_system_digit_substitution() {
+    // The resolved numbering system substitutes the ASCII digits (consecutive-
+    // codepoint systems); separators stay, latn/hanidec are left ASCII.
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{numberingSystem:'arab'}).format(123)"),
+        "\u{0661}\u{0662}\u{0663}"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{numberingSystem:'deva'}).format(123)"),
+        "\u{0967}\u{0968}\u{0969}"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{numberingSystem:'thai'}).format(789)"),
+        "\u{0e57}\u{0e58}\u{0e59}"
+    );
+    assert_eq!(run("new Intl.NumberFormat('en').format(123)"), "123");
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{numberingSystem:'hanidec'}).format(5)"),
+        "5"
+    );
+    // Digits substituted but the grouping/decimal separators are untouched.
+    assert_eq!(
+        run("(1234).toLocaleString('en',{numberingSystem:'arab'})"),
+        "\u{0661},\u{0662}\u{0663}\u{0664}"
+    );
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en',{numberingSystem:'arab'}).resolvedOptions().numberingSystem"
+        ),
+        "arab"
+    );
+}

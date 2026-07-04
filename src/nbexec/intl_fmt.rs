@@ -7,6 +7,41 @@ enum UseGroupingResolved {
     Str(&'static str),
 }
 
+/// The Unicode code point of digit `0` for a decimal numbering system whose ten
+/// digits are consecutive (the common case), so digit `d` is `base + d`. Returns
+/// `None` for `latn` (ASCII, unchanged) and for non-consecutive systems like
+/// `hanidec`. Covers the numeric numbering systems the corpus exercises.
+fn numbering_system_digit_base(nu: &str) -> Option<u32> {
+    Some(match nu {
+        "arab" => 0x0660,
+        "arabext" => 0x06F0,
+        "bali" => 0x1B50,
+        "beng" => 0x09E6,
+        "deva" => 0x0966,
+        "fullwide" => 0xFF10,
+        "gujr" => 0x0AE6,
+        "guru" => 0x0A66,
+        "khmr" => 0x17E0,
+        "knda" => 0x0CE6,
+        "laoo" => 0x0ED0,
+        "limb" => 0x1946,
+        "mlym" => 0x0D66,
+        "mong" => 0x1810,
+        "mymr" => 0x1040,
+        "orya" => 0x0B66,
+        "osma" => 0x104A0,
+        "saur" => 0xA8D0,
+        "sund" => 0x1BB0,
+        "talu" => 0x19D0,
+        "tamldec" => 0x0BE6,
+        "telu" => 0x0C66,
+        "thai" => 0x0E50,
+        "tibt" => 0x0F20,
+        "vaii" => 0xA620,
+        _ => return None,
+    })
+}
+
 /// Whether `s` matches the UTS-35 `type` value production: one or more
 /// `alphanum{3,8}` subtags joined by `-` (used for `ca`/`nu` option validation).
 fn is_unicode_type_value(s: &str) -> bool {
@@ -2933,6 +2968,31 @@ impl<'a> Interp<'a> {
     /// `intl::number::format` (CLDR, locale-aware, full ECMA-402 options); the rest, and the
     /// no-`intl` build, use the hand-rolled en-US path below.
     pub(crate) fn intl_format_number(&mut self, handle: Handle, n: f64) -> String {
+        let s = self.intl_format_number_inner(handle, n);
+        // Substitute the ASCII digits for the resolved numbering system's digits
+        // (most systems are 10 consecutive code points, so a base offset suffices;
+        // `latn` and non-decimal systems like `hanidec` are left as ASCII).
+        let nu = self
+            .realm
+            .get_property(handle, "numberingSystem")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
+        match numbering_system_digit_base(&nu) {
+            Some(base) => s
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_digit() {
+                        char::from_u32(base + (c as u32 - '0' as u32)).unwrap_or(c)
+                    } else {
+                        c
+                    }
+                })
+                .collect(),
+            None => s,
+        }
+    }
+
+    fn intl_format_number_inner(&mut self, handle: Handle, n: f64) -> String {
         #[cfg(feature = "intl")]
         if !self.number_uses_handrolled(handle) {
             let locale = self
