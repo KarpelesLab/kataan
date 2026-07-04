@@ -103,6 +103,26 @@ impl<'a> Interp<'a> {
     /// `%XIteratorPrototype%` for `tag` (so `next` is inherited, not an own
     /// property). The receiver carries the same buffer/index slots a generator
     /// uses, so the shared `next` (`gen_iter_next`) advances it.
+    /// A **live** Set/Map iterator over the collection at `coll` (`kind`: 0 keys,
+    /// 1 values, 2 entries). Unlike [`make_builtin_iterator`], it holds no
+    /// snapshot — each `next()` re-reads the collection, so entries added or
+    /// removed during iteration are observed (per spec `%MapIteratorPrototype%`).
+    pub(crate) fn make_live_collection_iterator(
+        &mut self,
+        coll: Handle,
+        kind: u8,
+        tag: &'static str,
+    ) -> NanBox {
+        let proto = self.builtin_iterator_proto(tag);
+        let obj = self.realm.new_object();
+        self.realm.set_object_proto(obj, Some(proto));
+        self.realm
+            .set_hidden_property(obj, GEN_COLL, NanBox::handle(coll.to_raw()));
+        self.realm
+            .set_hidden_property(obj, GEN_KIND, NanBox::number(f64::from(kind)));
+        NanBox::handle(obj.to_raw())
+    }
+
     pub(crate) fn make_builtin_iterator(
         &mut self,
         values: Vec<NanBox>,

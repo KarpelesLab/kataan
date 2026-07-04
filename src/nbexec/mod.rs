@@ -1806,6 +1806,16 @@ const GEN_BUF: &str = "\u{0}gbuf";
 const GEN_IDX: &str = "\u{0}gidx";
 /// A generator's `return` value, surfaced once after its yields are exhausted.
 const GEN_RET: &str = "\u{0}gret";
+/// Hidden slots on a **live** Set/Map iterator (a spec-faithful iterator that
+/// re-reads the collection on each `next()`, so mutation mid-iteration is
+/// visible). `GEN_COLL` = the collection handle (its presence marks the iterator
+/// live); `GEN_KIND` = 0 keys / 1 values / 2 entries; `GEN_LASTKEY` = the last
+/// yielded key (absent → not yet started); `GEN_IDX` = its position at yield time
+/// (the resume point if that key was since deleted); `GEN_DONE` = detached.
+const GEN_COLL: &str = "\u{0}gcoll";
+const GEN_KIND: &str = "\u{0}gkind";
+const GEN_LASTKEY: &str = "\u{0}glast";
+const GEN_DONE: &str = "\u{0}gdone";
 /// Hidden slot on a *lazy* generator object: the index of its suspended
 /// [`generator::GenFrame`] in `Interp::gen_frames`.
 const GEN_FRAME: &str = "\u{0}gframe";

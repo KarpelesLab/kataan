@@ -6827,3 +6827,64 @@ fn array_from_subclass_uses_dense_storage() {
     // Plain Array.from unaffected.
     assert_eq!(run("Array.from([1,2,3]).join(',')"), "1,2,3");
 }
+
+#[test]
+fn live_set_map_iteration() {
+    // Set/Map iterators are live: a mutation mid-iteration is observed (added
+    // entries are visited, deleted ones skipped), per %MapIteratorPrototype%.
+    assert_eq!(
+        run("var s=new Set([1]);var o=[];for(var x of s){o.push(x);if(x===1)s.add(2)}o.join(',')"),
+        "1,2"
+    );
+    assert_eq!(
+        run(
+            "var s=new Set([1,2,3]);var o=[];for(var x of s){o.push(x);if(x===1)s.delete(2)}o.join(',')"
+        ),
+        "1,3"
+    );
+    assert_eq!(
+        run(
+            "var m=new Map([[1,1],[2,2],[3,3]]);var o=[];for(var[k]of m){o.push(k);if(k===1)m.delete(2)}o.join(',')"
+        ),
+        "1,3"
+    );
+    // A manual iterator (via .values() and via [Symbol.iterator]) is live too.
+    assert_eq!(
+        run(
+            "var s=new Set([1,2]);var it=s.values();var r=[it.next().value];s.add(3);var n;while(!(n=it.next()).done)r.push(n.value);r.join(',')"
+        ),
+        "1,2,3"
+    );
+    assert_eq!(
+        run(
+            "var s=new Set([1,2]);var it=s[Symbol.iterator]();var r=[it.next().value];s.add(3);var n;while(!(n=it.next()).done)r.push(n.value);r.join(',')"
+        ),
+        "1,2,3"
+    );
+    // Deleting the just-yielded key still advances to the successor.
+    assert_eq!(
+        run("var s=new Set([1,2,3]);var o=[];for(var x of s){o.push(x);s.delete(x)}o.join(',')"),
+        "1,2,3"
+    );
+    // Once exhausted the iterator detaches (a later add is not resumed).
+    assert_eq!(
+        run(
+            "var s=new Set([1]);var it=s[Symbol.iterator]();it.next();it.next();s.add(2);it.next().done"
+        ),
+        "true"
+    );
+    // An iterator is its own iterable; ordinary iteration/spread unaffected.
+    assert_eq!(
+        run("var it=new Set([1]).values();it[Symbol.iterator]()===it"),
+        "true"
+    );
+    assert_eq!(run("[...new Set([1,2,3])].join(',')"), "1,2,3");
+    assert_eq!(
+        run("JSON.stringify([...new Map([['a',1],['b',2]])])"),
+        r#"[["a",1],["b",2]]"#
+    );
+    assert_eq!(
+        run("Object.prototype.toString.call(new Set([1]).values())"),
+        "[object Set Iterator]"
+    );
+}

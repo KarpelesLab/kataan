@@ -899,8 +899,25 @@ impl<'a> Interp<'a> {
                             if recv.as_handle().map(Handle::from_raw).is_some_and(|h| {
                                 self.realm.get_property(h, GEN_BUF).is_some()
                                     || self.realm.get_property(h, GEN_FRAME).is_some()
+                                    || self.realm.get_property(h, GEN_COLL).is_some()
                             }) {
                                 return Ok(recv);
+                            }
+                            // A non-weak Map/Set yields a **live** iterator (a Set
+                            // over its values, a Map over its entries), so
+                            // `s[Symbol.iterator]()` observes mutation mid-iteration.
+                            if let Some(h) = recv.as_handle().map(Handle::from_raw)
+                                && !self.realm.collection_is_weak(h)
+                                && self.realm.collection_entries(h).is_some()
+                            {
+                                let is_set = self.realm.collection_is_set(h) == Some(true);
+                                let tag = if is_set {
+                                    "Set Iterator"
+                                } else {
+                                    "Map Iterator"
+                                };
+                                let kind = if is_set { 1 } else { 2 };
+                                return Ok(self.make_live_collection_iterator(h, kind, tag));
                             }
                             let vals = self.iterate_values(recv)?;
                             // Tag the iterator with the receiver's kind so its

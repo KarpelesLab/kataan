@@ -226,6 +226,15 @@ impl<'a> Interp<'a> {
         let Some(h) = this.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("Generator.prototype.next called on non-object"));
         };
+        // A **live** Set/Map iterator (has `GEN_COLL`) re-reads the collection.
+        if let Some(coll) = self
+            .realm
+            .get_property(h, GEN_COLL)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            return self.live_collection_iter_next(h, coll);
+        }
         let Some(buf) = self
             .realm
             .get_property(h, GEN_BUF)
@@ -261,6 +270,70 @@ impl<'a> Interp<'a> {
             }
         };
         Ok(self.iter_result(value, done))
+    }
+
+    /// `next()` for a **live** Set/Map iterator (see `make_live_collection_iterator`):
+    /// re-reads the collection so a mutation mid-iteration is observed. Resumes
+    /// after the last-yielded key (found by `SameValueZero`); if that key was
+    /// deleted, resumes from its recorded position (the successor after the
+    /// compacting delete); once the end is reached the iterator detaches (`GEN_DONE`).
+    pub(crate) fn live_collection_iter_next(
+        &mut self,
+        h: Handle,
+        coll: Handle,
+    ) -> Result<NanBox, ExecError> {
+        // Once detached (exhausted), stay done regardless of later mutation.
+        if self.realm.get_property(h, GEN_DONE).is_some() {
+            return Ok(self.iter_result(NanBox::undefined(), true));
+        }
+        let kind = self
+            .realm
+            .get_property(h, GEN_KIND)
+            .and_then(|n| n.as_number())
+            .unwrap_or(0.0) as u8;
+        let is_set = self.realm.collection_is_set(coll) == Some(true);
+        let entries = self.realm.collection_entries(coll).unwrap_or_default();
+        // Determine the next position: 0 if not started, else after the
+        // last-yielded key (or its recorded slot if it was since deleted).
+        let next_pos = match self.realm.get_property(h, GEN_LASTKEY) {
+            None => 0,
+            Some(last_key) => match entries
+                .iter()
+                .position(|(k, _)| self.realm.same_value_zero(*k, last_key))
+            {
+                Some(q) => q + 1,
+                None => self
+                    .realm
+                    .get_property(h, GEN_IDX)
+                    .and_then(|n| n.as_number())
+                    .unwrap_or(0.0) as usize,
+            },
+        };
+        let Some(&(k, v)) = entries.get(next_pos) else {
+            self.realm
+                .set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
+            return Ok(self.iter_result(NanBox::undefined(), true));
+        };
+        self.realm.set_hidden_property(h, GEN_LASTKEY, k);
+        self.realm
+            .set_hidden_property(h, GEN_IDX, NanBox::number(next_pos as f64));
+        let value = match kind {
+            0 => k,                        // keys
+            2 => self.new_iter_pair(k, v), // entries: [key, value]
+            _ => {
+                if is_set {
+                    k
+                } else {
+                    v
+                }
+            } // values (a Set yields its element)
+        };
+        Ok(self.iter_result(value, false))
+    }
+
+    /// A fresh 2-element `[key, value]` array for a Map/Set `entries()` result.
+    fn new_iter_pair(&mut self, k: NanBox, v: NanBox) -> NanBox {
+        NanBox::handle(self.realm.new_array(alloc::vec![k, v]).to_raw())
     }
 
     /// The eager-generator iterator's `return(v)`: mark exhausted, report done.
@@ -1705,6 +1778,20 @@ impl<'a> Interp<'a> {
         let Some(h) = v.as_handle().map(Handle::from_raw) else {
             return Ok(None);
         };
+        // A non-weak Map/Set gets a **live** iterator so `for-of` observes a
+        // mutation mid-iteration (a Set yields values; a Map yields entries). A
+        // weak collection is not iterable — fall through to the TypeError path.
+        if !self.realm.collection_is_weak(h) && self.realm.collection_entries(h).is_some() {
+            let is_set = self.realm.collection_is_set(h) == Some(true);
+            let tag = if is_set {
+                "Set Iterator"
+            } else {
+                "Map Iterator"
+            };
+            let kind = if is_set { 1 } else { 2 };
+            let it = self.make_live_collection_iterator(h, kind, tag);
+            return Ok(it.as_handle().map(Handle::from_raw));
+        }
         if self.realm.array_elements(h).is_some()
             || self.realm.string_value(h).is_some()
             || self.realm.collection_entries(h).is_some()

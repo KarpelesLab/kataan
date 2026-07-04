@@ -4181,54 +4181,21 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(Some(NanBox::undefined()));
                 }
-                "keys" => {
-                    // A real iterator object (with `.next`/`[Symbol.iterator]`), so
-                    // `m.keys().next()` works — not just `for-of`.
+                // `keys`/`values`/`entries` return a **live** iterator (re-reads the
+                // collection on each `next()`), so a mutation mid-iteration is
+                // observed and `m.keys().next()` works — not just `for-of`.
+                "keys" | "values" | "entries" => {
                     let tag = if self.realm.collection_is_set(handle) == Some(true) {
                         "Set Iterator"
                     } else {
                         "Map Iterator"
                     };
-                    let keys: Vec<NanBox> = self
-                        .realm
-                        .collection_entries(handle)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(k, _)| k)
-                        .collect();
-                    return Ok(Some(self.make_builtin_iterator(keys, tag)));
-                }
-                "values" => {
-                    // A Set yields its elements; a Map yields its values.
-                    let is_set = self.realm.collection_is_set(handle) == Some(true);
-                    let tag = if is_set {
-                        "Set Iterator"
-                    } else {
-                        "Map Iterator"
+                    let kind = match method {
+                        "keys" => 0,
+                        "entries" => 2,
+                        _ => 1,
                     };
-                    let vals: Vec<NanBox> = self
-                        .realm
-                        .collection_entries(handle)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(k, v)| if is_set { k } else { v })
-                        .collect();
-                    return Ok(Some(self.make_builtin_iterator(vals, tag)));
-                }
-                "entries" => {
-                    let tag = if self.realm.collection_is_set(handle) == Some(true) {
-                        "Set Iterator"
-                    } else {
-                        "Map Iterator"
-                    };
-                    let pairs = self.realm.collection_entries(handle).unwrap_or_default();
-                    let arr: Vec<NanBox> = pairs
-                        .into_iter()
-                        .map(|(k, v)| {
-                            NanBox::handle(self.realm.new_array(alloc::vec![k, v]).to_raw())
-                        })
-                        .collect();
-                    return Ok(Some(self.make_builtin_iterator(arr, tag)));
+                    return Ok(Some(self.make_live_collection_iterator(handle, kind, tag)));
                 }
                 // ES2025 Set composition (24.2.4). Each method reads a *Set Record*
                 // from its argument via `GetSetRecord` — `size` (a number, not NaN),
