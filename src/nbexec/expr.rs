@@ -1553,6 +1553,72 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// OrdinarySet's *parent* walk for a computed write when the receiver has no
+    /// own binding for `key`: an inherited **setter**, or a **proxy** on the
+    /// prototype chain, performs the write via `parent.[[Set]]` (the setter runs,
+    /// or the proxy's `set` trap fires, with Receiver = the original object).
+    /// Returns `Some(())` if the chain handled the write (the caller must NOT
+    /// create an own property), or `None` to fall through to the ordinary
+    /// own-property write. Mirrors the `assign_member` (dot-key) prototype walk so
+    /// the computed-key path (`o[k] = v`, `arr[i] = v`) matches it.
+    pub(crate) fn set_through_proto_chain(
+        &mut self,
+        receiver: crate::heap::Handle,
+        key: &str,
+        new: NanBox,
+    ) -> Result<Option<()>, ExecError> {
+        let mut cur = self.realm.object_proto(receiver);
+        while let Some(c) = cur {
+            // A proxy above the receiver handles the write through its own
+            // `[[Set]]` (trap, or trapless forward to an inherited setter, else the
+            // own-property creation on the receiver).
+            if let Some((target, p_handler)) = self.realm.proxy_at(c) {
+                self.guard_revoked(c)?;
+                if let Some(trap) = self.proxy_trap(p_handler, "set")? {
+                    let key_box = self.new_str(key);
+                    let recv = NanBox::handle(receiver.to_raw());
+                    let handler_box = NanBox::handle(p_handler.to_raw());
+                    let r = self.call_with_this(
+                        trap,
+                        handler_box,
+                        &[NanBox::handle(target.to_raw()), key_box, new, recv],
+                    )?;
+                    if self.strict && !self.realm.truthy(r) {
+                        let m = self.new_str(&alloc::format!(
+                            "'set' on proxy: trap returned falsish for property '{key}'"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    return Ok(Some(()));
+                }
+                if let Some((_, setter)) = self.realm.accessor(target, key)
+                    && !matches!(setter.unpack(), Unpacked::Undefined)
+                {
+                    let this = NanBox::handle(receiver.to_raw());
+                    self.call_with_this(setter, this, &[new])?;
+                    return Ok(Some(()));
+                }
+                return Ok(None);
+            }
+            if let Some((_, setter)) = self.realm.accessor(c, key) {
+                if !matches!(setter.unpack(), Unpacked::Undefined) {
+                    let this = NanBox::handle(receiver.to_raw());
+                    self.call_with_this(setter, this, &[new])?;
+                }
+                // A getter-only inherited accessor shadows the data write (the
+                // existing computed-path behavior; strict-throw is not introduced
+                // here to avoid changing unrelated cases).
+                return Ok(Some(()));
+            }
+            // An own data property below shadows an inherited accessor/proxy.
+            if self.realm.has_own(c, key) {
+                break;
+            }
+            cur = self.realm.object_proto(c);
+        }
+        Ok(None)
+    }
+
     /// A proxy's `[[Set]]` returning the **boolean** result (for `Reflect.set`,
     /// which reports success/failure rather than throwing on a falsy trap
     /// result): invokes the `set` trap with `receiver`, or forwards trapless to
@@ -1692,6 +1758,24 @@ impl<'a> Interp<'a> {
                 // / frozen), which it then honors. A typed-array view writes through
                 // its bytes via `set_element_checked`.
                 if self.realm.typed_kind(handle).is_none() {
+                    // OrdinarySet: when the index is an *absent* own slot (a hole
+                    // or past the end) and the array's `[[Prototype]]` is NOT the
+                    // default `%Array.prototype%` (which has no index setters), an
+                    // inherited setter / proxy on the chain handles the write —
+                    // e.g. `Object.setPrototypeOf(arr, proxy); arr[0] = v`. An
+                    // array with the default prototype stays on the dense fast path
+                    // (no walk, no key allocation).
+                    let absent_own = self
+                        .realm
+                        .array_length(handle)
+                        .is_none_or(|len| i >= len || self.realm.get_element(handle, i).is_hole());
+                    if absent_own
+                        && self.realm.object_proto(handle) != self.realm.array_proto_intrinsic()
+                        && let Some(()) =
+                            self.set_through_proto_chain(handle, &alloc::format!("{i}"), new)?
+                    {
+                        return Ok(());
+                    }
                     self.store_array_index(handle, i, new)?;
                 } else {
                     self.set_element_checked(handle, i, new)?;
@@ -1717,24 +1801,15 @@ impl<'a> Interp<'a> {
             }
             return Ok(());
         }
-        // No own property: an *inherited* accessor on the prototype chain handles the
-        // write (its setter runs with `this` = the receiver). An inherited data
-        // property, or none, falls through to creating an own data property.
-        if !self.realm.has_own(handle, &name) {
-            let mut cur = self.realm.object_proto(handle);
-            while let Some(p) = cur {
-                if let Some((_, setter)) = self.realm.accessor(p, &name) {
-                    if !matches!(setter.unpack(), Unpacked::Undefined) {
-                        let this = NanBox::handle(handle.to_raw());
-                        self.call_with_this(setter, this, &[new])?;
-                    }
-                    return Ok(());
-                }
-                if self.realm.has_own(p, &name) {
-                    break;
-                }
-                cur = self.realm.object_proto(p);
-            }
+        // No own property: an *inherited* accessor **or a proxy** on the prototype
+        // chain handles the write via `parent.[[Set]]` (its setter runs, or the
+        // proxy's `set` trap fires, with `this`/Receiver = the receiver). An
+        // inherited data property, or none, falls through to creating an own data
+        // property.
+        if !self.realm.has_own(handle, &name)
+            && let Some(()) = self.set_through_proto_chain(handle, &name, new)?
+        {
+            return Ok(());
         }
         // `arr.length = n` resizes the array (with ToUint32 + RangeError check).
         if name == "length" && self.realm.is_array(handle) {

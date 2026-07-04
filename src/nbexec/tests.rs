@@ -5985,3 +5985,50 @@ fn reflect_set_proxy_target_returns_trap_boolean() {
         "true"
     );
 }
+
+#[test]
+fn computed_set_walks_proxy_and_setter_prototype() {
+    // OrdinarySet: a computed write (`o[k]=v`, `arr[i]=v`) whose own slot is
+    // absent runs parent.[[Set]] — an inherited setter or a proxy prototype
+    // handles it (dot-key `assign_member` already did; now the computed path too).
+    assert_eq!(
+        run(
+            "globalThis.__log=[];var pr=new Proxy({},{set(t,k,v){__log.push(k+'='+v);return true}});\
+             var o=Object.create(pr);o['x']=1;__log.join(',')+'|'+o.hasOwnProperty('x')"
+        ),
+        "x=1|false"
+    );
+    // An array index whose prototype is a proxy forwards to the trap.
+    assert_eq!(
+        run(
+            "globalThis.__log=[];var pr=new Proxy({},{set(t,k,v){__log.push(k+'='+v);return true}});\
+             var a=[];Object.setPrototypeOf(a,pr);a[0]=9;__log.join(',')+'|'+a.hasOwnProperty('0')"
+        ),
+        "0=9|false"
+    );
+    // An inherited index setter runs with the array as receiver.
+    assert_eq!(
+        run(
+            "var got;var a=[];Object.setPrototypeOf(a,{set 0(v){got=v;}});a[0]=7;got+'|'+a.hasOwnProperty('0')"
+        ),
+        "7|false"
+    );
+    // Fast path preserved: default-prototype arrays, present indices, hole fills.
+    assert_eq!(run("var a=[1,2,3];a[1]=9;a.join(',')"), "1,9,3");
+    assert_eq!(
+        run("var a=[1];a[1]=2;a[2]=3;a.join(',')+'|'+a.length"),
+        "1,2,3|3"
+    );
+    assert_eq!(
+        run("var a=[1,,3];a[1]=2;a.join(',')+'|'+a.hasOwnProperty('1')"),
+        "1,2,3|true"
+    );
+    // A *present* own index on a proxy-proto array writes the own slot (no walk).
+    assert_eq!(
+        run(
+            "globalThis.__log=[];var pr=new Proxy({},{set(t,k,v){__log.push(k);return true}});\
+             var a=[1,2,3];Object.setPrototypeOf(a,pr);a[1]=9;a.join(',')+'|'+__log.length"
+        ),
+        "1,9,3|0"
+    );
+}

@@ -275,6 +275,14 @@ impl Realm {
         self.array_proto_intrinsic = Some(handle);
     }
 
+    /// The realm's `%Array.prototype%` intrinsic, if installed — the default
+    /// `[[Prototype]]` of a dense array (used to fast-path element writes: an
+    /// array with the default prototype has no inherited index setters/proxy).
+    #[must_use]
+    pub fn array_proto_intrinsic(&self) -> Option<Handle> {
+        self.array_proto_intrinsic
+    }
+
     /// Records the realm's `%Symbol.prototype%` intrinsic — the `[[Prototype]]`
     /// for every `Cell::Symbol` primitive.
     pub fn set_symbol_proto_intrinsic(&mut self, handle: Handle) {

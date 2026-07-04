@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(proxy)* a **computed** write (`o[k]=v`, `arr[i]=v`) whose own slot is absent
+  now runs `parent.[[Set]]` — an inherited setter, or a proxy on the prototype
+  chain, handles it (with Receiver = the object) — matching the dot-key
+  `assign_member` path. So `Object.setPrototypeOf(arr, proxyWithSetTrap); arr[0]=v`
+  fires the trap instead of silently creating an own index. Default-`%Array.
+  prototype%` arrays and present indices keep the dense fast path (ROADMAP §3.6).
 - *(with)* the `with` object-environment `HasBinding` is a proxy-aware
   `HasProperty`, so `with (new Proxy(o, {has(){…}})) { name }` consults the `has`
   trap (a trapless proxy forwards to its target) instead of throwing a spurious
