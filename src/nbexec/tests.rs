@@ -5563,6 +5563,43 @@ fn host_fn_property_api_has_delete_keys() {
 }
 
 #[test]
+fn host_fn_construct_reenters_js() {
+    // A host fn `new`s a JS class via cx.construct and reads back a field, and
+    // reports is_constructor for a class vs a plain function.
+    let program = Parser::parse_program(
+        "class Point { constructor(x, y) { this.x = x; this.y = y; } }\
+         var arrow = () => {};\
+         make(Point, arrow)",
+    )
+    .expect("parse");
+    let mut interp = Interp::new();
+    interp.register_global_fn("make", 2, |cx, _t, args| {
+        let ctor = args.first().copied().unwrap_or(cx.undefined());
+        let arrow = args.get(1).copied().unwrap_or(cx.undefined());
+        let three = cx.number(3.0);
+        let four = cx.number(4.0);
+        let p = cx.construct(ctor, &[three, four])?;
+        let px = cx.get(p, "x")?;
+        let py = cx.get(p, "y")?;
+        let x = cx.to_number(px)?;
+        let y = cx.to_number(py)?;
+        Ok(cx.string(&alloc::format!(
+            "{}+{}={}/class:{}/arrow:{}",
+            x,
+            y,
+            x + y,
+            cx.is_constructor(ctor),
+            cx.is_constructor(arrow)
+        )))
+    });
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(
+        interp.realm().to_display_string(v),
+        "3+4=7/class:true/arrow:false"
+    );
+}
+
+#[test]
 fn host_fn_returns_promises() {
     // A host fn returns a resolved / rejected promise; JS observes them via
     // then/catch after the microtask drain, and is_promise inspects the value.

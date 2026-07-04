@@ -871,6 +871,24 @@ impl<'c, 'a> Ctx<'c, 'a> {
             .map(Handle::from_raw)
             .is_some_and(|h| self.interp.realm.promise_state(h).is_some())
     }
+
+    /// Whether `v` is a constructor (usable as the target of `new` / `construct`).
+    #[must_use]
+    pub fn is_constructor(&self, v: NanBox) -> bool {
+        self.interp.is_constructor_value(v)
+    }
+
+    /// `Construct(callee, args)` — invoke `callee` as a constructor (`new
+    /// callee(...args)`) and return the constructed object, re-entering JS.
+    ///
+    /// # Errors
+    /// A `TypeError` if `callee` is not a constructor, or the thrown value if the
+    /// constructor (or a base it chains to) throws.
+    pub fn construct(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, NanBox> {
+        self.interp
+            .construct(callee, args)
+            .map_err(|e| self.interp.exec_error_value(e))
+    }
 }
 
 /// A queued promise reaction: run `handler` with `value`, then settle `result`
