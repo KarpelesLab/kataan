@@ -2034,6 +2034,15 @@ impl<'a> Interp<'a> {
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
+        self.init_relative_time_format(obj, args)?;
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    pub(crate) fn init_relative_time_format(
+        &mut self,
+        obj: Handle,
+        args: &[NanBox],
+    ) -> Result<(), ExecError> {
         let marker = self.new_str("rtf");
         self.realm.set_hidden_property(obj, "\u{0}intl", marker);
         // 1. CanonicalizeLocaleList(locales) — a malformed tag raises a RangeError.
@@ -2085,7 +2094,7 @@ impl<'a> Interp<'a> {
         self.store_str(obj, "style", &Some(style));
         self.store_str(obj, "numeric", &Some(numeric));
         self.brand_intl_instance(obj, N_INTL_REL_TIME);
-        Ok(NanBox::handle(obj.to_raw()))
+        Ok(())
     }
 
     /// The resolved `(numeric, style)` of an `Intl.RelativeTimeFormat` instance
@@ -2230,6 +2239,15 @@ impl<'a> Interp<'a> {
     /// a plain call (no `new`) throws a `TypeError` before reaching here.
     pub(crate) fn make_list_format(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
+        self.init_list_format(obj, args)?;
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    pub(crate) fn init_list_format(
+        &mut self,
+        obj: Handle,
+        args: &[NanBox],
+    ) -> Result<(), ExecError> {
         let marker = self.new_str("list");
         self.realm.set_hidden_property(obj, "\u{0}intl", marker);
         // 1. CanonicalizeLocaleList(locales) — a malformed tag raises a RangeError.
@@ -2272,7 +2290,7 @@ impl<'a> Interp<'a> {
         self.store_str(obj, "type", &Some(list_type));
         self.store_str(obj, "style", &Some(style));
         self.brand_intl_instance(obj, N_INTL_LIST_FORMAT);
-        Ok(NanBox::handle(obj.to_raw()))
+        Ok(())
     }
 
     /// `StringListFromIterable(iterable)`: `undefined` → an empty list; otherwise
@@ -2575,6 +2593,11 @@ impl<'a> Interp<'a> {
     /// `segment(input)` method.
     pub(crate) fn make_segmenter(&mut self, args: &[NanBox]) -> NanBox {
         let obj = self.realm.new_object();
+        self.init_segmenter(obj, args);
+        NanBox::handle(obj.to_raw())
+    }
+
+    pub(crate) fn init_segmenter(&mut self, obj: Handle, args: &[NanBox]) {
         // Resolve + store the locale (best-effort; the constructor path validates).
         let locale = self
             .canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))
@@ -2598,7 +2621,6 @@ impl<'a> Interp<'a> {
         let kindv = self.new_str("segmenter");
         self.realm.set_hidden_property(obj, "\u{0}intl", kindv);
         self.brand_intl_instance(obj, N_INTL_SEGMENTER);
-        NanBox::handle(obj.to_raw())
     }
 
     /// Breaks a UTC millisecond timestamp into typed `(type, value)` parts per an

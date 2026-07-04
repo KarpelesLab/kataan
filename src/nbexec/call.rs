@@ -2819,17 +2819,34 @@ impl<'a> Interp<'a> {
             self.init_shadow_realm_super(instance);
             return Ok(());
         }
-        // `class S extends Intl.NumberFormat {}` / `Intl.DateTimeFormat`: `super()`
-        // initializes the formatter's internal slots on the (already subclass-proto-
-        // linked) instance, so `format`/`resolvedOptions`/`formatToParts` resolve.
-        if native_id == N_INTL_NUMBER_FORMAT || native_id == N_INTL_DATETIME_FORMAT {
-            self.init_intl_formatter_state(instance, native_id, args)?;
-            return Ok(());
-        }
-        // `class S extends Intl.PluralRules {}`: `super()` initializes the
-        // PluralRules slots on the (already subclass-proto-linked) instance.
-        if native_id == N_INTL_PLURAL_RULES {
-            self.init_plural_rules(instance, args)?;
+        // `class S extends Intl.<Service> {}`: `super()` initializes the service's
+        // internal slots on the (already subclass-proto-linked) instance, so its
+        // methods resolve. The `init_*` helpers re-brand the object to the service
+        // prototype, so save and restore the subclass prototype around them.
+        let intl_init: bool = matches!(
+            native_id,
+            N_INTL_NUMBER_FORMAT
+                | N_INTL_DATETIME_FORMAT
+                | N_INTL_PLURAL_RULES
+                | N_INTL_LIST_FORMAT
+                | N_INTL_REL_TIME
+                | N_INTL_SEGMENTER
+        );
+        if intl_init {
+            let subclass_proto = self.realm.object_proto(instance);
+            match native_id {
+                N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => {
+                    self.init_intl_formatter_state(instance, native_id, args)?;
+                }
+                N_INTL_PLURAL_RULES => self.init_plural_rules(instance, args)?,
+                N_INTL_LIST_FORMAT => self.init_list_format(instance, args)?,
+                N_INTL_REL_TIME => self.init_relative_time_format(instance, args)?,
+                N_INTL_SEGMENTER => self.init_segmenter(instance, args),
+                _ => unreachable!(),
+            }
+            if let Some(p) = subclass_proto {
+                self.realm.set_object_proto(instance, Some(p));
+            }
             return Ok(());
         }
         // `Symbol` and `BigInt` are callable but have no `[[Construct]]`: extending
