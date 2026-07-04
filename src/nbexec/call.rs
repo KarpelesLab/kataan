@@ -1031,7 +1031,8 @@ impl<'a> Interp<'a> {
                 // array; return the segment-data object whose `[index, index+len)`
                 // range covers `index` (undefined out of range / non-integer).
                 N_INTL_SEGMENTS_CONTAINING => {
-                    let idx = self.realm.to_number(arg0);
+                    // ToIntegerOrInfinity(index): a Symbol/BigInt throws; NaN → 0.
+                    let idx = self.coerce_to_integer_or_infinity(arg0)?;
                     let mut result = NanBox::undefined();
                     if idx.is_finite() && idx >= 0.0 {
                         let idx = idx as usize;
