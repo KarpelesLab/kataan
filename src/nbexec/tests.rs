@@ -6131,3 +6131,29 @@ fn split_tostring_before_limit_zero() {
         r#"["a","b","c"]"#
     );
 }
+
+#[test]
+fn reflect_set_trapless_chain_to_ordinary_getter_only() {
+    // Reflect.set forwarding through a trap-less proxy chain to an ordinary
+    // target: an inherited getter-only accessor fails (false); a setter runs
+    // (true); a data write succeeds (true).
+    assert_eq!(
+        run("var re=/(?:)/g;var rp=new Proxy(new Proxy(re,{}),{});Reflect.set(rp,'global',true)"),
+        "false"
+    );
+    assert_eq!(
+        run(
+            "var got;var o={set x(v){got=v}};var rp=new Proxy(new Proxy(o,{}),{});Reflect.set(rp,'x',5)+','+got"
+        ),
+        "true,5"
+    );
+    assert_eq!(
+        run("var o={};var rp=new Proxy(new Proxy(o,{}),{});Reflect.set(rp,'y',9)+','+o.y"),
+        "true,9"
+    );
+    // Plain assignment through a proxy-of-proxy still reaches a setter accessor.
+    assert_eq!(
+        run("var bar;var o={set bar(v){bar=v}};var p=new Proxy(new Proxy(o,{}),{});p.bar=1;bar"),
+        "1"
+    );
+}

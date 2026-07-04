@@ -1634,7 +1634,24 @@ impl<'a> Interp<'a> {
         receiver: NanBox,
     ) -> Result<bool, ExecError> {
         let Some((target, handler)) = self.realm.proxy_at(handle) else {
-            // Reached an ordinary object via a trapless forward: perform the set.
+            // Reached an ordinary object via a trapless forward: OrdinarySet
+            // returning the boolean. An inherited **getter-only** accessor fails
+            // (`false`); a setter runs (with the receiver as `this`) and succeeds;
+            // otherwise a data property is written.
+            let mut cur = Some(handle);
+            while let Some(c) = cur {
+                if let Some((_, setter)) = self.realm.accessor(c, key) {
+                    if matches!(setter.unpack(), Unpacked::Undefined) {
+                        return Ok(false);
+                    }
+                    self.call_with_this(setter, receiver, &[value])?;
+                    return Ok(true);
+                }
+                if self.realm.has_own(c, key) {
+                    break;
+                }
+                cur = self.realm.object_proto(c);
+            }
             let key_box = self.new_str(key);
             self.assign_member_value(handle, key_box, value)?;
             return Ok(true);
