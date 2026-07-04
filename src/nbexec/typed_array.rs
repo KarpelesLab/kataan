@@ -537,6 +537,72 @@ impl<'a> Interp<'a> {
         self.array_buffer_from_bytes(bytes)
     }
 
+    /// Allocates the result of `ArrayBuffer.prototype.slice` through
+    /// `SpeciesConstructor(O, %ArrayBuffer%)` and copies `data` (already the final
+    /// `new_len` bytes) into it. A default / `undefined` species takes the fast
+    /// `make_array_buffer_from_bytes` path; a subclass species is `Construct`ed
+    /// (returning a subclass instance), then validated as a distinct ArrayBuffer
+    /// of at least `new_len` bytes.
+    pub(crate) fn array_buffer_species_new(
+        &mut self,
+        original: Handle,
+        data: &[u8],
+        new_len: usize,
+    ) -> Result<Handle, ExecError> {
+        // SpeciesConstructor(O, %ArrayBuffer%): `Get(O, "constructor")`, then
+        // `C[@@species]` (undefined/null → the default constructor).
+        let mut c = self.read_member(original, "constructor")?;
+        if let Some(ch) = c.as_handle().map(Handle::from_raw) {
+            let sym = self.well_known_symbol("species");
+            let key = self.member_key(sym);
+            let s = self.read_member(ch, &key)?;
+            c = if matches!(s.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                NanBox::undefined()
+            } else {
+                s
+            };
+        } else if !matches!(c.unpack(), Unpacked::Undefined) {
+            return Err(
+                self.type_error("ArrayBuffer.prototype.slice: constructor is not an object")
+            );
+        }
+        let is_default = matches!(c.unpack(), Unpacked::Undefined)
+            || self.current.get("ArrayBuffer").and_then(|v| v.as_handle()) == c.as_handle();
+        if is_default {
+            return Ok(self.make_array_buffer_from_bytes(data));
+        }
+        if !self.is_constructor_value(c) {
+            return Err(
+                self.type_error("ArrayBuffer.prototype.slice: species is not a constructor")
+            );
+        }
+        // `Construct(C, «new_len»)` — a distinct, non-shared ArrayBuffer with at
+        // least `new_len` bytes; then copy the sliced data in.
+        let created = self.construct(c, &[NanBox::number(new_len as f64)])?;
+        let Some(nh) = created.as_handle().map(Handle::from_raw) else {
+            return Err(
+                self.type_error("ArrayBuffer.prototype.slice: species did not return an object")
+            );
+        };
+        if nh == original {
+            return Err(
+                self.type_error("ArrayBuffer.prototype.slice: species returned the source buffer")
+            );
+        }
+        let Some(nb_bytes) = self.array_buffer_bytes(nh) else {
+            return Err(self
+                .type_error("ArrayBuffer.prototype.slice: species did not return an ArrayBuffer"));
+        };
+        if self.realm.bytes_at(nb_bytes).map_or(0, <[u8]>::len) < new_len {
+            return Err(self.type_error("ArrayBuffer.prototype.slice: species buffer is too small"));
+        }
+        if let Some(dst) = self.realm.bytes_at_mut(nb_bytes) {
+            let n = data.len().min(dst.len());
+            dst[..n].copy_from_slice(&data[..n]);
+        }
+        Ok(nh)
+    }
+
     /// `%ArrayBuffer.prototype%`, the `[[Prototype]]` every `ArrayBuffer` object
     /// inherits (so its methods, accessors, and `Symbol.toStringTag` resolve through
     /// the chain). `None` only before `install_globals` has run.

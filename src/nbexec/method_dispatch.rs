@@ -919,7 +919,14 @@ impl<'a> Interp<'a> {
             // the current store, leaving any remainder zero.
             let mut sub = alloc::vec![0u8; new_len];
             sub[..count].copy_from_slice(cur.get(begin..begin + count).unwrap_or(&[]));
-            let nb = self.make_array_buffer_from_bytes(&sub);
+            // Plain `slice` allocates the result via `SpeciesConstructor(O,
+            // %ArrayBuffer%)` (so a subclass gets a subclass instance);
+            // `sliceToImmutable` always yields a fresh immutable `%ArrayBuffer%`.
+            let nb = if method == "slice" {
+                self.array_buffer_species_new(handle, &sub, new_len)?
+            } else {
+                self.make_array_buffer_from_bytes(&sub)
+            };
             // `sliceToImmutable` yields an immutable buffer.
             if method == "sliceToImmutable" {
                 self.realm

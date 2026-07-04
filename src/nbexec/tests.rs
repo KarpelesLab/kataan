@@ -6292,3 +6292,39 @@ fn arraybuffer_symbol_species() {
         "true"
     );
 }
+
+#[test]
+fn arraybuffer_slice_species_constructor() {
+    // ArrayBuffer.prototype.slice allocates the result via SpeciesConstructor.
+    assert_eq!(
+        run(
+            "class B extends ArrayBuffer{};var s=new B(8).slice(0,4);(s instanceof B)+','+s.byteLength"
+        ),
+        "true,4"
+    );
+    assert_eq!(
+        run(
+            "class B extends ArrayBuffer{static get [Symbol.species](){return ArrayBuffer}};\
+             var s=new B(8).slice(0,4);(s instanceof ArrayBuffer)+','+(s instanceof B)"
+        ),
+        "true,false"
+    );
+    // A non-constructor species is a TypeError.
+    assert_eq!(
+        run(
+            "class B extends ArrayBuffer{static get [Symbol.species](){return 42}};\
+             try{new B(8).slice(0,4);'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    // Data is copied; plain ArrayBuffer slice unaffected.
+    assert_eq!(
+        run("var b=new ArrayBuffer(4);new Uint8Array(b).set([1,2,3,4]);\
+             JSON.stringify(Array.from(new Uint8Array(b.slice(1,3))))"),
+        "[2,3]"
+    );
+    assert_eq!(
+        run("var s=new ArrayBuffer(8).slice(2,6);s.byteLength+','+(s instanceof ArrayBuffer)"),
+        "4,true"
+    );
+}

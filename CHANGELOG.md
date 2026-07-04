@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(arraybuffer)* `ArrayBuffer[Symbol.species]` getter is installed (returns
+  `this`, so a subclass inherits it), and `ArrayBuffer.prototype.slice` allocates
+  its result via `SpeciesConstructor(O, %ArrayBuffer%)` — a subclass instance for
+  a subclass receiver, a non-constructor species is a TypeError, and the result
+  is validated as a distinct ArrayBuffer of sufficient length (ROADMAP §3.6).
 - *(string)* `String.prototype.split` runs `ToString(separator)` before the
   `limit === 0` short-circuit (a throwing separator `toString` throws even at
   limit 0), and the bytecode VM faults an object/Symbol/wrapper separator (or an
