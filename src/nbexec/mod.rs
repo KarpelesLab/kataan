@@ -944,6 +944,28 @@ impl<'c, 'a> Ctx<'c, 'a> {
         self.interp.realm.release_persistent(idx);
     }
 
+    /// Attaches opaque native `state` (any `'static` Rust value) to the object
+    /// `obj`, à la N-API `napi_wrap`: retrievable with [`native_state`](Self::native_state)
+    /// and **dropped (its `Drop` run as a finalizer) when `obj` is
+    /// garbage-collected**. The attachment is weak — it does not keep `obj` alive.
+    /// A non-object `obj` is ignored.
+    pub fn set_native_state<T: core::any::Any>(&mut self, obj: NanBox, state: T) {
+        if let Some(h) = obj.as_handle().map(Handle::from_raw) {
+            self.interp
+                .realm
+                .set_native_state(h, alloc::boxed::Box::new(state));
+        }
+    }
+
+    /// Borrows the native state attached to `obj`, downcast to `T` (`None` if
+    /// absent or a different type).
+    #[must_use]
+    pub fn native_state<T: core::any::Any>(&self, obj: NanBox) -> Option<&T> {
+        obj.as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.interp.realm.native_state::<T>(h))
+    }
+
     /// Full `[[Set]]` of `obj[key] = value` (`OrdinarySet`): invokes an own or
     /// inherited accessor **setter**, honors non-writable data properties, and
     /// runs a proxy `set` trap — unlike [`set`](Self::set), which writes an own

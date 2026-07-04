@@ -180,6 +180,14 @@ pub struct Realm {
     /// index — never a raw `Handle` that compaction would invalidate. `None` slots
     /// are freed indices, reused by the next `persist`.
     host_persistent: Vec<Option<NanBox>>,
+    /// Host-attached **opaque native state** (`ROADMAP.md` §4.0 host-backed exotic
+    /// objects): a `Box<dyn Any>` an embedder wraps onto a JS object (à la N-API
+    /// `napi_wrap`), keyed by the object's handle. A **weak** table — it does NOT
+    /// root the key, so the object may still be collected; when it is, the entry
+    /// (and its boxed state) is dropped during the sweep, running the state's Rust
+    /// `Drop` as the finalizer (freeing file handles, sockets, …). Surviving keys
+    /// are forwarded on compaction.
+    host_native_state: alloc::collections::BTreeMap<u64, alloc::boxed::Box<dyn core::any::Any>>,
     /// The RegExp legacy static match record (Annex B.2.5): updated after every
     /// successful built-in match, read by the `RegExp.$1`..`$9` / `RegExp.input`
     /// / `lastMatch` / … static accessors.
@@ -253,6 +261,7 @@ impl Realm {
             bigint_proto_intrinsic: None,
             intl_protos: alloc::collections::BTreeMap::new(),
             host_persistent: Vec::new(),
+            host_native_state: alloc::collections::BTreeMap::new(),
             legacy_regexp: LegacyRegExpState::default(),
             limits,
         }
@@ -3037,6 +3046,34 @@ impl Realm {
         }
     }
 
+    /// Attaches opaque `state` to the object at `handle` (replacing any previous
+    /// state), keyed weakly by the handle (see [`host_native_state`](Self::host_native_state)).
+    pub fn set_native_state(
+        &mut self,
+        handle: Handle,
+        state: alloc::boxed::Box<dyn core::any::Any>,
+    ) {
+        self.host_native_state.insert(handle.to_raw(), state);
+    }
+
+    /// Borrows the native state attached to `handle`, downcast to `T`
+    /// (`None` if absent or a different type).
+    #[must_use]
+    pub fn native_state<T: core::any::Any>(&self, handle: Handle) -> Option<&T> {
+        self.host_native_state
+            .get(&handle.to_raw())
+            .and_then(|b| b.downcast_ref::<T>())
+    }
+
+    /// Removes and returns the native state attached to `handle` (running no
+    /// finalizer — the caller owns the box).
+    pub fn take_native_state(
+        &mut self,
+        handle: Handle,
+    ) -> Option<alloc::boxed::Box<dyn core::any::Any>> {
+        self.host_native_state.remove(&handle.to_raw())
+    }
+
     /// Pushes, into `extra`, the value handles of every side-table entry whose
     /// **key is live** (reachable from the real roots) — the ephemeron rule a
     /// weak-key map needs: an entry's value is a root only while its key is alive.
@@ -3107,6 +3144,10 @@ impl Realm {
         frozen_arrays: &mut alloc::collections::BTreeSet<u64>,
         sealed_arrays: &mut alloc::collections::BTreeSet<u64>,
         non_extensible_arrays: &mut alloc::collections::BTreeSet<u64>,
+        host_native_state: &mut alloc::collections::BTreeMap<
+            u64,
+            alloc::boxed::Box<dyn core::any::Any>,
+        >,
     ) {
         let dead = |raw: u64| {
             let h = Handle::from_raw(raw);
@@ -3116,6 +3157,9 @@ impl Realm {
         frozen_arrays.retain(|raw| !dead(*raw));
         sealed_arrays.retain(|raw| !dead(*raw));
         non_extensible_arrays.retain(|raw| !dead(*raw));
+        // Weak native-state entries whose object died are dropped here — running
+        // the boxed state's `Drop` as the object's finalizer.
+        host_native_state.retain(|cell_raw, _| !dead(*cell_raw));
         // `fn_ctor`/`fn_protos` are id-keyed; the function handle is the key's
         // identity. Drop both when the function handle is collectable-and-dead.
         let dead_ids: alloc::vec::Vec<u32> = fn_ctor
@@ -3154,6 +3198,7 @@ impl Realm {
             frozen_arrays,
             sealed_arrays,
             non_extensible_arrays,
+            host_native_state,
             ..
         } = self;
         // Phase 1 — mark from the real roots, expanding the weak-key side-tables
@@ -3182,6 +3227,7 @@ impl Realm {
             frozen_arrays,
             sealed_arrays,
             non_extensible_arrays,
+            host_native_state,
         );
         // Phase 3 — sweep the unmarked objects and promote the survivors.
         gc::sweep_full(heap, &marked)
@@ -3240,6 +3286,7 @@ impl Realm {
                 frozen_arrays,
                 sealed_arrays,
                 non_extensible_arrays,
+                host_native_state,
                 ..
             } = self;
             let marked =
@@ -3264,6 +3311,7 @@ impl Realm {
                 frozen_arrays,
                 sealed_arrays,
                 non_extensible_arrays,
+                host_native_state,
             );
         }
 
@@ -3287,6 +3335,7 @@ impl Realm {
             symbols_by_id,
             intl_protos,
             host_persistent,
+            host_native_state,
             ..
         } = self;
         let stats = gc::compact_with(heap, &mut all, &mut |forward| {
@@ -3332,6 +3381,12 @@ impl Realm {
                 if let Some(raw) = slot.as_handle() {
                     *slot = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
                 }
+            }
+            // Native-state is keyed by the owning object's handle; forward the key
+            // (the boxed value is opaque Rust data, not a cell reference).
+            let old_ns = core::mem::take(host_native_state);
+            for (cell_raw, state) in old_ns {
+                host_native_state.insert(forward(Handle::from_raw(cell_raw)).to_raw(), state);
             }
         });
         roots.copy_from_slice(&all[..n]);
@@ -4792,6 +4847,45 @@ mod tests {
                 .string_value(Handle::from_raw(label.as_handle().unwrap()))
                 .as_deref(),
             Some("tag"),
+        );
+    }
+
+    #[test]
+    fn native_state_finalized_on_collection_and_relocated() {
+        use alloc::rc::Rc;
+        use core::cell::Cell;
+        // A guard whose Drop bumps a shared counter — stands in for a native
+        // resource freed by its finalizer.
+        struct Guard(Rc<Cell<u32>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let dropped = Rc::new(Cell::new(0u32));
+        let mut realm = Realm::new();
+
+        // A live object keeps its state across a full GC and reads it back.
+        let live = realm.new_object();
+        realm.set_native_state(live, alloc::boxed::Box::new(Guard(dropped.clone())));
+        realm.collect(&[live]);
+        assert!(realm.native_state::<Guard>(live).is_some());
+        assert_eq!(dropped.get(), 0, "not finalized while reachable");
+
+        // A dead object (reachable only via native_state, which is weak) is
+        // collected, dropping its state — the finalizer runs.
+        let dead = realm.new_object();
+        realm.set_native_state(dead, alloc::boxed::Box::new(Guard(dropped.clone())));
+        realm.collect(&[live]);
+        assert_eq!(dropped.get(), 1, "finalizer ran on collection");
+        assert!(realm.native_state::<Guard>(dead).is_none(), "entry pruned");
+
+        // Compaction relocates the owning object and forwards the state key.
+        let mut roots = [live];
+        realm.compact(&mut roots);
+        assert!(
+            realm.native_state::<Guard>(roots[0]).is_some(),
+            "state follows relocated key",
         );
     }
 

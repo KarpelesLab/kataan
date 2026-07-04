@@ -5563,6 +5563,27 @@ fn host_fn_property_api_has_delete_keys() {
 }
 
 #[test]
+fn host_fn_native_state_wrap() {
+    // napi_wrap-style: attach opaque Rust state to a JS object, read it back.
+    let mut interp = Interp::new();
+    interp.register_global_fn("wrap", 1, |cx, _t, args| {
+        let o = cx.new_object();
+        let n = cx.to_number(args.first().copied().unwrap_or(cx.undefined()))? as i64;
+        cx.set_native_state(o, n);
+        Ok(o)
+    });
+    interp.register_global_fn("unwrap", 1, |cx, _t, args| {
+        let o = args.first().copied().unwrap_or(cx.undefined());
+        let v = cx.native_state::<i64>(o).copied().unwrap_or(-1);
+        Ok(cx.number(v as f64))
+    });
+    let p =
+        Parser::parse_program("var w = wrap(42); [unwrap(w), typeof w].join(',')").expect("parse");
+    let v = interp.run(&p).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "42,object");
+}
+
+#[test]
 fn host_deferred_promise_settled_later() {
     use core::cell::RefCell;
     // A host fn hands JS a deferred promise; the host settles it from "outside"
