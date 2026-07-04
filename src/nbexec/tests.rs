@@ -5891,3 +5891,36 @@ fn flat_flatmap_skip_absent_array_like_indices() {
         "2,2"
     );
 }
+
+#[test]
+fn flat_flatmap_array_species_create() {
+    // flat/flatMap use ArraySpeciesCreate(O, 0): a non-constructor @@species is a
+    // TypeError, a subclass species builds that subclass.
+    assert_eq!(
+        run(
+            "try{var a=[1,[2]];a.constructor={[Symbol.species]:42};a.flat();'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "try{var a=[1,2];a.constructor={[Symbol.species]:42};a.flatMap(x=>[x]);'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "class S extends Array{};var a=new S(1,[2,3]);var r=a.flat();(r instanceof S)+','+JSON.stringify(Array.from(r))"
+        ),
+        r#"true,[1,2,3]"#
+    );
+    // Normal behavior unchanged.
+    assert_eq!(run("JSON.stringify([1,[2,[3]]].flat())"), "[1,2,[3]]");
+    assert_eq!(run("JSON.stringify([1,[2,[3]]].flat(2))"), "[1,2,3]");
+    assert_eq!(
+        run("JSON.stringify([1,2].flatMap(x=>[x,x*10]))"),
+        "[1,10,2,20]"
+    );
+    // A hole in a mapped array is skipped when flattened.
+    assert_eq!(run("JSON.stringify([1].flatMap(x=>[x,,x*2]))"), "[1,2]");
+}

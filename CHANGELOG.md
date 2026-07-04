@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indices per FlattenIntoArray's HasProperty check (so a poisoned getter past
   `length` is never read), and `flatMap` passes the source object as the
   callback's 3rd argument (ROADMAP §3.6).
+- *(array)* `Array.prototype.flat`/`flatMap` build the result with
+  `ArraySpeciesCreate(O, 0)` + `CreateDataPropertyOrThrow` — a non-constructor
+  `@@species` (or a non-extensible/non-configurable target) now throws a
+  TypeError, and a subclass species is honored (ROADMAP §3.6).
 - *(array)* `Array.of` honors a constructor `this` (`Array.of.call(C, …)` /
   subclass `C.of(…)`) — `Construct(C, «len»)` + `CreateDataPropertyOrThrow` —
   instead of always building a plain `%Array%` (ROADMAP §3.7).

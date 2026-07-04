@@ -3574,6 +3574,12 @@ impl<'a> Interp<'a> {
                     } else {
                         self.realm.to_number(arg(0)) as i32
                     };
+                    // `A = ArraySpeciesCreate(O, 0)` — throws a TypeError for a
+                    // non-constructor `@@species`, *before* any element access.
+                    let a_v = self.array_species_create(handle, 0)?;
+                    let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
+                        return Err(self.type_error("Array species did not return an object"));
+                    };
                     // FlattenIntoArray processes only *present* elements
                     // (HasProperty). Mark an absent generic-array-like index as a
                     // hole so `flatten` skips it (real-array holes are already
@@ -3584,8 +3590,18 @@ impl<'a> Interp<'a> {
                         .map(|(i, e)| if is_present(i) { *e } else { NanBox::hole() })
                         .collect();
                     let out = self.flatten(&src, depth, 0)?;
-                    let h = self.realm.new_array(out);
-                    return Ok(Some(NanBox::handle(h.to_raw())));
+                    // `CreateDataPropertyOrThrow` each element into the target — a
+                    // non-extensible / non-configurable target throws. The default
+                    // fresh array takes the fast element write.
+                    let default_array = self.realm.is_array(a_h) && !self.realm.is_frozen(a_h);
+                    for (k, e) in out.into_iter().enumerate() {
+                        if default_array {
+                            self.realm.set_element(a_h, k, e);
+                        } else {
+                            self.create_data_property_or_throw(a_h, k, e)?;
+                        }
+                    }
+                    return Ok(Some(a_v));
                 }
                 // `copyWithin(target, start, end?)` — copy a slice within the
                 // array in place; negatives count from the end.
@@ -3616,7 +3632,14 @@ impl<'a> Interp<'a> {
                 // `map` then flatten one level.
                 "flatMap" => {
                     let f = arg(0);
-                    let mut out = Vec::new();
+                    // `A = ArraySpeciesCreate(O, 0)` first — a non-constructor
+                    // `@@species` is a TypeError before any mapping.
+                    let a_v = self.array_species_create(handle, 0)?;
+                    let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
+                        return Err(self.type_error("Array species did not return an object"));
+                    };
+                    let default_array = self.realm.is_array(a_h) && !self.realm.is_frozen(a_h);
+                    let mut k = 0usize;
                     for (i, e) in elems.iter().enumerate() {
                         // Only *present* elements are mapped (HasProperty); an
                         // absent generic-array-like index (or a real-array hole) is
@@ -3625,17 +3648,26 @@ impl<'a> Interp<'a> {
                             continue;
                         }
                         let r = self.call(f, &[*e, NanBox::number(i as f64), callback_recv])?;
-                        match r
+                        // Flatten one level: a mapped array spreads its *present*
+                        // elements (holes skipped), a non-array is appended.
+                        let items: Vec<NanBox> = match r
                             .as_handle()
                             .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
                             .map(<[_]>::to_vec)
                         {
-                            Some(inner) => out.extend(inner),
-                            None => out.push(r),
+                            Some(inner) => inner.into_iter().filter(|v| !v.is_hole()).collect(),
+                            None => alloc::vec![r],
+                        };
+                        for it in items {
+                            if default_array {
+                                self.realm.set_element(a_h, k, it);
+                            } else {
+                                self.create_data_property_or_throw(a_h, k, it)?;
+                            }
+                            k += 1;
                         }
                     }
-                    let h = self.realm.new_array(out);
-                    return Ok(Some(NanBox::handle(h.to_raw())));
+                    return Ok(Some(a_v));
                 }
                 // `at` with negative-from-end indexing. The index is
                 // ToIntegerOrInfinity (a Symbol/abrupt valueOf throws).
