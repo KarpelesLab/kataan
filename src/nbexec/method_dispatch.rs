@@ -3628,7 +3628,7 @@ impl<'a> Interp<'a> {
                     let start = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
-                        let n = self.realm.to_number(arg(1));
+                        let n = self.coerce_to_integer_or_infinity(arg(1))?;
                         if n < 0.0 {
                             (len as f64 + n).max(0.0) as usize
                         } else {
@@ -3638,7 +3638,7 @@ impl<'a> Interp<'a> {
                     let end = if matches!(arg(2).unpack(), Unpacked::Undefined) {
                         len
                     } else {
-                        let n = self.realm.to_number(arg(2));
+                        let n = self.coerce_to_integer_or_infinity(arg(2))?;
                         if n < 0.0 {
                             (len as f64 + n).max(0.0) as usize
                         } else {
@@ -3657,7 +3657,7 @@ impl<'a> Interp<'a> {
                     let depth = if matches!(arg(0).unpack(), Unpacked::Undefined) {
                         1
                     } else {
-                        self.realm.to_number(arg(0)) as i32
+                        self.coerce_to_integer_or_infinity(arg(0))? as i32
                     };
                     // `A = ArraySpeciesCreate(O, 0)` — throws a TypeError for a
                     // non-constructor `@@species`, *before* any element access.
@@ -3696,12 +3696,12 @@ impl<'a> Interp<'a> {
                         let i = v as i64;
                         if i < 0 { (len + i).max(0) } else { i.min(len) }
                     };
-                    let target = norm(self.realm.to_number(arg(0)));
-                    let start = norm(self.realm.to_number(arg(1)));
+                    let target = norm(self.coerce_to_integer_or_infinity(arg(0))?);
+                    let start = norm(self.coerce_to_integer_or_infinity(arg(1))?);
                     let end = if matches!(arg(2).unpack(), Unpacked::Undefined) {
                         len
                     } else {
-                        norm(self.realm.to_number(arg(2)))
+                        norm(self.coerce_to_integer_or_infinity(arg(2))?)
                     };
                     // A hole/accessor array copies through `[[Get]]`/`[[Set]]`/
                     // `Delete` (getters/setters fire, holes propagate), choosing the

@@ -6462,3 +6462,37 @@ fn splice_coerces_args_with_tointegerorinfinity() {
         "[4]"
     );
 }
+
+#[test]
+fn array_index_args_use_tointegerorinfinity() {
+    // fill/flat/copyWithin coerce their index/depth args via ToIntegerOrInfinity
+    // (valueOf, not the string form); a throwing coercion propagates.
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4].fill(0,{valueOf:()=>2}))"),
+        "[1,2,0,0]"
+    );
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4].fill(0,1,{valueOf:()=>3}))"),
+        "[1,0,0,4]"
+    );
+    assert_eq!(
+        run("try{[1,2,3].fill(0,{valueOf:()=>{throw 'e'}});'no'}catch(e){e}"),
+        "e"
+    );
+    assert_eq!(
+        run("JSON.stringify([1,[2,[3]]].flat({valueOf:()=>2}))"),
+        "[1,2,3]"
+    );
+    assert_eq!(
+        run("try{[1,[2]].flat({valueOf:()=>{throw 'd'}});'no'}catch(e){e}"),
+        "d"
+    );
+    assert_eq!(
+        run("JSON.stringify([1,2,3,4,5].copyWithin({valueOf:()=>1},3))"),
+        "[1,4,5,4,5]"
+    );
+    assert_eq!(
+        run("try{[1,2,3].copyWithin({valueOf:()=>{throw 'c'}},0);'no'}catch(e){e}"),
+        "c"
+    );
+}
