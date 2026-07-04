@@ -3479,6 +3479,21 @@ fn builtin_method(
                 NanBox::handle(ctx.realm.new_string(&c).to_raw())
             }
             "split" => {
+                // The native fast path only handles a plain string / number /
+                // boolean / null / undefined separator and a plain numeric limit.
+                // A separator that is an object (a RegExp, or a custom
+                // `toString`/`@@split`), a String wrapper, or a Symbol — or an
+                // object `limit` — needs interpreter-aware coercion / delegation
+                // and the exact `ToString`-before-`limit === 0` ordering, so fault
+                // to the tree-walker's full `String.prototype.split`.
+                let needs_walk = |v: NanBox| {
+                    v.as_handle()
+                        .map(Handle::from_raw)
+                        .is_some_and(|hh| ctx.realm.string_value(hh).is_none())
+                };
+                if needs_walk(arg0()) || args.get(1).copied().is_some_and(needs_walk) {
+                    return None;
+                }
                 let sep = ctx.realm.to_display_string(arg0());
                 let mut parts: Vec<NanBox> = if sep.is_empty() {
                     s.chars()

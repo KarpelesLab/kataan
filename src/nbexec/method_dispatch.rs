@@ -1901,19 +1901,26 @@ impl<'a> Interp<'a> {
                             0
                         }
                     } as usize;
+                    // `R = ToString(separator)` (spec step 7) runs *before* the
+                    // `lim === 0` short-circuit (step 8), so a throwing separator
+                    // `toString` throws even when `limit` is 0. An `undefined`
+                    // separator skips the coercion (its ToString is harmless) and
+                    // returns the whole string below.
+                    let sep = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                        None
+                    } else {
+                        Some(self.arg_string_bytes_fallible(arg(0))?)
+                    };
                     if limit == 0 {
                         return Ok(Some(NanBox::handle(
                             self.realm.new_array(Vec::new()).to_raw(),
                         )));
                     }
-                    // An `undefined` separator returns the whole string as the sole
-                    // element.
-                    if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                    let Some(sep) = sep else {
                         let whole = self.new_str_bytes(bytes.clone());
                         let arr = self.realm.new_array(alloc::vec![whole]);
                         return Ok(Some(NanBox::handle(arr.to_raw())));
-                    }
-                    let sep = self.arg_string_bytes_fallible(arg(0))?;
+                    };
                     let mut parts: Vec<NanBox> = if sep.is_empty() {
                         // Empty separator → one entry per UTF-16 code unit (a lone
                         // surrogate is its own one-unit entry).

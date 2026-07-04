@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(string)* `String.prototype.split` runs `ToString(separator)` before the
+  `limit === 0` short-circuit (a throwing separator `toString` throws even at
+  limit 0), and the bytecode VM faults an object/Symbol/wrapper separator (or an
+  object `limit`) to the tree-walker so a custom `toString`/`@@split` and RegExp
+  delegation are honored — previously `"axbxc".split({toString:()=>"x"})` did not
+  split under `nbvm` (ROADMAP §3.6, §6 two-engines-one-truth).
 - *(string)* `String.raw` uses throwing `ToObject` on the template and on
   `Get(template, "raw")` (a `null`/`undefined` or a non-object `raw` throws
   TypeError), and reads `raw` via `Get` so an inherited getter fires and its

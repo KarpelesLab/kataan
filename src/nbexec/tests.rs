@@ -6105,3 +6105,29 @@ fn string_raw_validates_template_and_raw() {
     assert_eq!(run("String.raw({raw:['a','b','c']},1,2)"), "a1b2c");
     assert_eq!(run("String.raw({raw:{length:2,0:'x',1:'y'}},9)"), "x9y");
 }
+
+#[test]
+fn split_tostring_before_limit_zero() {
+    // `ToString(separator)` (spec step 7) runs before the `lim === 0`
+    // short-circuit (step 8), so a throwing separator toString throws even at
+    // limit 0; an object separator is ToString'd.
+    assert_eq!(
+        run("try{'x'.split({toString:()=>{throw 's'}},0);'no'}catch(e){e}"),
+        "s"
+    );
+    assert_eq!(
+        run("JSON.stringify('axbxc'.split({toString:()=>'x'}))"),
+        r#"["a","b","c"]"#
+    );
+    assert_eq!(run("JSON.stringify('a,b'.split(',',0))"), "[]");
+    assert_eq!(
+        run("JSON.stringify('a,b,c'.split(','))"),
+        r#"["a","b","c"]"#
+    );
+    assert_eq!(run("JSON.stringify('x'.split(undefined))"), r#"["x"]"#);
+    assert_eq!(run("JSON.stringify('ab'.split(''))"), r#"["a","b"]"#);
+    assert_eq!(
+        run("JSON.stringify('a1b2c'.split(/\\d/))"),
+        r#"["a","b","c"]"#
+    );
+}
