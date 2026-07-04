@@ -2806,7 +2806,23 @@ impl<'a> Interp<'a> {
                 .get_property(handle, "\u{0}locale")
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_else(|| String::from("en"));
-            let opts = self.number_format_options(handle);
+            let mut opts = self.number_format_options(handle);
+            // `trailingZeroDisplay: "stripIfInteger"`: an integer value drops its
+            // forced trailing fraction (and significant) zeros. The intl crate has
+            // no such option, so lower the minimum digit counts for this value.
+            if n.is_finite() && n.fract() == 0.0 {
+                let tzd = self
+                    .realm
+                    .get_property(handle, "trailingZeroDisplay")
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default();
+                if tzd == "stripIfInteger" {
+                    opts.minimum_fraction_digits = Some(0);
+                    if opts.minimum_significant_digits.is_some() {
+                        opts.minimum_significant_digits = Some(1);
+                    }
+                }
+            }
             // `intl` 0.4 panics on negative zero; format +0 and re-apply the sign.
             if n == 0.0 && n.is_sign_negative() {
                 let body = intl::number::format(&locale, 0.0, &opts);

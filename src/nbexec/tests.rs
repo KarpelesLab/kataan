@@ -7427,3 +7427,32 @@ fn intl_number_format_significant_digit_defaults() {
         "1.235"
     );
 }
+
+#[test]
+fn intl_number_format_trailing_zero_display() {
+    // trailingZeroDisplay:"stripIfInteger" drops forced trailing zeros for an
+    // integer value; a real fraction is kept, and "auto" is unaffected.
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en',{minimumFractionDigits:2,trailingZeroDisplay:'stripIfInteger'}).format(5)"
+        ),
+        "5"
+    );
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en',{minimumFractionDigits:2,trailingZeroDisplay:'stripIfInteger'}).format(5.5)"
+        ),
+        "5.50"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{minimumFractionDigits:2}).format(5)"),
+        "5.00"
+    );
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en',{minimumSignificantDigits:3,trailingZeroDisplay:'stripIfInteger'}).format(5)"
+        ),
+        "5"
+    );
+    assert_eq!(run("new Intl.NumberFormat('en').format(1234.5)"), "1,234.5");
+}
