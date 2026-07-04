@@ -1523,7 +1523,35 @@ impl<'a> Interp<'a> {
         let lv = self.new_str(&locale);
         self.realm.set_property(out, "locale", lv);
 
-        if kind == "segmenter" {
+        if kind == "collator" {
+            // `Intl.Collator.prototype.resolvedOptions()` — key order per the spec
+            // table: locale, usage, sensitivity, ignorePunctuation, collation,
+            // numeric, caseFirst.
+            let usage = get_str(self, "usage").unwrap_or_else(|| String::from("sort"));
+            let uv = self.new_str(&usage);
+            self.realm.set_property(out, "usage", uv);
+            let sens = get_str(self, "sensitivity").unwrap_or_else(|| String::from("variant"));
+            let sv = self.new_str(&sens);
+            self.realm.set_property(out, "sensitivity", sv);
+            let ip = fmt
+                .and_then(|h| self.realm.get_property(h, "ignorePunctuation"))
+                .and_then(|v| v.as_boolean())
+                .unwrap_or(false);
+            self.realm
+                .set_property(out, "ignorePunctuation", NanBox::boolean(ip));
+            let coll = get_str(self, "collation").unwrap_or_else(|| String::from("default"));
+            let cv = self.new_str(&coll);
+            self.realm.set_property(out, "collation", cv);
+            let numeric = fmt
+                .and_then(|h| self.realm.get_property(h, "numeric"))
+                .and_then(|v| v.as_boolean())
+                .unwrap_or(false);
+            self.realm
+                .set_property(out, "numeric", NanBox::boolean(numeric));
+            let cf = get_str(self, "caseFirst").unwrap_or_else(|| String::from("false"));
+            let cfv = self.new_str(&cf);
+            self.realm.set_property(out, "caseFirst", cfv);
+        } else if kind == "segmenter" {
             // `Intl.Segmenter.prototype.resolvedOptions()` — `{ locale, granularity }`.
             let gran = get_str(self, "granularity").unwrap_or_else(|| String::from("grapheme"));
             let gv = self.new_str(&gran);
@@ -2168,12 +2196,23 @@ impl<'a> Interp<'a> {
             .unwrap_or_else(|| String::from("en"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
+        // Mark the kind so `resolvedOptions` builds the Collator table (not the
+        // default NumberFormat one).
+        let kindv = self.new_str("collator");
+        self.realm.set_hidden_property(obj, "\u{0}intl", kindv);
         if let Some(opts) = args
             .get(1)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
         {
-            for key in ["sensitivity", "numeric", "caseFirst"] {
+            for key in [
+                "usage",
+                "sensitivity",
+                "numeric",
+                "caseFirst",
+                "ignorePunctuation",
+                "collation",
+            ] {
                 if let Some(v) = self.realm.get_property(opts, key) {
                     self.realm.set_hidden_property(obj, key, v);
                 }
