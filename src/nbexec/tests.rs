@@ -5563,6 +5563,35 @@ fn host_fn_property_api_has_delete_keys() {
 }
 
 #[test]
+fn host_fn_persistent_handle_across_calls() {
+    // A host fn pins an object in one call and reads it back in a later call via a
+    // persistent handle — surviving the GC that runs between them.
+    let mut interp = Interp::new();
+    interp.register_global_fn("stash", 1, |cx, _t, args| {
+        let o = cx.new_object();
+        let v = args.first().copied().unwrap_or(cx.undefined());
+        cx.set(o, "x", v);
+        let idx = cx.persist(o);
+        Ok(cx.number(f64::from(idx)))
+    });
+    interp.register_global_fn("readX", 1, |cx, _t, args| {
+        let idx = cx.to_number(args.first().copied().unwrap_or(cx.undefined()))? as u32;
+        let o = cx.persistent(idx);
+        cx.get(o, "x")
+    });
+    // Persist in one run; allocate garbage (to move the heap) in another; read back.
+    let stash = Parser::parse_program("stash(99)").expect("parse");
+    let idx = interp.run(&stash).expect("exec");
+    let idx = interp.realm().to_display_string(idx);
+    let churn =
+        Parser::parse_program("var s=''; for (var i=0;i<500;i++) s+={a:i}.a;").expect("parse");
+    interp.run(&churn).expect("exec");
+    let read = Parser::parse_program(&alloc::format!("readX({idx})")).expect("parse");
+    let v = interp.run(&read).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "99");
+}
+
+#[test]
 #[cfg(feature = "std")]
 fn host_fn_panic_is_trapped_as_error() {
     // A panicking host closure becomes a catchable JS Error rather than unwinding

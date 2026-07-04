@@ -894,6 +894,30 @@ impl<'c, 'a> Ctx<'c, 'a> {
             .map_err(|e| self.interp.exec_error_value(e))
     }
 
+    /// Pins `value` as a **persistent handle**, returning a stable index the host
+    /// can hold *across* engine calls — the value survives GC and stays valid when
+    /// the moving collector relocates it (a bare `NanBox` handle would not; see the
+    /// `Ctx` note). Read it back later with [`Interp::persistent`] and free it with
+    /// [`Interp::release_persistent`]. (`ROADMAP.md` §4.0 handle scope.)
+    pub fn persist(&mut self, value: NanBox) -> u32 {
+        self.interp.realm.persist(value)
+    }
+
+    /// Reads a value pinned earlier by [`persist`](Self::persist) (`undefined` if
+    /// the index was released or never allocated), reflecting any GC relocation.
+    #[must_use]
+    pub fn persistent(&self, idx: u32) -> NanBox {
+        self.interp
+            .realm
+            .persistent(idx)
+            .unwrap_or(NanBox::undefined())
+    }
+
+    /// Releases a persistent handle so its value is no longer pinned.
+    pub fn release_persistent(&mut self, idx: u32) {
+        self.interp.realm.release_persistent(idx);
+    }
+
     /// Full `[[Set]]` of `obj[key] = value` (`OrdinarySet`): invokes an own or
     /// inherited accessor **setter**, honors non-writable data properties, and
     /// runs a proxy `set` trap — unlike [`set`](Self::set), which writes an own
@@ -4315,6 +4339,24 @@ impl<'a> Interp<'a> {
         }));
         let h = self.realm.new_host_fn(id);
         NanBox::handle(h.to_raw())
+    }
+
+    /// Reads a persistent handle pinned by [`Ctx::persist`] (or [`persist`](Self::persist)),
+    /// reflecting any relocation the collector has applied. `None` if released.
+    #[must_use]
+    pub fn persistent(&self, idx: u32) -> Option<NanBox> {
+        self.realm.persistent(idx)
+    }
+
+    /// Pins `value` as a persistent handle from outside a host call (host-side
+    /// setup), returning its index. See [`Ctx::persist`].
+    pub fn persist(&mut self, value: NanBox) -> u32 {
+        self.realm.persist(value)
+    }
+
+    /// Releases a persistent handle so its value is no longer a GC root.
+    pub fn release_persistent(&mut self, idx: u32) {
+        self.realm.release_persistent(idx);
     }
 
     /// Whether the host function with registry index `id` was registered as a

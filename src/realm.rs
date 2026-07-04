@@ -173,6 +173,13 @@ pub struct Realm {
     /// `fn_protos`; also kept alive as GC roots in `gc_side_table_values` (and
     /// reachable through the constructor's `prototype` data property).
     intl_protos: alloc::collections::BTreeMap<u16, Handle>,
+    /// Host-held **persistent handles** (`ROADMAP.md` §4.0 handle scope): values an
+    /// embedder pins across engine calls. Each slot is a GC root (so the value
+    /// survives collection) and is forwarded on compaction (so the handle stays
+    /// valid when the moving collector relocates it). The host holds only the slot
+    /// index — never a raw `Handle` that compaction would invalidate. `None` slots
+    /// are freed indices, reused by the next `persist`.
+    host_persistent: Vec<Option<NanBox>>,
     /// The RegExp legacy static match record (Annex B.2.5): updated after every
     /// successful built-in match, read by the `RegExp.$1`..`$9` / `RegExp.input`
     /// / `lastMatch` / … static accessors.
@@ -245,6 +252,7 @@ impl Realm {
             symbol_proto_intrinsic: None,
             bigint_proto_intrinsic: None,
             intl_protos: alloc::collections::BTreeMap::new(),
+            host_persistent: Vec::new(),
             legacy_regexp: LegacyRegExpState::default(),
             limits,
         }
@@ -2989,7 +2997,44 @@ impl Realm {
         r.extend(self.fn_ctor.values().copied());
         r.extend(self.intl_protos.values().copied());
         r.extend(self.symbols_by_id.values().copied());
+        // Host persistent handles keep their (object) values alive across calls.
+        r.extend(
+            self.host_persistent
+                .iter()
+                .flatten()
+                .filter_map(|nb| nb.as_handle().map(Handle::from_raw)),
+        );
         r
+    }
+
+    /// Pins `value` as a **persistent handle** and returns its slot index (see
+    /// [`host_persistent`](Self::host_persistent)). The value survives GC and stays
+    /// valid across compaction until [`release_persistent`](Self::release_persistent).
+    /// A freed slot is reused before growing the table.
+    pub fn persist(&mut self, value: NanBox) -> u32 {
+        if let Some(i) = self.host_persistent.iter().position(Option::is_none) {
+            self.host_persistent[i] = Some(value);
+            i as u32
+        } else {
+            self.host_persistent.push(Some(value));
+            (self.host_persistent.len() - 1) as u32
+        }
+    }
+
+    /// Reads the current value of persistent handle `idx` (`None` if the slot was
+    /// released or never allocated). The returned `NanBox` reflects any relocation
+    /// the collector has applied.
+    #[must_use]
+    pub fn persistent(&self, idx: u32) -> Option<NanBox> {
+        self.host_persistent.get(idx as usize).copied().flatten()
+    }
+
+    /// Releases persistent handle `idx`, so its value is no longer a GC root and the
+    /// slot can be reused. A double release / unknown index is a harmless no-op.
+    pub fn release_persistent(&mut self, idx: u32) {
+        if let Some(slot) = self.host_persistent.get_mut(idx as usize) {
+            *slot = None;
+        }
     }
 
     /// Pushes, into `extra`, the value handles of every side-table entry whose
@@ -3241,6 +3286,7 @@ impl Realm {
             fn_ctor,
             symbols_by_id,
             intl_protos,
+            host_persistent,
             ..
         } = self;
         let stats = gc::compact_with(heap, &mut all, &mut |forward| {
@@ -3279,6 +3325,13 @@ impl Realm {
             }
             for v in symbols_by_id.values_mut() {
                 *v = forward(*v);
+            }
+            // Host persistent handles: forward each pinned *object* value so the
+            // slot the embedder reads through stays valid after relocation.
+            for slot in host_persistent.iter_mut().flatten() {
+                if let Some(raw) = slot.as_handle() {
+                    *slot = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
+                }
             }
         });
         roots.copy_from_slice(&all[..n]);
@@ -4740,6 +4793,50 @@ mod tests {
                 .as_deref(),
             Some("tag"),
         );
+    }
+
+    #[test]
+    fn compaction_roots_and_relocates_persistent_handles() {
+        let mut realm = Realm::new();
+        // A persisted object is reachable ONLY through the `host_persistent` table
+        // (not the explicit roots), so the collector must root it and compaction
+        // must forward it. Unrooted garbage before it forces relocation.
+        let _garbage = realm.new_string("garbage");
+        let obj = realm.new_object();
+        let tag = realm.new_string("kept");
+        realm.set_property(obj, "v", NanBox::handle(tag.to_raw()));
+        let idx = realm.persist(NanBox::handle(obj.to_raw()));
+
+        // Compact with NO explicit roots: only the persistent side table keeps `obj`
+        // (and, transitively, `tag`) alive.
+        let mut roots: [Handle; 0] = [];
+        realm.compact(&mut roots);
+
+        let obj2 = realm
+            .persistent(idx)
+            .expect("persistent survived compaction");
+        let h2 = Handle::from_raw(obj2.as_handle().unwrap());
+        assert_ne!(obj2.as_handle().unwrap(), obj.to_raw(), "handle relocated");
+        let v = realm
+            .get_property(h2, "v")
+            .expect("transitive value survived");
+        assert_eq!(
+            realm
+                .string_value(Handle::from_raw(v.as_handle().unwrap()))
+                .as_deref(),
+            Some("kept"),
+        );
+
+        // A primitive persists too (stored inline, no rooting needed).
+        let pidx = realm.persist(NanBox::number(42.0));
+        assert_eq!(
+            realm.persistent(pidx).and_then(|n| n.as_number()),
+            Some(42.0)
+        );
+
+        // Release frees the slot and drops the root; the index reads `None`.
+        realm.release_persistent(idx);
+        assert!(realm.persistent(idx).is_none());
     }
 
     #[test]
