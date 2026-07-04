@@ -426,36 +426,19 @@ impl<'a> Interp<'a> {
     /// its prototype chain (own data/accessor property, or an in-range array index /
     /// `length`). Mirrors the `in` operator / `Reflect.has`.
     pub(crate) fn has_property(&mut self, obj: Handle, key: &str) -> bool {
-        // Integer-indexed exotic `[[HasProperty]]`: when `obj` is a typed array and
-        // `key` is a *canonical numeric index*, the answer is exactly
-        // IsValidIntegerIndex (in-bounds, attached, not `-0`/non-integer) — the
-        // prototype chain is **never** consulted (so a numeric key set on
-        // `%TypedArray%.prototype` is invisible, and an out-of-bounds index is
-        // false even if inherited).
-        if self.realm.typed_kind(obj).is_some()
-            && let Some(n) = canonical_numeric_index(key)
-        {
-            let is_neg_zero = n == 0.0 && n.is_sign_negative();
-            return !self.typed_array_detached(obj)
-                && !is_neg_zero
-                && n == (n as i64) as f64
-                && n >= 0.0
-                && self
-                    .realm
-                    .typed_len(obj)
-                    .is_some_and(|len| (n as usize) < len);
-        }
-        let mut cur = Some(obj);
-        while let Some(c) = cur {
-            // `has_own` already reports an in-range non-hole index (and `length`)
-            // for an array, so it suffices for every cell kind. A hole is absent
-            // here but may still be inherited, so the prototype walk continues.
-            if self.realm.has_own(c, key) {
-                return true;
-            }
-            cur = self.realm.object_proto(c);
-        }
-        false
+        // Route through the proxy-aware `[[HasProperty]]` (`has_property_proxied`)
+        // so a **proxy** receiver — or a proxy anywhere on the prototype chain —
+        // forwards to its `has` trap / target instead of reporting every index as
+        // absent. This is what makes generic array-like algorithms and iteration
+        // (`[...proxyOfArray]`, `Array.prototype.forEach.call(proxy, …)`) observe
+        // the proxied elements rather than skipping them as holes. The proxied
+        // form's non-proxy path is a superset of the plain chain walk (it also
+        // honors in-range array indices and accessors), so ordinary objects are
+        // unaffected. A throwing `has` trap — an extreme edge in the boolean
+        // callers — collapses to `false`; call sites where a trap throw must
+        // propagate (the `in` operator, `Reflect.has`) use `has_property_proxied`
+        // directly.
+        self.has_property_proxied(obj, key).unwrap_or(false)
     }
 
     /// ToPropertyDescriptor (ECMA-262 6.2.6.5): normalizes a user-supplied

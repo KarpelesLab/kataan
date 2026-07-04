@@ -5609,3 +5609,48 @@ fn host_fn_self_reentrancy_throws() {
     let v = interp.run(&program).expect("exec");
     assert_eq!(interp.realm().to_display_string(v), "true");
 }
+
+// --- Trap-less Proxy forwarding through iteration (ROADMAP §3.7) ------------
+
+#[test]
+fn proxy_of_array_iterates_through_get() {
+    // `[...proxy]` / `Array.from(proxy)` must read each index through the
+    // proxy's `[[Get]]` (HasProperty must forward to the target), not snapshot
+    // the target array and read holes.
+    assert_eq!(run("JSON.stringify([...new Proxy([1,2,3],{})])"), "[1,2,3]");
+    assert_eq!(
+        run("JSON.stringify(Array.from(new Proxy([1,2,3],{})))"),
+        "[1,2,3]"
+    );
+    // The `get` trap observes the numeric indices (not just `length`).
+    assert_eq!(
+        run(
+            "var log=[]; var p=new Proxy([1,2,3],{get(t,k,r){if(typeof k==='string')log.push(k);return Reflect.get(t,k,r);}}); \
+             [...p]; JSON.stringify(log.filter(k=>k==='0'||k==='1'||k==='2'))"
+        ),
+        r#"["0","1","2"]"#
+    );
+}
+
+#[test]
+fn proxy_of_array_generic_methods() {
+    // Generic array-like algorithms applied to a proxy read through `[[Get]]`.
+    assert_eq!(
+        run(
+            "var s=[];Array.prototype.forEach.call(new Proxy([4,5,6],{}),x=>s.push(x));JSON.stringify(s)"
+        ),
+        "[4,5,6]"
+    );
+    assert_eq!(
+        run(r#"Array.prototype.join.call(new Proxy([7,8,9],{}), "-")"#),
+        "7-8-9"
+    );
+    assert_eq!(
+        run("Array.prototype.map.call(new Proxy([1,2,3],{}),x=>x*2).join(',')"),
+        "2,4,6"
+    );
+    assert_eq!(
+        run("Array.prototype.indexOf.call(new Proxy([1,2,3],{}), 2)"),
+        "1"
+    );
+}

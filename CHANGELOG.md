@@ -7,16 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(proxy)* route HasProperty through the proxy `has` trap in generic
+  array-like iteration, so `[...new Proxy([1,2,3],{})]`, `Array.from(proxy)`,
+  and `Array.prototype.*.call(proxy, …)` observe the proxied elements instead
+  of reading holes (ROADMAP §3.7).
+
 ## [0.0.6](https://github.com/KarpelesLab/kataan/compare/v0.0.5...v0.0.6) - 2026-07-04
-
-### Added
-
-- *(embed)* host-function registration API — register_fn + Ctx (§4.0 M1)
-
-### Other
-
-- *(roadmap)* plan the host-function registration / embedding API (§4.0)
-- add CI, crates.io, docs.rs, and MIT license badges to README
 
 ### Added
 
@@ -26,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values, read/write properties, throw catchable errors, coerce arguments, and
   re-enter JS. Backed by a new `Cell::HostFn` registry cell; self-reentrancy is
   a clean `TypeError`.
+
+### Other
+
+- *(roadmap)* plan the host-function registration / embedding API (§4.0)
+- add CI, crates.io, docs.rs, and MIT license badges to README
 
 ## [0.0.5](https://github.com/KarpelesLab/kataan/compare/v0.0.4...v0.0.5) - 2026-07-03
 
