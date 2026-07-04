@@ -130,9 +130,23 @@ impl<'a> Interp<'a> {
                     }
                 }
                 "valueOf" => Some(recv),
-                // `toLocaleString()` — a minimal grouping format (thousands
-                // separators with `,`), since no locale data is available.
+                // `toLocaleString(locales, options)` — build a real NumberFormat and
+                // format through it so *every* option (notation/unit/significant
+                // digits/signDisplay/…) applies, not just the minimal grouping path.
                 "toLocaleString" => {
+                    #[cfg(feature = "intl")]
+                    let s = {
+                        let fmt_args = [
+                            args.first().copied().unwrap_or(NanBox::undefined()),
+                            args.get(1).copied().unwrap_or(NanBox::undefined()),
+                        ];
+                        let inst = self.make_intl_formatter(N_INTL_NUMBER_FORMAT, &fmt_args)?;
+                        match inst.as_handle().map(Handle::from_raw) {
+                            Some(h) => self.intl_format_number(h, n),
+                            None => self.number_to_locale_string(n, args.get(1).copied()),
+                        }
+                    };
+                    #[cfg(not(feature = "intl"))]
                     let s = self.number_to_locale_string(n, args.get(1).copied());
                     Some(self.new_str(&s))
                 }
