@@ -2142,11 +2142,13 @@ impl<'a> Interp<'a> {
     /// `of(code)` method.
     pub(crate) fn make_display_names(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
-        let locale = args
-            .first()
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|h| self.realm.string_value(h))
+        // CanonicalizeLocaleList(locales) first (a Symbol/bad element is a
+        // TypeError/RangeError); the resolved locale is the first requested tag.
+        let requested =
+            self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
+        let locale = requested
+            .into_iter()
+            .next()
             .unwrap_or_else(|| String::from("en"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
@@ -3635,13 +3637,18 @@ impl<'a> Interp<'a> {
                 continue;
             }
             let el = self.read_member(oh, &key)?;
-            // Element must be a String or Object.
+            // Element must be a String or Object (per spec `Type(kValue)`); any other
+            // primitive — Symbol, Number, Boolean, BigInt — is a TypeError. (A boxed
+            // String/primitive is an Object and is allowed, coerced via ToString.)
             let el_is_string = el
                 .as_handle()
                 .map(Handle::from_raw)
                 .is_some_and(|h| self.realm.string_value(h).is_some());
             let el_is_object = self.is_object_value(el) && !el_is_string;
-            if !el_is_string && !el_is_object {
+            let ty = self.realm.type_of_value(el);
+            let el_is_primitive_nonstring =
+                !el_is_string && matches!(ty, "symbol" | "number" | "boolean" | "bigint");
+            if el_is_primitive_nonstring || (!el_is_string && !el_is_object) {
                 let m = self.new_str("locale list element is not a string or object");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
