@@ -2161,6 +2161,14 @@ impl<'a> Interp<'a> {
             }
             _ => None,
         };
+        // `localeMatcher` is read (and validated) first, before `type` (spec order);
+        // it is otherwise unused.
+        let _ = self.get_string_option(
+            opts,
+            "localeMatcher",
+            &["lookup", "best fit"],
+            Some("best fit"),
+        )?;
         // `type` is a **required** option (its absence — including when `options`
         // is undefined — is a TypeError); it must be one of the valid types.
         let type_s = self.get_string_option(

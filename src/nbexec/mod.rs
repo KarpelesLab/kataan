@@ -1881,6 +1881,9 @@ fn builtin_native_arity(id: u16) -> u32 {
         // Length 2.
         // `FinalizationRegistry.prototype.register(target, heldValue [, token])`.
         N_FINREG_REGISTER
+        // `Intl.DisplayNames(locales, options)` — both required (options is not
+        // optional), so `length === 2`.
+        | N_INTL_DISPLAY_NAMES
         | N_PROXY
         | N_OBJECT_SET_PROTO
         | N_OBJECT_IS
