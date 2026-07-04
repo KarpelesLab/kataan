@@ -409,6 +409,12 @@ impl Realm {
         self.default_object_proto = Some(proto);
     }
 
+    /// The realm's `%Object.prototype%`, if wired.
+    #[must_use]
+    pub fn default_object_proto(&self) -> Option<Handle> {
+        self.default_object_proto
+    }
+
     /// The auxiliary property object for a non-object cell, created on first use.
     fn aux_object(&mut self, handle: Handle) -> Handle {
         if let Some(h) = self.aux_props.get(&handle.to_raw()) {

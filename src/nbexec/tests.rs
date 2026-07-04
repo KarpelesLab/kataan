@@ -6695,3 +6695,34 @@ fn for_in_enumerates_string_indices() {
         r#"["a","b"]"#
     );
 }
+
+#[test]
+fn error_subclass_constructor_is_the_subclass() {
+    // A subclass of a native error resolves `.constructor` to the subclass (its
+    // own/prototype-chain link), not the base error global — the error-name
+    // fallback only fires when nothing before Object.prototype defines it.
+    assert_eq!(
+        run("class E extends Error{}new E('m').constructor===E"),
+        "true"
+    );
+    assert_eq!(
+        run("class E extends TypeError{}new E().constructor===E"),
+        "true"
+    );
+    assert_eq!(
+        run("class E extends Error{}class F extends E{}new F().constructor===F"),
+        "true"
+    );
+    assert_eq!(
+        run("class E extends Error{}var e=new E('hi');e.message+','+(e instanceof Error)"),
+        "hi,true"
+    );
+    // Direct / thrown native errors still resolve to their own global.
+    assert_eq!(run("new Error().constructor===Error"), "true");
+    assert_eq!(run("new TypeError().constructor===TypeError"), "true");
+    assert_eq!(run("new RangeError().constructor===RangeError"), "true");
+    assert_eq!(
+        run("try{null.x}catch(e){e.constructor===TypeError}"),
+        "true"
+    );
+}

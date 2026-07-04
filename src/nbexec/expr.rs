@@ -2075,19 +2075,36 @@ impl<'a> Interp<'a> {
         }
         // An error object's `.constructor` is its specific error global — its
         // prototype otherwise reports a generic `Object`. Recognized by an own
-        // `name` in the error family plus a `message` (so a user `new Foo()`,
-        // whose constructor resolves through its prototype, is never matched).
+        // `name` in the error family plus a `message`. This is a *fallback* only:
+        // it fires when nothing before `Object.prototype` defines `constructor`,
+        // so a subclass instance (`class E extends Error {}`, whose `constructor`
+        // resolves to `E` through its own/prototype chain) is never overridden.
         if name == "constructor" {
-            let nm = self
-                .realm
-                .get_property(handle, "name")
-                .map(|v| self.realm.to_display_string(v))
-                .unwrap_or_default();
-            if ERROR_NAMES.contains(&nm.as_str())
-                && self.realm.get_property(handle, "message").is_some()
-                && let Some(ctor) = self.current.get(&nm)
-            {
-                return Ok(ctor);
+            let mut cur = Some(handle);
+            let obj_proto = self.realm.default_object_proto();
+            let mut resolved = false;
+            while let Some(c) = cur {
+                if Some(c) == obj_proto {
+                    break;
+                }
+                if self.realm.has_own(c, "constructor") {
+                    resolved = true;
+                    break;
+                }
+                cur = self.realm.object_proto(c);
+            }
+            if !resolved {
+                let nm = self
+                    .realm
+                    .get_property(handle, "name")
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default();
+                if ERROR_NAMES.contains(&nm.as_str())
+                    && self.realm.get_property(handle, "message").is_some()
+                    && let Some(ctor) = self.current.get(&nm)
+                {
+                    return Ok(ctor);
+                }
             }
         }
         // Well-known `Symbol.iterator` / `Symbol.asyncIterator` (lazily created).
