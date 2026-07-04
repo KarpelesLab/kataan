@@ -500,7 +500,7 @@ impl<'a> Interp<'a> {
 
     /// The constructor function handle for the `Intl` service whose property name
     /// on the namespace is `ctor_name` (e.g. `"NumberFormat"`).
-    fn intl_ctor_handle(&mut self, ctor_name: &str) -> Option<Handle> {
+    pub(crate) fn intl_ctor_handle(&mut self, ctor_name: &str) -> Option<Handle> {
         let ns = self.intl_namespace()?;
         self.realm
             .get_property(ns, ctor_name)
@@ -612,6 +612,16 @@ impl<'a> Interp<'a> {
             if let Some(proto) = self.intl_service_prototype(svc) {
                 self.realm.set_object_proto(obj, Some(proto));
             }
+        }
+    }
+
+    /// Brands `obj` with the service's internal-slot marker *without* touching its
+    /// prototype (for a subclass `super()`, whose instance already links to the
+    /// subclass prototype).
+    fn set_intl_marker(&mut self, obj: Handle, ctor_id: u16) {
+        if let Some(svc) = INTL_SERVICES.iter().find(|s| s.ctor_id == ctor_id) {
+            self.realm
+                .set_hidden_property(obj, svc.marker, NanBox::boolean(true));
         }
     }
 
@@ -766,6 +776,23 @@ impl<'a> Interp<'a> {
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
+        // Link `[[Prototype]]` to `Intl.X.prototype` (a subclass/Reflect.construct
+        // newTarget overrides it in the caller) and initialize the formatter state.
+        self.brand_intl_instance(obj, id);
+        self.init_intl_formatter_state(obj, id, args)?;
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    /// Initializes an Intl formatter's internal slots on an *already-allocated*
+    /// (and prototype-linked) `obj` — the shared body of `make_intl_formatter` and
+    /// the `class S extends Intl.NumberFormat {}` `super()` path, so a subclass
+    /// instance carries the `[[NumberFormat]]`/`[[DateTimeFormat]]` slots.
+    pub(crate) fn init_intl_formatter_state(
+        &mut self,
+        obj: Handle,
+        id: u16,
+        args: &[NanBox],
+    ) -> Result<(), ExecError> {
         let kind = if id == N_INTL_NUMBER_FORMAT {
             "number"
         } else {
@@ -773,10 +800,9 @@ impl<'a> Interp<'a> {
         };
         let marker = self.new_str(kind);
         self.realm.set_hidden_property(obj, "\u{0}intl", marker);
-        // Brand the instance with the service's internal slot and link its
-        // `[[Prototype]]` to `Intl.X.prototype` (where `format`/`resolvedOptions`/
-        // `formatToParts` now live as branded prototype methods).
-        self.brand_intl_instance(obj, id);
+        // Brand the instance with the service's internal-slot marker (without
+        // resetting the prototype, which a subclass `super()` has already set).
+        self.set_intl_marker(obj, id);
         // CanonicalizeLocaleList(locales): the resolved locale is the first
         // requested tag (this engine serves any structurally valid locale), else
         // the default. A malformed tag raises a RangeError here.
@@ -803,7 +829,7 @@ impl<'a> Interp<'a> {
         } else {
             self.init_datetime_format(obj, opts)?;
         }
-        Ok(NanBox::handle(obj.to_raw()))
+        Ok(())
     }
 
     /// `GetOption(options, prop, "string", values, default)` — reads `prop` via

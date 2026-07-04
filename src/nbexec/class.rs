@@ -714,7 +714,23 @@ impl<'a> Interp<'a> {
                 return Some(h);
             }
         }
-        None
+        // The Intl service constructors live under the `Intl` namespace, not the
+        // global scope, so `class M extends Intl.NumberFormat {}` resolves the base
+        // by id to link `M.prototype` to `Intl.NumberFormat.prototype`.
+        let intl_name = match id {
+            N_INTL_NUMBER_FORMAT => "NumberFormat",
+            N_INTL_DATETIME_FORMAT => "DateTimeFormat",
+            N_INTL_COLLATOR => "Collator",
+            N_INTL_PLURAL_RULES => "PluralRules",
+            N_INTL_LIST_FORMAT => "ListFormat",
+            N_INTL_REL_TIME => "RelativeTimeFormat",
+            N_INTL_DISPLAY_NAMES => "DisplayNames",
+            N_INTL_SEGMENTER => "Segmenter",
+            N_INTL_DURATION_FORMAT => "DurationFormat",
+            N_INTL_LOCALE => "Locale",
+            _ => return None,
+        };
+        self.intl_ctor_handle(intl_name)
     }
 
     /// The "native base kind" for a superclass `handle` used as `extends` heritage:

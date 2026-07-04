@@ -7233,3 +7233,52 @@ fn intl_service_constructors_non_enumerable() {
         "function"
     );
 }
+
+#[test]
+fn intl_formatter_subclassing() {
+    // `class M extends Intl.NumberFormat {}` links M.prototype to
+    // NumberFormat.prototype (instanceof), super() initializes the internal slots
+    // (format/resolvedOptions work), and a Reflect.construct newTarget's prototype
+    // is honored.
+    assert_eq!(
+        run("class M extends Intl.NumberFormat{}new M('en-US').format(1234.5)"),
+        "1,234.5"
+    );
+    assert_eq!(
+        run(
+            "class M extends Intl.NumberFormat{}var f=new M('en');(f instanceof M)+','+(f instanceof Intl.NumberFormat)"
+        ),
+        "true,true"
+    );
+    assert_eq!(
+        run("class M extends Intl.NumberFormat{}new M('en-US').resolvedOptions().locale"),
+        "en-US"
+    );
+    assert_eq!(
+        run(
+            "class M extends Intl.NumberFormat{fmt2(x){return this.format(x)+'!'}}new M('en-US').fmt2(5)"
+        ),
+        "5!"
+    );
+    assert_eq!(
+        run("class M extends Intl.NumberFormat{}new M('en-US',{style:'percent'}).format(0.5)"),
+        "50%"
+    );
+    assert_eq!(
+        run("class M extends Intl.DateTimeFormat{}typeof new M('en').format(new Date(0))"),
+        "string"
+    );
+    assert_eq!(
+        run(
+            "function D(){}var f=Reflect.construct(Intl.NumberFormat,['en-US'],D);f.format(5)+','+(Object.getPrototypeOf(f)===D.prototype)"
+        ),
+        "5,true"
+    );
+    // Direct construction unaffected.
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en-US').format(99)+','+(new Intl.NumberFormat() instanceof Intl.NumberFormat)"
+        ),
+        "99,true"
+    );
+}

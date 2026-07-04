@@ -1868,7 +1868,16 @@ impl<'a> Interp<'a> {
         }
         // `new Intl.NumberFormat(locales, options)` / `Intl.DateTimeFormat(...)`.
         if id == N_INTL_NUMBER_FORMAT || id == N_INTL_DATETIME_FORMAT {
-            return self.make_intl_formatter(id, args);
+            let result = self.make_intl_formatter(id, args)?;
+            // OrdinaryCreateFromConstructor(newTarget): a subclass /
+            // `Reflect.construct` newTarget supplies the instance prototype (the
+            // formatter defaults to `%Intl.X.prototype%`).
+            if let Some(oh) = result.as_handle().map(Handle::from_raw)
+                && let Some(proto) = self.instance_proto(native_new_target, callee, None)
+            {
+                self.realm.set_object_proto(oh, Some(proto));
+            }
+            return Ok(result);
         }
         // `new Intl.Collator(...)` → an object whose `compare` is a bound function
         // (so `arr.sort(new Intl.Collator().compare)` works); code-point order, no
@@ -2679,6 +2688,13 @@ impl<'a> Interp<'a> {
         // `class S extends ShadowRealm {}`: brand + allocate the persistent scope.
         if native_id == N_SHADOW_REALM {
             self.init_shadow_realm_super(instance);
+            return Ok(());
+        }
+        // `class S extends Intl.NumberFormat {}` / `Intl.DateTimeFormat`: `super()`
+        // initializes the formatter's internal slots on the (already subclass-proto-
+        // linked) instance, so `format`/`resolvedOptions`/`formatToParts` resolve.
+        if native_id == N_INTL_NUMBER_FORMAT || native_id == N_INTL_DATETIME_FORMAT {
+            self.init_intl_formatter_state(instance, native_id, args)?;
             return Ok(());
         }
         // `Symbol` and `BigInt` are callable but have no `[[Construct]]`: extending
