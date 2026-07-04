@@ -415,15 +415,19 @@ sentinel builtins onto the registry to prove the path end-to-end.
 first-class callable (spec-shaped own `name`/`length`, `typeof === "function"`,
 `Function.prototype.toString` shape, `new` → `TypeError`). The closure receives
 a `Ctx` with value builders (`number`/`string`/`new_object`/`new_array`/…),
-property `get`/`set`, argument coercion (`to_number`/`to_string`/`to_boolean`),
-error builders (`type_error`/`range_error`/`error`), and reentrant `call` to
-re-enter JS; `Err(value)` raises a catchable JS exception. Self-reentrancy onto
-the same host function is a clean `TypeError` (the `FnMut` is taken out of its
-slot for the call). See `examples/embed_host_fn.rs`. **Remaining for §4.0:** a
-rooted **handle scope** (host values held across calls), `construct` +
-host-backed exotic objects/finalizers, panic-trapping at the boundary, the
-**C ABI** mirror, async/promise interop, `nbvm` host-native fault-through, and
-migrating a sentinel builtin onto the registry.
+property access (`get`/`set`/`has`/`has_own`/`delete`/`own_keys`), value
+inspection (`type_of`/`is_callable`/`is_object`/`is_array`), array reads
+(`array_len`/`array_get`), argument coercion (`to_number`/`to_string`/
+`to_boolean`), error builders (`type_error`/`range_error`/`error`), promise
+creation (`resolved_promise`/`rejected_promise`/`is_promise`), and reentrant
+`call` to re-enter JS; `Err(value)` raises a catchable JS exception.
+Self-reentrancy onto the same host function is a clean `TypeError` (the `FnMut` is
+taken out of its slot for the call). See `examples/embed_host_fn.rs`.
+**Remaining for §4.0:** a rooted **handle scope** (host values held across calls),
+`construct` + host-backed exotic objects/finalizers, panic-trapping at the
+boundary, the **C ABI** mirror, the async *continuation* half (a `Resolver` the
+host settles later from a timer/IO completion), `nbvm` host-native fault-through,
+and migrating a sentinel builtin onto the registry.
 
 ### 4.1 Event loop & scheduling
 
