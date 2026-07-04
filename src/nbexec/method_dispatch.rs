@@ -3574,7 +3574,16 @@ impl<'a> Interp<'a> {
                     } else {
                         self.realm.to_number(arg(0)) as i32
                     };
-                    let out = self.flatten(&elems, depth, 0)?;
+                    // FlattenIntoArray processes only *present* elements
+                    // (HasProperty). Mark an absent generic-array-like index as a
+                    // hole so `flatten` skips it (real-array holes are already
+                    // `is_hole()`), e.g. `[].flat.call({length:3,0:1,2:[2,3]})`.
+                    let src: Vec<NanBox> = elems
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| if is_present(i) { *e } else { NanBox::hole() })
+                        .collect();
+                    let out = self.flatten(&src, depth, 0)?;
                     let h = self.realm.new_array(out);
                     return Ok(Some(NanBox::handle(h.to_raw())));
                 }
@@ -3609,7 +3618,13 @@ impl<'a> Interp<'a> {
                     let f = arg(0);
                     let mut out = Vec::new();
                     for (i, e) in elems.iter().enumerate() {
-                        let r = self.call(f, &[*e, NanBox::number(i as f64)])?;
+                        // Only *present* elements are mapped (HasProperty); an
+                        // absent generic-array-like index (or a real-array hole) is
+                        // skipped, so a poisoned getter past `length` is never read.
+                        if !is_present(i) {
+                            continue;
+                        }
+                        let r = self.call(f, &[*e, NanBox::number(i as f64), callback_recv])?;
                         match r
                             .as_handle()
                             .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))

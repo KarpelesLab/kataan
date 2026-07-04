@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the generic array-like iteration (`forEach`/`map`/… presence probe) all
   counted holes. Now hole-aware (via `has_own`). `Array.prototype.flat`/
   `flatMap` also skip holes (FlattenIntoArray uses HasProperty) (ROADMAP §3.6).
+- *(array)* `Array.prototype.flat`/`flatMap` on a generic array-like skip absent
+  indices per FlattenIntoArray's HasProperty check (so a poisoned getter past
+  `length` is never read), and `flatMap` passes the source object as the
+  callback's 3rd argument (ROADMAP §3.6).
 - *(array)* `Array.of` honors a constructor `this` (`Array.of.call(C, …)` /
   subclass `C.of(…)`) — `Construct(C, «len»)` + `CreateDataPropertyOrThrow` —
   instead of always building a plain `%Array%` (ROADMAP §3.7).

@@ -5868,3 +5868,26 @@ fn sparse_array_holes_in_haspropety_and_flat() {
     // Object.keys unaffected (already hole-aware).
     assert_eq!(run("JSON.stringify(Object.keys([2,,3]))"), r#"["0","2"]"#);
 }
+
+#[test]
+fn flat_flatmap_skip_absent_array_like_indices() {
+    // FlattenIntoArray uses HasProperty: an absent generic-array-like index is
+    // skipped, and a poisoned getter past `length` is never read.
+    assert_eq!(
+        run("var a={length:3,0:1,2:21,get 3(){throw 'no'}};\
+             JSON.stringify([].flatMap.call(a,function(e){return [39,e*2];}))"),
+        "[39,2,39,42]"
+    );
+    assert_eq!(
+        run("var b={length:3,0:1,2:[2,3],get 3(){throw 'no'}};JSON.stringify([].flat.call(b))"),
+        "[1,2,3]"
+    );
+    // Real arrays with holes unaffected.
+    assert_eq!(run("JSON.stringify([1,,3].flatMap(x=>[x]))"), "[1,3]");
+    assert_eq!(run("JSON.stringify([1,[2,,3]].flat())"), "[1,2,3]");
+    // flatMap passes the source object as the 3rd callback argument.
+    assert_eq!(
+        run("[1,2].flatMap((x,i,arr)=>[arr.length]).join(',')"),
+        "2,2"
+    );
+}
