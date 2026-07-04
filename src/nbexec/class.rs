@@ -570,78 +570,11 @@ impl<'a> Interp<'a> {
         };
         let this_val = NanBox::handle(instance.to_raw());
 
-        // *Private* methods/accessors (`#m`) are not public prototype members:
-        // they brand the instance directly, so install them as own (hidden)
-        // private-keyed members over the whole chain (base-first so a derived
-        // private overrides — though shadowing across the chain is rare).
-        for (cid, cenv) in chain.iter().rev() {
-            let class = self.classes[*cid as usize];
-            for member in &class.body {
-                let ClassMember::Method(m) = member else {
-                    continue;
-                };
-                if m.is_static {
-                    continue;
-                }
-                // Only private members are installed on the instance; public ones
-                // live on the prototype.
-                if !matches!(&m.key, PropertyKey::Private(_)) {
-                    continue;
-                }
-                let key = {
-                    let saved = core::mem::replace(&mut self.current, cenv.clone());
-                    let k = self.eval_member_key_for_class(&m.key, *cid);
-                    self.current = saved;
-                    k?
-                };
-                // A private method/accessor is defined once per class and shared by
-                // every instance (`c1.#m === c2.#m`); cache by (class, kind, key).
-                let cache_key = (
-                    *cid,
-                    alloc::format!("{}\u{0}{key}", method_kind_tag(m.kind)),
-                );
-                let f = if let Some(f) = self.private_method_cache.get(&cache_key) {
-                    *f
-                } else {
-                    let saved = core::mem::replace(&mut self.current, cenv.clone());
-                    let f = self.make_method(
-                        &m.value.params,
-                        Body::Block(&m.value.body),
-                        m.value.is_async,
-                        m.value.is_generator,
-                        Some(*cid),
-                        false,
-                    );
-                    self.current = saved;
-                    if let Some(n) = self.private_method_display_name(&m.key, m.kind) {
-                        self.install_method_meta(f, &n, &m.value.params);
-                    }
-                    self.private_method_cache.insert(cache_key, f);
-                    f
-                };
-                match m.kind {
-                    MethodKind::Method => {
-                        self.realm.set_hidden_property(instance, &key, f);
-                        // A private method is non-writable (and non-configurable):
-                        // `obj.#method = …` / `obj.#method op= …` is a TypeError in
-                        // PrivateSet. Marking it read-only lets the private-write
-                        // path reject the store.
-                        self.realm.set_readonly_property(instance, &key);
-                    }
-                    MethodKind::Get => {
-                        self.realm
-                            .define_accessor(instance, &key, f, NanBox::undefined());
-                        self.realm.mark_hidden(instance, &key);
-                    }
-                    MethodKind::Set => {
-                        self.realm
-                            .define_accessor(instance, &key, NanBox::undefined(), f);
-                        self.realm.mark_hidden(instance, &key);
-                    }
-                    MethodKind::Constructor => {}
-                }
-            }
-        }
+        // NOTE: private methods/accessors are NOT installed here. Per spec they are
+        // added by `InitializeInstanceElements` — after each class's `super()`
+        // returns — so `install_private_methods` runs per-class from
+        // `init_instance_fields`, keeping a private method unreachable while a base
+        // constructor is still executing.
 
         self.realm.set_class_tag(instance, class_id);
         let saved_this = core::mem::replace(&mut self.this_val, this_val);
@@ -934,11 +867,88 @@ impl<'a> Interp<'a> {
     /// Applies a class's own (non-static) instance field initializers to
     /// `instance`. Run before the constructor body (base class) / after the
     /// implicit super for a constructor-less derived class.
+    /// Installs *one class's* private methods/accessors (`#m`, `get #x`, `set #x`)
+    /// on `instance` as own hidden private-keyed members. Per spec these are added
+    /// by `InitializeInstanceElements` — i.e. **after `super()` returns**, together
+    /// with (and just before) that class's field initializers — so a private
+    /// method is NOT reachable while a base constructor is still running (called
+    /// from `init_instance_fields`, not at allocation).
+    pub(crate) fn install_private_methods(
+        &mut self,
+        class_id: u32,
+        instance: Handle,
+    ) -> Result<(), ExecError> {
+        let cenv = self.class_envs[class_id as usize].clone();
+        let class = self.classes[class_id as usize];
+        for member in &class.body {
+            let ClassMember::Method(m) = member else {
+                continue;
+            };
+            if m.is_static || !matches!(&m.key, PropertyKey::Private(_)) {
+                continue;
+            }
+            let key = {
+                let saved = core::mem::replace(&mut self.current, cenv.clone());
+                let k = self.eval_member_key_for_class(&m.key, class_id);
+                self.current = saved;
+                k?
+            };
+            // A private method/accessor is defined once per class and shared by
+            // every instance (`c1.#m === c2.#m`); cache by (class, kind, key).
+            let cache_key = (
+                class_id,
+                alloc::format!("{}\u{0}{key}", method_kind_tag(m.kind)),
+            );
+            let f = if let Some(f) = self.private_method_cache.get(&cache_key) {
+                *f
+            } else {
+                let saved = core::mem::replace(&mut self.current, cenv.clone());
+                let f = self.make_method(
+                    &m.value.params,
+                    Body::Block(&m.value.body),
+                    m.value.is_async,
+                    m.value.is_generator,
+                    Some(class_id),
+                    false,
+                );
+                self.current = saved;
+                if let Some(n) = self.private_method_display_name(&m.key, m.kind) {
+                    self.install_method_meta(f, &n, &m.value.params);
+                }
+                self.private_method_cache.insert(cache_key, f);
+                f
+            };
+            match m.kind {
+                MethodKind::Method => {
+                    self.realm.set_hidden_property(instance, &key, f);
+                    // A private method is non-writable (and non-configurable):
+                    // `obj.#method = …` is a TypeError in PrivateSet.
+                    self.realm.set_readonly_property(instance, &key);
+                }
+                MethodKind::Get => {
+                    self.realm
+                        .define_accessor(instance, &key, f, NanBox::undefined());
+                    self.realm.mark_hidden(instance, &key);
+                }
+                MethodKind::Set => {
+                    self.realm
+                        .define_accessor(instance, &key, NanBox::undefined(), f);
+                    self.realm.mark_hidden(instance, &key);
+                }
+                MethodKind::Constructor => {}
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn init_instance_fields(
         &mut self,
         class_id: u32,
         instance: Handle,
     ) -> Result<(), ExecError> {
+        // Private methods/accessors install first (before this class's field
+        // initializers, which may reference them), and only now — after `super()`.
+        self.install_private_methods(class_id, instance)?;
         let class = self.classes[class_id as usize];
         // Instance field initializers run with the class as their home object, so
         // `super.x` (e.g. inside an arrow stored in a field) resolves against the

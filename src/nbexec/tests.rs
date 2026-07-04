@@ -6907,3 +6907,56 @@ fn string_symbol_method_only_for_object_arg() {
     assert_eq!(run("'a1b'.match(/\\d/)[0]"), "1");
     assert_eq!(run("'x'.match({[Symbol.match](s){return 'c:'+s}})"), "c:x");
 }
+
+#[test]
+fn private_methods_install_after_super() {
+    // Private methods/accessors are installed by InitializeInstanceElements —
+    // after super() returns — so they're unreachable while a base constructor
+    // runs (called via this.f() before super completes → TypeError).
+    assert_eq!(
+        run(
+            "var C=class{constructor(){this.f()}};class D extends C{f(){this.#m()}#m(){return 42}}try{new D();'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "var C=class{constructor(){this.f()}};class D extends C{f(){return this.#x}get #x(){return 1}}try{new D();'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    // Normal private-member behavior is intact.
+    assert_eq!(
+        run("class A{#m(){return 42}call(){return this.#m()}}new A().call()"),
+        "42"
+    );
+    assert_eq!(
+        run(
+            "var C=class{constructor(){}};class D extends C{f(){return this.#m()}#m(){return 7}}new D().f()"
+        ),
+        "7"
+    );
+    assert_eq!(
+        run(
+            "class A{#a(){return 1}ga(){return this.#a()}}class B extends A{#b(){return 2}gb(){return this.#b()}}var b=new B();b.ga()+','+b.gb()"
+        ),
+        "1,2"
+    );
+    // A field initializer may reference this class's private method (installed first).
+    assert_eq!(run("class A{#m(){return 9}x=this.#m()}new A().x"), "9");
+    // Shared per class (c1.#m === c2.#m), static private, and `#x in o` still work.
+    assert_eq!(
+        run(
+            "class A{#m(){}chk(o){return this.gm()===o.gm()}gm(){return this.#m}}var a=new A();a.chk(new A())"
+        ),
+        "true"
+    );
+    assert_eq!(
+        run("class A{static #s=10;static get(){return A.#s}}A.get()"),
+        "10"
+    );
+    assert_eq!(
+        run("class A{#x=1;static has(o){return #x in o}}A.has(new A())+','+A.has({})"),
+        "true,false"
+    );
+}
