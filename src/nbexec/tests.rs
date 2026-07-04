@@ -6614,3 +6614,22 @@ fn string_exotic_own_index_and_length() {
         "true,false"
     );
 }
+
+#[test]
+fn string_exotic_property_is_enumerable() {
+    // A String object's index properties are enumerable; `length` is not.
+    assert_eq!(run("'abc'.propertyIsEnumerable(0)"), "true");
+    assert_eq!(run("'abc'.propertyIsEnumerable('length')"), "false");
+    assert_eq!(run("'abc'.propertyIsEnumerable(5)"), "false");
+    assert_eq!(run("new String('ab').propertyIsEnumerable(1)"), "true");
+    assert_eq!(
+        run("JSON.stringify(Object.keys('abc'))"),
+        r#"["0","1","2"]"#
+    );
+    // Arrays and plain objects unaffected.
+    assert_eq!(
+        run("[1,2].propertyIsEnumerable(0)+','+[1,2].propertyIsEnumerable('length')"),
+        "true,false"
+    );
+    assert_eq!(run("({a:1}).propertyIsEnumerable('a')"), "true");
+}

@@ -2807,6 +2807,21 @@ impl Realm {
     /// Whether own property `key` is enumerable (not marked hidden).
     #[must_use]
     pub fn property_is_enumerable(&self, handle: Handle, key: &str) -> bool {
+        // A String exotic object's index properties (`"0".."length-1"`) are
+        // enumerable, writable:false, configurable:false; `length` is
+        // non-enumerable. Checked before the generic object branch (a String
+        // wrapper is a `Cell::Object`).
+        if let Some(slen) = self.string_object_len(handle) {
+            if key == "length" {
+                return false;
+            }
+            if let Ok(i) = key.parse::<usize>()
+                && alloc::format!("{i}") == key
+                && i < slen
+            {
+                return true;
+            }
+        }
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
             return !o.is_hidden(key);
         }
