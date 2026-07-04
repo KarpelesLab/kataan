@@ -6888,3 +6888,22 @@ fn live_set_map_iteration() {
         "[object Set Iterator]"
     );
 }
+
+#[test]
+fn string_symbol_method_only_for_object_arg() {
+    // String.prototype.match/replace/search/split access @@match/@@replace/etc.
+    // ONLY when the argument is an Object — a BigInt/Symbol primitive (whose
+    // prototype may carry the symbol) is coerced to a string pattern instead.
+    assert_eq!(
+        run(
+            "Object.defineProperty(BigInt.prototype,Symbol.match,{get(){throw new Error('x')},configurable:true});\
+             var m='a1b1c'.match(1n);var r=m.index+','+JSON.stringify(m);delete BigInt.prototype[Symbol.match];r"
+        ),
+        r#"1,["1"]"#
+    );
+    assert_eq!(run("'a1b1c'.split(1n).join('|')"), "a|b|c");
+    assert_eq!(run("'a1b1c'.replace(1n,'X')"), "aXb1c");
+    // A RegExp or a custom-@@match object still delegates.
+    assert_eq!(run("'a1b'.match(/\\d/)[0]"), "1");
+    assert_eq!(run("'x'.match({[Symbol.match](s){return 'c:'+s}})"), "c:x");
+}

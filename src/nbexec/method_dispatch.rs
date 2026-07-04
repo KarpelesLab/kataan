@@ -1662,7 +1662,10 @@ impl<'a> Interp<'a> {
         // well-known symbol method (`Symbol.match`/`replace`/`search`/`split`/
         // `matchAll`), `str.method(obj)` delegates to `obj[@@method](str, …rest)`.
         // (A RegExp argument now resolves its `@@method` through `RegExp.prototype`,
-        // so this is the spec path for `"…".match(/re/)` etc.)
+        // so this is the spec path for `"…".match(/re/)` etc.) The `@@method`
+        // lookup happens ONLY when the argument **is an Object** — a primitive
+        // regexp (a string, or a `BigInt`/`Symbol` whose prototype might carry a
+        // `@@match`) is never inspected; it is coerced to a string pattern.
         if self.realm.string_value(handle).is_some()
             && let Some(sym_name) = match method {
                 "match" => Some("match"),
@@ -1672,6 +1675,7 @@ impl<'a> Interp<'a> {
                 "split" => Some("split"),
                 _ => None,
             }
+            && self.is_object_value(arg(0))
             && let Some(argh) = arg(0).as_handle().map(Handle::from_raw)
         {
             // `replaceAll`/`matchAll` first require that a RegExp `searchValue`/
