@@ -2792,6 +2792,9 @@ impl<'a> Interp<'a> {
         };
         get(self, "style").as_deref() == Some("unit")
             || get(self, "notation").as_deref() == Some("compact")
+            // Accounting currency sign (parenthesized negatives) is composed on the
+            // hand-rolled path (the intl crate emits a minus sign).
+            || get(self, "currencySign").as_deref() == Some("accounting")
     }
 
     /// Formats `n` per an `Intl.NumberFormat` instance. With the `intl` crate, all styles
@@ -3059,6 +3062,14 @@ impl<'a> Interp<'a> {
             }
             _ => String::from(magnitude),
         };
+        // `currencySign: "accounting"` renders a negative currency amount in
+        // parentheses (`($5.00)`) instead of with a minus sign.
+        if neg
+            && style == "currency"
+            && opt_str(self, "currencySign").as_deref() == Some("accounting")
+        {
+            return alloc::format!("({styled})");
+        }
         let is_zero = magnitude.bytes().all(|b| matches!(b, b'0' | b'.' | b','));
         let sign = match opt_str(self, "signDisplay").as_deref() {
             Some("never") => "",

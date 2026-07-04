@@ -7489,3 +7489,31 @@ fn intl_number_format_rounding_increment() {
         "1.23"
     );
 }
+
+#[test]
+fn intl_number_format_accounting_sign() {
+    // currencySign:"accounting" wraps a negative currency amount in parentheses.
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en',{style:'currency',currency:'USD',currencySign:'accounting'}).format(-5)"
+        ),
+        "($5.00)"
+    );
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en',{style:'currency',currency:'USD',currencySign:'accounting'}).format(5)"
+        ),
+        "$5.00"
+    );
+    // Standard sign and non-accounting formats are unchanged.
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{style:'currency',currency:'USD'}).format(-5)"),
+        "-$5.00"
+    );
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en',{style:'currency',currency:'USD',currencySign:'accounting'}).resolvedOptions().currencySign"
+        ),
+        "accounting"
+    );
+}
