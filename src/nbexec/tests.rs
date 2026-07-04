@@ -7614,3 +7614,26 @@ fn intl_display_names_of_fallback() {
         "US Dollar"
     );
 }
+
+#[test]
+fn array_from_async_subclass_uses_dense_storage() {
+    // `C.fromAsync(...)` (subclass constructor `this`) must CreateDataPropertyOrThrow
+    // each element into the dense store, like C.from — a raw set_property stashed
+    // them as named props that join/reduce missed.
+    assert_eq!(
+        run(
+            "var r;(async()=>{class A extends Array{}var a=await Array.fromAsync.call(A,[1,2,3]);r=(a instanceof A)+','+a.join(',')+','+a.reduce((x,y)=>x+y,0)})();r"
+        ),
+        "true,1,2,3,6"
+    );
+    assert_eq!(
+        run(
+            "var r;(async()=>{class A extends Array{}var a=await Array.fromAsync.call(A,[1,2],x=>x*10);r=a.join(',')})();r"
+        ),
+        "10,20"
+    );
+    assert_eq!(
+        run("var r;(async()=>{r=(await Array.fromAsync([1,2,3])).join(',')})();r"),
+        "1,2,3"
+    );
+}
