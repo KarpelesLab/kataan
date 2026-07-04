@@ -2859,7 +2859,11 @@ impl<'a> Interp<'a> {
                     .get_property(handle, "signDisplay")
                     .map(|v| self.realm.to_display_string(v))
                     .unwrap_or_default();
-                if !matches!(sd.as_str(), "never" | "exceptZero") && !body.starts_with('-') {
+                // `never`/`exceptZero`/`negative` do not sign a negative *zero*
+                // (only `auto`/`always` do).
+                if !matches!(sd.as_str(), "never" | "exceptZero" | "negative")
+                    && !body.starts_with('-')
+                {
                     // `signDisplay: "always"` formatted `+0` as "+0"; -0 takes the
                     // negative sign, so drop a leading "+" before prepending "-".
                     let mag = body.strip_prefix('+').unwrap_or(&body);
@@ -3087,7 +3091,11 @@ impl<'a> Interp<'a> {
                     "+"
                 }
             }
-            // "auto" (default) and "exceptZero" on a zero: a sign only for negatives.
+            // "negative": a minus for a negative value but NOT a negative zero.
+            Some("negative") if neg && !is_zero => "-",
+            Some("negative") => "",
+            // "auto" (default) and "exceptZero" on a zero: a sign only for negatives
+            // (including a negative zero under "auto").
             _ if neg => "-",
             _ => "",
         };

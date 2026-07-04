@@ -7517,3 +7517,30 @@ fn intl_number_format_accounting_sign() {
         "accounting"
     );
 }
+
+#[test]
+fn intl_number_format_signdisplay_negative_mode() {
+    // signDisplay:"negative" shows a minus for negative values but NOT for -0.
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{signDisplay:'negative'}).format(-0)"),
+        "0"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{signDisplay:'negative'}).format(-5)"),
+        "-5"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{signDisplay:'negative'}).format(5)"),
+        "5"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{style:'percent',signDisplay:'negative'}).format(-0)"),
+        "0%"
+    );
+    // auto/always still sign a negative zero.
+    assert_eq!(run("new Intl.NumberFormat('en').format(-0)"), "-0");
+    assert_eq!(
+        run("new Intl.NumberFormat('en',{signDisplay:'always'}).format(-0)"),
+        "-0"
+    );
+}
