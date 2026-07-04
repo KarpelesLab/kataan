@@ -6054,3 +6054,28 @@ fn function_constructor_tostring_coerces_arguments() {
     // Normal string arguments unaffected.
     assert_eq!(run("new Function('a','b','return a+b')(2,3)"), "5");
 }
+
+#[test]
+fn string_replace_coerces_replacement_via_tostring() {
+    // replace / replaceAll ToString the replacement value and the function
+    // replacer's result (custom toString / @@toPrimitive runs; a throw propagates)
+    // instead of rendering "[object Object]".
+    assert_eq!(run("'aa'.replace('a',{toString:()=>'z'})"), "za");
+    assert_eq!(
+        run("'aa'.replaceAll('a',{[Symbol.toPrimitive]:()=>'z'})"),
+        "zz"
+    );
+    assert_eq!(run("'aa'.replace('a',()=>({toString:()=>'Q'}))"), "Qa");
+    assert_eq!(run("'aa'.replaceAll('a',()=>({toString:()=>'Q'}))"), "QQ");
+    assert_eq!(
+        run("try{'aa'.replace('a',{toString:()=>{throw 'x'}});'no'}catch(e){e}"),
+        "x"
+    );
+    assert_eq!(
+        run("try{'aa'.replaceAll('a',{toString:()=>{throw 'y'}});'no'}catch(e){e}"),
+        "y"
+    );
+    // Normal string replacement and $-patterns unaffected.
+    assert_eq!(run("'a.b'.replace('.','-')"), "a-b");
+    assert_eq!(run("'abc'.replaceAll('b','[$&]')"), "a[b]c");
+}

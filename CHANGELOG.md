@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(string)* `String.prototype.replace`/`replaceAll` `ToString` the replacement
+  value and the function-replacer's result (a custom `toString`/`@@toPrimitive`
+  runs and a thrown value propagates) instead of rendering `"[object Object]"`
+  (ROADMAP §3.6).
 - *(functions)* the `Function` constructor `ToString`s each argument
   (CreateDynamicFunction): a custom `toString`/`valueOf` runs and a thrown value
   propagates — `new Function({toString(){throw 1}}, "")` throws `1` instead of

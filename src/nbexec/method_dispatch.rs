@@ -1939,7 +1939,9 @@ impl<'a> Interp<'a> {
                                 let off = NanBox::number(s[..pos].encode_utf16().count() as f64);
                                 let whole = self.new_str(&s);
                                 let r = self.call(repl, &[m, off, whole])?;
-                                let rs = self.realm.to_display_string(r);
+                                // `ToString` the replacer result (custom `toString`/
+                                // `@@toPrimitive` runs; a throw propagates).
+                                let rs = self.coerce_to_string(r)?;
                                 let out =
                                     alloc::format!("{}{}{}", &s[..pos], rs, &s[pos + from.len()..]);
                                 Some(self.new_str(&out))
@@ -1947,7 +1949,10 @@ impl<'a> Interp<'a> {
                             None => Some(self.new_str(&s)),
                         }
                     } else {
-                        let to = self.realm.to_display_string(repl);
+                        // A non-callable replaceValue is `ToString`'d (spec step): a
+                        // custom `toString`/`@@toPrimitive` runs and a throw
+                        // propagates, not "[object Object]".
+                        let to = self.coerce_to_string(repl)?;
                         match s.find(&from) {
                             Some(pos) => {
                                 let before = &s[..pos];
@@ -1983,17 +1988,23 @@ impl<'a> Interp<'a> {
                             let off = NanBox::number(off_units as f64);
                             let whole = self.new_str(&s);
                             let r = self.call(repl, &[m, off, whole])?;
-                            out.push_str(&self.realm.to_display_string(r));
+                            // `ToString` the replacer result (a custom `toString`/
+                            // `@@toPrimitive` runs, a throw propagates).
+                            let rs = self.coerce_to_string(r)?;
+                            out.push_str(&rs);
                             units_to_last = off_units + from.encode_utf16().count();
                             last = abs + from.len();
                         }
                         out.push_str(&s[last..]);
                         Some(self.new_str(&out))
                     } else if from.is_empty() {
-                        let to = self.realm.to_display_string(repl);
+                        // A non-callable replaceValue is `ToString`'d once (spec
+                        // step 6): a custom `toString`/`@@toPrimitive` runs and a
+                        // throw propagates, rather than rendering "[object Object]".
+                        let to = self.coerce_to_string(repl)?;
                         Some(self.new_str(&s.replace(&from, &to)))
                     } else {
-                        let to = self.realm.to_display_string(repl);
+                        let to = self.coerce_to_string(repl)?;
                         let mut out = String::new();
                         let mut last = 0;
                         while let Some(rel) = s[last..].find(&from) {
