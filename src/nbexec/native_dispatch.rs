@@ -2429,6 +2429,19 @@ impl<'a> Interp<'a> {
                     };
                     match crate_name {
                         Some(n) => self.new_str(n),
+                        // A crate-backed type (language/region) with no match honors
+                        // `fallback`: "none" → undefined, "code" → the code itself.
+                        None if matches!(ty.as_str(), "language" | "region") => {
+                            let fallback = fmt
+                                .and_then(|h| self.realm.get_property(h, "fallback"))
+                                .map(|v| self.realm.to_display_string(v))
+                                .unwrap_or_else(|| String::from("code"));
+                            if fallback == "none" {
+                                NanBox::undefined()
+                            } else {
+                                self.new_str(&code)
+                            }
+                        }
                         None => {
                             let s = display_name(&ty, &code);
                             self.new_str(&s)

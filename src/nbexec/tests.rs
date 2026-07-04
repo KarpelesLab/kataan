@@ -7587,3 +7587,30 @@ fn intl_display_names_resolved_options() {
         "United States"
     );
 }
+
+#[test]
+fn intl_display_names_of_fallback() {
+    // For a crate-backed type with no match, `fallback:"none"` returns undefined
+    // and "code" returns the code (works where the data reports "not found").
+    assert_eq!(
+        run("new Intl.DisplayNames('en',{type:'language',fallback:'none'}).of('xx')===undefined"),
+        "true"
+    );
+    assert_eq!(
+        run("new Intl.DisplayNames('en',{type:'language',fallback:'code'}).of('xx')"),
+        "xx"
+    );
+    // Known names and other types are unaffected.
+    assert_eq!(
+        run("new Intl.DisplayNames('en',{type:'language'}).of('fr')"),
+        "French"
+    );
+    assert_eq!(
+        run("new Intl.DisplayNames('en',{type:'region'}).of('US')"),
+        "United States"
+    );
+    assert_eq!(
+        run("new Intl.DisplayNames('en',{type:'currency'}).of('USD')"),
+        "US Dollar"
+    );
+}
