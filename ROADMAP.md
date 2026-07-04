@@ -335,9 +335,13 @@ helper edges, `Iterator.zip`/`zipKeyed`), **String** (54), **Function** (59 —
 
 - **Resizable/growable `ArrayBuffer`:** length-tracking is partly in; the
   TypedArray methods' out-of-bounds-on-shrink behavior remains.
-- **`SharedArrayBuffer` + `Atomics`** (`load`/`store`/`add`/…/`wait`/`notify`/
-  `waitAsync`) on shared memory, including the **agents** harness — a real
-  threading/worker substrate. Currently skip-gated; large.
+- **`SharedArrayBuffer` + `Atomics`**: the **single-agent deterministic core is
+  done** — `Atomics.add/sub/and/or/xor/exchange/compareExchange/load/store/
+  isLockFree` over integer typed arrays, and `SharedArrayBuffer` (constructor,
+  `byteLength`/`growable`/`maxByteLength`, `grow`, `slice`, and full typed-array/
+  `DataView`/`Atomics` backing). What remains is the genuinely concurrent part:
+  `wait`/`notify`/`waitAsync` and the **agents** harness — a real threading/worker
+  substrate (still skip-gated; large). Corpus un-skip pending that.
 
 ### 3.9 Whole subsystems currently skipped (each a project)
 
