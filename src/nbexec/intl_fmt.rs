@@ -1497,6 +1497,25 @@ impl<'a> Interp<'a> {
             let m = self.new_str("dateStyle/timeStyle may not be combined with component options");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
+        // If no component field and no dateStyle/timeStyle were requested, the
+        // default format is a numeric date: year/month/day = "numeric".
+        let any_field = weekday.is_some()
+            || era.is_some()
+            || year.is_some()
+            || month.is_some()
+            || day.is_some()
+            || day_period.is_some()
+            || hour.is_some()
+            || minute.is_some()
+            || second.is_some()
+            || fsd.is_some()
+            || tzn.is_some();
+        if !any_field && date_style.is_none() && time_style.is_none() {
+            let numeric = Some(String::from("numeric"));
+            self.store_str(obj, "year", &numeric);
+            self.store_str(obj, "month", &numeric);
+            self.store_str(obj, "day", &numeric);
+        }
         Ok(())
     }
 
