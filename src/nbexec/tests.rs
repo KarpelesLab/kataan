@@ -6032,3 +6032,25 @@ fn computed_set_walks_proxy_and_setter_prototype() {
         "1,9,3|0"
     );
 }
+
+#[test]
+fn function_constructor_tostring_coerces_arguments() {
+    // CreateDynamicFunction ToString's each argument: a custom toString runs and
+    // a thrown value propagates (not stringified to "[object Object]").
+    assert_eq!(run("new Function({toString:()=>'a'},'return a')(5)"), "5");
+    assert_eq!(
+        run("try{new Function({toString:()=>{throw 1}},'return 1')();'no'}catch(e){e}"),
+        "1"
+    );
+    assert_eq!(
+        run("try{new Function('a',{toString:()=>{throw 'body'}});'no'}catch(e){e}"),
+        "body"
+    );
+    // valueOf is the fallback when toString is not callable.
+    assert_eq!(
+        run("new Function({toString:null,valueOf:()=>'x'},'return x')(9)"),
+        "9"
+    );
+    // Normal string arguments unaffected.
+    assert_eq!(run("new Function('a','b','return a+b')(2,3)"), "5");
+}

@@ -4483,11 +4483,17 @@ impl<'a> Interp<'a> {
         // the parameter-list pieces, joined with commas.
         let (params, body) = match args.split_last() {
             Some((last, rest)) => {
-                let parts: Vec<String> = rest
-                    .iter()
-                    .map(|a| self.realm.to_display_string(*a))
-                    .collect();
-                (parts.join(","), self.realm.to_display_string(*last))
+                // `ToString` each argument in order (spec CreateDynamicFunction):
+                // a custom `toString`/`valueOf` runs and a thrown value propagates
+                // — `new Function({toString(){throw 1}}, "")` throws `1`, it does
+                // not stringify to `"[object Object]"` and fail to parse. Parameter
+                // pieces are ToString'd before the body.
+                let mut parts: Vec<String> = Vec::with_capacity(rest.len());
+                for a in rest {
+                    parts.push(self.coerce_to_string(*a)?);
+                }
+                let body = self.coerce_to_string(*last)?;
+                (parts.join(","), body)
             }
             // `Function()` with no arguments → an empty-body anonymous function.
             None => (String::new(), String::new()),

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(functions)* the `Function` constructor `ToString`s each argument
+  (CreateDynamicFunction): a custom `toString`/`valueOf` runs and a thrown value
+  propagates — `new Function({toString(){throw 1}}, "")` throws `1` instead of
+  stringifying to `"[object Object]"` and failing to parse (ROADMAP §3.6).
 - *(proxy)* a **computed** write (`o[k]=v`, `arr[i]=v`) whose own slot is absent
   now runs `parent.[[Set]]` — an inherited setter, or a proxy on the prototype
   chain, handles it (with Receiver = the object) — matching the dot-key
