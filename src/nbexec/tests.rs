@@ -7386,3 +7386,44 @@ fn intl_display_names_type_required() {
         "US Dollar"
     );
 }
+
+#[test]
+fn intl_number_format_significant_digit_defaults() {
+    // SetNumberFormatDigitOptions: a lone significant-digit option defaults the
+    // other (min→1, max→21), so the minimum padding actually applies.
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US',{minimumSignificantDigits:3}).format(1)"),
+        "1.00"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US',{minimumSignificantDigits:3}).format(12)"),
+        "12.0"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US',{maximumSignificantDigits:2}).format(123.4)"),
+        "120"
+    );
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en-US',{minimumSignificantDigits:3}).resolvedOptions().maximumSignificantDigits"
+        ),
+        "21"
+    );
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en-US',{maximumSignificantDigits:5}).resolvedOptions().minimumSignificantDigits"
+        ),
+        "1"
+    );
+    // No significant-digit option → no significant path (fraction digits default).
+    assert_eq!(
+        run("new Intl.NumberFormat('en-US').resolvedOptions().minimumSignificantDigits"),
+        "undefined"
+    );
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en-US',{minimumSignificantDigits:2,maximumSignificantDigits:4}).format(1.23456)"
+        ),
+        "1.235"
+    );
+}

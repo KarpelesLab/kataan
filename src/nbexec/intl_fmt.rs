@@ -1099,6 +1099,16 @@ impl<'a> Interp<'a> {
                 self.new_str("minimumSignificantDigits is greater than maximumSignificantDigits");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
+        // SetNumberFormatDigitOptions: when *either* significant-digit option is
+        // present, the "significant digits" path is used and the other defaults
+        // (min → 1, max → 21). Without this, a lone `minimumSignificantDigits` was
+        // stored but the missing max meant the padding never applied
+        // (`format(1)` with `{minimumSignificantDigits:3}` gave "1", not "1.00").
+        let (mnsd, mxsd) = if mnsd.is_some() || mxsd.is_some() {
+            (Some(mnsd.unwrap_or(1.0)), Some(mxsd.unwrap_or(21.0)))
+        } else {
+            (mnsd, mxsd)
+        };
         // roundingIncrement ∈ a fixed allowed set.
         let rinc = self
             .get_int_option(opts, "roundingIncrement", 1.0, 5000.0, Some(1.0))?
