@@ -76,6 +76,12 @@ const SKIP_FEATURES: &[&str] = &[
     "tail-call-optimization",
     "import-assertions",
     "import-attributes",
+    // Atomics / SharedArrayBuffer: the single-agent deterministic core is
+    // implemented (namespace, ops, SAB construct/grow/slice), so non-gated probes
+    // like `Atomics.pause` already pass. The bulk stays skipped pending the
+    // concurrent part (wait/notify + `$262.agent` threading) and BigInt Atomics —
+    // a local `KATAAN_TEST262_FILTER=Atomics` run currently shows Atomics 34% /
+    // SharedArrayBuffer 79%, too many failures to un-skip cleanly yet.
     "Atomics",
     "Atomics.waitAsync",
     "SharedArrayBuffer",
@@ -440,6 +446,14 @@ fn collect_tests(root: &Path) -> Vec<(String, PathBuf)> {
         }
     }
     out.sort();
+    // `KATAAN_TEST262_FILTER=substr` restricts the run to test paths containing
+    // `substr` (a local convenience for iterating on one area; applied in both the
+    // coordinator and workers so their indexing agrees). Unset in CI.
+    if let Ok(filter) = std::env::var("KATAAN_TEST262_FILTER")
+        && !filter.is_empty()
+    {
+        out.retain(|(rel, _)| rel.contains(&filter));
+    }
     out
 }
 
