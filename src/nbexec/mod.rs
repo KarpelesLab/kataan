@@ -816,6 +816,16 @@ impl<'c, 'a> Ctx<'c, 'a> {
         }
     }
 
+    /// Sets element `i` of the Array `arr` to `value` (growing the array's length
+    /// if `i` is past the end), returning whether the write happened (`false` when
+    /// `arr` is not an Array). Pairs with [`array_get`](Self::array_get).
+    pub fn array_set(&mut self, arr: NanBox, i: usize, value: NanBox) -> bool {
+        match arr.as_handle().map(Handle::from_raw) {
+            Some(h) if self.interp.realm.is_array(h) => self.interp.realm.set_element(h, i, value),
+            _ => false,
+        }
+    }
+
     /// `HasProperty(obj, key)` — whether `obj` or its prototype chain has `key`
     /// (the `in` operator; runs proxy `has` traps). A non-object `obj` is `false`.
     pub fn has(&mut self, obj: NanBox, key: &str) -> bool {

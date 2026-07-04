@@ -5571,6 +5571,29 @@ fn host_fn_typeof_name_length() {
 }
 
 #[test]
+fn host_fn_array_set_writes_and_grows() {
+    // A host fn writes array elements via array_set (in-range and past-the-end,
+    // which grows the length); array_set on a non-array returns false.
+    let mut interp = Interp::new();
+    interp.register_global_fn("fill", 1, |cx, _t, args| {
+        let a = args.first().copied().unwrap_or(cx.undefined());
+        let ten = cx.number(10.0);
+        let wrote = cx.array_set(a, 1, ten); // in range
+        let twenty = cx.number(20.0);
+        cx.array_set(a, 5, twenty); // past the end → grows to length 6
+        let obj = cx.new_object();
+        let non_array = cx.array_set(obj, 0, ten);
+        Ok(cx.boolean(wrote && !non_array))
+    });
+    let program = Parser::parse_program(
+        "var a = [1, 2, 3]; var ok = fill(a); ok + ',' + a.length + ',' + a[1] + ',' + a[5]",
+    )
+    .expect("parse");
+    let v = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "true,6,10,20");
+}
+
+#[test]
 fn host_fn_value_inspection_and_array_access() {
     // A host fn that inspects its argument via the Ctx introspection API and, for
     // an Array, sums its elements through array_len/array_get.
