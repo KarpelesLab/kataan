@@ -2197,7 +2197,7 @@ impl<'a> Interp<'a> {
     fn gen_unwind(
         &mut self,
         stack: &mut Vec<Step<'a>>,
-        _values: &mut Vec<NanBox>,
+        _values: &mut [NanBox],
         mut completion: Completion,
     ) -> Result<Option<Result<GenStep, ExecError>>, ExecError> {
         loop {
@@ -2365,7 +2365,7 @@ impl<'a> Interp<'a> {
         discriminant: &'a Expr,
         cases: &'a [SwitchCase],
         stack: &mut Vec<Step<'a>>,
-        _values: &mut Vec<NanBox>,
+        _values: &mut [NanBox],
         _label: &Option<String>,
     ) -> StepResult {
         let value = self.eval(discriminant).map_err(GenAbrupt::from)?;

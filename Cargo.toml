@@ -9,7 +9,7 @@ exclude = ["fuzz"]
 name = "kataan"
 version = "0.0.6"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.88"
 authors = ["Karpelès Lab Inc."]
 description = "A high-performance JavaScript engine written in pure Rust. Library, C FFI, and CLI."
 repository = "https://github.com/KarpelesLab/kataan"
@@ -73,7 +73,7 @@ cli = ["std", "regex", "module", "host"]
 [dependencies]
 # `rsurl` powers `fetch` / Node http(s); keep it on its pure-Rust TLS backend
 # (`purecrypto-tls`) so the "no foreign code" charter holds end to end.
-rsurl = { version = "0.0", optional = true, default-features = false, features = ["purecrypto-tls"] }
+rsurl = { version = "0.1", optional = true, default-features = false, features = ["purecrypto-tls"] }
 purecrypto = { version = "0.6", optional = true, default-features = false, features = ["rng", "hash", "cipher", "linux-getrandom"] }
 # Pure-Rust, no_std Unicode/Intl primitives (a pure-Rust ICU analog). `full`
 # selects supplementary planes so JS strings (full Unicode) are covered.

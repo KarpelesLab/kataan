@@ -5458,7 +5458,7 @@ fn format_precision(n: f64, p: usize) -> String {
         };
     }
     let decimals = (p as i32 - 1 - e).max(0) as usize;
-    alloc::format!("{:.*}", decimals, n)
+    alloc::format!("{n:.decimals$}")
 }
 
 /// Quotes and escapes a string as a JSON string literal (the `&str` form, used
