@@ -51,6 +51,24 @@ impl<'a> Interp<'a> {
             // integer `TypedArray`. `isLockFree(n)` is a pure size check; the rest
             // validate the array kind + in-range index, then act atomically (trivial
             // without concurrent agents).
+            // `Atomics.pause([N])` — a spin-loop hint. Single-agent: a no-op that
+            // returns `undefined`. `N`, if present, must be an integral Number
+            // (else a TypeError); it is otherwise ignored.
+            N_ATOMICS_PAUSE => {
+                let a = arg(0);
+                if !matches!(a.unpack(), Unpacked::Undefined) {
+                    let n = match a.unpack() {
+                        Unpacked::Number(n) => n,
+                        _ => f64::NAN,
+                    };
+                    if !(n.is_finite() && n == (n as i64) as f64) {
+                        return Err(
+                            self.type_error("Atomics.pause: iterationNumber must be an integer")
+                        );
+                    }
+                }
+                NanBox::undefined()
+            }
             N_ATOMICS_IS_LOCK_FREE => {
                 let n = self.realm.to_number(arg(0));
                 // An integer byte width of 1/2/4/8 is lock-free (no `f64::fract` in

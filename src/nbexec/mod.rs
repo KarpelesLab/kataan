@@ -1431,6 +1431,9 @@ const N_ATOMICS_COMPARE_EXCHANGE: u16 = 683;
 const N_ATOMICS_LOAD: u16 = 684;
 const N_ATOMICS_STORE: u16 = 685;
 const N_ATOMICS_IS_LOCK_FREE: u16 = 686;
+/// `Atomics.pause([N])` — a spin-loop hint; a single-agent no-op returning
+/// `undefined` (validates that `N`, if present, is an integral Number).
+const N_ATOMICS_PAUSE: u16 = 904;
 /// `SharedArrayBuffer` — a growable byte store (single-agent: no cross-agent
 /// sharing, so it behaves as an `ArrayBuffer` that only ever grows). Its bytes
 /// live in the same `ARRAY_BUFFER_BYTES` slot, so typed arrays and `Atomics`
@@ -1901,7 +1904,9 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_SYMBOL
         | N_ITERATOR
         // `Array.of(...items)` is variadic → `length` 0.
-        | N_ARRAY_OF => 0,
+        | N_ARRAY_OF
+        // `Atomics.pause([N])` — the optional `N` is not counted.
+        | N_ATOMICS_PAUSE => 0,
         // Length 2.
         // `FinalizationRegistry.prototype.register(target, heldValue [, token])`.
         N_FINREG_REGISTER
@@ -3349,6 +3354,7 @@ impl<'a> Interp<'a> {
                 ("load", N_ATOMICS_LOAD),
                 ("store", N_ATOMICS_STORE),
                 ("isLockFree", N_ATOMICS_IS_LOCK_FREE),
+                ("pause", N_ATOMICS_PAUSE),
             ],
         );
         if let Some(ah) = self.current.get("Atomics").and_then(NanBox::as_handle) {
