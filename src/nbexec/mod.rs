@@ -1908,11 +1908,15 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_MATH_POW
         | N_MATH_ATAN2
         | N_MATH_HYPOT
-        | N_MATH_IMUL => 2,
+        | N_MATH_IMUL
+        // `JSON.parse(text, reviver)`.
+        | N_JSON_PARSE => 2,
         // Length 3.
         N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP | N_REFLECT_APPLY
         // `SuppressedError(error, suppressed, message)`.
-        | N_SUPPRESSED_ERROR => 3,
+        | N_SUPPRESSED_ERROR
+        // `JSON.stringify(value, replacer, space)`.
+        | N_JSON_STRINGIFY => 3,
         // A concrete TypedArray constructor (`Int8Array`, …) has `length` 3
         // (`new T(buffer, byteOffset, length)`).
         id if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
