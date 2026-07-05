@@ -1840,13 +1840,19 @@ impl Realm {
             self.non_extensible_arrays.insert(handle.to_raw());
             return true;
         }
-        match self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
-            Some(obj) => {
-                obj.freeze();
-                true
-            }
-            None => false,
+        if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            obj.freeze();
+            return true;
         }
+        // An aux-backed cell (function/Date/typed array/RegExp/…) keeps its
+        // properties in the aux object; freeze that.
+        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied() {
+            if let Some(obj) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                obj.freeze();
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether the value at `handle` is a frozen object or array.
@@ -2452,16 +2458,14 @@ impl Realm {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.sealed_arrays.insert(handle.to_raw());
             self.non_extensible_arrays.insert(handle.to_raw());
-        } else if matches!(
-            self.heap.get(handle),
-            Some(Cell::TypedArray { .. } | Cell::RegExp { .. })
-        ) {
-            let aux = self.aux_object(handle);
+        } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.seal();
+        } else if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied() {
+            // An aux-backed cell (function/Date/typed array/RegExp/…) keeps its
+            // properties in the aux object; seal that.
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
                 o.seal();
             }
-        } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
-            o.seal();
         }
     }
 
