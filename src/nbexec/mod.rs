@@ -1828,7 +1828,7 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "now" => 0,
         // Two-argument methods.
         "slice" | "sliceToImmutable" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
-        | "replaceAll" | "padStart" | "padEnd" | "with" | "setInt8" | "setUint8" | "asIntN"
+        | "replaceAll" | "with" | "setInt8" | "setUint8" | "asIntN"
         | "asUintN" | "setMonth" | "setUTCMonth" | "setSeconds" | "setUTCSeconds" | "subarray"
         // `Map.prototype.getOrInsert(key, value)` / `getOrInsertComputed(key, fn)`.
         | "getOrInsert" | "getOrInsertComputed"
