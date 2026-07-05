@@ -2906,6 +2906,8 @@ impl<'a> Interp<'a> {
         self.realm
             .set_property(ta, "prototype", NanBox::handle(ta_proto.to_raw()));
         self.realm.mark_hidden(ta, "prototype");
+        self.realm.set_readonly_property(ta, "prototype");
+        self.realm.set_non_configurable_property(ta, "prototype");
         // Generic statics `from` (length 1) and `of` (length 0).
         let from_fn = self.new_named_native("from", N_TYPED_ARRAY_FROM);
         self.realm
@@ -3684,6 +3686,9 @@ impl<'a> Interp<'a> {
             NanBox::handle(iter_proto.to_raw()),
         );
         self.realm.mark_hidden(iterator_ctor, "prototype");
+        self.realm.set_readonly_property(iterator_ctor, "prototype");
+        self.realm
+            .set_non_configurable_property(iterator_ctor, "prototype");
         // `Iterator.concat` — the `iterator-sequencing` static (lazy concatenation).
         let concat_fn = self.realm.new_native(N_ITERATOR_CONCAT);
         self.install_fn_name_length(concat_fn, "concat", 0);
@@ -4358,6 +4363,9 @@ impl<'a> Interp<'a> {
                 self.realm
                     .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
                 self.realm.mark_hidden(ctor, "prototype");
+                // A constructor's `.prototype` is { writable:false, configurable:false }.
+                self.realm.set_readonly_property(ctor, "prototype");
+                self.realm.set_non_configurable_property(ctor, "prototype");
                 proto
             })
         {
@@ -4391,6 +4399,8 @@ impl<'a> Interp<'a> {
                     self.realm
                         .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
                     self.realm.mark_hidden(ctor, "prototype");
+                    self.realm.set_readonly_property(ctor, "prototype");
+                    self.realm.set_non_configurable_property(ctor, "prototype");
                     // `AggregateError(errors, message)` has `length` 2; the other
                     // error constructors take just `message` (`length` 1).
                     if name == "AggregateError" {
