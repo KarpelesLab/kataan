@@ -975,24 +975,8 @@ impl<'a> Interp<'a> {
                 }
             }
         };
-        // padding (only for longest mode).
-        let mut padding: Vec<NanBox> = Vec::new();
-        if mode == 1 && opts_present {
-            let pad_val = self.read_member(
-                options.as_handle().map(Handle::from_raw).unwrap(),
-                "padding",
-            )?;
-            if !matches!(pad_val.unpack(), Unpacked::Undefined) {
-                if !self.is_object_value(pad_val) {
-                    return Err(
-                        self.type_error(&alloc::format!("{what}: padding is not an object"))
-                    );
-                }
-                // padding is collected per-iterator below (indexed by position).
-                padding = self.zip_collect_padding(pad_val)?;
-            }
-        }
-        // Collect (key?, iterable) pairs.
+        // Collect (key?, iterable) pairs (before padding, since keyed padding is
+        // read per key).
         let pairs: Vec<(Option<String>, NanBox)> = if keyed {
             let h = iterables.as_handle().map(Handle::from_raw).unwrap();
             let keys = self.realm.object_keys_with_symbols(h);
@@ -1009,6 +993,32 @@ impl<'a> Interp<'a> {
             let vals = self.iterate_values(iterables)?;
             vals.into_iter().map(|v| (None, v)).collect()
         };
+        // padding (only for longest mode). For `zip` it is an iterable of per-position
+        // fillers; for `zipKeyed` it is an object read per key (matching `pairs`).
+        let mut padding: Vec<NanBox> = Vec::new();
+        if mode == 1 && opts_present {
+            let pad_val = self.read_member(
+                options.as_handle().map(Handle::from_raw).unwrap(),
+                "padding",
+            )?;
+            if !matches!(pad_val.unpack(), Unpacked::Undefined) {
+                if !self.is_object_value(pad_val) {
+                    return Err(
+                        self.type_error(&alloc::format!("{what}: padding is not an object"))
+                    );
+                }
+                if keyed {
+                    let ph = pad_val.as_handle().map(Handle::from_raw).unwrap();
+                    for (k, _) in &pairs {
+                        let pv = self.read_member(ph, k.as_deref().unwrap_or(""))?;
+                        padding.push(pv);
+                    }
+                } else {
+                    // padding is collected per-iterator (indexed by position).
+                    padding = self.zip_collect_padding(pad_val)?;
+                }
+            }
+        }
         // Open each iterator (GetIteratorFlattenable), caching its `next`. On an
         // error opening iterator N, close the already-opened ones.
         let mut iters: Vec<NanBox> = Vec::with_capacity(pairs.len());
