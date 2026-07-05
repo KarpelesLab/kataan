@@ -1442,6 +1442,9 @@ const N_ASYNC_GENERATOR_FUNCTION_CTOR: u16 = 906;
 /// `%AsyncIteratorPrototype%[@@asyncDispose]` — calls the iterator's `return` and
 /// returns a promise (fulfilled with `undefined`, rejected if `return` throws).
 const N_ASYNC_ITERATOR_DISPOSE: u16 = 907;
+/// An anonymous fulfillment handler that ignores its argument and returns
+/// `undefined` — the `onFulfilled` of the `@@asyncDispose` `.then`-chain.
+const N_RETURN_UNDEFINED: u16 = 908;
 /// `SharedArrayBuffer` — a growable byte store (single-agent: no cross-agent
 /// sharing, so it behaves as an `ArrayBuffer` that only ever grows). Its bytes
 /// live in the same `ARRAY_BUFFER_BYTES` slot, so typed arrays and `Atomics`
@@ -1917,6 +1920,7 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_ATOMICS_PAUSE => 0,
         N_GENERATOR_FUNCTION_CTOR | N_ASYNC_GENERATOR_FUNCTION_CTOR => 1,
         N_ASYNC_ITERATOR_DISPOSE => 0,
+        N_RETURN_UNDEFINED => 1,
         // Length 2.
         // `FinalizationRegistry.prototype.register(target, heldValue [, token])`.
         N_FINREG_REGISTER

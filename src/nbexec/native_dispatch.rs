@@ -1763,12 +1763,14 @@ impl<'a> Interp<'a> {
                 NanBox::undefined()
             }
             // `%AsyncIteratorPrototype%[@@asyncDispose]()` — invokes the iterator's
-            // `return` and returns a promise fulfilled with `undefined` (rejected if
-            // reading or calling `return` throws). A `return` that yields a rejected
-            // promise is not awaited here (a `.then`-chain refinement is a follow-up).
+            // `return`, wraps its result with `PromiseResolve`, and returns
+            // `resultWrapper.then(() => undefined)` so the dispose promise fulfills
+            // with `undefined` (and rejects if `return` yields/throws a rejection). A
+            // synchronously-abrupt read/call, or a non-callable `return`, rejects.
             N_ASYNC_ITERATOR_DISPOSE => {
                 let this = self.this_val;
                 let mut rejection: Option<NanBox> = None;
+                let mut wrap_result: Option<NanBox> = None;
                 if let Some(h) = this.as_handle().map(Handle::from_raw) {
                     match self.read_member(h, "return") {
                         Ok(ret) => {
@@ -1777,7 +1779,7 @@ impl<'a> Interp<'a> {
                                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
                             {
                                 match self.call_with_this(ret, this, &[]) {
-                                    Ok(_) => {}
+                                    Ok(res) => wrap_result = Some(res),
                                     Err(ExecError::Throw(v)) => rejection = Some(v),
                                     Err(e) => return Err(e),
                                 }
@@ -1793,23 +1795,31 @@ impl<'a> Interp<'a> {
                         Err(e) => return Err(e),
                     }
                 }
-                match rejection {
-                    Some(v) => {
-                        let promise = self.fresh_promise();
-                        let reject = self.realm.new_bound_native(N_REJECT, promise);
-                        self.call_with_this(
-                            NanBox::handle(reject.to_raw()),
-                            NanBox::undefined(),
-                            &[v],
-                        )?;
-                        NanBox::handle(promise.to_raw())
-                    }
-                    None => {
-                        let p = self.promise_resolve(NanBox::undefined());
-                        NanBox::handle(p.to_raw())
-                    }
+                if let Some(v) = rejection {
+                    let promise = self.fresh_promise();
+                    let reject = self.realm.new_bound_native(N_REJECT, promise);
+                    self.call_with_this(
+                        NanBox::handle(reject.to_raw()),
+                        NanBox::undefined(),
+                        &[v],
+                    )?;
+                    NanBox::handle(promise.to_raw())
+                } else if let Some(result) = wrap_result {
+                    let wrapper = self.promise_resolve(result);
+                    let onf = self.realm.new_native(N_RETURN_UNDEFINED);
+                    let then = self.read_member(wrapper, "then")?;
+                    self.call_with_this(
+                        then,
+                        NanBox::handle(wrapper.to_raw()),
+                        &[NanBox::handle(onf.to_raw())],
+                    )?
+                } else {
+                    let p = self.promise_resolve(NanBox::undefined());
+                    NanBox::handle(p.to_raw())
                 }
             }
+            // `onFulfilled` of the `@@asyncDispose` `.then`-chain: ignore, yield undefined.
+            N_RETURN_UNDEFINED => NanBox::undefined(),
             // `Iterator.zip(iterables, options)` (joint-iteration).
             N_ITERATOR_ZIP => self.iterator_zip(arg(0), arg(1), false)?,
             // `Iterator.zipKeyed(iterables, options)`.
