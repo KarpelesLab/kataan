@@ -4077,16 +4077,31 @@ impl<'a> Interp<'a> {
                 Ok(NanBox::handle(obj.to_raw()))
             }
             "getWeekInfo" => {
+                // Own keys are exactly { firstDay, weekend } (the proposal dropped
+                // `minimalDays`). `firstDay` (1=Mon…7=Sun) comes from the locale's
+                // `firstDayOfWeek` option when set, else defaults to Monday.
                 let obj = self.realm.new_object();
+                let fw = self
+                    .realm
+                    .get_property(h, "\u{0}loc_fw")
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default();
+                let first_day = match fw.as_str() {
+                    "tue" => 2.0,
+                    "wed" => 3.0,
+                    "thu" => 4.0,
+                    "fri" => 5.0,
+                    "sat" => 6.0,
+                    "sun" => 7.0,
+                    _ => 1.0,
+                };
                 self.realm
-                    .set_property(obj, "firstDay", NanBox::number(1.0));
+                    .set_property(obj, "firstDay", NanBox::number(first_day));
                 let weekend = self
                     .realm
                     .new_array(alloc::vec![NanBox::number(6.0), NanBox::number(7.0)]);
                 self.realm
                     .set_property(obj, "weekend", NanBox::handle(weekend.to_raw()));
-                self.realm
-                    .set_property(obj, "minimalDays", NanBox::number(1.0));
                 Ok(NanBox::handle(obj.to_raw()))
             }
             // maximize/minimize: rebuild a Locale from the (unchanged) tag.
