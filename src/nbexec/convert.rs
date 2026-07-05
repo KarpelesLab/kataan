@@ -243,10 +243,12 @@ impl<'a> Interp<'a> {
             return Ok(v);
         };
         let h = Handle::from_raw(raw);
-        // A primitive wrapper's ToPrimitive is simply its boxed value.
-        if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
-            return Ok(prim);
-        }
+        // A primitive wrapper (`new Number/String/Boolean(...)`, a boxed
+        // Symbol/BigInt) is an ordinary object for ToPrimitive: it runs
+        // `@@toPrimitive` / OrdinaryToPrimitive so a user-overridden
+        // `valueOf`/`toString` is honored (the default methods just return the
+        // boxed value). It must NOT short-circuit to the boxed primitive.
+        let is_wrapper = self.realm.get_property(h, PRIM_WRAP).is_some();
         // Strings and arrays are handled by the arithmetic path directly. A
         // typed-array view is an exotic object (no `object_keys`) but still has a
         // `valueOf`/`toString` (and may carry a user-overridden one or an
@@ -257,11 +259,12 @@ impl<'a> Interp<'a> {
         // run OrdinaryToPrimitive — not be returned as-is (which would make
         // `Date.prototype.toJSON.call(date)` see the Date object rather than its
         // numeric time, and call `toISOString` even on an invalid date).
-        if self.realm.string_value(h).is_some()
-            || self.realm.is_array(h)
-            || (self.realm.object_keys(h).is_none()
-                && self.realm.typed_kind(h).is_none()
-                && self.realm.date_at(h).is_none())
+        if !is_wrapper
+            && (self.realm.string_value(h).is_some()
+                || self.realm.is_array(h)
+                || (self.realm.object_keys(h).is_none()
+                    && self.realm.typed_kind(h).is_none()
+                    && self.realm.date_at(h).is_none()))
         {
             return Ok(v);
         }

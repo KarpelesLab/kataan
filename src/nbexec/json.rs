@@ -101,16 +101,19 @@ impl<'a> Interp<'a> {
                             if self.realm.string_value(h).is_some() {
                                 Some(self.realm.to_display_string(e))
                             } else if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
-                                // A String/Number wrapper object contributes its key.
+                                // A String/Number wrapper contributes its key via
+                                // ToString/ToNumber (honoring a user valueOf/toString).
+                                // A Number *or* String wrapper's key is `ToString(v)`
+                                // (per PropertyList construction) — not ToNumber.
                                 match prim.unpack() {
-                                    Unpacked::Number(_) => Some(self.realm.to_display_string(prim)),
+                                    Unpacked::Number(_) => Some(self.coerce_to_string(e)?),
                                     Unpacked::Handle(pr)
                                         if self
                                             .realm
                                             .string_value(Handle::from_raw(pr))
                                             .is_some() =>
                                     {
-                                        Some(self.realm.to_display_string(prim))
+                                        Some(self.coerce_to_string(e)?)
                                     }
                                     _ => None,
                                 }
@@ -132,7 +135,7 @@ impl<'a> Interp<'a> {
         // The `space` gap: a Number (or Number wrapper) → that many spaces (clamped
         // to 0..=10); a String (or String wrapper) → its first 10 code units; else
         // empty (compact).
-        let space = self.json_unwrap_wrapper(space);
+        let space = self.json_unwrap_wrapper(space)?;
         let gap = if let Some(n) = space.as_number() {
             // ToIntegerOrInfinity then `min(10)` spaces; a non-positive count is 0.
             // The cast to `usize` truncates toward zero (ToInteger) and a NaN maps
@@ -162,15 +165,23 @@ impl<'a> Interp<'a> {
         )
     }
 
-    /// If `v` is a Number/String/Boolean wrapper object, returns its boxed
-    /// primitive; otherwise returns `v` unchanged. (For the `space` argument.)
-    fn json_unwrap_wrapper(&self, v: NanBox) -> NanBox {
+    /// The `space` argument's ToPrimitive: a `[[NumberData]]` wrapper becomes
+    /// `ToNumber(space)` and a `[[StringData]]` wrapper `ToString(space)` (both
+    /// honoring a user `valueOf`/`toString`); anything else is returned unchanged.
+    fn json_unwrap_wrapper(&mut self, v: NanBox) -> Result<NanBox, ExecError> {
         if let Some(h) = v.as_handle().map(Handle::from_raw)
             && let Some(prim) = self.realm.get_property(h, PRIM_WRAP)
         {
-            return prim;
+            return Ok(match prim.unpack() {
+                Unpacked::Number(_) => self.coerce_to_number(v)?,
+                Unpacked::Handle(r) if self.realm.string_value(Handle::from_raw(r)).is_some() => {
+                    let s = self.coerce_to_string(v)?;
+                    self.new_str(&s)
+                }
+                _ => prim,
+            });
         }
-        v
+        Ok(v)
     }
 
     /// `SerializeJSONProperty(key, holder)` — serializes `holder[key]`, applying
@@ -228,7 +239,21 @@ impl<'a> Interp<'a> {
                 return Ok(Some(self.realm.to_display_string(raw)));
             }
             if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
-                prim
+                // SerializeJSONProperty step 4: a `[[NumberData]]` wrapper is
+                // `ToNumber(value)` and a `[[StringData]]` wrapper is
+                // `ToString(value)` — both applied to the *wrapper*, so a custom
+                // `valueOf`/`toString` is honored. Boolean/BigInt wrappers use the
+                // boxed primitive directly.
+                match prim.unpack() {
+                    Unpacked::Number(_) => self.coerce_to_number(value)?,
+                    Unpacked::Handle(r)
+                        if self.realm.string_value(Handle::from_raw(r)).is_some() =>
+                    {
+                        let s = self.coerce_to_string(value)?;
+                        self.new_str(&s)
+                    }
+                    _ => prim,
+                }
             } else {
                 value
             }
