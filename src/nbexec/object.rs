@@ -116,7 +116,10 @@ impl<'a> Interp<'a> {
                     // default, but `Object.defineProperty(arr, i, …)` can demote
                     // any of those attributes (recorded in the element-flag maps);
                     // reflect the actual recorded flags rather than the defaults.
-                    let writable = !self.realm.property_is_readonly(obj, key);
+                    // A frozen array's elements are non-writable (the write is already
+                    // blocked at runtime; reflect it in the descriptor too).
+                    let writable =
+                        !self.realm.property_is_readonly(obj, key) && !self.realm.is_frozen(obj);
                     let enumerable = self.realm.property_is_enumerable(obj, key);
                     let configurable = !self.realm.property_is_non_configurable(obj, key);
                     (

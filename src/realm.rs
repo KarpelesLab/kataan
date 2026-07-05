@@ -1838,6 +1838,13 @@ impl Realm {
             self.frozen_arrays.insert(handle.to_raw());
             self.sealed_arrays.insert(handle.to_raw());
             self.non_extensible_arrays.insert(handle.to_raw());
+            // Named (non-index) properties live in the aux object; freeze them too
+            // (non-writable + non-configurable) so `verifyProperty` sees them frozen.
+            if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+                && let Some(obj) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+            {
+                obj.freeze();
+            }
             return true;
         }
         if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
