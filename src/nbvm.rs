@@ -2824,7 +2824,10 @@ fn regex_match_object(
     let groups = if group_names.is_empty() {
         NanBox::undefined()
     } else {
-        let g = realm.new_object();
+        // Null-prototype container (per spec); duplicate names resolve to whichever
+        // occurrence participated (a `Some` capture wins, never clobbered by a later
+        // non-participating `None` duplicate).
+        let g = realm.new_object_with_proto(None);
         for (idx, name) in group_names {
             let v = match caps.groups.get(*idx).and_then(|x| *x) {
                 Some((s, e)) => {
@@ -2832,7 +2835,9 @@ fn regex_match_object(
                 }
                 None => NanBox::undefined(),
             };
-            realm.set_property(g, name, v);
+            if !v.is_undefined() || realm.get_property(g, name).is_none() {
+                realm.set_property(g, name, v);
+            }
         }
         NanBox::handle(g.to_raw())
     };
