@@ -151,6 +151,10 @@ enum Step<'a> {
     /// coroutine on the operand's settlement (the resumed value is pushed back
     /// as this expression's result).
     AwaitExpr,
+    /// The yield half of an async-generator `yield`: yield the value on the stack
+    /// (which has already been `Await`ed). `AsyncGeneratorYield` = Await(value) then
+    /// GeneratorYield; this is the second half, pushed after an `AwaitExpr`.
+    AsyncYield,
     /// A `yield*` delegation pumping `iter`.
     YieldStar { iter: Handle },
     /// Assign the value on the stack to simple target `name`, leaving the value
@@ -1875,11 +1879,23 @@ impl<'a> Interp<'a> {
                         stack,
                         values,
                     )
+                } else if self.gen_is_async {
+                    // `AsyncGeneratorYield(operand)` = Await(operand) then
+                    // GeneratorYield. Await first (so `yield <rejected promise>`
+                    // rejects the `next()` promise, and a fulfilled promise yields
+                    // its value); the pushed `AsyncYield` yields the settled value.
+                    stack.push(Step::AsyncYield);
+                    Ok(StepOut::Await(operand))
                 } else {
                     // Plain `yield v`: suspend. On resume, the injected value is
                     // pushed by `gen_drive` and becomes this expression's result.
                     Ok(StepOut::Yield(operand))
                 }
+            }
+            Step::AsyncYield => {
+                // The awaited operand is on the stack; surface it as the yielded value.
+                let awaited = values.pop().unwrap_or(NanBox::undefined());
+                Ok(StepOut::Yield(awaited))
             }
             Step::YieldStar { iter } => {
                 // A `YieldStar` on top at resume is intercepted by `gen_drive`
