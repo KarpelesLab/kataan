@@ -4058,6 +4058,9 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
         {
             self.realm.set_function_proto_intrinsic(func_proto);
+            // `%Function.prototype%` is itself a function with own `name` "" and
+            // `length` 0 (`{ w:false, e:false, c:true }`).
+            self.install_fn_name_length(func_proto, "", 0);
             // `Function.prototype.caller` / `.arguments` are poisoned accessors
             // (`%ThrowTypeError%` for both get and set), enumerable: false,
             // configurable: true. Strict and bound functions inherit them, so
