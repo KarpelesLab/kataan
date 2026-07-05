@@ -1153,7 +1153,7 @@ impl<'a> Interp<'a> {
                                             self.method_display_name(&k, MethodKind::Method)
                                             && v.as_handle()
                                                 .map(Handle::from_raw)
-                                                .is_some_and(|h| !self.realm.has_own(h, "name"))
+                                                .is_some_and(|h| self.fn_name_unset(h))
                                         {
                                             if matches!(&**value, Expr::Class(_)) {
                                                 // A class already has its `length`; only
@@ -1231,7 +1231,7 @@ impl<'a> Interp<'a> {
                                     MethodKind::Set
                                 };
                                 if let Some(nm) = self.method_display_name(&k, kind)
-                                    && !self.realm.has_own(fh, "name")
+                                    && self.fn_name_unset(fh)
                                 {
                                     self.install_fn_name_length(fh, &nm, value.params.len() as u32);
                                 }
@@ -1400,18 +1400,16 @@ impl<'a> Interp<'a> {
             && self.functions[func_id as usize].name.is_empty()
         {
             self.functions[func_id as usize].name = name;
-            // Materialize `name`/`length` as own, non-enumerable, non-writable,
-            // configurable data properties so `f.hasOwnProperty("name")`,
-            // `getOwnPropertyDescriptor`, and `verifyProperty` behave per spec.
+            // Overwrite the `name` "" placeholder materialized at creation with the
+            // NamedEvaluation name (own, non-enumerable, non-writable, configurable),
+            // so `hasOwnProperty`/`getOwnPropertyDescriptor`/`verifyProperty` see it.
             let handle = Handle::from_raw(raw);
-            if !self.realm.has_own(handle, "name") {
-                let len = self.functions[func_id as usize]
-                    .params
-                    .iter()
-                    .take_while(|p| p.default.is_none() && !p.rest)
-                    .count() as u32;
-                self.install_fn_name_length(handle, name, len);
-            }
+            let len = self.functions[func_id as usize]
+                .params
+                .iter()
+                .take_while(|p| p.default.is_none() && !p.rest)
+                .count() as u32;
+            self.install_fn_name_length(handle, name, len);
             return;
         }
         // NamedEvaluation of an anonymous class: `let C = class {}` gives the

@@ -2554,15 +2554,35 @@ impl<'a> Interp<'a> {
     /// `defineProperty` redefinitions behave per spec — exactly what Test262's
     /// `verifyProperty` exercises.
     pub(crate) fn install_fn_name_length(&mut self, f: Handle, name: &str, length: u32) {
-        // Spec own-key order for a function is `length` before `name`.
+        // Spec own-key order for a function is `length` before `name`. Clear any
+        // prior readonly flag first so a re-install (e.g. a NamedEvaluation name
+        // overwriting the "" placeholder set at creation) actually takes effect —
+        // `set_property` is a no-op on a readonly property.
+        self.realm.clear_readonly_property(f, "length");
         self.realm
             .set_property(f, "length", NanBox::number(f64::from(length)));
         self.realm.mark_hidden(f, "length");
         self.realm.set_readonly_property(f, "length");
         let name_v = self.new_str(name);
+        self.realm.clear_readonly_property(f, "name");
         self.realm.set_property(f, "name", name_v);
         self.realm.mark_hidden(f, "name");
         self.realm.set_readonly_property(f, "name");
+    }
+
+    /// Whether a function's `name` is still the empty-string placeholder (or
+    /// absent) — the signal that a NamedEvaluation / property-key inference may
+    /// still set it. Functions now materialize `name` "" at creation, so a bare
+    /// `has_own("name")` no longer distinguishes "named yet".
+    pub(crate) fn fn_name_unset(&self, h: Handle) -> bool {
+        match self.realm.get_property(h, "name") {
+            None => true,
+            Some(v) => v
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|nh| self.realm.string_value(nh))
+                .map_or(true, |s| s.is_empty()),
+        }
     }
 
     /// Installs the own `name`/`length` data properties on a freshly created
@@ -2581,14 +2601,20 @@ impl<'a> Interp<'a> {
         {
             self.functions[func_id as usize].name = self.intern_method_name(name);
         }
-        if self.realm.has_own(handle, "name") {
-            return;
-        }
+        // Overwrite the `name` "" placeholder installed at creation with the
+        // resolved name: a named function-expression value keeps its own
+        // `FnDef::name`; a plain method takes the property key `name`.
+        let install_name = match self.realm.function_at(handle) {
+            Some((func_id, _)) if !self.functions[func_id as usize].name.is_empty() => {
+                self.functions[func_id as usize].name
+            }
+            _ => name,
+        };
         let len = params
             .iter()
             .take_while(|p| p.default.is_none() && !p.rest)
             .count() as u32;
-        self.install_fn_name_length(handle, name, len);
+        self.install_fn_name_length(handle, install_name, len);
     }
 
     /// Interns `s` to a `&'a str` for storing as a `FnDef::name`. Method names are
@@ -5278,6 +5304,15 @@ impl<'a> Interp<'a> {
             is_method: false,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
+        // Materialize `name` ("" until a later NamedEvaluation / method key sets
+        // it) and `length` as own data properties so `hasOwnProperty("name")` and
+        // `verifyProperty` behave per spec even for anonymous functions. A named
+        // context (`set_fn_name`/`install_method_meta`) overwrites the name after.
+        let length = params
+            .iter()
+            .take_while(|p| p.default.is_none() && !p.rest)
+            .count() as u32;
+        self.install_fn_name_length(handle, "", length);
         NanBox::handle(handle.to_raw())
     }
 
