@@ -31,6 +31,10 @@ struct ScopeData {
     vars: BTreeMap<String, NanBox>,
     /// Names declared `const` in this frame (reassignment is a TypeError).
     consts: alloc::collections::BTreeSet<String>,
+    /// Names bound as *soft* immutable bindings in this frame — a named function
+    /// expression's own name. Reassignment throws in strict mode but is a silent
+    /// no-op in sloppy mode (per SetMutableBinding on an immutable binding).
+    soft_consts: alloc::collections::BTreeSet<String>,
     parent: Option<Scope>,
     /// Explicit-resource-management disposers recorded by `using` / `await using`
     /// declarations bound *in this frame*, in declaration order. Each entry is
@@ -66,6 +70,7 @@ impl Scope {
         Scope(Rc::new(RefCell::new(ScopeData {
             vars: BTreeMap::new(),
             consts: alloc::collections::BTreeSet::new(),
+            soft_consts: alloc::collections::BTreeSet::new(),
             parent: None,
             disposers: None,
             with_obj: None,
@@ -79,6 +84,7 @@ impl Scope {
         Scope(Rc::new(RefCell::new(ScopeData {
             vars: BTreeMap::new(),
             consts: alloc::collections::BTreeSet::new(),
+            soft_consts: alloc::collections::BTreeSet::new(),
             parent: Some(self.clone()),
             disposers: None,
             with_obj: None,
@@ -146,6 +152,25 @@ impl Scope {
             return data.consts.contains(name);
         }
         data.parent.as_ref().is_some_and(|p| p.is_const(name))
+    }
+
+    /// Declares `name` as a *soft* immutable binding in *this* scope — a named
+    /// function expression's own name (strict reassignment throws, sloppy is a
+    /// no-op).
+    pub fn declare_soft_const(&self, name: &str, value: NanBox) {
+        let mut data = self.0.borrow_mut();
+        data.vars.insert(String::from(name), value);
+        data.soft_consts.insert(String::from(name));
+    }
+
+    /// Whether the nearest binding of `name` is a soft immutable binding.
+    #[must_use]
+    pub fn is_soft_const(&self, name: &str) -> bool {
+        let data = self.0.borrow();
+        if data.vars.contains_key(name) {
+            return data.soft_consts.contains(name);
+        }
+        data.parent.as_ref().is_some_and(|p| p.is_soft_const(name))
     }
 
     /// Whether `name` is bound in *this* scope (not the enclosing chain).

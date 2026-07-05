@@ -1344,7 +1344,9 @@ impl<'a> Interp<'a> {
                 func.is_generator,
             );
             self.set_fn_name(f, &id.name);
-            self.current.declare(&id.name, f);
+            // The name is an immutable binding: reassigning it inside the body
+            // throws in strict mode and is a silent no-op in sloppy mode.
+            self.current.declare_soft_const(&id.name, f);
             self.current = saved;
             return f;
         }
@@ -2904,6 +2906,22 @@ impl<'a> Interp<'a> {
                 let m = self.new_str("Assignment to constant variable.");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
+            // A named-function-expression name is a soft immutable binding: strict
+            // reassignment throws, sloppy is a silent no-op (the expression still
+            // evaluates to the RHS).
+            if self.current.is_soft_const(name) {
+                let rhs = self.eval(value)?;
+                if self.strict {
+                    let m = self.new_str("Assignment to constant variable.");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                let current = self.read_ident_ref(name)?;
+                return Ok(if op == AssignOp::Assign {
+                    rhs
+                } else {
+                    self.binary(compound_op(op)?, current, rhs)?
+                });
+            }
             // Capture the declarative reference (owning scope frame) *now*.
             let frame = self.current.owner_frame(name);
             let current = self.read_ident_ref(name)?;
@@ -2971,6 +2989,21 @@ impl<'a> Interp<'a> {
                 if self.current.is_const(name) {
                     let m = self.new_str("Assignment to constant variable.");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                // A named-function-expression name is a soft immutable binding:
+                // strict reassignment throws, sloppy is a silent no-op (the
+                // expression still evaluates to the RHS / compound result).
+                if self.current.is_soft_const(name) {
+                    if self.strict {
+                        let m = self.new_str("Assignment to constant variable.");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    return Ok(if op == AssignOp::Assign {
+                        rhs
+                    } else {
+                        let current = self.read_ident_ref(name)?;
+                        self.binary(compound_op(op)?, current, rhs)?
+                    });
                 }
                 let new = if op == AssignOp::Assign {
                     // NamedEvaluation: `x = function(){}` / `x = () => {}` /
