@@ -5351,6 +5351,15 @@ impl<'a> Interp<'a> {
             .take_while(|p| p.default.is_none() && !p.rest)
             .count() as u32;
         self.install_fn_name_length(handle, "", length);
+        // A sync generator function's `[[Prototype]]` is `%GeneratorFunction.prototype%`
+        // (distinct from `%Function.prototype%`), so `Object.getPrototypeOf(g).prototype`
+        // resolves to `%GeneratorPrototype%`. `object_proto` honors this override.
+        if is_generator
+            && !is_async
+            && let Some(gfp) = self.generator_function_prototype()
+        {
+            self.realm.set_native_proto(handle, gfp);
+        }
         NanBox::handle(handle.to_raw())
     }
 

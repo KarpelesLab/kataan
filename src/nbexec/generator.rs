@@ -366,6 +366,91 @@ impl<'a> Interp<'a> {
         NanBox::handle(obj.to_raw())
     }
 
+    /// The shared `%GeneratorPrototype%`: `next`/`return`/`throw` (length 1, each
+    /// dispatching on `this`'s generator frame) and `[Symbol.toStringTag]`
+    /// "Generator", inheriting `%IteratorPrototype%`. Created once, cached on the
+    /// `Iterator` constructor.
+    fn generator_prototype(&mut self) -> Option<Handle> {
+        let iter_ctor = self
+            .current
+            .get("Iterator")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)?;
+        const CACHE: &str = "\u{0}genproto";
+        if let Some(gp) = self
+            .realm
+            .get_property(iter_ctor, CACHE)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            return Some(gp);
+        }
+        let iter_proto = self
+            .realm
+            .get_property(iter_ctor, "prototype")
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)?;
+        let gp = self.realm.new_object_with_proto(Some(iter_proto));
+        for (name, nid) in [
+            ("next", N_GEN_NEXT),
+            ("return", N_GEN_RETURN),
+            ("throw", N_GEN_THROW),
+        ] {
+            let f = self.realm.new_native(nid);
+            self.install_fn_name_length(f, name, 1);
+            self.realm
+                .set_property(gp, name, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(gp, name);
+        }
+        self.install_to_string_tag(gp, "Generator");
+        self.realm
+            .set_hidden_property(iter_ctor, CACHE, NanBox::handle(gp.to_raw()));
+        Some(gp)
+    }
+
+    /// `%GeneratorFunction.prototype%` — an ordinary object inheriting
+    /// `%Function.prototype%`, whose own `prototype` data property is
+    /// `%GeneratorPrototype%` (so `Object.getPrototypeOf(g).prototype` resolves to
+    /// it), with `[Symbol.toStringTag]` "GeneratorFunction". A sync generator
+    /// function's `[[Prototype]]` is set to this (via `set_native_proto`), which
+    /// `object_proto` honors ahead of the `%Function.prototype%` fallback. Cached on
+    /// the `Iterator` constructor.
+    pub(crate) fn generator_function_prototype(&mut self) -> Option<Handle> {
+        let iter_ctor = self
+            .current
+            .get("Iterator")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)?;
+        const CACHE: &str = "\u{0}genfnproto";
+        if let Some(gfp) = self
+            .realm
+            .get_property(iter_ctor, CACHE)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            return Some(gfp);
+        }
+        let fn_proto = self
+            .current
+            .get("Function")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw);
+        let gfp = self.realm.new_object_with_proto(fn_proto);
+        if let Some(gp) = self.generator_prototype() {
+            self.realm
+                .set_property(gfp, "prototype", NanBox::handle(gp.to_raw()));
+            self.realm.mark_hidden(gfp, "prototype");
+            self.realm.set_readonly_property(gfp, "prototype");
+        }
+        self.install_to_string_tag(gfp, "GeneratorFunction");
+        self.realm
+            .set_hidden_property(iter_ctor, CACHE, NanBox::handle(gfp.to_raw()));
+        Some(gfp)
+    }
+
     /// Whether `h` is a lazy *async* generator (`async function*`): `Some(true)`,
     /// a sync generator: `Some(false)`, or not a lazy generator at all: `None`.
     /// A `for await` loop uses this to drive an async-generator iterable through
