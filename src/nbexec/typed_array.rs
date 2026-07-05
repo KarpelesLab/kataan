@@ -640,7 +640,7 @@ impl<'a> Interp<'a> {
             .filter(|nt| nt.as_handle() != callee.as_handle())
             .and_then(|nt| nt.as_handle())
             .map(Handle::from_raw)
-            .and_then(|nt| self.constructor_prototype(nt))
+            .and_then(|nt| self.newtarget_object_proto(nt))
             .or_else(|| {
                 let kind_name = TYPED_ARRAY_KINDS[kind as usize].0;
                 self.intrinsic_proto(kind_name)

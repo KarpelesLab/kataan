@@ -1576,44 +1576,41 @@ impl<'a> Interp<'a> {
         if new_target.as_handle().is_some()
             && new_target.as_handle() != callee.as_handle()
             && let Some(nt) = new_target.as_handle().map(Handle::from_raw)
-            && let Some(p) = self.constructor_prototype(nt)
+            && let Some(p) = self.newtarget_object_proto(nt)
         {
             return Some(p);
         }
         default_proto
     }
 
-    /// `Get(constructor, "prototype")` reduced to a `[[Prototype]]`-eligible object
-    /// handle. Resolves a class's prototype (stored in the realm's class-prototype
-    /// table), an ordinary function's `.prototype` (the lazily-materialized
-    /// `fn_protos` object), and an aux-stored `prototype` data property (a native
-    /// constructor, or a function whose `prototype` was reassigned). `None` when the
-    /// constructor has no object prototype (so the caller falls back to the
-    /// intrinsic default).
-    pub(crate) fn constructor_prototype(&mut self, ctor: Handle) -> Option<Handle> {
-        // A class: its prototype object (materialized on demand).
-        if let Some((class_id, _)) = self.realm.class_at(ctor) {
+    /// `GetPrototypeFromConstructor(newTarget, defaultProto)`'s prototype lookup:
+    /// the newTarget's `"prototype"` *only if it is an Object*, else `None` so the
+    /// caller substitutes the default intrinsic. Unlike `constructor_prototype`,
+    /// this does NOT fall back to a function's own default prototype when the
+    /// explicit `prototype` is a non-object (null/undefined/primitive) — that case
+    /// must use the intrinsic default per spec.
+    pub(crate) fn newtarget_object_proto(&mut self, nt: Handle) -> Option<Handle> {
+        if let Some((class_id, _)) = self.realm.class_at(nt) {
             return Some(self.class_prototype_by_id(class_id));
         }
-        // An ordinary function: its `.prototype` (an aux reassignment wins over the
-        // default `fn_protos` object, matching `read_member`).
-        if let Some((func_id, _)) = self.realm.function_at(ctor) {
-            if let Some(p) = self
-                .realm
-                .get_property(ctor, "prototype")
-                .and_then(|p| p.as_handle())
-                .map(Handle::from_raw)
-            {
-                return Some(p);
+        match self.realm.get_property(nt, "prototype") {
+            // An explicit `prototype`: honor it only when it is an Object; a
+            // non-object (null / undefined / primitive) means the caller must fall
+            // back to the intrinsic default (GetPrototypeFromConstructor step 3).
+            Some(p) => {
+                if self.is_object_value(p) {
+                    p.as_handle().map(Handle::from_raw)
+                } else {
+                    None
+                }
             }
-            return Some(self.realm.function_prototype(func_id));
+            // No stored `prototype`: an ordinary function's lazily-materialized
+            // default prototype object; anything else has no object prototype.
+            None => self
+                .realm
+                .function_at(nt)
+                .map(|(func_id, _)| self.realm.function_prototype(func_id)),
         }
-        // A native constructor / bound native / any other callable: its `prototype`
-        // data property, if it carries one that is an object.
-        self.realm
-            .get_property(ctor, "prototype")
-            .and_then(|p| p.as_handle())
-            .map(Handle::from_raw)
     }
 
     /// The intrinsic `.prototype` object handle for a constructor bound at the
