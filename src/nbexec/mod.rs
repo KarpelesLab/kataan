@@ -3508,6 +3508,7 @@ impl<'a> Interp<'a> {
             // `ArrayBuffer.isView(x)` — true for a typed array or a DataView.
             if id == N_ARRAY_BUFFER {
                 let isview = self.realm.new_native(N_ARRAY_BUFFER_IS_VIEW);
+                self.install_fn_name_length(isview, "isView", 1);
                 self.realm
                     .set_hidden_property(f, "isView", NanBox::handle(isview.to_raw()));
             }
@@ -4071,7 +4072,9 @@ impl<'a> Interp<'a> {
             // `Function.prototype[Symbol.hasInstance]` — OrdinaryHasInstance,
             // non-writable, non-enumerable, non-configurable (a first-class
             // native so `instanceof` and explicit `.call` both work).
-            let has_instance = NanBox::handle(self.realm.new_native(N_FN_HAS_INSTANCE).to_raw());
+            let hi_handle = self.realm.new_native(N_FN_HAS_INSTANCE);
+            self.install_fn_name_length(hi_handle, "[Symbol.hasInstance]", 1);
+            let has_instance = NanBox::handle(hi_handle.to_raw());
             let sym = self.well_known_symbol("hasInstance");
             let key = self.member_key(sym);
             self.realm
