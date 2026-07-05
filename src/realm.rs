@@ -1852,10 +1852,10 @@ impl Realm {
             return true;
         }
         // An aux-backed cell (function/Date/typed array/RegExp/…) keeps its
-        // properties in the aux object; freeze that.
-        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
-            && let Some(obj) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
-        {
+        // properties in the aux object; freeze that (create it if absent so a
+        // property-less callable/Date is still frozen = non-extensible).
+        let aux = self.aux_object(handle);
+        if let Some(obj) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
             obj.freeze();
             return true;
         }
@@ -1868,8 +1868,14 @@ impl Realm {
         if self.frozen_arrays.contains(&handle.to_raw()) {
             return true;
         }
-        self.heap
-            .get(handle)
+        if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
+            return o.is_frozen();
+        }
+        // An aux-backed cell (function/Date/…): frozen iff its aux object exists and
+        // is frozen (freeze creates + freezes it).
+        self.aux_props
+            .get(&handle.to_raw())
+            .and_then(|a| self.heap.get(*a))
             .and_then(Cell::as_object)
             .is_some_and(crate::object::Object::is_frozen)
     }
@@ -2467,9 +2473,11 @@ impl Realm {
             self.non_extensible_arrays.insert(handle.to_raw());
         } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.seal();
-        } else if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied() {
+        } else {
             // An aux-backed cell (function/Date/typed array/RegExp/…) keeps its
-            // properties in the aux object; seal that.
+            // properties in the aux object; seal that (create it if absent so a
+            // property-less callable/Date is still sealed = non-extensible).
+            let aux = self.aux_object(handle);
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
                 o.seal();
             }
@@ -2535,8 +2543,14 @@ impl Realm {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             return self.sealed_arrays.contains(&handle.to_raw());
         }
-        self.heap
-            .get(handle)
+        if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
+            return o.is_sealed();
+        }
+        // An aux-backed cell (function/Date/…): sealed iff its aux object exists and
+        // is sealed (seal/freeze creates + seals it).
+        self.aux_props
+            .get(&handle.to_raw())
+            .and_then(|a| self.heap.get(*a))
             .and_then(Cell::as_object)
             .is_some_and(Object::is_sealed)
     }
