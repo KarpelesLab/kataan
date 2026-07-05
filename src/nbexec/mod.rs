@@ -1439,6 +1439,9 @@ const N_ATOMICS_PAUSE: u16 = 904;
 const N_GENERATOR_FUNCTION_CTOR: u16 = 905;
 /// `%AsyncGeneratorFunction%` — builds an `async function*` from dynamic source.
 const N_ASYNC_GENERATOR_FUNCTION_CTOR: u16 = 906;
+/// `%AsyncIteratorPrototype%[@@asyncDispose]` — calls the iterator's `return` and
+/// returns a promise (fulfilled with `undefined`, rejected if `return` throws).
+const N_ASYNC_ITERATOR_DISPOSE: u16 = 907;
 /// `SharedArrayBuffer` — a growable byte store (single-agent: no cross-agent
 /// sharing, so it behaves as an `ArrayBuffer` that only ever grows). Its bytes
 /// live in the same `ARRAY_BUFFER_BYTES` slot, so typed arrays and `Atomics`
@@ -1913,6 +1916,7 @@ fn builtin_native_arity(id: u16) -> u32 {
         // `Atomics.pause([N])` — the optional `N` is not counted.
         | N_ATOMICS_PAUSE => 0,
         N_GENERATOR_FUNCTION_CTOR | N_ASYNC_GENERATOR_FUNCTION_CTOR => 1,
+        N_ASYNC_ITERATOR_DISPOSE => 0,
         // Length 2.
         // `FinalizationRegistry.prototype.register(target, heldValue [, token])`.
         N_FINREG_REGISTER

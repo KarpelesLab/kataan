@@ -507,6 +507,14 @@ impl<'a> Interp<'a> {
         let key = self.member_key(sym);
         self.realm
             .set_hidden_property(aip, &key, NanBox::handle(self_iter.to_raw()));
+        // `%AsyncIteratorPrototype%[@@asyncDispose]` (length 0).
+        let dispose = self.realm.new_native(N_ASYNC_ITERATOR_DISPOSE);
+        self.install_fn_name_length(dispose, "[Symbol.asyncDispose]", 0);
+        let dsym = self.well_known_symbol("asyncDispose");
+        let dkey = self.member_key(dsym);
+        self.realm
+            .set_property(aip, &dkey, NanBox::handle(dispose.to_raw()));
+        self.realm.mark_hidden(aip, &dkey);
         self.realm
             .set_hidden_property(iter_ctor, CACHE, NanBox::handle(aip.to_raw()));
         Some(aip)
