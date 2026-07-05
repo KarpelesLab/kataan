@@ -2581,7 +2581,7 @@ impl<'a> Interp<'a> {
                 .as_handle()
                 .map(Handle::from_raw)
                 .and_then(|nh| self.realm.string_value(nh))
-                .map_or(true, |s| s.is_empty()),
+                .is_none_or(|s| s.is_empty()),
         }
     }
 
