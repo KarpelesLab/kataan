@@ -1846,11 +1846,11 @@ impl Realm {
         }
         // An aux-backed cell (function/Date/typed array/RegExp/…) keeps its
         // properties in the aux object; freeze that.
-        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied() {
-            if let Some(obj) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
-                obj.freeze();
-                return true;
-            }
+        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+            && let Some(obj) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+        {
+            obj.freeze();
+            return true;
         }
         false
     }
