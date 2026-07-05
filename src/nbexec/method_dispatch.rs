@@ -4305,9 +4305,35 @@ impl<'a> Interp<'a> {
                     let f = arg(0);
                     let this_arg = arg(1);
                     let coll = NanBox::handle(handle.to_raw());
-                    for (k, v) in self.realm.collection_entries(handle).unwrap_or_default() {
-                        // The callback gets `(value, key, collection)` with `thisArg`.
-                        self.call_with_this(f, this_arg, &[v, k, coll])?;
+                    let is_set = self.realm.collection_is_set(handle) == Some(true);
+                    // LIVE iteration (mirrors the keys/values/entries iterator): a
+                    // value added during the callback is visited, a deleted one is
+                    // skipped, and a delete-then-re-add is revisited. Track the last
+                    // key and re-read entries each step, resuming after the last key's
+                    // current position (or the recorded index if it was deleted).
+                    let mut last_key: Option<NanBox> = None;
+                    let mut idx: usize = 0;
+                    loop {
+                        let entries = self.realm.collection_entries(handle).unwrap_or_default();
+                        let next_pos = match last_key {
+                            None => 0,
+                            Some(lk) => match entries
+                                .iter()
+                                .position(|(k, _)| self.realm.same_value_zero(*k, lk))
+                            {
+                                Some(q) => q + 1,
+                                None => idx,
+                            },
+                        };
+                        let Some(&(k, v)) = entries.get(next_pos) else {
+                            break;
+                        };
+                        last_key = Some(k);
+                        idx = next_pos;
+                        // The callback gets `(value, key, collection)` with `thisArg`
+                        // (a Set yields its element as both value and key).
+                        let val = if is_set { k } else { v };
+                        self.call_with_this(f, this_arg, &[val, k, coll])?;
                     }
                     return Ok(Some(NanBox::undefined()));
                 }
