@@ -3129,25 +3129,16 @@ impl<'a> Interp<'a> {
                                 .realm
                                 .typed_get(handle, i)
                                 .unwrap_or_else(NanBox::undefined);
-                            // Invoke(element, "toLocaleString"): box the Number
+                            // Invoke(element, "toLocaleString"): box the Number/BigInt
                             // element (ToObject), read the (possibly user-overridden)
-                            // method off the wrapper, and call it with the primitive
-                            // as `this`. A BigInt has no PRIM_WRAP-backed proto, so
-                            // resolve it through the primitive method dispatch.
-                            // Abrupt completions (a throwing override) propagate.
-                            let r = if e
-                                .as_handle()
-                                .map(Handle::from_raw)
-                                .is_some_and(|h| self.realm.bigint_at(h).is_some())
-                            {
-                                self.call_method(e, "toLocaleString", &[])?
-                                    .unwrap_or_else(NanBox::undefined)
-                            } else {
-                                let boxed = self.coerce_to_object(e);
-                                let bh = boxed.as_handle().map(Handle::from_raw).unwrap();
-                                let m = self.read_member(bh, "toLocaleString")?;
-                                self.call_with_this(m, e, &[])?
-                            };
+                            // method off the wrapper's prototype, and call it with the
+                            // primitive as `this` — so a replaced Number.prototype /
+                            // BigInt.prototype `toLocaleString` is honored. Abrupt
+                            // completions (a throwing override) propagate.
+                            let boxed = self.coerce_to_object(e);
+                            let bh = boxed.as_handle().map(Handle::from_raw).unwrap();
+                            let m = self.read_member(bh, "toLocaleString")?;
+                            let r = self.call_with_this(m, e, &[])?;
                             parts.push(self.coerce_to_string(r)?);
                         }
                         return Ok(Some(self.new_str(&parts.join(","))));
