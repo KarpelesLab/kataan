@@ -4173,6 +4173,31 @@ impl<'a> Interp<'a> {
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
         {
+            // The well-known symbols are own data properties of `%Symbol%` with
+            // attributes { writable:false, enumerable:false, configurable:false }.
+            for name in [
+                "iterator",
+                "asyncIterator",
+                "match",
+                "matchAll",
+                "replace",
+                "search",
+                "split",
+                "hasInstance",
+                "isConcatSpreadable",
+                "species",
+                "toPrimitive",
+                "toStringTag",
+                "unscopables",
+                "dispose",
+                "asyncDispose",
+            ] {
+                let sym = self.well_known_symbol(name);
+                self.realm.set_property(sym_ctor, name, sym);
+                self.realm.mark_hidden(sym_ctor, name);
+                self.realm.set_readonly_property(sym_ctor, name);
+                self.realm.set_non_configurable_property(sym_ctor, name);
+            }
             let proto = self.realm.new_object_with_proto(Some(obj_proto));
             // `toString` / `valueOf` — { writable:true, enumerable:false, configurable:true }.
             for (name, nid) in [
