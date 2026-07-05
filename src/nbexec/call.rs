@@ -54,11 +54,17 @@ impl<'a> Interp<'a> {
             return true;
         }
         // A user function constructs unless it is an arrow / generator / async
-        // function (and, per spec, a concise method — which this model does not
-        // distinguish, so an object-literal method is treated as a constructor).
+        // function, or a concise method / accessor: object-literal `{m(){}}` /
+        // `get`/`set` (flagged `is_method`) and class methods (which carry a
+        // `home_class`) all lack `[[Construct]]`. (A class *constructor* is caught
+        // earlier via `class_at`.)
         if let Some((func_id, _)) = self.realm.function_at(handle) {
             let def = self.functions[func_id as usize];
-            return !(def.is_arrow || def.is_generator || def.is_async);
+            return !(def.is_arrow
+                || def.is_generator
+                || def.is_async
+                || def.is_method
+                || def.home_class.is_some());
         }
         // `Object` / `Array` are namespace objects callable as constructors.
         if self.current.get("Object").and_then(|v| v.as_handle()) == value.as_handle()
@@ -1731,9 +1737,16 @@ impl<'a> Interp<'a> {
         // body, and return it — unless the function explicitly returned an object
         // (the spec's constructor return rule).
         if let Some((func_id, _)) = self.realm.function_at(handle) {
-            // Arrow, generator, and async functions are not constructors.
+            // Arrow / generator / async functions, and concise methods / accessors
+            // (object `{m(){}}`/`get`/`set`, flagged `is_method`) and class methods
+            // (which carry a `home_class`) are not constructors.
             let def = self.functions[func_id as usize];
-            if def.is_arrow || def.is_generator || def.is_async {
+            if def.is_arrow
+                || def.is_generator
+                || def.is_async
+                || def.is_method
+                || def.home_class.is_some()
+            {
                 let m = self.new_str("is not a constructor");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }

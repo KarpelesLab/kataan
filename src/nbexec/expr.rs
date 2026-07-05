@@ -1098,6 +1098,7 @@ impl<'a> Interp<'a> {
                             key,
                             value,
                             shorthand,
+                            method,
                             ..
                         } => {
                             // `{ __proto__: obj }` — only the *unquoted identifier*
@@ -1174,8 +1175,10 @@ impl<'a> Interp<'a> {
                             }
                             // A concise method (`{ m() {} }`, not an arrow) records
                             // this object as its `[[HomeObject]]`, so `super.x`
-                            // inside it resolves through the object's prototype.
-                            if matches!(&**value, Expr::Function(_))
+                            // inside it resolves through the object's prototype, and
+                            // is flagged as a method (no `[[Construct]]`).
+                            if *method
+                                && matches!(&**value, Expr::Function(_))
                                 && let Some(fv) = v.as_handle().map(Handle::from_raw)
                             {
                                 self.realm.set_hidden_property(
@@ -1183,6 +1186,9 @@ impl<'a> Interp<'a> {
                                     HOME_OBJECT,
                                     NanBox::handle(handle.to_raw()),
                                 );
+                                if let Some((fid, _)) = self.realm.function_at(fv) {
+                                    self.functions[fid as usize].is_method = true;
+                                }
                             }
                             self.realm.set_property(handle, &k, v);
                         }
@@ -1206,8 +1212,12 @@ impl<'a> Interp<'a> {
                                 false,
                             );
                             // An object-literal accessor's `[[HomeObject]]` is this
-                            // object, so `super.x` inside it resolves via the proto.
+                            // object, so `super.x` inside it resolves via the proto;
+                            // an accessor is a method (no `[[Construct]]`).
                             if let Some(fh) = f.as_handle().map(Handle::from_raw) {
+                                if let Some((fid, _)) = self.realm.function_at(fh) {
+                                    self.functions[fid as usize].is_method = true;
+                                }
                                 self.realm.set_hidden_property(
                                     fh,
                                     HOME_OBJECT,

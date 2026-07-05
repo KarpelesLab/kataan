@@ -168,6 +168,11 @@ pub(crate) struct FnDef<'a> {
     /// For a method this is its `home_class`; for an ordinary function it is the
     /// class textually enclosing it (or `None` outside any class).
     lexical_class: Option<u32>,
+    /// Whether this is a concise method / accessor (object-literal `{m(){}}` /
+    /// `get`/`set`) — such functions have no `[[Construct]]` (`new m()` throws).
+    /// Set post-creation like `is_arrow`. Class methods are detected via
+    /// `home_class` instead.
+    is_method: bool,
 }
 
 /// One SplitMix64 step: scrambles an input word into a well-distributed output.
@@ -5206,6 +5211,7 @@ impl<'a> Interp<'a> {
             home_class,
             home_static,
             lexical_class,
+            is_method: false,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
         NanBox::handle(handle.to_raw())
