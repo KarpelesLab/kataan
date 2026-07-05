@@ -2159,6 +2159,10 @@ const HELPER_LIMIT: &str = "\u{0}hlimit";
 const HELPER_COUNTER: &str = "\u{0}hcounter";
 /// Set once the helper is exhausted/closed; further `next` returns `{done:true}`.
 const HELPER_DONE: &str = "\u{0}hdone";
+/// Set while an iterator helper's `next` is executing; a reentrant `next` (a
+/// callback that resumes the same helper) sees it and throws a TypeError
+/// (GeneratorValidate: state is executing).
+const HELPER_RUNNING: &str = "\u{0}hrun";
 /// For flatMap: the current inner iterator being drained (absent when none).
 const HELPER_INNER: &str = "\u{0}hinner";
 const HELPER_INNER_NEXT: &str = "\u{0}hinnext";

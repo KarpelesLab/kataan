@@ -418,6 +418,28 @@ impl<'a> Interp<'a> {
     /// `%IteratorHelperPrototype%.next` — advances a lazy helper one step,
     /// pulling from the underlying iterator on demand.
     pub(crate) fn iter_helper_next(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
+        // Reentrancy guard (GeneratorValidate: if the helper is already executing,
+        // throw a TypeError). Set the running flag, run the body, and clear it on
+        // *every* path — capture the result before clearing (no `?`) so a thrown
+        // body cannot leave the helper stuck "running".
+        let Some(h) = this.as_handle().map(Handle::from_raw) else {
+            return self.iter_helper_next_body(this);
+        };
+        if self
+            .realm
+            .get_property(h, HELPER_RUNNING)
+            .is_some_and(|v| self.realm.truthy(v))
+        {
+            return Err(self.type_error("Iterator Helper is already running"));
+        }
+        self.realm
+            .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(true));
+        let result = self.iter_helper_next_body(this);
+        self.realm.delete_property(h, HELPER_RUNNING);
+        result
+    }
+
+    fn iter_helper_next_body(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
         let Some(h) = this.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("Iterator Helper next called on non-object"));
         };
@@ -1314,6 +1336,25 @@ impl<'a> Interp<'a> {
 
     /// `%ConcatIteratorPrototype%.next` — advances through the queued iterables.
     pub(crate) fn iter_concat_next(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
+        // Reentrancy guard, as in `iter_helper_next` (state=executing → TypeError).
+        let Some(h) = this.as_handle().map(Handle::from_raw) else {
+            return self.iter_concat_next_body(this);
+        };
+        if self
+            .realm
+            .get_property(h, HELPER_RUNNING)
+            .is_some_and(|v| self.realm.truthy(v))
+        {
+            return Err(self.type_error("Iterator Helper is already running"));
+        }
+        self.realm
+            .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(true));
+        let result = self.iter_concat_next_body(this);
+        self.realm.delete_property(h, HELPER_RUNNING);
+        result
+    }
+
+    fn iter_concat_next_body(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
         let Some(h) = this.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("next called on non-object"));
         };
