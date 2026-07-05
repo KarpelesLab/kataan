@@ -446,6 +446,30 @@ impl<'a> Interp<'a> {
             self.realm.set_readonly_property(gfp, "prototype");
         }
         self.install_to_string_tag(gfp, "GeneratorFunction");
+        // `%GeneratorFunction%` — the constructor, reachable as
+        // `Object.getPrototypeOf(function*(){}).constructor`. Its own `[[Prototype]]`
+        // is `%Function%`; `prototype` is `%GeneratorFunction.prototype%`
+        // { w:false,e:false,c:false }; the prototype's `constructor` points back
+        // { w:false,e:false,c:true }.
+        let gf = self.realm.new_native(N_GENERATOR_FUNCTION_CTOR);
+        self.install_fn_name_length(gf, "GeneratorFunction", 1);
+        self.realm
+            .set_property(gf, "prototype", NanBox::handle(gfp.to_raw()));
+        self.realm.mark_hidden(gf, "prototype");
+        self.realm.set_readonly_property(gf, "prototype");
+        self.realm.set_non_configurable_property(gf, "prototype");
+        if let Some(fn_ctor) = self
+            .current
+            .get("Function")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_native_proto(gf, fn_ctor);
+        }
+        self.realm
+            .set_property(gfp, "constructor", NanBox::handle(gf.to_raw()));
+        self.realm.mark_hidden(gfp, "constructor");
+        self.realm.set_readonly_property(gfp, "constructor");
         self.realm
             .set_hidden_property(iter_ctor, CACHE, NanBox::handle(gfp.to_raw()));
         Some(gfp)
@@ -560,6 +584,27 @@ impl<'a> Interp<'a> {
             self.realm.set_readonly_property(agfp, "prototype");
         }
         self.install_to_string_tag(agfp, "AsyncGeneratorFunction");
+        // `%AsyncGeneratorFunction%` — the constructor, reachable as
+        // `Object.getPrototypeOf(async function*(){}).constructor`.
+        let agf = self.realm.new_native(N_ASYNC_GENERATOR_FUNCTION_CTOR);
+        self.install_fn_name_length(agf, "AsyncGeneratorFunction", 1);
+        self.realm
+            .set_property(agf, "prototype", NanBox::handle(agfp.to_raw()));
+        self.realm.mark_hidden(agf, "prototype");
+        self.realm.set_readonly_property(agf, "prototype");
+        self.realm.set_non_configurable_property(agf, "prototype");
+        if let Some(fn_ctor) = self
+            .current
+            .get("Function")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_native_proto(agf, fn_ctor);
+        }
+        self.realm
+            .set_property(agfp, "constructor", NanBox::handle(agf.to_raw()));
+        self.realm.mark_hidden(agfp, "constructor");
+        self.realm.set_readonly_property(agfp, "constructor");
         self.realm
             .set_hidden_property(iter_ctor, CACHE, NanBox::handle(agfp.to_raw()));
         Some(agfp)

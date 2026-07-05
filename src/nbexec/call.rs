@@ -2748,6 +2748,12 @@ impl<'a> Interp<'a> {
         if id == N_FUNCTION {
             return self.build_function_constructor(args);
         }
+        if id == N_GENERATOR_FUNCTION_CTOR {
+            return self.build_function_constructor_kw(args, "function*");
+        }
+        if id == N_ASYNC_GENERATOR_FUNCTION_CTOR {
+            return self.build_function_constructor_kw(args, "async function*");
+        }
         // `WeakMap`/`WeakSet` reuse the collection cell (no true weak refs here).
         let is_set = match id {
             N_SET | N_WEAKSET => true,

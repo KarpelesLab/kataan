@@ -1434,6 +1434,11 @@ const N_ATOMICS_IS_LOCK_FREE: u16 = 686;
 /// `Atomics.pause([N])` — a spin-loop hint; a single-agent no-op returning
 /// `undefined` (validates that `N`, if present, is an integral Number).
 const N_ATOMICS_PAUSE: u16 = 904;
+/// `%GeneratorFunction%` — builds a `function*` from dynamic source (like
+/// `%Function%`); reachable via `Object.getPrototypeOf(function*(){}).constructor`.
+const N_GENERATOR_FUNCTION_CTOR: u16 = 905;
+/// `%AsyncGeneratorFunction%` — builds an `async function*` from dynamic source.
+const N_ASYNC_GENERATOR_FUNCTION_CTOR: u16 = 906;
 /// `SharedArrayBuffer` — a growable byte store (single-agent: no cross-agent
 /// sharing, so it behaves as an `ArrayBuffer` that only ever grows). Its bytes
 /// live in the same `ARRAY_BUFFER_BYTES` slot, so typed arrays and `Atomics`
@@ -1907,6 +1912,7 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_ARRAY_OF
         // `Atomics.pause([N])` — the optional `N` is not counted.
         | N_ATOMICS_PAUSE => 0,
+        N_GENERATOR_FUNCTION_CTOR | N_ASYNC_GENERATOR_FUNCTION_CTOR => 1,
         // Length 2.
         // `FinalizationRegistry.prototype.register(target, heldValue [, token])`.
         N_FINREG_REGISTER
@@ -1993,6 +1999,8 @@ fn is_native_constructor(id: u16) -> bool {
             | N_DATE
             | N_REGEXP
             | N_FUNCTION
+            | N_GENERATOR_FUNCTION_CTOR
+            | N_ASYNC_GENERATOR_FUNCTION_CTOR
             | N_ARRAY_BUFFER
             | N_SHARED_ARRAY_BUFFER
             | N_DATA_VIEW
@@ -5100,6 +5108,17 @@ impl<'a> Interp<'a> {
     /// (so it closes over globals only), sloppy unless the body self-declares
     /// `"use strict"`. A parse failure (bad params or body) throws a SyntaxError.
     fn build_function_constructor(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        self.build_function_constructor_kw(args, "function")
+    }
+
+    /// As `build_function_constructor`, but with an explicit function keyword so the
+    /// `GeneratorFunction` ("function*") and `AsyncGeneratorFunction`
+    /// ("async function*") intrinsics can reuse the same dynamic-source machinery.
+    fn build_function_constructor_kw(
+        &mut self,
+        args: &[NanBox],
+        keyword: &str,
+    ) -> Result<NanBox, ExecError> {
         // Coerce arguments to strings (ToString). Last is the body; the rest are
         // the parameter-list pieces, joined with commas.
         let (params, body) = match args.split_last() {
@@ -5119,7 +5138,7 @@ impl<'a> Interp<'a> {
             // `Function()` with no arguments → an empty-body anonymous function.
             None => (String::new(), String::new()),
         };
-        let source = alloc::format!("(function anonymous({params}\n) {{\n{body}\n}})");
+        let source = alloc::format!("({keyword} anonymous({params}\n) {{\n{body}\n}})");
 
         // A `Function(…)` body is global-scoped — no inherited `super`. (Its body
         // is wrapped in a function expression, so `new.target` inside is enabled by

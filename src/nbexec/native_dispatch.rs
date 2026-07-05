@@ -439,6 +439,12 @@ impl<'a> Interp<'a> {
                 // anonymous function from the supplied parameter/body source.
                 return self.build_function_constructor(args);
             }
+            N_GENERATOR_FUNCTION_CTOR => {
+                return self.build_function_constructor_kw(args, "function*");
+            }
+            N_ASYNC_GENERATOR_FUNCTION_CTOR => {
+                return self.build_function_constructor_kw(args, "async function*");
+            }
             N_EVAL => {
                 // Reaching `eval` through `call_native` means an *indirect* eval
                 // (the callee wasn't the literal identifier `eval` — e.g.
