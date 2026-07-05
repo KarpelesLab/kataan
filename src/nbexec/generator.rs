@@ -2835,9 +2835,11 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 Resumption::Next(_) => {
-                    // `next` must exist; treat as done.
-                    values.push(NanBox::undefined());
-                    return Ok(StepOut::Continue);
+                    // `yield*` requires a callable `next` (IteratorNext →
+                    // Call(next)); an absent/non-callable one is a TypeError.
+                    return Err(GenAbrupt::Throw(
+                        self.make_type_error("The iterator does not provide a 'next' method"),
+                    ));
                 }
             }
         }
