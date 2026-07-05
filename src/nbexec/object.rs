@@ -1344,8 +1344,14 @@ impl<'a> Interp<'a> {
         }
         // `callee`.
         if self.strict {
-            // A strict arguments object's `callee` is a poisoned accessor.
-            let thrower = NanBox::handle(self.realm.new_native(N_THROW_TYPE_ERROR).to_raw());
+            // A strict arguments object's `callee` is a poisoned accessor
+            // (`%ThrowTypeError%`, which has own non-configurable `name`/`length`).
+            let thrower_h = self.realm.new_native(N_THROW_TYPE_ERROR);
+            self.install_fn_name_length(thrower_h, "", 0);
+            self.realm.set_non_configurable_property(thrower_h, "name");
+            self.realm
+                .set_non_configurable_property(thrower_h, "length");
+            let thrower = NanBox::handle(thrower_h.to_raw());
             self.realm.define_accessor(obj, "callee", thrower, thrower);
             self.realm.mark_hidden(obj, "callee");
         } else {

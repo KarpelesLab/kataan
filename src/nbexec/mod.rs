@@ -4066,7 +4066,15 @@ impl<'a> Interp<'a> {
             // configurable: true. Strict and bound functions inherit them, so
             // `boundFn.caller` / `strictFn.arguments` throw a TypeError without a
             // (forbidden) own property.
-            let thrower = NanBox::handle(self.realm.new_native(N_THROW_TYPE_ERROR).to_raw());
+            let thrower_h = self.realm.new_native(N_THROW_TYPE_ERROR);
+            // %ThrowTypeError% is a frozen function: own `name` "" / `length` 0
+            // that are uniquely NON-configurable (as well as non-writable/
+            // non-enumerable).
+            self.install_fn_name_length(thrower_h, "", 0);
+            self.realm.set_non_configurable_property(thrower_h, "name");
+            self.realm
+                .set_non_configurable_property(thrower_h, "length");
+            let thrower = NanBox::handle(thrower_h.to_raw());
             for key in ["caller", "arguments"] {
                 self.realm
                     .define_accessor(func_proto, key, thrower, thrower);
