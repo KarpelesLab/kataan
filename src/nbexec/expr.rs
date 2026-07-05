@@ -138,6 +138,37 @@ impl<'a> Interp<'a> {
         self.realm.to_display_string(k)
     }
 
+    /// The `(old, next)` pair for a `++`/`--` on `current`: `old` is the numeric (or
+    /// BigInt) value to yield for a postfix update, `next` the incremented/decremented
+    /// value to store. Runs `ToNumeric` (a BigInt stays BigInt; an object operand goes
+    /// through ToPrimitive, whose `valueOf`/`toString` may throw).
+    fn update_value(
+        &mut self,
+        op: crate::ast::UpdateOp,
+        current: NanBox,
+    ) -> Result<(NanBox, NanBox), ExecError> {
+        if let Some(big) = current
+            .as_handle()
+            .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)))
+        {
+            let one = crate::bignum::BigInt::from_i128(1);
+            let next = match op {
+                crate::ast::UpdateOp::Inc => big.add(&one),
+                crate::ast::UpdateOp::Dec => big.sub(&one),
+            };
+            let next_box = NanBox::handle(self.realm.new_bigint(next).to_raw());
+            let old_box = NanBox::handle(self.realm.new_bigint(big).to_raw());
+            return Ok((old_box, next_box));
+        }
+        let coerced = self.coerce_to_number(current)?;
+        let old = self.realm.to_number(coerced);
+        let next = match op {
+            crate::ast::UpdateOp::Inc => old + 1.0,
+            crate::ast::UpdateOp::Dec => old - 1.0,
+        };
+        Ok((NanBox::number(old), NanBox::number(next)))
+    }
+
     /// `ToPropertyKey(k)`: like `member_key`, but a non-string, non-symbol object
     /// key is coerced with ToPrimitive(String) so a user `toString` is honored
     /// (`obj[{toString(){return "x"}}]` keys on `"x"`).
@@ -601,34 +632,39 @@ impl<'a> Interp<'a> {
                 argument,
                 ..
             } => {
-                let current = self.read_target(argument)?;
-                // A BigInt operand increments/decrements by one BigInt.
-                if let Some(big) = current
-                    .as_handle()
-                    .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)))
+                // For a member target, the reference is evaluated exactly once: the
+                // base and (computed) key run once, then GetValue + PutValue share
+                // them — so `obj[keyWithSideEffect()]++` does not run the key twice.
+                if let Expr::Member {
+                    object, property, ..
+                } = &**argument
+                    && !matches!(&**object, Expr::Super(_))
                 {
-                    let one = crate::bignum::BigInt::from_i128(1);
-                    let next = match op {
-                        crate::ast::UpdateOp::Inc => big.add(&one),
-                        crate::ast::UpdateOp::Dec => big.sub(&one),
+                    let obj = self.eval(object)?;
+                    let key = self.eval_prop_key(property)?;
+                    if matches!(obj.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                        return Err(self.type_error("Cannot read properties of null or undefined"));
+                    }
+                    // A primitive base is boxed for the read; the write then lands on
+                    // the throwaway wrapper (a no-op, as for any primitive property set).
+                    let handle = match obj.as_handle() {
+                        Some(raw) => Handle::from_raw(raw),
+                        None => Handle::from_raw(
+                            self.coerce_to_object(obj)
+                                .as_handle()
+                                .ok_or_else(|| self.type_error("cannot convert to object"))?,
+                        ),
                     };
-                    let next_box = NanBox::handle(self.realm.new_bigint(next).to_raw());
-                    self.assign_to(argument, next_box)?;
-                    let old_box = NanBox::handle(self.realm.new_bigint(big).to_raw());
-                    return Ok(if *prefix { next_box } else { old_box });
+                    let current = self.read_member(handle, &key)?;
+                    let (old, next) = self.update_value(*op, current)?;
+                    let key_box = self.new_str(&key);
+                    self.assign_member_value(handle, key_box, next)?;
+                    return Ok(if *prefix { next } else { old });
                 }
-                // `ToNumber(GetValue(arg))` runs ToPrimitive(number) on an object
-                // operand (its `valueOf`/`toString`, which may throw) — e.g.
-                // `(new Boolean(true))++` is `2`. The infallible `to_number` routes
-                // an object through `toString` only, so go via the spec path.
-                let coerced = self.coerce_to_number(current)?;
-                let old = self.realm.to_number(coerced);
-                let next = match op {
-                    crate::ast::UpdateOp::Inc => old + 1.0,
-                    crate::ast::UpdateOp::Dec => old - 1.0,
-                };
-                self.assign_to(argument, NanBox::number(next))?;
-                Ok(NanBox::number(if *prefix { next } else { old }))
+                let current = self.read_target(argument)?;
+                let (old, next) = self.update_value(*op, current)?;
+                self.assign_to(argument, next)?;
+                Ok(if *prefix { next } else { old })
             }
             Expr::Binary {
                 op, left, right, ..
