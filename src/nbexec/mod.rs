@@ -1832,6 +1832,9 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "asUintN" | "setMonth" | "setUTCMonth" | "setSeconds" | "setUTCSeconds" | "subarray"
         // `Map.prototype.getOrInsert(key, value)` / `getOrInsertComputed(key, fn)`.
         | "getOrInsert" | "getOrInsertComputed"
+        // `Map/WeakMap.prototype.set(key, value)`; `Map.groupBy(items, cb)` /
+        // `Object.groupBy`.
+        | "set" | "groupBy"
         // `Promise.prototype.then(onFulfilled, onRejected)`.
         | "then"
         // `Function.prototype.apply(thisArg, argArray)`.
@@ -1914,7 +1917,9 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_MATH_HYPOT
         | N_MATH_IMUL
         // `JSON.parse(text, reviver)`.
-        | N_JSON_PARSE => 2,
+        | N_JSON_PARSE
+        // `Object.groupBy(items, callbackfn)`.
+        | N_OBJECT_GROUP_BY => 2,
         // Length 3.
         N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP | N_REFLECT_APPLY
         // `SuppressedError(error, suppressed, message)`.
