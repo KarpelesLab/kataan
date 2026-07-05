@@ -451,6 +451,120 @@ impl<'a> Interp<'a> {
         Some(gfp)
     }
 
+    /// `%AsyncIteratorPrototype%` — `[Symbol.asyncIterator]` returns `this`,
+    /// inheriting `%Object.prototype%`. Cached on the `Iterator` constructor.
+    fn async_iterator_prototype(&mut self) -> Option<Handle> {
+        let iter_ctor = self
+            .current
+            .get("Iterator")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)?;
+        const CACHE: &str = "\u{0}asynciterproto";
+        if let Some(h) = self
+            .realm
+            .get_property(iter_ctor, CACHE)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            return Some(h);
+        }
+        let obj_proto = self
+            .current
+            .get("Object")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw);
+        let aip = self.realm.new_object_with_proto(obj_proto);
+        let self_iter = self.realm.new_native(N_ITERATOR_PROTO_SELF);
+        self.install_fn_name_length(self_iter, "[Symbol.asyncIterator]", 0);
+        let sym = self.well_known_symbol("asyncIterator");
+        let key = self.member_key(sym);
+        self.realm
+            .set_hidden_property(aip, &key, NanBox::handle(self_iter.to_raw()));
+        self.realm
+            .set_hidden_property(iter_ctor, CACHE, NanBox::handle(aip.to_raw()));
+        Some(aip)
+    }
+
+    /// `%AsyncGeneratorPrototype%` — `next`/`return`/`throw` (length 1, each
+    /// dispatching on `this`'s frame and wrapping the result in a promise) and
+    /// `[Symbol.toStringTag]` "AsyncGenerator", inheriting `%AsyncIteratorPrototype%`.
+    fn async_generator_prototype(&mut self) -> Option<Handle> {
+        let iter_ctor = self
+            .current
+            .get("Iterator")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)?;
+        const CACHE: &str = "\u{0}asyncgenproto";
+        if let Some(h) = self
+            .realm
+            .get_property(iter_ctor, CACHE)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            return Some(h);
+        }
+        let aip = self.async_iterator_prototype();
+        let agp = self.realm.new_object_with_proto(aip);
+        for (name, nid) in [
+            ("next", N_GEN_NEXT),
+            ("return", N_GEN_RETURN),
+            ("throw", N_GEN_THROW),
+        ] {
+            let f = self.realm.new_native(nid);
+            self.install_fn_name_length(f, name, 1);
+            self.realm
+                .set_property(agp, name, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(agp, name);
+        }
+        self.install_to_string_tag(agp, "AsyncGenerator");
+        self.realm
+            .set_hidden_property(iter_ctor, CACHE, NanBox::handle(agp.to_raw()));
+        Some(agp)
+    }
+
+    /// `%AsyncGeneratorFunction.prototype%` — own `prototype` =
+    /// `%AsyncGeneratorPrototype%`, `[Symbol.toStringTag]` "AsyncGeneratorFunction",
+    /// inheriting `%Function.prototype%`. An `async function*`'s `[[Prototype]]` is
+    /// set to this via `set_native_proto`.
+    pub(crate) fn async_generator_function_prototype(&mut self) -> Option<Handle> {
+        let iter_ctor = self
+            .current
+            .get("Iterator")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)?;
+        const CACHE: &str = "\u{0}asyncgenfnproto";
+        if let Some(h) = self
+            .realm
+            .get_property(iter_ctor, CACHE)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            return Some(h);
+        }
+        let fn_proto = self
+            .current
+            .get("Function")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw);
+        let agfp = self.realm.new_object_with_proto(fn_proto);
+        if let Some(agp) = self.async_generator_prototype() {
+            self.realm
+                .set_property(agfp, "prototype", NanBox::handle(agp.to_raw()));
+            self.realm.mark_hidden(agfp, "prototype");
+            self.realm.set_readonly_property(agfp, "prototype");
+        }
+        self.install_to_string_tag(agfp, "AsyncGeneratorFunction");
+        self.realm
+            .set_hidden_property(iter_ctor, CACHE, NanBox::handle(agfp.to_raw()));
+        Some(agfp)
+    }
+
     /// Whether `h` is a lazy *async* generator (`async function*`): `Some(true)`,
     /// a sync generator: `Some(false)`, or not a lazy generator at all: `None`.
     /// A `for await` loop uses this to drive an async-generator iterable through

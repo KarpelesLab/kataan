@@ -5360,6 +5360,13 @@ impl<'a> Interp<'a> {
         {
             self.realm.set_native_proto(handle, gfp);
         }
+        // An `async function*`'s `[[Prototype]]` is `%AsyncGeneratorFunction.prototype%`.
+        if is_generator
+            && is_async
+            && let Some(agfp) = self.async_generator_function_prototype()
+        {
+            self.realm.set_native_proto(handle, agfp);
+        }
         NanBox::handle(handle.to_raw())
     }
 
