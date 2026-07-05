@@ -4385,6 +4385,11 @@ impl<'a> Interp<'a> {
                     self.realm
                         .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
                     self.realm.mark_hidden(ctor, "prototype");
+                    // `AggregateError(errors, message)` has `length` 2; the other
+                    // error constructors take just `message` (`length` 1).
+                    if name == "AggregateError" {
+                        self.install_fn_name_length(ctor, "AggregateError", 2);
+                    }
                     // `Object.getPrototypeOf(TypeError) === Error` (the subclass
                     // constructor inherits `Error`'s static side).
                     if let Some(error_ctor) = self
