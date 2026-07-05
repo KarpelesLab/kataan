@@ -1097,6 +1097,10 @@ const N_INTL_FORMAT_TO_PARTS: u16 = 219;
 /// `formatRangeToParts(x, y)` (high, collision-free ids).
 const N_INTL_FORMAT_RANGE: u16 = 900;
 const N_INTL_FORMAT_RANGE_TO_PARTS: u16 = 901;
+/// `get %IteratorPrototype%[Symbol.toStringTag]` → the string "Iterator".
+const N_ITERATOR_TAG_GET: u16 = 902;
+/// `set %IteratorPrototype%[Symbol.toStringTag]` — SetterThatIgnoresPrototypeProperties.
+const N_ITERATOR_TAG_SET: u16 = 903;
 /// A readable static method bound to a `[constructor, name]` pair (so a detached call
 /// still routes to the constructor's `call_method` static dispatch).
 const N_STATIC_METHOD: u16 = 220;
@@ -3593,6 +3597,23 @@ impl<'a> Interp<'a> {
             NanBox::handle(dispose_native.to_raw()),
         );
         self.realm.mark_hidden(iter_proto, &dispose_key);
+        // `%IteratorPrototype%[Symbol.toStringTag]` is a get/set accessor
+        // (`get` → "Iterator"; `set` = SetterThatIgnoresPrototypeProperties),
+        // enumerable: false, configurable: true — so `Object.prototype.toString`
+        // on a bare iterator yields `[object Iterator]`.
+        let tag_get = self.realm.new_native(N_ITERATOR_TAG_GET);
+        self.install_fn_name_length(tag_get, "get [Symbol.toStringTag]", 0);
+        let tag_set = self.realm.new_native(N_ITERATOR_TAG_SET);
+        self.install_fn_name_length(tag_set, "set [Symbol.toStringTag]", 1);
+        let tag_sym = self.well_known_symbol("toStringTag");
+        let tag_key = self.member_key(tag_sym);
+        self.realm.define_accessor(
+            iter_proto,
+            &tag_key,
+            NanBox::handle(tag_get.to_raw()),
+            NanBox::handle(tag_set.to_raw()),
+        );
+        self.realm.mark_hidden(iter_proto, &tag_key);
         // The ES2025 helper methods as first-class functions on `%IteratorPrototype%`
         // (so `Iterator.prototype.map`, `it.map(...)` resolve through the chain).
         for &name in ITERATOR_PROTO_METHODS {

@@ -2009,6 +2009,28 @@ impl<'a> Interp<'a> {
             // `get %TypedArray%[Symbol.species]` — returns the receiver constructor.
             // (Also shared by `Map`/`Set`/… species getters, which all return `this`.)
             N_TYPED_ARRAY_SPECIES => self.this_val,
+            // `get %IteratorPrototype%[Symbol.toStringTag]` → always "Iterator".
+            N_ITERATOR_TAG_GET => self.new_str("Iterator"),
+            // `set %IteratorPrototype%[Symbol.toStringTag]`: SetterThatIgnores-
+            // PrototypeProperties. A non-object `this`, or `this` being the home
+            // prototype itself (detected as owning the accessor), is a TypeError;
+            // otherwise the value is written as an own property of `this`.
+            N_ITERATOR_TAG_SET => {
+                let Some(this_h) = self.this_val.as_handle().map(Handle::from_raw) else {
+                    return Err(self.type_error(
+                        "Iterator.prototype[Symbol.toStringTag] setter requires an object",
+                    ));
+                };
+                let tag_sym = self.well_known_symbol("toStringTag");
+                let tag_key = self.member_key(tag_sym);
+                if self.realm.accessor(this_h, &tag_key).is_some() {
+                    return Err(
+                        self.type_error("cannot set Symbol.toStringTag on %Iterator.prototype%")
+                    );
+                }
+                self.realm.set_property(this_h, &tag_key, arg(0));
+                NanBox::undefined()
+            }
             // `get Map.prototype.size` / `get Set.prototype.size` — brand-checked.
             // `this` must be a non-weak Map (resp. Set); else a TypeError.
             N_MAP_SIZE | N_SET_SIZE => {
