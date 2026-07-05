@@ -3776,7 +3776,18 @@ impl<'a> Interp<'a> {
             );
             self.realm.mark_hidden(proto, name);
         }
-        for &m in &["maximize", "minimize", "toString"] {
+        for &m in &[
+            "maximize",
+            "minimize",
+            "toString",
+            "getCalendars",
+            "getCollations",
+            "getHourCycles",
+            "getNumberingSystems",
+            "getTimeZones",
+            "getTextInfo",
+            "getWeekInfo",
+        ] {
             let target = self.new_str(m);
             let th = target.as_handle().map(Handle::from_raw).unwrap();
             let f = self.realm.new_bound_native(N_INTL_LOCALE_METHOD, th);
@@ -4024,8 +4035,60 @@ impl<'a> Interp<'a> {
             .get_property(h, "\u{0}locale_tag")
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
+        // The Locale Info API: single-element defaults (real CLDR availability
+        // data is §3.9). Each returns a fresh Array/object per call.
+        let array_of = |this: &mut Self, items: &[&str]| {
+            let vals: Vec<NanBox> = items.iter().map(|s| this.new_str(s)).collect();
+            NanBox::handle(this.realm.new_array(vals).to_raw())
+        };
         match name {
             "toString" => Ok(self.new_str(&tag)),
+            "getCalendars" => Ok(array_of(self, &["gregory"])),
+            "getCollations" => Ok(array_of(self, &["default"])),
+            "getHourCycles" => Ok(array_of(self, &["h23"])),
+            "getNumberingSystems" => Ok(array_of(self, &["latn"])),
+            "getTimeZones" => {
+                // `undefined` for a region-less locale; otherwise a (placeholder)
+                // Array. Real per-region zone lists are §3.9 CLDR data.
+                if ParsedLocale::from_canonical(&tag)
+                    .region
+                    .as_deref()
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    Ok(NanBox::undefined())
+                } else {
+                    Ok(array_of(self, &["UTC"]))
+                }
+            }
+            "getTextInfo" => {
+                let obj = self.realm.new_object();
+                let pl = ParsedLocale::from_canonical(&tag);
+                let rtl = matches!(
+                    pl.script.as_deref().unwrap_or(""),
+                    "Arab" | "Hebr" | "Syrc" | "Thaa" | "Nkoo" | "Rohg" | "Adlm"
+                ) || matches!(
+                    pl.language.as_str(),
+                    "ar" | "he" | "fa" | "ur" | "ps" | "sd" | "ug" | "yi" | "dv" | "ku" | "ckb"
+                );
+                let dir = if rtl { "rtl" } else { "ltr" };
+                let d = self.new_str(dir);
+                self.realm.set_property(obj, "direction", d);
+                Ok(NanBox::handle(obj.to_raw()))
+            }
+            "getWeekInfo" => {
+                let obj = self.realm.new_object();
+                self.realm
+                    .set_property(obj, "firstDay", NanBox::number(1.0));
+                let weekend = self
+                    .realm
+                    .new_array(alloc::vec![NanBox::number(6.0), NanBox::number(7.0)]);
+                self.realm
+                    .set_property(obj, "weekend", NanBox::handle(weekend.to_raw()));
+                self.realm
+                    .set_property(obj, "minimalDays", NanBox::number(1.0));
+                Ok(NanBox::handle(obj.to_raw()))
+            }
             // maximize/minimize: rebuild a Locale from the (unchanged) tag.
             _ => {
                 let tagv = self.new_str(&tag);
