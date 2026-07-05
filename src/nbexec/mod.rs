@@ -1807,7 +1807,7 @@ fn builtin_method_arity(name: &str) -> u32 {
         "pop" | "shift" | "reverse" | "keys" | "values" | "entries" | "toString"
         | "toLocaleString" | "valueOf" | "flat" | "clear" | "trim" | "trimStart" | "trimEnd"
         | "toUpperCase" | "toLowerCase" | "toLocaleUpperCase" | "toLocaleLowerCase"
-        | "toReversed" | "toSorted" | "isWellFormed" | "toWellFormed" | "getInt8" | "getUint8"
+        | "toReversed" | "isWellFormed" | "of" | "toWellFormed" | "getInt8" | "getUint8"
         | "toArray" | "normalize"
         // Annex B.2.3 zero-argument HTML wrapper methods.
         | "big" | "blink" | "bold" | "fixed" | "italics" | "small"
@@ -1834,7 +1834,7 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "getOrInsert" | "getOrInsertComputed"
         // `Map/WeakMap.prototype.set(key, value)`; `Map.groupBy(items, cb)` /
         // `Object.groupBy`.
-        | "set" | "groupBy"
+        | "set" | "groupBy" | "assign" | "toSpliced"
         // `Promise.prototype.then(onFulfilled, onRejected)`.
         | "then"
         // `Function.prototype.apply(thisArg, argArray)`.
@@ -1890,7 +1890,18 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_SYMBOL_PROTO_VALUEOF
         | N_SYMBOL_PROTO_DESC_GET
         // `get Error.prototype.stack` takes no arguments.
-        | N_ERROR_PROTO_STACK_GET => 0,
+        | N_ERROR_PROTO_STACK_GET
+        // Constructors whose sole argument is optional have `length` 0:
+        // `Map`/`Set`/`WeakMap`/`WeakSet`([iterable]), `Symbol`([description]),
+        // `Iterator`() (abstract).
+        | N_MAP
+        | N_SET
+        | N_WEAKMAP
+        | N_WEAKSET
+        | N_SYMBOL
+        | N_ITERATOR
+        // `Array.of(...items)` is variadic → `length` 0.
+        | N_ARRAY_OF => 0,
         // Length 2.
         // `FinalizationRegistry.prototype.register(target, heldValue [, token])`.
         N_FINREG_REGISTER
@@ -1918,8 +1929,9 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_MATH_IMUL
         // `JSON.parse(text, reviver)`.
         | N_JSON_PARSE
-        // `Object.groupBy(items, callbackfn)`.
-        | N_OBJECT_GROUP_BY => 2,
+        // `Object.groupBy(items, callbackfn)`; `Object.assign(target, ...sources)`.
+        | N_OBJECT_GROUP_BY
+        | N_OBJECT_ASSIGN => 2,
         // Length 3.
         N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP | N_REFLECT_APPLY
         // `SuppressedError(error, suppressed, message)`.
