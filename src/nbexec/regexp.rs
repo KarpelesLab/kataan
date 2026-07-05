@@ -40,14 +40,21 @@ impl<'a> Interp<'a> {
         let groups = if group_names.is_empty() {
             NanBox::undefined()
         } else {
-            // Named-group container is a null-prototype object (per spec).
+            // Named-group container is a null-prototype object (per spec). A name may
+            // occur more than once (duplicate named groups in disjoint alternatives):
+            // whichever occurrence participated in the match wins. Create each name on
+            // its first occurrence (preserving key order) with its value; a later
+            // duplicate overwrites the value only when *it* participated (`Some`), so a
+            // non-participating `None` never clobbers the matched capture.
             let g = self.realm.new_object_with_proto(None);
             for (idx, name) in group_names {
                 let v = match caps.groups.get(*idx).and_then(|x| *x) {
                     Some((s, e)) => self.new_str_bytes(u16_slice(units, s, e)),
                     None => NanBox::undefined(),
                 };
-                self.realm.set_property(g, name, v);
+                if !v.is_undefined() || self.realm.get_property(g, name).is_none() {
+                    self.realm.set_property(g, name, v);
+                }
             }
             NanBox::handle(g.to_raw())
         };
@@ -73,8 +80,12 @@ impl<'a> Interp<'a> {
             } else {
                 let g = self.realm.new_object_with_proto(None);
                 for (idx, name) in group_names {
-                    let v = pair(self, caps.groups.get(*idx).copied().flatten());
-                    self.realm.set_property(g, name, v);
+                    let span = caps.groups.get(*idx).copied().flatten();
+                    let v = pair(self, span);
+                    // Duplicate names: the participating occurrence wins (see `groups`).
+                    if span.is_some() || self.realm.get_property(g, name).is_none() {
+                        self.realm.set_property(g, name, v);
+                    }
                 }
                 NanBox::handle(g.to_raw())
             };
