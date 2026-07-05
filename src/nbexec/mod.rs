@@ -5378,6 +5378,13 @@ impl<'a> Interp<'a> {
             && let Some(gfp) = self.generator_function_prototype()
         {
             self.realm.set_native_proto(handle, gfp);
+            // `g.prototype` inherits `%GeneratorPrototype%` (so a produced generator
+            // reaches it, and `getPrototypeOf(getPrototypeOf(g.prototype))` is
+            // `%IteratorPrototype%`).
+            if let Some(gp) = self.generator_prototype() {
+                let proto = self.realm.new_object_with_proto(Some(gp));
+                self.realm.set_function_prototype(func_id, proto);
+            }
         }
         // An `async function*`'s `[[Prototype]]` is `%AsyncGeneratorFunction.prototype%`.
         if is_generator
@@ -5385,6 +5392,12 @@ impl<'a> Interp<'a> {
             && let Some(agfp) = self.async_generator_function_prototype()
         {
             self.realm.set_native_proto(handle, agfp);
+            // `ag.prototype` inherits `%AsyncGeneratorPrototype%`, whose prototype is
+            // `%AsyncIteratorPrototype%`.
+            if let Some(agp) = self.async_generator_prototype() {
+                let proto = self.realm.new_object_with_proto(Some(agp));
+                self.realm.set_function_prototype(func_id, proto);
+            }
         }
         NanBox::handle(handle.to_raw())
     }

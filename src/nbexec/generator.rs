@@ -370,7 +370,7 @@ impl<'a> Interp<'a> {
     /// dispatching on `this`'s generator frame) and `[Symbol.toStringTag]`
     /// "Generator", inheriting `%IteratorPrototype%`. Created once, cached on the
     /// `Iterator` constructor.
-    fn generator_prototype(&mut self) -> Option<Handle> {
+    pub(crate) fn generator_prototype(&mut self) -> Option<Handle> {
         let iter_ctor = self
             .current
             .get("Iterator")
@@ -515,7 +515,7 @@ impl<'a> Interp<'a> {
     /// `%AsyncGeneratorPrototype%` — `next`/`return`/`throw` (length 1, each
     /// dispatching on `this`'s frame and wrapping the result in a promise) and
     /// `[Symbol.toStringTag]` "AsyncGenerator", inheriting `%AsyncIteratorPrototype%`.
-    fn async_generator_prototype(&mut self) -> Option<Handle> {
+    pub(crate) fn async_generator_prototype(&mut self) -> Option<Handle> {
         let iter_ctor = self
             .current
             .get("Iterator")
