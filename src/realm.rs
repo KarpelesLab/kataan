@@ -2447,16 +2447,16 @@ impl Realm {
     pub fn prevent_extensions(&mut self, handle: Handle) {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.non_extensible_arrays.insert(handle.to_raw());
-        } else if matches!(
-            self.heap.get(handle),
-            Some(Cell::TypedArray { .. } | Cell::RegExp { .. })
-        ) {
+        } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.prevent_extensions();
+        } else {
+            // An aux-backed cell (function/Date/typed array/RegExp/Map/Set/Promise…)
+            // records the flag on its auxiliary object; create it if absent so a
+            // property-less callable/Date is still marked non-extensible.
             let aux = self.aux_object(handle);
             if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
                 o.prevent_extensions();
             }
-        } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
-            o.prevent_extensions();
         }
     }
 
@@ -2507,7 +2507,9 @@ impl Realm {
                 .and_then(Cell::as_object)
                 .is_none_or(Object::is_extensible);
         }
-        matches!(
+        // A callable (function/class/native/bound/host) is extensible by default;
+        // `preventExtensions`/`seal`/`freeze` records the flag on its aux object.
+        if matches!(
             self.heap.get(handle),
             Some(
                 Cell::Function { .. }
@@ -2516,7 +2518,15 @@ impl Realm {
                     | Cell::HostFn(_)
                     | Cell::BoundNative { .. }
             )
-        )
+        ) {
+            return self
+                .aux_props
+                .get(&handle.to_raw())
+                .and_then(|a| self.heap.get(*a))
+                .and_then(Cell::as_object)
+                .is_none_or(Object::is_extensible);
+        }
+        false
     }
 
     /// Whether the object at `handle` is sealed (or frozen).
