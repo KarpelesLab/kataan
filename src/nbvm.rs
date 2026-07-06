@@ -6738,7 +6738,10 @@ impl Compiler {
                             let cur = self.read_var(b);
                             let c = cond(self, cur)?;
                             let jf = self.emit_jump_if_false(c);
-                            let v = self.expr(value)?;
+                            // NamedEvaluation: `x &&= function(){}` / `x ??= () => {}`
+                            // names the anonymous RHS after the LHS identifier.
+                            let bt = crate::ast::BindingTarget::Ident((*id).clone());
+                            let v = self.expr_named(value, &bt)?;
                             self.write_var(b, v);
                             self.patch(jf);
                             return Ok(self.read_var(b));

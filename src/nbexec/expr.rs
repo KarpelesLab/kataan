@@ -2799,6 +2799,14 @@ impl<'a> Interp<'a> {
                 return Ok(current);
             }
             let rhs = self.eval(value)?;
+            // NamedEvaluation: `x &&= function(){}` / `x ||= () => {}` /
+            // `x ??= class {}` names the anonymous RHS after the LHS *identifier*
+            // (only a simple identifier target, only an anonymous fn/arrow/class).
+            if let Expr::Ident(id) = target
+                && matches!(value, Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_))
+            {
+                self.set_fn_name(rhs, &id.name);
+            }
             self.assign_to(target, rhs)?;
             return Ok(rhs);
         }
