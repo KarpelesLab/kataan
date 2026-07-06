@@ -351,7 +351,7 @@ impl<'a> Interp<'a> {
 
     /// Builds a Temporal instance linked to its kind's intrinsic prototype (no
     /// subclass), for engine-produced values (e.g. `Temporal.Now.*`).
-    fn build_temporal(&mut self, data: crate::temporal_iso::TemporalData) -> NanBox {
+    pub(crate) fn build_temporal(&mut self, data: crate::temporal_iso::TemporalData) -> NanBox {
         let kind = data.kind;
         let h = self.realm.new_temporal(data);
         if let Some(p) = self.temporal_proto(kind) {
@@ -362,7 +362,10 @@ impl<'a> Interp<'a> {
 
     /// Resolves a `Temporal.Now` time-zone argument to an IANA/offset id string
     /// (undefined → the system default, taken here as `"UTC"`); validates it.
-    fn now_tz_arg(&mut self, arg: NanBox) -> Result<alloc::string::String, ExecError> {
+    pub(crate) fn temporal_tz_arg(
+        &mut self,
+        arg: NanBox,
+    ) -> Result<alloc::string::String, ExecError> {
         if matches!(arg.unpack(), Unpacked::Undefined) {
             return Ok(alloc::string::String::from("UTC"));
         }
@@ -382,7 +385,7 @@ impl<'a> Interp<'a> {
             self.coerce_to_string(arg)?
         };
         // Accept UTC, a fixed offset, or a known IANA name.
-        if self.now_tz_offset_ns(&s, 0).is_some() {
+        if self.temporal_tz_offset_ns(&s, 0).is_some() {
             Ok(s)
         } else {
             let m = self.new_str(&alloc::format!("invalid time zone: {s}"));
@@ -392,7 +395,7 @@ impl<'a> Interp<'a> {
 
     /// The offset (in nanoseconds east of UTC) for time-zone id `tz` at
     /// `epoch_ns`, or `None` if `tz` is not a recognised zone.
-    fn now_tz_offset_ns(&self, tz: &str, epoch_ns: i128) -> Option<i128> {
+    pub(crate) fn temporal_tz_offset_ns(&self, tz: &str, epoch_ns: i128) -> Option<i128> {
         if tz == "UTC" || tz == "Etc/UTC" || tz == "Etc/GMT" {
             return Some(0);
         }
@@ -438,7 +441,8 @@ impl<'a> Interp<'a> {
                 ..Default::default()
             })),
             "zonedDateTimeISO" => {
-                let tz = self.now_tz_arg(args.first().copied().unwrap_or(NanBox::undefined()))?;
+                let tz =
+                    self.temporal_tz_arg(args.first().copied().unwrap_or(NanBox::undefined()))?;
                 Ok(self.build_temporal(TemporalData {
                     kind: TemporalKind::ZonedDateTime,
                     epoch_ns,
@@ -447,8 +451,9 @@ impl<'a> Interp<'a> {
                 }))
             }
             "plainDateTimeISO" | "plainDateISO" | "plainTimeISO" => {
-                let tz = self.now_tz_arg(args.first().copied().unwrap_or(NanBox::undefined()))?;
-                let offset = self.now_tz_offset_ns(&tz, epoch_ns).unwrap_or(0);
+                let tz =
+                    self.temporal_tz_arg(args.first().copied().unwrap_or(NanBox::undefined()))?;
+                let offset = self.temporal_tz_offset_ns(&tz, epoch_ns).unwrap_or(0);
                 let (day, time) = balance_time_from_nanos(epoch_ns + offset);
                 let date = epoch_days_to_iso(day);
                 let data = match name {

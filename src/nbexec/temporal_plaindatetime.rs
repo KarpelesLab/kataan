@@ -236,7 +236,21 @@ impl<'a> Interp<'a> {
                 "Temporal.PlainDateTime.prototype.valueOf must not be called; use compare() or an \
                  explicit conversion",
             )),
-            "toZonedDateTime" => Err(self.temporal_todo("PlainDateTime.prototype.toZonedDateTime")),
+            "toZonedDateTime" => {
+                // Interpret this wall-clock date-time in `timeZone` → an exact
+                // instant (epoch ns = local wall ns − zone offset).
+                let tz = self.temporal_tz_arg(arg(0))?;
+                let local_ns = crate::temporal_iso::iso_to_epoch_days(data.date) as i128
+                    * crate::temporal_iso::NS_PER_DAY
+                    + crate::temporal_iso::time_to_nanos(data.time);
+                let offset = self.temporal_tz_offset_ns(&tz, local_ns).unwrap_or(0);
+                Ok(self.build_temporal(crate::temporal_iso::TemporalData {
+                    kind: crate::temporal_iso::TemporalKind::ZonedDateTime,
+                    epoch_ns: local_ns - offset,
+                    tz: Some(tz),
+                    ..Default::default()
+                }))
+            }
             _ => Err(self.temporal_todo(&alloc::format!("PlainDateTime.prototype.{method}"))),
         }
     }

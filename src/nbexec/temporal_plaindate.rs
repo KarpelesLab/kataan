@@ -23,6 +23,7 @@ pub(crate) const METHODS: &[&str] = &[
     "toPlainDateTime",
     "toPlainYearMonth",
     "toPlainMonthDay",
+    "toZonedDateTime",
     "toString",
     "toJSON",
     "toLocaleString",
@@ -132,6 +133,39 @@ impl<'a> Interp<'a> {
             "valueOf" => Err(self.type_error(
                 "Called Temporal.PlainDate.prototype.valueOf, use compare() or equals() instead",
             )),
+            "toZonedDateTime" => {
+                // `date.toZonedDateTime(timeZone | { timeZone, plainTime })` → the
+                // instant of the (date, plainTime|midnight) wall time in the zone.
+                let item = arg(0);
+                let tz = self.temporal_tz_arg(item)?;
+                let mut time = crate::temporal_iso::IsoTime::default();
+                if self.is_object_value(item)
+                    && let Some(h) = item.as_handle().map(Handle::from_raw)
+                {
+                    let ptv = self
+                        .realm
+                        .get_property(h, "plainTime")
+                        .unwrap_or(NanBox::undefined());
+                    if let Some(pt) = ptv
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|hh| self.realm.temporal_at(hh))
+                        && pt.kind == crate::temporal_iso::TemporalKind::PlainTime
+                    {
+                        time = pt.time;
+                    }
+                }
+                let local_ns = crate::temporal_iso::iso_to_epoch_days(data.date) as i128
+                    * crate::temporal_iso::NS_PER_DAY
+                    + crate::temporal_iso::time_to_nanos(time);
+                let offset = self.temporal_tz_offset_ns(&tz, local_ns).unwrap_or(0);
+                Ok(self.build_temporal(crate::temporal_iso::TemporalData {
+                    kind: crate::temporal_iso::TemporalKind::ZonedDateTime,
+                    epoch_ns: local_ns - offset,
+                    tz: Some(tz),
+                    ..Default::default()
+                }))
+            }
             _ => Err(self.temporal_todo(&alloc::format!("PlainDate.prototype.{method}"))),
         }
     }
