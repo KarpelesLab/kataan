@@ -450,6 +450,11 @@ impl<'a> Interp<'a> {
                 }
                 return Err(self.type_error(&alloc::format!("Temporal.{name} is not applicable")));
             }
+            // A `Temporal.Now.<method>` clock call.
+            if id == crate::nbexec::temporal::N_TEMPORAL_NOW_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                return self.now_method(&name, args);
+            }
             // A first-class `Iterator.prototype.<helper>` (map/filter/take/…) run
             // on the call's `this` iterator.
             if id == N_ITERATOR_PROTO_FN {

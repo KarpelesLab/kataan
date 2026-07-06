@@ -32,6 +32,18 @@ pub(crate) const N_TEMPORAL_GETTER: u16 = 1211;
 /// A bound Temporal *static* method installed as an own property of a constructor
 /// (name carried on the cell; the kind comes from the `this` constructor).
 pub(crate) const N_TEMPORAL_STATIC_FN: u16 = 1212;
+/// A bound method of the `Temporal.Now` namespace (name carried on the cell).
+pub(crate) const N_TEMPORAL_NOW_FN: u16 = 1213;
+
+/// `Temporal.Now.<method>` names + `.length`.
+const NOW_METHODS: [(&str, u32); 6] = [
+    ("timeZoneId", 0),
+    ("instant", 0),
+    ("plainDateTimeISO", 0),
+    ("zonedDateTimeISO", 0),
+    ("plainDateISO", 0),
+    ("plainTimeISO", 0),
+];
 
 /// The static method names + `.length` for a kind (installed as own ctor props).
 fn statics_for(kind: TemporalKind) -> &'static [(&'static str, u32)] {
@@ -194,6 +206,23 @@ impl<'a> Interp<'a> {
             self.set_temporal_proto(kind, proto);
         }
         // `Temporal[Symbol.toStringTag] = "Temporal"`.
+        // `Temporal.Now` — a namespace object of clock methods.
+        let now_ns = self.realm.new_object();
+        if let Some(op) = self.object_prototype() {
+            self.realm.set_object_proto(now_ns, Some(op));
+        }
+        for (nm, len) in NOW_METHODS {
+            let name_h = self.realm.new_string(nm);
+            let f = self.realm.new_bound_native(N_TEMPORAL_NOW_FN, name_h);
+            self.install_fn_name_length(f, nm, len);
+            self.realm
+                .set_property(now_ns, nm, NanBox::handle(f.to_raw()));
+            self.realm.mark_hidden(now_ns, nm);
+        }
+        self.install_to_string_tag(now_ns, "Temporal.Now");
+        self.realm
+            .set_property(temporal_ns, "Now", NanBox::handle(now_ns.to_raw()));
+        self.realm.mark_hidden(temporal_ns, "Now");
         self.install_to_string_tag(temporal_ns, "Temporal");
         self.current
             .declare("Temporal", NanBox::handle(temporal_ns.to_raw()));
@@ -318,5 +347,131 @@ impl<'a> Interp<'a> {
     /// or brand-mismatched Temporal operation.
     pub(crate) fn temporal_todo(&mut self, what: &str) -> ExecError {
         self.type_error(&alloc::format!("Temporal: {what} is not yet implemented"))
+    }
+
+    /// Builds a Temporal instance linked to its kind's intrinsic prototype (no
+    /// subclass), for engine-produced values (e.g. `Temporal.Now.*`).
+    fn build_temporal(&mut self, data: crate::temporal_iso::TemporalData) -> NanBox {
+        let kind = data.kind;
+        let h = self.realm.new_temporal(data);
+        if let Some(p) = self.temporal_proto(kind) {
+            self.realm.set_native_proto(h, p);
+        }
+        NanBox::handle(h.to_raw())
+    }
+
+    /// Resolves a `Temporal.Now` time-zone argument to an IANA/offset id string
+    /// (undefined → the system default, taken here as `"UTC"`); validates it.
+    fn now_tz_arg(&mut self, arg: NanBox) -> Result<alloc::string::String, ExecError> {
+        if matches!(arg.unpack(), Unpacked::Undefined) {
+            return Ok(alloc::string::String::from("UTC"));
+        }
+        // A string time-zone id, or an object with a `timeZone`/`id`.
+        let s = if self.is_object_value(arg) {
+            let h = arg.as_handle().map(Handle::from_raw).unwrap();
+            let tzv = self
+                .realm
+                .get_property(h, "timeZone")
+                .unwrap_or(NanBox::undefined());
+            self.coerce_to_string(if matches!(tzv.unpack(), Unpacked::Undefined) {
+                arg
+            } else {
+                tzv
+            })?
+        } else {
+            self.coerce_to_string(arg)?
+        };
+        // Accept UTC, a fixed offset, or a known IANA name.
+        if self.now_tz_offset_ns(&s, 0).is_some() {
+            Ok(s)
+        } else {
+            let m = self.new_str(&alloc::format!("invalid time zone: {s}"));
+            Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))))
+        }
+    }
+
+    /// The offset (in nanoseconds east of UTC) for time-zone id `tz` at
+    /// `epoch_ns`, or `None` if `tz` is not a recognised zone.
+    fn now_tz_offset_ns(&self, tz: &str, epoch_ns: i128) -> Option<i128> {
+        if tz == "UTC" || tz == "Etc/UTC" || tz == "Etc/GMT" {
+            return Some(0);
+        }
+        // Fixed offset `±HH[:MM[:SS]]`.
+        let b = tz.as_bytes();
+        if matches!(b.first(), Some(b'+' | b'-')) {
+            let neg = b[0] == b'-';
+            let digits: alloc::vec::Vec<u8> = tz[1..].bytes().filter(u8::is_ascii_digit).collect();
+            if digits.len() >= 2 {
+                let h: i128 = (digits[0] - b'0') as i128 * 10 + (digits[1] - b'0') as i128;
+                let m: i128 = if digits.len() >= 4 {
+                    (digits[2] - b'0') as i128 * 10 + (digits[3] - b'0') as i128
+                } else {
+                    0
+                };
+                let ns = (h * 3600 + m * 60) * crate::temporal_iso::NS_PER_SEC;
+                return Some(if neg { -ns } else { ns });
+            }
+            return None;
+        }
+        // Named IANA zone via the timezone-data crate.
+        let unix = (epoch_ns / crate::temporal_iso::NS_PER_SEC) as i64;
+        timezone_data::load_insensitive(tz)
+            .ok()
+            .map(|z| i128::from(z.lookup(unix).offset) * crate::temporal_iso::NS_PER_SEC)
+    }
+
+    /// `Temporal.Now.<method>()` dispatch.
+    pub(crate) fn now_method(&mut self, name: &str, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        use crate::temporal_iso::{
+            TemporalData, TemporalKind, balance_time_from_nanos, epoch_days_to_iso,
+        };
+        let ms = now_ms();
+        let epoch_ns = (ms as i128) * 1_000_000;
+        match name {
+            "timeZoneId" => {
+                let h = self.realm.new_string("UTC");
+                Ok(NanBox::handle(h.to_raw()))
+            }
+            "instant" => Ok(self.build_temporal(TemporalData {
+                kind: TemporalKind::Instant,
+                epoch_ns,
+                ..Default::default()
+            })),
+            "zonedDateTimeISO" => {
+                let tz = self.now_tz_arg(args.first().copied().unwrap_or(NanBox::undefined()))?;
+                Ok(self.build_temporal(TemporalData {
+                    kind: TemporalKind::ZonedDateTime,
+                    epoch_ns,
+                    tz: Some(tz),
+                    ..Default::default()
+                }))
+            }
+            "plainDateTimeISO" | "plainDateISO" | "plainTimeISO" => {
+                let tz = self.now_tz_arg(args.first().copied().unwrap_or(NanBox::undefined()))?;
+                let offset = self.now_tz_offset_ns(&tz, epoch_ns).unwrap_or(0);
+                let (day, time) = balance_time_from_nanos(epoch_ns + offset);
+                let date = epoch_days_to_iso(day);
+                let data = match name {
+                    "plainDateISO" => TemporalData {
+                        kind: TemporalKind::PlainDate,
+                        date,
+                        ..Default::default()
+                    },
+                    "plainTimeISO" => TemporalData {
+                        kind: TemporalKind::PlainTime,
+                        time,
+                        ..Default::default()
+                    },
+                    _ => TemporalData {
+                        kind: TemporalKind::PlainDateTime,
+                        date,
+                        time,
+                        ..Default::default()
+                    },
+                };
+                Ok(self.build_temporal(data))
+            }
+            _ => Err(self.temporal_todo(&alloc::format!("Now.{name}"))),
+        }
     }
 }

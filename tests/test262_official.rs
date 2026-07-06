@@ -249,9 +249,7 @@ fn skip_reason(rel: &str, meta: &Meta) -> Option<&'static str> {
     // Temporal is implemented for the plain/instant/duration types; ZonedDateTime
     // (time-zone database) and Now (system clock) are not yet, so skip those two
     // subtrees rather than ledger their whole surface as failing.
-    if rel.starts_with("built-ins/Temporal/Now/") {
-        return Some("Temporal Now not yet implemented");
-    }
+
     if rel.starts_with("intl402/") && !cfg!(feature = "intl") {
         return Some("intl402 (build without the intl feature)");
     }
