@@ -552,7 +552,14 @@ impl<'a> Interp<'a> {
         // SpeciesConstructor(O, %ArrayBuffer%): `Get(O, "constructor")`, then
         // `C[@@species]` (undefined/null → the default constructor).
         let mut c = self.read_member(original, "constructor")?;
-        if let Some(ch) = c.as_handle().map(Handle::from_raw) {
+        // C must be an *Object* — a heap-backed primitive (string/symbol/bigint)
+        // has a handle but is not an object, so filter on `is_object_value` (else
+        // a String `constructor` would be treated as an object below).
+        if let Some(ch) = c
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|_| self.is_object_value(c))
+        {
             let sym = self.well_known_symbol("species");
             let key = self.member_key(sym);
             let s = self.read_member(ch, &key)?;
