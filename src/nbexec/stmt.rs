@@ -1205,6 +1205,17 @@ impl<'a> Interp<'a> {
             self.assign_member_value(h, key, value)?;
             return Ok(());
         }
+        // Assigning to a lexical binding still in its temporal dead zone (a
+        // destructuring-assignment target `({ x } = …)` / `[x] = …` naming a
+        // `let`/`const` before its declaration executes) is a ReferenceError.
+        if self.current.get(name).is_some_and(|v| v.is_tdz()) {
+            let msg = self.new_str(&alloc::format!(
+                "Cannot access '{name}' before initialization"
+            ));
+            return Err(ExecError::Throw(
+                self.make_error(N_REFERENCE_ERROR, Some(msg)),
+            ));
+        }
         // Reassigning a `const` binding is a TypeError.
         if self.current.is_const(name) {
             let m = self.new_str("Assignment to constant variable.");

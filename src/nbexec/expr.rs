@@ -3021,6 +3021,21 @@ impl<'a> Interp<'a> {
                     self.assign_member_value(h, key, new)?;
                     return Ok(new);
                 }
+                // Assigning to a lexical binding still in its temporal dead zone
+                // (a `let`/`const`/`class` referenced by a bare `x = v` before its
+                // declaration executes) is a ReferenceError — PutValue on an
+                // uninitialized binding throws, exactly as reading it does. The
+                // compound path additionally reads first (read_ident_ref, which
+                // also throws TDZ); this guards the plain `=` case where no read
+                // occurs before the write.
+                if self.current.get(name).is_some_and(|v| v.is_tdz()) {
+                    let msg = self.new_str(&alloc::format!(
+                        "Cannot access '{name}' before initialization"
+                    ));
+                    return Err(ExecError::Throw(
+                        self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                    ));
+                }
                 // Reassigning a `const` binding is a TypeError.
                 if self.current.is_const(name) {
                     let m = self.new_str("Assignment to constant variable.");

@@ -5316,6 +5316,24 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // Lexical declaration instantiation (script / function body / eval /
+        // module / block scope): `let`/`const`/`class` names bound directly in
+        // this statement list (not in a nested block — those instantiate at their
+        // own scope entry) are pre-declared in their Temporal Dead Zone at scope
+        // entry, before any statement runs. A reference before the declaration's
+        // initializer executes then throws a ReferenceError — a read via
+        // `read_ident_ref` (which checks `is_tdz`) and a write via the assign path
+        // (which checks it too). The initializer later clears the sentinel with
+        // `declare`/`declare_const`. `has_local` guards against re-declaring a
+        // name already bound here (e.g. a top-level function declaration; a true
+        // let/const-vs-function collision is an early SyntaxError caught earlier).
+        let mut lex_names: Vec<&str> = Vec::new();
+        collect_lexical_names(stmts, &mut lex_names);
+        for name in lex_names {
+            if !self.current.has_local(name) {
+                self.current.declare(name, NanBox::tdz());
+            }
+        }
         Ok(())
     }
 
