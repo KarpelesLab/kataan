@@ -8,7 +8,11 @@
 //! nanosecond precision; epoch instants use `i128` nanoseconds.
 #![allow(clippy::many_single_char_names)]
 #![allow(missing_docs)] // data-heavy pure-logic module; fields are self-describing
-#![allow(clippy::manual_range_contains, clippy::manual_clamp, clippy::while_let_loop)]
+#![allow(
+    clippy::manual_range_contains,
+    clippy::manual_clamp,
+    clippy::while_let_loop
+)]
 
 use alloc::string::String;
 

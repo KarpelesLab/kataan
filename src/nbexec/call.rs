@@ -423,6 +423,22 @@ impl<'a> Interp<'a> {
                 };
                 return self.temporal_getter(this_val, &data, &name);
             }
+            // A Temporal static (`Temporal.<Type>.from`/`.compare`/…): the `this`
+            // is the constructor, whose native id gives the kind.
+            if id == crate::nbexec::temporal::N_TEMPORAL_STATIC_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let kind = this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.native_at(h))
+                    .and_then(crate::nbexec::temporal::kind_for_ctor_id);
+                if let Some(k) = kind
+                    && let Some(v) = self.temporal_static(k, this_val, &name, args)?
+                {
+                    return Ok(v);
+                }
+                return Err(self.type_error(&alloc::format!("Temporal.{name} is not applicable")));
+            }
             // A first-class `Iterator.prototype.<helper>` (map/filter/take/…) run
             // on the call's `this` iterator.
             if id == N_ITERATOR_PROTO_FN {

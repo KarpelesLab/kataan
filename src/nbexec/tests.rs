@@ -2894,10 +2894,13 @@ fn coercion_string_number_join_freeze_tofixed() {
         run("[{toString(){return 'a';}},{toString(){return 'b';}}].join(',')"),
         "a,b"
     );
-    // Frozen array rejects push.
+    // Frozen array rejects push: `Array.prototype.push` does `Set(…, Throw=true)`,
+    // so it throws a TypeError (even in sloppy mode) and leaves the array unchanged.
     assert_eq!(
-        run("let a=[1,2,3]; Object.freeze(a); a.push(4); a.length + ':' + Object.isFrozen(a)"),
-        "3:true"
+        run(
+            "let a=[1,2,3]; let e=''; try{a=Object.freeze(a); a.push(4)}catch(x){e=x.name}; a.length + ':' + Object.isFrozen(a) + ':' + e"
+        ),
+        "3:true:TypeError"
     );
     // toFixed rounds half away from zero.
     assert_eq!(run("(0.5).toFixed(0)"), "1");
@@ -8124,8 +8127,8 @@ fn atomics_single_agent_integer_ops() {
     );
     assert_eq!(
         run("var a=new Uint8Array(1);Atomics.store(a,0,256)+','+a[0]"),
-        "0,0"
-    ); // wraps
+        "256,0"
+    ); // Atomics.store returns the integer value; the element wraps to 0
     assert_eq!(
         run("var a=new Uint8Array(1);a[0]=42;Atomics.load(a,0)"),
         "42"

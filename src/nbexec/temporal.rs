@@ -29,6 +29,44 @@ pub(crate) const N_TEMPORAL_ZONEDDATETIME: u16 = 1207;
 pub(crate) const N_TEMPORAL_PROTO_FN: u16 = 1210;
 /// A bound Temporal prototype *getter* accessor (name carried on the cell).
 pub(crate) const N_TEMPORAL_GETTER: u16 = 1211;
+/// A bound Temporal *static* method installed as an own property of a constructor
+/// (name carried on the cell; the kind comes from the `this` constructor).
+pub(crate) const N_TEMPORAL_STATIC_FN: u16 = 1212;
+
+/// The static method names + `.length` for a kind (installed as own ctor props).
+fn statics_for(kind: TemporalKind) -> &'static [(&'static str, u32)] {
+    match kind {
+        TemporalKind::Instant => &[
+            ("from", 1),
+            ("fromEpochMilliseconds", 1),
+            ("fromEpochNanoseconds", 1),
+            ("compare", 2),
+        ],
+        TemporalKind::PlainMonthDay => &[("from", 1)],
+        _ => &[("from", 1), ("compare", 2)],
+    }
+}
+
+/// The constructor `.length` (count of required leading parameters) per kind.
+fn ctor_len(kind: TemporalKind) -> u32 {
+    match kind {
+        TemporalKind::PlainDate | TemporalKind::PlainDateTime => 3,
+        TemporalKind::PlainTime | TemporalKind::Duration => 0,
+        TemporalKind::Instant => 1,
+        TemporalKind::PlainYearMonth
+        | TemporalKind::PlainMonthDay
+        | TemporalKind::ZonedDateTime => 2,
+    }
+}
+
+/// The `.length` of a prototype method by name (spec required-arg count; default 0).
+fn method_len(name: &str) -> u32 {
+    match name {
+        "with" | "add" | "subtract" | "until" | "since" | "round" | "total" | "equals"
+        | "toZonedDateTime" | "withPlainTime" | "withCalendar" | "toPlainDate" => 1,
+        _ => 0,
+    }
+}
 
 /// The eight constructor ids, aligned with [`TemporalKind`].
 pub(crate) const TEMPORAL_CTOR_IDS: [(TemporalKind, u16); 8] = [
@@ -89,14 +127,25 @@ impl<'a> Interp<'a> {
         for (kind, ctor_id) in TEMPORAL_CTOR_IDS {
             let name = kind.type_name();
             let ctor = self.new_named_native(name, ctor_id);
+            self.install_fn_name_length(ctor, name, ctor_len(kind));
             let (methods, getters) = tables_for(kind);
             let op = self.object_prototype();
             let proto = self.realm.new_object_with_proto(op);
+            // Static methods (`from`/`compare`/…): own non-enumerable function
+            // properties of the constructor.
+            for &(sname, slen) in statics_for(kind) {
+                let name_h = self.realm.new_string(sname);
+                let f = self.realm.new_bound_native(N_TEMPORAL_STATIC_FN, name_h);
+                self.install_fn_name_length(f, sname, slen);
+                self.realm
+                    .set_property(ctor, sname, NanBox::handle(f.to_raw()));
+                self.realm.mark_hidden(ctor, sname);
+            }
             // Prototype methods: each a BoundNative{proto_fn, name}.
             for &m in methods {
                 let name_h = self.realm.new_string(m);
                 let f = self.realm.new_bound_native(N_TEMPORAL_PROTO_FN, name_h);
-                self.install_fn_name_length(f, m, 0);
+                self.install_fn_name_length(f, m, method_len(m));
                 self.realm
                     .set_property(proto, m, NanBox::handle(f.to_raw()));
                 self.realm.mark_hidden(proto, m);

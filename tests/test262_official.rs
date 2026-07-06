@@ -71,7 +71,7 @@ var $262 = {
 /// `features:` tags whose tests we skip until the corresponding engine support
 /// lands. (intl402 is gated separately on the build feature.)
 const SKIP_FEATURES: &[&str] = &[
-    "Temporal",
+    // "Temporal", // implemented (ZonedDateTime/Now skipped via path-check above)
     "decorators",
     "tail-call-optimization",
     "import-assertions",
@@ -245,6 +245,15 @@ fn assemble(
 fn skip_reason(rel: &str, meta: &Meta) -> Option<&'static str> {
     if rel.starts_with("staging/") {
         return Some("staging");
+    }
+    // Temporal is implemented for the plain/instant/duration types; ZonedDateTime
+    // (time-zone database) and Now (system clock) are not yet, so skip those two
+    // subtrees rather than ledger their whole surface as failing.
+    if rel.starts_with("built-ins/Temporal/ZonedDateTime/")
+        || rel.starts_with("built-ins/Temporal/Now/")
+        || rel.contains("/ZonedDateTime/")
+    {
+        return Some("Temporal ZonedDateTime/Now not yet implemented");
     }
     if rel.starts_with("intl402/") && !cfg!(feature = "intl") {
         return Some("intl402 (build without the intl feature)");
