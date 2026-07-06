@@ -226,6 +226,20 @@ impl<'a> Interp<'a> {
                 if self.typed_array_detached(ta) {
                     return Err(self.type_error("Atomics called on a detached ArrayBuffer"));
                 }
+                // `wait` requires a *shared* buffer; a non-shared buffer is a
+                // TypeError raised BEFORE the index/value/timeout coercions (their
+                // `valueOf` must not run — the poisoned-args tests). `notify`
+                // allows a non-shared buffer (it returns 0).
+                if id == N_ATOMICS_WAIT {
+                    let shared = self.realm.typed_array_object(ta).is_some_and(|buf| {
+                        self.realm
+                            .get_property(buf, SHARED_ARRAY_BUFFER_BRAND)
+                            .is_some()
+                    });
+                    if !shared {
+                        return Err(self.type_error("Atomics.wait requires a SharedArrayBuffer"));
+                    }
+                }
                 // ValidateAtomicAccess: the length is read *before* the index's
                 // `valueOf` runs, and an out-of-range index is a RangeError.
                 let len = self.realm.array_length(ta).unwrap_or(0);
