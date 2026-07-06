@@ -316,6 +316,27 @@ impl<'a> Interp<'a> {
     /// view operation, *before* argument coercion, so a poisoned `valueOf` is not
     /// observed when the write is forbidden. A non-view, or a view over a mutable
     /// buffer, passes.
+    pub(crate) fn coerce_typed_elements(
+        &mut self,
+        view: Handle,
+        items: &[NanBox],
+    ) -> Result<Vec<NanBox>, ExecError> {
+        let is_bigint = self
+            .realm
+            .typed_kind(view)
+            .is_some_and(crate::nbexec::is_bigint_kind);
+        let mut out = Vec::with_capacity(items.len());
+        for e in items {
+            out.push(if is_bigint {
+                let b = self.coerce_to_bigint(*e)?;
+                NanBox::handle(self.realm.new_bigint(b).to_raw())
+            } else {
+                self.coerce_to_number(*e)?
+            });
+        }
+        Ok(out)
+    }
+
     pub(crate) fn guard_view_immutable(&mut self, handle: Handle) -> Result<(), ExecError> {
         // A typed array exposes its buffer via `typed_array_object`; a `DataView`
         // stores it under `DATA_VIEW_BUF`.

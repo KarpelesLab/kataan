@@ -614,7 +614,11 @@ impl<'a> Interp<'a> {
             let view = self
                 .realm
                 .new_typed_array(bytes_h, buf, 0, items.len(), kind);
-            // Bulk write-through: one buffer borrow, no per-element heap lookup.
+            // Each element is ToNumber'd (or ToBigInt'd) per [[Set]] before the
+            // bulk write — a Symbol / uncoercible value is a TypeError (a poisoned
+            // `valueOf` propagates), not the silent NaN `typed_set_from_numbers`
+            // would store.
+            let items = self.coerce_typed_elements(view, &items)?;
             self.realm.typed_set_from_numbers(view, 0, &items);
             // Link the result's `[[Prototype]]` to the constructor's `.prototype`
             // (`Int8Array.of(...)`'s result is an `Int8Array` instance), so
