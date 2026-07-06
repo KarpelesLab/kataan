@@ -399,7 +399,10 @@ impl<'a> Interp<'a> {
                 let desc = if matches!(arg(0).unpack(), Unpacked::Undefined) {
                     String::from(SYMBOL_NO_DESC)
                 } else {
-                    self.realm.to_display_string(arg(0))
+                    // `Symbol(description)` does `ToString(description)` — a user
+                    // `toString` runs (propagating) and a Symbol argument is a
+                    // TypeError, unlike the raw `to_display_string`.
+                    self.coerce_to_string(arg(0))?
                 };
                 NanBox::handle(self.realm.new_symbol(&desc).to_raw())
             }
