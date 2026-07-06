@@ -2638,9 +2638,12 @@ impl<'a> Interp<'a> {
                         len
                     }
                     None => {
-                        // No explicit length: the view spans the rest of the buffer,
-                        // which must divide evenly into elements.
-                        if !avail.is_multiple_of(elem_size) {
+                        // No explicit length: the view spans the rest of the buffer.
+                        // A FIXED-LENGTH buffer must divide evenly into elements; a
+                        // RESIZABLE buffer instead length-tracks — floor to the
+                        // largest fitting element count (no "exact multiple" check).
+                        let resizable = self.realm.get_property(bh, ARRAY_BUFFER_MAXLEN).is_some();
+                        if !resizable && !avail.is_multiple_of(elem_size) {
                             let m = self.new_str(
                                 "buffer length minus the byteOffset is not a multiple of the element size",
                             );
