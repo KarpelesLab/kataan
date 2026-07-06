@@ -1300,6 +1300,24 @@ impl<'a> Interp<'a> {
                 return Ok(f);
             }
         }
+        // Fallback: resolve the method off the real prototype chain of the
+        // HomeObject (the defining class's `.prototype`). Catches a method added
+        // dynamically to a superclass prototype AND a native superclass's method
+        // (`class MyMap extends Map { … super.set() }` → `Map.prototype.set`),
+        // neither of which is a declared class-body method.
+        if !self.current_home_static {
+            let home_proto = self.class_prototype_by_id(home);
+            if let Some(super_base) = self.realm.object_proto(home_proto)
+                && self.has_property(super_base, name)
+            {
+                let f = self.read_member(super_base, name)?;
+                if f.as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Ok(f);
+                }
+            }
+        }
         Err(ExecError::Throw(
             self.new_str(&alloc::format!("super method {name} not found")),
         ))
@@ -1445,6 +1463,25 @@ impl<'a> Interp<'a> {
             }
         } else if let Some(v) = self.fn_super_member(home, name)? {
             return Ok(v);
+        }
+        // Fallback for a non-static member: the class-body walk above only matches
+        // *declared* methods/getters, so a property added dynamically to a
+        // superclass prototype (`A.prototype.p = …`) is missed. Resolve it the
+        // spec way — GetPrototypeOf(HomeObject).[[Get]](name, this) — over the real
+        // prototype chain (HomeObject = the defining class's `.prototype`).
+        if !self.current_home_static {
+            let home_proto = self.class_prototype_by_id(home);
+            if let Some(super_base) = self.realm.object_proto(home_proto)
+                && self.has_property(super_base, name)
+            {
+                if let Some((getter, _)) = self.realm.accessor(super_base, name) {
+                    if matches!(getter.unpack(), Unpacked::Undefined) {
+                        return Ok(NanBox::undefined());
+                    }
+                    return self.call_with_this(getter, self.this_val, &[]);
+                }
+                return self.read_member(super_base, name);
+            }
         }
         Ok(NanBox::undefined())
     }
