@@ -112,16 +112,19 @@ impl<'a> Interp<'a> {
         if let Some(rh) = replacer.as_handle().map(Handle::from_raw) {
             if self.is_callable(rh) {
                 replacer_fn = replacer;
-            } else if self.realm.is_array(rh) {
-                // Build the PropertyList: ToString each element that is a String, a
-                // Number, or a String/Number wrapper object; dedupe, preserve order.
-                let elems = self
-                    .realm
-                    .array_elements(rh)
-                    .map(<[_]>::to_vec)
-                    .unwrap_or_default();
+            } else if self.realm.is_array(self.proxy_key_target(rh)) {
+                // Build the PropertyList via `[[Get]]` (length + each index) so a
+                // Proxy replacer drives its traps and an element getter's abrupt
+                // completion propagates. ToString each element that is a String, a
+                // Number, or a String/Number wrapper; dedupe, preserve order.
+                let len_v = self.read_member(rh, "length")?;
+                let len = self
+                    .coerce_to_integer_or_infinity(len_v)?
+                    .max(0.0)
+                    .min(9_007_199_254_740_991.0) as usize;
                 let mut list: Vec<String> = Vec::new();
-                for e in elems {
+                for i in 0..len {
+                    let e = self.read_member(rh, &alloc::format!("{i}"))?;
                     let item = match e.unpack() {
                         Unpacked::Number(_) => Some(self.realm.to_display_string(e)),
                         Unpacked::Handle(raw) => {
