@@ -1084,9 +1084,12 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             };
             let cur = self.realm.bytes_len(bh).unwrap_or(0);
+            // `newLength` is ToIndex'd: a Symbol / non-coercible is a TypeError, an
+            // object's `valueOf` runs, a non-integer / negative is a RangeError.
+            let new_f = self.coerce_to_integer_or_infinity(arg(0))?;
+            let new_len = self.validate_alloc_len(new_f, "SharedArrayBuffer.prototype.grow")?;
             // `grow` only ever increases the length (a shrink is a RangeError), up to
             // maxByteLength.
-            let new_len = self.realm.to_number(arg(0)).max(0.0) as usize;
             if new_len < cur || new_len > max {
                 let m = self.new_str("SharedArrayBuffer.prototype.grow: invalid new length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
