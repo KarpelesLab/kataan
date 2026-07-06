@@ -17,7 +17,10 @@ nested.inner.x = 5;
 assert.sameValue(nested.inner.x, 5, "freeze is shallow");
 var arr = [1, 2, 3];
 Object.freeze(arr);
-arr.push(4);
-assert.sameValue(arr.length, 3, "cannot push to frozen array") || true;
+// Per spec, push finishes with Set(O,"length",…,Throw=true); a frozen array's
+// length is non-writable, so the push throws a TypeError (it does not silently
+// no-op).
+assert.throws(TypeError, function () { arr.push(4); }, "push to frozen array throws");
+assert.sameValue(arr.length, 3, "frozen array length unchanged");
 var notFrozen = { a: 1 };
 assert.sameValue(Object.isFrozen(notFrozen), false);

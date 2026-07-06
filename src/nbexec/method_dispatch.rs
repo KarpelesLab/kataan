@@ -2970,28 +2970,47 @@ impl<'a> Interp<'a> {
             ) {
                 self.require_callable(arg(0), &alloc::format!("{method} callback"))?;
             }
-            // NOTE: per spec the length-mutating methods finish with
-            // Set(O, "length", …, Throw=true) and so throw a TypeError on a
-            // non-writable/frozen array's `length`. The curated gate's
-            // `freeze-semantics.js` relies on the (non-conformant) silent no-op,
-            // so we keep the lenient behavior here to preserve the 693/693 gate.
+            // Per spec the length-mutating methods finish with
+            // Set(O, "length", …, Throw=true), which throws a TypeError when the
+            // array's `length` is non-writable (explicitly demoted or frozen). The
+            // throw fires whenever the operation would actually change `length`
+            // (push/unshift with items, pop/shift on a non-empty array); a no-op
+            // form (`push()`, `pop()` on `[]`) sets `length` to its current value
+            // and does not throw.
             match method {
                 "push" => {
+                    if !args.is_empty() && self.realm.array_length_is_readonly(handle) {
+                        let m = self.new_str(
+                            "Cannot assign to read only property 'length' of object '[object Array]'",
+                        );
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
                     let mut len = elems.len();
-                    // A frozen array rejects new elements (non-strict: silent).
-                    if !self.realm.is_frozen(handle) {
-                        for a in args {
-                            len = self.realm.array_push(handle, *a).unwrap_or(len);
-                        }
+                    for a in args {
+                        len = self.realm.array_push(handle, *a).unwrap_or(len);
                     }
                     return Ok(Some(NanBox::number(len as f64)));
                 }
-                "pop" => return Ok(Some(self.realm.array_pop(handle))),
+                "pop" => {
+                    if !elems.is_empty() && self.realm.array_length_is_readonly(handle) {
+                        let m = self.new_str(
+                            "Cannot assign to read only property 'length' of object '[object Array]'",
+                        );
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    return Ok(Some(self.realm.array_pop(handle)));
+                }
                 // `splice(start, deleteCount?, ...items)` — mutate in place,
                 // return the removed elements as a new array.
                 "shift" => {
                     if elems.is_empty() {
                         return Ok(Some(NanBox::undefined()));
+                    }
+                    if self.realm.array_length_is_readonly(handle) {
+                        let m = self.new_str(
+                            "Cannot assign to read only property 'length' of object '[object Array]'",
+                        );
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     }
                     // The removed first element: a hole is read as `undefined`
                     // (the sentinel never escapes). The remaining elements keep
@@ -3006,6 +3025,12 @@ impl<'a> Interp<'a> {
                     return Ok(Some(first));
                 }
                 "unshift" => {
+                    if !args.is_empty() && self.realm.array_length_is_readonly(handle) {
+                        let m = self.new_str(
+                            "Cannot assign to read only property 'length' of object '[object Array]'",
+                        );
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
                     let mut next: Vec<NanBox> = args.to_vec();
                     next.extend_from_slice(&elems);
                     let len = next.len();
