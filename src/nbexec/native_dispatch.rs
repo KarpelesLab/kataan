@@ -608,10 +608,14 @@ impl<'a> Interp<'a> {
                 return self.eval_string(&source, false);
             }
             N_PARSE_INT => {
-                let s = self.realm.to_display_string(arg(0));
+                // `ToString(string)` then `ToInt32(radix)` both run user
+                // `toString`/`valueOf` (whose abrupt completion propagates); the raw
+                // `to_display_string`/`to_number` skip a user coercion for objects.
+                let s = self.coerce_to_string(arg(0))?;
                 let radix = match args.get(1) {
                     Some(r) if !matches!(r.unpack(), Unpacked::Undefined) => {
-                        let n = self.realm.to_number(*r);
+                        let n = self.coerce_to_number(*r)?;
+                        let n = self.realm.to_number(n);
                         // Keep the sign (a `… as u32` cast saturates a negative
                         // radix to 0, which would wrongly default to base 10).
                         if n.is_finite() { n as i64 } else { 0 }
@@ -2548,13 +2552,13 @@ impl<'a> Interp<'a> {
                 })
             }
             N_PARSE_FLOAT => {
-                let s = self.realm.to_display_string(arg(0));
+                let s = self.coerce_to_string(arg(0))?;
                 NanBox::number(parse_float_prefix(s.trim()))
             }
             // URI encoding/decoding. `encodeURI` preserves the URI reserved set
             // on top of the unreserved set that `encodeURIComponent` keeps.
             N_ENCODE_URI_COMPONENT | N_ENCODE_URI => {
-                let s = self.realm.to_display_string(arg(0));
+                let s = self.coerce_to_string(arg(0))?;
                 let extra = if id == N_ENCODE_URI {
                     ";,/?:@&=+$#"
                 } else {
@@ -2565,7 +2569,7 @@ impl<'a> Interp<'a> {
                 NanBox::handle(h.to_raw())
             }
             N_DECODE_URI_COMPONENT | N_DECODE_URI => {
-                let s = self.realm.to_display_string(arg(0));
+                let s = self.coerce_to_string(arg(0))?;
                 match uri_decode(&s) {
                     Some(out) => {
                         let h = self.realm.new_string(&out);
