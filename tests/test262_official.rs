@@ -520,7 +520,12 @@ fn run_worker(spec: &str) {
             continue;
         };
         let meta = parse_meta(&src);
-        if skip_reason(rel, &meta).is_some() {
+        // A test that drives `$262.agent` needs the cooperative agent scheduler
+        // (concurrent Atomics: one agent blocks in `Atomics.wait` until another
+        // `notify`s). That scheduler is not implemented, so skip these regardless
+        // of path — they surface across built-ins/{Atomics,TypedArray,…} via the
+        // `SharedArrayBuffer` feature tag, not just under a single directory.
+        if skip_reason(rel, &meta).is_some() || src.contains("$262.agent") {
             let _ = writeln!(f, "R\t{cur}\t{rel}\tSKIP\t");
             continue;
         }
