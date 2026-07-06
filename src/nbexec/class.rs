@@ -650,6 +650,19 @@ impl<'a> Interp<'a> {
     /// resolves by `ERROR_NAMES`; any other native is found by scanning the global
     /// bindings for the callable whose native id matches.
     pub(crate) fn native_ctor_by_id(&mut self, id: u16) -> Option<Handle> {
+        // Temporal constructors live on the `Temporal` namespace object, not as
+        // global bindings, so `class X extends Temporal.PlainDate {}` resolves the
+        // base through `Temporal[<Type>]`.
+        if let Some(kind) = crate::nbexec::temporal::kind_for_ctor_id(id) {
+            return self
+                .current
+                .get("Temporal")
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|t| self.realm.get_property(t, kind.type_name()))
+                .and_then(|c| c.as_handle())
+                .map(Handle::from_raw);
+        }
         if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) {
             let name = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
             return self

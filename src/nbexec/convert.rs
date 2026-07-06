@@ -264,7 +264,11 @@ impl<'a> Interp<'a> {
                 || self.realm.is_array(h)
                 || (self.realm.object_keys(h).is_none()
                     && self.realm.typed_kind(h).is_none()
-                    && self.realm.date_at(h).is_none()))
+                    && self.realm.date_at(h).is_none()
+                    // A Temporal instance is an ordinary object for ToPrimitive:
+                    // it must run OrdinaryToPrimitive so its `valueOf` (which
+                    // always throws a TypeError) fires under `<`/`+`/etc.
+                    && self.realm.temporal_at(h).is_none()))
         {
             return Ok(v);
         }
