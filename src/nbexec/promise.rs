@@ -995,23 +995,38 @@ impl<'a> Interp<'a> {
         settled: bool,
     ) -> Result<NanBox, ExecError> {
         let promise_resolve = self.combinator_resolve_fn(c)?;
-        let items = self.iterate_values(iterable)?;
-        let values = self
-            .realm
-            .new_array(alloc::vec![NanBox::undefined(); items.len()]);
-        let remaining = self.count_cell((items.len() + 1) as f64);
+        // Iterate LAZILY (spec PerformPromiseAll): the per-element `promiseResolve`
+        // call and `then` invocation are interleaved with `IteratorStep`, so an
+        // abrupt completion there must `IteratorClose` the still-open iterator.
+        let values = self.realm.new_array(alloc::vec![]);
         let values_box = NanBox::handle(values.to_raw());
-        for (i, item) in items.into_iter().enumerate() {
-            let next = self.call_with_this(promise_resolve, c, &[item])?;
-            let state = self.combinator_state(remaining, values_box, cap, NanBox::number(i as f64));
-            if settled {
-                let on_f = self.make_element_fn(N_PROMISE_ALLSETTLED_FULFILL, state);
-                let on_r = self.make_element_fn(N_PROMISE_ALLSETTLED_REJECT, state);
-                self.invoke_then(next, on_f, on_r)?;
-            } else {
-                let on_f = self.make_element_fn(N_PROMISE_ALL_ELEMENT, state);
-                self.invoke_then(next, on_f, cap.reject)?;
+        let remaining = self.count_cell(1.0);
+        let it = self.get_iter_object(iterable)?;
+        let next_m = self.read_member(it, "next")?;
+        let mut i = 0usize;
+        loop {
+            let item = match self.iter_step(it, next_m)? {
+                Some(v) => v,
+                None => break,
+            };
+            self.realm.set_element(values, i, NanBox::undefined());
+            let cur = self.cell_get(remaining);
+            self.cell_set(remaining, cur + 1.0);
+            let step = self.perform_promise_all_element(
+                c,
+                promise_resolve,
+                item,
+                remaining,
+                values_box,
+                cap,
+                i,
+                settled,
+            );
+            if let Err(e) = step {
+                let _ = self.iterator_close(it);
+                return Err(e);
             }
+            i += 1;
         }
         // Decrement the initial +1: if every input already settled synchronously
         // (count back to 0) resolve now.
@@ -1021,6 +1036,34 @@ impl<'a> Interp<'a> {
             self.capability_resolve(cap, values_box)?;
         }
         Ok(cap.promise)
+    }
+
+    /// One element of `all`/`allSettled`: `promiseResolve(item)` then subscribe the
+    /// element resolve/reject functions. Split out so the iterator can be closed on
+    /// an abrupt completion here.
+    #[allow(clippy::too_many_arguments)]
+    fn perform_promise_all_element(
+        &mut self,
+        c: NanBox,
+        promise_resolve: NanBox,
+        item: NanBox,
+        remaining: Handle,
+        values_box: NanBox,
+        cap: &PromiseCapability,
+        i: usize,
+        settled: bool,
+    ) -> Result<(), ExecError> {
+        let next = self.call_with_this(promise_resolve, c, &[item])?;
+        let state = self.combinator_state(remaining, values_box, cap, NanBox::number(i as f64));
+        if settled {
+            let on_f = self.make_element_fn(N_PROMISE_ALLSETTLED_FULFILL, state);
+            let on_r = self.make_element_fn(N_PROMISE_ALLSETTLED_REJECT, state);
+            self.invoke_then(next, on_f, on_r)?;
+        } else {
+            let on_f = self.make_element_fn(N_PROMISE_ALL_ELEMENT, state);
+            self.invoke_then(next, on_f, cap.reject)?;
+        }
+        Ok(())
     }
 
     /// `Promise.race(iterable)` (this = `C`).
@@ -1041,15 +1084,34 @@ impl<'a> Interp<'a> {
         cap: &PromiseCapability,
     ) -> Result<NanBox, ExecError> {
         let promise_resolve = self.combinator_resolve_fn(c)?;
-        let items = self.iterate_values(iterable)?;
-        for item in items {
-            let next = self.call_with_this(promise_resolve, c, &[item])?;
-            // Each input forwards directly to the capability's resolve/reject — the
-            // first to settle wins (later settlements are ignored once the
-            // capability promise is settled).
-            self.invoke_then(next, cap.resolve, cap.reject)?;
+        // Lazy iteration + IteratorClose on an abrupt `promiseResolve`/`then`.
+        let it = self.get_iter_object(iterable)?;
+        let next_m = self.read_member(it, "next")?;
+        loop {
+            let item = match self.iter_step(it, next_m)? {
+                Some(v) => v,
+                None => break,
+            };
+            if let Err(e) = self.perform_promise_race_element(c, promise_resolve, item, cap) {
+                let _ = self.iterator_close(it);
+                return Err(e);
+            }
         }
         Ok(cap.promise)
+    }
+
+    /// One element of `race`: `promiseResolve(item)` then forward directly to the
+    /// capability's resolve/reject (the first to settle wins).
+    fn perform_promise_race_element(
+        &mut self,
+        c: NanBox,
+        promise_resolve: NanBox,
+        item: NanBox,
+        cap: &PromiseCapability,
+    ) -> Result<(), ExecError> {
+        let next = self.call_with_this(promise_resolve, c, &[item])?;
+        self.invoke_then(next, cap.resolve, cap.reject)?;
+        Ok(())
     }
 
     /// `Promise.any(iterable)` (this = `C`).
@@ -1070,18 +1132,35 @@ impl<'a> Interp<'a> {
         cap: &PromiseCapability,
     ) -> Result<NanBox, ExecError> {
         let promise_resolve = self.combinator_resolve_fn(c)?;
-        let items = self.iterate_values(iterable)?;
-        let errors = self
-            .realm
-            .new_array(alloc::vec![NanBox::undefined(); items.len()]);
-        let remaining = self.count_cell((items.len() + 1) as f64);
+        // Lazy iteration + IteratorClose on an abrupt `promiseResolve`/`then`.
+        let errors = self.realm.new_array(alloc::vec![]);
         let errors_box = NanBox::handle(errors.to_raw());
-        for (i, item) in items.into_iter().enumerate() {
-            let next = self.call_with_this(promise_resolve, c, &[item])?;
-            let state = self.combinator_state(remaining, errors_box, cap, NanBox::number(i as f64));
-            let on_r = self.make_element_fn(N_PROMISE_ANY_ELEMENT, state);
-            // Fulfillment forwards directly to the capability resolve (first wins).
-            self.invoke_then(next, cap.resolve, on_r)?;
+        let remaining = self.count_cell(1.0);
+        let it = self.get_iter_object(iterable)?;
+        let next_m = self.read_member(it, "next")?;
+        let mut i = 0usize;
+        loop {
+            let item = match self.iter_step(it, next_m)? {
+                Some(v) => v,
+                None => break,
+            };
+            self.realm.set_element(errors, i, NanBox::undefined());
+            let cur = self.cell_get(remaining);
+            self.cell_set(remaining, cur + 1.0);
+            let step = self.perform_promise_any_element(
+                c,
+                promise_resolve,
+                item,
+                remaining,
+                errors_box,
+                cap,
+                i,
+            );
+            if let Err(e) = step {
+                let _ = self.iterator_close(it);
+                return Err(e);
+            }
+            i += 1;
         }
         let n = self.cell_get(remaining) - 1.0;
         self.cell_set(remaining, n);
@@ -1090,6 +1169,26 @@ impl<'a> Interp<'a> {
             self.capability_reject(cap, agg)?;
         }
         Ok(cap.promise)
+    }
+
+    /// One element of `any`: `promiseResolve(item)` then subscribe fulfillment to
+    /// the capability resolve (first wins) and rejection to the any-element fn.
+    #[allow(clippy::too_many_arguments)]
+    fn perform_promise_any_element(
+        &mut self,
+        c: NanBox,
+        promise_resolve: NanBox,
+        item: NanBox,
+        remaining: Handle,
+        errors_box: NanBox,
+        cap: &PromiseCapability,
+        i: usize,
+    ) -> Result<(), ExecError> {
+        let next = self.call_with_this(promise_resolve, c, &[item])?;
+        let state = self.combinator_state(remaining, errors_box, cap, NanBox::number(i as f64));
+        let on_r = self.make_element_fn(N_PROMISE_ANY_ELEMENT, state);
+        self.invoke_then(next, cap.resolve, on_r)?;
+        Ok(())
     }
 
     /// `Promise.prototype.finally(onFinally)` — species-aware. When `onFinally`
