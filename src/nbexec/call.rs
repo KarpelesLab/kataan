@@ -2234,10 +2234,23 @@ impl<'a> Interp<'a> {
             } else {
                 (args.first().copied(), args.get(1))
             };
-            let err = self.make_error(id, msg_arg);
+            // `message`, if not undefined, is `ToString`'d (running a user
+            // `toString`/`valueOf`, propagating an abrupt one, throwing for a
+            // Symbol) — the raw `to_display_string` `make_error` uses would not.
+            let msg = match msg_arg {
+                Some(m) if !matches!(m.unpack(), Unpacked::Undefined) => {
+                    let s = self.coerce_to_string(m)?;
+                    Some(self.new_str(&s))
+                }
+                _ => None,
+            };
+            let err = self.make_error(id, msg);
             if is_aggregate && let Some(eh) = err.as_handle() {
+                // IterableToList(errors): a non-iterable, an absent/throwing
+                // `@@iterator`, or an abrupt `next` propagates (was swallowed by
+                // `unwrap_or_default`).
                 let errors = args.first().copied().unwrap_or(NanBox::undefined());
-                let list = self.iterate_values(errors).unwrap_or_default();
+                let list = self.iterate_values(errors)?;
                 let arr = self.realm.new_array(list);
                 self.realm.set_property(
                     Handle::from_raw(eh),

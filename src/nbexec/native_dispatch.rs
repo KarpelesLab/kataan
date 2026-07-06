@@ -3418,7 +3418,19 @@ impl<'a> Interp<'a> {
             }
             // `Error(msg)` / `new Error(msg, { cause })` (the ES2022 cause option).
             id if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) => {
-                let err = self.make_error(id, args.first().copied());
+                // `Error(message)`: if message is not undefined it is `ToString`'d
+                // (running a user `toString`/`valueOf`, propagating an abrupt one,
+                // and throwing a TypeError for a Symbol) before it becomes the
+                // non-enumerable `message` property — unlike the raw
+                // `to_display_string` `make_error` falls back to.
+                let msg = match args.first().copied() {
+                    Some(m) if !matches!(m.unpack(), Unpacked::Undefined) => {
+                        let s = self.coerce_to_string(m)?;
+                        Some(self.new_str(&s))
+                    }
+                    _ => None,
+                };
+                let err = self.make_error(id, msg);
                 if let Some(opts) = args
                     .get(1)
                     .and_then(|v| v.as_handle())
