@@ -59,25 +59,34 @@ impl<'a> Interp<'a> {
                 let keys = if let Some(pk) = self.proxy_own_enumerable_keys(vh)? {
                     pk
                 } else {
-                    self.realm.object_keys(vh).unwrap_or_default()
+                    // A proxy with no `ownKeys` trap enumerates its target's own
+                    // enumerable keys (proxy_key_target is identity for a plain
+                    // object).
+                    self.realm
+                        .object_keys(self.proxy_key_target(vh))
+                        .unwrap_or_default()
                 };
                 for k in keys {
                     let nv = self.json_revive(vh, &k, reviver)?;
                     if matches!(nv.unpack(), Unpacked::Undefined) {
-                        // `? val.[[Delete]](P)` — silently fails on a non-configurable
-                        // own property (ordinary [[Delete]] returns false, not abrupt).
-                        self.realm.delete_property(vh, &k);
+                        // `? val.[[Delete]](P)` — proxy-aware; a throwing
+                        // `deleteProperty` trap propagates, a non-abrupt `false`
+                        // (e.g. a non-configurable own property) is ignored.
+                        self.delete_property_of(vh, &k)?;
                     } else {
-                        // `? CreateDataProperty(val, P, newElement)` — a fresh
-                        // `{value, writable, enumerable, configurable: true}` data
-                        // property. It silently fails (returns false) when an existing
-                        // own property is non-configurable, leaving it unchanged.
-                        if self.realm.has_own(vh, &k)
-                            && self.realm.property_is_non_configurable(vh, &k)
-                        {
-                            continue;
-                        }
-                        self.realm.force_set_property(vh, &k, nv);
+                        // `? CreateDataProperty(val, P, newElement)` — proxy-aware
+                        // [[DefineOwnProperty]]: a throwing `defineProperty` trap
+                        // propagates, a non-abrupt failure (a non-configurable own
+                        // property) is ignored (plain CreateDataProperty).
+                        let desc = self.realm.new_object();
+                        self.realm.set_property(desc, "value", nv);
+                        self.realm
+                            .set_property(desc, "writable", NanBox::boolean(true));
+                        self.realm
+                            .set_property(desc, "enumerable", NanBox::boolean(true));
+                        self.realm
+                            .set_property(desc, "configurable", NanBox::boolean(true));
+                        self.apply_descriptor(vh, &k, desc, true)?;
                     }
                 }
             }
