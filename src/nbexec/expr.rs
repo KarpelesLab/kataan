@@ -673,6 +673,19 @@ impl<'a> Interp<'a> {
                     self.assign_member_value(handle, key_box, next)?;
                     return Ok(if *prefix { next } else { old });
                 }
+                // A bare identifier resolving to a `with`-object binding: resolve
+                // the object ONCE, so a read through a self-mutating getter (e.g.
+                // `get x(){ delete this.x; return 2 }`) does not change where the
+                // write lands — GetValue and PutValue share the same reference.
+                if let Expr::Ident(id) = &**argument
+                    && let Some(h) = self.with_binding(&id.name)
+                {
+                    let current = self.read_member(h, &id.name)?;
+                    let (old, next) = self.update_value(*op, current)?;
+                    let key = self.new_str(&id.name);
+                    self.assign_member_value(h, key, next)?;
+                    return Ok(if *prefix { next } else { old });
+                }
                 let current = self.read_target(argument)?;
                 let (old, next) = self.update_value(*op, current)?;
                 self.assign_to(argument, next)?;
