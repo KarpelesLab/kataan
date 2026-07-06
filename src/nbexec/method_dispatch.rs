@@ -1046,7 +1046,14 @@ impl<'a> Interp<'a> {
                 let m = self.new_str("ArrayBuffer.prototype.resize: buffer is not resizable");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             };
-            let new_len = self.realm.to_number(arg(0)).max(0.0) as usize;
+            // newLength is ToIndex'd: a negative / non-integer-out-of-range / huge
+            // value is a RangeError (not silently clamped to 0).
+            let new_f = self.coerce_to_integer_or_infinity(arg(0))?;
+            if !new_f.is_finite() || new_f < 0.0 || new_f >= 9_007_199_254_740_992.0 {
+                let m = self.new_str("ArrayBuffer.prototype.resize: invalid length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            let new_len = new_f as usize;
             if new_len > max {
                 let m = self.new_str("ArrayBuffer.prototype.resize: length exceeds maxByteLength");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
