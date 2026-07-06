@@ -705,7 +705,10 @@ impl<'a> Interp<'a> {
         if self.realm.native_at(handle) == Some(N_SYMBOL) {
             match method {
                 "for" => {
-                    let key = self.realm.to_display_string(arg(0));
+                    // `Symbol.for(key)` does `ToString(key)` — a user `toString`/
+                    // `valueOf` runs (propagating) and a Symbol argument is a
+                    // TypeError, unlike the raw `to_display_string`.
+                    let key = self.coerce_to_string(arg(0))?;
                     if let Some(s) = self.symbol_registry.get(&key) {
                         return Ok(Some(*s));
                     }
