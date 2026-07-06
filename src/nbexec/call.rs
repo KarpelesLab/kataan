@@ -2304,7 +2304,14 @@ impl<'a> Interp<'a> {
         }
         // `new ArrayBuffer(n)` — a zeroed byte store of length `n`.
         if id == N_ARRAY_BUFFER {
-            let raw = args.first().map_or(0.0, |v| self.realm.to_number(*v));
+            // `new ArrayBuffer(length)` does `ToIndex(length)`: ToIntegerOrInfinity
+            // runs a user `valueOf`/`toString` (propagating a poisoned one) and a
+            // Symbol argument is a TypeError — the raw `to_number` skipped that,
+            // giving a spurious RangeError from a NaN.
+            let raw = match args.first() {
+                Some(v) => self.coerce_to_integer_or_infinity(*v)?,
+                None => 0.0,
+            };
             let n = self.validate_alloc_len(raw, "Invalid ArrayBuffer length")?;
             let buf = self.make_array_buffer(n);
             // A subclass (`class S extends ArrayBuffer {}` / `Reflect.construct`)
