@@ -1024,9 +1024,11 @@ impl Parser {
         if self.eat('{') {
             let mut v: u32 = 0;
             let mut any = false;
+            let mut closed = false;
             while let Some(c) = self.peek() {
                 if c == '}' {
                     self.pos += 1;
+                    closed = true;
                     break;
                 }
                 let d = c
@@ -1038,6 +1040,11 @@ impl Parser {
             }
             if !any {
                 return Err(RegexError::new("empty `\\u{}` escape"));
+            }
+            // An unterminated `\u{…` (no closing `}`) is a Syntax Error in unicode
+            // mode, where `\u{…}` is the required code-point-escape form.
+            if !closed && (self.unicode || self.unicode_sets) {
+                return Err(RegexError::new("unterminated `\\u{…}` escape"));
             }
             if v > 0x10_FFFF {
                 return Err(RegexError::new("escape is not a valid code point"));
@@ -1164,7 +1171,30 @@ impl Parser {
                             let val = self.read_legacy_octal(d);
                             self.push_class_member(&mut items, val)?;
                         }
+                        // `\cX` — a control escape inside a class (`X` an ASCII
+                        // letter → U+0001..=U+001A). Under `u`, `\c` not followed by
+                        // a letter is a Syntax Error; without `u` it falls through
+                        // to the identity fallback (Annex B).
+                        'c' if self.peek().is_some_and(|c| c.is_ascii_alphabetic()) => {
+                            let letter = self.bump().unwrap();
+                            self.push_class_member(
+                                &mut items,
+                                (letter.to_ascii_uppercase() as u32 - 'A' as u32) + 1,
+                            )?;
+                        }
+                        'c' if self.unicode => {
+                            return Err(RegexError::new("invalid `\\c` control escape"));
+                        }
+                        // Any other escaped character is a ClassEscape IdentityEscape.
+                        // Under `u` only SyntaxCharacters, `/`, and `-` may be escaped
+                        // this way (an arbitrary `\M` is a Syntax Error); without `u`,
+                        // Annex B allows escaping any source character.
                         other => {
+                            if self.unicode && !is_u_identity_escape(other) && other != '-' {
+                                return Err(RegexError::new(
+                                    "invalid identity escape in unicode mode",
+                                ));
+                            }
                             self.push_class_member(&mut items, escape_char(other) as u32)?;
                         }
                     }
