@@ -2896,25 +2896,53 @@ impl<'a> Interp<'a> {
         if matches!(id, N_WEAKMAP | N_WEAKSET) {
             self.realm.set_collection_weak(handle);
         }
-        // Seed from an iterable: a `Set` from array elements, a `Map` from
-        // `[key, value]` pairs.
-        // Seed from any iterable (array, string, Set, Map, …): a `Set` from each
-        // value, a `Map` from each `[key, value]` pair.
+        // AddEntriesFromIterable: Get the adder (`set` for Map, `add` for Set)
+        // once and require it callable, THEN iterate — calling the (possibly
+        // user-overridden) adder per entry via [[Call]], validating that a Map
+        // entry is an object and reading its `0`/`1` via [[Get]], and closing the
+        // iterator (IteratorClose) on any abrupt completion.
         let first = args.first().copied().unwrap_or(NanBox::undefined());
         if !matches!(first.unpack(), Unpacked::Undefined | Unpacked::Null) {
-            for item in self.iterate_values(first)? {
-                if is_set {
-                    self.guard_weak_key(handle, item)?;
-                    self.realm.collection_set(handle, item, item);
-                } else if let Some(pr) = item
-                    .as_handle()
-                    .and_then(|r| self.realm.array_elements(Handle::from_raw(r)))
-                    .map(<[_]>::to_vec)
-                {
-                    let k = pr.first().copied().unwrap_or(NanBox::undefined());
-                    let v = pr.get(1).copied().unwrap_or(NanBox::undefined());
-                    self.guard_weak_key(handle, k)?;
-                    self.realm.collection_set(handle, k, v);
+            let map_val = NanBox::handle(handle.to_raw());
+            let adder_name = if is_set { "add" } else { "set" };
+            let adder = self.read_member(handle, adder_name)?;
+            if !adder
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                return Err(self.type_error(&alloc::format!(
+                    "{ctor_name}.prototype.{adder_name} is not callable"
+                )));
+            }
+            let it = self.get_iter_object(first)?;
+            let next = self.read_member(it, "next")?;
+            while let Some(entry) = self.iter_step(it, next)? {
+                let call_res = if is_set {
+                    self.call_with_this(adder, map_val, &[entry])
+                } else if !self.is_object_value(entry) {
+                    let _ = self.iterator_close(it);
+                    return Err(self.type_error("Map iterator value is not an entry object"));
+                } else {
+                    let eh = entry.as_handle().map(Handle::from_raw).unwrap();
+                    let k = match self.read_member(eh, "0") {
+                        Ok(k) => k,
+                        Err(e) => {
+                            let _ = self.iterator_close(it);
+                            return Err(e);
+                        }
+                    };
+                    let v = match self.read_member(eh, "1") {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = self.iterator_close(it);
+                            return Err(e);
+                        }
+                    };
+                    self.call_with_this(adder, map_val, &[k, v])
+                };
+                if let Err(e) = call_res {
+                    let _ = self.iterator_close(it);
+                    return Err(e);
                 }
             }
         }
