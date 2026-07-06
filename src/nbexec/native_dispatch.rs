@@ -70,9 +70,10 @@ impl<'a> Interp<'a> {
                 NanBox::undefined()
             }
             N_ATOMICS_IS_LOCK_FREE => {
-                let n = self.realm.to_number(arg(0));
-                // An integer byte width of 1/2/4/8 is lock-free (no `f64::fract` in
-                // the no_std core, so test integrality with an int round-trip).
+                // `size` is ToIntegerOrInfinity'd — an object's `valueOf` runs
+                // (`isLockFree({valueOf:()=>1})` === `isLockFree(1)`).
+                let n = self.coerce_to_integer_or_infinity(arg(0))?;
+                // An integer byte width of 1/2/4/8 is lock-free.
                 let is_int = n.is_finite() && n == (n as i64) as f64;
                 NanBox::boolean(is_int && matches!(n as i64, 1 | 2 | 4 | 8))
             }
