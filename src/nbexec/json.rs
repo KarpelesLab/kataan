@@ -17,10 +17,17 @@ impl<'a> Interp<'a> {
         // `val = ? Get(holder, name)` — through `[[Get]]` (prototype chain + getters).
         let value = self.read_member(holder, key)?;
         if let Some(vh) = value.as_handle().map(Handle::from_raw) {
-            if self.realm.is_array(vh) {
-                // `len = ? LengthOfArrayLike(val)`; recurse each index.
+            // `IsArray(val)` unwraps proxy chains — a Proxy whose target is an array
+            // takes the array branch (its traps then fire on the reads/writes
+            // below). A revoked proxy would already have thrown at the `[[Get]]`
+            // above.
+            if self.realm.is_array(self.proxy_key_target(vh)) {
+                // `len = ? LengthOfArrayLike(val)` = ToLength(? Get(val,"length")):
+                // both the `[[Get]]` (a proxy trap) and the numeric coercion (a
+                // `valueOf`) run user code whose abrupt completion must propagate.
                 let len_v = self.read_member(vh, "length")?;
-                let len = self.realm.to_number(len_v).max(0.0) as usize;
+                let len_f = self.coerce_to_integer_or_infinity(len_v)?;
+                let len = len_f.max(0.0).min(9_007_199_254_740_991.0) as usize;
                 for i in 0..len {
                     let ks = alloc::format!("{i}");
                     let nv = self.json_revive(vh, &ks, reviver)?;
