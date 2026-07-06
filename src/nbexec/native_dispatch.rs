@@ -1713,9 +1713,40 @@ impl<'a> Interp<'a> {
                     }
                     None => false,
                 };
+                let mut mapped_already = false;
                 let raw_items = if is_iterable {
-                    // Drain the iterator; a `next`/getter throw propagates.
-                    self.iterate_values(items_box)?
+                    // Iterate LAZILY, applying mapFn per element interleaved with
+                    // IteratorStep, so an abrupt mapFn completion IteratorCloses the
+                    // still-open iterator (a `next`/getter throw propagates directly).
+                    let it = self.get_iter_object(items_box)?;
+                    let next = self.read_member(it, "next")?;
+                    let mut out = Vec::new();
+                    let mut k = 0usize;
+                    loop {
+                        let val = match self.iter_step(it, next)? {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        let mapped = if has_map {
+                            match self.call_with_this(
+                                map_fn,
+                                this_arg,
+                                &[val, NanBox::number(k as f64)],
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    let _ = self.iterator_close(it);
+                                    return Err(e);
+                                }
+                            }
+                        } else {
+                            val
+                        };
+                        out.push(mapped);
+                        k += 1;
+                    }
+                    mapped_already = has_map;
+                    out
                 } else {
                     // Array-like: ToLength(Get(O, "length")) then Get each index.
                     let mut out = Vec::new();
@@ -1741,7 +1772,7 @@ impl<'a> Interp<'a> {
                     }
                     out
                 };
-                let items = if !has_map {
+                let items = if !has_map || mapped_already {
                     raw_items
                 } else {
                     let mut out = Vec::with_capacity(raw_items.len());
