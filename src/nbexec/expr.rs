@@ -2789,6 +2789,55 @@ impl<'a> Interp<'a> {
             op,
             AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign
         ) {
+            // A computed-member target (non-super): evaluate base + key ONCE,
+            // shared by the read and the write — this both avoids the key
+            // double-eval (`obj[f()] &&= g()` calls `f()` once) and evaluates the
+            // key even on a null base, before that base's GetValue TypeError
+            // (`null[f()] &&= g()` runs `f()` first).
+            if let Expr::Member {
+                object,
+                property: PropertyKey::Computed(key_expr),
+                ..
+            } = target
+                && !matches!(&**object, Expr::Super(_))
+            {
+                let obj = self.eval(object)?;
+                let mut key = self.eval(key_expr)?;
+                let Some(raw) = obj.as_handle() else {
+                    // A null/undefined base is a TypeError (the key was already
+                    // evaluated); a number/boolean primitive reads `undefined` and
+                    // its write is a sloppy no-op.
+                    if matches!(obj.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                        return Err(self.type_error("Cannot read property of null or undefined"));
+                    }
+                    if matches!(op, AssignOp::AndAssign) {
+                        return Ok(NanBox::undefined());
+                    }
+                    return self.eval(value);
+                };
+                let handle = crate::heap::Handle::from_raw(raw);
+                // Coerce an object key to a primitive property key once (its
+                // `toString` runs once, before the RHS), reused for read and write.
+                if key.as_handle().is_some_and(|r| {
+                    let h = crate::heap::Handle::from_raw(r);
+                    self.realm.symbol_at(h).is_none() && self.realm.string_value(h).is_none()
+                }) {
+                    let pk = self.coerce_property_key(key)?;
+                    key = self.new_str(&pk);
+                }
+                let current = self.read_member_value(handle, key)?;
+                let assign = match op {
+                    AssignOp::AndAssign => self.realm.truthy(current),
+                    AssignOp::OrAssign => !self.realm.truthy(current),
+                    _ => matches!(current.unpack(), Unpacked::Undefined | Unpacked::Null),
+                };
+                if !assign {
+                    return Ok(current);
+                }
+                let rhs = self.eval(value)?;
+                self.assign_member_value(handle, key, rhs)?;
+                return Ok(rhs);
+            }
             let current = self.read_target(target)?;
             let assign = match op {
                 AssignOp::AndAssign => self.realm.truthy(current),
