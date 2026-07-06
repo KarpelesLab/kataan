@@ -147,6 +147,66 @@ impl<'a> Interp<'a> {
                     NanBox::number(old)
                 }
             }
+            N_ATOMICS_NOTIFY | N_ATOMICS_WAIT => {
+                // `notify`/`wait` operate only on a *waitable* integer TypedArray —
+                // `Int32Array` (kind 5) or `BigInt64Array` (kind 9)
+                // (ValidateIntegerTypedArray with `waitable = true`).
+                let Some(ta) = arg(0).as_handle().map(Handle::from_raw) else {
+                    return Err(
+                        self.type_error("Atomics operand must be an Int32Array or BigInt64Array")
+                    );
+                };
+                let Some(kind) = self.realm.typed_kind(ta) else {
+                    return Err(
+                        self.type_error("Atomics operand must be an Int32Array or BigInt64Array")
+                    );
+                };
+                if !matches!(kind, 5 | 9) {
+                    return Err(
+                        self.type_error("Atomics operand must be an Int32Array or BigInt64Array")
+                    );
+                }
+                // A detached buffer ([[ArrayBufferData]] is null) is a TypeError,
+                // raised before any index/count `valueOf` coercion runs.
+                if self.typed_array_detached(ta) {
+                    return Err(self.type_error("Atomics called on a detached ArrayBuffer"));
+                }
+                // ValidateAtomicAccess: the length is read *before* the index's
+                // `valueOf` runs, and an out-of-range index is a RangeError.
+                let len = self.realm.array_length(ta).unwrap_or(0);
+                let idx_f = self.coerce_to_integer_or_infinity(arg(1))?;
+                if !(idx_f.is_finite() && idx_f >= 0.0 && (idx_f as usize) < len) {
+                    let m = self.new_str("Atomics index out of range");
+                    return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
+                }
+                if id == N_ATOMICS_NOTIFY {
+                    // Coerce `count` (default +Infinity, else ToIntegerOrInfinity
+                    // clamped to ≥ 0) — its `valueOf` runs and may throw. This
+                    // engine is single-agent: no agent is ever in the wait list, so
+                    // (and always, for a non-shared buffer) `notify` returns 0.
+                    if !matches!(arg(2).unpack(), crate::nanbox::Unpacked::Undefined) {
+                        let _ = self.coerce_to_integer_or_infinity(arg(2))?;
+                    }
+                    NanBox::number(0.0)
+                } else {
+                    // `wait` coerces `value` then `timeout` (running their `valueOf`),
+                    // then requires the agent be able to block on a *shared* buffer.
+                    // The single (main) agent has [[CanBlock]] = false and these
+                    // tests use non-shared buffers, so `wait` throws a TypeError.
+                    if crate::nbexec::is_bigint_kind(kind) {
+                        return Err(
+                            self.type_error("Atomics on BigInt typed arrays is not yet supported")
+                        );
+                    }
+                    let _ = self.coerce_to_integer_or_infinity(arg(2))?;
+                    if !matches!(arg(3).unpack(), crate::nanbox::Unpacked::Undefined) {
+                        let _ = self.coerce_to_number(arg(3))?;
+                    }
+                    return Err(
+                        self.type_error("Atomics.wait cannot block: agent CanBlock is false")
+                    );
+                }
+            }
             N_MATH_MAX => {
                 // ToNumber every argument first (in order, propagating any abrupt
                 // completion), then reduce — so each element's `valueOf` runs even

@@ -82,7 +82,6 @@ const SKIP_FEATURES: &[&str] = &[
     // concurrent part (wait/notify + `$262.agent` threading) and BigInt Atomics —
     // a local `KATAAN_TEST262_FILTER=Atomics` run currently shows Atomics 34% /
     // SharedArrayBuffer 79%, too many failures to un-skip cleanly yet.
-    "Atomics",
     "Atomics.waitAsync",
     "SharedArrayBuffer",
     "cross-realm",

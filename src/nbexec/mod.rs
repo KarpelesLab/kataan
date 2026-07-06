@@ -1434,6 +1434,16 @@ const N_ATOMICS_IS_LOCK_FREE: u16 = 686;
 /// `Atomics.pause([N])` — a spin-loop hint; a single-agent no-op returning
 /// `undefined` (validates that `N`, if present, is an integral Number).
 const N_ATOMICS_PAUSE: u16 = 904;
+/// `Atomics.notify(typedArray, index, count)` — wakes up to `count` agents
+/// waiting on `(buffer, index)`. In this single-agent engine no agent is ever
+/// waiting, so after validating the (integer TypedArray, in-range index,
+/// non-negative count) it always returns `0`.
+const N_ATOMICS_NOTIFY: u16 = 909;
+/// `Atomics.wait(typedArray, index, value, timeout)` — blocks the agent until
+/// notified. Requires a shared integer TypedArray whose agent CanBlock; the main
+/// agent cannot block and a non-shared buffer is invalid, so after validation
+/// this throws a TypeError in the single-agent engine.
+const N_ATOMICS_WAIT: u16 = 910;
 /// `%GeneratorFunction%` — builds a `function*` from dynamic source (like
 /// `%Function%`); reachable via `Object.getPrototypeOf(function*(){}).constructor`.
 const N_GENERATOR_FUNCTION_CTOR: u16 = 905;
@@ -1918,6 +1928,13 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_ARRAY_OF
         // `Atomics.pause([N])` — the optional `N` is not counted.
         | N_ATOMICS_PAUSE => 0,
+        // `Atomics.compareExchange(ta, index, expected, replacement)` = 4;
+        // `load(ta, index)` = 2; the read-modify-write ops and `store` = 3;
+        // `isLockFree(size)` = 1.
+        N_ATOMICS_COMPARE_EXCHANGE | N_ATOMICS_WAIT => 4,
+        N_ATOMICS_LOAD => 2,
+        N_ATOMICS_ADD | N_ATOMICS_SUB | N_ATOMICS_AND | N_ATOMICS_OR | N_ATOMICS_XOR
+        | N_ATOMICS_EXCHANGE | N_ATOMICS_STORE | N_ATOMICS_NOTIFY => 3,
         N_GENERATOR_FUNCTION_CTOR | N_ASYNC_GENERATOR_FUNCTION_CTOR => 1,
         N_ASYNC_ITERATOR_DISPOSE => 0,
         N_RETURN_UNDEFINED => 1,
@@ -3377,6 +3394,8 @@ impl<'a> Interp<'a> {
                 ("store", N_ATOMICS_STORE),
                 ("isLockFree", N_ATOMICS_IS_LOCK_FREE),
                 ("pause", N_ATOMICS_PAUSE),
+                ("notify", N_ATOMICS_NOTIFY),
+                ("wait", N_ATOMICS_WAIT),
             ],
         );
         if let Some(ah) = self.current.get("Atomics").and_then(NanBox::as_handle) {
@@ -4317,7 +4336,12 @@ impl<'a> Interp<'a> {
         }
         // Namespace objects carry their own `[Symbol.toStringTag]` value (not on a
         // prototype): `Reflect`/`JSON`/`Math` → `[object Reflect|JSON|Math]`.
-        for (ns_name, tag) in [("Reflect", "Reflect"), ("JSON", "JSON"), ("Math", "Math")] {
+        for (ns_name, tag) in [
+            ("Reflect", "Reflect"),
+            ("JSON", "JSON"),
+            ("Math", "Math"),
+            ("Atomics", "Atomics"),
+        ] {
             if let Some(ns) = self
                 .current
                 .get(ns_name)
