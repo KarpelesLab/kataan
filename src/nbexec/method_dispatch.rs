@@ -1328,6 +1328,24 @@ impl<'a> Interp<'a> {
             {
                 return Ok(Some(self.call_with_this(m, recv, args)?));
             }
+            // `Date.prototype.toTemporalInstant()` — a Temporal.Instant at the
+            // Date's epoch (an invalid Date is a RangeError).
+            if method == "toTemporalInstant" {
+                if !ms.is_finite() {
+                    let msg = self.new_str("toTemporalInstant called on an invalid Date");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(msg))));
+                }
+                let data = crate::temporal_iso::TemporalData {
+                    kind: crate::temporal_iso::TemporalKind::Instant,
+                    epoch_ns: (ms as i128) * 1_000_000,
+                    ..Default::default()
+                };
+                let ih = self.realm.new_temporal(data);
+                if let Some(p) = self.temporal_proto(crate::temporal_iso::TemporalKind::Instant) {
+                    self.realm.set_native_proto(ih, p);
+                }
+                return Ok(Some(NanBox::handle(ih.to_raw())));
+            }
             // An invalid (NaN) date: every numeric getter is `NaN` (the field
             // decomposition below would otherwise read garbage from `0`).
             if !ms.is_finite()

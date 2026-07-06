@@ -1546,6 +1546,7 @@ const N_BIGINT_PROTO_FN: u16 = 240;
 const N_DATE_PROTO_FN: u16 = 242;
 /// The `Date.prototype` methods exposed as first-class values.
 const DATE_PROTO_METHODS: &[&str] = &[
+    "toTemporalInstant",
     "getTime",
     "valueOf",
     "getFullYear",
@@ -1844,7 +1845,7 @@ fn builtin_method_arity(name: &str) -> u32 {
         | "toLocaleString" | "valueOf" | "flat" | "clear" | "trim" | "trimStart" | "trimEnd"
         | "toUpperCase" | "toLowerCase" | "toLocaleUpperCase" | "toLocaleLowerCase"
         | "toReversed" | "isWellFormed" | "of" | "toWellFormed" | "getInt8" | "getUint8"
-        | "toArray" | "normalize"
+        | "toArray" | "normalize" | "toTemporalInstant"
         // Annex B.2.3 zero-argument HTML wrapper methods.
         | "big" | "blink" | "bold" | "fixed" | "italics" | "small"
         | "strike" | "sub" | "sup"
