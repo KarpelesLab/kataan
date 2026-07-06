@@ -2312,23 +2312,40 @@ impl<'a> Interp<'a> {
         // marked with `SHARED_ARRAY_BUFFER_BRAND` and linked to `%SharedArrayBuffer
         // .prototype%`.
         if id == N_SHARED_ARRAY_BUFFER {
-            let raw = args.first().map_or(0.0, |v| self.realm.to_number(*v));
+            // The length is ToIndex'd: an object's `valueOf` runs (and may throw),
+            // a Symbol is a TypeError (not silently NaN → RangeError).
+            let raw = match args.first() {
+                Some(v) => self.coerce_to_integer_or_infinity(*v)?,
+                None => 0.0,
+            };
             let n = self.validate_alloc_len(raw, "Invalid SharedArrayBuffer length")?;
-            let buf = self.make_array_buffer(n);
-            self.realm
-                .set_hidden_property(buf, SHARED_ARRAY_BUFFER_BRAND, NanBox::boolean(true));
-            // `{ maxByteLength }` makes it growable up to `max`.
-            if let Some(opts) = args
+            // `{ maxByteLength }` makes it growable up to `max`. Validate it
+            // (ToIndex: valueOf runs, Symbol→TypeError, out-of-range→RangeError,
+            // < length→RangeError) BEFORE allocating the byte store — the
+            // data-allocation-after-object-creation tests observe this order. A
+            // missing / `undefined` option leaves the buffer non-growable.
+            let maxlen: Option<usize> = if let Some(opts) = args
                 .get(1)
                 .and_then(|v| v.as_handle())
                 .map(Handle::from_raw)
                 && let Some(maxv) = self.realm.get_property(opts, "maxByteLength")
+                && !matches!(maxv.unpack(), Unpacked::Undefined)
             {
-                let max = self.realm.to_number(maxv).max(0.0) as usize;
+                let max_f = self.coerce_to_integer_or_infinity(maxv)?;
+                let max =
+                    self.validate_alloc_len(max_f, "Invalid SharedArrayBuffer maxByteLength")?;
                 if max < n {
                     let m = self.new_str("SharedArrayBuffer maxByteLength is smaller than length");
                     return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                 }
+                Some(max)
+            } else {
+                None
+            };
+            let buf = self.make_array_buffer(n);
+            self.realm
+                .set_hidden_property(buf, SHARED_ARRAY_BUFFER_BRAND, NanBox::boolean(true));
+            if let Some(max) = maxlen {
                 self.realm.set_hidden_property(
                     buf,
                     ARRAY_BUFFER_MAXLEN,

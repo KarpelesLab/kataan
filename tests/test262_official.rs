@@ -83,7 +83,6 @@ const SKIP_FEATURES: &[&str] = &[
     // a local `KATAAN_TEST262_FILTER=Atomics` run currently shows Atomics 34% /
     // SharedArrayBuffer 79%, too many failures to un-skip cleanly yet.
     "Atomics.waitAsync",
-    "SharedArrayBuffer",
     "cross-realm",
     "IsHTMLDDA",
 ];
