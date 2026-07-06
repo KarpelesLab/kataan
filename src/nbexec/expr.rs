@@ -653,7 +653,15 @@ impl<'a> Interp<'a> {
                     && !matches!(&**object, Expr::Super(_))
                 {
                     let obj = self.eval(object)?;
-                    let key = self.eval_prop_key(property)?;
+                    // Evaluate the computed key *expression* now (observable side
+                    // effects: `base[f()]--` runs `f()`), but defer ToPropertyKey
+                    // (its `toString`) until after the null/undefined-base check —
+                    // so `null[objWithThrowingToString]--` is a TypeError, not the
+                    // key's `toString` error.
+                    let raw_key = match property {
+                        PropertyKey::Computed(e) => Some(self.eval(e)?),
+                        _ => None,
+                    };
                     if matches!(obj.unpack(), Unpacked::Null | Unpacked::Undefined) {
                         return Err(self.type_error("Cannot read properties of null or undefined"));
                     }
@@ -666,6 +674,10 @@ impl<'a> Interp<'a> {
                                 .as_handle()
                                 .ok_or_else(|| self.type_error("cannot convert to object"))?,
                         ),
+                    };
+                    let key = match raw_key {
+                        Some(kv) => self.coerce_property_key(kv)?,
+                        None => self.eval_prop_key(property)?,
                     };
                     let current = self.read_member(handle, &key)?;
                     let (old, next) = self.update_value(*op, current)?;
