@@ -697,6 +697,7 @@ impl<'a> Interp<'a> {
             "String",
             "Boolean",
             "ArrayBuffer",
+            "SharedArrayBuffer",
             "DataView",
             "Promise",
             "DisposableStack",
@@ -773,6 +774,7 @@ impl<'a> Interp<'a> {
                 | N_STRING
                 | N_BOOLEAN
                 | N_ARRAY_BUFFER
+                | N_SHARED_ARRAY_BUFFER
                 | N_DATA_VIEW
                 | N_BASE_ARRAY
         ) || (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id)
