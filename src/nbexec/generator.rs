@@ -155,8 +155,11 @@ enum Step<'a> {
     /// (which has already been `Await`ed). `AsyncGeneratorYield` = Await(value) then
     /// GeneratorYield; this is the second half, pushed after an `AwaitExpr`.
     AsyncYield,
-    /// A `yield*` delegation pumping `iter`.
-    YieldStar { iter: Handle },
+    /// A `yield*` delegation pumping `iter`. `next` is the iterator's `next`
+    /// method, cached once at acquisition per spec (GetIterator stores
+    /// [[NextMethod]]) so it is not re-read every step — only `return`/`throw` are
+    /// fetched per-use.
+    YieldStar { iter: Handle, next: NanBox },
     /// Assign the value on the stack to simple target `name`, leaving the value
     /// on the stack as the assignment's result.
     AssignName { name: &'a str },
@@ -970,10 +973,10 @@ impl<'a> Interp<'a> {
         // `return`/`throw` — is forwarded to the inner iterator.
         let mut pending: Option<Completion> = None;
         if started && matches!(stack.last(), Some(Step::YieldStar { .. })) {
-            let Some(Step::YieldStar { iter }) = stack.pop() else {
+            let Some(Step::YieldStar { iter, next }) = stack.pop() else {
                 unreachable!()
             };
-            match self.gen_yield_star_step(iter, how, &mut stack, &mut values) {
+            match self.gen_yield_star_step(iter, how, next, &mut stack, &mut values) {
                 Ok(StepOut::Yield(v)) => {
                     self.store_machine(id, stack, values);
                     return Ok(GenStep::Yielded(v));
@@ -1873,9 +1876,13 @@ impl<'a> Interp<'a> {
                     // initial `next(undefined)`. `gen_yield_star_step` re-pushes a
                     // `YieldStar` step itself on a non-done inner result.
                     let iter = self.gen_delegate_iter(operand).map_err(GenAbrupt::from)?;
+                    // GetIterator caches [[NextMethod]] once (GetV(iter, "next"));
+                    // this single read is the only "get next" the delegation makes.
+                    let next = self.read_member(iter, "next").map_err(GenAbrupt::from)?;
                     self.gen_yield_star_step(
                         iter,
                         Resumption::Next(NanBox::undefined()),
+                        next,
                         stack,
                         values,
                     )
@@ -1897,12 +1904,18 @@ impl<'a> Interp<'a> {
                 let awaited = values.pop().unwrap_or(NanBox::undefined());
                 Ok(StepOut::Yield(awaited))
             }
-            Step::YieldStar { iter } => {
+            Step::YieldStar { iter, next } => {
                 // A `YieldStar` on top at resume is intercepted by `gen_drive`
                 // (which forwards the resumption to the inner iterator); reaching
                 // it here means it was not the suspension point, so pump it with
                 // `next(undefined)`.
-                self.gen_yield_star_step(iter, Resumption::Next(NanBox::undefined()), stack, values)
+                self.gen_yield_star_step(
+                    iter,
+                    Resumption::Next(NanBox::undefined()),
+                    next,
+                    stack,
+                    values,
+                )
             }
             Step::AwaitExpr => {
                 // `await v`: suspend the async coroutine on `v`'s settlement. On
@@ -2804,19 +2817,25 @@ impl<'a> Interp<'a> {
         &mut self,
         iter: Handle,
         how: Resumption,
+        next_method: NanBox,
         stack: &mut Vec<Step<'a>>,
         values: &mut Vec<NanBox>,
     ) -> StepResult {
         let iter_val = NanBox::handle(iter.to_raw());
-        let (method_name, arg) = match how {
-            Resumption::Next(v) => ("next", v),
-            Resumption::Return(v) => ("return", v),
-            Resumption::Throw(e) => ("throw", e),
+        let (method_name, arg, is_next) = match how {
+            Resumption::Next(v) => ("next", v, true),
+            Resumption::Return(v) => ("return", v, false),
+            Resumption::Throw(e) => ("throw", e, false),
         };
-        // Resolve the method; an absent `return`/`throw` has special handling.
-        let method = self
-            .read_member(iter, method_name)
-            .map_err(GenAbrupt::from)?;
+        // `next` is the cached [[NextMethod]] (read once at acquisition, not every
+        // step); `return`/`throw` are fetched per-use (GetMethod each time), and an
+        // absent one has special handling below.
+        let method = if is_next {
+            next_method
+        } else {
+            self.read_member(iter, method_name)
+                .map_err(GenAbrupt::from)?
+        };
         let absent = method.is_undefined() || method.is_null();
         if absent {
             match how {
@@ -2879,7 +2898,10 @@ impl<'a> Interp<'a> {
             // — it surfaces the inner result object verbatim (its `value` getter is
             // read by the outer consumer). An *async* `yield*` (AsyncGeneratorYield)
             // unwraps the value and re-wraps per its own protocol, so read it here.
-            stack.push(Step::YieldStar { iter });
+            stack.push(Step::YieldStar {
+                iter,
+                next: next_method,
+            });
             if self.gen_is_async {
                 let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
                 Ok(StepOut::Yield(value))
