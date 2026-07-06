@@ -61,7 +61,7 @@ var print = function () { var s = ''; for (var i = 0; i < arguments.length; i++)
 var $262 = {
   global: this,
   gc: function () {},
-  evalScript: function (src) { return eval(src); },
+  evalScript: function (src) { return (0, eval)(src); },
   detachArrayBuffer: function (b) { return $262_detachArrayBuffer(b); },
   createRealm: function () { throw new TypeError('$262.createRealm is not supported'); },
   IsHTMLDDA: undefined
