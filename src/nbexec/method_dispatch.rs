@@ -1790,7 +1790,7 @@ impl<'a> Interp<'a> {
             // `replaceAll`/`matchAll` first require that a RegExp `searchValue`/
             // `regexp` be global (`IsRegExp` + `Get(flags)` not containing "g" →
             // TypeError), checked *before* dispatching the symbol method.
-            if matches!(method, "replaceAll" | "matchAll") && self.is_regexp(arg(0))? {
+            if matches!(method, "replaceAll" | "matchAll") && self.is_regexp_arg(arg(0)) {
                 let flags_v = self.read_member(argh, "flags")?;
                 if matches!(flags_v.unpack(), Unpacked::Undefined | Unpacked::Null) {
                     return Err(self.type_error(&alloc::format!(
