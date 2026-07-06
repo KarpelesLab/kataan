@@ -3183,6 +3183,28 @@ fn builtin_method(
 
     // --- array methods ---
     if ctx.realm.is_array(h) {
+        // A length-changing mutator (`push`/`unshift` with items, `pop`/`shift`
+        // on a non-empty array) on an array whose `length` is non-writable
+        // (frozen or defineProperty-demoted) throws a TypeError — the mutator
+        // ends with Set(O,"length",…,Throw=true). Mirror of the nbexec path
+        // (method_dispatch.rs); NBVM implements push/pop natively and lets
+        // shift/unshift fall through, so guard all four here before either.
+        if matches!(key, "push" | "pop" | "shift" | "unshift")
+            && ctx.realm.array_length_is_readonly(h)
+        {
+            let changes = match key {
+                "push" | "unshift" => !args.is_empty(),
+                _ => ctx.realm.array_length(h).unwrap_or(0) > 0,
+            };
+            if changes {
+                let e = make_error(
+                    ctx.realm,
+                    "TypeError",
+                    "Cannot assign to read only property 'length' of object '[object Array]'",
+                );
+                return Some(Err(VmError::Thrown(e)));
+            }
+        }
         // `elems` snapshots (clones) the backing store. It is used only by the
         // callback-taking methods (`map`/`filter`/`forEach`/`reduce`/`find`/
         // `some`/`every`) and the array-building ones (`concat`/`reverse`): a
