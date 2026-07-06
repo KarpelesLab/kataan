@@ -2377,6 +2377,36 @@ impl<'a> Interp<'a> {
             } else {
                 None
             };
+            // Resolve the instance [[Prototype]] via the [[Get]] path BEFORE
+            // allocating the byte-data block (OrdinaryCreateFromConstructor runs
+            // `newTarget.prototype`'s getter — bound functions / accessors — first,
+            // so a throwing accessor beats the allocation's RangeError). A
+            // non-object prototype falls back to `%SharedArrayBuffer.prototype%`.
+            let default_proto = self
+                .current
+                .get("SharedArrayBuffer")
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|c| self.realm.get_property(c, "prototype"))
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw);
+            let proto = if let Some(nt) = native_new_target
+                .as_handle()
+                .filter(|_| native_new_target.as_handle() != callee.as_handle())
+                .map(Handle::from_raw)
+            {
+                let p = if let Some((class_id, _)) = self.realm.class_at(nt) {
+                    Some(self.class_prototype_by_id(class_id))
+                } else {
+                    let pv = self.read_member(nt, "prototype")?;
+                    pv.as_handle()
+                        .map(Handle::from_raw)
+                        .filter(|_| self.is_object_value(pv))
+                };
+                p.or(default_proto)
+            } else {
+                default_proto
+            };
             let buf = self.make_array_buffer(n);
             self.realm
                 .set_hidden_property(buf, SHARED_ARRAY_BUFFER_BRAND, NanBox::boolean(true));
@@ -2387,24 +2417,6 @@ impl<'a> Interp<'a> {
                     NanBox::number(max as f64),
                 );
             }
-            // Link to `%SharedArrayBuffer.prototype%` (or newTarget's for a
-            // subclass). `make_array_buffer` linked the *ArrayBuffer* default, so a
-            // non-object `newTarget.prototype` (instance_proto → None) must fall
-            // back to `%SharedArrayBuffer.prototype%`, not leave the AB default.
-            let default_proto = self
-                .current
-                .get("SharedArrayBuffer")
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw)
-                .and_then(|c| self.realm.get_property(c, "prototype"))
-                .and_then(|p| p.as_handle())
-                .map(Handle::from_raw);
-            let proto = if native_new_target.as_handle() != callee.as_handle() {
-                self.instance_proto(native_new_target, callee, None)
-                    .or(default_proto)
-            } else {
-                default_proto
-            };
             if let Some(proto) = proto {
                 self.realm.set_object_proto(buf, Some(proto));
             }

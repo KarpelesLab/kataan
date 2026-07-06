@@ -2240,9 +2240,14 @@ impl<'a> Interp<'a> {
             });
         }
         // A constructor function's `.prototype` (lazily created), so
-        // `Fn.prototype.method = …` and prototype-chain inheritance work.
+        // `Fn.prototype.method = …` and prototype-chain inheritance work. Skip the
+        // synthesis when an own `prototype` property is present — a *non-object*
+        // assignment (`Fn.prototype = undefined`) can't enter the `fn_protos`
+        // side-table (it holds Handles) and is stored as an own property, which
+        // must be honored (else the synthesized default wrongly shadows it).
         if name == "prototype"
             && let Some((func_id, _)) = self.realm.function_at(handle)
+            && !self.realm.has_own(handle, "prototype")
         {
             let proto = self.realm.function_prototype(func_id);
             return Ok(NanBox::handle(proto.to_raw()));
