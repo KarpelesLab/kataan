@@ -195,9 +195,11 @@ impl<'a> Interp<'a> {
                     _ => old,
                 };
                 self.realm.typed_set(ta, idx, NanBox::number(new));
-                // `store` returns the coerced value it wrote; the rest return the old.
+                // `store` returns `ToInteger(value)` (the *un-truncated* operand —
+                // `typed_set` truncated the stored element, but the return is `v`);
+                // the rest return the old value.
                 if id == N_ATOMICS_STORE {
-                    NanBox::number(coerce_typed(u16::from(kind), v))
+                    NanBox::number(v)
                 } else {
                     NanBox::number(old)
                 }
@@ -258,22 +260,38 @@ impl<'a> Interp<'a> {
                     }
                     NanBox::number(0.0)
                 } else {
-                    // `wait` coerces `value` then `timeout` (running their `valueOf`),
-                    // then requires the agent be able to block on a *shared* buffer.
-                    // The single (main) agent has [[CanBlock]] = false and these
-                    // tests use non-shared buffers, so `wait` throws a TypeError.
-                    if crate::nbexec::is_bigint_kind(kind) {
-                        return Err(
-                            self.type_error("Atomics on BigInt typed arrays is not yet supported")
-                        );
-                    }
-                    let _ = self.coerce_to_integer_or_infinity(arg(2))?;
-                    if !matches!(arg(3).unpack(), crate::nanbox::Unpacked::Undefined) {
-                        let _ = self.coerce_to_number(arg(3))?;
-                    }
-                    return Err(
-                        self.type_error("Atomics.wait cannot block: agent CanBlock is false")
-                    );
+                    // `wait` on a shell-like host ([[CanBlock]] = true): coerce
+                    // `value` then `timeout` (running their `valueOf`), read the
+                    // current element, and resolve. This engine is single-agent, so
+                    // no `notify` can ever arrive — the result is "not-equal" (the
+                    // element no longer holds `value`) or "timed-out" (nothing will
+                    // wake it). Tests that require [[CanBlock]] = false carry
+                    // flags:[CanBlockIsFalse] and are skipped by the runner.
+                    let idx = idx_f as usize;
+                    let equal = if crate::nbexec::is_bigint_kind(kind) {
+                        let v = self.coerce_to_bigint(arg(2))?.to_u64_wrapping();
+                        if !matches!(arg(3).unpack(), crate::nanbox::Unpacked::Undefined) {
+                            let _ = self.coerce_to_number(arg(3))?;
+                        }
+                        let w = match self.realm.typed_get(ta, idx) {
+                            Some(b) => self.coerce_to_bigint(b)?.to_u64_wrapping(),
+                            None => 0,
+                        };
+                        w == v
+                    } else {
+                        let v = self.coerce_to_integer_or_infinity(arg(2))? as i64 as i32;
+                        if !matches!(arg(3).unpack(), crate::nanbox::Unpacked::Undefined) {
+                            let _ = self.coerce_to_number(arg(3))?;
+                        }
+                        let w = self
+                            .realm
+                            .typed_get(ta, idx)
+                            .and_then(|x| x.as_number())
+                            .unwrap_or(0.0) as i64 as i32;
+                        w == v
+                    };
+                    let s = self.new_str(if equal { "timed-out" } else { "not-equal" });
+                    return Ok(s);
                 }
             }
             N_MATH_MAX => {

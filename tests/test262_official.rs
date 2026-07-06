@@ -525,7 +525,13 @@ fn run_worker(spec: &str) {
         // `notify`s). That scheduler is not implemented, so skip these regardless
         // of path — they surface across built-ins/{Atomics,TypedArray,…} via the
         // `SharedArrayBuffer` feature tag, not just under a single directory.
-        if skip_reason(rel, &meta).is_some() || src.contains("$262.agent") {
+        // `flags: [CanBlockIsFalse]` tests require a host whose main agent has
+        // [[CanBlock]] = false (so `Atomics.wait` throws). This engine models a
+        // shell host (CanBlock = true, `wait` returns), so skip them.
+        if skip_reason(rel, &meta).is_some()
+            || src.contains("$262.agent")
+            || meta.has_flag("CanBlockIsFalse")
+        {
             let _ = writeln!(f, "R\t{cur}\t{rel}\tSKIP\t");
             continue;
         }
