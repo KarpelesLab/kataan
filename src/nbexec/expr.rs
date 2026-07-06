@@ -431,9 +431,12 @@ impl<'a> Interp<'a> {
                         let mut is_property_delete = false;
                         // `delete a?.b` unwraps the optional-chain target; a nullish base
                         // short-circuits the whole `delete` to a no-op returning `true`.
-                        let argument: &Expr = match &**argument {
-                            Expr::OptChain { expr, .. } => expr,
-                            other => other,
+                        // A *plain* member whose base is nullish is NOT a short-circuit —
+                        // `delete u.x` / `delete n[0]` does ToObject(base), which throws a
+                        // TypeError — so track whether the target was optional.
+                        let (argument, base_optional): (&Expr, bool) = match &**argument {
+                            Expr::OptChain { expr, .. } => (expr, true),
+                            other => (other, false),
                         };
                         if let Expr::Member {
                             object, property, ..
@@ -458,7 +461,16 @@ impl<'a> Interp<'a> {
                                 Err(e) => return Err(e),
                             };
                             if matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                                return Ok(NanBox::boolean(true));
+                                // An optional target (`delete a?.b` with nullish `a`)
+                                // short-circuits to `true`; a plain member delete on a
+                                // nullish base throws a TypeError (ToObject fails).
+                                if base_optional {
+                                    return Ok(NanBox::boolean(true));
+                                }
+                                let m = self.new_str("Cannot convert undefined or null to object");
+                                return Err(ExecError::Throw(
+                                    self.make_error(N_TYPE_ERROR, Some(m)),
+                                ));
                             }
                             if let Some(raw) = obj.as_handle() {
                                 let h = Handle::from_raw(raw);
