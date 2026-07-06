@@ -1111,7 +1111,10 @@ impl<'a> Interp<'a> {
             .array_elements(iters_arr)
             .map(<[_]>::to_vec)
             .unwrap_or_default();
-        for (i, it) in iters.iter().enumerate() {
+        // Close the still-open iterators in REVERSE index order (per Iterator.zip:
+        // the abrupt path runs IteratorClose from the last opened down to the
+        // first), skipping the one that already aborted.
+        for (i, it) in iters.iter().enumerate().rev() {
             if i == skip {
                 continue;
             }
