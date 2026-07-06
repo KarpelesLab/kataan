@@ -1385,7 +1385,12 @@ impl<'a> Interp<'a> {
         if let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {
             #[cfg(all(feature = "module", feature = "std"))]
             self.trigger_deferred_namespace(th, name)?;
-            self.realm.set_property(th, name, value);
+            // `super.x = v` is `superBase.[[Set]](x, v, this)` — the write lands on
+            // the receiver. Route it through the strict-aware member-assignment path
+            // so a failed set (frozen/non-extensible/non-writable receiver) throws a
+            // TypeError, since a class method body is always strict.
+            let key = self.new_str(name);
+            self.assign_member_value(th, key, value)?;
         }
         Ok(())
     }
