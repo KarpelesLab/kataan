@@ -1449,6 +1449,11 @@ const N_ATOMICS_WAIT: u16 = 910;
 /// so `SharedArrayBuffer.prototype.byteLength` called on a plain `ArrayBuffer`
 /// (or vice versa for the AB getter) throws a TypeError.
 const N_SAB_ACCESSOR: u16 = 911;
+/// `SharedArrayBuffer.prototype` method (`grow` / `slice`). Like
+/// [`N_AB_PROTO_FN`] but brand-validates the receiver is a *shared* buffer, so
+/// `SharedArrayBuffer.prototype.slice` on a plain `ArrayBuffer` is a TypeError
+/// (and the AB methods reject a shared receiver).
+const N_SAB_PROTO_FN: u16 = 912;
 /// `%GeneratorFunction%` — builds a `function*` from dynamic source (like
 /// `%Function%`); reachable via `Object.getPrototypeOf(function*(){}).constructor`.
 const N_GENERATOR_FUNCTION_CTOR: u16 = 905;
@@ -3205,8 +3210,16 @@ impl<'a> Interp<'a> {
     /// whose dispatch must first reject a `this` lacking the `[[ArrayBufferData]]`
     /// internal slot (see [`N_AB_PROTO_FN`]).
     fn readable_ab_method(&mut self, name: &str) -> NanBox {
+        self.readable_buffer_method(name, N_AB_PROTO_FN)
+    }
+
+    /// Like [`readable_ab_method`](Self::readable_ab_method) but with an explicit
+    /// dispatch id — `N_AB_PROTO_FN` for `ArrayBuffer.prototype` methods,
+    /// `N_SAB_PROTO_FN` for `SharedArrayBuffer.prototype` methods (which
+    /// brand-validate a shared receiver).
+    fn readable_buffer_method(&mut self, name: &str, id: u16) -> NanBox {
         let name_h = self.realm.new_string(name);
-        let f = self.realm.new_bound_native(N_AB_PROTO_FN, name_h);
+        let f = self.realm.new_bound_native(id, name_h);
         self.install_fn_name_length(f, name, builtin_method_arity(name));
         NanBox::handle(f.to_raw())
     }
@@ -3646,7 +3659,7 @@ impl<'a> Interp<'a> {
             // `grow` (growable SABs) and `slice` (returns a new SAB) — bound natives
             // re-dispatched through `call_method`, like the ArrayBuffer methods.
             for m in ["grow", "slice"] {
-                let f = self.readable_ab_method(m);
+                let f = self.readable_buffer_method(m, N_SAB_PROTO_FN);
                 self.realm.set_property(proto, m, f);
                 self.realm.mark_hidden(proto, m);
             }

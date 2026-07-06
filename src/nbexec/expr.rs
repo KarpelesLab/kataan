@@ -2357,6 +2357,7 @@ impl<'a> Interp<'a> {
             if let Some((id, target)) = self.realm.bound_native_at(handle) {
                 let method = if id == N_ARRAY_PROTO_FN
                     || id == N_AB_PROTO_FN
+                    || id == N_SAB_PROTO_FN
                     || id == N_TYPED_ARRAY_PROTO_FN
                 {
                     self.realm.string_value(target)

@@ -208,15 +208,29 @@ impl<'a> Interp<'a> {
         if let Some((id, target)) = self.realm.bound_native_at(handle) {
             // A first-class `ArrayBuffer.prototype.<method>`: reject a `this` that is
             // not an Object with an `[[ArrayBufferData]]` slot, then dispatch.
-            if id == N_AB_PROTO_FN {
+            if id == N_AB_PROTO_FN || id == N_SAB_PROTO_FN {
                 let name = self.realm.string_value(target).unwrap_or_default();
-                let ok = this_val
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .is_some_and(|h| self.realm.get_property(h, ARRAY_BUFFER_BYTES).is_some());
+                // An `ArrayBuffer.prototype` method requires a non-shared buffer;
+                // a `SharedArrayBuffer.prototype` method requires a shared one — so
+                // e.g. `SharedArrayBuffer.prototype.slice` on a plain `ArrayBuffer`
+                // (and `ArrayBuffer.prototype.slice` on a SAB) is a TypeError.
+                let want_shared = id == N_SAB_PROTO_FN;
+                let kind = if want_shared {
+                    "SharedArrayBuffer"
+                } else {
+                    "ArrayBuffer"
+                };
+                let ok = this_val.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    self.realm.get_property(h, ARRAY_BUFFER_BYTES).is_some()
+                        && self
+                            .realm
+                            .get_property(h, SHARED_ARRAY_BUFFER_BRAND)
+                            .is_some()
+                            == want_shared
+                });
                 if !ok {
                     return Err(self.type_error(&alloc::format!(
-                        "ArrayBuffer.prototype.{name} called on a non-ArrayBuffer object"
+                        "{kind}.prototype.{name} called on an incompatible receiver"
                     )));
                 }
                 return Ok(self
