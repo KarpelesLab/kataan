@@ -62,8 +62,20 @@ fn ctor_len(kind: TemporalKind) -> u32 {
 /// The `.length` of a prototype method by name (spec required-arg count; default 0).
 fn method_len(name: &str) -> u32 {
     match name {
-        "with" | "add" | "subtract" | "until" | "since" | "round" | "total" | "equals"
-        | "toZonedDateTime" | "withPlainTime" | "withCalendar" | "toPlainDate" => 1,
+        "with"
+        | "add"
+        | "subtract"
+        | "until"
+        | "since"
+        | "round"
+        | "total"
+        | "equals"
+        | "toZonedDateTime"
+        | "withPlainTime"
+        | "withCalendar"
+        | "toPlainDate"
+        | "withTimeZone"
+        | "getTimeZoneTransition" => 1,
         _ => 0,
     }
 }
