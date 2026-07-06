@@ -96,11 +96,6 @@ impl<'a> Interp<'a> {
                 if matches!(kind, 2 | 7 | 8 | 11) {
                     return Err(self.type_error("Atomics operand must be an integer TypedArray"));
                 }
-                if crate::nbexec::is_bigint_kind(kind) {
-                    return Err(
-                        self.type_error("Atomics on BigInt typed arrays is not yet supported")
-                    );
-                }
                 // A *writing* atomic op (every one but `load`) on an immutable
                 // ArrayBuffer is a TypeError, raised before the index/value
                 // `valueOf` coercions run (the immutable-arraybuffer proposal).
@@ -114,6 +109,59 @@ impl<'a> Interp<'a> {
                     return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
                 }
                 let idx = idx_f as usize;
+                // BigInt64Array / BigUint64Array: the element and the operands are
+                // BigInts (ToBigInt, not ToIntegerOrInfinity). Work in the low 64
+                // bits (what the element encoding keeps); `store` returns the
+                // ToBigInt operand, every other writing op returns the old value.
+                if crate::nbexec::is_bigint_kind(kind) {
+                    use crate::bignum::BigInt;
+                    let old_box = self.realm.typed_get(ta, idx).unwrap_or_else(|| {
+                        NanBox::handle(self.realm.new_bigint(BigInt::zero()).to_raw())
+                    });
+                    let old = self
+                        .this_bigint_value(old_box)
+                        .unwrap_or_else(BigInt::zero)
+                        .to_u64_wrapping();
+                    if id == N_ATOMICS_LOAD {
+                        return Ok(old_box);
+                    }
+                    if id == N_ATOMICS_COMPARE_EXCHANGE {
+                        let expected = self.coerce_to_bigint(arg(2))?.to_u64_wrapping();
+                        let replacement = self.coerce_to_bigint(arg(3))?.to_u64_wrapping();
+                        if old == expected {
+                            let nb = NanBox::handle(
+                                self.realm
+                                    .new_bigint(BigInt::from_i128(replacement as i64 as i128))
+                                    .to_raw(),
+                            );
+                            self.realm.typed_set(ta, idx, nb);
+                        }
+                        return Ok(old_box);
+                    }
+                    let v_big = self.coerce_to_bigint(arg(2))?;
+                    let v = v_big.to_u64_wrapping();
+                    let new_u = match id {
+                        N_ATOMICS_STORE | N_ATOMICS_EXCHANGE => v,
+                        N_ATOMICS_ADD => old.wrapping_add(v),
+                        N_ATOMICS_SUB => old.wrapping_sub(v),
+                        N_ATOMICS_AND => old & v,
+                        N_ATOMICS_OR => old | v,
+                        N_ATOMICS_XOR => old ^ v,
+                        _ => old,
+                    };
+                    let nb = NanBox::handle(
+                        self.realm
+                            .new_bigint(BigInt::from_i128(new_u as i64 as i128))
+                            .to_raw(),
+                    );
+                    self.realm.typed_set(ta, idx, nb);
+                    // `store` returns the ToBigInt operand; the rest return old.
+                    return Ok(if id == N_ATOMICS_STORE {
+                        NanBox::handle(self.realm.new_bigint(v_big).to_raw())
+                    } else {
+                        old_box
+                    });
+                }
                 let old = self
                     .realm
                     .typed_get(ta, idx)
