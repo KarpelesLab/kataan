@@ -2381,17 +2381,23 @@ impl<'a> Interp<'a> {
                     NanBox::number(max as f64),
                 );
             }
-            // Link to `%SharedArrayBuffer.prototype%` (or newTarget's for a subclass).
+            // Link to `%SharedArrayBuffer.prototype%` (or newTarget's for a
+            // subclass). `make_array_buffer` linked the *ArrayBuffer* default, so a
+            // non-object `newTarget.prototype` (instance_proto → None) must fall
+            // back to `%SharedArrayBuffer.prototype%`, not leave the AB default.
+            let default_proto = self
+                .current
+                .get("SharedArrayBuffer")
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|c| self.realm.get_property(c, "prototype"))
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw);
             let proto = if native_new_target.as_handle() != callee.as_handle() {
                 self.instance_proto(native_new_target, callee, None)
+                    .or(default_proto)
             } else {
-                self.current
-                    .get("SharedArrayBuffer")
-                    .and_then(|v| v.as_handle())
-                    .map(Handle::from_raw)
-                    .and_then(|c| self.realm.get_property(c, "prototype"))
-                    .and_then(|p| p.as_handle())
-                    .map(Handle::from_raw)
+                default_proto
             };
             if let Some(proto) = proto {
                 self.realm.set_object_proto(buf, Some(proto));
