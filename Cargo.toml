@@ -85,6 +85,8 @@ intl = { version = "0.5", optional = true, default-features = false, features = 
     "number", "currency", "datetime", "list", "displaynames", "relative", "units", "locale",
 ] }
 puremp = { version = "0.2", default-features = false, features = ["int"] }
+# IANA time-zone database (no_std, no-alloc) for Temporal.ZonedDateTime.
+timezone-data = "0.1"
 
 [lints.rust]
 # Keep the foundation documented and the API surface honest.
