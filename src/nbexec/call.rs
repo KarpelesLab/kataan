@@ -2347,7 +2347,19 @@ impl<'a> Interp<'a> {
                 Some(v) => self.coerce_to_integer_or_infinity(*v)?,
                 None => 0.0,
             };
-            let n = self.validate_alloc_len(raw, "Invalid SharedArrayBuffer length")?;
+            // ToIndex(length): a non-negative integer < 2^53. The *allocation*
+            // limit is enforced later (after OrdinaryCreateFromConstructor runs
+            // newTarget.prototype's getter), so an over-large but valid index still
+            // observes that getter's abrupt completion before the RangeError.
+            if !raw.is_finite()
+                || raw < 0.0
+                || raw >= 9_007_199_254_740_992.0
+                || raw != (raw as u64) as f64
+            {
+                let m = self.new_str("Invalid SharedArrayBuffer length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            let n = raw as usize;
             // `{ maxByteLength }` makes it growable up to `max`. Validate it
             // (ToIndex: valueOf runs, Symbol→TypeError, out-of-range→RangeError,
             // < length→RangeError) BEFORE allocating the byte store — the
@@ -2407,6 +2419,13 @@ impl<'a> Interp<'a> {
             } else {
                 default_proto
             };
+            // CreateSharedByteDataBlock: now (after the object exists) enforce the
+            // engine's allocation cap — a valid-index-but-too-large length is a
+            // RangeError here, *after* the prototype getter above has run.
+            if n > self.realm.limits.max_array_len {
+                let m = self.new_str("SharedArrayBuffer length exceeds the allocation limit");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
             let buf = self.make_array_buffer(n);
             self.realm
                 .set_hidden_property(buf, SHARED_ARRAY_BUFFER_BRAND, NanBox::boolean(true));
