@@ -25,12 +25,24 @@ impl<'a> Interp<'a> {
                     let ks = alloc::format!("{i}");
                     let nv = self.json_revive(vh, &ks, reviver)?;
                     if matches!(nv.unpack(), Unpacked::Undefined) {
-                        // `? val.[[Delete]](P)` — a numeric index on an array clears
-                        // the element to a hole (undefined).
-                        self.realm.set_element(vh, i, NanBox::undefined());
+                        // `? val.[[Delete]](P)` — proxy-aware, so a throwing
+                        // `deleteProperty` trap propagates (a non-abrupt `false` is
+                        // ignored).
+                        self.delete_property_of(vh, &ks)?;
                     } else {
-                        // `? CreateDataProperty(val, P, newElement)`.
-                        self.realm.set_element(vh, i, nv);
+                        // `? CreateDataProperty(val, P, newElement)` — proxy-aware
+                        // [[DefineOwnProperty]]: a throwing `defineProperty` trap
+                        // propagates, a non-abrupt failure (e.g. a non-configurable
+                        // index) is ignored (plain CreateDataProperty, not …OrThrow).
+                        let desc = self.realm.new_object();
+                        self.realm.set_property(desc, "value", nv);
+                        self.realm
+                            .set_property(desc, "writable", NanBox::boolean(true));
+                        self.realm
+                            .set_property(desc, "enumerable", NanBox::boolean(true));
+                        self.realm
+                            .set_property(desc, "configurable", NanBox::boolean(true));
+                        self.apply_descriptor(vh, &ks, desc, true)?;
                     }
                 }
             } else if self.realm.object_keys(vh).is_some() || self.realm.proxy_at(vh).is_some() {
