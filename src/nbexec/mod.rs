@@ -1444,6 +1444,11 @@ const N_ATOMICS_NOTIFY: u16 = 909;
 /// agent cannot block and a non-shared buffer is invalid, so after validation
 /// this throws a TypeError in the single-agent engine.
 const N_ATOMICS_WAIT: u16 = 910;
+/// `SharedArrayBuffer.prototype` getter (byteLength / maxByteLength / growable).
+/// Like [`N_AB_ACCESSOR`] but brand-validates the receiver is a *shared* buffer —
+/// so `SharedArrayBuffer.prototype.byteLength` called on a plain `ArrayBuffer`
+/// (or vice versa for the AB getter) throws a TypeError.
+const N_SAB_ACCESSOR: u16 = 911;
 /// `%GeneratorFunction%` — builds a `function*` from dynamic source (like
 /// `%Function%`); reachable via `Object.getPrototypeOf(function*(){}).constructor`.
 const N_GENERATOR_FUNCTION_CTOR: u16 = 905;
@@ -3628,7 +3633,7 @@ impl<'a> Interp<'a> {
             // .prototype` itself throws, but an instance read works.
             for accessor in ["byteLength", "maxByteLength", "growable"] {
                 let name_h = self.realm.new_string(accessor);
-                let getter = self.realm.new_bound_native(N_AB_ACCESSOR, name_h);
+                let getter = self.realm.new_bound_native(N_SAB_ACCESSOR, name_h);
                 self.install_fn_name_length(getter, &alloc::format!("get {accessor}"), 0);
                 self.realm.define_accessor(
                     proto,

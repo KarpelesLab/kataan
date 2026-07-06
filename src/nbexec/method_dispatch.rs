@@ -1055,13 +1055,26 @@ impl<'a> Interp<'a> {
             return Ok(Some(NanBox::undefined()));
         }
         // --- SharedArrayBuffer.prototype.grow(newByteLength) (growable SABs only) ---
+        // `grow` is a SharedArrayBuffer-only buffer method (ArrayBuffer uses
+        // `resize`), so calling it on a plain ArrayBuffer receiver is a TypeError.
         if method == "grow"
             && self
                 .realm
-                .get_property(handle, SHARED_ARRAY_BUFFER_BRAND)
+                .get_property(handle, ARRAY_BUFFER_BYTES)
                 .is_some()
-            && let Some(bh) = self.array_buffer_bytes(handle)
         {
+            if self
+                .realm
+                .get_property(handle, SHARED_ARRAY_BUFFER_BRAND)
+                .is_none()
+            {
+                let m = self
+                    .new_str("SharedArrayBuffer.prototype.grow called on an incompatible receiver");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            let Some(bh) = self.array_buffer_bytes(handle) else {
+                return Ok(None);
+            };
             let Some(max) = self
                 .realm
                 .get_property(handle, ARRAY_BUFFER_MAXLEN)

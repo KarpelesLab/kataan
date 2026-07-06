@@ -631,15 +631,30 @@ impl<'a> Interp<'a> {
             // A `get ArrayBuffer.prototype.<accessor>` getter (byteLength/
             // maxByteLength/resizable/detached): the `this` must have an
             // `[[ArrayBufferData]]` internal slot, else a TypeError.
-            if id == N_AB_ACCESSOR {
+            if id == N_AB_ACCESSOR || id == N_SAB_ACCESSOR {
                 let name = self.realm.string_value(target).unwrap_or_default();
+                // The SAB getter requires a *shared* buffer receiver, the AB getter
+                // a non-shared one — so `SharedArrayBuffer.prototype.byteLength` on
+                // a plain `ArrayBuffer` (and vice versa) is a TypeError.
+                let want_shared = id == N_SAB_ACCESSOR;
+                let kind = if want_shared {
+                    "SharedArrayBuffer"
+                } else {
+                    "ArrayBuffer"
+                };
                 let Some(h) = this_val
                     .as_handle()
                     .map(Handle::from_raw)
                     .filter(|h| self.realm.get_property(*h, ARRAY_BUFFER_BYTES).is_some())
+                    .filter(|h| {
+                        self.realm
+                            .get_property(*h, SHARED_ARRAY_BUFFER_BRAND)
+                            .is_some()
+                            == want_shared
+                    })
                 else {
                     return Err(self.type_error(&alloc::format!(
-                        "get ArrayBuffer.prototype.{name} called on a non-ArrayBuffer object"
+                        "get {kind}.prototype.{name} called on an incompatible receiver"
                     )));
                 };
                 let detached = self.realm.get_property(h, ARRAY_BUFFER_DETACHED).is_some();
