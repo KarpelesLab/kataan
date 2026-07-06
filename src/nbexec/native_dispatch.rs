@@ -3393,8 +3393,17 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            N_IS_NAN => NanBox::boolean(self.realm.to_number(arg(0)).is_nan()),
-            N_IS_FINITE => NanBox::boolean(self.realm.to_number(arg(0)).is_finite()),
+            N_IS_NAN => {
+                // `isNaN(x)` = ToNumber(x) is NaN; ToNumber runs a `valueOf`/
+                // `toString` (whose abrupt completion propagates), not the raw
+                // non-coercing `to_number` that returns NaN for objects.
+                let num = self.coerce_to_number(arg(0))?;
+                NanBox::boolean(self.realm.to_number(num).is_nan())
+            }
+            N_IS_FINITE => {
+                let num = self.coerce_to_number(arg(0))?;
+                NanBox::boolean(self.realm.to_number(num).is_finite())
+            }
             // `Error(msg)` / `new Error(msg, { cause })` (the ES2022 cause option).
             id if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id) => {
                 let err = self.make_error(id, args.first().copied());
