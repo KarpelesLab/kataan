@@ -867,12 +867,11 @@ impl<'a> Interp<'a> {
     pub(crate) fn read_target(&mut self, target: &'a Expr) -> Result<NanBox, ExecError> {
         match target {
             Expr::Ident(id) => {
-                // A bare identifier inside `with (obj)` first resolves against the
-                // with-object's properties (via `[[Get]]`, so accessors fire).
-                if let Some(h) = self.with_binding(&id.name) {
-                    return self.read_member(h, &id.name);
-                }
-                Ok(self.current.get(&id.name).unwrap_or(NanBox::undefined()))
+                // Reading the LHS reference (for `&&=`/`||=`/`??=` and `++`/`--`):
+                // an *unresolvable* identifier is a ReferenceError, not silently
+                // `undefined`. `read_ident_ref` also handles `with`-bindings (via
+                // the object's `[[Get]]`) and live module imports.
+                self.read_ident_ref(&id.name)
             }
             Expr::Member {
                 object, property, ..
