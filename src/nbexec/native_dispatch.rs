@@ -647,7 +647,10 @@ impl<'a> Interp<'a> {
                 }
             }
             N_JSON_PARSE => {
-                let text = self.realm.to_display_string(arg(0));
+                // `JSON.parse(text)` does `ToString(text)` first — a user
+                // `toString`/`valueOf` runs (propagating), unlike the raw
+                // `to_display_string` which stringifies an object as "[object …]".
+                let text = self.coerce_to_string(arg(0))?;
                 let chars: Vec<char> = text.chars().collect();
                 let mut pos = 0;
                 let value = self.json_parse(&chars, &mut pos, 0)?;
