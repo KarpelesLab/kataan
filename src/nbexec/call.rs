@@ -2315,23 +2315,32 @@ impl<'a> Interp<'a> {
             {
                 self.realm.set_object_proto(buf, Some(proto));
             }
-            // `new ArrayBuffer(n, { maxByteLength })` makes the buffer resizable up to `max`.
+            // `new ArrayBuffer(n, { maxByteLength })` makes the buffer resizable up
+            // to `max`. `read_member` runs a poisoned getter; `maxByteLength` is
+            // ToIndex'd and bounded by the allocation cap (validate_alloc_len rejects
+            // negative / excessive / over-limit — e.g. 7 PiB or 2^53-1), and must be
+            // >= the length.
             if let Some(opts) = args
                 .get(1)
                 .and_then(|v| v.as_handle())
                 .map(Handle::from_raw)
-                && let Some(maxv) = self.realm.get_property(opts, "maxByteLength")
             {
-                let max = self.realm.to_number(maxv).max(0.0) as usize;
-                if max < n {
-                    let m = self.new_str("ArrayBuffer maxByteLength is smaller than its length");
-                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                let maxv = self.read_member(opts, "maxByteLength")?;
+                if !matches!(maxv.unpack(), Unpacked::Undefined) {
+                    let max_f = self.coerce_to_integer_or_infinity(maxv)?;
+                    let max =
+                        self.validate_alloc_len(max_f, "Invalid ArrayBuffer maxByteLength")?;
+                    if max < n {
+                        let m =
+                            self.new_str("ArrayBuffer maxByteLength is smaller than its length");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
+                    self.realm.set_hidden_property(
+                        buf,
+                        ARRAY_BUFFER_MAXLEN,
+                        NanBox::number(max as f64),
+                    );
                 }
-                self.realm.set_hidden_property(
-                    buf,
-                    ARRAY_BUFFER_MAXLEN,
-                    NanBox::number(max as f64),
-                );
             }
             return Ok(NanBox::handle(buf.to_raw()));
         }
