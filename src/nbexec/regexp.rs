@@ -112,6 +112,22 @@ impl<'a> Interp<'a> {
         self.realm.regexp_at(h).is_some()
     }
 
+    /// `IsRegExp(argument)` (spec) — reads `@@match` via `[[Get]]` so a throwing
+    /// getter propagates (unlike the raw `is_regexp_arg`); `@@match` present and
+    /// truthy → true, absent → the `[[RegExpMatcher]]` internal-slot fallback.
+    pub(crate) fn is_regexp(&mut self, v: NanBox) -> Result<bool, ExecError> {
+        let Some(h) = v.as_handle().map(Handle::from_raw) else {
+            return Ok(false);
+        };
+        let sym = self.well_known_symbol("match");
+        let key = self.member_key(sym);
+        let m = self.read_member(h, &key)?;
+        if !matches!(m.unpack(), Unpacked::Undefined) {
+            return Ok(self.realm.truthy(m));
+        }
+        Ok(self.realm.regexp_at(h).is_some())
+    }
+
     /// Builds `RegExp.prototype` as a real object: first-class `exec`/`test`/
     /// `compile`/`toString` methods, the `@@match`/`@@matchAll`/`@@replace`/
     /// `@@search`/`@@split` symbol methods, the `source`/`flags`/flag-getter
