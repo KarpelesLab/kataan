@@ -1318,6 +1318,20 @@ impl Realm {
         self.heap.alloc(Cell::Date(ms))
     }
 
+    /// Allocates a branded `Temporal.*` instance cell wrapping `data`.
+    pub fn new_temporal(&mut self, data: crate::temporal_iso::TemporalData) -> Handle {
+        self.heap.alloc(Cell::Temporal(alloc::rc::Rc::new(data)))
+    }
+
+    /// The `Temporal.*` internal-slot record, if `handle` is a Temporal instance.
+    #[must_use]
+    pub fn temporal_at(
+        &self,
+        handle: Handle,
+    ) -> Option<alloc::rc::Rc<crate::temporal_iso::TemporalData>> {
+        self.heap.get(handle).and_then(Cell::as_temporal).cloned()
+    }
+
     /// The timestamp (ms) of the `Date` at `handle`, if it is one.
     #[must_use]
     pub fn date_at(&self, handle: Handle) -> Option<f64> {
@@ -3604,6 +3618,12 @@ impl Realm {
                     } else {
                         alloc::string::String::from("Invalid Date")
                     }
+                }
+                // Temporal instances stringify via their own `toString` methods
+                // (the interpreter method path); this low-level fallback is only
+                // hit for a raw display and reports a tagged placeholder.
+                Some(Cell::Temporal(t)) => {
+                    alloc::format!("[object Temporal.{}]", t.kind.type_name())
                 }
                 Some(Cell::RegExp { source, flags, .. }) => alloc::format!("/{source}/{flags}"),
                 Some(Cell::Symbol { description, .. }) => {

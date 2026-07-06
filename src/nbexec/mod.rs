@@ -352,6 +352,8 @@ pub struct Interp<'a> {
     /// `classes`. Used with `class_lexical_parent` to resolve a private
     /// reference to its declaring class.
     class_private_names: Vec<alloc::collections::BTreeSet<alloc::boxed::Box<str>>>,
+    /// Intrinsic `Temporal.<Type>.prototype` handles, indexed by `TemporalKind`.
+    temporal_protos: Vec<Option<Handle>>,
     /// One-shot binding name for NamedEvaluation of an anonymous class
     /// expression (`var C = class {}`, `x = class {}`): the name the class will
     /// receive. `make_class` consumes it so the class's `name` is set *before*
@@ -2008,6 +2010,9 @@ fn builtin_native_arity(id: u16) -> u32 {
 /// (`Object` and `Array` are matched by identity, not id, so are handled separately.)
 #[must_use]
 fn is_native_constructor(id: u16) -> bool {
+    if crate::nbexec::temporal::is_temporal_ctor_id(id) {
+        return true;
+    }
     if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id) {
         return true;
     }
@@ -2497,6 +2502,15 @@ mod promise;
 mod regexp;
 mod resource;
 mod stmt;
+mod temporal;
+mod temporal_duration;
+mod temporal_instant;
+mod temporal_plaindate;
+mod temporal_plaindatetime;
+mod temporal_plainmonthday;
+mod temporal_plaintime;
+mod temporal_plainyearmonth;
+mod temporal_zoneddatetime;
 mod typed_array;
 mod wasm;
 
@@ -2532,6 +2546,7 @@ impl<'a> Interp<'a> {
             private_method_cache: alloc::collections::BTreeMap::new(),
             class_lexical_parent: Vec::new(),
             class_private_names: Vec::new(),
+            temporal_protos: Vec::new(),
             pending_class_name: None,
             call_depth: 0,
             new_target_in_scope: false,
@@ -4268,6 +4283,7 @@ impl<'a> Interp<'a> {
         // `ArrayBuffer.prototype.slice` (SpeciesConstructor). TypedArrays inherit
         // theirs from the shared `%TypedArray%` intrinsic.
         self.install_ctor_species("ArrayBuffer");
+        self.install_temporal();
         self.install_proto_to_string_tag("WeakMap", "WeakMap");
         self.install_proto_to_string_tag("WeakSet", "WeakSet");
         self.install_proto_to_string_tag("Promise", "Promise");

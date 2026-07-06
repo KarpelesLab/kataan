@@ -4099,6 +4099,12 @@ impl<'a> Interp<'a> {
                     return Ok(self.realm.collection_is_set(oh).is_some());
                 }
                 N_DATE => return Ok(self.realm.date_at(oh).is_some()),
+                id if crate::nbexec::temporal::is_temporal_ctor_id(id) => {
+                    // `x instanceof Temporal.<Type>` — a branded instance of that
+                    // exact kind.
+                    return Ok(self.realm.temporal_at(oh).map(|d| d.kind)
+                        == crate::nbexec::temporal::kind_for_ctor_id(id));
+                }
                 N_PROMISE => return Ok(self.realm.promise_state(oh).is_some()),
                 // Every callable (function, native, bound) and every class is a
                 // `Function`.

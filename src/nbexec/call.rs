@@ -394,6 +394,35 @@ impl<'a> Interp<'a> {
                     .call_method(this_val, &name, args)?
                     .unwrap_or(NanBox::undefined()));
             }
+            // A first-class `Temporal.<Type>.prototype.<method>`: the `this` must
+            // be a branded Temporal instance; route to the per-type logic.
+            if id == crate::nbexec::temporal::N_TEMPORAL_PROTO_FN {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let Some(data) = this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.temporal_at(h))
+                else {
+                    return Err(self.type_error(&alloc::format!(
+                        "Temporal.prototype.{name} called on an incompatible receiver"
+                    )));
+                };
+                return self.temporal_method(this_val, &data, &name, args);
+            }
+            // A first-class Temporal getter accessor (`get year`, …).
+            if id == crate::nbexec::temporal::N_TEMPORAL_GETTER {
+                let name = self.realm.string_value(target).unwrap_or_default();
+                let Some(data) = this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.temporal_at(h))
+                else {
+                    return Err(self.type_error(&alloc::format!(
+                        "Temporal getter '{name}' called on an incompatible receiver"
+                    )));
+                };
+                return self.temporal_getter(this_val, &data, &name);
+            }
             // A first-class `Iterator.prototype.<helper>` (map/filter/take/…) run
             // on the call's `this` iterator.
             if id == N_ITERATOR_PROTO_FN {
@@ -2079,6 +2108,10 @@ impl<'a> Interp<'a> {
                 r?;
             }
             return Ok(NanBox::handle(promise.to_raw()));
+        }
+        // `new Temporal.<Type>(...)` — route to the per-type constructor.
+        if let Some(kind) = crate::nbexec::temporal::kind_for_ctor_id(id) {
+            return self.temporal_construct(kind, args, native_new_target, callee);
         }
         // `new Date(ms)` (or `new Date()` for "now").
         if id == N_DATE {

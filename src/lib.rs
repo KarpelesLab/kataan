@@ -166,6 +166,10 @@ pub mod nbeval;
 #[cfg(feature = "alloc")]
 pub mod nbexec;
 
+/// Pure-logic ISO-8601 calendar/time/duration core shared by the `Temporal.*`
+/// native types (no engine coupling — plain structs + functions, unit-testable).
+pub mod temporal_iso;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]

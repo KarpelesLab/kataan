@@ -778,6 +778,7 @@ impl<'a> Interp<'a> {
                 | N_DATA_VIEW
                 | N_BASE_ARRAY
         ) || (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id)
+            || crate::nbexec::temporal::is_temporal_ctor_id(id)
     }
 
     pub(crate) fn class_prototype(&mut self, class_id: u32, class_handle: Handle) -> Handle {

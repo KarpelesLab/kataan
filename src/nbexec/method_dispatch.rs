@@ -19,6 +19,18 @@ impl<'a> Interp<'a> {
     ) -> Result<Option<NanBox>, ExecError> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
 
+        // Temporal statics: `Temporal.<Type>.from(...)` / `.compare(...)` — a
+        // Temporal instance is not a native, so this only matches a constructor
+        // receiver (mirrors how `Date.now` is recognised). Instance methods route
+        // through the bound-native `N_TEMPORAL_PROTO_FN` handler in `call.rs`.
+        if let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && let Some(cid) = self.realm.native_at(h)
+            && let Some(kind) = crate::nbexec::temporal::kind_for_ctor_id(cid)
+            && let Some(v) = self.temporal_static(kind, recv, method, args)?
+        {
+            return Ok(Some(v));
+        }
+
         // ValidateTypedArray: the data-accessing `%TypedArray%.prototype` methods
         // throw a TypeError up front if the backing buffer is detached (the view was
         // length-0'd on detach, so without this they would silently operate on an

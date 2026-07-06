@@ -213,6 +213,9 @@ pub enum Cell {
     Promise(Rc<RefCell<PromiseState>>),
     /// A `Date`: milliseconds since the Unix epoch (UTC).
     Date(f64),
+    /// A branded `Temporal.*` instance (immutable; one uniform record for every
+    /// Temporal type, shared behind an `Rc`).
+    Temporal(alloc::rc::Rc<crate::temporal_iso::TemporalData>),
     /// A `RegExp`: its source pattern and flags (compiled on demand by the
     /// `regex` engine, so the variant itself carries no feature-gated type).
     RegExp {
@@ -406,6 +409,15 @@ impl Cell {
         }
     }
 
+    /// The `Temporal.*` internal-slot record, if this cell is a Temporal instance.
+    #[must_use]
+    pub fn as_temporal(&self) -> Option<&alloc::rc::Rc<crate::temporal_iso::TemporalData>> {
+        match self {
+            Cell::Temporal(t) => Some(t),
+            _ => None,
+        }
+    }
+
     /// The `(source, flags)` if this cell is a `RegExp`.
     #[must_use]
     pub fn as_regexp(&self) -> Option<(&str, &str)> {
@@ -465,6 +477,7 @@ impl Cell {
             | Cell::Collection { .. }
             | Cell::Promise(_)
             | Cell::Date(_)
+            | Cell::Temporal(_)
             | Cell::RegExp { .. }
             | Cell::Proxy { .. } => "object",
             // An internal byte backing store is never a user-visible value; it is
@@ -592,6 +605,7 @@ impl Trace for Cell {
             | Cell::Native(_)
             | Cell::HostFn(_)
             | Cell::Date(_)
+            | Cell::Temporal(_)
             | Cell::RegExp { .. }
             | Cell::Symbol { .. }
             | Cell::BigInt(_)
@@ -646,6 +660,7 @@ impl crate::gc::Relocate for Cell {
             | Cell::Native(_)
             | Cell::HostFn(_)
             | Cell::Date(_)
+            | Cell::Temporal(_)
             | Cell::RegExp { .. }
             | Cell::Symbol { .. }
             | Cell::BigInt(_)
