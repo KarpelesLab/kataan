@@ -138,6 +138,20 @@ impl<'a> Interp<'a> {
         self.realm.to_display_string(k)
     }
 
+    /// Inverse of [`member_key`] for handing a property key to a Proxy trap: a
+    /// `"\0sym:<id>"` storage key becomes the real Symbol *value* (so the trap sees
+    /// `Symbol(Symbol.iterator)`, not the internal sentinel string); any other key
+    /// becomes a String.
+    pub(crate) fn key_to_value(&mut self, name: &str) -> NanBox {
+        if let Some(idstr) = name.strip_prefix("\u{0}sym:")
+            && let Ok(id) = idstr.parse::<u64>()
+            && let Some(sh) = self.realm.symbol_for_id(id)
+        {
+            return NanBox::handle(sh.to_raw());
+        }
+        self.new_str(name)
+    }
+
     /// The `(old, next)` pair for a `++`/`--` on `current`: `old` is the numeric (or
     /// BigInt) value to yield for a postfix update, `next` the incremented/decremented
     /// value to store. Runs `ToNumeric` (a BigInt stays BigInt; an object operand goes
@@ -496,7 +510,7 @@ impl<'a> Interp<'a> {
                                         if let Some(trap) =
                                             self.proxy_trap(handler, "deleteProperty")?
                                         {
-                                            let kb = self.new_str(&name);
+                                            let kb = self.key_to_value(&name);
                                             let handler_box = NanBox::handle(handler.to_raw());
                                             let r = self.call_with_this(
                                                 trap,
@@ -1764,7 +1778,7 @@ impl<'a> Interp<'a> {
         };
         self.guard_revoked(handle)?;
         if let Some(trap) = self.proxy_trap(handler, "set")? {
-            let key_box = self.new_str(key);
+            let key_box = self.key_to_value(key);
             let handler_box = NanBox::handle(handler.to_raw());
             let r = self.call_with_this(
                 trap,
@@ -1795,7 +1809,7 @@ impl<'a> Interp<'a> {
             self.guard_revoked(handle)?;
             if let Some(trap) = self.proxy_trap(handler, "set")? {
                 let name = self.member_key(key);
-                let key_box = self.new_str(&name);
+                let key_box = self.key_to_value(&name);
                 let recv = NanBox::handle(handle.to_raw());
                 let handler_box = NanBox::handle(handler.to_raw());
                 let r = self.call_with_this(
@@ -2141,7 +2155,7 @@ impl<'a> Interp<'a> {
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
             if let Some(trap) = self.proxy_trap(handler, "get")? {
-                let key = self.new_str(name);
+                let key = self.key_to_value(name);
                 let recv = NanBox::handle(handle.to_raw());
                 let handler_box = NanBox::handle(handler.to_raw());
                 let result = self.call_with_this(
@@ -3325,7 +3339,7 @@ impl<'a> Interp<'a> {
             self.guard_revoked(handle)?;
             if let Some(trap) = self.proxy_trap(handler, "set")? {
                 let key = self.eval_prop_key(property)?;
-                let key_box = self.new_str(&key);
+                let key_box = self.key_to_value(&key);
                 let recv = NanBox::handle(handle.to_raw());
                 let handler_box = NanBox::handle(handler.to_raw());
                 let r = self.call_with_this(

@@ -212,7 +212,7 @@ impl<'a> Interp<'a> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "getOwnPropertyDescriptor")? {
-                let key_v = self.new_str(key);
+                let key_v = self.key_to_value(key);
                 let handler_box = NanBox::handle(handler.to_raw());
                 let trap_result = self.call_with_this(
                     trap,
@@ -528,7 +528,7 @@ impl<'a> Interp<'a> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "defineProperty")? {
-                let key_v = self.new_str(key);
+                let key_v = self.key_to_value(key);
                 let handler_box = NanBox::handle(handler.to_raw());
                 let r = self.call_with_this(
                     trap,
@@ -1507,7 +1507,7 @@ impl<'a> Interp<'a> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "deleteProperty")? {
-                let kb = self.new_str(key);
+                let kb = self.key_to_value(key);
                 let handler_box = NanBox::handle(handler.to_raw());
                 let r =
                     self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw()), kb])?;
@@ -1866,7 +1866,7 @@ impl<'a> Interp<'a> {
             if let Some((target, handler)) = self.realm.proxy_at(c) {
                 self.guard_revoked(c)?;
                 if let Some(trap) = self.proxy_trap(handler, "has")? {
-                    let kb = self.new_str(key);
+                    let kb = self.key_to_value(key);
                     let handler_box = NanBox::handle(handler.to_raw());
                     let r = self.call_with_this(
                         trap,
