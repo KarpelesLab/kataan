@@ -2357,17 +2357,23 @@ impl<'a> Interp<'a> {
                 .get(1)
                 .and_then(|v| v.as_handle())
                 .map(Handle::from_raw)
-                && let Some(maxv) = self.realm.get_property(opts, "maxByteLength")
-                && !matches!(maxv.unpack(), Unpacked::Undefined)
             {
-                let max_f = self.coerce_to_integer_or_infinity(maxv)?;
-                let max =
-                    self.validate_alloc_len(max_f, "Invalid SharedArrayBuffer maxByteLength")?;
-                if max < n {
-                    let m = self.new_str("SharedArrayBuffer maxByteLength is smaller than length");
-                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                // `read_member` runs a `maxByteLength` *getter* (so a poisoned
+                // accessor propagates), unlike `get_property`.
+                let maxv = self.read_member(opts, "maxByteLength")?;
+                if matches!(maxv.unpack(), Unpacked::Undefined) {
+                    None
+                } else {
+                    let max_f = self.coerce_to_integer_or_infinity(maxv)?;
+                    let max =
+                        self.validate_alloc_len(max_f, "Invalid SharedArrayBuffer maxByteLength")?;
+                    if max < n {
+                        let m =
+                            self.new_str("SharedArrayBuffer maxByteLength is smaller than length");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
+                    Some(max)
                 }
-                Some(max)
             } else {
                 None
             };
