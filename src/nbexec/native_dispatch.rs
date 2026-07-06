@@ -101,6 +101,12 @@ impl<'a> Interp<'a> {
                         self.type_error("Atomics on BigInt typed arrays is not yet supported")
                     );
                 }
+                // A *writing* atomic op (every one but `load`) on an immutable
+                // ArrayBuffer is a TypeError, raised before the index/value
+                // `valueOf` coercions run (the immutable-arraybuffer proposal).
+                if id != N_ATOMICS_LOAD {
+                    self.guard_view_immutable(ta)?;
+                }
                 let len = self.realm.array_length(ta).unwrap_or(0);
                 let idx_f = self.coerce_to_integer_or_infinity(arg(1))?;
                 if !(idx_f.is_finite() && idx_f >= 0.0 && (idx_f as usize) < len) {
