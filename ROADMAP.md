@@ -357,7 +357,7 @@ one both adds coverage and moves its tests from skipped → ran:
 - **Import attributes / assertions** — IMPLEMENTED (with/assert grammar + JSON/text modules, 94/100, un-skipped).
 - **IsHTMLDDA** (`document.all`) — IMPLEMENTED (34/34, un-skipped).
 - **cross-realm** (`$262.createRealm`) — IMPLEMENTED (identity bulk 77/204; deep proto-from-ctor-realm ledgered).
-- **Tail-call optimization** (proper tail calls) — still skipped.
+- **Tail-call optimization** — IMPLEMENTED (PTC on both tiers, 34/35, un-skipped).
 
 ### 3.10 The gate
 
