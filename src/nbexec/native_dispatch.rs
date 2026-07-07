@@ -204,9 +204,9 @@ impl<'a> Interp<'a> {
                     NanBox::number(old)
                 }
             }
-            N_ATOMICS_NOTIFY | N_ATOMICS_WAIT => {
-                // `notify`/`wait` operate only on a *waitable* integer TypedArray —
-                // `Int32Array` (kind 5) or `BigInt64Array` (kind 9)
+            N_ATOMICS_NOTIFY | N_ATOMICS_WAIT | N_ATOMICS_WAIT_ASYNC => {
+                // `notify`/`wait`/`waitAsync` operate only on a *waitable* integer
+                // TypedArray — `Int32Array` (kind 5) or `BigInt64Array` (kind 9)
                 // (ValidateIntegerTypedArray with `waitable = true`).
                 let Some(ta) = arg(0).as_handle().map(Handle::from_raw) else {
                     return Err(
@@ -228,11 +228,11 @@ impl<'a> Interp<'a> {
                 if self.typed_array_detached(ta) {
                     return Err(self.type_error("Atomics called on a detached ArrayBuffer"));
                 }
-                // `wait` requires a *shared* buffer; a non-shared buffer is a
-                // TypeError raised BEFORE the index/value/timeout coercions (their
-                // `valueOf` must not run — the poisoned-args tests). `notify`
-                // allows a non-shared buffer (it returns 0).
-                if id == N_ATOMICS_WAIT {
+                // `wait`/`waitAsync` require a *shared* buffer; a non-shared buffer
+                // is a TypeError raised BEFORE the index/value/timeout coercions
+                // (their `valueOf` must not run — the poisoned-args tests).
+                // `notify` allows a non-shared buffer (it returns 0).
+                if id == N_ATOMICS_WAIT || id == N_ATOMICS_WAIT_ASYNC {
                     let shared = self.realm.typed_array_object(ta).is_some_and(|buf| {
                         self.realm
                             .get_property(buf, SHARED_ARRAY_BUFFER_BRAND)
@@ -250,46 +250,62 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("Atomics index out of range");
                     return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
                 }
+                let idx = idx_f as usize;
                 if id == N_ATOMICS_NOTIFY {
                     // Coerce `count` (default +Infinity, else ToIntegerOrInfinity
-                    // clamped to ≥ 0) — its `valueOf` runs and may throw. This
-                    // engine is single-agent: no agent is ever in the wait list, so
-                    // (and always, for a non-shared buffer) `notify` returns 0.
-                    if !matches!(arg(2).unpack(), crate::nanbox::Unpacked::Undefined) {
-                        let _ = self.coerce_to_integer_or_infinity(arg(2))?;
-                    }
-                    NanBox::number(0.0)
+                    // clamped to ≥ 0) — its `valueOf` runs and may throw. Then wake
+                    // up to `count` matching `waitAsync` waiters (single-agent: no
+                    // *blocking* `wait` can ever be parked, but same-agent
+                    // `waitAsync` promises can), returning the number woken.
+                    let count = if matches!(arg(2).unpack(), crate::nanbox::Unpacked::Undefined) {
+                        f64::INFINITY
+                    } else {
+                        self.coerce_to_integer_or_infinity(arg(2))?.max(0.0)
+                    };
+                    let woken = self.atomics_notify(ta, idx, kind, count);
+                    NanBox::number(woken as f64)
                 } else {
-                    // `wait` on a shell-like host ([[CanBlock]] = true): coerce
-                    // `value` then `timeout` (running their `valueOf`), read the
-                    // current element, and resolve. This engine is single-agent, so
-                    // no `notify` can ever arrive — the result is "not-equal" (the
-                    // element no longer holds `value`) or "timed-out" (nothing will
-                    // wake it). Tests that require [[CanBlock]] = false carry
-                    // flags:[CanBlockIsFalse] and are skipped by the runner.
-                    let idx = idx_f as usize;
-                    let equal = if crate::nbexec::is_bigint_kind(kind) {
+                    // `wait`/`waitAsync` on a shell-like host ([[CanBlock]] = true):
+                    // coerce `value` then `timeout` (running their `valueOf`) and
+                    // read the current element. `wait` blocks; this engine is
+                    // single-agent, so no `notify` can arrive mid-block — a matching
+                    // value resolves "timed-out" (nothing wakes it), a mismatch
+                    // "not-equal". `waitAsync` instead parks an async waiter that a
+                    // later same-agent `notify` can resolve "ok". Tests needing
+                    // [[CanBlock]] = false carry flags:[CanBlockIsFalse] (skipped).
+                    let (equal, timeout) = if crate::nbexec::is_bigint_kind(kind) {
                         let v = self.coerce_to_bigint(arg(2))?.to_u64_wrapping();
-                        if !matches!(arg(3).unpack(), crate::nanbox::Unpacked::Undefined) {
-                            let _ = self.coerce_to_number(arg(3))?;
-                        }
+                        let timeout =
+                            if matches!(arg(3).unpack(), crate::nanbox::Unpacked::Undefined) {
+                                f64::INFINITY
+                            } else {
+                                let tn = self.coerce_to_number(arg(3))?;
+                                self.realm.to_number(tn)
+                            };
                         let w = match self.realm.typed_get(ta, idx) {
                             Some(b) => self.coerce_to_bigint(b)?.to_u64_wrapping(),
                             None => 0,
                         };
-                        w == v
+                        (w == v, timeout)
                     } else {
                         let v = self.coerce_to_integer_or_infinity(arg(2))? as i64 as i32;
-                        if !matches!(arg(3).unpack(), crate::nanbox::Unpacked::Undefined) {
-                            let _ = self.coerce_to_number(arg(3))?;
-                        }
+                        let timeout =
+                            if matches!(arg(3).unpack(), crate::nanbox::Unpacked::Undefined) {
+                                f64::INFINITY
+                            } else {
+                                let tn = self.coerce_to_number(arg(3))?;
+                                self.realm.to_number(tn)
+                            };
                         let w = self
                             .realm
                             .typed_get(ta, idx)
                             .and_then(|x| x.as_number())
                             .unwrap_or(0.0) as i64 as i32;
-                        w == v
+                        (w == v, timeout)
                     };
+                    if id == N_ATOMICS_WAIT_ASYNC {
+                        return Ok(self.atomics_wait_async(ta, idx, kind, equal, timeout));
+                    }
                     let s = self.new_str(if equal { "timed-out" } else { "not-equal" });
                     return Ok(s);
                 }
@@ -2711,6 +2727,19 @@ impl<'a> Interp<'a> {
             N_262_CREATE_REALM => return self.create_realm(),
             // `realm.evalScript(src)` — evaluate `src` in the receiver realm.
             N_262_EVAL_SCRIPT => return self.eval_script_in_realm(arg(0)),
+            // Test262 `$262.agent` cooperative scheduler (see the `agent` module).
+            N_262_AGENT_START => return self.agent_start(arg(0)),
+            N_262_AGENT_BROADCAST => return self.agent_broadcast(arg(0)),
+            N_262_AGENT_GET_REPORT => return Ok(self.agent_get_report()),
+            N_262_AGENT_GET_REPORT_ASYNC => return self.agent_get_report_async(),
+            N_262_AGENT_REPORT => return self.agent_report(arg(0)),
+            N_262_AGENT_RECEIVE_BROADCAST => {
+                return self.agent_receive_broadcast(arg(0));
+            }
+            // `sleep(ms)` — a cooperative no-op; `leaving()`/`tryYield` are handled
+            // entirely in JS (the worker prelude), so no native is needed for them.
+            N_262_AGENT_SLEEP => NanBox::undefined(),
+            N_262_AGENT_MONOTONIC_NOW => NanBox::number(self.agent_monotonic_now()),
             // `DisposableStack()` / `AsyncDisposableStack()` / `ShadowRealm()`
             // called without `new` is a TypeError (they require a `[[Construct]]`).
             N_DISPOSABLE_STACK | N_ASYNC_DISPOSABLE_STACK | N_SHADOW_REALM => {

@@ -64,7 +64,19 @@ var $262 = {
   evalScript: function (src) { return (0, eval)(src); },
   detachArrayBuffer: function (b) { return $262_detachArrayBuffer(b); },
   createRealm: function () { return $262_createRealm(); },
-  IsHTMLDDA: $262_IsHTMLDDA()
+  IsHTMLDDA: $262_IsHTMLDDA(),
+  agent: {
+    start: function (src) { return $262_agent_start(src); },
+    broadcast: function (sab) { return $262_agent_broadcast(sab); },
+    safeBroadcast: function (ta) { return $262_agent_broadcast(ta.buffer); },
+    getReport: function () { return $262_agent_getReport(); },
+    getReportAsync: function () { return $262_agent_getReportAsync(); },
+    report: function (m) { return $262_agent_report(m); },
+    receiveBroadcast: function (f) { return $262_agent_receiveBroadcast(f); },
+    leaving: function () {},
+    sleep: function (ms) { return $262_agent_sleep(ms); },
+    monotonicNow: function () { return $262_agent_monotonicNow(); }
+  }
 };
 "#;
 
@@ -77,13 +89,13 @@ const SKIP_FEATURES: &[&str] = &[
     // additionally needs a Uint8Array-over-immutable-ArrayBuffer default export
     // (the import-bytes proposal), which is unimplemented — skip that feature.
     "import-bytes",
-    // Atomics / SharedArrayBuffer: the single-agent deterministic core is
-    // implemented (namespace, ops, SAB construct/grow/slice), so non-gated probes
-    // like `Atomics.pause` already pass. The bulk stays skipped pending the
-    // concurrent part (wait/notify + `$262.agent` threading) and BigInt Atomics —
-    // a local `KATAAN_TEST262_FILTER=Atomics` run currently shows Atomics 34% /
-    // SharedArrayBuffer 79%, too many failures to un-skip cleanly yet.
-    "Atomics.waitAsync",
+    // Atomics / SharedArrayBuffer + `$262.agent`: the cooperative single-threaded
+    // scheduler is now implemented (see `nbexec::agent`) — workers run eagerly to
+    // completion in a fresh realm, reports flow through a shared queue, and
+    // `Atomics.waitAsync`/`notify` settle async waiters. So `Atomics.waitAsync` is
+    // no longer skipped, and the `$262.agent` guard in `run_worker` is removed.
+    // Tests needing *true* interleaving (main blocks in `Atomics.wait` while a
+    // worker runs and notifies) time out and are ledgered.
     // cross-realm: `$262.createRealm` builds a second global environment with
     // distinct intrinsics (see `Interp::create_realm`). The identity bulk passes;
     // the deep `proto-from-ctor-realm` subset (per-function-realm
@@ -528,18 +540,15 @@ fn run_worker(spec: &str) {
             continue;
         };
         let meta = parse_meta(&src);
-        // A test that drives `$262.agent` needs the cooperative agent scheduler
-        // (concurrent Atomics: one agent blocks in `Atomics.wait` until another
-        // `notify`s). That scheduler is not implemented, so skip these regardless
-        // of path — they surface across built-ins/{Atomics,TypedArray,…} via the
-        // `SharedArrayBuffer` feature tag, not just under a single directory.
+        // `$262.agent` tests now run on the cooperative scheduler (`nbexec::agent`):
+        // workers execute eagerly to completion in a fresh realm and report through
+        // a shared queue. Tests needing *true* interleaving (main blocks in
+        // `Atomics.wait` while a worker runs and notifies) instead time out — the
+        // coordinator's idle-kill records them as failures, which are ledgered.
         // `flags: [CanBlockIsFalse]` tests require a host whose main agent has
         // [[CanBlock]] = false (so `Atomics.wait` throws). This engine models a
         // shell host (CanBlock = true, `wait` returns), so skip them.
-        if skip_reason(rel, &meta).is_some()
-            || src.contains("$262.agent")
-            || meta.has_flag("CanBlockIsFalse")
-        {
+        if skip_reason(rel, &meta).is_some() || meta.has_flag("CanBlockIsFalse") {
             let _ = writeln!(f, "R\t{cur}\t{rel}\tSKIP\t");
             continue;
         }

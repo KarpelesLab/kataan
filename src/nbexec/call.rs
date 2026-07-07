@@ -1205,6 +1205,9 @@ impl<'a> Interp<'a> {
                 }
                 N_RESOLVE => self.resolve_with(target, arg0),
                 N_REJECT => self.settle(target, arg0, false),
+                // A finite-timeout `Atomics.waitAsync` waiter's macrotask: if its
+                // promise (`target`) is still parked, settle it `"timed-out"`.
+                N_ATOMICS_ASYNC_TIMEOUT => self.atomics_wait_async_timeout(target),
                 // The `revoke` function from `Proxy.revocable`.
                 N_PROXY_REVOKE => self.realm.revoke_proxy(target),
                 // An async coroutine resume reaction: `target` is the controller

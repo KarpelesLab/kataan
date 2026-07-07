@@ -610,6 +610,50 @@ pub struct Interp<'a> {
     /// data the GC cannot trace and are not serialized (a snapshot drops them,
     /// like IC slots), which is why they live here rather than in the heap.
     host_fns: Vec<Option<HostFn>>,
+    /// Test262 `$262.agent` cooperative-scheduler state (see [`agent`]).
+    agent: AgentState,
+}
+
+/// The Test262 `$262.agent` cooperative scheduler + `Atomics.waitAsync` state.
+///
+/// This engine is single-threaded (the heap is `Rc`, not `Send`), so worker
+/// agents are modeled cooperatively: `$262.agent.start(src)` runs the worker to
+/// completion *eagerly* in a fresh realm, and a worker that registers a
+/// `receiveBroadcast` callback has it invoked later when the main agent
+/// `broadcast`s. Reports flow through a shared FIFO queue. True cross-agent
+/// interleaving (main *blocks* in `Atomics.wait` while a worker runs and
+/// `notify`s) is out of scope — those tests time out and are ledgered.
+#[derive(Default)]
+struct AgentState {
+    /// The shared FIFO report queue: workers `report(msg)` push, the main agent
+    /// `getReport()` pops (returns the front, or `null` when empty).
+    reports: alloc::collections::VecDeque<String>,
+    /// Worker `receiveBroadcast(cb)` callbacks awaiting a `broadcast`: each is
+    /// `(created-realm index, callback)`. Drained (in order) by `broadcast(sab)`,
+    /// which invokes every callback with the SharedArrayBuffer.
+    broadcasts: Vec<(usize, NanBox)>,
+    /// Pending `Atomics.waitAsync` waiters, keyed by `(buffer handle, byte
+    /// index)`; a matching `Atomics.notify` settles the promise with `"ok"`, and
+    /// a finite-timeout waiter is settled `"timed-out"` by a macrotask.
+    waiters: Vec<AtomicsWaiter>,
+    /// The created-realm index of the worker whose source is *currently* running
+    /// eagerly under `$262.agent.start` — so a `receiveBroadcast` callback it
+    /// registers is tagged with the realm to restore when it is later invoked.
+    current_agent_realm: Option<usize>,
+    /// A monotonic tick handed out by `$262.agent.monotonicNow()` (no real clock;
+    /// a strictly non-decreasing counter suffices for the spin-wait idiom).
+    mono: u64,
+}
+
+/// One pending `Atomics.waitAsync` async waiter.
+struct AtomicsWaiter {
+    /// The backing buffer's handle (raw), identifying the wait location together
+    /// with `byte_index` across all views over the same SharedArrayBuffer.
+    buffer: u64,
+    /// The absolute byte offset of the waited-on element within the buffer.
+    byte_index: usize,
+    /// The promise to settle with `"ok"` (a matching `notify`) or `"timed-out"`.
+    promise: Handle,
 }
 
 /// A dynamically-registered host (native) function: the Rust closure
@@ -1480,6 +1524,32 @@ const N_262_CREATE_REALM: u16 = 950;
 /// realm's global environment (swapping in its scope + intrinsics), returning the
 /// completion value.
 const N_262_EVAL_SCRIPT: u16 = 951;
+/// `$262.agent.start(src)` — spawn a worker agent: create a fresh realm, install
+/// a worker-side `$262.agent`, and run `src` eagerly to completion in it.
+const N_262_AGENT_START: u16 = 952;
+/// `$262.agent.broadcast(sab)` / `safeBroadcast(sab)` — deliver the
+/// SharedArrayBuffer to every worker's registered `receiveBroadcast` callback.
+const N_262_AGENT_BROADCAST: u16 = 953;
+/// `$262.agent.getReport()` — pop the front of the shared report queue (or `null`).
+const N_262_AGENT_GET_REPORT: u16 = 954;
+/// `$262.agent.getReportAsync()` — the same, wrapped in a resolved promise.
+const N_262_AGENT_GET_REPORT_ASYNC: u16 = 955;
+/// `$262.agent.report(msg)` — push `ToString(msg)` onto the shared report queue.
+const N_262_AGENT_REPORT: u16 = 956;
+/// `$262.agent.receiveBroadcast(cb)` — register a worker callback for the next
+/// `broadcast` (deferred: invoked when the main agent broadcasts).
+const N_262_AGENT_RECEIVE_BROADCAST: u16 = 957;
+/// `$262.agent.sleep(ms)` — a cooperative no-op (no real clock to block on).
+const N_262_AGENT_SLEEP: u16 = 958;
+/// `$262.agent.monotonicNow()` — a monotonic millisecond clock reading.
+const N_262_AGENT_MONOTONIC_NOW: u16 = 959;
+/// `Atomics.waitAsync(view, idx, value, timeout)` — the async, non-blocking
+/// counterpart of `Atomics.wait`; returns `{ async, value }` (a promise when it
+/// would block) settled `"ok"` by a matching `notify` or `"timed-out"`.
+const N_ATOMICS_WAIT_ASYNC: u16 = 960;
+/// A bound native (target = the waitAsync promise) that a finite-timeout waiter's
+/// macrotask calls to settle it `"timed-out"` if still pending.
+const N_ATOMICS_ASYNC_TIMEOUT: u16 = 961;
 /// `%GeneratorFunction%` — builds a `function*` from dynamic source (like
 /// `%Function%`); reachable via `Object.getPrototypeOf(function*(){}).constructor`.
 const N_GENERATOR_FUNCTION_CTOR: u16 = 905;
@@ -1968,7 +2038,7 @@ fn builtin_native_arity(id: u16) -> u32 {
         // `Atomics.compareExchange(ta, index, expected, replacement)` = 4;
         // `load(ta, index)` = 2; the read-modify-write ops and `store` = 3;
         // `isLockFree(size)` = 1.
-        N_ATOMICS_COMPARE_EXCHANGE | N_ATOMICS_WAIT => 4,
+        N_ATOMICS_COMPARE_EXCHANGE | N_ATOMICS_WAIT | N_ATOMICS_WAIT_ASYNC => 4,
         N_ATOMICS_LOAD => 2,
         N_ATOMICS_ADD | N_ATOMICS_SUB | N_ATOMICS_AND | N_ATOMICS_OR | N_ATOMICS_XOR
         | N_ATOMICS_EXCHANGE | N_ATOMICS_STORE | N_ATOMICS_NOTIFY => 3,
@@ -2515,6 +2585,7 @@ const PCOMB_REJECT: &str = "\u{0}pc_rej";
 const PCOMB_INDEX: &str = "\u{0}pc_idx";
 const PCOMB_CALLED: &str = "\u{0}pc_called";
 
+mod agent;
 mod base64;
 mod call;
 mod class;
@@ -2654,6 +2725,7 @@ impl<'a> Interp<'a> {
             #[cfg(all(feature = "module", feature = "std"))]
             active_module_key: None,
             host_fns: Vec::new(),
+            agent: AgentState::default(),
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run
@@ -3475,6 +3547,7 @@ impl<'a> Interp<'a> {
                 ("pause", N_ATOMICS_PAUSE),
                 ("notify", N_ATOMICS_NOTIFY),
                 ("wait", N_ATOMICS_WAIT),
+                ("waitAsync", N_ATOMICS_WAIT_ASYNC),
             ],
         );
         if let Some(ah) = self.current.get("Atomics").and_then(NanBox::as_handle) {
@@ -3633,6 +3706,17 @@ impl<'a> Interp<'a> {
             // prelude) to this global so cross-realm tests can obtain a second
             // realm with a distinct set of intrinsics.
             ("$262_createRealm", N_262_CREATE_REALM),
+            // Test262 `$262.agent` host hooks (wired by the runner's JS prelude,
+            // and by the worker-side prelude `$262.agent.start` installs). See the
+            // `agent` module for the cooperative-scheduler model.
+            ("$262_agent_start", N_262_AGENT_START),
+            ("$262_agent_broadcast", N_262_AGENT_BROADCAST),
+            ("$262_agent_getReport", N_262_AGENT_GET_REPORT),
+            ("$262_agent_getReportAsync", N_262_AGENT_GET_REPORT_ASYNC),
+            ("$262_agent_report", N_262_AGENT_REPORT),
+            ("$262_agent_receiveBroadcast", N_262_AGENT_RECEIVE_BROADCAST),
+            ("$262_agent_sleep", N_262_AGENT_SLEEP),
+            ("$262_agent_monotonicNow", N_262_AGENT_MONOTONIC_NOW),
         ] {
             let f = self.new_named_native(name, id);
             self.current.declare(name, NanBox::handle(f.to_raw()));

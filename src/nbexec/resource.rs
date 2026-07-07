@@ -379,7 +379,14 @@ impl<'a> Interp<'a> {
     /// deep `proto-from-ctor-realm` subset (which needs per-function realm tagging
     /// so `GetPrototypeFromConstructor` picks the *newTarget's* realm's intrinsic)
     /// is intentionally left for a follow-up.
-    pub(crate) fn create_realm(&mut self) -> Result<NanBox, ExecError> {
+    /// Builds a fresh, genuinely distinct realm environment (its own
+    /// `install_globals` populating a brand-new root scope, so its intrinsics are
+    /// separate heap cells from every other realm's), records it in
+    /// `created_realms`, and returns its index. The active realm's environment
+    /// (scope, `globalThis`, intrinsic prototype pointers) is saved and restored,
+    /// so the caller keeps running in its original realm. Shared by
+    /// `$262.createRealm` and `$262.agent.start` (each worker gets its own realm).
+    pub(crate) fn create_realm_env(&mut self) -> usize {
         // Save the active realm's environment.
         let saved_current = self.current.clone();
         let saved_global_scope = self.global_scope.clone();
@@ -417,13 +424,18 @@ impl<'a> Interp<'a> {
         self.strict = saved_strict;
         self.realm.restore_intrinsics(saved_intrinsics);
 
-        // Record the new realm and build the returned realm object.
         let idx = self.created_realms.len();
         self.created_realms.push(CreatedRealm {
             global_scope: new_global_scope,
             global_this: new_global_this,
             intrinsics: new_intrinsics,
         });
+        idx
+    }
+
+    pub(crate) fn create_realm(&mut self) -> Result<NanBox, ExecError> {
+        let idx = self.create_realm_env();
+        let new_global_this = self.created_realms[idx].global_this;
         let realm_obj = self.realm.new_object();
         self.realm
             .set_hidden_property(realm_obj, CREATED_REALM_IDX, NanBox::number(idx as f64));
@@ -454,17 +466,29 @@ impl<'a> Interp<'a> {
         let Some(idx) = idx.filter(|i| *i < self.created_realms.len()) else {
             return Err(self.type_error("evalScript called on an object that is not a realm"));
         };
+        let source = self.coerce_to_string(src)?;
+        self.eval_source_in_realm(idx, &source)
+    }
+
+    /// Evaluates `source` (as a Script) in the created realm at `idx`, swapping in
+    /// that realm's global scope + intrinsics for the duration and restoring the
+    /// caller's afterward. Shared by `evalScript` and `$262.agent.start` (which
+    /// runs a worker's whole source in its own realm).
+    pub(crate) fn eval_source_in_realm(
+        &mut self,
+        idx: usize,
+        source: &str,
+    ) -> Result<NanBox, ExecError> {
         if self.eval_depth >= self.realm.limits.max_eval_depth {
             let msg = self.new_str("Maximum call stack size exceeded");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(msg))));
         }
-        let source = self.coerce_to_string(src)?;
         let scope = self.created_realms[idx].global_scope.clone();
         let global_this = self.created_realms[idx].global_this;
         let intrinsics = self.created_realms[idx].intrinsics;
 
         // Parse first so a SyntaxError surfaces before any environment swap.
-        let program = self.parse_eval_program(&source, false, false, false, false)?;
+        let program = self.parse_eval_program(source, false, false, false, false)?;
 
         let saved_current = self.current.clone();
         let saved_global_scope = self.global_scope.clone();
