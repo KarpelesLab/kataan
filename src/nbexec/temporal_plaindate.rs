@@ -390,7 +390,16 @@ impl<'a> Interp<'a> {
             )
             .ok_or_else(|| self.type_error("toPlainDateTime: invalid time"));
         }
-        // ISO string.
+        // Only a String parses to a time; any other primitive (number, boolean,
+        // …) is a TypeError under ToTemporalTime, not a RangeError.
+        let is_string = v
+            .as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| self.realm.string_value(h).is_some());
+        if !is_string {
+            return Err(self
+                .type_error("toPlainDateTime: expected a time, time-like object, or ISO string"));
+        }
         let s = self.coerce_to_string(v)?;
         parse_iso_datetime(&s)
             .and_then(|p| p.time.or(Some(IsoTime::default())))
