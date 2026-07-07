@@ -348,7 +348,7 @@ helper edges, `Iterator.zip`/`zipKeyed`), **String** (54), **Function** (59 —
 These are removed from the *ran* denominator via `SKIP_FEATURES`; implementing any
 one both adds coverage and moves its tests from skipped → ran:
 
-- **Temporal** — the entire date/time subsystem (hundreds of tests).
+- **Temporal** — IMPLEMENTED (~90%, 4134/4603): all 9 types + Now, un-skipped. Remaining: i128 Duration precision, DST edges, per-type parser polish.
 - **Decorators** — class/field decorators + `Symbol.metadata`.
 - **Tail-call optimization** (proper tail calls).
 - **Import attributes / assertions** (with §3.1).
