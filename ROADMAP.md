@@ -340,8 +340,11 @@ helper edges, `Iterator.zip`/`zipKeyed`), **String** (54), **Function** (59 —
   isLockFree` over integer typed arrays, and `SharedArrayBuffer` (constructor,
   `byteLength`/`growable`/`maxByteLength`, `grow`, `slice`, and full typed-array/
   `DataView`/`Atomics` backing). What remains is the genuinely concurrent part:
-  `wait`/`notify`/`waitAsync` and the **agents** harness — a real threading/worker
-  substrate (still skip-gated; large). Corpus un-skip pending that.
+  `waitAsync`/`notify` + the **`$262.agent`** harness are now IMPLEMENTED via a
+  single-threaded COOPERATIVE scheduler (workers run eagerly to completion in a fresh
+  realm, shared FIFO report queue, async waiters settle on the microtask queue):
+  Atomics 320/388 (82%), un-skipped. True-interleaving (main blocks in `wait` while a
+  worker notifies) + real-elapsed-timeout cases are ledgered (need whole-script suspension).
 
 ### 3.9 Whole subsystems currently skipped (each a project)
 
