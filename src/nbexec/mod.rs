@@ -1456,6 +1456,12 @@ const N_SAB_ACCESSOR: u16 = 911;
 /// `SharedArrayBuffer.prototype.slice` on a plain `ArrayBuffer` is a TypeError
 /// (and the AB methods reject a shared receiver).
 const N_SAB_PROTO_FN: u16 = 912;
+/// `$262_IsHTMLDDA()` — the Test262 host hook (`$262.IsHTMLDDA`). Returns a fresh
+/// [[IsHTMLDDA]] exotic object (the Annex-B `document.all` value): an ordinary
+/// object branded with [`crate::realm::HTMLDDA_SLOT`], so `typeof` reports
+/// `"undefined"`, it is falsy, it is loosely equal to `null`/`undefined`, and its
+/// `[[Call]]` returns `null`.
+const N_HTMLDDA: u16 = 913;
 /// `%GeneratorFunction%` — builds a `function*` from dynamic source (like
 /// `%Function%`); reachable via `Object.getPrototypeOf(function*(){}).constructor`.
 const N_GENERATOR_FUNCTION_CTOR: u16 = 905;
@@ -3581,6 +3587,9 @@ impl<'a> Interp<'a> {
             // Test262 host hook: `$262.detachArrayBuffer` is wired (by the runner's
             // JS prelude) to this global so detach-dependent tests can run.
             ("$262_detachArrayBuffer", N_DETACH_ARRAY_BUFFER),
+            // Test262 host hook: `$262.IsHTMLDDA` is wired (by the runner's JS
+            // prelude) to this global so [[IsHTMLDDA]] tests can obtain the value.
+            ("$262_IsHTMLDDA", N_HTMLDDA),
         ] {
             let f = self.new_named_native(name, id);
             self.current.declare(name, NanBox::handle(f.to_raw()));

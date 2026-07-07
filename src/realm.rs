@@ -52,6 +52,15 @@ pub(crate) const PROMISE_STATE_SLOT: &str = "\u{0}PromiseState";
 /// it never enumerates (`Object.keys`/`getOwnPropertyNames`).
 pub(crate) const TEMPORAL_SLOT: &str = "\u{0}temporal";
 
+/// The hidden internal-slot key that brands an ordinary object as an
+/// **[[IsHTMLDDA]]** exotic object (the Annex-B `document.all` value, exposed to
+/// Test262 as `$262.IsHTMLDDA`). The object is otherwise an ordinary extensible
+/// object (so `defineProperty`, a `[[Prototype]]`, `instanceof`, etc. all work),
+/// but its presence makes `typeof` report `"undefined"`, `ToBoolean` report
+/// `false`, loose equality with `null`/`undefined` report `true`, and its
+/// `[[Call]]` return `null`. `\u{0}`-prefixed so it never enumerates.
+pub(crate) const HTMLDDA_SLOT: &str = "\u{0}htmldda";
+
 /// Bytes-per-element for each typed-array `kind` (index into the engine's
 /// `TYPED_ARRAY_KINDS` table: Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32,
 /// Uint32, Float32, Float64, BigInt64, BigUint64). A `kind` outside the table
@@ -4006,9 +4015,25 @@ impl Realm {
             if let Some(n) = self.bigint_at(h) {
                 return !n.is_zero(); // `0n` is falsy
             }
+            // An [[IsHTMLDDA]] exotic object (`document.all`) is falsy.
+            if self.is_html_dda(h) {
+                return false;
+            }
             return true;
         }
         v.to_boolean()
+    }
+
+    /// Whether the value at `handle` is an **[[IsHTMLDDA]]** exotic object (the
+    /// Annex-B `document.all` value): an ordinary object carrying the hidden
+    /// [`HTMLDDA_SLOT`] brand. Such an object lies about `typeof` (`"undefined"`),
+    /// is falsy, is loosely equal to `null`/`undefined`, and is callable.
+    #[must_use]
+    pub fn is_html_dda(&self, handle: Handle) -> bool {
+        // Only an ordinary object can carry the brand; skip the property lookup
+        // for every other cell kind so the hot `typeof`/`truthy` paths stay cheap.
+        matches!(self.heap.get(handle), Some(Cell::Object(_)))
+            && self.get_property(handle, HTMLDDA_SLOT).is_some()
     }
 
     /// The `typeof` string for any value: primitives via the box
@@ -4019,6 +4044,11 @@ impl Realm {
         match v.as_handle() {
             Some(raw) => {
                 let h = Handle::from_raw(raw);
+                // An [[IsHTMLDDA]] exotic object (`document.all`) reports
+                // `typeof` as `"undefined"` despite being an object.
+                if self.is_html_dda(h) {
+                    return "undefined";
+                }
                 // A proxy reflects its target's `typeof` (function vs object).
                 if let Some((target, _)) = self.proxy_at(h) {
                     return self.type_of(target).unwrap_or("object");
@@ -4140,9 +4170,23 @@ impl Realm {
         use crate::nanbox::Unpacked::{Bool, Handle as H, Null, Undefined};
         let (ua, ub) = (a.unpack(), b.unpack());
         let nullish = |u| matches!(u, Undefined | Null);
-        // null/undefined are == to each other and to nothing else.
+        // null/undefined are == to each other and to nothing else — *except* an
+        // [[IsHTMLDDA]] exotic object (`document.all`), which the Abstract
+        // Equality Comparison special-cases as == to both `null` and `undefined`.
         if nullish(ua) || nullish(ub) {
-            return nullish(ua) && nullish(ub);
+            if nullish(ua) && nullish(ub) {
+                return true;
+            }
+            // The non-nullish side, if it is an [[IsHTMLDDA]] object, is == here.
+            let other = if nullish(ua) { b } else { a };
+            if other
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|h| self.is_html_dda(h))
+            {
+                return true;
+            }
+            return false;
         }
         // Two references: strings by value, objects by identity.
         if matches!(ua, H(_)) && matches!(ub, H(_)) {

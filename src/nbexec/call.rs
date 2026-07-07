@@ -6,6 +6,8 @@ impl<'a> Interp<'a> {
             || self.realm.host_fn_at(handle).is_some()
             || self.realm.function_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
+            // An [[IsHTMLDDA]] exotic object (`document.all`) has a `[[Call]]`.
+            || self.realm.is_html_dda(handle)
             // A bound function (`fn.bind(...)`) is callable.
             || self.realm.get_property(handle, BOUND_TARGET).is_some()
             // A proxy is callable iff its target is.
@@ -136,6 +138,27 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         };
         let handle = Handle::from_raw(raw);
+        // An [[IsHTMLDDA]] exotic object's `[[Call]]` (Annex B `document.all`):
+        // return `null` when called with no arguments, or when the first argument
+        // is `undefined` or the empty String; otherwise the host-defined result
+        // (here `undefined`). Test262 only exercises the `null`-returning cases.
+        if self.realm.is_html_dda(handle) {
+            let returns_null = match args.first().copied() {
+                None => true,
+                Some(a) => {
+                    matches!(a.unpack(), Unpacked::Undefined)
+                        || a.as_handle()
+                            .map(Handle::from_raw)
+                            .and_then(|h| self.realm.string_value(h))
+                            .is_some_and(|s| s.is_empty())
+                }
+            };
+            return Ok(if returns_null {
+                NanBox::null()
+            } else {
+                NanBox::undefined()
+            });
+        }
         // `Array(...)` without `new` behaves like `new Array(...)`.
         if self.current.get("Array").and_then(|v| v.as_handle()) == callee.as_handle() {
             return self.construct(callee, args);

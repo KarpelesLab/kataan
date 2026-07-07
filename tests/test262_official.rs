@@ -64,7 +64,7 @@ var $262 = {
   evalScript: function (src) { return (0, eval)(src); },
   detachArrayBuffer: function (b) { return $262_detachArrayBuffer(b); },
   createRealm: function () { throw new TypeError('$262.createRealm is not supported'); },
-  IsHTMLDDA: undefined
+  IsHTMLDDA: $262_IsHTMLDDA()
 };
 "#;
 
@@ -84,7 +84,6 @@ const SKIP_FEATURES: &[&str] = &[
     // SharedArrayBuffer 79%, too many failures to un-skip cleanly yet.
     "Atomics.waitAsync",
     "cross-realm",
-    "IsHTMLDDA",
 ];
 
 /// The subset of frontmatter the runner acts on.

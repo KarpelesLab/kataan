@@ -2690,6 +2690,21 @@ impl<'a> Interp<'a> {
                 self.detach_array_buffer(buf);
                 NanBox::null()
             }
+            // `$262_IsHTMLDDA()` — the Test262 `$262.IsHTMLDDA` host hook. Returns
+            // a fresh [[IsHTMLDDA]] exotic object: an ordinary extensible object
+            // (with `Object.prototype` as its `[[Prototype]]`) branded with the
+            // hidden `HTMLDDA_SLOT`. The brand drives the exotic `typeof`
+            // (`"undefined"`), `ToBoolean` (`false`), loose-equality-with-nullish
+            // (`true`), and `[[Call]]` (returns `null`) behaviours.
+            N_HTMLDDA => {
+                let obj = self.realm.new_object();
+                self.realm.set_hidden_property(
+                    obj,
+                    crate::realm::HTMLDDA_SLOT,
+                    NanBox::boolean(true),
+                );
+                NanBox::handle(obj.to_raw())
+            }
             // `DisposableStack()` / `AsyncDisposableStack()` / `ShadowRealm()`
             // called without `new` is a TypeError (they require a `[[Construct]]`).
             N_DISPOSABLE_STACK | N_ASYNC_DISPOSABLE_STACK | N_SHADOW_REALM => {
