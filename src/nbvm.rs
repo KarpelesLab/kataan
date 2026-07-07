@@ -235,6 +235,18 @@ pub enum Op {
     Throw { src: Reg },
     /// Halt, yielding the value in `src`.
     Return { src: Reg },
+    /// Proper tail call to static function `func` with `args` (strict-mode PTC):
+    /// instead of pushing a new activation, the callee *reuses* the current
+    /// frame (the interpreter trampolines in [`call_with_inner`]), so unbounded
+    /// tail recursion runs in O(1) native stack. Emitted only for a `return`
+    /// (and its tail-transparent sub-expressions) in a strict, non-async
+    /// function. No `dst`: it is the frame's final act.
+    TailCall { func: u32, args: Vec<Reg> },
+    /// Proper tail call through a function *value* held in `callee` (the indirect
+    /// analogue of [`Op::TailCall`], mirroring [`Op::CallValue`]). If `callee`
+    /// is not a plain VM function, it degrades to an ordinary call whose result
+    /// is returned.
+    TailCallValue { callee: Reg, args: Vec<Reg> },
 }
 
 // `Op::ValueBin` op codes.
@@ -496,83 +508,125 @@ fn call_with_inner(
     captures: &[NanBox],
     this_val: NanBox,
 ) -> Result<NanBox, VmError> {
-    // `id` can originate from a runtime value (an indirect call reads it out of a
-    // callee array's slot 0), so a hostile script can make it point past the
-    // function table. Surface a catchable TypeError instead of indexing OOB.
-    let Some(proto) = funcs.get(id) else {
-        let e = make_error(ctx.realm, "TypeError", "not a function");
-        return Err(VmError::Thrown(e));
-    };
-    let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
-    match proto.rest_from {
-        // A rest parameter: fixed args fill `0..fixed`, the remainder becomes an
-        // array in register `fixed`.
-        Some(fixed) => {
-            for (i, a) in args.iter().enumerate().take(fixed) {
-                regs[i] = *a;
+    // Owned copies of the activation inputs; a proper tail call (`FrameExit::Tail`)
+    // rebinds these and loops *without* recursing, so unbounded tail recursion
+    // reuses this one native frame (O(1) stack) rather than growing it.
+    let mut id = id;
+    let mut args: Vec<NanBox> = args.to_vec();
+    let mut captures: Vec<NanBox> = captures.to_vec();
+    let mut this_val = this_val;
+    loop {
+        // `id` can originate from a runtime value (an indirect call reads it out of
+        // a callee array's slot 0), so a hostile script can make it point past the
+        // function table. Surface a catchable TypeError instead of indexing OOB.
+        let Some(proto) = funcs.get(id) else {
+            let e = make_error(ctx.realm, "TypeError", "not a function");
+            return Err(VmError::Thrown(e));
+        };
+        let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
+        match proto.rest_from {
+            // A rest parameter: fixed args fill `0..fixed`, the remainder becomes an
+            // array in register `fixed`.
+            Some(fixed) => {
+                for (i, a) in args.iter().enumerate().take(fixed) {
+                    regs[i] = *a;
+                }
+                let rest: Vec<NanBox> = args.get(fixed..).unwrap_or(&[]).to_vec();
+                let arr = ctx.realm.new_array(rest);
+                if fixed < regs.len() {
+                    regs[fixed] = NanBox::handle(arr.to_raw());
+                }
             }
-            let rest: Vec<NanBox> = args.get(fixed..).unwrap_or(&[]).to_vec();
-            let arr = ctx.realm.new_array(rest);
-            if fixed < regs.len() {
-                regs[fixed] = NanBox::handle(arr.to_raw());
+            None => {
+                for (i, a) in args.iter().enumerate().take(proto.n_params) {
+                    regs[i] = *a;
+                }
             }
         }
-        None => {
-            for (i, a) in args.iter().enumerate().take(proto.n_params) {
-                regs[i] = *a;
+        for (i, c) in captures.iter().enumerate().take(proto.n_captures) {
+            regs[proto.n_params + i] = *c;
+        }
+        // The `this` slot sits right after the captures.
+        if let Some(slot) = regs.get_mut(proto.n_params + proto.n_captures) {
+            *slot = this_val;
+        }
+        // Tier-up: count this activation, optimize the body once the function gets
+        // hot, and run the optimized bytecode thereafter.
+        let optimized: Option<alloc::rc::Rc<Vec<Op>>> = {
+            let entry = ctx.tiers.entry(id).or_default();
+            entry.0 = entry.0.saturating_add(1);
+            if entry.0 == TIER_UP_THRESHOLD && entry.1.is_none() {
+                entry.1 = Some(alloc::rc::Rc::new(optimize_ops(&funcs[id].ops)));
             }
-        }
-    }
-    for (i, c) in captures.iter().enumerate().take(proto.n_captures) {
-        regs[proto.n_params + i] = *c;
-    }
-    // The `this` slot sits right after the captures.
-    if let Some(slot) = regs.get_mut(proto.n_params + proto.n_captures) {
-        *slot = this_val;
-    }
-    // Tier-up: count this activation, optimize the body once the function gets
-    // hot, and run the optimized bytecode thereafter.
-    let optimized: Option<alloc::rc::Rc<Vec<Op>>> = {
-        let entry = ctx.tiers.entry(id).or_default();
-        entry.0 = entry.0.saturating_add(1);
-        if entry.0 == TIER_UP_THRESHOLD && entry.1.is_none() {
-            entry.1 = Some(alloc::rc::Rc::new(optimize_ops(&funcs[id].ops)));
-        }
-        entry.1.clone()
-    };
-    let body: &[Op] = match &optimized {
-        Some(o) => o.as_slice(),
-        None => proto.ops.as_slice(),
-    };
-    // Native fast path (Phase G JIT): once a function is hot, try compiling it to
-    // machine code. Eligible functions are pure straight-line/looping integer
-    // arithmetic (no side effects), so running the native code is observationally
-    // equivalent to the interpreter; a non-integer/overflowing call deopts to
-    // `None` and we fall through to `run_frame`.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-    if optimized.is_some() && !proto.is_async && proto.rest_from.is_none() && proto.n_captures == 0
-    {
-        let mut stack = alloc::collections::BTreeSet::new();
-        let cached = ensure_jit(&mut ctx.jit_cache, funcs, id, &mut stack);
-        if let Some(jit) = cached
-            && let Some(result) = jit.call_guarded(args)
+            entry.1.clone()
+        };
+        let body: &[Op] = match &optimized {
+            Some(o) => o.as_slice(),
+            None => proto.ops.as_slice(),
+        };
+        // Native fast path (Phase G JIT): once a function is hot, try compiling it
+        // to machine code. Eligible functions are pure straight-line/looping
+        // integer arithmetic (no side effects), so running the native code is
+        // observationally equivalent to the interpreter; a non-integer/overflowing
+        // call deopts to `None` and we fall through to `run_frame`. (A function with
+        // a tail call is never JIT-eligible, so this never intercepts the
+        // trampoline.)
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        if optimized.is_some()
+            && !proto.is_async
+            && proto.rest_from.is_none()
+            && proto.n_captures == 0
         {
-            return Ok(result);
+            let mut stack = alloc::collections::BTreeSet::new();
+            let cached = ensure_jit(&mut ctx.jit_cache, funcs, id, &mut stack);
+            if let Some(jit) = cached
+                && let Some(result) = jit.call_guarded(&args)
+            {
+                return Ok(result);
+            }
+        }
+        // An `async` function: its synchronous body runs to completion, and its
+        // result (or thrown value) settles a returned `Promise`. (No `await` yet —
+        // a body that awaits falls back at compile time.)
+        if proto.is_async {
+            let p = ctx.realm.new_promise();
+            match run_frame(ctx, funcs, body, &mut regs) {
+                Ok(FrameExit::Return(ret)) => {
+                    settle(ctx, p, ret.unwrap_or(NanBox::undefined()), true);
+                }
+                // An async body does not emit tail-call ops, but stay correct if
+                // one ever reaches here: run it as an ordinary call and settle.
+                Ok(FrameExit::Tail {
+                    id: tid,
+                    args: targs,
+                    captures: tcaps,
+                    this,
+                }) => match call_with(ctx, funcs, tid, &targs, &tcaps, this) {
+                    Ok(v) => settle(ctx, p, v, true),
+                    Err(VmError::Thrown(e)) => settle(ctx, p, e, false),
+                    Err(other) => return Err(other),
+                },
+                Err(VmError::Thrown(e)) => settle(ctx, p, e, false),
+                Err(other) => return Err(other),
+            }
+            return Ok(NanBox::handle(p.to_raw()));
+        }
+        match run_frame(ctx, funcs, body, &mut regs)? {
+            FrameExit::Return(v) => return Ok(v.unwrap_or(NanBox::undefined())),
+            // Proper tail call: rebind the activation inputs and reuse this frame.
+            FrameExit::Tail {
+                id: tid,
+                args: targs,
+                captures: tcaps,
+                this,
+            } => {
+                id = tid;
+                args = targs;
+                captures = tcaps;
+                this_val = this;
+            }
         }
     }
-    // An `async` function: its synchronous body runs to completion, and its
-    // result (or thrown value) settles a returned `Promise`. (No `await` yet —
-    // a body that awaits falls back at compile time.)
-    if proto.is_async {
-        let p = ctx.realm.new_promise();
-        match run_frame(ctx, funcs, body, &mut regs) {
-            Ok(ret) => settle(ctx, p, ret.unwrap_or(NanBox::undefined()), true),
-            Err(VmError::Thrown(e)) => settle(ctx, p, e, false),
-            Err(other) => return Err(other),
-        }
-        return Ok(NanBox::handle(p.to_raw()));
-    }
-    Ok(run_frame(ctx, funcs, body, &mut regs)?.unwrap_or(NanBox::undefined()))
 }
 
 /// Compiles function `id` to native code (memoized in `cache`), first compiling
@@ -616,6 +670,23 @@ fn ensure_jit(
     compiled
 }
 
+/// How a single frame's execution ([`run_frame`]) finished normally: either it
+/// `return`ed (or fell off the end), or it hit a tail call whose activation the
+/// caller ([`call_with_inner`]) must set up by *reusing* this frame (the PTC
+/// trampoline). Splitting the two lets the trampoline loop stay in the frame
+/// owner, keeping the native stack flat under unbounded tail recursion.
+enum FrameExit {
+    /// A `return value;` (or falling off the end → `None`).
+    Return(Option<NanBox>),
+    /// A proper tail call: run function `id` next, in this same activation.
+    Tail {
+        id: usize,
+        args: Vec<NanBox>,
+        captures: Vec<NanBox>,
+        this: NanBox,
+    },
+}
+
 /// Why execution stopped abnormally.
 #[derive(Clone, PartialEq, Debug)]
 pub enum VmError {
@@ -648,7 +719,17 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         jit_cache: alloc::collections::BTreeMap::new(),
         call_depth: 0,
     };
-    Ok(run_frame(&mut ctx, &[], program, &mut regs)?.unwrap_or(NanBox::undefined()))
+    match run_frame(&mut ctx, &[], program, &mut regs)? {
+        FrameExit::Return(v) => Ok(v.unwrap_or(NanBox::undefined())),
+        // A top-level program body never emits a tail call (there is no enclosing
+        // function to reuse); degrade to an ordinary call if one ever appears.
+        FrameExit::Tail {
+            id,
+            args,
+            captures,
+            this,
+        } => call_with(&mut ctx, &[], id, &args, &captures, this),
+    }
 }
 
 /// Collects every value produced by iterating `v`, for the bytecode VM's
@@ -1156,7 +1237,7 @@ fn run_frame(
     funcs: &[FnProto],
     program: &[Op],
     regs: &mut [NanBox],
-) -> Result<Option<NanBox>, VmError> {
+) -> Result<FrameExit, VmError> {
     let mut pc = 0;
     // Active exception handlers: `(catch_pc, catch_reg)`, innermost last.
     let mut handlers: Vec<(usize, Reg)> = Vec::new();
@@ -2394,10 +2475,53 @@ fn run_frame(
                     None => return Err(VmError::Thrown(v)),
                 }
             }
-            Op::Return { src } => return Ok(Some(regs[*src as usize])),
+            Op::Return { src } => return Ok(FrameExit::Return(Some(regs[*src as usize]))),
+            // Proper tail call to a static function: hand the callee id/args back
+            // to `call_with_inner`, which reuses this activation (O(1) stack). The
+            // callee is a plain VM function (the compiler only emits this for a
+            // strict `return f(...)`), so no fallback is needed.
+            Op::TailCall { func, args } => {
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                return Ok(FrameExit::Tail {
+                    id: *func as usize,
+                    args: argv,
+                    captures: Vec::new(),
+                    this: NanBox::undefined(),
+                });
+            }
+            // Proper tail call through a function *value*: if it is a plain VM
+            // closure, trampoline (reusing the frame); otherwise degrade to an
+            // ordinary call and return its result (semantically `return callee()`).
+            Op::TailCallValue { callee, args } => {
+                let val = regs[*callee as usize];
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                match val.as_handle().map(Handle::from_raw) {
+                    Some(h) if ctx.realm.is_vm_function(h) => {
+                        let fid = ctx.realm.get_element(h, 0).as_number().unwrap_or(-1.0);
+                        let n_caps = ctx.realm.array_length(h).unwrap_or(1).saturating_sub(1);
+                        let caps: Vec<NanBox> = (0..n_caps)
+                            .map(|i| ctx.realm.get_element(h, i + 1))
+                            .collect();
+                        if fid >= 0.0 {
+                            return Ok(FrameExit::Tail {
+                                id: fid as usize,
+                                args: argv,
+                                captures: caps,
+                                this: NanBox::undefined(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                // Not a VM closure: fall back to an ordinary call.
+                match call_closure(ctx, funcs, val, &argv, NanBox::undefined()) {
+                    Ok(v) => return Ok(FrameExit::Return(Some(v))),
+                    Err(e) => handle_throw!(e),
+                }
+            }
         }
     }
-    Ok(None)
+    Ok(FrameExit::Return(None))
 }
 
 /// Interpreter-aware `JSON.stringify(value, replacer?, space?)`: normalizes the
@@ -4322,6 +4446,23 @@ fn uses_dynamic_code(program: &Program) -> bool {
         .any(|name| direct.contains(*name) || nested.contains(*name))
 }
 
+/// Whether `body`'s directive prologue opens with a literal `"use strict"`
+/// (a run of leading string-literal expression statements, one of which is
+/// `"use strict"`). Used to decide strict mode for proper-tail-call gating.
+fn body_starts_strict(body: &[Stmt]) -> bool {
+    for stmt in body {
+        match stmt {
+            Stmt::Expr { expression, .. } => match &**expression {
+                Expr::Str { value, .. } if &**value == b"use strict" => return true,
+                Expr::Str { .. } => {} // another directive — keep scanning
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Compiles `program` to a function table (function 0 is the top-level body).
 ///
 /// # Errors
@@ -4406,8 +4547,20 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
     protos
         .borrow_mut()
         .extend((0..next_id).map(|_| placeholder()));
+    // The top-level program is strict iff it opens with a `"use strict"`
+    // directive; a strict program makes its top-level functions strict too.
+    let program_strict = body_starts_strict(&program.body);
     // Compile main (id 0), each top-level function, then each class member.
-    let main = Compiler::compile_fn(&fn_ids, &classes, &protos, &[], &[], &program.body, true)?;
+    let main = Compiler::compile_fn(
+        &fn_ids,
+        &classes,
+        &protos,
+        &[],
+        &[],
+        &program.body,
+        true,
+        program_strict,
+    )?;
     protos.borrow_mut()[0] = main;
     for (i, f) in decls.iter().enumerate() {
         let mut proto = Compiler::compile_fn_inner(
@@ -4422,6 +4575,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
             &[],
             None,
             f.is_async,
+            program_strict,
         )?;
         // A function declaration's `name` is its declared identifier.
         if let Some(id) = &f.id {
@@ -4448,6 +4602,8 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
             &job.fields,
             job.super_of.clone(),
             false,
+            // Class bodies are always strict.
+            true,
         )?;
         protos.borrow_mut()[job.id as usize] = proto;
     }
@@ -5168,6 +5324,17 @@ struct Compiler {
     /// turns it into a
     /// clean `CompileError` instead of emitting a corrupt proto.
     reg_overflow: bool,
+    /// Whether a `return` compiled *right here* is a proper-tail-call candidate:
+    /// true at a strict, non-async function body's top level, and preserved
+    /// through ordinary statement nesting (`if`/loops/`switch`/`block`/label).
+    /// A `try` clears it inside the guarded Block (and inside a `catch` when a
+    /// `finally` follows), since a call there is not in tail position. Toggled
+    /// (save/restore) around `try` compilation.
+    tail_ok: bool,
+    /// This function's strict-mode flag (its own directive or an inherited strict
+    /// context). Nested functions inherit it (strict code's inner functions are
+    /// strict). Distinct from [`Self::tail_ok`], which is mutated during `try`.
+    strict: bool,
 }
 
 impl Compiler {
@@ -5184,6 +5351,7 @@ impl Compiler {
         captures: &[String],
         body: &[Stmt],
         is_main: bool,
+        strict: bool,
     ) -> Result<FnProto, CompileError> {
         Self::compile_fn_inner(
             fn_ids,
@@ -5197,6 +5365,7 @@ impl Compiler {
             &[],
             None,
             false,
+            strict,
         )
     }
 
@@ -5213,10 +5382,16 @@ impl Compiler {
         fields: &[(String, Option<&crate::ast::Expr>)],
         super_class: Option<String>,
         is_async: bool,
+        strict: bool,
     ) -> Result<FnProto, CompileError> {
         // Which of this function's own names are captured by nested functions →
         // must be cells.
         let cell_names = captured_names(params, body);
+        // Strict mode enables proper tail calls (PTC). A function is strict if its
+        // lexical context is strict or its own directive prologue says `"use
+        // strict"`. Async functions are excluded (their body settles a promise, so
+        // a "tail" call is not a real stack tail call).
+        let strict = strict || body_starts_strict(body);
         let mut c = Compiler {
             fn_ids: alloc::rc::Rc::clone(fn_ids),
             classes: alloc::rc::Rc::clone(classes),
@@ -5224,6 +5399,8 @@ impl Compiler {
             cell_names,
             super_ctor,
             super_class,
+            tail_ok: strict && !is_async,
+            strict,
             ..Compiler::default()
         };
         c.scopes.push(alloc::collections::BTreeMap::new());
@@ -5698,11 +5875,15 @@ impl Compiler {
                 Ok(None)
             }
             Stmt::Return { argument, .. } => {
-                let src = match argument {
-                    Some(e) => self.expr(e)?,
-                    None => self.constant(NanBox::undefined())?,
-                };
-                self.ops.push(Op::Return { src });
+                match argument {
+                    // `return expr;` — `expr` (and its tail-transparent
+                    // sub-positions) is a proper-tail-call candidate in strict code.
+                    Some(e) => self.compile_tail_return(e)?,
+                    None => {
+                        let src = self.constant(NanBox::undefined())?;
+                        self.ops.push(Op::Return { src });
+                    }
+                }
                 Ok(None)
             }
             Stmt::Throw { argument, .. } => {
@@ -5782,6 +5963,12 @@ impl Compiler {
                 {
                     return Err(CompileError::Unsupported("try/finally with abrupt exit"));
                 }
+                // Tail-position tracking (PTC): a call in the `try` Block is never
+                // in tail position (a `catch`/`finally` may run after it), so clear
+                // `tail_ok` while compiling it; the `catch`/`finally` restore it
+                // (a `catch` only when no `finally` follows). Saved and restored so
+                // the enclosing context is unaffected.
+                let saved_tail = self.tail_ok;
                 // The register the thrown value lands in (and the catch binding,
                 // if any, names it).
                 let catch_reg = self.alloc();
@@ -5790,10 +5977,13 @@ impl Compiler {
                     target: 0,
                     reg: catch_reg,
                 });
+                self.tail_ok = false;
                 self.block_stmts(block)?;
                 self.ops.push(Op::PopHandler);
-                // Normal completion: run `finally`, then jump past the handler.
+                // Normal completion: run `finally` (in tail position), then jump
+                // past the handler.
                 if let Some(fin) = finalizer {
+                    self.tail_ok = saved_tail;
                     self.block_stmts(fin)?;
                 }
                 let jend = self.emit_jump();
@@ -5827,20 +6017,27 @@ impl Compiler {
                             .expect("a scope")
                             .insert(String::from(&**name), b);
                     }
+                    // A `catch` body is in tail position only when no `finally`
+                    // follows (otherwise the `finally` runs after it).
+                    self.tail_ok = saved_tail && finalizer.is_none();
                     for s in &catch.body {
                         self.stmt(s)?;
                     }
                     self.scopes.pop();
                     if let Some(fin) = finalizer {
+                        self.tail_ok = saved_tail;
                         self.block_stmts(fin)?;
                     }
                 } else {
-                    // `try { } finally { }`: run `finally`, then re-raise.
+                    // `try { } finally { }`: run `finally` (in tail position), then
+                    // re-raise.
                     if let Some(fin) = finalizer {
+                        self.tail_ok = saved_tail;
                         self.block_stmts(fin)?;
                     }
                     self.ops.push(Op::Throw { src: catch_reg });
                 }
+                self.tail_ok = saved_tail;
                 self.patch(jend);
                 Ok(None)
             }
@@ -6212,6 +6409,202 @@ impl Compiler {
             }
             _ => Err(CompileError::Unsupported("statement")),
         }
+    }
+
+    /// Compiles `return e;` with `e` in tail position. Threads the tail flag
+    /// through the tail-transparent expression forms — `?:` (both arms),
+    /// `&&`/`||`/`??` (the right operand), and the comma sequence's last operand —
+    /// and emits a frame-reusing tail-call opcode (`Op::TailCall` /
+    /// `Op::TailCallValue`) when the tail expression is a plain function/closure
+    /// call. Every other expression falls back to `Op::Return` of its value. When
+    /// `tail_ok` is false (sloppy code, an async body, or inside a `try` Block)
+    /// it degenerates to a plain `Op::Return`. Every path it emits is *terminal*
+    /// (ends in a return or tail call), so branch arms need no join jump.
+    fn compile_tail_return(&mut self, e: &Expr) -> Result<(), CompileError> {
+        if !self.tail_ok {
+            let src = self.expr(e)?;
+            self.ops.push(Op::Return { src });
+            return Ok(());
+        }
+        match e {
+            Expr::Call {
+                callee,
+                arguments,
+                optional,
+                ..
+            } if !*optional => {
+                if !self.try_emit_tail_call(callee, arguments)? {
+                    let src = self.expr(e)?;
+                    self.ops.push(Op::Return { src });
+                }
+                Ok(())
+            }
+            // A tagged template's tag is invoked in tail position.
+            Expr::TaggedTemplate { tag, quasi, .. } => {
+                // A lone surrogate in a quasi can't round-trip the constant pool;
+                // let the ordinary (surrogate-correct) path handle it.
+                let surrogate = quasi.quasis.iter().any(|q| {
+                    q.cooked
+                        .as_deref()
+                        .is_some_and(|b| crate::wtf8::as_str(b).is_none())
+                });
+                if surrogate {
+                    let src = self.expr(e)?;
+                    self.ops.push(Op::Return { src });
+                    return Ok(());
+                }
+                let strings = self.alloc();
+                self.ops.push(Op::NewArray {
+                    dst: strings,
+                    len: 0,
+                });
+                for q in &quasi.quasis {
+                    let s = match q.cooked.as_deref() {
+                        Some(c) => self.constant_str(&crate::wtf8::to_string_lossy(c)),
+                        None => self.constant(NanBox::undefined())?,
+                    };
+                    self.ops.push(Op::ArrayPush {
+                        arr: strings,
+                        src: s,
+                    });
+                }
+                let mut args = alloc::vec![strings];
+                for ex in &quasi.expressions {
+                    args.push(self.expr(ex)?);
+                }
+                if let Expr::Ident(id) = &**tag
+                    && self.lookup(&id.name).is_none()
+                    && let Some(&func) = self.fn_ids.get(&*id.name)
+                {
+                    self.ops.push(Op::TailCall { func, args });
+                } else {
+                    let callee = self.expr(tag)?;
+                    self.ops.push(Op::TailCallValue { callee, args });
+                }
+                Ok(())
+            }
+            // `return c ? a : b;` — both arms inherit tail position.
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                let cond = self.expr(test)?;
+                let jf = self.emit_jump_if_false(cond);
+                self.compile_tail_return(consequent)?; // terminal
+                self.patch(jf);
+                self.compile_tail_return(alternate)?; // terminal
+                Ok(())
+            }
+            // `return l && r;` / `l || r;` / `l ?? r;` — the *right* operand is in
+            // tail position; a short-circuit returns the left value directly.
+            Expr::Logical {
+                op, left, right, ..
+            } => {
+                use crate::ast::LogicalOp;
+                let l = self.expr(left)?;
+                match op {
+                    LogicalOp::And => {
+                        let jf = self.emit_jump_if_false(l); // falsy → return l
+                        self.compile_tail_return(right)?; // truthy → tail r
+                        self.patch(jf);
+                        self.ops.push(Op::Return { src: l });
+                    }
+                    LogicalOp::Or => {
+                        let jf = self.emit_jump_if_false(l); // falsy → tail r
+                        self.ops.push(Op::Return { src: l }); // truthy → return l
+                        self.patch(jf);
+                        self.compile_tail_return(right)?;
+                    }
+                    LogicalOp::Nullish => {
+                        let nn = self.emit_not_nullish(l)?;
+                        let jf = self.emit_jump_if_false(nn); // nullish → tail r
+                        self.ops.push(Op::Return { src: l }); // else → return l
+                        self.patch(jf);
+                        self.compile_tail_return(right)?;
+                    }
+                }
+                Ok(())
+            }
+            // `return a, b, c;` — the last operand is in tail position.
+            Expr::Sequence { expressions, .. } => {
+                match expressions.split_last() {
+                    Some((last, rest)) => {
+                        for ex in rest {
+                            self.expr(ex)?;
+                        }
+                        self.compile_tail_return(last)?;
+                    }
+                    None => {
+                        let src = self.constant(NanBox::undefined())?;
+                        self.ops.push(Op::Return { src });
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                let src = self.expr(e)?;
+                self.ops.push(Op::Return { src });
+                Ok(())
+            }
+        }
+    }
+
+    /// Emits a frame-reusing tail-call opcode for `return f(args)` when `f` is a
+    /// plain function (static dispatch → [`Op::TailCall`]) or a function *value*
+    /// (→ [`Op::TailCallValue`]). Returns `Ok(false)` — leaving nothing emitted —
+    /// for a call shape that is not a frame-reusable tail call (spread args,
+    /// `super(...)`, a built-in, or a method / `super.` / `Class.static` call),
+    /// so the caller can fall back to an ordinary call plus `Op::Return`.
+    fn try_emit_tail_call(
+        &mut self,
+        callee: &Expr,
+        arguments: &[crate::ast::Argument],
+    ) -> Result<bool, CompileError> {
+        if arguments
+            .iter()
+            .any(|a| !matches!(a, crate::ast::Argument::Item(_)))
+        {
+            return Ok(false);
+        }
+        if matches!(callee, Expr::Super(_)) {
+            return Ok(false);
+        }
+        if native_call(callee)
+            .or_else(|| native_global(callee))
+            .is_some()
+        {
+            return Ok(false);
+        }
+        // Method / `super.method` / `Class.static` calls keep the ordinary
+        // receiver-binding path (still correct, just not PTC).
+        if matches!(callee, Expr::Member { .. }) {
+            return Ok(false);
+        }
+        // Evaluate the arguments (matching the ordinary call's arg-first order).
+        let mut args = Vec::with_capacity(arguments.len());
+        for a in arguments {
+            let crate::ast::Argument::Item(e) = a else {
+                return Ok(false);
+            };
+            args.push(self.expr(e)?);
+        }
+        // A direct call to a hoisted function by name reuses the frame in place;
+        // any other callee is an indirect call through a function value.
+        if let Expr::Ident(id) = callee
+            && self.lookup(&id.name).is_none()
+            && let Some(&func) = self.fn_ids.get(&*id.name)
+        {
+            self.ops.push(Op::TailCall { func, args });
+        } else {
+            let callee_reg = self.expr(callee)?;
+            self.ops.push(Op::TailCallValue {
+                callee: callee_reg,
+                args,
+            });
+        }
+        Ok(true)
     }
 
     fn expr(&mut self, expr: &Expr) -> Result<Reg, CompileError> {
@@ -7230,10 +7623,25 @@ impl Compiler {
         // Captures = free variables that resolve to an enclosing binding (others
         // are top-level functions / globals, reached directly).
         let free = free_of_function(params, body);
-        let captures: Vec<String> = free
+        // A *named function expression* binds its own name inside its body (to the
+        // function itself). If that name is referenced, thread it as a trailing
+        // "self" capture: a cell we create here and backfill with the finished
+        // closure, so a recursive call (`return f(n-1)`) reaches the function
+        // *with its own captures* — which also makes it eligible for a proper
+        // tail call. The name is invisible outside the body.
+        let self_name: Option<&str> = if !name.is_empty() && free.contains(name) {
+            Some(name)
+        } else {
+            None
+        };
+        let mut captures: Vec<String> = free
             .into_iter()
-            .filter(|n| self.lookup(n).is_some())
+            .filter(|n| self.lookup(n).is_some() && Some(n.as_str()) != self_name)
             .collect();
+        if let Some(sn) = self_name {
+            // Bound last → its capture register is the self-cell below.
+            captures.push(String::from(sn));
+        }
         // Reserve the new function's table id, compile it, then store it.
         let id = {
             let mut p = self.protos.borrow_mut();
@@ -7261,22 +7669,41 @@ impl Compiler {
             &[],
             None,
             is_async,
+            self.strict,
         )?;
         let mut proto = proto;
         proto.name = alloc::string::String::from(name);
         self.protos.borrow_mut()[id as usize] = proto;
-        // Capture the cell registers for each free variable (in the same sorted
-        // order the callee binds them).
-        let capture_regs: Vec<Reg> = captures
-            .iter()
-            .map(|n| self.lookup(n).expect("captured binding").reg)
-            .collect();
+        // Capture the cell registers for each free variable (in the same order the
+        // callee binds them). The self-name (if any) gets a fresh cell here,
+        // backfilled with the closure after it is built.
+        let mut capture_regs: Vec<Reg> = Vec::with_capacity(captures.len());
+        let mut self_cell: Option<Reg> = None;
+        for n in &captures {
+            if Some(n.as_str()) == self_name {
+                let cell = self.alloc();
+                self.ops.push(Op::NewArray { dst: cell, len: 1 });
+                self_cell = Some(cell);
+                capture_regs.push(cell);
+            } else {
+                capture_regs.push(self.lookup(n).expect("captured binding").reg);
+            }
+        }
         let dst = self.alloc();
         self.ops.push(Op::MakeClosure {
             dst,
             func: id,
             captures: capture_regs,
         });
+        // Backfill the self-cell so the body's own-name binding reads this closure.
+        if let Some(cell) = self_cell {
+            let idx = self.constant(NanBox::number(0.0))?;
+            self.ops.push(Op::SetElem {
+                arr: cell,
+                index: idx,
+                src: dst,
+            });
+        }
         Ok(dst)
     }
 

@@ -457,6 +457,14 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             regs(args)
         }
         Op::Throw { src } | Op::Return { src } => reg(*src),
+        Op::TailCall { func: f, args } => {
+            func(*f)?;
+            regs(args)
+        }
+        Op::TailCallValue { callee, args } => {
+            reg(*callee)?;
+            regs(args)
+        }
         Op::PopHandler => Ok(()),
     }
 }
@@ -862,6 +870,16 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(53, out);
             w_reg(*src, out);
         }
+        Op::TailCall { func, args } => {
+            w_u8(58, out);
+            w_u32(*func, out);
+            w_regs(args, out);
+        }
+        Op::TailCallValue { callee, args } => {
+            w_u8(59, out);
+            w_reg(*callee, out);
+            w_regs(args, out);
+        }
     }
 }
 
@@ -1121,6 +1139,14 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         55 => Op::IterValues {
             dst: r.reg()?,
             src: r.reg()?,
+        },
+        58 => Op::TailCall {
+            func: r.u32()?,
+            args: r.regs()?,
+        },
+        59 => Op::TailCallValue {
+            callee: r.reg()?,
+            args: r.regs()?,
         },
         t => return Err(DecodeError::BadTag(t)),
     })

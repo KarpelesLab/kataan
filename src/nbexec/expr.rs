@@ -254,6 +254,51 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// Builds a tagged template's argument list `[stringsObject, ...substitutions]`.
+    /// The frozen strings object (with its `.raw` array) is created once per
+    /// template-literal site and reused on every evaluation — its identity is
+    /// observable to the tag. Shared by the ordinary tagged-template evaluation
+    /// and the proper-tail-call path (a tagged template's tag is called in tail
+    /// position).
+    pub(crate) fn tagged_template_args(
+        &mut self,
+        quasi: &'a crate::ast::TemplateLiteral,
+    ) -> Result<Vec<NanBox>, ExecError> {
+        let cache_key = core::ptr::from_ref(quasi) as usize;
+        let strings_arr = if let Some(cached) = self.tagged_template_cache.get(&cache_key) {
+            *cached
+        } else {
+            // A quasi with an invalid escape sequence has no cooked value
+            // (`undefined`), while its `.raw` is still preserved (ES2018).
+            let strings: Vec<NanBox> = quasi
+                .quasis
+                .iter()
+                .map(|q| match q.cooked.as_deref() {
+                    Some(s) => self.new_str_bytes(s.to_vec()),
+                    None => NanBox::undefined(),
+                })
+                .collect();
+            let raw: Vec<NanBox> = quasi.quasis.iter().map(|q| self.new_str(&q.raw)).collect();
+            let strings_h = self.realm.new_array(strings);
+            // The strings object carries a `.raw` array (for `String.raw` and tags
+            // reading `strings.raw`). Both arrays are frozen, per spec — freeze
+            // `.raw` first and `strings` last so the property write lands.
+            let raw_h = self.realm.new_array(raw);
+            self.realm.freeze_object(raw_h);
+            self.realm
+                .set_property(strings_h, "raw", NanBox::handle(raw_h.to_raw()));
+            self.realm.freeze_object(strings_h);
+            let arr = NanBox::handle(strings_h.to_raw());
+            self.tagged_template_cache.insert(cache_key, arr);
+            arr
+        };
+        let mut args = alloc::vec![strings_arr];
+        for e in &quasi.expressions {
+            args.push(self.eval(e)?);
+        }
+        Ok(args)
+    }
+
     pub(crate) fn eval(&mut self, expr: &'a Expr) -> Result<NanBox, ExecError> {
         // C2: guard the native recursion that `eval` performs on nested
         // expressions (a deep `a + a + … + a` is shallow in the AST but recurses
@@ -321,41 +366,7 @@ impl<'a> Interp<'a> {
             }
             // A tagged template: `tag(stringsArray, ...interpolatedValues)`.
             Expr::TaggedTemplate { tag, quasi, .. } => {
-                // The frozen strings object is created once per template-literal site
-                // and reused on every evaluation (its identity is observable to the tag).
-                let cache_key = core::ptr::from_ref(quasi) as usize;
-                let strings_arr = if let Some(cached) = self.tagged_template_cache.get(&cache_key) {
-                    *cached
-                } else {
-                    // A quasi with an invalid escape sequence has no cooked value
-                    // (`undefined`), while its `.raw` is still preserved (ES2018).
-                    let strings: Vec<NanBox> = quasi
-                        .quasis
-                        .iter()
-                        .map(|q| match q.cooked.as_deref() {
-                            Some(s) => self.new_str_bytes(s.to_vec()),
-                            None => NanBox::undefined(),
-                        })
-                        .collect();
-                    let raw: Vec<NanBox> =
-                        quasi.quasis.iter().map(|q| self.new_str(&q.raw)).collect();
-                    let strings_h = self.realm.new_array(strings);
-                    // The strings object carries a `.raw` array (for `String.raw` and
-                    // tags reading `strings.raw`). Both arrays are frozen, per spec —
-                    // freeze `.raw` first and `strings` last so the property write lands.
-                    let raw_h = self.realm.new_array(raw);
-                    self.realm.freeze_object(raw_h);
-                    self.realm
-                        .set_property(strings_h, "raw", NanBox::handle(raw_h.to_raw()));
-                    self.realm.freeze_object(strings_h);
-                    let arr = NanBox::handle(strings_h.to_raw());
-                    self.tagged_template_cache.insert(cache_key, arr);
-                    arr
-                };
-                let mut args = alloc::vec![strings_arr];
-                for e in &quasi.expressions {
-                    args.push(self.eval(e)?);
-                }
+                let args = self.tagged_template_args(quasi)?;
                 // A `recv.tag` tag (e.g. `String.raw`) is dispatched as a method
                 // call, so a built-in tag works even if it isn't a readable value.
                 if let Expr::Member {

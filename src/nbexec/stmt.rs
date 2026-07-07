@@ -192,13 +192,13 @@ impl<'a> Interp<'a> {
                 body,
                 ..
             } => self.exec_for(init.as_ref(), test.as_deref(), update.as_deref(), body),
-            Stmt::Return { argument, .. } => {
-                let v = match argument {
-                    Some(e) => self.eval(e)?,
-                    None => NanBox::undefined(),
-                };
-                Ok(Flow::Return(v))
-            }
+            Stmt::Return { argument, .. } => match argument {
+                // `return expr;` — in tail position (strict, non-async, outside a
+                // `try` Block) a tail call reuses the caller's frame (PTC).
+                Some(e) if self.tail_pos => self.eval_tail_return(e),
+                Some(e) => Ok(Flow::Return(self.eval(e)?)),
+                None => Ok(Flow::Return(NanBox::undefined())),
+            },
             // A bare `break`/`continue` has an empty completion value; the
             // enclosing StatementList's `UpdateEmpty` fills in the accumulated
             // value (see `exec_seq`).
@@ -308,6 +308,14 @@ impl<'a> Interp<'a> {
         handler: Option<&'a crate::ast::CatchClause>,
         finalizer: Option<&'a [Stmt]>,
     ) -> Result<Flow, ExecError> {
+        // Proper-tail-call tracking: a call in the `try` Block is never in tail
+        // position (a `catch`/`finally` may run after it), so clear `tail_pos`
+        // while running it. A `catch` restores it only when no `finally` follows;
+        // a `finally` always restores it. Saved/restored so the enclosing context
+        // is unaffected. (When `tail_pos` is already false — sloppy/async code —
+        // this is a harmless no-op.)
+        let saved_tail_pos = self.tail_pos;
+        self.tail_pos = false;
         let mut outcome = self.exec_scoped(block);
         // A thrown value is routed to the catch clause, if any.
         if let (Err(ExecError::Throw(value)), Some(catch)) = (&outcome, handler) {
@@ -320,11 +328,14 @@ impl<'a> Interp<'a> {
                 Some(target) => self.bind_pattern(target, thrown),
                 None => Ok(()),
             };
+            // The catch body is in tail position only if no `finally` follows.
+            self.tail_pos = saved_tail_pos && finalizer.is_none();
             outcome = bound.and_then(|()| self.exec_seq(&catch.body));
             self.current = saved;
         }
         // `finally` runs regardless; an abrupt finally overrides the outcome.
         let outcome = if let Some(fin) = finalizer {
+            self.tail_pos = saved_tail_pos;
             match self.exec_scoped(fin) {
                 Ok(Flow::Normal(_)) => outcome,
                 other => other, // finally returned/broke/threw → that wins
@@ -332,9 +343,111 @@ impl<'a> Interp<'a> {
         } else {
             outcome
         };
+        self.tail_pos = saved_tail_pos;
         // Spec: a `try` completion is `UpdateEmpty(result, undefined)` — it never
         // surfaces the empty-completion sentinel.
         outcome.map(empty_to_undefined)
+    }
+
+    /// Evaluates the operand of a tail-position `return`, threading tail position
+    /// through its tail-transparent sub-forms — `?:` (the taken arm), `&&`/`||`/
+    /// `??` (the right operand on the non-short-circuit path), and the comma
+    /// sequence's last operand — and emitting an [`ExecError::TailCall`] when the
+    /// tail expression is a plain function call (a proper tail call). Everything
+    /// else returns `Ok(Flow::Return(value))` as usual. Called only when
+    /// `self.tail_pos` holds.
+    fn eval_tail_return(&mut self, e: &'a Expr) -> Result<Flow, ExecError> {
+        match e {
+            Expr::Call {
+                callee,
+                arguments,
+                optional,
+                ..
+            } if !*optional => {
+                // Only a plain call reuses the frame. A method / `super` call binds
+                // a receiver, and a spread needs iteration → leave those to the
+                // ordinary call path (still correct, just not PTC).
+                let simple = !matches!(&**callee, Expr::Member { .. } | Expr::Super(_))
+                    && arguments
+                        .iter()
+                        .all(|a| matches!(a, crate::ast::Argument::Item(_)));
+                if !simple {
+                    return Ok(Flow::Return(self.eval(e)?));
+                }
+                // A bare call binds `this` to undefined (strict — `tail_pos`
+                // implies strict).
+                let func = self.eval(callee)?;
+                // A *direct* eval — `eval(...)` whose callee still resolves to the
+                // %eval% intrinsic — has special scope/strictness semantics and is
+                // not a tail call; hand it back to the ordinary path. A *shadowed*
+                // `eval` (bound to some other function) is an ordinary tail call.
+                if matches!(&**callee, Expr::Ident(id) if &*id.name == "eval")
+                    && func
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.native_at(h))
+                        == Some(N_EVAL)
+                {
+                    return Ok(Flow::Return(self.eval(e)?));
+                }
+                let args = self.eval_args(arguments)?;
+                Err(ExecError::TailCall {
+                    callee: func,
+                    this_val: NanBox::undefined(),
+                    args,
+                })
+            }
+            Expr::Conditional {
+                consequent,
+                alternate,
+                test,
+                ..
+            } => {
+                if self.eval_truthy(test)? {
+                    self.eval_tail_return(consequent)
+                } else {
+                    self.eval_tail_return(alternate)
+                }
+            }
+            Expr::Logical {
+                op, left, right, ..
+            } => {
+                let l = self.eval(left)?;
+                let take_right = match op {
+                    LogicalOp::And => self.realm.truthy(l),
+                    LogicalOp::Or => !self.realm.truthy(l),
+                    LogicalOp::Nullish => {
+                        matches!(l.unpack(), Unpacked::Undefined | Unpacked::Null)
+                    }
+                };
+                if take_right {
+                    self.eval_tail_return(right)
+                } else {
+                    Ok(Flow::Return(l))
+                }
+            }
+            Expr::Sequence { expressions, .. } => match expressions.split_last() {
+                Some((last, rest)) => {
+                    for ex in rest {
+                        self.eval(ex)?;
+                    }
+                    self.eval_tail_return(last)
+                }
+                None => Ok(Flow::Return(NanBox::undefined())),
+            },
+            // A tagged template's tag is invoked in tail position. A member tag
+            // (`recv.tag\`...\``) binds a receiver → leave it to the ordinary path.
+            Expr::TaggedTemplate { tag, quasi, .. } if !matches!(&**tag, Expr::Member { .. }) => {
+                let args = self.tagged_template_args(quasi)?;
+                let func = self.eval(tag)?;
+                Err(ExecError::TailCall {
+                    callee: func,
+                    this_val: NanBox::undefined(),
+                    args,
+                })
+            }
+            _ => Ok(Flow::Return(self.eval(e)?)),
+        }
     }
 
     /// Runs a statement list in a fresh child scope.

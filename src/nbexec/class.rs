@@ -1090,6 +1090,11 @@ impl<'a> Interp<'a> {
         let saved_scope = core::mem::replace(&mut self.current, env.child());
         // A class constructor body (and its field initializers) is strict code.
         let saved_strict = core::mem::replace(&mut self.strict, true);
+        // A constructor body is *never* a proper-tail-call context: `[[Construct]]`
+        // must survive to apply the constructor-return rule (a derived constructor
+        // returning a non-object throws), so a `return f()` here must not reuse the
+        // frame. Clear the inherited `tail_pos` for the whole body.
+        let saved_tail_pos = core::mem::replace(&mut self.tail_pos, false);
         // The constructor body's home class is this class, so a `this.#x` /
         // `super.x` inside it resolves the private name (and super members)
         // against this class. (`init_instance_fields` re-establishes the same
@@ -1229,6 +1234,7 @@ impl<'a> Interp<'a> {
         self.pending_super_native = saved_super_native;
         self.pending_super_fn = saved_super_fn;
         self.strict = saved_strict;
+        self.tail_pos = saved_tail_pos;
         self.current_home = saved_home;
         self.current_lexical_home = saved_lexical_home;
         self.current_home_static = saved_home_static;

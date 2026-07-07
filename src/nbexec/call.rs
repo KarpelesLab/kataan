@@ -1387,9 +1387,69 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(err));
         }
         self.call_depth += 1;
-        let r = self.invoke_inner(def, captured, this_val, args, callee);
+        let mut r = self.invoke_inner(def, captured, this_val, args, callee);
+        // Proper-tail-call trampoline: a `return f(...)` in tail position unwinds
+        // to here as `ExecError::TailCall` (the current frame already torn down by
+        // `invoke_inner`), and we re-dispatch it *in place* — no new `invoke`, so
+        // the native stack and `call_depth` stay flat under unbounded tail
+        // recursion. A non-tail-call result (value / throw / break…) ends the loop.
+        while let Err(ExecError::TailCall {
+            callee: c,
+            this_val: t,
+            args: a,
+        }) = r
+        {
+            r = self.dispatch_tail(c, t, &a);
+        }
         self.call_depth -= 1;
         r
+    }
+
+    /// Dispatches a trampolined tail call. When the callee is a *plain* JS
+    /// function (ordinary, non-arrow, non-exotic) its body runs via
+    /// [`Interp::invoke_inner`] directly — reusing the trampoline's frame instead
+    /// of nesting a new `invoke` — so it may itself return another
+    /// [`ExecError::TailCall`] the loop consumes. Every other callable (bound
+    /// function, proxy, native, class constructor, arrow) takes the ordinary
+    /// [`Interp::call_with_this`] path: correct, and such callees do not
+    /// deep-tail-recurse, so growing one stack frame is harmless.
+    fn dispatch_tail(
+        &mut self,
+        callee: NanBox,
+        this_val: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        if let Some(raw) = callee.as_handle() {
+            let handle = Handle::from_raw(raw);
+            let plain = self.realm.function_at(handle).is_some()
+                && self.realm.get_property(handle, BOUND_TARGET).is_none()
+                && self.realm.proxy_at(handle).is_none()
+                && self.realm.native_at(handle).is_none()
+                && self.realm.host_fn_at(handle).is_none()
+                && self.realm.bound_native_at(handle).is_none()
+                && !self.is_array_ctor(callee)
+                && !self.is_object_ctor(callee);
+            if plain {
+                let (func_id, captured) = self.realm.function_at(handle).expect("plain fn");
+                let def = self.functions[func_id as usize];
+                // Arrows need their captured lexical `this`/home restored (as
+                // `call_with_this` does); skip the in-place path for them and take
+                // the ordinary route rather than duplicate that setup.
+                if !def.is_arrow {
+                    let home_obj = self
+                        .realm
+                        .get_property(handle, HOME_OBJECT)
+                        .and_then(|v| v.as_handle())
+                        .map(Handle::from_raw);
+                    let saved_home_obj =
+                        core::mem::replace(&mut self.current_home_object, home_obj);
+                    let r = self.invoke_inner(def, captured, this_val, args, callee);
+                    self.current_home_object = saved_home_obj;
+                    return r;
+                }
+            }
+        }
+        self.call_with_this(callee, this_val, args)
     }
 
     pub(crate) fn invoke_inner(
@@ -1634,7 +1694,22 @@ impl<'a> Interp<'a> {
                 self.pending_async_start = Some((id, controller));
                 return Ok(NanBox::handle(promise.to_raw()));
             }
-            self.run_body(def.body)
+            // Enter tail-position tracking for the body: a `return f(...)` here is
+            // a proper-tail-call candidate iff this is a strict, non-async,
+            // non-generator function invoked as a *call* (not a constructor — a
+            // `[[Construct]]` must survive to apply the constructor-return rule, so
+            // `new`/`super()` are never PTC; `self.new_target` is set only while
+            // constructing). This is the *only* place `tail_pos` is armed, so
+            // `ExecError::TailCall` can only arise inside this `invoke_inner` and is
+            // always consumed by the enclosing `invoke` trampoline.
+            let constructing = !matches!(self.new_target.unpack(), Unpacked::Undefined);
+            let saved_tail_pos = core::mem::replace(
+                &mut self.tail_pos,
+                self.strict && !def.is_async && !def.is_generator && !constructing,
+            );
+            let r = self.run_body(def.body);
+            self.tail_pos = saved_tail_pos;
+            r
         })();
         self.current = saved;
         #[cfg(all(feature = "module", feature = "std"))]

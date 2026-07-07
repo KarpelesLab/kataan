@@ -51,6 +51,21 @@ pub enum ExecError {
     /// `Expr::OptChain` boundary, which turns it into `undefined`. It is *not* a
     /// throw, so `try`/`catch` never sees it.
     OptShortCircuit,
+    /// A **proper tail call** (strict-mode PTC): a `return f(args)` in genuine
+    /// tail position hands the resolved callee/`this`/args back to the enclosing
+    /// [`Interp::invoke`] instead of calling recursively. `invoke`'s trampoline
+    /// re-dispatches it in place, so unbounded tail recursion runs in O(1) native
+    /// stack. Produced only where `self.tail_pos` holds (a strict, non-async
+    /// function body, outside any `try` Block), so it never escapes the `invoke`
+    /// that must consume it, and a `catch` (which only matches `Throw`) ignores it.
+    TailCall {
+        /// The already-evaluated callee (a function value) to invoke.
+        callee: NanBox,
+        /// The `this` binding for the call (`undefined` for a plain call).
+        this_val: NanBox,
+        /// The already-evaluated arguments.
+        args: alloc::vec::Vec<NanBox>,
+    },
 }
 
 /// The control-flow outcome of a statement.
@@ -361,6 +376,13 @@ pub struct Interp<'a> {
     pending_class_name: Option<&'a str>,
     /// Current function-call nesting depth (recursion guard).
     call_depth: usize,
+    /// Whether a `return` evaluated *right now* is a proper-tail-call candidate:
+    /// set true only while running a strict, non-async function body (in
+    /// [`Interp::invoke_inner`]); cleared inside a `try` Block (and a `catch`
+    /// that a `finally` follows) by [`Interp::exec_try`]. When true (and the
+    /// callee is a plain JS function), `return f(...)` yields
+    /// [`ExecError::TailCall`] for `invoke`'s trampoline instead of recursing.
+    tail_pos: bool,
     /// Whether `new.target` is lexically in scope at the current execution point —
     /// true inside a non-arrow function/method/constructor body, a class field
     /// initializer, or a static block; false at top-level script/module code. An
@@ -2665,6 +2687,7 @@ impl<'a> Interp<'a> {
             temporal_protos: Vec::new(),
             pending_class_name: None,
             call_depth: 0,
+            tail_pos: false,
             new_target_in_scope: false,
             eval_depth: 0,
             rng_state: math_random_seed(),
@@ -5004,6 +5027,15 @@ impl<'a> Interp<'a> {
                 self.make_error(N_ERROR_BASE, Some(m))
             }
             ExecError::OptShortCircuit => NanBox::undefined(),
+            // A tail call is always consumed by the enclosing `invoke` trampoline,
+            // so it never reaches the host boundary; defensively perform it here.
+            ExecError::TailCall {
+                callee,
+                this_val,
+                args,
+            } => self
+                .call_with_this(callee, this_val, &args)
+                .unwrap_or(NanBox::undefined()),
         }
     }
 

@@ -84,7 +84,9 @@ var $262 = {
 /// lands. (intl402 is gated separately on the build feature.)
 const SKIP_FEATURES: &[&str] = &[
     // "Temporal", // implemented (ZonedDateTime/Now skipped via path-check above)
-    "tail-call-optimization",
+    // tail-call-optimization (PTC) is implemented on the bytecode VM (strict-mode
+    // frame-reuse trampoline); the eval/`with`/cross-realm variants that fall back
+    // to the recursive tree-walker are ledgered in tests/test262-status.txt.
     // Import attributes are implemented (JSON + text modules); `type: "bytes"`
     // additionally needs a Uint8Array-over-immutable-ArrayBuffer default export
     // (the import-bytes proposal), which is unimplemented — skip that feature.
