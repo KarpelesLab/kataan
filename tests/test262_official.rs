@@ -72,7 +72,6 @@ var $262 = {
 /// lands. (intl402 is gated separately on the build feature.)
 const SKIP_FEATURES: &[&str] = &[
     // "Temporal", // implemented (ZonedDateTime/Now skipped via path-check above)
-    "decorators",
     "tail-call-optimization",
     "import-assertions",
     "import-attributes",

@@ -152,6 +152,11 @@ impl<'src> Parser<'src> {
                 self.parse_default_function()?
             } else if self.at(TokenKind::Keyword(Kw::Class)) {
                 self.parse_default_class()?
+            } else if self.at(TokenKind::At) {
+                // `export default @dec … class { … }` — a decorated default
+                // class. Decorators are parsed and discarded (no-op).
+                self.parse_decorators()?;
+                self.parse_default_class()?
             } else {
                 let expr = self.parse_assignment()?;
                 let espan = expr.span();
@@ -193,9 +198,10 @@ impl<'src> Parser<'src> {
         let decl_ok = matches!(
             self.peek(),
             TokenKind::Keyword(Kw::Function | Kw::Class | Kw::Var | Kw::Let | Kw::Const)
-        ) || (self.at(TokenKind::Keyword(Kw::Async))
-            && self.nth_kind(1) == TokenKind::Keyword(Kw::Function)
-            && !self.nth_newline(1));
+        ) || self.at(TokenKind::At)
+            || (self.at(TokenKind::Keyword(Kw::Async))
+                && self.nth_kind(1) == TokenKind::Keyword(Kw::Function)
+                && !self.nth_newline(1));
         if !decl_ok {
             return Err(
                 self.err("`export` must be followed by a declaration, `default`, `*`, or `{ … }`")

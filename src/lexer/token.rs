@@ -104,6 +104,8 @@ pub enum TokenKind {
     QuestionQuestion,
     /// `=>`
     Arrow,
+    /// `@` — introduces a decorator (`@dec class …`, `@dec method() {}`).
+    At,
 
     // --- operators ---
     /// `<`

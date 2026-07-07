@@ -238,6 +238,12 @@ impl<'src> Parser<'src> {
                 self.parse_function_declaration()
             }
             TokenKind::Keyword(Kw::Class) => self.parse_class_declaration(),
+            // `@dec … class C { … }` — a decorated class declaration. The
+            // decorators are parsed and discarded (applied as no-ops).
+            TokenKind::At => {
+                self.parse_decorators()?;
+                self.parse_class_declaration()
+            }
             // `import(` / `import.` are expression forms (dynamic import /
             // import.meta), handled as expressions, not import declarations.
             TokenKind::Keyword(Kw::Import)

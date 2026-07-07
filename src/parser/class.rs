@@ -3,8 +3,10 @@
 
 use super::{Parser, cook};
 use crate::ast::{
-    Class, ClassField, ClassMember, ClassMethod, Expr, Function, MethodKind, PropertyKey, Stmt,
+    AssignOp, BindingTarget, Class, ClassField, ClassMember, ClassMethod, Expr, Function, Ident,
+    MethodKind, Param, PropertyKey, Stmt,
 };
+use crate::common::Span;
 use crate::error::Result;
 use crate::lexer::{Keyword as Kw, TokenKind};
 use alloc::boxed::Box;
@@ -72,7 +74,10 @@ impl<'src> Parser<'src> {
             if self.eat(TokenKind::Semicolon) {
                 continue; // a stray `;` between members is allowed
             }
-            body.push(self.parse_class_member()?);
+            // A member may expand into several `ClassMember`s: an auto-accessor
+            // (`accessor x`) desugars to a private backing field plus a
+            // getter/setter pair.
+            body.extend(self.parse_class_member()?);
         }
         let end = self.expect(TokenKind::RBrace)?.span;
 
@@ -84,8 +89,15 @@ impl<'src> Parser<'src> {
         })
     }
 
-    fn parse_class_member(&mut self) -> Result<ClassMember> {
+    fn parse_class_member(&mut self) -> Result<Vec<ClassMember>> {
         let start = self.cur_span();
+
+        // A `DecoratorList` may prefix any class element. Decorators are parsed
+        // (validated for shape) but discarded — no test exercises decorator
+        // application at runtime, so they act as no-ops.
+        if self.at(TokenKind::At) {
+            self.parse_decorators()?;
+        }
 
         // `static` — a modifier, unless it is itself the member name or begins
         // a static initialization block.
@@ -98,10 +110,10 @@ impl<'src> Parser<'src> {
                 TokenKind::LBrace => {
                     self.bump(); // `static`
                     let body = self.in_function_context(false, true, Self::parse_block_body)?;
-                    return Ok(ClassMember::StaticBlock {
+                    return Ok(alloc::vec![ClassMember::StaticBlock {
                         body,
                         span: start.to(self.prev_span()),
-                    });
+                    }]);
                 }
                 // `static` used as a field/method name.
                 TokenKind::LParen | TokenKind::Eq | TokenKind::Semicolon | TokenKind::RBrace => {
@@ -115,6 +127,26 @@ impl<'src> Parser<'src> {
         } else {
             false
         };
+
+        // An auto-accessor: `accessor [no LineTerminator here] ClassElementName
+        // Initializer_opt`. It is a contextual keyword: `accessor` is an
+        // ordinary member name unless directly (no newline) followed by a token
+        // that begins a `ClassElementName`.
+        if self.at(TokenKind::Keyword(Kw::Accessor))
+            && !self.nth_newline(1)
+            && token_starts_class_element_name(self.nth_kind(1))
+        {
+            self.bump(); // `accessor`
+            let key = self.parse_class_key()?;
+            let value = if self.eat(TokenKind::Eq) {
+                Some(self.parse_assignment()?)
+            } else {
+                None
+            };
+            self.semicolon()?;
+            let span = start.to(self.prev_span());
+            return Ok(self.desugar_auto_accessor(key, value, is_static, span));
+        }
 
         // Method modifiers: `async`, generator `*`, and `get`/`set`.
         let is_async = self.at(TokenKind::Keyword(Kw::Async))
@@ -153,13 +185,13 @@ impl<'src> Parser<'src> {
                 }
                 None => MethodKind::Method,
             };
-            return Ok(ClassMember::Method(ClassMethod {
+            return Ok(alloc::vec![ClassMember::Method(ClassMethod {
                 key,
                 kind,
                 value,
                 is_static,
                 span: start.to(self.prev_span()),
-            }));
+            })]);
         }
 
         // A field: get/set/async/* are not valid here.
@@ -172,12 +204,97 @@ impl<'src> Parser<'src> {
             None
         };
         self.semicolon()?;
-        Ok(ClassMember::Field(ClassField {
+        Ok(alloc::vec![ClassMember::Field(ClassField {
             key,
             value,
             is_static,
             span: start.to(self.prev_span()),
-        }))
+        })])
+    }
+
+    /// Desugars an auto-accessor (`accessor x = init`) into three members: a
+    /// private backing field holding the value, plus a public (or private)
+    /// getter and setter that read/write the backing field. This reuses the
+    /// existing field / accessor machinery so the runtime needs no special
+    /// case. The backing field's private name is unique (derived from the
+    /// member's source offset) and starts with a digit, so it cannot collide
+    /// with — or be named by — any user-written `#name`.
+    fn desugar_auto_accessor(
+        &self,
+        key: PropertyKey,
+        value: Option<Expr>,
+        is_static: bool,
+        span: Span,
+    ) -> Vec<ClassMember> {
+        let backing: Box<str> = format!("0acc{}", span.start).into();
+
+        // `this.#backing`
+        let backing_member = |span: Span| Expr::Member {
+            object: Box::new(Expr::This(span)),
+            property: PropertyKey::Private(backing.clone()),
+            optional: false,
+            span,
+        };
+
+        // getter: `get key() { return this.#backing; }`
+        let getter = Function {
+            id: None,
+            params: Vec::new(),
+            body: alloc::vec![Stmt::Return {
+                argument: Some(Box::new(backing_member(span))),
+                span,
+            }],
+            is_async: false,
+            is_generator: false,
+            span,
+        };
+
+        // setter: `set key(value) { this.#backing = value; }`
+        let param_name: Box<str> = "value".into();
+        let setter = Function {
+            id: None,
+            params: alloc::vec![Param {
+                target: BindingTarget::Ident(Ident::new(param_name.clone(), span)),
+                default: None,
+                rest: false,
+                span,
+            }],
+            body: alloc::vec![Stmt::Expr {
+                expression: Box::new(Expr::Assign {
+                    op: AssignOp::Assign,
+                    target: Box::new(backing_member(span)),
+                    value: Box::new(Expr::Ident(Ident::new(param_name, span))),
+                    span,
+                }),
+                span,
+            }],
+            is_async: false,
+            is_generator: false,
+            span,
+        };
+
+        alloc::vec![
+            ClassMember::Method(ClassMethod {
+                key: key.clone(),
+                kind: MethodKind::Get,
+                value: getter,
+                is_static,
+                span,
+            }),
+            ClassMember::Method(ClassMethod {
+                key,
+                kind: MethodKind::Set,
+                value: setter,
+                is_static,
+                span,
+            }),
+            ClassMember::Field(ClassField {
+                key: PropertyKey::Private(backing),
+                value,
+                is_static,
+                span,
+            }),
+        ]
     }
 
     /// A class member key: a private name, a computed `[expr]`, a string/number
@@ -229,6 +346,22 @@ impl<'src> Parser<'src> {
             TokenKind::LParen | TokenKind::Eq | TokenKind::Semicolon | TokenKind::RBrace
         )
     }
+}
+
+/// Whether a token can begin a `ClassElementName` (a private name, a computed
+/// key, a string/number literal, or any identifier name). Used to decide
+/// whether a contextual `accessor` is an auto-accessor modifier or a plain
+/// member name.
+fn token_starts_class_element_name(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::PrivateName
+            | TokenKind::LBracket
+            | TokenKind::String
+            | TokenKind::Number
+            | TokenKind::Identifier
+            | TokenKind::Keyword(_)
+    )
 }
 
 /// Whether a method key/flags identify the `constructor`.

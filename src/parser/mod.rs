@@ -901,6 +901,61 @@ impl<'src> Parser<'src> {
         Ok(args)
     }
 
+    // --- decorators -----------------------------------------------------
+
+    /// Parses a `DecoratorList` — a run of `@ Decorator` prefixes on a class or
+    /// class element. The decorator expressions are parsed (and validated for
+    /// grammatical shape) but *not* retained: no test exercises decorator
+    /// application at runtime, so they are evaluated as no-ops. Returns the
+    /// number of decorators consumed.
+    pub(super) fn parse_decorators(&mut self) -> Result<usize> {
+        let mut count = 0;
+        while self.at(TokenKind::At) {
+            self.parse_decorator()?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Parses a single `Decorator`:
+    ///   `@ DecoratorMemberExpression`
+    ///   `@ DecoratorParenthesizedExpression`  (`@ ( Expression )`)
+    ///   `@ DecoratorCallExpression`           (member expr + `Arguments`)
+    fn parse_decorator(&mut self) -> Result<()> {
+        self.expect(TokenKind::At)?;
+        // `@ ( Expression )` — a fully parenthesized expression.
+        if self.at(TokenKind::LParen) {
+            self.bump();
+            self.without_no_in(Self::parse_expression)?;
+            self.expect(TokenKind::RParen)?;
+            return Ok(());
+        }
+        // `DecoratorMemberExpression` — an IdentifierReference followed by a
+        // chain of `.IdentifierName` / `.PrivateIdentifier` (no computed `[…]`).
+        match self.peek() {
+            TokenKind::Identifier | TokenKind::Keyword(_) => self.bump(),
+            other => return Err(self.err(format!("expected a decorator, found {other:?}"))),
+        };
+        while self.at(TokenKind::Dot) {
+            self.bump();
+            match self.peek() {
+                // `.IdentifierName` (any name, reserved words allowed) or
+                // `.#PrivateIdentifier`.
+                TokenKind::Identifier | TokenKind::Keyword(_) | TokenKind::PrivateName => {
+                    self.bump();
+                }
+                other => {
+                    return Err(self.err(format!("expected a property name, found {other:?}")));
+                }
+            }
+        }
+        // An optional trailing `Arguments` makes this a `DecoratorCallExpression`.
+        if self.at(TokenKind::LParen) {
+            self.parse_arguments()?;
+        }
+        Ok(())
+    }
+
     // --- primary --------------------------------------------------------
 
     fn parse_primary(&mut self) -> Result<Expr> {
@@ -1062,6 +1117,12 @@ impl<'src> Parser<'src> {
             TokenKind::LBrace => self.parse_object(),
             TokenKind::Keyword(Kw::Function) => self.parse_function_expr(false, tok.span),
             TokenKind::Keyword(Kw::Class) => self.parse_class_expr(),
+            // `@dec … class { … }` — a decorated class expression. The
+            // decorators are parsed and discarded (applied as no-ops).
+            TokenKind::At => {
+                self.parse_decorators()?;
+                self.parse_class_expr()
+            }
             // A bare `#x` — only valid as the left of `#x in obj` (brand check).
             TokenKind::PrivateName => {
                 self.bump();

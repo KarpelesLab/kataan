@@ -200,6 +200,7 @@ impl<'src> Lexer<'src> {
             b';' => self.single(TokenKind::Semicolon),
             b',' => self.single(TokenKind::Comma),
             b'~' => self.single(TokenKind::Tilde),
+            b'@' => self.single(TokenKind::At),
             b':' => self.single(TokenKind::Colon),
             b'?' => self.read_question(),
             // `.` may begin a number (`.5`), the spread `...`, or a member `.`.
