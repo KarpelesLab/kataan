@@ -96,20 +96,7 @@ impl<'a> Interp<'a> {
                 Ok(NanBox::boolean(other == data.date))
             }
             "toPlainDateTime" => {
-                // Combine with a wall-clock time (default midnight). Only a
-                // PlainTime instance or undefined is handled precisely.
-                let time = if matches!(arg(0).unpack(), Unpacked::Undefined) {
-                    temporal_iso::IsoTime::default()
-                } else if let Some(td) = arg(0)
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .and_then(|h| self.realm.temporal_at(h))
-                    .filter(|t| t.kind == TemporalKind::PlainTime)
-                {
-                    td.time
-                } else {
-                    return Err(self.type_error("toPlainDateTime expects a PlainTime"));
-                };
+                let time = self.pd_to_temporal_time(arg(0))?;
                 Ok(self.pd_new_kind(TemporalKind::PlainDateTime, data.date, time))
             }
             "toPlainYearMonth" => Ok(self.pd_new_kind(
@@ -351,6 +338,65 @@ impl<'a> Interp<'a> {
 
     /// Builds a fresh Temporal instance of a date/time kind linked to that kind's
     /// intrinsic prototype (used for PlainDate and the `toPlain*` conversions).
+    /// ToTemporalTime for `toPlainDateTime`'s argument: undefined → midnight, a
+    /// PlainTime/PlainDateTime instance → its time, an object with time fields →
+    /// each `ToIntegerWithTruncation`'d + constrained, or an ISO string.
+    fn pd_to_temporal_time(&mut self, v: NanBox) -> Result<temporal_iso::IsoTime, ExecError> {
+        use crate::temporal_iso::{IsoTime, Overflow, parse_iso_datetime, regulate_iso_time};
+        if matches!(v.unpack(), Unpacked::Undefined) {
+            return Ok(IsoTime::default());
+        }
+        if self.is_object_value(v)
+            && let Some(h) = v.as_handle().map(Handle::from_raw)
+        {
+            if let Some(td) = self.realm.temporal_at(h) {
+                return match td.kind {
+                    TemporalKind::PlainTime | TemporalKind::PlainDateTime => Ok(td.time),
+                    _ => Err(self.type_error("toPlainDateTime: not a time-like value")),
+                };
+            }
+            // A property bag of time fields (ToTemporalTimeRecord); at least one
+            // recognised field must be present.
+            let mut fields = [0_i64; 6];
+            let mut any = false;
+            for (i, k) in [
+                "hour",
+                "minute",
+                "second",
+                "millisecond",
+                "microsecond",
+                "nanosecond",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let pv = self.realm.get_property(h, k).unwrap_or(NanBox::undefined());
+                if !matches!(pv.unpack(), Unpacked::Undefined) {
+                    any = true;
+                    fields[i] = self.coerce_to_integer_or_infinity(pv)? as i64;
+                }
+            }
+            if !any {
+                return Err(self.type_error("toPlainDateTime: object has no time fields"));
+            }
+            return regulate_iso_time(
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4],
+                fields[5],
+                Overflow::Constrain,
+            )
+            .ok_or_else(|| self.type_error("toPlainDateTime: invalid time"));
+        }
+        // ISO string.
+        let s = self.coerce_to_string(v)?;
+        parse_iso_datetime(&s)
+            .and_then(|p| p.time.or(Some(IsoTime::default())))
+            .ok_or_else(|| self.pd_range_error("toPlainDateTime: invalid time string"))
+    }
+
     fn pd_new_kind(
         &mut self,
         kind: TemporalKind,
