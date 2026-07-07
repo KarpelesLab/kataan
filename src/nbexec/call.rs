@@ -426,25 +426,17 @@ impl<'a> Interp<'a> {
             // A Temporal static (`Temporal.<Type>.from`/`.compare`/…): the `this`
             // is the constructor, whose native id gives the kind.
             if id == crate::nbexec::temporal::N_TEMPORAL_STATIC_FN {
-                let name = self.realm.string_value(target).unwrap_or_default();
-                // The receiver is the constructor — or a subclass of one, in which
-                // case walk its `[[Prototype]]` chain to the native Temporal ctor.
-                let mut cur = this_val.as_handle().map(Handle::from_raw);
-                let mut kind = None;
-                for _ in 0..1000 {
-                    let Some(h) = cur else { break };
-                    if let Some(k) = self
-                        .realm
-                        .native_at(h)
-                        .and_then(crate::nbexec::temporal::kind_for_ctor_id)
-                    {
-                        kind = Some(k);
-                        break;
-                    }
-                    cur = self.realm.object_proto(h);
-                }
+                // Target = "<kind-index>\0<method>"; the kind is bound to the
+                // function (statics ignore `this`).
+                let raw = self.realm.string_value(target).unwrap_or_default();
+                let (kidx, name) = raw.split_once('\u{0}').unwrap_or(("", raw.as_str()));
+                let kind = kidx
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| crate::nbexec::temporal::TEMPORAL_CTOR_IDS.get(i))
+                    .map(|(k, _)| *k);
                 if let Some(k) = kind
-                    && let Some(v) = self.temporal_static(k, this_val, &name, args)?
+                    && let Some(v) = self.temporal_static(k, this_val, name, args)?
                 {
                     return Ok(v);
                 }

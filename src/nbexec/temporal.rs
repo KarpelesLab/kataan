@@ -158,7 +158,11 @@ impl<'a> Interp<'a> {
             // Static methods (`from`/`compare`/…): own non-enumerable function
             // properties of the constructor.
             for &(sname, slen) in statics_for(kind) {
-                let name_h = self.realm.new_string(sname);
+                // The bound target encodes the kind so the static is bound to its
+                // TYPE (spec: `from`/`compare` ignore `this`, so `from.call(x)` and
+                // subclass inheritance still resolve the right type).
+                let target = alloc::format!("{}\u{0}{sname}", kind as usize);
+                let name_h = self.realm.new_string(&target);
                 let f = self.realm.new_bound_native(N_TEMPORAL_STATIC_FN, name_h);
                 self.install_fn_name_length(f, sname, slen);
                 self.realm
