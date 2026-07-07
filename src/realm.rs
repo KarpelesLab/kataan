@@ -45,6 +45,13 @@ use alloc::vec::Vec;
 /// subclass instance. `\u{0}`-prefixed like every other internal slot key.
 pub(crate) const PROMISE_STATE_SLOT: &str = "\u{0}PromiseState";
 
+/// The hidden internal-slot key under which a `Temporal.*` instance stashes its
+/// immutable data carrier ([`Cell::TemporalData`]). The instance itself is an
+/// ordinary extensible object; [`Realm::temporal_at`] reads this slot to recover
+/// the branded record. `\u{0}`-prefixed like every other internal slot key, so
+/// it never enumerates (`Object.keys`/`getOwnPropertyNames`).
+pub(crate) const TEMPORAL_SLOT: &str = "\u{0}temporal";
+
 /// Bytes-per-element for each typed-array `kind` (index into the engine's
 /// `TYPED_ARRAY_KINDS` table: Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32,
 /// Uint32, Float32, Float64, BigInt64, BigUint64). A `kind` outside the table
@@ -284,6 +291,15 @@ impl Realm {
     /// the constructor-side chain (e.g. `getPrototypeOf(Int8Array)` →
     /// `%TypedArray%`).
     pub fn set_native_proto(&mut self, handle: Handle, proto: Handle) {
+        // An ordinary object (e.g. a Temporal instance, which is now a plain
+        // extensible object) stores its `[[Prototype]]` **inline**; `object_proto`
+        // reads that inline link and never consults `native_protos` for an object,
+        // so the link must be written on the object itself.
+        if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            obj.set_proto(Some(proto));
+            self.write_barrier(handle, NanBox::handle(proto.to_raw()));
+            return;
+        }
         self.native_protos.insert(handle.to_raw(), proto);
     }
 
@@ -1318,18 +1334,32 @@ impl Realm {
         self.heap.alloc(Cell::Date(ms))
     }
 
-    /// Allocates a branded `Temporal.*` instance cell wrapping `data`.
+    /// Allocates a branded `Temporal.*` instance. The instance is an **ordinary
+    /// extensible object** so all property machinery (get/set/defineProperty/
+    /// isExtensible/…) applies to it; the immutable Temporal record is stashed in
+    /// a hidden [`TEMPORAL_SLOT`] internal slot as a non-enumerable data carrier
+    /// ([`Cell::TemporalData`]) that is never surfaced as a value.
     pub fn new_temporal(&mut self, data: crate::temporal_iso::TemporalData) -> Handle {
-        self.heap.alloc(Cell::Temporal(alloc::rc::Rc::new(data)))
+        let obj = self.new_object();
+        let carrier = self
+            .heap
+            .alloc(Cell::TemporalData(alloc::rc::Rc::new(data)));
+        self.set_hidden_property(obj, TEMPORAL_SLOT, NanBox::handle(carrier.to_raw()));
+        obj
     }
 
-    /// The `Temporal.*` internal-slot record, if `handle` is a Temporal instance.
+    /// The `Temporal.*` internal-slot record, if `handle` is a Temporal instance
+    /// (i.e. an ordinary object carrying the hidden [`TEMPORAL_SLOT`] data cell).
     #[must_use]
     pub fn temporal_at(
         &self,
         handle: Handle,
     ) -> Option<alloc::rc::Rc<crate::temporal_iso::TemporalData>> {
-        self.heap.get(handle).and_then(Cell::as_temporal).cloned()
+        let carrier = self.get_property(handle, TEMPORAL_SLOT)?.as_handle()?;
+        self.heap
+            .get(Handle::from_raw(carrier))
+            .and_then(Cell::as_temporal)
+            .cloned()
     }
 
     /// The timestamp (ms) of the `Date` at `handle`, if it is one.
@@ -3571,6 +3601,15 @@ impl Realm {
                     seen.pop();
                     parts.join(",")
                 }
+                // A Temporal instance is an ordinary object carrying a hidden
+                // data slot; render the tagged placeholder (its own `toString`
+                // handles real stringification on the interpreter method path).
+                Some(Cell::Object(o)) if o.get(TEMPORAL_SLOT).is_some() => {
+                    match self.temporal_at(Handle::from_raw(raw)) {
+                        Some(t) => alloc::format!("[object Temporal.{}]", t.kind.type_name()),
+                        None => "[object Object]".into(),
+                    }
+                }
                 Some(Cell::Object(_)) => "[object Object]".into(),
                 // A callable stringifies as `Function.prototype.toString` would —
                 // `function name() { [native code] }` (the engine retains no source)
@@ -3619,10 +3658,11 @@ impl Realm {
                         alloc::string::String::from("Invalid Date")
                     }
                 }
-                // Temporal instances stringify via their own `toString` methods
-                // (the interpreter method path); this low-level fallback is only
-                // hit for a raw display and reports a tagged placeholder.
-                Some(Cell::Temporal(t)) => {
+                // The Temporal data carrier is an internal hidden-slot cell that
+                // is never a user-visible value; it cannot reach this display path
+                // (its owning instance is a `Cell::Object`), but the match is
+                // exhaustive, so report the tagged placeholder for completeness.
+                Some(Cell::TemporalData(t)) => {
                     alloc::format!("[object Temporal.{}]", t.kind.type_name())
                 }
                 Some(Cell::RegExp { source, flags, .. }) => alloc::format!("/{source}/{flags}"),

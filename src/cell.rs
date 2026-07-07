@@ -213,9 +213,14 @@ pub enum Cell {
     Promise(Rc<RefCell<PromiseState>>),
     /// A `Date`: milliseconds since the Unix epoch (UTC).
     Date(f64),
-    /// A branded `Temporal.*` instance (immutable; one uniform record for every
-    /// Temporal type, shared behind an `Rc`).
-    Temporal(alloc::rc::Rc<crate::temporal_iso::TemporalData>),
+    /// The internal-slot **data carrier** for a `Temporal.*` instance (one
+    /// uniform record for every Temporal type, shared behind an `Rc`). This cell
+    /// is **never** a user-visible value: it lives only inside a hidden
+    /// (`"\0temporal"`) slot on an ordinary [`Cell::Object`] instance, so that
+    /// all property machinery (get/set/defineProperty/isExtensible/…) applies to
+    /// the instance for free. It holds no `Handle`s, so `Trace`/`Relocate` ignore
+    /// it and `type_of` is irrelevant (it is never surfaced).
+    TemporalData(alloc::rc::Rc<crate::temporal_iso::TemporalData>),
     /// A `RegExp`: its source pattern and flags (compiled on demand by the
     /// `regex` engine, so the variant itself carries no feature-gated type).
     RegExp {
@@ -409,11 +414,12 @@ impl Cell {
         }
     }
 
-    /// The `Temporal.*` internal-slot record, if this cell is a Temporal instance.
+    /// The `Temporal.*` internal-slot record, if this cell is the Temporal data
+    /// carrier (the hidden-slot cell, never a user-visible instance).
     #[must_use]
     pub fn as_temporal(&self) -> Option<&alloc::rc::Rc<crate::temporal_iso::TemporalData>> {
         match self {
-            Cell::Temporal(t) => Some(t),
+            Cell::TemporalData(t) => Some(t),
             _ => None,
         }
     }
@@ -477,12 +483,11 @@ impl Cell {
             | Cell::Collection { .. }
             | Cell::Promise(_)
             | Cell::Date(_)
-            | Cell::Temporal(_)
             | Cell::RegExp { .. }
             | Cell::Proxy { .. } => "object",
-            // An internal byte backing store is never a user-visible value; it is
-            // reached only through its owning ArrayBuffer/view.
-            Cell::Bytes(_) => "object",
+            // An internal byte backing store, or a Temporal data carrier, is never
+            // a user-visible value; it is reached only through its owning object.
+            Cell::Bytes(_) | Cell::TemporalData(_) => "object",
         }
     }
 
@@ -605,7 +610,7 @@ impl Trace for Cell {
             | Cell::Native(_)
             | Cell::HostFn(_)
             | Cell::Date(_)
-            | Cell::Temporal(_)
+            | Cell::TemporalData(_)
             | Cell::RegExp { .. }
             | Cell::Symbol { .. }
             | Cell::BigInt(_)
@@ -660,7 +665,7 @@ impl crate::gc::Relocate for Cell {
             | Cell::Native(_)
             | Cell::HostFn(_)
             | Cell::Date(_)
-            | Cell::Temporal(_)
+            | Cell::TemporalData(_)
             | Cell::RegExp { .. }
             | Cell::Symbol { .. }
             | Cell::BigInt(_)
