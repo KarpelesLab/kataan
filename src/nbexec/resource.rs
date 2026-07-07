@@ -31,6 +31,10 @@ const ADSTACK_LIST: &str = "\u{0}adstack_list";
 /// Hidden boolean slot: whether an `AsyncDisposableStack` has been disposed/moved.
 const ADSTACK_DISPOSED: &str = "\u{0}adstack_disposed";
 
+/// Hidden slot on a `$262.createRealm()` realm object: the index of its distinct
+/// global environment in `Interp::created_realms`.
+const CREATED_REALM_IDX: &str = "\u{0}created_realm";
+
 /// Hidden internal-slot brand marking a `ShadowRealm` instance.
 const SHADOWREALM_BRAND: &str = "\u{0}shadowrealm";
 /// Hidden slot on a `ShadowRealm` instance: the index of its persistent global
@@ -360,6 +364,145 @@ impl<'a> Interp<'a> {
             .set_hidden_property(instance, list_key, NanBox::handle(list.to_raw()));
         self.realm
             .set_hidden_property(instance, disposed_key, NanBox::boolean(false));
+    }
+
+    /// `$262.createRealm()` — the Test262 cross-realm host hook. Builds a second
+    /// global environment with a *distinct* set of intrinsics on the shared heap
+    /// (its `Array`/`Object`/`TypeError`/… are separate heap cells from the current
+    /// realm's) and returns a `$262`-shaped realm object: `{ global, evalScript,
+    /// createRealm }`. `.global` is the new global object (its own constructors),
+    /// so `other.Array !== Array`, `[] instanceof other.Array === false`, etc.
+    ///
+    /// The heap, atom table, well-known symbols, and a handful of lazily-shared
+    /// prototypes (iterator/regexp/intl) are shared with the host realm — a
+    /// best-effort model that lands the large cross-realm *identity* bulk. The
+    /// deep `proto-from-ctor-realm` subset (which needs per-function realm tagging
+    /// so `GetPrototypeFromConstructor` picks the *newTarget's* realm's intrinsic)
+    /// is intentionally left for a follow-up.
+    pub(crate) fn create_realm(&mut self) -> Result<NanBox, ExecError> {
+        // Save the active realm's environment.
+        let saved_current = self.current.clone();
+        let saved_global_scope = self.global_scope.clone();
+        let saved_var_scope = self.var_scope.clone();
+        let saved_global_this = self.global_this;
+        let saved_this = self.this_val;
+        let saved_new_target = self.new_target;
+        let saved_strict = self.strict;
+        let saved_intrinsics = self.realm.intrinsics_snapshot();
+
+        // Install a fresh global environment into a brand-new root scope. Because
+        // `install_globals` allocates a fresh cell for every intrinsic, the new
+        // realm's globals are distinct handles from the current realm's.
+        let root = Scope::root();
+        self.current = root.clone();
+        self.global_scope = root.clone();
+        self.var_scope = root.clone();
+        self.this_val = NanBox::undefined();
+        self.new_target = NanBox::undefined();
+        self.strict = false;
+        self.install_globals();
+        let new_global_this = self.global_this;
+        let new_global_scope = self.global_scope.clone();
+        let new_intrinsics = self.realm.intrinsics_snapshot();
+
+        // Restore the active realm's environment — including its intrinsic
+        // prototype pointers, so `[]`/`{}` literals created afterward in the
+        // original realm keep the original realm's prototypes.
+        self.current = saved_current;
+        self.global_scope = saved_global_scope;
+        self.var_scope = saved_var_scope;
+        self.global_this = saved_global_this;
+        self.this_val = saved_this;
+        self.new_target = saved_new_target;
+        self.strict = saved_strict;
+        self.realm.restore_intrinsics(saved_intrinsics);
+
+        // Record the new realm and build the returned realm object.
+        let idx = self.created_realms.len();
+        self.created_realms.push(CreatedRealm {
+            global_scope: new_global_scope,
+            global_this: new_global_this,
+            intrinsics: new_intrinsics,
+        });
+        let realm_obj = self.realm.new_object();
+        self.realm
+            .set_hidden_property(realm_obj, CREATED_REALM_IDX, NanBox::number(idx as f64));
+        self.realm
+            .set_property(realm_obj, "global", new_global_this);
+        // `.evalScript(src)` — a plain native dispatched with `this` = realm_obj.
+        let eval_fn = self.new_named_native("evalScript", N_262_EVAL_SCRIPT);
+        self.realm
+            .set_property(realm_obj, "evalScript", NanBox::handle(eval_fn.to_raw()));
+        // Nested `.createRealm()` (some tests build realms recursively).
+        let cr_fn = self.new_named_native("createRealm", N_262_CREATE_REALM);
+        self.realm
+            .set_property(realm_obj, "createRealm", NanBox::handle(cr_fn.to_raw()));
+        Ok(NanBox::handle(realm_obj.to_raw()))
+    }
+
+    /// `realm.evalScript(src)` — evaluate `src` in the receiver realm's global
+    /// environment (swapping in its scope + intrinsics), returning the completion
+    /// value. `this` must be a realm object built by [`create_realm`].
+    pub(crate) fn eval_script_in_realm(&mut self, src: NanBox) -> Result<NanBox, ExecError> {
+        let idx = self
+            .this_val
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.get_property(h, CREATED_REALM_IDX))
+            .and_then(|v| v.as_number())
+            .map(|n| n as usize);
+        let Some(idx) = idx.filter(|i| *i < self.created_realms.len()) else {
+            return Err(self.type_error("evalScript called on an object that is not a realm"));
+        };
+        if self.eval_depth >= self.realm.limits.max_eval_depth {
+            let msg = self.new_str("Maximum call stack size exceeded");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(msg))));
+        }
+        let source = self.coerce_to_string(src)?;
+        let scope = self.created_realms[idx].global_scope.clone();
+        let global_this = self.created_realms[idx].global_this;
+        let intrinsics = self.created_realms[idx].intrinsics;
+
+        // Parse first so a SyntaxError surfaces before any environment swap.
+        let program = self.parse_eval_program(&source, false, false, false, false)?;
+
+        let saved_current = self.current.clone();
+        let saved_global_scope = self.global_scope.clone();
+        let saved_var_scope = self.var_scope.clone();
+        let saved_global_this = self.global_this;
+        let saved_this = self.this_val;
+        let saved_new_target = self.new_target;
+        let saved_strict = self.strict;
+        let saved_intrinsics = self.realm.intrinsics_snapshot();
+
+        self.strict = has_use_strict(&program.body);
+        // A strict program gets its own child so its lexical declarations don't
+        // leak into the realm's persistent global scope; a sloppy one runs in it
+        // directly so `var`/function declarations persist across evalScript calls.
+        self.current = if self.strict {
+            scope.child()
+        } else {
+            scope.clone()
+        };
+        self.global_scope = scope;
+        self.var_scope = self.current.clone();
+        self.global_this = global_this;
+        self.this_val = global_this;
+        self.new_target = NanBox::undefined();
+        self.realm.restore_intrinsics(intrinsics);
+        self.eval_depth += 1;
+        let result = self.run_eval_body(program);
+        self.eval_depth -= 1;
+
+        self.current = saved_current;
+        self.global_scope = saved_global_scope;
+        self.var_scope = saved_var_scope;
+        self.global_this = saved_global_this;
+        self.this_val = saved_this;
+        self.new_target = saved_new_target;
+        self.strict = saved_strict;
+        self.realm.restore_intrinsics(saved_intrinsics);
+        result
     }
 
     /// Stamps the `ShadowRealm` internal slots onto a subclass-built instance.

@@ -2705,6 +2705,12 @@ impl<'a> Interp<'a> {
                 );
                 NanBox::handle(obj.to_raw())
             }
+            // `$262_createRealm()` — the Test262 `$262.createRealm` host hook
+            // (also `realm.createRealm()`). Builds a second realm with distinct
+            // intrinsics and returns its `$262`-shaped realm object.
+            N_262_CREATE_REALM => return self.create_realm(),
+            // `realm.evalScript(src)` — evaluate `src` in the receiver realm.
+            N_262_EVAL_SCRIPT => return self.eval_script_in_realm(arg(0)),
             // `DisposableStack()` / `AsyncDisposableStack()` / `ShadowRealm()`
             // called without `new` is a TypeError (they require a `[[Construct]]`).
             N_DISPOSABLE_STACK | N_ASYNC_DISPOSABLE_STACK | N_SHADOW_REALM => {

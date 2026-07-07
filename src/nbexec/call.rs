@@ -68,10 +68,9 @@ impl<'a> Interp<'a> {
                 || def.is_method
                 || def.home_class.is_some());
         }
-        // `Object` / `Array` are namespace objects callable as constructors.
-        if self.current.get("Object").and_then(|v| v.as_handle()) == value.as_handle()
-            || self.current.get("Array").and_then(|v| v.as_handle()) == value.as_handle()
-        {
+        // `Object` / `Array` are namespace objects callable as constructors
+        // (including a cross-realm `Object`/`Array`).
+        if self.is_object_ctor(value) || self.is_array_ctor(value) {
             return true;
         }
         // A built-in native: constructs iff its dispatch id is a recognised
@@ -94,6 +93,31 @@ impl<'a> Interp<'a> {
     /// call sites that use this shorter name.
     pub(crate) fn is_constructor(&self, value: NanBox) -> bool {
         self.is_constructor_value(value)
+    }
+
+    /// Whether `value` is *an* `Object` constructor — the current realm's global
+    /// `Object`, or any other realm's (`$262.createRealm().global.Object`), which
+    /// is a distinct heap cell carrying the same `N_BASE_OBJECT` native id. Used
+    /// so the `Object(...)` / `new Object(...)` dispatch honors cross-realm
+    /// `Object`, not only the binding installed in the active scope.
+    pub(crate) fn is_object_ctor(&self, value: NanBox) -> bool {
+        self.current.get("Object").and_then(|v| v.as_handle()) == value.as_handle()
+            || value
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.native_at(h))
+                == Some(N_BASE_OBJECT)
+    }
+
+    /// Whether `value` is *an* `Array` constructor — the current realm's global
+    /// `Array` or any other realm's (see [`Self::is_object_ctor`]).
+    pub(crate) fn is_array_ctor(&self, value: NanBox) -> bool {
+        self.current.get("Array").and_then(|v| v.as_handle()) == value.as_handle()
+            || value
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.native_at(h))
+                == Some(N_BASE_ARRAY)
     }
 
     /// Builds a bound function (`Function.prototype.bind`): an object recording
@@ -160,12 +184,12 @@ impl<'a> Interp<'a> {
             });
         }
         // `Array(...)` without `new` behaves like `new Array(...)`.
-        if self.current.get("Array").and_then(|v| v.as_handle()) == callee.as_handle() {
+        if self.is_array_ctor(callee) {
             return self.construct(callee, args);
         }
         // `Object(value)` (ToObject): `null`/`undefined` → a new object; an object is
         // returned as-is; a primitive is boxed in its wrapper.
-        if self.current.get("Object").and_then(|v| v.as_handle()) == callee.as_handle() {
+        if self.is_object_ctor(callee) {
             let v = args.first().copied().unwrap_or(NanBox::undefined());
             return Ok(self.coerce_to_object(v));
         }
@@ -1894,10 +1918,11 @@ impl<'a> Interp<'a> {
             }
             return Ok(this);
         }
-        // `new Object(value)` — Object is a namespace object, matched by identity.
-        // With no/`null`/`undefined` argument it makes a fresh object; otherwise it
-        // is ToObject(value) (the same as calling `Object(value)`).
-        if self.current.get("Object").and_then(|v| v.as_handle()) == callee.as_handle() {
+        // `new Object(value)` — Object is a namespace object (matched by native id,
+        // so a cross-realm `Object` is also handled). With no/`null`/`undefined`
+        // argument it makes a fresh object; otherwise it is ToObject(value) (the
+        // same as calling `Object(value)`).
+        if self.is_object_ctor(callee) {
             let nt = self.reflect_new_target.unwrap_or(callee);
             // `Object(value)` with an actual object value returns it as-is, ignoring
             // newTarget; only the fresh-object path (no/null/undefined arg, or a
@@ -1913,9 +1938,10 @@ impl<'a> Interp<'a> {
             }
             return Ok(result);
         }
-        // `new Array(...)` — Array is a namespace object, matched by identity.
+        // `new Array(...)` — Array is a namespace object (matched by native id, so
+        // a cross-realm `Array` is also handled).
         // A single number argument is the length; otherwise the elements.
-        if self.current.get("Array").and_then(|v| v.as_handle()) == callee.as_handle() {
+        if self.is_array_ctor(callee) {
             let single_len = if args.len() == 1
                 && let Some(n) = args[0].as_number()
             {

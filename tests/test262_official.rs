@@ -63,7 +63,7 @@ var $262 = {
   gc: function () {},
   evalScript: function (src) { return (0, eval)(src); },
   detachArrayBuffer: function (b) { return $262_detachArrayBuffer(b); },
-  createRealm: function () { throw new TypeError('$262.createRealm is not supported'); },
+  createRealm: function () { return $262_createRealm(); },
   IsHTMLDDA: $262_IsHTMLDDA()
 };
 "#;
@@ -84,7 +84,11 @@ const SKIP_FEATURES: &[&str] = &[
     // a local `KATAAN_TEST262_FILTER=Atomics` run currently shows Atomics 34% /
     // SharedArrayBuffer 79%, too many failures to un-skip cleanly yet.
     "Atomics.waitAsync",
-    "cross-realm",
+    // cross-realm: `$262.createRealm` builds a second global environment with
+    // distinct intrinsics (see `Interp::create_realm`). The identity bulk passes;
+    // the deep `proto-from-ctor-realm` subset (per-function-realm
+    // GetPrototypeFromConstructor) and "honoring the realm" error-type checks are
+    // ledgered in `tests/test262-status.txt`.
 ];
 
 /// The subset of frontmatter the runner acts on.

@@ -233,6 +233,28 @@ pub struct LegacyRegExpState {
     pub parens: [alloc::vec::Vec<u8>; 9],
 }
 
+/// A snapshot of a realm's intrinsic prototype pointers (the realm-wide
+/// singletons that determine the `[[Prototype]]` of newly-created object/array/
+/// symbol/bigint values and the shared `%TypedArray%`). Captured and restored by
+/// `$262.createRealm` so a second global environment can be installed on the
+/// shared heap without disturbing the original realm's defaults. See
+/// [`Realm::intrinsics_snapshot`].
+#[derive(Clone, Copy, Default)]
+pub struct RealmIntrinsics {
+    /// `%Object.prototype%` — the default `[[Prototype]]` of a plain object.
+    pub default_object_proto: Option<Handle>,
+    /// `%Array.prototype%` — the default `[[Prototype]]` of a dense array.
+    pub array_proto: Option<Handle>,
+    /// `%Function.prototype%` — the default `[[Prototype]]` of a callable.
+    pub function_proto: Option<Handle>,
+    /// `%Symbol.prototype%` — the `[[Prototype]]` of a `Symbol` primitive.
+    pub symbol_proto: Option<Handle>,
+    /// `%BigInt.prototype%` — the `[[Prototype]]` of a `BigInt` primitive.
+    pub bigint_proto: Option<Handle>,
+    /// The shared abstract `%TypedArray%` intrinsic constructor.
+    pub typed_array: Option<Handle>,
+}
+
 impl Default for Realm {
     fn default() -> Self {
         Self::new()
@@ -335,6 +357,35 @@ impl Realm {
     #[must_use]
     pub fn array_proto_intrinsic(&self) -> Option<Handle> {
         self.array_proto_intrinsic
+    }
+
+    /// Snapshots the realm-wide intrinsic prototype pointers that
+    /// [`crate::nbexec::Interp::install_globals`] installs. Used by
+    /// `$262.createRealm` to build a second global environment on the shared heap
+    /// and then restore the original realm's intrinsics, so ordinary object/array/
+    /// symbol/bigint literals created afterward keep their original realm's
+    /// prototypes.
+    #[must_use]
+    pub fn intrinsics_snapshot(&self) -> RealmIntrinsics {
+        RealmIntrinsics {
+            default_object_proto: self.default_object_proto,
+            array_proto: self.array_proto_intrinsic,
+            function_proto: self.function_proto_intrinsic,
+            symbol_proto: self.symbol_proto_intrinsic,
+            bigint_proto: self.bigint_proto_intrinsic,
+            typed_array: self.typed_array_intrinsic,
+        }
+    }
+
+    /// Restores the realm-wide intrinsic prototype pointers captured by
+    /// [`intrinsics_snapshot`](Realm::intrinsics_snapshot).
+    pub fn restore_intrinsics(&mut self, s: RealmIntrinsics) {
+        self.default_object_proto = s.default_object_proto;
+        self.array_proto_intrinsic = s.array_proto;
+        self.function_proto_intrinsic = s.function_proto;
+        self.symbol_proto_intrinsic = s.symbol_proto;
+        self.bigint_proto_intrinsic = s.bigint_proto;
+        self.typed_array_intrinsic = s.typed_array;
     }
 
     /// Records the realm's `%Symbol.prototype%` intrinsic — the `[[Prototype]]`

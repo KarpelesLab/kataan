@@ -31,7 +31,7 @@ use crate::ast::{
 use crate::env::Scope;
 use crate::heap::Handle;
 use crate::nanbox::{NanBox, Unpacked};
-use crate::realm::Realm;
+use crate::realm::{Realm, RealmIntrinsics};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -538,6 +538,14 @@ pub struct Interp<'a> {
     /// share variable/function declarations. (Intrinsics are shared with the host
     /// realm — a best-effort model, not a fully isolated realm.)
     shadow_realm_scopes: Vec<Scope>,
+    /// Per-`$262.createRealm()` global environments — each a *genuinely distinct*
+    /// realm: its own global scope populated by a fresh `install_globals` (so its
+    /// `Array`/`Object`/`TypeError`/… are separate heap cells from every other
+    /// realm's), its own global object, and a snapshot of its intrinsic prototype
+    /// pointers. Unlike `shadow_realm_scopes` (which share the host intrinsics),
+    /// these back cross-realm identity (`other.Array !== Array`). The realm object
+    /// returned to JS stores an index into this vector under a hidden slot.
+    created_realms: Vec<CreatedRealm>,
     /// Programs parsed at runtime by `eval` / the `Function` constructor, keyed by
     /// source string. The interpreter's function/AST tables hold `&'a` references
     /// into the running program; a dynamically-parsed `Program` must therefore
@@ -1462,6 +1470,16 @@ const N_SAB_PROTO_FN: u16 = 912;
 /// `"undefined"`, it is falsy, it is loosely equal to `null`/`undefined`, and its
 /// `[[Call]]` returns `null`.
 const N_HTMLDDA: u16 = 913;
+/// `$262_createRealm()` — the Test262 host hook (`$262.createRealm`). Builds a
+/// second global environment (a fresh set of intrinsics: distinct `Array`,
+/// `Object`, `TypeError`, … from the current realm's) on the shared heap and
+/// returns a `$262`-shaped realm object whose `.global` is the new global object
+/// and whose `.evalScript(src)` runs code in that environment.
+const N_262_CREATE_REALM: u16 = 950;
+/// `$262.createRealm().evalScript(src)` — evaluates `src` in the receiver
+/// realm's global environment (swapping in its scope + intrinsics), returning the
+/// completion value.
+const N_262_EVAL_SCRIPT: u16 = 951;
 /// `%GeneratorFunction%` — builds a `function*` from dynamic source (like
 /// `%Function%`); reachable via `Object.getPrototypeOf(function*(){}).constructor`.
 const N_GENERATOR_FUNCTION_CTOR: u16 = 905;
@@ -2028,7 +2046,13 @@ fn is_native_constructor(id: u16) -> bool {
     }
     matches!(
         id,
-        N_STRING
+        // The `Object`/`Array` namespace-object constructors carry these native
+        // ids; recognizing them here (not just via global-binding identity) makes
+        // a *cross-realm* `Object`/`Array` — a distinct heap cell with the same id
+        // — pass `IsConstructor` (`Reflect.construct(other.Array, …)`).
+        N_BASE_OBJECT
+            | N_BASE_ARRAY
+            | N_STRING
             | N_NUMBER
             | N_BOOLEAN
             // `Symbol`/`BigInt` have a `[[Construct]]` (so `IsConstructor` is true)
@@ -2521,6 +2545,20 @@ mod temporal_zoneddatetime;
 mod typed_array;
 mod wasm;
 
+/// A second global environment created by `$262.createRealm` — a genuinely
+/// distinct realm sharing the host heap. Holds the realm's global scope (its own
+/// `Array`/`Object`/… bindings), its global object, and its intrinsic prototype
+/// pointers, so `.evalScript` can swap the interpreter into this environment.
+struct CreatedRealm {
+    /// The realm's populated global scope (a fresh `Scope::root()` filled by a
+    /// dedicated `install_globals`).
+    global_scope: Scope,
+    /// The realm's `globalThis` object (its `.global`).
+    global_this: NanBox,
+    /// The realm's intrinsic prototype pointers, swapped in during `evalScript`.
+    intrinsics: RealmIntrinsics,
+}
+
 impl<'a> Interp<'a> {
     /// A fresh interpreter with a single (global) scope and a starter stdlib,
     /// using default [`Limits`](crate::limits::Limits).
@@ -2599,6 +2637,7 @@ impl<'a> Interp<'a> {
             output: String::new(),
             global_scope: Scope::root(),
             shadow_realm_scopes: Vec::new(),
+            created_realms: Vec::new(),
             eval_programs: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "module", feature = "std"))]
             modules: module::ModuleRegistry::new(),
@@ -3590,6 +3629,10 @@ impl<'a> Interp<'a> {
             // Test262 host hook: `$262.IsHTMLDDA` is wired (by the runner's JS
             // prelude) to this global so [[IsHTMLDDA]] tests can obtain the value.
             ("$262_IsHTMLDDA", N_HTMLDDA),
+            // Test262 host hook: `$262.createRealm` is wired (by the runner's JS
+            // prelude) to this global so cross-realm tests can obtain a second
+            // realm with a distinct set of intrinsics.
+            ("$262_createRealm", N_262_CREATE_REALM),
         ] {
             let f = self.new_named_native(name, id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
