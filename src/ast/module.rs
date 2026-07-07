@@ -5,6 +5,11 @@ use crate::common::Span;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+/// A single `key: "value"` entry of an import `with { … }` / `assert { … }`
+/// clause (an *import attribute*). The key is an IdentifierName or StringLiteral
+/// (stored cooked); the value is always a StringLiteral (stored cooked).
+pub type ImportAttribute = (Box<str>, Box<str>);
+
 /// An `import` declaration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImportDecl {
@@ -17,6 +22,9 @@ pub struct ImportDecl {
     /// first accessed. Only ever set together with a single
     /// [`ImportSpecifier::Namespace`].
     pub deferred: bool,
+    /// The `with { … }` / (legacy) `assert { … }` import attributes, if any
+    /// (the import-attributes proposal). Empty when the clause is absent.
+    pub attributes: Vec<ImportAttribute>,
     /// The span of the whole declaration.
     pub span: Span,
 }
@@ -53,12 +61,17 @@ pub enum ExportDecl {
     Named {
         specifiers: Vec<ExportSpecifier>,
         source: Option<Box<str>>,
+        /// `with { … }` import attributes on the re-export's `from` clause
+        /// (only meaningful when `source` is `Some`).
+        attributes: Vec<ImportAttribute>,
         span: Span,
     },
     /// `export * from "mod"` / `export * as ns from "mod"`.
     All {
         exported: Option<ModuleExportName>,
         source: Box<str>,
+        /// `with { … }` import attributes on the `from` clause.
+        attributes: Vec<ImportAttribute>,
         span: Span,
     },
     /// `export default …` (the declaration is a function/class declaration or

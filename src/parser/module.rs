@@ -37,11 +37,13 @@ impl<'src> Parser<'src> {
         // Bare side-effect import: `import "mod";`.
         if self.at(TokenKind::String) {
             let source = self.parse_module_specifier()?;
+            let attributes = self.parse_import_attributes()?;
             self.semicolon()?;
             return Ok(Stmt::Import(ImportDecl {
                 specifiers: Vec::new(),
                 source,
                 deferred: false,
+                attributes,
                 span: start.to(self.prev_span()),
             }));
         }
@@ -72,13 +74,91 @@ impl<'src> Parser<'src> {
 
         self.expect_contextual(Kw::From, "from")?;
         let source = self.parse_module_specifier()?;
+        let attributes = self.parse_import_attributes()?;
         self.semicolon()?;
         Ok(Stmt::Import(ImportDecl {
             specifiers,
             source,
             deferred,
+            attributes,
             span: start.to(self.prev_span()),
         }))
+    }
+
+    /// Parses an optional `WithClause` (`with { … }`) or the legacy
+    /// `AssertClause` (`assert { … }`) that may trail a module specifier
+    /// (import-attributes proposal). Returns the cooked key/value attribute
+    /// pairs, or an empty vec when no clause is present.
+    ///
+    /// Grammar:
+    /// ```text
+    /// WithClause : AttributesKeyword { WithEntries_opt ,opt }
+    /// AttributesKeyword : with | [no LineTerminator here] assert
+    /// WithEntries : AttributeKey : StringLiteral (, WithEntries)?
+    /// AttributeKey : IdentifierName | StringLiteral
+    /// ```
+    ///
+    /// A duplicate `AttributeKey` is an early SyntaxError.
+    fn parse_import_attributes(&mut self) -> Result<Vec<(Box<str>, Box<str>)>> {
+        // `with` may be preceded by a line terminator; the legacy `assert`
+        // keyword (a contextual identifier) may not, and an escaped spelling is
+        // never the keyword.
+        let is_with = self.at(TokenKind::Keyword(Kw::With));
+        let is_assert = self.at_contextual_ident("assert")
+            && !self.peek_tok().newline_before
+            && !self.peek_tok().had_escape;
+        if !is_with && !is_assert {
+            return Ok(Vec::new());
+        }
+        self.bump(); // `with` / `assert`
+        self.expect(TokenKind::LBrace)?;
+        let mut attributes: Vec<(Box<str>, Box<str>)> = Vec::new();
+        while !self.at(TokenKind::RBrace) {
+            let (key, key_span) = self.parse_attribute_key()?;
+            self.expect(TokenKind::Colon)?;
+            // The value must be a StringLiteral.
+            let vtok = self.expect(TokenKind::String)?;
+            let value: Box<str> = cook::string_key(vtok.text(self.source), vtok.span)?.into();
+            // Early error: duplicate AttributeKey.
+            if attributes.iter().any(|(k, _)| **k == *key) {
+                return Err(
+                    self.err_at(key_span, format!("duplicate import attribute key '{key}'"))
+                );
+            }
+            attributes.push((key, value));
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(attributes)
+    }
+
+    /// An `AttributeKey`: an IdentifierName (including reserved words) or a
+    /// StringLiteral. Returns the cooked key text and its span.
+    fn parse_attribute_key(&mut self) -> Result<(Box<str>, crate::common::Span)> {
+        let tok = self.peek_tok();
+        match tok.kind {
+            TokenKind::String => {
+                self.bump();
+                Ok((
+                    cook::string_key(tok.text(self.source), tok.span)?.into(),
+                    tok.span,
+                ))
+            }
+            TokenKind::Identifier => {
+                self.bump();
+                Ok((self.ident_name(tok).into(), tok.span))
+            }
+            TokenKind::Keyword(kw) => {
+                self.bump();
+                Ok((kw.as_str().into(), tok.span))
+            }
+            _ => Err(self.err(format!(
+                "expected an import attribute key, found {:?}",
+                tok.kind
+            ))),
+        }
     }
 
     /// Parses the namespace (`* as ns`) or named (`{ … }`) part of an import
@@ -134,10 +214,12 @@ impl<'src> Parser<'src> {
             };
             self.expect_contextual(Kw::From, "from")?;
             let source = self.parse_module_specifier()?;
+            let attributes = self.parse_import_attributes()?;
             self.semicolon()?;
             return Ok(Stmt::Export(ExportDecl::All {
                 exported,
                 source,
+                attributes,
                 span: start.to(self.prev_span()),
             }));
         }
@@ -175,15 +257,18 @@ impl<'src> Parser<'src> {
         // `export { … } [from "mod"];`
         if self.at(TokenKind::LBrace) {
             let specifiers = self.parse_export_specifiers()?;
-            let source = if self.eat(TokenKind::Keyword(Kw::From)) {
-                Some(self.parse_module_specifier()?)
+            let (source, attributes) = if self.eat(TokenKind::Keyword(Kw::From)) {
+                let src = self.parse_module_specifier()?;
+                let attrs = self.parse_import_attributes()?;
+                (Some(src), attrs)
             } else {
-                None
+                (None, Vec::new())
             };
             self.semicolon()?;
             return Ok(Stmt::Export(ExportDecl::Named {
                 specifiers,
                 source,
+                attributes,
                 span: start.to(self.prev_span()),
             }));
         }

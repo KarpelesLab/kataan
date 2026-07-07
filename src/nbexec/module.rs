@@ -244,6 +244,24 @@ struct ImportEntry {
     /// `import defer * as ns from …` — this dependency is loaded and linked but
     /// not eagerly evaluated; its namespace triggers evaluation on first access.
     deferred: bool,
+    /// The `type` import attribute (`with { type: "json" }`), selecting a
+    /// non-JavaScript module kind for the dependency.
+    type_attr: Option<String>,
+}
+
+/// The kind of a loaded module, selected by the `type` import attribute
+/// (import-attributes proposal). A JavaScript module has a parsed AST body; a
+/// JSON / text module is *synthetic* — a single frozen-shaped `default` export
+/// built from the referenced file's contents, with no named exports.
+enum ModuleKind {
+    /// An ordinary ECMAScript module (the AST body drives evaluation).
+    JavaScript,
+    /// `with { type: "json" }` — the file is parsed with `JSON.parse` and its
+    /// value becomes the module's `default` export.
+    Json,
+    /// `with { type: "text" }` — the file's raw text becomes the `default`
+    /// export (the import-text proposal).
+    Text,
 }
 
 /// A single binding introduced by an import declaration.
@@ -264,11 +282,19 @@ enum ReExport {
         key: String,
         local: String,
         exported: String,
+        type_attr: Option<String>,
     },
     /// `export * from "m"` — re-expose every named export of `m`.
-    Star { key: String },
+    Star {
+        key: String,
+        type_attr: Option<String>,
+    },
     /// `export * as ns from "m"` — expose `m`'s namespace under `ns`.
-    StarAs { key: String, exported: String },
+    StarAs {
+        key: String,
+        exported: String,
+        type_attr: Option<String>,
+    },
 }
 
 /// A parsed, registered module and its link/evaluate state.
@@ -302,6 +328,13 @@ struct ModuleRecord {
     /// A captured evaluation error (so a re-entered, already-failed module
     /// rethrows the same value rather than re-running).
     eval_error: Option<NanBox>,
+    /// JavaScript / JSON / text (import-attributes). A synthetic (JSON/text)
+    /// module has an empty `program` and a single `default` export.
+    kind: ModuleKind,
+    /// For a synthetic (JSON/text) module: the already-built `default` export
+    /// value (JSON parsed / text string), materialised at load time so a JSON
+    /// parse failure surfaces in the load/resolution phase.
+    default_value: Option<NanBox>,
 }
 
 /// The set of loaded modules, keyed by resolved key, plus the active host.
@@ -336,7 +369,7 @@ impl<'a> Interp<'a> {
         entry_key: &str,
         host: &dyn ModuleHost,
     ) -> Result<NanBox, ExecError> {
-        self.load_module(entry_key, host)?;
+        self.load_module(entry_key, host, None)?;
         self.link_module(entry_key)?;
         self.evaluate_entry(entry_key)
     }
@@ -348,7 +381,7 @@ impl<'a> Interp<'a> {
         entry_key: &str,
         host: &dyn ModuleHost,
     ) -> Result<(), ExecError> {
-        self.load_module(entry_key, host)
+        self.load_module(entry_key, host, None)
     }
 
     /// Public wrapper over `Self::link_module`.
@@ -404,27 +437,109 @@ impl<'a> Interp<'a> {
 
     /// Transitively loads and parses `key` and its dependencies, deduping by key
     /// and tolerating import cycles (a key already present is not reloaded).
-    fn load_module(&mut self, key: &str, host: &dyn ModuleHost) -> Result<(), ExecError> {
+    /// `type_attr` is the `type` import attribute of the request that reached
+    /// `key` (`None` for the entry module), selecting a JSON / text synthetic
+    /// module instead of a JavaScript one.
+    fn load_module(
+        &mut self,
+        key: &str,
+        host: &dyn ModuleHost,
+        type_attr: Option<&str>,
+    ) -> Result<(), ExecError> {
         if self.modules.records.contains_key(key) {
             return Ok(());
         }
-        let source = host.load(key).map_err(|e| self.syntax_error(&e))?;
-        let record = self.parse_module(key, &source, host)?;
-        // Collect dependency keys before recursing (the borrow of `record` ends).
-        let deps: Vec<String> = record
+        // The map key of a JSON / text module is suffixed with its type (so the
+        // same file imported both as JavaScript and as text/JSON is two distinct
+        // modules, per the spec's `(specifier, attributes)` module map key). The
+        // host loads the underlying file, so strip the suffix first.
+        let source = host
+            .load(module_load_path(key))
+            .map_err(|e| self.syntax_error(&e))?;
+        // A `type` attribute selects a synthetic (JSON / text) module; otherwise
+        // the file is an ordinary JavaScript module. A JSON parse error here is a
+        // load/resolution-phase failure (a SyntaxError), matching the tests'
+        // `negative: { phase: resolution }` expectation.
+        let record = match type_attr {
+            Some("json") => self.build_json_module(key, &source)?,
+            Some("text") => self.build_text_module(key, &source),
+            _ => self.parse_module(key, &source, host)?,
+        };
+        // Collect dependency keys (with their own `type` attributes) before
+        // recursing — the borrow of `record` ends here.
+        let deps: Vec<(String, Option<String>)> = record
             .imports
             .iter()
-            .map(|i| i.key.clone())
-            .chain(record.reexports.iter().map(reexport_key))
+            .map(|i| (i.key.clone(), i.type_attr.clone()))
+            .chain(record.reexports.iter().map(reexport_key_type))
             .collect();
         self.modules.records.insert(key.to_string(), record);
-        for dep in deps {
-            self.load_module(&dep, host)?;
+        for (dep, dep_type) in deps {
+            self.load_module(&dep, host, dep_type.as_deref())?;
         }
         if let Some(r) = self.modules.records.get_mut(key) {
             r.status = Status::Loaded;
         }
         Ok(())
+    }
+
+    /// Builds a synthetic **JSON module** record for `key`: `JSON.parse(source)`
+    /// becomes the sole `default` export. An empty AST body drives (no) link /
+    /// evaluation. A malformed source propagates as a SyntaxError.
+    fn build_json_module(&mut self, key: &str, source: &str) -> Result<ModuleRecord, ExecError> {
+        let value = self.parse_json_source(source)?;
+        Ok(self.synthetic_module(key, ModuleKind::Json, value))
+    }
+
+    /// Builds a synthetic **text module** record for `key`: the raw source text
+    /// becomes the `default` export (import-text proposal).
+    fn build_text_module(&mut self, key: &str, source: &str) -> ModuleRecord {
+        let value = self.new_str(source);
+        self.synthetic_module(key, ModuleKind::Text, value)
+    }
+
+    /// Assembles a synthetic module record (JSON / text): an empty program, a
+    /// single local `default` export, and the pre-built export `value`.
+    fn synthetic_module(&mut self, key: &str, kind: ModuleKind, value: NanBox) -> ModuleRecord {
+        // A leaked empty program so the record's `&'static Program` invariant
+        // holds (link/instantiate iterate an empty body — no-ops).
+        let empty = Program {
+            body: Vec::new(),
+            source_type: crate::ast::SourceType::Module,
+            span: crate::common::Span::new(0, 0),
+        };
+        let program: &'static Program = alloc::boxed::Box::leak(alloc::boxed::Box::new(empty));
+        let mut local_exports = BTreeMap::new();
+        local_exports.insert("default".to_string(), DEFAULT_LOCAL.to_string());
+        ModuleRecord {
+            key: key.to_string(),
+            program,
+            imports: Vec::new(),
+            reexports: Vec::new(),
+            local_exports,
+            scope: Scope::root(),
+            import_aliases: Rc::new(BTreeMap::new()),
+            namespace: None,
+            deferred_namespace: None,
+            meta: None,
+            status: Status::New,
+            eval_error: None,
+            kind,
+            default_value: Some(value),
+        }
+    }
+
+    /// Full `JSON.parse` of a whole source string (value plus a trailing-content
+    /// check), used to materialise a JSON module's default export.
+    fn parse_json_source(&mut self, source: &str) -> Result<NanBox, ExecError> {
+        let chars: Vec<char> = source.chars().collect();
+        let mut pos = 0;
+        let value = self.json_parse(&chars, &mut pos, 0)?;
+        super::skip_ws(&chars, &mut pos);
+        if pos != chars.len() {
+            return Err(self.json_error("Unexpected token in JSON"));
+        }
+        Ok(value)
     }
 
     /// Parses one module source into a [`ModuleRecord`], resolving each import /
@@ -454,6 +569,8 @@ impl<'a> Interp<'a> {
             match stmt {
                 Stmt::Import(decl) => {
                     let dep = resolve(&decl.source, self)?;
+                    let type_attr = attr_type(&decl.attributes);
+                    let dep = module_map_key(&dep, type_attr.as_deref());
                     let mut binds = Vec::new();
                     for s in &decl.specifiers {
                         match s {
@@ -475,19 +592,24 @@ impl<'a> Interp<'a> {
                         key: dep,
                         specifiers: binds,
                         deferred: decl.deferred,
+                        type_attr,
                     });
                 }
                 Stmt::Export(ExportDecl::Named {
                     specifiers,
                     source: Some(src),
+                    attributes,
                     ..
                 }) => {
                     let dep = resolve(src, self)?;
+                    let type_attr = attr_type(attributes);
+                    let dep = module_map_key(&dep, type_attr.as_deref());
                     for sp in specifiers {
                         reexports.push(ReExport::Named {
                             key: dep.clone(),
                             local: export_name(&sp.local),
                             exported: export_name(&sp.exported),
+                            type_attr: type_attr.clone(),
                         });
                     }
                 }
@@ -503,15 +625,22 @@ impl<'a> Interp<'a> {
                 Stmt::Export(ExportDecl::All {
                     exported,
                     source: src,
+                    attributes,
                     ..
                 }) => {
                     let dep = resolve(src, self)?;
+                    let type_attr = attr_type(attributes);
+                    let dep = module_map_key(&dep, type_attr.as_deref());
                     match exported {
                         Some(name) => reexports.push(ReExport::StarAs {
                             key: dep,
                             exported: export_name(name),
+                            type_attr,
                         }),
-                        None => reexports.push(ReExport::Star { key: dep }),
+                        None => reexports.push(ReExport::Star {
+                            key: dep,
+                            type_attr,
+                        }),
                     }
                 }
                 Stmt::Export(ExportDecl::Default { declaration, .. }) => {
@@ -548,6 +677,8 @@ impl<'a> Interp<'a> {
             meta: None,
             status: Status::New,
             eval_error: None,
+            kind: ModuleKind::JavaScript,
+            default_value: None,
         })
     }
 
@@ -647,32 +778,18 @@ impl<'a> Interp<'a> {
         }
         // Validate this module's own re-exports resolve (link-time SyntaxError on
         // a missing/ambiguous re-exported name).
-        let reexports: Vec<ReExport> = {
+        let named_reexports: Vec<(String, String)> = {
             let r = &self.modules.records[key];
             r.reexports
                 .iter()
-                .map(|re| match re {
-                    ReExport::Named {
-                        key,
-                        local,
-                        exported,
-                    } => ReExport::Named {
-                        key: key.clone(),
-                        local: local.clone(),
-                        exported: exported.clone(),
-                    },
-                    ReExport::Star { key } => ReExport::Star { key: key.clone() },
-                    ReExport::StarAs { key, exported } => ReExport::StarAs {
-                        key: key.clone(),
-                        exported: exported.clone(),
-                    },
+                .filter_map(|re| match re {
+                    ReExport::Named { key, local, .. } => Some((key.clone(), local.clone())),
+                    _ => None,
                 })
                 .collect()
         };
-        for re in &reexports {
-            if let ReExport::Named { key, local, .. } = re {
-                self.resolve_export(key, local, &mut BTreeSet::new())?;
-            }
+        for (dep, local) in &named_reexports {
+            self.resolve_export(dep, local, &mut BTreeSet::new())?;
         }
 
         let aliases = Rc::new(aliases);
@@ -689,6 +806,16 @@ impl<'a> Interp<'a> {
         // module's body has run — e.g. `b` may call `a`'s exported function even
         // when `a` is mid-evaluation.
         self.instantiate_module_functions(key)?;
+        // A synthetic (JSON / text) module has no body: bind its pre-built
+        // `default` export value into its scope now, so a `default` import or a
+        // namespace snapshot reads it (evaluation is a no-op for these).
+        if let Some(r) = self.modules.records.get(key)
+            && !matches!(r.kind, ModuleKind::JavaScript)
+            && let Some(value) = r.default_value
+        {
+            let scope = r.scope.clone();
+            scope.declare_const(DEFAULT_LOCAL, value);
+        }
         Ok(())
     }
 
@@ -801,8 +928,9 @@ impl<'a> Interp<'a> {
                     key,
                     local,
                     exported,
+                    ..
                 } if exported == name => Some((key.clone(), local.clone())),
-                ReExport::StarAs { key, exported } if exported == name => {
+                ReExport::StarAs { key, exported, .. } if exported == name => {
                     Some((key.clone(), String::new()))
                 }
                 _ => None,
@@ -826,7 +954,7 @@ impl<'a> Interp<'a> {
             .reexports
             .iter()
             .filter_map(|re| match re {
-                ReExport::Star { key } => Some(key.clone()),
+                ReExport::Star { key, .. } => Some(key.clone()),
                 _ => None,
             })
             .collect();
@@ -1321,7 +1449,7 @@ impl<'a> Interp<'a> {
                 ReExport::Named { exported, .. } | ReExport::StarAs { exported, .. } => {
                     names.insert(exported.clone());
                 }
-                ReExport::Star { key } => star_deps.push(key.clone()),
+                ReExport::Star { key, .. } => star_deps.push(key.clone()),
             }
         }
         for dep in star_deps {
@@ -1371,12 +1499,19 @@ impl<'a> Interp<'a> {
         &mut self,
         arguments: &'a [crate::ast::Argument],
     ) -> Result<NanBox, ExecError> {
-        let promise = self.fresh_promise();
-        // Evaluate the specifier argument (the first item; options are ignored).
+        // Evaluate the specifier and the optional options argument *before* the
+        // promise capability exists: a throw from either expression (or its
+        // `GetValue`) propagates synchronously per `ImportCall` steps 2–4, and
+        // both are evaluated in source order (`2nd-param-evaluation-sequence`).
         let spec = match arguments.first() {
             Some(crate::ast::Argument::Item(e)) => self.eval(e)?,
             _ => NanBox::undefined(),
         };
+        let options = match arguments.get(1) {
+            Some(crate::ast::Argument::Item(e)) => Some(self.eval(e)?),
+            _ => None,
+        };
+        let promise = self.fresh_promise();
         let referrer = self.current_module_key();
         let host = FileModuleHost;
         let outcome: Result<NanBox, ExecError> = (|this: &mut Self| {
@@ -1385,10 +1520,15 @@ impl<'a> Interp<'a> {
             // rather than propagating synchronously. Use the real ToString (not
             // the lossy display form) so a user `toString` override is honoured.
             let spec_str = this.coerce_to_string(spec)?;
+            // Import attributes from the options `with` object (a non-object
+            // options / `with`, or a non-string attribute value, rejects the
+            // promise with a TypeError).
+            let type_attr = this.import_call_attributes_type(options)?;
             let dep = host
                 .resolve(&spec_str, referrer.as_deref())
                 .map_err(|e| this.type_error(&e))?;
-            this.load_module(&dep, &host)?;
+            let dep = module_map_key(&dep, type_attr.as_deref());
+            this.load_module(&dep, &host, type_attr.as_deref())?;
             this.link_module(&dep)?;
             this.evaluate_module(&dep)?;
             this.namespace_object(&dep)
@@ -1425,7 +1565,7 @@ impl<'a> Interp<'a> {
             let dep = host
                 .resolve(&spec_str, referrer.as_deref())
                 .map_err(|e| this.type_error(&e))?;
-            this.load_module(&dep, &host)?;
+            this.load_module(&dep, &host, None)?;
             this.link_module(&dep)?;
             // Deliberately NOT evaluated — deferred until first namespace access.
             this.deferred_namespace_object(&dep)
@@ -1440,6 +1580,73 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(NanBox::handle(promise.to_raw()))
+    }
+
+    /// Processes a dynamic `import(specifier, options)` second argument per the
+    /// `ImportCall` runtime semantics (import-attributes): validates `options`
+    /// is an Object (or absent/undefined), reads its `with` attributes object,
+    /// enumerates every own-enumerable string attribute (running getters /
+    /// proxy traps, each value required to be a String), and returns the value
+    /// of the `type` attribute if present. Any type violation (non-object
+    /// options / `with`, non-string value) is a TypeError that rejects the
+    /// promise; an abrupt getter / trap propagates.
+    fn import_call_attributes_type(
+        &mut self,
+        options: Option<NanBox>,
+    ) -> Result<Option<String>, ExecError> {
+        let Some(options) = options else {
+            return Ok(None);
+        };
+        if options.is_undefined() {
+            return Ok(None);
+        }
+        if !self.is_object_value(options) {
+            return Err(self.type_error("the import() options argument must be an object"));
+        }
+        let opt_h = crate::heap::Handle::from_raw(options.as_handle().unwrap());
+        let with_val = self.read_member(opt_h, "with")?;
+        if with_val.is_undefined() {
+            return Ok(None);
+        }
+        if !self.is_object_value(with_val) {
+            return Err(self.type_error("the `with` import attributes must be an object"));
+        }
+        let attrs_h = crate::heap::Handle::from_raw(with_val.as_handle().unwrap());
+        let keys = self.enumerable_own_string_keys(attrs_h)?;
+        let mut type_attr = None;
+        for k in keys {
+            let v = self.read_member(attrs_h, &k)?;
+            let s = v
+                .as_handle()
+                .map(crate::heap::Handle::from_raw)
+                .and_then(|h| self.realm.string_value(h));
+            let Some(s) = s else {
+                return Err(self.type_error("an import attribute value must be a string"));
+            };
+            if k == "type" {
+                type_attr = Some(s);
+            }
+        }
+        Ok(type_attr)
+    }
+
+    /// The own **enumerable** String-keyed property names of `handle`
+    /// (`EnumerableOwnProperties`, key kind), routed through the proxy
+    /// `ownKeys` / `getOwnPropertyDescriptor` protocol for a proxy.
+    fn enumerable_own_string_keys(
+        &mut self,
+        handle: crate::heap::Handle,
+    ) -> Result<Vec<String>, ExecError> {
+        if self.realm.proxy_at(handle).is_some() {
+            return Ok(self.proxy_own_enumerable_keys(handle)?.unwrap_or_default());
+        }
+        let mut out = Vec::new();
+        for k in self.realm.own_property_names(handle).unwrap_or_default() {
+            if self.realm.property_is_enumerable(handle, &k) {
+                out.push(k);
+            }
+        }
+        Ok(out)
     }
 
     /// The key of the module whose body is currently running, found by matching
@@ -1482,10 +1689,49 @@ struct DepBinds {
 /// The resolved dependency key of a re-export.
 fn reexport_key(re: &ReExport) -> String {
     match re {
-        ReExport::Named { key, .. } | ReExport::Star { key } | ReExport::StarAs { key, .. } => {
+        ReExport::Named { key, .. } | ReExport::Star { key, .. } | ReExport::StarAs { key, .. } => {
             key.clone()
         }
     }
+}
+
+/// The resolved dependency key of a re-export paired with its `type` import
+/// attribute (so a JSON re-export target is loaded as a JSON module).
+fn reexport_key_type(re: &ReExport) -> (String, Option<String>) {
+    match re {
+        ReExport::Named { key, type_attr, .. }
+        | ReExport::Star { key, type_attr }
+        | ReExport::StarAs { key, type_attr, .. } => (key.clone(), type_attr.clone()),
+    }
+}
+
+/// The internal module-map key for a resolved specifier under a `type` import
+/// attribute. A JSON / text module is keyed by `<path>\0type=<t>` so the same
+/// file imported both as JavaScript and as JSON/text is two distinct module
+/// records (the spec keys the module map by `(specifier, attributes)`). A
+/// plain JavaScript import keeps the bare resolved path as its key.
+fn module_map_key(resolved: &str, type_attr: Option<&str>) -> String {
+    match type_attr {
+        Some(t @ ("json" | "text")) => alloc::format!("{resolved}\u{0}type={t}"),
+        _ => resolved.to_string(),
+    }
+}
+
+/// The underlying file path of a (possibly type-suffixed) module map key — the
+/// path the host actually loads.
+fn module_load_path(key: &str) -> &str {
+    match key.split_once('\u{0}') {
+        Some((path, _)) => path,
+        None => key,
+    }
+}
+
+/// The value of the `type` import attribute (`with { type: "…" }`), if present.
+fn attr_type(attrs: &[crate::ast::ImportAttribute]) -> Option<String> {
+    attrs
+        .iter()
+        .find(|(k, _)| &**k == "type")
+        .map(|(_, v)| v.to_string())
 }
 
 /// The string form of a `ModuleExportName`.

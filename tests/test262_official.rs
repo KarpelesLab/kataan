@@ -73,8 +73,10 @@ var $262 = {
 const SKIP_FEATURES: &[&str] = &[
     // "Temporal", // implemented (ZonedDateTime/Now skipped via path-check above)
     "tail-call-optimization",
-    "import-assertions",
-    "import-attributes",
+    // Import attributes are implemented (JSON + text modules); `type: "bytes"`
+    // additionally needs a Uint8Array-over-immutable-ArrayBuffer default export
+    // (the import-bytes proposal), which is unimplemented — skip that feature.
+    "import-bytes",
     // Atomics / SharedArrayBuffer: the single-agent deterministic core is
     // implemented (namespace, ops, SAB construct/grow/slice), so non-gated probes
     // like `Atomics.pause` already pass. The bulk stays skipped pending the

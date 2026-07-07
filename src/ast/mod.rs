@@ -23,7 +23,9 @@ pub use expr::{
     Argument, ArrayElement, Expr, ObjectMember, PropertyKey, TemplateElement, TemplateLiteral,
 };
 pub use function::{Arrow, ArrowBody, Function, Param};
-pub use module::{ExportDecl, ExportSpecifier, ImportDecl, ImportSpecifier, ModuleExportName};
+pub use module::{
+    ExportDecl, ExportSpecifier, ImportAttribute, ImportDecl, ImportSpecifier, ModuleExportName,
+};
 pub use pattern::{
     ArrayPattern, ArrayPatternElement, BindingTarget, ObjectPattern, ObjectPatternProp,
 };
