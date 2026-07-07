@@ -735,8 +735,10 @@ impl Cursor<'_> {
             false
         }
     }
-    /// Consumes a sign: ASCII `+`/`-` or U+2212 MINUS SIGN (`0xE2 0x88 0x92`).
-    /// Returns `Some(true)` for a minus, `Some(false)` for a plus.
+    /// Consumes an ASCII sign `+`/`-`. Returns `Some(true)` for a minus,
+    /// `Some(false)` for a plus. Temporal's grammar forbids the U+2212 MINUS SIGN,
+    /// so it is NOT accepted (a leading U+2212 makes the string fail to parse → a
+    /// RangeError at the call site).
     fn eat_sign(&mut self) -> Option<bool> {
         match self.peek() {
             Some(b'+') => {
@@ -745,13 +747,6 @@ impl Cursor<'_> {
             }
             Some(b'-') => {
                 self.i += 1;
-                Some(true)
-            }
-            Some(0xE2)
-                if self.b.get(self.i + 1) == Some(&0x88)
-                    && self.b.get(self.i + 2) == Some(&0x92) =>
-            {
-                self.i += 3;
                 Some(true)
             }
             _ => None,
