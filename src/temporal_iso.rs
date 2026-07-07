@@ -820,9 +820,18 @@ fn parse_date(c: &mut Cursor) -> Option<IsoDate> {
     } else {
         c.digits(4)?
     };
-    c.eat(b'-');
+    // Date separators are all-or-nothing: if a `-` follows the year it must also
+    // follow the month (and vice versa). Mixed forms like `2020-0101` or
+    // `202001-01` are not valid ISO date strings.
+    let sep = c.eat(b'-');
     let month = c.digits(2)?;
-    c.eat(b'-');
+    if sep {
+        if !c.eat(b'-') {
+            return None;
+        }
+    } else if c.peek() == Some(b'-') {
+        return None;
+    }
     let day = c.digits(2)?;
     regulate_iso_date(year as i32, month, day, Overflow::Reject)
 }
@@ -836,13 +845,13 @@ fn parse_time_and_offset(c: &mut Cursor) -> Option<(IsoTime, Option<i128>, bool)
         minute = c.digits(2)?;
         if c.eat(b':') {
             second = c.digits(2)?;
-            frac_ns = parse_fraction(c);
+            frac_ns = parse_fraction(c)?;
         }
     } else if c.peek().is_some_and(|b| b.is_ascii_digit()) {
         minute = c.digits(2)?;
         if c.peek().is_some_and(|b| b.is_ascii_digit()) {
             second = c.digits(2)?;
-            frac_ns = parse_fraction(c);
+            frac_ns = parse_fraction(c)?;
         }
     }
     let time = regulate_iso_time(
@@ -854,45 +863,49 @@ fn parse_time_and_offset(c: &mut Cursor) -> Option<(IsoTime, Option<i128>, bool)
         frac_ns % 1_000,
         Overflow::Reject,
     )?;
-    let (off, z) = parse_offset(c);
+    let (off, z) = parse_offset(c)?;
     Some((time, off, z))
 }
 
-/// Parses a `.` or `,` fractional-seconds group into nanoseconds (0 if absent).
-fn parse_fraction(c: &mut Cursor) -> i64 {
+/// Parses a `.` or `,` fractional-seconds group into nanoseconds. Returns
+/// `Some(0)` when no fraction is present, `Some(ns)` for a valid 1–9-digit
+/// fraction, and `None` when the fraction is malformed (a `.`/`,` with no
+/// following digit, or MORE than 9 fractional digits — the Temporal grammar
+/// caps a fraction at 9 places, so a 10th digit makes the whole string fail).
+fn parse_fraction(c: &mut Cursor) -> Option<i64> {
     if c.eat(b'.') || c.eat(b',') {
         let mut ns = 0_i64;
         let mut count = 0;
-        while count < 9 {
-            match c.peek() {
-                Some(b) if b.is_ascii_digit() => {
-                    ns = ns * 10 + i64::from(b - b'0');
-                    c.i += 1;
-                    count += 1;
-                }
-                _ => break,
-            }
-        }
-        // Consume any excess digits (spec allows only up to 9, but be lenient).
         while c.peek().is_some_and(|b| b.is_ascii_digit()) {
+            if count == 9 {
+                return None; // a 10th fractional digit is a parse error
+            }
+            ns = ns * 10 + i64::from(c.peek().unwrap() - b'0');
             c.i += 1;
+            count += 1;
+        }
+        if count == 0 {
+            return None; // '.'/',' with no fractional digit
         }
         for _ in count..9 {
             ns *= 10;
         }
-        ns
+        Some(ns)
     } else {
-        0
+        Some(0)
     }
 }
 
-fn parse_offset(c: &mut Cursor) -> (Option<i128>, bool) {
+/// Parses an optional `Z`/`z` or `±HH[:MM[:SS[.fffffffff]]]` UTC offset. The
+/// outer `Option` is `None` only on a genuine parse error (e.g. an offset with a
+/// >9-digit fraction); a *missing* offset returns `Some((None, false))`.
+fn parse_offset(c: &mut Cursor) -> Option<(Option<i128>, bool)> {
     if c.eat(b'Z') || c.eat(b'z') {
-        return (Some(0), true);
+        return Some((Some(0), true));
     }
     if let Some(neg) = c.eat_sign() {
         let Some(h) = c.digits(2) else {
-            return (None, false);
+            return Some((None, false));
         };
         let mut m = 0;
         let mut s = 0;
@@ -901,18 +914,23 @@ fn parse_offset(c: &mut Cursor) -> (Option<i128>, bool) {
             m = c.digits(2).unwrap_or(0);
             if c.eat(b':') {
                 s = c.digits(2).unwrap_or(0);
-                frac = parse_fraction(c);
+                frac = parse_fraction(c)?;
             }
         } else if c.peek().is_some_and(|b| b.is_ascii_digit()) {
             m = c.digits(2).unwrap_or(0);
+        }
+        // A UTC offset's hour/minute/second components have the usual ranges; a
+        // value like `+24:00` or `-00:60` is not a valid offset (→ parse error).
+        if h > 23 || m > 59 || s > 59 {
+            return None;
         }
         let ns = i128::from(h) * NS_PER_HOUR
             + i128::from(m) * NS_PER_MINUTE
             + i128::from(s) * NS_PER_SEC
             + i128::from(frac);
-        return (Some(if neg { -ns } else { ns }), false);
+        return Some((Some(if neg { -ns } else { ns }), false));
     }
-    (None, false)
+    Some((None, false))
 }
 
 fn parse_annotations(c: &mut Cursor, out: &mut ParsedIso) {
@@ -1047,13 +1065,16 @@ fn peek_number(c: &mut Cursor) -> Option<(i64, Option<i64>)> {
         c.i += 1;
         let mut f = 0_i64;
         let mut cnt = 0;
-        while cnt < 9 && c.peek().is_some_and(|b| b.is_ascii_digit()) {
+        while c.peek().is_some_and(|b| b.is_ascii_digit()) {
+            if cnt == 9 {
+                return None; // a 10th fractional digit is a parse error
+            }
             f = f * 10 + i64::from(c.peek().unwrap() - b'0');
             c.i += 1;
             cnt += 1;
         }
-        while c.peek().is_some_and(|b| b.is_ascii_digit()) {
-            c.i += 1;
+        if cnt == 0 {
+            return None; // '.'/',' with no fractional digit
         }
         for _ in cnt..9 {
             f *= 10;
@@ -1174,6 +1195,53 @@ mod tests {
         );
         let z = parse_iso_datetime("2020-03-15T12:30:45Z").unwrap();
         assert!(z.z);
+    }
+
+    #[test]
+    fn parse_fraction_at_most_9_digits() {
+        // Exactly 9 fractional digits is valid; a 10th is a parse error.
+        assert!(parse_iso_datetime("1970-01-01T00:00:00.123456789").is_some());
+        assert!(parse_iso_datetime("1970-01-01T00:00:00.1234567891").is_none());
+        assert!(parse_iso_datetime("1970-01-01T00:00:00.1234567890").is_none());
+        // Bare time forms.
+        assert!(parse_iso_datetime("00:00:00.123456789").is_some());
+        assert!(parse_iso_datetime("00:00:00.1234567891").is_none());
+        // Fractional seconds inside a UTC offset are likewise capped at 9.
+        assert!(parse_iso_datetime("00+00:00:00.123456789").is_some());
+        assert!(parse_iso_datetime("00+00:00:00.1234567891").is_none());
+        // A shorter fraction still normalises to nanoseconds correctly.
+        let p = parse_iso_datetime("1970-01-01T00:00:00.5").unwrap();
+        assert_eq!(p.time.unwrap().millisecond, 500);
+        // A '.' with no following digit is malformed.
+        assert!(parse_iso_datetime("1970-01-01T00:00:00.").is_none());
+        // Duration fractions are also capped at 9 places.
+        assert!(parse_iso_duration("PT0.123456789S").is_some());
+        assert!(parse_iso_duration("PT0.1234567891S").is_none());
+    }
+
+    #[test]
+    fn parse_date_separator_consistency() {
+        // All-or-nothing date separators: a consistent form yields a date.
+        assert!(parse_iso_datetime("2020-01-01").unwrap().date.is_some());
+        assert!(parse_iso_datetime("20200101").unwrap().date.is_some());
+        assert!(parse_iso_datetime("+002020-01-01").unwrap().date.is_some());
+        // Mixed separators must NOT be accepted as a date (they may still parse
+        // as a bare time, which the date-requiring callers reject).
+        assert!(parse_iso_datetime("2020-0101").is_none_or(|p| p.date.is_none()));
+        assert!(parse_iso_datetime("202001-01").is_none_or(|p| p.date.is_none()));
+        // A 7-digit signed year is malformed outright.
+        assert!(parse_iso_datetime("+0002020-01-01").is_none());
+    }
+
+    #[test]
+    fn parse_offset_component_ranges() {
+        // Valid offsets.
+        assert!(parse_iso_datetime("00:00:00+23:59").is_some());
+        assert!(parse_iso_datetime("00:00:00+00:00").is_some());
+        // Out-of-range offset components make the whole string fail.
+        assert!(parse_iso_datetime("00:00-24:00").is_none());
+        assert!(parse_iso_datetime("00:00+24:00").is_none());
+        assert!(parse_iso_datetime("00:00:00-00:60").is_none());
     }
 
     #[test]
