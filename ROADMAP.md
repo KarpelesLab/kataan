@@ -349,10 +349,12 @@ These are removed from the *ran* denominator via `SKIP_FEATURES`; implementing a
 one both adds coverage and moves its tests from skipped → ran:
 
 - **Temporal** — IMPLEMENTED (~90%, 4134/4603): all 9 types + Now, un-skipped. Remaining: i128 Duration precision, DST edges, per-type parser polish.
-- **Decorators** — class/field decorators + `Symbol.metadata`.
+- **Decorators** — IMPLEMENTED (parse + accessor auto-accessors, 24/24 language tests, un-skipped).
 - **Tail-call optimization** (proper tail calls).
-- **Import attributes / assertions** (with §3.1).
-- **cross-realm** (`$262.createRealm`) and **IsHTMLDDA** (host-quirk `document.all`).
+- **Import attributes / assertions** — IMPLEMENTED (with/assert grammar + JSON/text modules, 94/100, un-skipped).
+- **IsHTMLDDA** (`document.all`) — IMPLEMENTED (34/34, un-skipped).
+- **cross-realm** (`$262.createRealm`) — a second realm with isolated globals (still skipped).
+- **Tail-call optimization** (proper tail calls) — still skipped.
 
 ### 3.10 The gate
 
