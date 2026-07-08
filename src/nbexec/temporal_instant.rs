@@ -8,6 +8,8 @@
 //! integer nanosecond arithmetic; wall-clock strings are derived on demand from
 //! the ISO core (`epoch_days_to_iso` + `balance_time_from_nanos`).
 use super::*;
+#[cfg(not(feature = "std"))]
+use crate::common::FloatExt;
 use crate::temporal_iso::{
     self, DurationFields, IsoDate, IsoTime, RoundMode, TemporalData, TemporalKind, Unit,
     balance_time_duration, balance_time_from_nanos, epoch_days_to_iso, format_fraction,

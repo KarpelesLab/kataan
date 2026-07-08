@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(not(feature = "std"))]
+use crate::common::FloatExt;
 
 /// The resolved form of `Intl.NumberFormat`'s `useGrouping` option: a boolean
 /// `false`, or one of the string modes `"auto"`/`"always"`/`"min2"`.

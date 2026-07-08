@@ -9,6 +9,8 @@
 //! derived on demand: `local = epoch_ns + offset(zone, epoch_ns)`, then decomposed
 //! with `balance_time_from_nanos` + `epoch_days_to_iso`.
 use super::*;
+#[cfg(not(feature = "std"))]
+use crate::common::FloatExt;
 use crate::temporal_iso::{
     self as iso, DurationFields, IsoDate, IsoTime, Overflow, RoundMode, TemporalData, TemporalKind,
     Unit, balance_time_from_nanos, epoch_days_to_iso, iso_to_epoch_days, time_to_nanos,

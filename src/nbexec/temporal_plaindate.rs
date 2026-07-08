@@ -3,6 +3,8 @@
 //! method/getter/static logic), so it can be implemented independently of the
 //! other Temporal types and of the shared wiring in `temporal.rs`.
 use super::*;
+#[cfg(not(feature = "std"))]
+use crate::common::FloatExt;
 use crate::temporal_iso::{
     self, DurationFields, IsoDate, MAX_EPOCH_DAYS, MIN_EPOCH_DAYS, Overflow, TemporalData,
     TemporalKind, Unit, add_iso_date, compare_iso_date, difference_iso_date, format_iso_year,

@@ -8,6 +8,8 @@
 //! [`IsoDate`] carrying the reference day; the `kind` is
 //! [`TemporalKind::PlainYearMonth`].
 use super::*;
+#[cfg(not(feature = "std"))]
+use crate::common::FloatExt;
 use crate::temporal_iso::{
     self, IsoDate, Overflow, RoundMode, TemporalData, TemporalKind, format_iso_year, is_leap_year,
     iso_date_in_range, iso_days_in_month, iso_days_in_year, pad, regulate_iso_date,

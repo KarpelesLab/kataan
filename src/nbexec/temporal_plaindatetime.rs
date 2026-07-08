@@ -8,6 +8,8 @@
 //! `TemporalData.time` (`IsoTime`) and is essentially `PlainDate + PlainTime`
 //! combined, reusing the shared `crate::temporal_iso` helpers.
 use super::*;
+#[cfg(not(feature = "std"))]
+use crate::common::FloatExt;
 use crate::temporal_iso::{
     self as iso, DurationFields, IsoDate, IsoTime, Overflow, RoundMode, TemporalData, TemporalKind,
     Unit,
