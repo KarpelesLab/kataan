@@ -155,6 +155,7 @@ impl Drop for ExternalBytes {
 }
 
 /// A heap-allocated reference value.
+#[repr(u8)] // JIT inline fast path bakes the Object-variant discriminant; verified in jit layout test
 pub enum Cell {
     /// An ordinary object (shape + value slots).
     Object(Object),

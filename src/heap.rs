@@ -55,6 +55,7 @@ impl Handle {
 /// A heap slot: either holds a live value or is free and awaiting reuse. Both
 /// carry the generation so a freed-then-reallocated slot invalidates old
 /// handles.
+#[repr(u8)] // JIT inline fast path bakes Slot<Cell> offsets; verified in jit layout test
 enum Slot<T> {
     Occupied {
         generation: u16,

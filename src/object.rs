@@ -51,6 +51,7 @@ fn array_index(k: &str) -> Option<u32> {
 /// `Dict` mode, an insertion-ordered map that adds **no**
 /// shape transitions: this bounds the shape transition-tree's growth for
 /// programs that pile up unbounded unique keys (MEM-3).
+#[repr(u8)] // JIT inline fast path bakes the Shaped discriminant + field offsets; verified
 enum ObjectData {
     /// Default representation: a hidden-class shape and a dense value vector
     /// indexed by the shape's slot numbers.
@@ -71,6 +72,7 @@ enum ObjectData {
 /// A property-bearing object: a hidden-class shape plus its value slots (or a
 /// dictionary once it grows past the threshold), with an optional side list of
 /// accessor (getter/setter) properties.
+#[repr(C)] // JIT inline fast path bakes `data` at offset 0; verified in jit layout test
 pub struct Object {
     /// The data-property storage: shaped (default) or dictionary mode.
     data: ObjectData,

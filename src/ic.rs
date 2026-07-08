@@ -23,6 +23,7 @@ use alloc::rc::Rc;
 /// A monomorphic inline cache for one property-access site: it remembers the
 /// last shape it resolved and the slot the property lived in.
 #[derive(Default)]
+#[repr(C)] // JIT inline fast path reads `shape`/`slot` offsets; verified in jit layout test
 pub struct PropertyCache {
     /// The cached shape, if the site has been warmed.
     shape: Option<Rc<Shape>>,
