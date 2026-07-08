@@ -5252,6 +5252,39 @@ fn wasm_memory_grow_keeps_same_buffer_object_and_shares() {
     );
 }
 
+#[test]
+fn wasm_exported_table_is_introspectable_from_js() {
+    // A module exporting a `funcref` table (slot 0 = the exported `add`, slot 1
+    // uninitialized) plus the `add` function. From JS, `tbl.get(0)` is the `add`
+    // wrapper (callable), `tbl.length` is 2, and `tbl.get(1)` is null.
+    // Hand-encoded: (type (i32 i32)->i32) (func add) (table 2 funcref)
+    //   (elem (i32.const 0) 0) (export "tbl" table 0) (export "add" func 0)
+    let module_bytes: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, // type (i32 i32)->i32
+        0x03, 0x02, 0x01, 0x00, // func 0: type 0
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x02, // table: funcref min 2
+        0x07, 0x0d, 0x02, // exports: 2
+        0x03, 0x74, 0x62, 0x6c, 0x01, 0x00, // "tbl" table 0
+        0x03, 0x61, 0x64, 0x64, 0x00, 0x00, // "add" func 0
+        0x09, 0x07, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x01, 0x00, // elem active t0 off0 [func0]
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b, // code: add
+    ];
+    let src = "const inst = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array(MOD)));
+         const t = inst.exports.tbl;
+         const f = t.get(0);
+         // slot 1 is an uninitialized funcref (null); `join` renders it as empty.
+         [t.length, typeof f, f(20, 22), t.get(1) === null].join(',');";
+    let combined = alloc::format!("const MOD = {}; {src}", js_byte_array(module_bytes));
+    let program = Parser::parse_program(&combined).expect("parse");
+    let mut interp = Interp::new();
+    let value = interp.run(&program).expect("exec");
+    assert_eq!(
+        interp.realm().to_display_string(value),
+        "2,function,42,true"
+    );
+}
+
 /// Runs `src` with the module compiled from `wat` pre-installed as the global
 /// `MOD` (a JS array of byte numbers), returning the completion display.
 fn run_wasm_wat(wat: &str, src: &str) -> alloc::string::String {

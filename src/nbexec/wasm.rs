@@ -350,6 +350,41 @@ impl<'a> Interp<'a> {
         mem
     }
 
+    /// Builds a `WebAssembly.Table` object over an existing element array
+    /// (`elems`), exposing `.length` + `get`/`set`/`grow` and recording an
+    /// optional maximum. Shared by `new WebAssembly.Table` and exported tables.
+    pub(crate) fn make_wasm_table_object(
+        &mut self,
+        elems: Handle,
+        maximum: Option<usize>,
+    ) -> Handle {
+        let table = self.realm.new_object();
+        self.realm
+            .set_hidden_property(table, WASM_TABLE_ELEMS, NanBox::handle(elems.to_raw()));
+        self.realm.set_hidden_property(
+            table,
+            WASM_TABLE_MAX,
+            maximum.map_or(NanBox::undefined(), |m| NanBox::number(m as f64)),
+        );
+        let len_get = self.realm.new_bound_native(N_WASM_TABLE_LEN, table);
+        self.realm.define_accessor(
+            table,
+            "length",
+            NanBox::handle(len_get.to_raw()),
+            NanBox::undefined(),
+        );
+        for (name, nid) in [
+            ("get", N_WASM_TABLE_GET),
+            ("set", N_WASM_TABLE_SET),
+            ("grow", N_WASM_TABLE_GROW),
+        ] {
+            let f = self.realm.new_bound_native(nid, table);
+            self.realm
+                .set_property(table, name, NanBox::handle(f.to_raw()));
+        }
+        table
+    }
+
     /// Builds a `WebAssembly.Global` object wrapping the already-coerced `value`
     /// of type `ty`, with a `.value` accessor (settable only when `mutable`).
     pub(crate) fn make_wasm_global(&mut self, value: NanBox, ty: &str, mutable: bool) -> NanBox {
@@ -466,6 +501,10 @@ impl<'a> Interp<'a> {
         let inst_id = self.wasm_next_id;
         self.wasm_next_id = self.wasm_next_id.wrapping_add(1);
         let exports = self.realm.new_object();
+        // Map each exported function's index to its JS wrapper, so an exported
+        // table holding a `funcref` to an exported function surfaces that same
+        // callable via `table.get(i)`.
+        let mut fn_wrappers: Vec<(u32, NanBox)> = Vec::new();
         for name in names {
             let data = self.realm.new_object();
             self.realm.set_property(data, WASM_BYTES, bytes_arr);
@@ -475,8 +514,11 @@ impl<'a> Interp<'a> {
             self.realm
                 .set_property(data, WASM_INSTANCE_ID, NanBox::number(f64::from(inst_id)));
             let f = self.realm.new_bound_native(N_WASM_CALL, data);
-            self.realm
-                .set_property(exports, &name, NanBox::handle(f.to_raw()));
+            let wrapper = NanBox::handle(f.to_raw());
+            if let Some(idx) = module.export(&name) {
+                fn_wrappers.push((idx, wrapper));
+            }
+            self.realm.set_property(exports, &name, wrapper);
         }
         // Exported globals become `WebAssembly.Global` objects holding the
         // instance's value, read at instantiation. Supported for modules with no
@@ -534,6 +576,45 @@ impl<'a> Interp<'a> {
                     .set_property(exports, mname, NanBox::handle(mem.to_raw()));
             }
         }
+        // Exported tables become introspectable `WebAssembly.Table` objects: the
+        // element array is populated from the instance's initial table contents,
+        // mapping a `funcref` to an exported function to that export's JS wrapper
+        // (a null reference / an unexported funcref / an externref → `null`). This
+        // exposes `table.length` and `table.get(i)` to JS. (The JS-side Table is a
+        // snapshot: `table.set` from JS is not yet mirrored back into the wasm
+        // instance's `call_indirect`; two-way liveness is a follow-up, as with
+        // imported host tables.)
+        let table_exports: Vec<(String, u32)> = module
+            .table_exports()
+            .iter()
+            .map(|(n, i)| ((*n).into(), *i))
+            .collect();
+        if !table_exports.is_empty()
+            && module.import_names().is_empty()
+            && module.global_import_names().is_empty()
+            && let Ok(inst) = crate::wasm_rt::Instance::new(&module)
+        {
+            for (tname, tidx) in &table_exports {
+                let Some(size) = inst.table_size(*tidx) else {
+                    continue;
+                };
+                let mut js_elems: Vec<NanBox> = Vec::with_capacity(size);
+                for i in 0..size {
+                    let v = match inst.table_get(*tidx, i) {
+                        Some(crate::wasm_rt::Val::FuncRef(Some(f))) => fn_wrappers
+                            .iter()
+                            .find(|(idx, _)| *idx == f)
+                            .map_or(NanBox::null(), |(_, w)| *w),
+                        _ => NanBox::null(),
+                    };
+                    js_elems.push(v);
+                }
+                let arr = self.realm.new_array(js_elems);
+                let table = self.make_wasm_table_object(arr, None);
+                self.realm
+                    .set_property(exports, tname, NanBox::handle(table.to_raw()));
+            }
+        }
         let instance = self.realm.new_object();
         self.realm
             .set_property(instance, "exports", NanBox::handle(exports.to_raw()));
@@ -561,6 +642,10 @@ impl<'a> Interp<'a> {
                 let big = crate::bignum::BigInt::from_i128(i128::from(n));
                 (NanBox::handle(self.realm.new_bigint(big).to_raw()), "i64")
             }
+            // Reference-typed globals surface as `null` on the JS side (the
+            // engine does not yet map a non-null funcref/externref to a JS value).
+            crate::wasm_rt::Val::FuncRef(_) => (NanBox::null(), "funcref"),
+            crate::wasm_rt::Val::ExternRef(_) => (NanBox::null(), "externref"),
         }
     }
 

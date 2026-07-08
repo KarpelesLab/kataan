@@ -16,8 +16,8 @@ use alloc::vec::Vec;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmRtError(pub &'static str);
 
-/// A WebAssembly value (the numeric core; reference types land with the host
-/// interop bridge).
+/// A WebAssembly value: the numeric core plus the two reference types
+/// (`funcref`/`externref`) from the reference-types proposal.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Val {
     /// 32-bit integer (sign-agnostic; ops pick the interpretation).
@@ -28,6 +28,11 @@ pub enum Val {
     F32(f32),
     /// 64-bit float.
     F64(f64),
+    /// A `funcref`: `Some(func_index)` or `None` for `ref.null func`.
+    FuncRef(Option<u32>),
+    /// An `externref`: `Some(host_id)` (an opaque token the host maps to a JS
+    /// value) or `None` for `ref.null extern`.
+    ExternRef(Option<u64>),
 }
 
 impl Val {
@@ -38,6 +43,21 @@ impl Val {
             Val::I64(_) => ValType::I64,
             Val::F32(_) => ValType::F32,
             Val::F64(_) => ValType::F64,
+            Val::FuncRef(_) => ValType::FuncRef,
+            Val::ExternRef(_) => ValType::ExternRef,
+        }
+    }
+    /// Whether this value is a reference type (`funcref`/`externref`).
+    #[must_use]
+    pub fn is_ref(self) -> bool {
+        matches!(self, Val::FuncRef(_) | Val::ExternRef(_))
+    }
+    /// Whether this reference value is null (`ref.null`), for `ref.is_null`.
+    fn ref_is_null(self) -> Result<bool, WasmRtError> {
+        match self {
+            Val::FuncRef(f) => Ok(f.is_none()),
+            Val::ExternRef(e) => Ok(e.is_none()),
+            _ => Err(WasmRtError("type mismatch: expected a reference")),
         }
     }
     fn as_i32(self) -> Result<i32, WasmRtError> {
@@ -69,20 +89,35 @@ impl Val {
     /// side of the JS↔WASM boundary.
     #[must_use]
     pub fn to_nanbox(self) -> crate::nanbox::NanBox {
-        crate::nanbox::NanBox::number(match self {
-            Val::I32(v) => f64::from(v),
-            Val::I64(v) => v as f64,
-            Val::F32(v) => f64::from(v),
-            Val::F64(v) => v,
-        })
+        match self {
+            Val::I32(v) => crate::nanbox::NanBox::number(f64::from(v)),
+            Val::I64(v) => crate::nanbox::NanBox::number(v as f64),
+            Val::F32(v) => crate::nanbox::NanBox::number(f64::from(v)),
+            Val::F64(v) => crate::nanbox::NanBox::number(v),
+            // Reference values have no numeric image; the JS boundary marshals
+            // them via the host-id side table, so a bare `to_nanbox` maps every
+            // reference (null or not) to `null` as a safe fallback.
+            Val::FuncRef(_) | Val::ExternRef(_) => crate::nanbox::NanBox::null(),
+        }
     }
 
     /// Marshals a JS value (`NanBox`) into a WASM value of type `ty` — the
-    /// argument side of the boundary. Numbers and booleans convert; other JS
-    /// types are rejected.
+    /// argument side of the boundary. Numbers and booleans convert; a JS `null`
+    /// maps to a null reference for the reference types; other combinations are
+    /// rejected (the host bridge handles non-null references via its side table).
     #[must_use]
     pub fn from_nanbox(v: crate::nanbox::NanBox, ty: ValType) -> Option<Val> {
         use crate::nanbox::Unpacked;
+        // Reference-typed parameters: only a bare `null` is representable here.
+        if matches!(ty, ValType::FuncRef | ValType::ExternRef) {
+            return match v.unpack() {
+                Unpacked::Null => Some(match ty {
+                    ValType::FuncRef => Val::FuncRef(None),
+                    _ => Val::ExternRef(None),
+                }),
+                _ => None,
+            };
+        }
         let n = match v.unpack() {
             Unpacked::Number(n) => n,
             Unpacked::Bool(b) => f64::from(u8::from(b)),
@@ -93,6 +128,7 @@ impl Val {
             ValType::I64 => Val::I64(n as i64),
             ValType::F32 => Val::F32(n as f32),
             ValType::F64 => Val::F64(n),
+            ValType::FuncRef | ValType::ExternRef => return None,
         })
     }
 }
@@ -108,6 +144,18 @@ pub enum ValType {
     F32,
     /// `f64`
     F64,
+    /// `funcref` (a reference to a function, or null)
+    FuncRef,
+    /// `externref` (an opaque host reference, or null)
+    ExternRef,
+}
+
+impl ValType {
+    /// Whether this is a reference type (`funcref`/`externref`).
+    #[must_use]
+    pub fn is_ref(self) -> bool {
+        matches!(self, ValType::FuncRef | ValType::ExternRef)
+    }
 }
 
 /// A function type `(params) -> (results)`.
@@ -117,6 +165,38 @@ pub struct FuncType {
     pub params: Vec<ValType>,
     /// Result types.
     pub results: Vec<ValType>,
+}
+
+/// A table type: element reference type + limits (min elements, optional max).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableType {
+    /// The table's element type (`funcref` or `externref`).
+    pub elem: ValType,
+    /// Minimum size, in elements.
+    pub min: u32,
+    /// Maximum size in elements, if the limits declared one.
+    pub max: Option<u32>,
+}
+
+/// How an element segment is applied.
+#[derive(Debug, Clone)]
+enum ElemMode {
+    /// Active: copied into `table` at `offset` at instantiation, then dropped.
+    Active { table: u32, offset: i32 },
+    /// Passive: kept for an explicit `table.init`.
+    Passive,
+    /// Declarative: only declares functions as reference-able; never usable at
+    /// runtime (dropped at instantiation).
+    Declarative,
+}
+
+/// A decoded element segment: its mode, element type, and items (a function
+/// index, or `None` for a null reference).
+#[derive(Debug, Clone)]
+struct ElemSegment {
+    mode: ElemMode,
+    elem_type: ValType,
+    items: Vec<Option<u32>>,
 }
 
 /// A decoded function body: extra local declarations + the raw instruction
@@ -159,9 +239,22 @@ pub struct Module {
     data: Vec<(Option<u32>, Vec<u8>)>,
     /// Module globals: `(initial value, mutable)`.
     globals: Vec<(Val, bool)>,
-    /// The function table (`funcref`): each slot is a function index, or `None`
-    /// for an uninitialized slot (traps on `call_indirect`).
-    table: Vec<Option<u32>>,
+    /// Table types, in index order: imported tables occupy the low indices,
+    /// followed by module-defined tables. Multiple tables are supported.
+    tables: Vec<TableType>,
+    /// Imported tables, occupying the low table indices before module-defined
+    /// tables: `(module, field, element type, min, max)`.
+    table_imports: Vec<(
+        alloc::string::String,
+        alloc::string::String,
+        ValType,
+        u32,
+        Option<u32>,
+    )>,
+    /// `name -> table_index` for exported tables.
+    table_exports: Vec<(alloc::string::String, u32)>,
+    /// Element segments in declaration order (active/passive/declarative).
+    elems: Vec<ElemSegment>,
     /// Imported functions, occupying the low function indices `0..n_imported_funcs`
     /// (module name, field name, type index). The host supplies their behavior.
     func_imports: Vec<(alloc::string::String, alloc::string::String, u32)>,
@@ -204,6 +297,20 @@ struct Store {
     dropped: Vec<bool>,
     /// The memory's declared maximum in pages (the limits' upper bound), if any.
     mem_max_pages: Option<u32>,
+    /// The runtime table instances (index-aligned with `Module::tables`): the
+    /// mutable element contents, plus each table's element type and max.
+    tables: Vec<TableInstance>,
+    /// Per element segment: `true` once `elem.drop` (or instantiation of an
+    /// active/declarative segment) has released it.
+    elem_dropped: Vec<bool>,
+}
+
+/// A runtime table instance: its element contents plus type/limit metadata.
+#[derive(Debug, Clone, PartialEq)]
+struct TableInstance {
+    elems: Vec<Val>,
+    elem_type: ValType,
+    max: Option<u32>,
 }
 
 /// LEB128 cursor over a byte slice.
@@ -307,6 +414,21 @@ impl<'a> Reader<'a> {
             0x0b => {
                 self.byte()?; // memory.fill: one reserved memory index
             }
+            // Bulk-table ops (reference-types proposal).
+            0x0c => {
+                self.u32()?; // table.init: elem index …
+                self.u32()?; // … + table index
+            }
+            0x0d => {
+                self.u32()?; // elem.drop: elem index
+            }
+            0x0e => {
+                self.u32()?; // table.copy: dst table index …
+                self.u32()?; // … + src table index
+            }
+            0x0f..=0x11 => {
+                self.u32()?; // table.grow / table.size / table.fill: table index
+            }
             _ => {} // trunc_sat (0x00..=0x07): no further immediate
         }
         Ok(())
@@ -319,7 +441,19 @@ fn val_type(b: u8) -> Result<ValType, WasmRtError> {
         0x7e => Ok(ValType::I64),
         0x7d => Ok(ValType::F32),
         0x7c => Ok(ValType::F64),
+        0x70 => Ok(ValType::FuncRef),
+        0x6f => Ok(ValType::ExternRef),
         _ => Err(WasmRtError("unsupported value type")),
+    }
+}
+
+/// A reference type from its element/heap-type byte (`0x70` funcref, `0x6f`
+/// externref).
+fn ref_type(b: u8) -> Result<ValType, WasmRtError> {
+    match b {
+        0x70 => Ok(ValType::FuncRef),
+        0x6f => Ok(ValType::ExternRef),
+        _ => Err(WasmRtError("unsupported reference type")),
     }
 }
 
@@ -537,6 +671,9 @@ fn zero_val(t: ValType) -> Val {
         ValType::I64 => Val::I64(0),
         ValType::F32 => Val::F32(0.0),
         ValType::F64 => Val::F64(0.0),
+        // The default for a reference type is the null reference.
+        ValType::FuncRef => Val::FuncRef(None),
+        ValType::ExternRef => Val::ExternRef(None),
     }
 }
 
@@ -949,6 +1086,54 @@ impl Module {
                     }
                     tc.vals.push(a.or(b));
                 }
+                0x1c => {
+                    // select t*: the operand type is given explicitly.
+                    let c = r.u32()?;
+                    let mut tys = Vec::with_capacity((c as usize).min(MAX_RESERVE));
+                    for _ in 0..c {
+                        tys.push(val_type(r.byte()?)?);
+                    }
+                    tc.pop_expect(I32)?; // condition
+                    let t = tys.first().copied();
+                    if let Some(t) = t {
+                        tc.pop_expect(t)?;
+                        tc.pop_expect(t)?;
+                        tc.push(t);
+                    } else {
+                        return Ok(()); // empty type vector: accept conservatively
+                    }
+                }
+                // table.get: [i32] -> [reftype]
+                0x25 => {
+                    let t = self
+                        .table_elem_type(r.u32()?)
+                        .ok_or(WasmRtError("bad table"))?;
+                    tc.pop_expect(I32)?;
+                    tc.push(t);
+                }
+                // table.set: [i32 reftype] -> []
+                0x26 => {
+                    let t = self
+                        .table_elem_type(r.u32()?)
+                        .ok_or(WasmRtError("bad table"))?;
+                    tc.pop_expect(t)?;
+                    tc.pop_expect(I32)?;
+                }
+                // ref.null ht: [] -> [reftype]
+                0xd0 => {
+                    let t = ref_type(r.byte()?)?;
+                    tc.push(t);
+                }
+                // ref.is_null: [ref] -> [i32]
+                0xd1 => {
+                    tc.pop()?; // any reference (accepted loosely)
+                    tc.push(I32);
+                }
+                // ref.func f: [] -> [funcref]
+                0xd2 => {
+                    r.u32()?;
+                    tc.push(ValType::FuncRef);
+                }
                 0x20 => {
                     let i = r.u32()? as usize;
                     tc.push(*locals.get(i).ok_or(WasmRtError("bad local"))?);
@@ -1078,6 +1263,49 @@ impl Module {
                             tc.pop_expect(I32)?;
                             tc.pop_expect(I32)?;
                         }
+                        // table.init: [i32 i32 i32] -> []
+                        0x0c => {
+                            r.u32()?; // elem index
+                            r.u32()?; // table index
+                            tc.pop_expect(I32)?;
+                            tc.pop_expect(I32)?;
+                            tc.pop_expect(I32)?;
+                        }
+                        // elem.drop: [] -> []
+                        0x0d => {
+                            r.u32()?;
+                        }
+                        // table.copy: [i32 i32 i32] -> []
+                        0x0e => {
+                            r.u32()?; // dst table
+                            r.u32()?; // src table
+                            tc.pop_expect(I32)?;
+                            tc.pop_expect(I32)?;
+                            tc.pop_expect(I32)?;
+                        }
+                        // table.grow: [reftype i32] -> [i32]
+                        0x0f => {
+                            let t = self
+                                .table_elem_type(r.u32()?)
+                                .ok_or(WasmRtError("bad table"))?;
+                            tc.pop_expect(I32)?;
+                            tc.pop_expect(t)?;
+                            tc.push(I32);
+                        }
+                        // table.size: [] -> [i32]
+                        0x10 => {
+                            r.u32()?;
+                            tc.push(I32);
+                        }
+                        // table.fill: [i32 reftype i32] -> []
+                        0x11 => {
+                            let t = self
+                                .table_elem_type(r.u32()?)
+                                .ok_or(WasmRtError("bad table"))?;
+                            tc.pop_expect(I32)?;
+                            tc.pop_expect(t)?;
+                            tc.pop_expect(I32)?;
+                        }
                         _ => return Ok(()), // other 0xfc ops: accept conservatively
                     }
                 }
@@ -1124,9 +1352,35 @@ impl Module {
                 }
                 0x11 => {
                     let t = r.u32()?;
-                    r.u32()?; // table index
+                    let tbl = r.u32()?; // table index
                     if t as usize >= self.types.len() {
                         return Err(WasmRtError("call_indirect type out of range"));
+                    }
+                    if tbl as usize >= self.n_tables() {
+                        return Err(WasmRtError("call_indirect table out of range"));
+                    }
+                }
+                // table.get / table.set: a table index immediate.
+                0x25 | 0x26 => {
+                    if r.u32()? as usize >= self.n_tables() {
+                        return Err(WasmRtError("table index out of range"));
+                    }
+                }
+                // ref.func: a function index immediate (must be in range).
+                0xd2 => {
+                    if r.u32()? as usize >= n_funcs {
+                        return Err(WasmRtError("ref.func target out of range"));
+                    }
+                }
+                // ref.null: a heap type byte.
+                0xd0 => {
+                    ref_type(r.byte()?)?;
+                }
+                // select t* (typed select): a vector of result types.
+                0x1c => {
+                    let c = r.u32()?;
+                    for _ in 0..c {
+                        val_type(r.byte()?)?;
                     }
                 }
                 // Skip the immediates of the remaining instructions (mirrors the
@@ -1163,7 +1417,59 @@ impl Module {
                     r.bytes(8)?;
                 }
                 0xfc => {
-                    r.skip_fc()?;
+                    // Range-check the table/elem/data index immediates of the
+                    // bulk ops; other 0xfc ops carry no cross-reference to check.
+                    let sub = r.u32()?;
+                    match sub {
+                        0x08 => {
+                            let d = r.u32()?; // memory.init: data index
+                            r.byte()?;
+                            if d as usize >= self.data.len() {
+                                return Err(WasmRtError("data index out of range"));
+                            }
+                        }
+                        0x09 => {
+                            if r.u32()? as usize >= self.data.len() {
+                                return Err(WasmRtError("data index out of range"));
+                            }
+                        }
+                        0x0a => {
+                            r.byte()?;
+                            r.byte()?;
+                        }
+                        0x0b => {
+                            r.byte()?;
+                        }
+                        0x0c => {
+                            let e = r.u32()?; // table.init: elem index …
+                            let t = r.u32()?; // … + table index
+                            if e as usize >= self.elems.len() {
+                                return Err(WasmRtError("elem index out of range"));
+                            }
+                            if t as usize >= self.n_tables() {
+                                return Err(WasmRtError("table index out of range"));
+                            }
+                        }
+                        0x0d => {
+                            if r.u32()? as usize >= self.elems.len() {
+                                return Err(WasmRtError("elem index out of range"));
+                            }
+                        }
+                        0x0e => {
+                            let a = r.u32()?; // table.copy: dst …
+                            let b = r.u32()?; // … + src
+                            if a as usize >= self.n_tables() || b as usize >= self.n_tables() {
+                                return Err(WasmRtError("table index out of range"));
+                            }
+                        }
+                        0x0f..=0x11 => {
+                            let t = r.u32()? as usize; // table.grow/size/fill
+                            if t >= self.n_tables() {
+                                return Err(WasmRtError("table index out of range"));
+                            }
+                        }
+                        _ => {} // trunc_sat: no immediate
+                    }
                 }
                 _ => {}
             }
@@ -1221,15 +1527,23 @@ impl Module {
                     m.func_types.push(type_idx);
                     m.func_imports.push((module, field, type_idx));
                 }
-                // table (0x01) / memory (0x02) / global (0x03) imports carry a
-                // descriptor we skip for now (only function imports are wired).
+                // An imported table: the host supplies the backing table. It
+                // occupies the next table index before any module-defined table.
                 0x01 => {
-                    s.byte()?; // elemtype
+                    let elem = ref_type(s.byte()?)?;
                     let flag = s.byte()?;
-                    s.u32()?;
-                    if flag == 1 {
-                        s.u32()?;
+                    let min = s.u32()?;
+                    let max = if flag == 1 { Some(s.u32()?) } else { None };
+                    if min > limits.max_table_elems {
+                        return Err(WasmRtError("table minimum exceeds limit"));
                     }
+                    if let Some(max) = max
+                        && min > max
+                    {
+                        return Err(WasmRtError("table minimum exceeds maximum"));
+                    }
+                    m.tables.push(TableType { elem, min, max });
+                    m.table_imports.push((module, field, elem, min, max));
                 }
                 0x02 => {
                     // An imported linear memory: the host supplies the bytes.
@@ -1274,6 +1588,16 @@ impl Module {
     /// The number of imported functions (which occupy the low function indices).
     fn n_imported_funcs(&self) -> usize {
         self.func_imports.len()
+    }
+
+    /// The total number of tables (imported + module-defined).
+    fn n_tables(&self) -> usize {
+        self.tables.len()
+    }
+
+    /// The element type of table `idx`, or `None` if out of range.
+    fn table_elem_type(&self, idx: u32) -> Option<ValType> {
+        self.tables.get(idx as usize).map(|t| t.elem)
     }
 
     /// The number of imported globals (which occupy the low global indices).
@@ -1355,46 +1679,125 @@ impl Module {
     ) -> Result<(), WasmRtError> {
         let count = s.u32()?;
         for _ in 0..count {
-            let _elemtype = s.byte()?; // 0x70 funcref (or 0x6f externref)
+            let elem = ref_type(s.byte()?)?; // 0x70 funcref or 0x6f externref
             let flag = s.byte()?;
             let min = s.u32()?;
-            if flag == 1 {
-                let _max = s.u32()?;
-            }
+            let max = if flag == 1 { Some(s.u32()?) } else { None };
             // Reject an oversized declared minimum before allocating: an unchecked
-            // `min` (e.g. 0xFFFF_FFFF) would request ~34 GiB and abort.
+            // `min` (e.g. 0xFFFF_FFFF) would request a huge Vec and abort.
             if min > limits.max_table_elems {
                 return Err(WasmRtError("table minimum exceeds limit"));
             }
-            // One table per module (multi-table is post-MVP); size to `min`.
-            m.table = alloc::vec![None; min as usize];
+            if let Some(max) = max
+                && min > max
+            {
+                return Err(WasmRtError("table minimum exceeds maximum"));
+            }
+            m.tables.push(TableType { elem, min, max });
         }
         Ok(())
+    }
+
+    /// Reads one element-expression item (`ref.func $f end` or `ref.null ht end`),
+    /// returning `Some(funcidx)` or `None` (a null reference).
+    fn read_elem_expr(s: &mut Reader) -> Result<Option<u32>, WasmRtError> {
+        let item = match s.byte()? {
+            0xd2 => Some(s.u32()?), // ref.func
+            0xd0 => {
+                ref_type(s.byte()?)?; // ref.null ht
+                None
+            }
+            _ => return Err(WasmRtError("unsupported element expression")),
+        };
+        if s.byte()? != 0x0b {
+            return Err(WasmRtError("expected end of element expression"));
+        }
+        Ok(item)
     }
 
     fn decode_elements(s: &mut Reader, m: &mut Module) -> Result<(), WasmRtError> {
         let count = s.u32()?;
         for _ in 0..count {
-            let mode = s.u32()?;
-            // Mode 0 = active, table 0, with an `i32.const off; end` offset.
-            if mode != 0 {
-                return Err(WasmRtError("unsupported element segment mode"));
-            }
-            let off = read_const_i32_expr(s)? as usize;
-            let n = s.u32()? as usize;
-            for i in 0..n {
-                let func = s.u32()?;
-                // Checked, to avoid a usize overflow on 32-bit targets (mirrors
-                // the data-segment path); `off` comes from a const expr and may
-                // be a large sign-extended value.
-                let slot = off
-                    .checked_add(i)
-                    .ok_or(WasmRtError("element segment out of bounds"))?;
-                if slot >= m.table.len() {
-                    return Err(WasmRtError("element segment out of bounds"));
+            // The reference-types element section: a `flags` field (0..=7) selects
+            // active/passive/declarative × funcidx/expression encodings.
+            let flags = s.u32()?;
+            let (mode, elem_type, uses_expr) = match flags {
+                0 => {
+                    let off = read_const_i32_expr(s)?;
+                    (
+                        ElemMode::Active {
+                            table: 0,
+                            offset: off,
+                        },
+                        ValType::FuncRef,
+                        false,
+                    )
                 }
-                m.table[slot] = Some(func);
+                1 => {
+                    if s.byte()? != 0x00 {
+                        return Err(WasmRtError("unsupported element kind"));
+                    }
+                    (ElemMode::Passive, ValType::FuncRef, false)
+                }
+                2 => {
+                    let table = s.u32()?;
+                    let off = read_const_i32_expr(s)?;
+                    if s.byte()? != 0x00 {
+                        return Err(WasmRtError("unsupported element kind"));
+                    }
+                    (
+                        ElemMode::Active { table, offset: off },
+                        ValType::FuncRef,
+                        false,
+                    )
+                }
+                3 => {
+                    if s.byte()? != 0x00 {
+                        return Err(WasmRtError("unsupported element kind"));
+                    }
+                    (ElemMode::Declarative, ValType::FuncRef, false)
+                }
+                4 => {
+                    let off = read_const_i32_expr(s)?;
+                    (
+                        ElemMode::Active {
+                            table: 0,
+                            offset: off,
+                        },
+                        ValType::FuncRef,
+                        true,
+                    )
+                }
+                5 => {
+                    let et = ref_type(s.byte()?)?;
+                    (ElemMode::Passive, et, true)
+                }
+                6 => {
+                    let table = s.u32()?;
+                    let off = read_const_i32_expr(s)?;
+                    let et = ref_type(s.byte()?)?;
+                    (ElemMode::Active { table, offset: off }, et, true)
+                }
+                7 => {
+                    let et = ref_type(s.byte()?)?;
+                    (ElemMode::Declarative, et, true)
+                }
+                _ => return Err(WasmRtError("unsupported element segment mode")),
+            };
+            let n = s.u32()? as usize;
+            let mut items = Vec::with_capacity(n.min(MAX_RESERVE));
+            for _ in 0..n {
+                items.push(if uses_expr {
+                    Self::read_elem_expr(s)?
+                } else {
+                    Some(s.u32()?) // a bare function index
+                });
             }
+            m.elems.push(ElemSegment {
+                mode,
+                elem_type,
+                items,
+            });
         }
         Ok(())
     }
@@ -1437,6 +1840,24 @@ impl Module {
                     }
                     Val::F64(v)
                 }
+                // Reference-typed globals: the init is `ref.null ht` or `ref.func f`.
+                ValType::FuncRef | ValType::ExternRef => {
+                    let v = match s.byte()? {
+                        0xd0 => {
+                            let t = ref_type(s.byte()?)?;
+                            match t {
+                                ValType::ExternRef => Val::ExternRef(None),
+                                _ => Val::FuncRef(None),
+                            }
+                        }
+                        0xd2 => Val::FuncRef(Some(s.u32()?)),
+                        _ => return Err(WasmRtError("unsupported reference global init")),
+                    };
+                    if s.byte()? != 0x0b {
+                        return Err(WasmRtError("expected end of global init"));
+                    }
+                    v
+                }
             };
             m.globals.push((init, mutable));
         }
@@ -1477,10 +1898,11 @@ impl Module {
             let index = s.u32()?;
             m.export_descriptors.push((name.clone(), kind));
             match kind {
-                0x00 => m.exports.push((name, index)), // function export
+                0x00 => m.exports.push((name, index)),       // function export
+                0x01 => m.table_exports.push((name, index)), // table export
                 0x02 => m.memory_exports.push((name, index)), // memory export
                 0x03 => m.global_exports.push((name, index)), // global export
-                _ => {} // table exports: introspectable, not yet wired
+                _ => {}
             }
         }
         Ok(())
@@ -1543,6 +1965,21 @@ impl Module {
             .iter()
             .map(|(n, i)| (n.as_str(), *i))
             .collect()
+    }
+
+    /// `(name, table_index)` of each exported table.
+    #[must_use]
+    pub fn table_exports(&self) -> Vec<(&str, u32)> {
+        self.table_exports
+            .iter()
+            .map(|(n, i)| (n.as_str(), *i))
+            .collect()
+    }
+
+    /// The element reference type of table `index` (imports + defined), or `None`.
+    #[must_use]
+    pub fn table_type(&self, index: u32) -> Option<ValType> {
+        self.table_elem_type(index)
     }
 
     /// Whether global `index` (imports + defined) is declared mutable.
@@ -1612,12 +2049,58 @@ impl Module {
         // Active segments are applied above and then immediately dropped (per spec);
         // passive segments stay live until an explicit `data.drop`.
         let dropped: Vec<bool> = self.data.iter().map(|(off, _)| off.is_some()).collect();
+        // Build the table instances at their minimum size, all slots null.
+        let mut tables: Vec<TableInstance> = self
+            .tables
+            .iter()
+            .map(|t| TableInstance {
+                elems: alloc::vec![zero_val(t.elem); t.min as usize],
+                elem_type: t.elem,
+                max: t.max,
+            })
+            .collect();
+        // Apply active element segments to their target tables (per spec, in
+        // declaration order); passive/declarative segments stay for `table.init`.
+        // An active/declarative segment is "dropped" immediately.
+        let mut elem_dropped: Vec<bool> = Vec::with_capacity(self.elems.len());
+        for seg in &self.elems {
+            match seg.mode {
+                ElemMode::Active { table, offset } => {
+                    let tbl = tables
+                        .get_mut(table as usize)
+                        .ok_or(WasmRtError("element segment: bad table index"))?;
+                    let off = offset as u32 as usize;
+                    let end = off
+                        .checked_add(seg.items.len())
+                        .filter(|e| *e <= tbl.elems.len())
+                        .ok_or(WasmRtError("element segment out of bounds"))?;
+                    for (i, item) in seg.items.iter().enumerate() {
+                        tbl.elems[off + i] = self.elem_item_to_val(seg.elem_type, *item);
+                    }
+                    let _ = end;
+                    elem_dropped.push(true);
+                }
+                ElemMode::Declarative => elem_dropped.push(true),
+                ElemMode::Passive => elem_dropped.push(false),
+            }
+        }
         Ok(Store {
             mem,
             globals,
             dropped,
             mem_max_pages: self.mem_max_pages,
+            tables,
+            elem_dropped,
         })
+    }
+
+    /// Converts an element-segment item (`Some(funcidx)`/`None`) to a runtime
+    /// reference value of the segment's element type.
+    fn elem_item_to_val(&self, elem_type: ValType, item: Option<u32>) -> Val {
+        match elem_type {
+            ValType::ExternRef => Val::ExternRef(None), // only null is expressible
+            _ => Val::FuncRef(item),
+        }
     }
 
     /// Calls function `index` with `args` over a fresh instance, dispatching any
@@ -1859,14 +2342,25 @@ impl Module {
                 // the function, check its signature, call it.
                 0x11 => {
                     let type_idx = r.u32()? as usize;
-                    let _table_idx = r.u32()?; // 0x00 (reserved in the MVP)
-                    let idx = pop!().as_i32()? as usize;
-                    let func = self
-                        .table
+                    let table_idx = r.u32()? as usize;
+                    let idx = pop!().as_i32()? as u32 as usize;
+                    let table = store
+                        .tables
+                        .get(table_idx)
+                        .ok_or(WasmRtError("call_indirect: bad table index"))?;
+                    let slot = table
+                        .elems
                         .get(idx)
                         .copied()
-                        .flatten()
                         .ok_or(WasmRtError("undefined element (call_indirect)"))?;
+                    // The slot must be a non-null funcref.
+                    let func = match slot {
+                        Val::FuncRef(Some(f)) => f,
+                        Val::FuncRef(None) => {
+                            return Err(WasmRtError("null element (call_indirect)"));
+                        }
+                        _ => return Err(WasmRtError("indirect call type mismatch")),
+                    };
                     // The dynamic signature must match the static expected type.
                     let expected = self.types.get(type_idx);
                     let actual = self
@@ -2298,6 +2792,63 @@ impl Module {
                     let a = pop!();
                     stack.push(if cond != 0 { a } else { b });
                 }
+                // select t* (typed select): same runtime behavior; skip the type
+                // vector immediate.
+                0x1c => {
+                    let c = r.u32()?;
+                    for _ in 0..c {
+                        r.byte()?;
+                    }
+                    let cond = pop!().as_i32()?;
+                    let b = pop!();
+                    let a = pop!();
+                    stack.push(if cond != 0 { a } else { b });
+                }
+                // table.get: pop i32 index, push the element (trap OOB).
+                0x25 => {
+                    let t = r.u32()? as usize;
+                    let idx = pop!().as_i32()? as u32 as usize;
+                    let table = store.tables.get(t).ok_or(WasmRtError("bad table index"))?;
+                    let v = table
+                        .elems
+                        .get(idx)
+                        .copied()
+                        .ok_or(WasmRtError("out of bounds table access"))?;
+                    stack.push(v);
+                }
+                // table.set: pop value then i32 index, store (trap OOB).
+                0x26 => {
+                    let t = r.u32()? as usize;
+                    let v = pop!();
+                    let idx = pop!().as_i32()? as u32 as usize;
+                    let table = store
+                        .tables
+                        .get_mut(t)
+                        .ok_or(WasmRtError("bad table index"))?;
+                    let slot = table
+                        .elems
+                        .get_mut(idx)
+                        .ok_or(WasmRtError("out of bounds table access"))?;
+                    *slot = v;
+                }
+                // ref.null ht: push a null reference of the heap type.
+                0xd0 => {
+                    let t = ref_type(r.byte()?)?;
+                    stack.push(match t {
+                        ValType::ExternRef => Val::ExternRef(None),
+                        _ => Val::FuncRef(None),
+                    });
+                }
+                // ref.is_null: pop a reference, push 1 if null else 0.
+                0xd1 => {
+                    let v = pop!();
+                    stack.push(Val::I32(i32::from(v.ref_is_null()?)));
+                }
+                // ref.func $f: push a non-null funcref to function `f`.
+                0xd2 => {
+                    let f = r.u32()?;
+                    stack.push(Val::FuncRef(Some(f)));
+                }
                 // --- floating point ---
                 0x43 => {
                     let v = f32::from_le_bytes(r.bytes(4)?.try_into().unwrap());
@@ -2594,6 +3145,114 @@ impl Module {
                                 *d = true;
                             }
                         }
+                        0x0c => {
+                            // table.init: elem index, table index, then n/src/dst.
+                            let seg = r.u32()? as usize;
+                            let t = r.u32()? as usize;
+                            let n = pop!().as_i32()? as u32 as usize;
+                            let src = pop!().as_i32()? as u32 as usize;
+                            let dst = pop!().as_i32()? as u32 as usize;
+                            // A dropped segment behaves as zero-length.
+                            let empty: Vec<Option<u32>> = Vec::new();
+                            let (etype, items) =
+                                match (self.elems.get(seg), store.elem_dropped.get(seg)) {
+                                    (Some(seg), Some(true)) => (seg.elem_type, &empty),
+                                    (Some(seg), _) => (seg.elem_type, &seg.items),
+                                    _ => return Err(WasmRtError("table.init: bad segment")),
+                                };
+                            let table = store
+                                .tables
+                                .get_mut(t)
+                                .ok_or(WasmRtError("table.init: bad table index"))?;
+                            match (src.checked_add(n), dst.checked_add(n)) {
+                                (Some(es), Some(ed))
+                                    if es <= items.len() && ed <= table.elems.len() =>
+                                {
+                                    for i in 0..n {
+                                        table.elems[dst + i] =
+                                            self.elem_item_to_val(etype, items[src + i]);
+                                    }
+                                }
+                                _ => return Err(WasmRtError("out of bounds table access")),
+                            }
+                        }
+                        0x0d => {
+                            // elem.drop: release the segment's items.
+                            let seg = r.u32()? as usize;
+                            if let Some(d) = store.elem_dropped.get_mut(seg) {
+                                *d = true;
+                            }
+                        }
+                        0x0e => {
+                            // table.copy: dst table, src table, then n/src/dst.
+                            let dt = r.u32()? as usize;
+                            let st = r.u32()? as usize;
+                            let n = pop!().as_i32()? as u32 as usize;
+                            let src = pop!().as_i32()? as u32 as usize;
+                            let dst = pop!().as_i32()? as u32 as usize;
+                            if dt >= store.tables.len() || st >= store.tables.len() {
+                                return Err(WasmRtError("table.copy: bad table index"));
+                            }
+                            let src_len = store.tables[st].elems.len();
+                            let dst_len = store.tables[dt].elems.len();
+                            match (src.checked_add(n), dst.checked_add(n)) {
+                                (Some(es), Some(ed)) if es <= src_len && ed <= dst_len => {
+                                    // Copy through a temporary so overlapping same-table
+                                    // ranges behave as a simultaneous move.
+                                    let slice: Vec<Val> = store.tables[st].elems[src..es].to_vec();
+                                    store.tables[dt].elems[dst..ed].copy_from_slice(&slice);
+                                }
+                                _ => return Err(WasmRtError("out of bounds table access")),
+                            }
+                        }
+                        0x0f => {
+                            // table.grow: table index; pop delta then init value.
+                            let t = r.u32()? as usize;
+                            let delta = pop!().as_i32()? as u32 as usize;
+                            let init = pop!();
+                            let table = store
+                                .tables
+                                .get_mut(t)
+                                .ok_or(WasmRtError("table.grow: bad table index"))?;
+                            let old = table.elems.len();
+                            let new_len = old + delta;
+                            let ceiling =
+                                table.max.map_or(self.limits.max_table_elems as usize, |m| {
+                                    (m as usize).min(self.limits.max_table_elems as usize)
+                                });
+                            if new_len <= ceiling {
+                                table.elems.resize(new_len, init);
+                                stack.push(Val::I32(old as i32));
+                            } else {
+                                stack.push(Val::I32(-1));
+                            }
+                        }
+                        0x10 => {
+                            // table.size: table index → current element count.
+                            let t = r.u32()? as usize;
+                            let table = store
+                                .tables
+                                .get(t)
+                                .ok_or(WasmRtError("table.size: bad table index"))?;
+                            stack.push(Val::I32(table.elems.len() as i32));
+                        }
+                        0x11 => {
+                            // table.fill: table index; pop n, val, dst.
+                            let t = r.u32()? as usize;
+                            let n = pop!().as_i32()? as u32 as usize;
+                            let val = pop!();
+                            let dst = pop!().as_i32()? as u32 as usize;
+                            let table = store
+                                .tables
+                                .get_mut(t)
+                                .ok_or(WasmRtError("table.fill: bad table index"))?;
+                            match dst.checked_add(n) {
+                                Some(end) if end <= table.elems.len() => {
+                                    table.elems[dst..end].fill(val);
+                                }
+                                _ => return Err(WasmRtError("out of bounds table access")),
+                            }
+                        }
                         _ => return Err(WasmRtError("unsupported 0xfc opcode")),
                     }
                 }
@@ -2657,6 +3316,10 @@ pub struct InstanceState {
     pub globals: Vec<Val>,
     /// per-data-segment dropped flags
     pub dropped: Vec<bool>,
+    /// table element contents, in table-index order (each a vector of ref values)
+    pub tables: Vec<Vec<Val>>,
+    /// per-element-segment dropped flags
+    pub elem_dropped: Vec<bool>,
 }
 
 /// An instantiated module: the decoded `module` plus its mutable `store` (linear
@@ -2904,6 +3567,57 @@ impl<'m> Instance<'m> {
         self.store.globals.get(index as usize).copied()
     }
 
+    /// The current element count of table `index`, or `None` if out of range.
+    #[must_use]
+    pub fn table_size(&self, index: u32) -> Option<usize> {
+        self.store.tables.get(index as usize).map(|t| t.elems.len())
+    }
+
+    /// The element at `slot` in table `index` (a reference `Val`), or `None` if
+    /// either index is out of range.
+    #[must_use]
+    pub fn table_get(&self, index: u32, slot: usize) -> Option<Val> {
+        self.store
+            .tables
+            .get(index as usize)
+            .and_then(|t| t.elems.get(slot).copied())
+    }
+
+    /// Sets `slot` of table `index` to `v`.
+    ///
+    /// # Errors
+    /// `WasmRtError` if the table or slot index is out of range.
+    pub fn table_set(&mut self, index: u32, slot: usize, v: Val) -> Result<(), WasmRtError> {
+        let t = self
+            .store
+            .tables
+            .get_mut(index as usize)
+            .ok_or(WasmRtError("bad table index"))?;
+        *t.elems
+            .get_mut(slot)
+            .ok_or(WasmRtError("out of bounds table access"))? = v;
+        Ok(())
+    }
+
+    /// Grows table `index` by `delta` elements initialized to `init`, returning
+    /// the prior size, or `-1` if the growth would exceed the declared maximum.
+    #[must_use]
+    pub fn table_grow(&mut self, index: u32, delta: usize, init: Val) -> i32 {
+        let cap = self.module.limits.max_table_elems as usize;
+        let Some(t) = self.store.tables.get_mut(index as usize) else {
+            return -1;
+        };
+        let old = t.elems.len();
+        let new_len = old + delta;
+        let ceiling = t.max.map_or(cap, |m| (m as usize).min(cap));
+        if new_len <= ceiling {
+            t.elems.resize(new_len, init);
+            old as i32
+        } else {
+            -1
+        }
+    }
+
     /// Snapshots the instance's mutable state (memory, globals, dropped segments).
     #[must_use]
     pub fn export_state(&self) -> InstanceState {
@@ -2911,6 +3625,8 @@ impl<'m> Instance<'m> {
             mem: self.store.mem.clone(),
             globals: self.store.globals.clone(),
             dropped: self.store.dropped.clone(),
+            tables: self.store.tables.iter().map(|t| t.elems.clone()).collect(),
+            elem_dropped: self.store.elem_dropped.clone(),
         }
     }
 
@@ -2920,10 +3636,13 @@ impl<'m> Instance<'m> {
     /// linear-memory copy (S2).
     #[must_use]
     pub fn into_state(self) -> InstanceState {
+        let tables = self.store.tables.iter().map(|t| t.elems.clone()).collect();
         InstanceState {
             mem: self.store.mem,
             globals: self.store.globals,
             dropped: self.store.dropped,
+            tables,
+            elem_dropped: self.store.elem_dropped,
         }
     }
 
@@ -2941,6 +3660,13 @@ impl<'m> Instance<'m> {
         self.store.mem = state.mem.clone();
         self.store.globals.clone_from(&state.globals);
         self.store.dropped.clone_from(&state.dropped);
+        // Restore table contents (length may have changed via `table.grow`).
+        for (t, elems) in self.store.tables.iter_mut().zip(&state.tables) {
+            t.elems.clone_from(elems);
+        }
+        if !state.elem_dropped.is_empty() {
+            self.store.elem_dropped.clone_from(&state.elem_dropped);
+        }
     }
 
     /// Calls an exported function with **JS values** (`NanBox`), marshaling each
@@ -3053,7 +3779,7 @@ fn else_split(code: &[u8]) -> Result<Option<usize>, WasmRtError> {
             0x05 if depth == 0 => return Ok(Some(at)),
             // Skip immediates so a literal `0x05` inside an operand isn't mistaken
             // for an `else` (mirrors `block_len`).
-            0x20..=0x24 | 0x0c | 0x0d | 0x10 => {
+            0x20..=0x26 | 0x0c | 0x0d | 0x10 | 0xd2 => {
                 r.u32()?;
             }
             0x0e => {
@@ -3062,6 +3788,17 @@ fn else_split(code: &[u8]) -> Result<Option<usize>, WasmRtError> {
                 for _ in 0..=c {
                     r.u32()?;
                 }
+            }
+            // select t* (typed select): a vector of result types.
+            0x1c => {
+                let c = r.u32()?;
+                for _ in 0..c {
+                    r.byte()?;
+                }
+            }
+            // ref.null: a heap type byte.
+            0xd0 => {
+                r.byte()?;
             }
             0x11 => {
                 r.u32()?;
@@ -3113,8 +3850,9 @@ fn block_len(code: &[u8]) -> Result<usize, WasmRtError> {
                 }
                 depth -= 1;
             }
-            // Skip immediates of the ops that carry them.
-            0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x0c | 0x0d | 0x10 => {
+            // Skip immediates of the ops that carry a single LEB index:
+            // local/global.get/set/tee, br/br_if, call, table.get/set, ref.func.
+            0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x0c | 0x0d | 0x10 | 0x25 | 0x26 | 0xd2 => {
                 r.u32()?;
             }
             0x0e => {
@@ -3128,6 +3866,17 @@ fn block_len(code: &[u8]) -> Result<usize, WasmRtError> {
             0x11 => {
                 r.u32()?;
                 r.u32()?;
+            }
+            // select t* (typed select): a vector of result types.
+            0x1c => {
+                let c = r.u32()?;
+                for _ in 0..c {
+                    r.byte()?;
+                }
+            }
+            // ref.null: a heap type byte.
+            0xd0 => {
+                r.byte()?;
             }
             // Memory load/store ops carry a memarg (align + offset, two LEBs).
             0x28..=0x3e => {

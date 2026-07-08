@@ -2694,30 +2694,7 @@ impl<'a> Interp<'a> {
             // Slots start at the init value (a function) or null.
             let init = args.get(1).copied().unwrap_or(NanBox::null());
             let elems = self.realm.new_array(alloc::vec![init; initial]);
-            let table = self.realm.new_object();
-            self.realm
-                .set_hidden_property(table, WASM_TABLE_ELEMS, NanBox::handle(elems.to_raw()));
-            self.realm.set_hidden_property(
-                table,
-                WASM_TABLE_MAX,
-                maximum.map_or(NanBox::undefined(), |m| NanBox::number(m as f64)),
-            );
-            let len_get = self.realm.new_bound_native(N_WASM_TABLE_LEN, table);
-            self.realm.define_accessor(
-                table,
-                "length",
-                NanBox::handle(len_get.to_raw()),
-                NanBox::undefined(),
-            );
-            for (name, nid) in [
-                ("get", N_WASM_TABLE_GET),
-                ("set", N_WASM_TABLE_SET),
-                ("grow", N_WASM_TABLE_GROW),
-            ] {
-                let f = self.realm.new_bound_native(nid, table);
-                self.realm
-                    .set_property(table, name, NanBox::handle(f.to_raw()));
-            }
+            let table = self.make_wasm_table_object(elems, maximum);
             return Ok(NanBox::handle(table.to_raw()));
         }
         // `new DataView(buffer, byteOffset?)` — a view onto an ArrayBuffer.
