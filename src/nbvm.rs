@@ -538,6 +538,23 @@ fn call(ctx: &mut Ctx, funcs: &[FnProto], id: usize, args: &[NanBox]) -> Result<
     call_with(ctx, funcs, id, args, &[], NanBox::undefined())
 }
 
+/// The interpreter's real static-call path (`Op::Call`'s semantics), factored out
+/// so the bytecode VM **and** the generic-JIT runtime helper ([`jit_helper_call`])
+/// share one code path and can never diverge: a plain static dispatch to the
+/// function-table entry `id` with `this` bound (no captures — a hoisted function
+/// call carries none). Delegates to [`call_with`] (recursion guard, arity binding,
+/// tier-up, the throw machinery), so any observable side effect runs exactly once
+/// per evaluation and a callee throw propagates identically on both tiers.
+fn vm_call(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    this: NanBox,
+    args: &[NanBox],
+) -> Result<NanBox, VmError> {
+    call_with(ctx, funcs, id, args, &[], this)
+}
+
 /// Calls function `id` with `args` (registers `0..n_params`), `captures`
 /// (registers `n_params..n_params + n_captures`), and `this_val` (the register
 /// right after).
@@ -943,6 +960,50 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
         return Err(VmError::Thrown(e));
     }
     Ok(ctx.realm.add(x, y))
+}
+
+/// The interpreter's real native-builtin dispatch (`Op::CallNative`'s semantics),
+/// factored out so the bytecode VM **and** the generic-JIT runtime helper
+/// ([`jit_helper_call_native`]) share one code path. The interpreter-aware natives
+/// (`JSON.stringify`/`JSON.parse`/`Array.from`/`Number`, which run user code or
+/// throw) are handled here — where `funcs` and the throw machinery are available —
+/// exactly as the VM loop did inline; everything else defers to the pure
+/// [`call_native`]. A user side effect runs exactly once per evaluation.
+fn vm_call_native(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    native: u16,
+    args: &[NanBox],
+) -> Result<NanBox, VmError> {
+    if native == NB_JSON_STRINGIFY {
+        json_stringify(ctx, funcs, args)
+    } else if native == NB_JSON_PARSE {
+        json_parse(ctx, funcs, args)
+    } else if native == NB_ARRAY_FROM {
+        vm_array_from(ctx, funcs, args)
+    } else if native == NB_NUMBER {
+        // `ToNumber` (`Number(x)`) on an object runs ToPrimitive(number) — its
+        // `valueOf`/`toString` — which can call a JS closure; a Symbol/BigInt
+        // operand throws a TypeError.
+        let arg = args.first().copied().unwrap_or(NanBox::undefined());
+        let prim = to_primitive(ctx, funcs, arg, true);
+        let bad = prim.as_handle().map(Handle::from_raw).and_then(|h| {
+            if ctx.realm.symbol_at(h).is_some() {
+                Some(SYM_NUM_ERR)
+            } else if ctx.realm.bigint_at(h).is_some() {
+                Some("Cannot convert a BigInt value to a number")
+            } else {
+                None
+            }
+        });
+        if let Some(msg) = bad {
+            let e = make_error(ctx.realm, "TypeError", msg);
+            return Err(VmError::Thrown(e));
+        }
+        Ok(NanBox::number(ctx.realm.to_number(prim)))
+    } else {
+        Ok(call_native(ctx, native, args))
+    }
 }
 
 /// The interpreter's real `-`/`*`/`/`/`%` operators (`Op::Sub`/`Mul`/`Div`/`Mod`),
@@ -1400,6 +1461,8 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         lt: jit_helper_lt,
         strict_eq: jit_helper_strict_eq,
         truthy: jit_helper_truthy,
+        call: jit_helper_call,
+        call_native: jit_helper_call_native,
     }
 }
 
@@ -1558,6 +1621,93 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
         Err(_) => {
             let e = make_error(ctx.realm, "Error", "JIT add fault");
             ctx.jit_pending = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// The generic-JIT runtime helper for a static function call (`Op::Call`): the
+/// slow path the native code calls to invoke callee `id` with `this` and the
+/// marshaled argument buffer. Reconstructs `&mut Ctx`, runs the shared [`vm_call`],
+/// and returns the result's `NanBox` bits — or, on any fault (a callee throw or a
+/// non-throw `VmError`), stashes the whole error in `ctx.jit_pending_fault` and
+/// returns the reserved throw/deopt sentinel ([`NanBox::jit_throw_bits`]), exactly
+/// as the property helpers do (so `call_generic` surfaces the identical `VmError`).
+/// The callee therefore runs **exactly once** — the body returns the sentinel and
+/// the interpreter propagates it without re-running the op.
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the dispatcher passed (with `ctx.jit_funcs` set);
+/// `argv`/`argc` a valid buffer of `argc` `NanBox` words for the call.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_call(
+    ctx: *mut core::ffi::c_void,
+    id: u64,
+    this: u64,
+    argv: *const u64,
+    argc: usize,
+) -> u64 {
+    // SAFETY: single-threaded reentrancy — as `jit_helper_add`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    // SAFETY: `argv` points at an `argc`-long buffer of NanBox words the emitted
+    // code marshaled into its own frame; it is live for this synchronous call.
+    let args: Vec<NanBox> = if argc == 0 {
+        Vec::new()
+    } else {
+        #[allow(unsafe_code)]
+        let raw = unsafe { core::slice::from_raw_parts(argv, argc) };
+        raw.iter().map(|&w| NanBox::from_bits(w)).collect()
+    };
+    match vm_call(ctx, funcs, id as usize, NanBox::from_bits(this), &args) {
+        Ok(v) => v.to_bits(),
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// The generic-JIT runtime helper for a native builtin call (`Op::CallNative`):
+/// runs the shared [`vm_call_native`]. Mirrors [`jit_helper_call`] — success bits,
+/// or the throw/deopt sentinel with the fault in `ctx.jit_pending_fault`.
+///
+/// # Safety
+/// As [`jit_helper_call`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_call_native(
+    ctx: *mut core::ffi::c_void,
+    native: u64,
+    argv: *const u64,
+    argc: usize,
+) -> u64 {
+    // SAFETY: as `jit_helper_call`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let args: Vec<NanBox> = if argc == 0 {
+        Vec::new()
+    } else {
+        #[allow(unsafe_code)]
+        let raw = unsafe { core::slice::from_raw_parts(argv, argc) };
+        raw.iter().map(|&w| NanBox::from_bits(w)).collect()
+    };
+    match vm_call_native(ctx, funcs, native as u16, &args) {
+        Ok(v) => v.to_bits(),
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
             NanBox::jit_throw_bits()
         }
     }
@@ -2708,8 +2858,9 @@ fn run_frame(
             Op::Call { dst, func, args } => {
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
                 // A throw from the callee is caught by this frame's nearest
-                // handler, else it keeps unwinding.
-                match call(ctx, funcs, *func as usize, &argv) {
+                // handler, else it keeps unwinding. Shared with the generic-JIT
+                // helper via `vm_call` so the two tiers can't diverge.
+                match vm_call(ctx, funcs, *func as usize, NanBox::undefined(), &argv) {
                     Ok(ret) => regs[*dst as usize] = ret,
                     Err(VmError::Thrown(v)) => match handlers.pop() {
                         Some((target, reg)) => {
@@ -2866,52 +3017,13 @@ fn run_frame(
             }
             Op::CallNative { dst, native, args } => {
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                // `JSON.stringify` needs interpreter access (toJSON / getters / a
-                // function or array replacer), so it is handled here where `funcs`
-                // and the throw machinery are available rather than in `call_native`.
-                if *native == NB_JSON_STRINGIFY {
-                    match json_stringify(ctx, funcs, &argv) {
-                        Ok(v) => regs[*dst as usize] = v,
-                        Err(e) => handle_throw!(e),
-                    }
-                } else if *native == NB_JSON_PARSE {
-                    match json_parse(ctx, funcs, &argv) {
-                        Ok(v) => regs[*dst as usize] = v,
-                        Err(e) => handle_throw!(e),
-                    }
-                } else if *native == NB_ARRAY_FROM {
-                    // `Array.from` is interpreter-aware: it validates/invokes a
-                    // `mapFn` closure and throws (null/undefined items, non-callable
-                    // mapFn, length over the array cap), so it runs here where the
-                    // throw machinery and `funcs` are available, not in call_native.
-                    match vm_array_from(ctx, funcs, &argv) {
-                        Ok(v) => regs[*dst as usize] = v,
-                        Err(e) => handle_throw!(e),
-                    }
-                } else if *native == NB_NUMBER {
-                    // `ToNumber` (`Number(x)`, `+x`, `x++`/`x--`) on an object runs
-                    // ToPrimitive(number) — its `valueOf`/`toString`, including the
-                    // default for primitive wrappers (`Number(new Boolean(true))` is
-                    // 1). That can call a JS closure and a Symbol/BigInt operand
-                    // throws a TypeError, so it runs here, not in `call_native`.
-                    let arg = argv.first().copied().unwrap_or(NanBox::undefined());
-                    let prim = to_primitive(ctx, funcs, arg, true);
-                    let bad = prim.as_handle().map(Handle::from_raw).and_then(|h| {
-                        if ctx.realm.symbol_at(h).is_some() {
-                            Some(SYM_NUM_ERR)
-                        } else if ctx.realm.bigint_at(h).is_some() {
-                            Some("Cannot convert a BigInt value to a number")
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(msg) = bad {
-                        let e = make_error(ctx.realm, "TypeError", msg);
-                        handle_throw!(VmError::Thrown(e));
-                    }
-                    regs[*dst as usize] = NanBox::number(ctx.realm.to_number(prim));
-                } else {
-                    regs[*dst as usize] = call_native(ctx, *native, &argv);
+                // Shared with the generic-JIT helper via `vm_call_native` so the two
+                // tiers can't diverge (it handles the interpreter-aware natives —
+                // JSON/Array.from/Number — where `funcs` and the throw machinery are
+                // available, and defers the rest to `call_native`).
+                match vm_call_native(ctx, funcs, *native, &argv) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
                 }
             }
             Op::PushHandler { target, reg } => {
@@ -11972,5 +12084,152 @@ mod generic_jit_tests {
             diff_ok(&funcs, ge, &[NanBox::number(4.0), NanBox::number(4.0)]).to_bits(),
             NanBox::boolean(true).to_bits()
         );
+    }
+
+    // --- Pass 4: function calls in the generic tier ---
+
+    /// Compiles `src` and returns `(funcs, id_of(name))`.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    fn compile_named(src: &str, name: &str) -> (Vec<FnProto>, usize) {
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let funcs = compile_program(&program).expect("compile");
+        let id = funcs
+            .iter()
+            .position(|p| p.name == name)
+            .unwrap_or_else(|| panic!("no function {name}"));
+        (funcs, id)
+    }
+
+    /// `f(a){ return g(a) + 1 }` calling another user function `g(x){ return x*2 }`:
+    /// asserts `f` compiles to the generic tier and the JIT-forced body (whose
+    /// `Op::Call` routes through `jit_helper_call`) matches the interpreter.
+    #[test]
+    fn generic_call_user_function_matches() {
+        let (funcs, f) = compile_named(
+            "function g(x){ return x*2; } function f(a){ return g(a) + 1; }",
+            "f",
+        );
+        // g(5)*..: 5*2 + 1 = 11; 0*2 + 1 = 1; -3*2 + 1 = -5.
+        assert_eq!(
+            diff_ok(&funcs, f, &[NanBox::number(5.0)]).as_number(),
+            Some(11.0)
+        );
+        assert_eq!(
+            diff_ok(&funcs, f, &[NanBox::number(0.0)]).as_number(),
+            Some(1.0)
+        );
+        assert_eq!(
+            diff_ok(&funcs, f, &[NanBox::number(-3.0)]).as_number(),
+            Some(-5.0)
+        );
+    }
+
+    /// A call to a native builtin (`Math.max`) lowers via `jit_helper_call_native`
+    /// and matches: `f(a){ return Math.max(a, 5) }`.
+    #[test]
+    fn generic_call_builtin_math_max_matches() {
+        let (funcs, f) = compile_named("function f(a){ return Math.max(a, 5); }", "f");
+        assert_eq!(
+            diff_ok(&funcs, f, &[NanBox::number(3.0)]).as_number(),
+            Some(5.0)
+        );
+        assert_eq!(
+            diff_ok(&funcs, f, &[NanBox::number(9.0)]).as_number(),
+            Some(9.0)
+        );
+    }
+
+    /// A call to the `String` builtin — the result is a fresh string handle each
+    /// run (so bits differ), but the JIT and interpreter produce the same string.
+    #[test]
+    fn generic_call_builtin_string_matches() {
+        let (funcs, f) = compile_named("function f(a){ return String(a); }", "f");
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers())
+            .expect("generic-eligible");
+        assert!(jit.is_generic(), "must be the generic tier");
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let arg = [NanBox::number(42.0)];
+        let interp = call(&mut ctx, &funcs, f, &arg).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &arg).unwrap().unwrap();
+        assert_eq!(ctx.realm.to_display_string(interp), "42");
+        assert_eq!(
+            ctx.realm.to_display_string(interp),
+            ctx.realm.to_display_string(jitted)
+        );
+    }
+
+    /// Recursion through the generic tier: `fact(n){ if (n<2) return 1; return
+    /// n*fact(n-1); }`. The JIT-forced outer frame's self-`Op::Call` routes through
+    /// `jit_helper_call` (re-entering the interpreter for the recursive frames) and
+    /// matches the interpreter's factorial exactly.
+    #[test]
+    fn generic_call_recursion_factorial_matches() {
+        let (funcs, fact) = compile_named(
+            "function fact(n){ if (n < 2) return 1; return n * fact(n - 1); }",
+            "fact",
+        );
+        for (n, want) in [(0.0, 1.0), (1.0, 1.0), (5.0, 120.0), (10.0, 3628800.0)] {
+            assert_eq!(
+                diff_ok(&funcs, fact, &[NanBox::number(n)]).as_number(),
+                Some(want),
+                "fact({n})"
+            );
+        }
+    }
+
+    /// A call whose callee throws: the JIT body returns through the throw sentinel,
+    /// `call_generic` surfaces the *identical* thrown value, and the callee's side
+    /// effect runs **exactly once** (no deopt-and-re-run). The interpreter and the
+    /// JIT run on separate counter objects so each starts at 0.
+    #[test]
+    fn generic_call_callee_throws_once_via_sentinel() {
+        let (funcs, f) = compile_named(
+            "function makeCounter(){ return { c: 0 }; }
+             function bump(o){ o.c = o.c + 1; throw o; }
+             function f(o){ bump(o); return 0; }",
+            "f",
+        );
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers())
+            .expect("generic-eligible");
+        assert!(jit.is_generic(), "must be the generic tier");
+        let mk_id = funcs.iter().position(|p| p.name == "makeCounter").unwrap();
+
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let obj_i = call(&mut ctx, &funcs, mk_id, &[]).unwrap();
+        let obj_j = call(&mut ctx, &funcs, mk_id, &[]).unwrap();
+
+        let interp = call(&mut ctx, &funcs, f, &[obj_i]);
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[obj_j]).unwrap();
+
+        // Both throw, and the thrown value is the passed-in counter object itself.
+        let (vi, vj) = match (interp, jitted) {
+            (Err(VmError::Thrown(vi)), Err(VmError::Thrown(vj))) => (vi, vj),
+            other => panic!("expected both paths to throw, got {other:?}"),
+        };
+        assert_eq!(vi.to_bits(), obj_i.to_bits());
+        assert_eq!(vj.to_bits(), obj_j.to_bits());
+
+        // `bump` ran exactly once on each object (side effect not doubled).
+        let ci = ctx
+            .realm
+            .get_property(obj_i.as_handle().map(Handle::from_raw).unwrap(), "c");
+        let cj = ctx
+            .realm
+            .get_property(obj_j.as_handle().map(Handle::from_raw).unwrap(), "c");
+        assert_eq!(ci.and_then(|v| v.as_number()), Some(1.0));
+        assert_eq!(cj.and_then(|v| v.as_number()), Some(1.0));
+    }
+
+    /// A zero-argument call lowers (empty argument buffer) and matches:
+    /// `f(){ return g() + 1 }`, `g(){ return 41 }`.
+    #[test]
+    fn generic_call_zero_args_matches() {
+        let (funcs, f) = compile_named(
+            "function g(){ return 41; } function f(){ return g() + 1; }",
+            "f",
+        );
+        assert_eq!(diff_ok(&funcs, f, &[]).as_number(), Some(42.0));
     }
 }

@@ -1776,12 +1776,48 @@ pub enum GenericOp {
         /// Target op index taken when the condition is falsy.
         target: usize,
     },
+    /// `reg[dst] = func(reg[args…])` — a plain static call to the function-table
+    /// entry `func`, with `this = undefined` (the interpreter's `Op::Call`). The
+    /// argument register list lives in the compiled proto's per-call-site table at
+    /// index `site`. Always routed through `jit_helper_call`, which runs the
+    /// interpreter's real call path (`call_with`: arity binding, tier-up, throw);
+    /// a direct JIT→JIT native call is intentionally *not* emitted (the callee's
+    /// registry entry, if any, is Int/Float-ABI code — a different signature — so a
+    /// direct call would mis-dispatch; helper-only is the sanctioned choice, see
+    /// `JIT_DESIGN.md` Pass 4).
+    Call {
+        /// Destination register.
+        dst: u8,
+        /// Callee function-table index.
+        func: u32,
+        /// Index into the per-call-site argument-register table.
+        site: u16,
+    },
+    /// `reg[dst] = <builtin native>(reg[args…])` — a call to a native builtin
+    /// (`Op::CallNative`, e.g. `Math.max`/`String`), routed through
+    /// `jit_helper_call_native` (the interpreter's real `Op::CallNative` dispatch,
+    /// including the interpreter-aware natives). The argument register list is at
+    /// per-call-site table index `site`.
+    CallNative {
+        /// Destination register.
+        dst: u8,
+        /// Native builtin discriminant.
+        native: u16,
+        /// Index into the per-call-site argument-register table.
+        site: u16,
+    },
     /// `return reg[src]`.
     Ret {
         /// Register holding the return value.
         src: u8,
     },
 }
+
+/// The result of [`lower_nbvm_generic`]: the generic-tier op stream, the per-site
+/// property-key strings (owned so the emitted code can hold stable pointers into
+/// them for the inline caches), and the per-call-site argument-register lists.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+type GenericLowering = (Vec<GenericOp>, Vec<alloc::boxed::Box<str>>, Vec<Vec<u8>>);
 
 /// Lowers a `nbvm::FnProto` to the generic-tier IR **iff** every op is one this
 /// tier can currently emit: constant loads, `Move`, `Return`, the general `+`
@@ -1798,9 +1834,7 @@ pub enum GenericOp {
 /// every target shifts by `n_params` (as in [`lower_nbvm_with`]).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 #[must_use]
-pub fn lower_nbvm_generic(
-    proto: &crate::nbvm::FnProto,
-) -> Option<(Vec<GenericOp>, Vec<alloc::boxed::Box<str>>)> {
+pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowering> {
     use crate::nbvm::Op;
     if proto.n_regs > 64 || proto.n_params > 32 || proto.n_captures != 0 {
         return None;
@@ -1820,6 +1854,10 @@ pub fn lower_nbvm_generic(
     // Per-site key strings for `GetProp`/`SetProp` (the site index into this Vec is
     // stored in the op); the caller boxes each for a stable pointer + persistent IC.
     let mut keys: Vec<alloc::boxed::Box<str>> = Vec::new();
+    // Per-call-site argument-register lists (the site index into this Vec is stored
+    // in each `Call`/`CallNative` op); the emitter marshals these into a contiguous
+    // stack buffer before the helper call.
+    let mut call_args: Vec<Vec<u8>> = Vec::new();
     // Parameters arrive as the `args` array; seed registers `0..n_params`.
     for i in 0..proto.n_params {
         out.push(GenericOp::Arg {
@@ -1940,6 +1978,49 @@ pub fn lower_nbvm_generic(
                     site,
                 }
             }
+            // A plain static call `func(args…)` — the callee is a function-table
+            // index (never a native builtin: those lower to `Op::CallNative`), and
+            // every argument register must already be written. Spread/computed/`new`
+            // callees compile to *other* ops (`CallValue`/`CallCtor`/…), none matched
+            // here, so this only ever accepts a plain positional static call.
+            Op::Call { dst, func, args } => {
+                if args.len() > 32 {
+                    return None;
+                }
+                let mut argregs: Vec<u8> = Vec::with_capacity(args.len());
+                for r in args {
+                    argregs.push(read(&written, *r)?);
+                }
+                let d = reg8(*dst)?;
+                let site = u16::try_from(call_args.len()).ok()?;
+                call_args.push(argregs);
+                written[*dst as usize] = true;
+                GenericOp::Call {
+                    dst: d,
+                    func: *func,
+                    site,
+                }
+            }
+            // A native builtin call `Math.max(…)`/`String(…)`/etc. — every argument
+            // register must already be written.
+            Op::CallNative { dst, native, args } => {
+                if args.len() > 32 {
+                    return None;
+                }
+                let mut argregs: Vec<u8> = Vec::with_capacity(args.len());
+                for r in args {
+                    argregs.push(read(&written, *r)?);
+                }
+                let d = reg8(*dst)?;
+                let site = u16::try_from(call_args.len()).ok()?;
+                call_args.push(argregs);
+                written[*dst as usize] = true;
+                GenericOp::CallNative {
+                    dst: d,
+                    native: *native,
+                    site,
+                }
+            }
             Op::Return { src } => GenericOp::Ret {
                 src: read(&written, *src)?,
             },
@@ -1960,7 +2041,7 @@ pub fn lower_nbvm_generic(
             return None;
         }
     }
-    Some((out, keys))
+    Some((out, keys, call_args))
 }
 
 /// A bytecode-VM function compiled to native code, callable from the VM with
@@ -2018,6 +2099,12 @@ pub struct GenericHelpers {
     pub strict_eq: JitAddHelper,
     /// The truthiness helper (`jit_helper_truthy`), returning `0`/`1` — never throws.
     pub truthy: JitTruthyHelper,
+    /// The static-call helper (`jit_helper_call`) — runs the interpreter's real
+    /// call path for a statically-known callee function id (Pass 4).
+    pub call: JitCallHelper,
+    /// The native-builtin-call helper (`jit_helper_call_native`) — runs the
+    /// interpreter's `Op::CallNative` dispatch for a builtin (Pass 4).
+    pub call_native: JitCallNativeHelper,
 }
 
 /// The runtime-helper ABI for a discriminated binary op: `(ctx, a, b, op) -> NanBox
@@ -2083,6 +2170,21 @@ enum JitKind {
 /// [`NanBox::jit_throw_bits`](crate::nanbox::NanBox::jit_throw_bits).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub type JitAddHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u64;
+
+/// The runtime-helper ABI for a **static function call** (`JIT_DESIGN.md` Pass 4):
+/// `(ctx, callee_id, this, argv_ptr, argc) -> NanBox bits` (or the throw sentinel,
+/// with the fault in `ctx.jit_pending_fault`). `callee_id` is the function-table
+/// index of the statically-known callee; `argv_ptr`/`argc` describe a contiguous
+/// buffer of argument `NanBox` words the emitted code marshals from its register
+/// spill slots.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitCallHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, *const u64, usize) -> u64;
+
+/// The runtime-helper ABI for a **native builtin call** (`Op::CallNative`):
+/// `(ctx, native_id, argv_ptr, argc) -> NanBox bits` (or the throw sentinel, with
+/// the fault in `ctx.jit_pending_fault`). `native_id` is the builtin discriminant.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitCallNativeHelper = extern "C" fn(*mut core::ffi::c_void, u64, *const u64, usize) -> u64;
 
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 impl JitProto {
@@ -2190,7 +2292,7 @@ impl JitProto {
     /// are stable; the emitted code holds raw pointers into them.
     #[must_use]
     pub fn compile_generic(proto: &crate::nbvm::FnProto, helpers: &GenericHelpers) -> Option<Self> {
-        let (ops, keys) = lower_nbvm_generic(proto)?;
+        let (ops, keys, call_args) = lower_nbvm_generic(proto)?;
         // One persistent inline cache per property-access site.
         let caches: alloc::boxed::Box<[core::cell::UnsafeCell<crate::ic::PropertyCache>]> = (0
             ..keys.len())
@@ -2207,8 +2309,14 @@ impl JitProto {
                 cache_ptr: c.get().cast::<core::ffi::c_void>(),
             })
             .collect();
-        let func =
-            JitFunction::compile_generic(proto.n_regs, proto.n_params, &ops, helpers, &site_info)?;
+        let func = JitFunction::compile_generic(
+            proto.n_regs,
+            proto.n_params,
+            &ops,
+            helpers,
+            &site_info,
+            &call_args,
+        )?;
         Some(Self {
             func,
             n_params: proto.n_params,
@@ -2872,6 +2980,25 @@ impl X64Assembler {
         };
         self.code.extend_from_slice(&[rex, op]);
         self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `lea <argreg[i]>, [rbp+disp32]` — load the *address* of a frame slot into
+    /// System V integer argument register `i` (rdi, rsi, rdx, rcx, r8, r9), for
+    /// passing a pointer to an in-frame scratch buffer (the generic-tier call
+    /// argument marshaling).
+    pub fn lea_argreg(&mut self, i: usize, disp: i32) {
+        // REX.W (+ REX.R for r8/r9) + `8D /r`, ModRM mod=10 (disp32), rm=101 (rbp).
+        let (rex, modrm): (u8, u8) = match i {
+            0 => (0x48, 0xbd), // rdi
+            1 => (0x48, 0xb5), // rsi
+            2 => (0x48, 0x95), // rdx
+            3 => (0x48, 0x8d), // rcx
+            4 => (0x4c, 0x85), // r8
+            5 => (0x4c, 0x8d), // r9
+            _ => return,
+        };
+        self.code.extend_from_slice(&[rex, 0x8d, modrm]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
     /// `sub rsp, imm8`.
@@ -3658,6 +3785,7 @@ impl JitFunction {
         ops: &[GenericOp],
         helpers: &GenericHelpers,
         sites: &[SiteInfo],
+        call_args: &[Vec<u8>],
     ) -> Option<Self> {
         use crate::nanbox::NanBox;
         if n_regs > 64 || n_params > 32 {
@@ -3671,6 +3799,15 @@ impl JitFunction {
         let lt_helper = helpers.lt as usize as u64;
         let strict_eq_helper = helpers.strict_eq as usize as u64;
         let truthy_helper = helpers.truthy as usize as u64;
+        let call_helper = helpers.call as usize as u64;
+        let call_native_helper = helpers.call_native as usize as u64;
+        // The widest argument list across all call sites; a scratch buffer of this
+        // many NanBox slots is reserved just below the register file so each call
+        // can marshal its arguments into a contiguous, in-frame region.
+        let max_argc = call_args.iter().map(Vec::len).max().unwrap_or(0);
+        if max_argc > 32 {
+            return None;
+        }
         // `is_number(bits) == (bits & QNAN) != QNAN`.
         const QNAN: u64 = 0x7ffc_0000_0000_0000;
         // The canonical quiet NaN a `NanBox` normalizes every NaN to, so a NaN sum
@@ -3683,10 +3820,16 @@ impl JitFunction {
         // Register slot `r` at `[rbp - (r+2)*8]`: `[rbp-8]` holds the saved r15,
         // the register file lives below it.
         let disp = |r: u8| -((i32::from(r) + 2) * 8);
-        // Reserve n_regs NanBox slots; the extra 8 makes `rsp` 16-byte aligned for
-        // calls (after `push rbp; push r15`, rsp ≡ 8 mod 16, so an ≡8-mod-16 frame
-        // restores alignment).
-        let frame = (((n_regs as u32) * 8 + 15) & !15) + 8;
+        // The per-call argument scratch buffer sits just below the register file.
+        // The helper reads `argv[i]` at ascending addresses (`base + i*8`), so slot
+        // 0 must be the *deepest* (most-negative) slot and later args ascend toward
+        // the register file: slot `i` at `[rbp - (n_regs+1+max_argc-i)*8]`. `base`
+        // (the pointer passed to the helper) is `argbuf_disp(0)`.
+        let argbuf_disp = |i: usize| -((n_regs as i32 + 1 + max_argc as i32 - i as i32) * 8);
+        // Reserve n_regs register slots + max_argc argument-buffer slots; the extra
+        // 8 makes `rsp` 16-byte aligned for calls (after `push rbp; push r15`, rsp ≡
+        // 8 mod 16, so an ≡8-mod-16 frame restores alignment).
+        let frame = ((((n_regs + max_argc) as u32) * 8 + 15) & !15) + 8;
         let mut a = X64Assembler::new();
         // One label per op so any op can be a branch target; bound just before that
         // op's code is emitted (control flow: `Jump`/`JumpIfFalse` target them).
@@ -4016,6 +4159,54 @@ impl JitFunction {
                     a.emit_truthy(disp(cond), truthy_helper, QNAN, tag_true, tag_false);
                     a.test_rax_rax();
                     a.je(labels[target]); // falsy (truthy == 0) → take the branch
+                }
+                GenericOp::Call { dst, func, site } => {
+                    if !ok(dst) {
+                        return None;
+                    }
+                    let args = call_args.get(site as usize)?;
+                    // Marshal each argument NanBox from its register slot into the
+                    // contiguous in-frame scratch buffer (rax is free here; the arg
+                    // registers are loaded *after* marshaling).
+                    for (i, &ar) in args.iter().enumerate() {
+                        if !ok(ar) {
+                            return None;
+                        }
+                        a.load_rax(disp(ar));
+                        a.store_rax(argbuf_disp(i));
+                    }
+                    // jit_helper_call(ctx, func_id, this=undefined, argv_ptr, argc).
+                    a.mov_rdi_r15(); // rdi = ctx
+                    a.movabs_argreg(1, i64::from(func)); // rsi = callee id
+                    a.movabs_argreg(2, NanBox::undefined().to_bits() as i64); // rdx = this
+                    a.lea_argreg(3, argbuf_disp(0)); // rcx = &argbuf[0]
+                    a.movabs_argreg(4, args.len() as i64); // r8 = argc
+                    a.movabs_rax(call_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.store_rax(disp(dst));
+                }
+                GenericOp::CallNative { dst, native, site } => {
+                    if !ok(dst) {
+                        return None;
+                    }
+                    let args = call_args.get(site as usize)?;
+                    for (i, &ar) in args.iter().enumerate() {
+                        if !ok(ar) {
+                            return None;
+                        }
+                        a.load_rax(disp(ar));
+                        a.store_rax(argbuf_disp(i));
+                    }
+                    // jit_helper_call_native(ctx, native_id, argv_ptr, argc).
+                    a.mov_rdi_r15(); // rdi = ctx
+                    a.movabs_argreg(1, i64::from(native)); // rsi = native id
+                    a.lea_argreg(2, argbuf_disp(0)); // rdx = &argbuf[0]
+                    a.movabs_argreg(3, args.len() as i64); // rcx = argc
+                    a.movabs_rax(call_native_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.store_rax(disp(dst));
                 }
                 GenericOp::Ret { src } => {
                     if !ok(src) {
