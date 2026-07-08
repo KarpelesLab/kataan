@@ -2430,6 +2430,16 @@ impl Realm {
         self.heap.get(handle)?.as_object()?.cached_get(key, cache)
     }
 
+    /// The object heap's slot-array base pointer + length, for the generic-JIT
+    /// inline property-get fast path (`jit_arena` helper). Re-read on every
+    /// fast-path entry so a reallocated arena is always addressed at its current
+    /// base; the length is the raw slot count (the handle-index bound).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_arena_slots(&self) -> (*const u8, usize) {
+        self.heap.slots_raw()
+    }
+
     /// The inline-cache fast path for a plain object's `SetProp`: writes `value`
     /// to an *existing* own data property `key` on the object at `handle`,
     /// consulting `cache`, and reports whether the in-place write happened.

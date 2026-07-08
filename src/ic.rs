@@ -84,6 +84,36 @@ impl PropertyCache {
     }
 }
 
+/// Runtime-probed byte layout of [`PropertyCache`] for the generic-JIT inline
+/// property-get fast path. Derived by pointer arithmetic on a real instance
+/// (never hand-baked); verified by the JIT layout test. `PropertyCache` is
+/// `#[repr(C)]`, so the field order is stable, but the offsets are still probed
+/// rather than assumed.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CacheLayout {
+    /// Byte offset of the `shape: Option<Rc<Shape>>` field (the 8-byte word the
+    /// inline guard compares against the object's shape pointer). `None` stores a
+    /// null pointer (niche), which never matches a live shape → the guard misses.
+    pub shape_off: usize,
+    /// Byte offset of the cached `slot: u32`.
+    pub slot_off: usize,
+    /// Byte offset of the `hits: u32` counter (bumped in place on an inline hit).
+    pub hits_off: usize,
+}
+
+/// Derives [`CacheLayout`] from a real [`PropertyCache`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_cache_layout() -> CacheLayout {
+    let pc = PropertyCache::new();
+    let base = core::ptr::addr_of!(pc) as usize;
+    CacheLayout {
+        shape_off: core::ptr::addr_of!(pc.shape) as usize - base,
+        slot_off: core::ptr::addr_of!(pc.slot) as usize - base,
+        hits_off: core::ptr::addr_of!(pc.hits) as usize - base,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

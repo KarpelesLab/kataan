@@ -745,6 +745,91 @@ impl crate::gc::Trace for Object {
     }
 }
 
+/// Runtime-probed byte layout of [`Object`] / `ObjectData::Shaped` (and the inner
+/// `Vec<NanBox>` slot store) for the generic-JIT inline property-get fast path.
+/// Every field is derived by pointer arithmetic on a real, populated shaped
+/// object (never hand-baked); the JIT layout verification test cross-checks each
+/// against a safe read, so a layout drift fails loudly instead of corrupting a
+/// raw memory read.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ObjectLayout {
+    /// Byte offset of the `data: ObjectData` field within `Object` (repr(C) → 0).
+    pub data_off: usize,
+    /// The `ObjectData::Shaped` discriminant byte value (tag at offset 0).
+    pub shaped_disc: u8,
+    /// Byte offset of the `shape: Rc<Shape>` field within `ObjectData`. The 8-byte
+    /// word there is the `Rc`'s stored `NonNull<RcBox>` (the shape identity the IC
+    /// compares against).
+    pub shape_off: usize,
+    /// Byte offset of the `slots: Vec<NanBox>` field within `ObjectData`.
+    pub slots_off: usize,
+    /// Byte offset of the data pointer within a `Vec<NanBox>`.
+    pub vec_ptr_off: usize,
+    /// Byte offset of the length within a `Vec<NanBox>`.
+    pub vec_len_off: usize,
+}
+
+/// Derives [`ObjectLayout`] from a real shaped object with several own data
+/// properties (so the slot `Vec` is populated, its length distinct from its
+/// capacity and data pointer, making the by-value word scan unambiguous).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_object_layout() -> ObjectLayout {
+    let mut obj = Object::new(Shape::root());
+    // Three properties: len == 3, cap != 3 (first growth → 4), ptr is a heap
+    // address — so exactly one Vec word equals 3 (the length).
+    obj.set("a", NanBox::number(1.0));
+    obj.set("b", NanBox::number(2.0));
+    obj.set("c", NanBox::number(3.0));
+
+    let obj_base = core::ptr::addr_of!(obj) as usize;
+    let data_off = core::ptr::addr_of!(obj.data) as usize - obj_base;
+    let od = &obj.data;
+    let od_base = core::ptr::addr_of!(*od) as usize;
+    // SAFETY: `od` is a live, initialized `ObjectData`; its repr(u8) tag byte is
+    // in bounds and always a valid `u8`.
+    #[allow(unsafe_code)]
+    let shaped_disc = unsafe { *(od_base as *const u8) };
+    let ObjectData::Shaped { shape, slots } = od else {
+        unreachable!("a fresh object is in Shaped mode");
+    };
+    let shape_off = core::ptr::addr_of!(*shape) as usize - od_base;
+    let slots_off = core::ptr::addr_of!(*slots) as usize - od_base;
+
+    // Locate the data-pointer and length words inside the `Vec<NanBox>` by
+    // matching their known values against each 8-byte word of the Vec — a pure
+    // derivation from a real instance (no assumed field order).
+    let vec_base = core::ptr::addr_of!(*slots) as usize;
+    let want_ptr = slots.as_ptr() as usize;
+    let want_len = slots.len(); // == 3
+    let words = core::mem::size_of::<Vec<NanBox>>() / core::mem::size_of::<usize>();
+    let mut vec_ptr_off = usize::MAX;
+    let mut vec_len_off = usize::MAX;
+    for i in 0..words {
+        // SAFETY: reading the i-th usize-word of a live `Vec<NanBox>`, in bounds.
+        #[allow(unsafe_code)]
+        let w = unsafe { *((vec_base + i * core::mem::size_of::<usize>()) as *const usize) };
+        if w == want_ptr {
+            vec_ptr_off = i * core::mem::size_of::<usize>();
+        } else if w == want_len {
+            vec_len_off = i * core::mem::size_of::<usize>();
+        }
+    }
+    assert!(
+        vec_ptr_off != usize::MAX && vec_len_off != usize::MAX && vec_ptr_off != vec_len_off,
+        "could not derive Vec ptr/len offsets"
+    );
+
+    ObjectLayout {
+        data_off,
+        shaped_disc,
+        shape_off,
+        slots_off,
+        vec_ptr_off,
+        vec_len_off,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

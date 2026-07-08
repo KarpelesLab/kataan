@@ -69,6 +69,55 @@ enum Slot<T> {
     },
 }
 
+/// Runtime-probed byte layout of `Slot<T>` for the generic-JIT inline
+/// property-get fast path. Every field is derived by pointer arithmetic on a real
+/// `Slot::Occupied` instance (never hand-baked), so a layout change is caught by
+/// the JIT layout verification test rather than silently corrupting a raw read.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SlotLayout {
+    /// `size_of::<Slot<T>>()` — the arena stride (`base + index * stride`).
+    pub stride: usize,
+    /// The `Slot::Occupied` discriminant byte value (tag at offset 0).
+    pub occupied_disc: u8,
+    /// Byte offset of the `generation: u16` field within the slot.
+    pub generation_off: usize,
+    /// Byte offset of the payload value (`T`) within the slot.
+    pub value_off: usize,
+}
+
+/// Derives [`SlotLayout`] for `Slot<T>` from a real `Occupied` instance. `value`
+/// supplies a `T` so the enum can be built; only its byte layout is inspected.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_slot_layout<T>(value: T) -> SlotLayout {
+    let slot: Slot<T> = Slot::Occupied {
+        generation: 0,
+        age: 0,
+        value,
+    };
+    let base = core::ptr::addr_of!(slot) as usize;
+    // The repr(u8) discriminant is the first byte.
+    // SAFETY: `slot` is a live, initialized `Slot<T>`; reading its tag byte is in
+    // bounds and the byte is always a valid `u8`.
+    #[allow(unsafe_code)]
+    let occupied_disc = unsafe { *(base as *const u8) };
+    let (generation_off, value_off) = match &slot {
+        Slot::Occupied {
+            generation, value, ..
+        } => (
+            core::ptr::addr_of!(*generation) as usize - base,
+            core::ptr::addr_of!(*value) as usize - base,
+        ),
+        Slot::Free { .. } => unreachable!("just built an Occupied slot"),
+    };
+    SlotLayout {
+        stride: core::mem::size_of::<Slot<T>>(),
+        occupied_disc,
+        generation_off,
+        value_off,
+    }
+}
+
 /// A generational arena of `T`, addressed by [`Handle`].
 pub struct Heap<T> {
     slots: Vec<Slot<T>>,
@@ -112,6 +161,18 @@ impl<T> Heap<T> {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.live
+    }
+
+    /// The raw base pointer and length of the backing slot array, for the
+    /// generic-JIT inline property-get fast path. The pointer is `slots.as_ptr()`
+    /// (arena base) and the length is `slots.len()` (the index bound, **not**
+    /// [`len`](Heap::len) which counts only live slots). Both are re-read on every
+    /// fast-path entry because [`alloc`](Heap::alloc)'s `push` may reallocate the
+    /// `Vec`; the JIT never caches this across a call.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn slots_raw(&self) -> (*const u8, usize) {
+        (self.slots.as_ptr().cast::<u8>(), self.slots.len())
     }
 
     /// Whether the heap holds no live objects.

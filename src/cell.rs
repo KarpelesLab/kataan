@@ -283,6 +283,37 @@ pub enum Cell {
     },
 }
 
+/// Runtime-probed byte layout of the `Cell::Object` variant for the generic-JIT
+/// inline property-get fast path. Derived by pointer arithmetic on a real
+/// `Cell::Object` instance (never hand-baked); verified by the JIT layout test.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CellLayout {
+    /// The `Cell::Object` discriminant byte value (tag at offset 0).
+    pub object_disc: u8,
+    /// Byte offset of the inner [`Object`] payload within the `Cell`.
+    pub object_off: usize,
+}
+
+/// Derives [`CellLayout`] from a real `Cell::Object`.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_cell_layout() -> CellLayout {
+    let cell = Cell::Object(Object::new(crate::shape::Shape::root()));
+    let base = core::ptr::addr_of!(cell) as usize;
+    // SAFETY: `cell` is a live, initialized `Cell`; its repr(u8) tag byte is in
+    // bounds and always a valid `u8`.
+    #[allow(unsafe_code)]
+    let object_disc = unsafe { *(base as *const u8) };
+    let object_off = match &cell {
+        Cell::Object(o) => core::ptr::addr_of!(*o) as usize - base,
+        _ => unreachable!("just built a Cell::Object"),
+    };
+    CellLayout {
+        object_disc,
+        object_off,
+    }
+}
+
 impl Cell {
     /// The object, if this cell is one.
     #[must_use]

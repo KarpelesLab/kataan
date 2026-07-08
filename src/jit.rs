@@ -2180,6 +2180,112 @@ pub struct GenericHelpers {
     /// The native-builtin-call helper (`jit_helper_call_native`) — runs the
     /// interpreter's `Op::CallNative` dispatch for a builtin (Pass 4).
     pub call_native: JitCallNativeHelper,
+    /// The heap-arena accessor (`jit_arena`) — returns the object heap's slot-array
+    /// base pointer + length so the inline monomorphic property-get fast path
+    /// (Pass 6) can read an object's shape/slot without re-entering the
+    /// interpreter. Re-invoked on every fast-path entry so a reallocated arena
+    /// (`slots.push`) is always addressed at its current base.
+    pub arena: JitArenaHelper,
+}
+
+/// The base pointer + length of the object heap's slot array, returned by the
+/// [`JitArenaHelper`]. `#[repr(C)]` with two integer-class eightbytes, so the
+/// System V ABI returns it in `rax:rdx` (base in `rax`, `len` in `rdx`) — which
+/// the emitted fast path reads directly after the `call`.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[repr(C)]
+pub struct JitArena {
+    /// `slots.as_ptr()` — the arena base (`base + index * SLOT_STRIDE` addresses a
+    /// slot). Never cached across a call: the `Vec` may reallocate.
+    pub base: *const u8,
+    /// `slots.len()` — the slot-index bound (used for the fast path's bounds check).
+    pub len: usize,
+}
+
+/// The runtime-helper ABI for the heap-arena accessor (`JIT_DESIGN.md` Pass 6):
+/// `(ctx) -> JitArena`. A leaf, non-allocating read that never triggers GC, so the
+/// inline fast path stays GC-safe and realloc-safe.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitArenaHelper = extern "C" fn(*mut core::ffi::c_void) -> JitArena;
+
+/// The byte offsets + discriminant values the inline monomorphic property-get
+/// fast path bakes into emitted machine code, all combined **relative to a slot's
+/// base address** (`arena_base + index * slot_stride`). Assembled by
+/// [`compute_jit_layout`] from the per-type runtime probes
+/// ([`crate::heap::jit_slot_layout`], [`crate::cell::jit_cell_layout`],
+/// [`crate::object::jit_object_layout`], [`crate::ic::jit_cache_layout`]) — never
+/// hand-written. If any offset is wrong the JIT layout verification test
+/// (`jit_layout_matches_safe_reads`) fails loudly rather than the JIT silently
+/// corrupting a raw read.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JitLayout {
+    /// `size_of::<Slot<Cell>>()` — the arena stride.
+    pub slot_stride: i32,
+    /// `Slot::Occupied` discriminant byte.
+    pub slot_occupied_disc: u8,
+    /// `Cell::Object` discriminant byte.
+    pub cell_object_disc: u8,
+    /// `ObjectData::Shaped` discriminant byte.
+    pub obj_shaped_disc: u8,
+    /// Slot-relative offset of the slot's `generation: u16`.
+    pub off_slot_gen: i32,
+    /// Slot-relative offset of the `Cell` tag byte.
+    pub off_cell_tag: i32,
+    /// Slot-relative offset of the `ObjectData` tag byte.
+    pub off_od_tag: i32,
+    /// Slot-relative offset of the object's shape-`Rc` word (8 bytes).
+    pub off_shape: i32,
+    /// Slot-relative offset of the slot `Vec`'s data pointer (8 bytes).
+    pub off_slots_ptr: i32,
+    /// Slot-relative offset of the slot `Vec`'s length (8 bytes).
+    pub off_slots_len: i32,
+    /// `PropertyCache`-relative offset of the cached shape word (8 bytes).
+    pub cache_shape_off: i32,
+    /// `PropertyCache`-relative offset of the cached `slot: u32`.
+    pub cache_slot_off: i32,
+    /// `PropertyCache`-relative offset of the `hits: u32` counter.
+    pub cache_hits_off: i32,
+}
+
+/// Assembles the [`JitLayout`] from the four per-type probes, combining the
+/// nested field offsets into slot-relative offsets. Computed once (memoized) and
+/// baked into every emitted property-get site.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn compute_jit_layout() -> &'static JitLayout {
+    use std::sync::OnceLock;
+    static LAYOUT: OnceLock<JitLayout> = OnceLock::new();
+    LAYOUT.get_or_init(|| {
+        let slot = crate::heap::jit_slot_layout(crate::cell::Cell::Object(
+            crate::object::Object::new(crate::shape::Shape::root()),
+        ));
+        let cell = crate::cell::jit_cell_layout();
+        let obj = crate::object::jit_object_layout();
+        let cache = crate::ic::jit_cache_layout();
+        // From a slot base S: the Cell payload sits at S + slot.value_off; the
+        // Object at + cell.object_off; its `data: ObjectData` at + obj.data_off
+        // (0 for repr(C) Object); then the ObjectData/Vec fields.
+        let cell_base = slot.value_off;
+        let obj_base = cell_base + cell.object_off;
+        let od_base = obj_base + obj.data_off;
+        let slots_base = od_base + obj.slots_off;
+        let to_i32 = |v: usize| i32::try_from(v).expect("jit layout offset fits in i32");
+        JitLayout {
+            slot_stride: to_i32(slot.stride),
+            slot_occupied_disc: slot.occupied_disc,
+            cell_object_disc: cell.object_disc,
+            obj_shaped_disc: obj.shaped_disc,
+            off_slot_gen: to_i32(slot.generation_off),
+            off_cell_tag: to_i32(cell_base),
+            off_od_tag: to_i32(od_base),
+            off_shape: to_i32(od_base + obj.shape_off),
+            off_slots_ptr: to_i32(slots_base + obj.vec_ptr_off),
+            off_slots_len: to_i32(slots_base + obj.vec_len_off),
+            cache_shape_off: to_i32(cache.shape_off),
+            cache_slot_off: to_i32(cache.slot_off),
+            cache_hits_off: to_i32(cache.hits_off),
+        }
+    })
 }
 
 /// The runtime-helper ABI for a discriminated binary op: `(ctx, a, b, op) -> NanBox
@@ -3224,6 +3330,91 @@ impl X64Assembler {
         self.zero_rax();
         self.bind(have);
     }
+
+    // --- inline monomorphic property-GET fast path (generic tier, Pass 6).
+    // These read the object heap at runtime-verified offsets (see
+    // `compute_jit_layout`): a slot pointer is built in `rcx`, the arena base in
+    // `r10`, the handle generation in `r8`, and the cached shape/slot come from a
+    // `PropertyCache` pointer in `r11`. Every one is a plain read; on any guard
+    // miss the emitter jumps to the existing helper slow path. ---
+
+    /// `mov r10, rax` — stash the arena base returned by `jit_arena`.
+    pub fn mov_r10_rax(&mut self) {
+        self.code.extend_from_slice(&[0x49, 0x89, 0xc2]);
+    }
+    /// `mov r8, rax` — copy the NanBox handle bits for generation extraction.
+    pub fn mov_r8_rax(&mut self) {
+        self.code.extend_from_slice(&[0x49, 0x89, 0xc0]);
+    }
+    /// `shr r8, imm8` — logical right shift (isolate the handle generation).
+    pub fn shr_r8_imm(&mut self, imm: u8) {
+        self.code.extend_from_slice(&[0x49, 0xc1, 0xe8, imm]);
+    }
+    /// `cmp rax, rdx`.
+    pub fn cmp_rax_rdx(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x39, 0xd0]);
+    }
+    /// `jae label` (jump if unsigned above-or-equal, CF=0) — an out-of-bounds
+    /// index/slot fails the check.
+    pub fn jae(&mut self, label: Label) {
+        self.code.extend_from_slice(&[0x0f, 0x83]);
+        self.emit_rel32(label);
+    }
+    /// `add rax, r10` — `rax += arena base`.
+    pub fn add_rax_r10(&mut self) {
+        self.code.extend_from_slice(&[0x4c, 0x01, 0xd0]);
+    }
+    /// `cmp byte [rcx+disp32], imm8` — compare a tag byte at the slot pointer.
+    pub fn cmp_byte_at_rcx_imm(&mut self, disp: i32, imm: u8) {
+        self.code.extend_from_slice(&[0x80, 0xb9]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.push(imm);
+    }
+    /// `cmp word [rcx+disp32], r8w` — compare the slot's `generation: u16` against
+    /// the handle generation (low 16 bits of `r8`).
+    pub fn cmp_word_at_rcx_r8w(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x66, 0x44, 0x39, 0x81]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `mov rax, [rcx+disp32]` — load an 8-byte field at the slot pointer.
+    pub fn mov_rax_at_rcx(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x48, 0x8b, 0x81]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `cmp rax, [rcx+disp32]`.
+    pub fn cmp_rax_at_rcx(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x48, 0x3b, 0x81]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `mov r11, [rcx+disp32]` — load the slot `Vec`'s data pointer.
+    pub fn mov_r11_at_rcx(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x4c, 0x8b, 0x99]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `cmp rax, [r11+disp32]` — compare against a `PropertyCache` field (the
+    /// cached shape word).
+    pub fn cmp_rax_at_r11(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x49, 0x3b, 0x83]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `mov eax, [r11+disp32]` — load a 32-bit `PropertyCache` field (the cached
+    /// slot index), zero-extended into `rax`.
+    pub fn mov_eax_at_r11(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x41, 0x8b, 0x83]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `mov rax, [r11 + rax*8]` — load the NanBox at slot index `rax` from the slot
+    /// `Vec` data pointer in `r11`.
+    pub fn mov_rax_at_r11_rax8(&mut self) {
+        self.code.extend_from_slice(&[0x49, 0x8b, 0x04, 0xc3]);
+    }
+    /// `add dword [r11+disp32], imm8` — bump a `PropertyCache` counter in place
+    /// (the inline-hit `hits` increment; sign-extended imm8).
+    pub fn add_dword_at_r11_imm(&mut self, disp: i32, imm: u8) {
+        self.code.extend_from_slice(&[0x41, 0x83, 0x83]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.push(imm);
+    }
 }
 
 /// Whether the JIT can emit and run native code on this target.
@@ -3879,6 +4070,12 @@ impl JitFunction {
         let truthy_helper = helpers.truthy as usize as u64;
         let call_helper = helpers.call as usize as u64;
         let call_native_helper = helpers.call_native as usize as u64;
+        let arena_helper = helpers.arena as usize as u64;
+        // Runtime-verified heap layout for the inline monomorphic property-get fast
+        // path (offsets/discriminants derived by pointer arithmetic on real
+        // instances; see `compute_jit_layout` + the `jit_layout_matches_safe_reads`
+        // verification test).
+        let layout = *compute_jit_layout();
         // The widest argument list across all call sites; a scratch buffer of this
         // many NanBox slots is reserved just below the register file so each call
         // can marshal its arguments into a contiguous, in-frame region.
@@ -3888,6 +4085,10 @@ impl JitFunction {
         }
         // `is_number(bits) == (bits & QNAN) != QNAN`.
         const QNAN: u64 = 0x7ffc_0000_0000_0000;
+        // A heap handle is `SIGN | QNAN | payload`, so `(bits & HANDLE_TAG) ==
+        // HANDLE_TAG` iff `bits` is a handle (both the sign and the QNAN pattern
+        // set; a number clears QNAN bits, every other tag clears SIGN).
+        const HANDLE_TAG: u64 = 0x8000_0000_0000_0000 | QNAN;
         // The canonical quiet NaN a `NanBox` normalizes every NaN to, so a NaN sum
         // reboxes bit-identically to the interpreter's `NanBox::number`.
         let canonical_nan = NanBox::number(f64::NAN).to_bits();
@@ -4008,12 +4209,79 @@ impl JitFunction {
                         return None;
                     }
                     let s = sites.get(site as usize)?;
+                    let helper = a.new_label();
+                    let done = a.new_label();
+                    // ===== inline monomorphic property-get fast path (Pass 6) =====
+                    // A pure sequence of reads at runtime-verified offsets: mask the
+                    // handle → index/generation, walk arena → slot → cell → object →
+                    // shape, compare the object's shape-Rc word to the site's cached
+                    // shape, and load the cached slot. Any guard miss falls to the
+                    // (correct) helper, which arms/updates the IC and handles
+                    // accessors, prototype walks, misses and throws. No allocation
+                    // and no call after `jit_arena`, so it is GC- and realloc-safe.
+                    //
+                    // arena = jit_arena(ctx): rax = slot-array base, rdx = len. The
+                    // base is reloaded on every entry (the `Vec` may realloc).
+                    a.mov_rdi_r15();
+                    a.movabs_rax(arena_helper as i64);
+                    a.call_rax();
+                    a.mov_r10_rax(); // r10 = arena base
+                    // Reload the receiver bits (the call clobbered rax).
+                    a.load_rax(disp(obj)); // rax = obj NanBox bits
+                    // is_handle: (bits & HANDLE_TAG) == HANDLE_TAG.
+                    a.movabs_r11(HANDLE_TAG as i64);
+                    a.mov_rcx_rax();
+                    a.and_rcx_r11();
+                    a.cmp_rcx_r11();
+                    a.jne(helper); // not a heap handle → helper
+                    // generation = (bits >> 32) & 0xffff (kept in r8w).
+                    a.mov_r8_rax();
+                    a.shr_r8_imm(32);
+                    // index = bits & 0xffff_ffff.
+                    a.movabs_r11(0xffff_ffff_i64);
+                    a.and_rax_r11(); // rax = handle index
+                    a.cmp_rax_rdx();
+                    a.jae(helper); // index >= arena len → helper
+                    // slot address = base + index * SLOT_STRIDE → rcx.
+                    a.imul_rax_imm(layout.slot_stride);
+                    a.add_rax_r10();
+                    a.mov_rcx_rax(); // rcx = &Slot
+                    // slot tag == Occupied.
+                    a.cmp_byte_at_rcx_imm(0, layout.slot_occupied_disc);
+                    a.jne(helper);
+                    // slot generation == handle generation (stale-handle guard).
+                    a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
+                    a.jne(helper);
+                    // cell tag == Object.
+                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
+                    a.jne(helper);
+                    // ObjectData tag == Shaped (dictionary mode → helper).
+                    a.cmp_byte_at_rcx_imm(layout.off_od_tag, layout.obj_shaped_disc);
+                    a.jne(helper);
+                    // shape-Rc word == cache.shape (8-byte RcBox base-ptr identity;
+                    // a cold/mismatched cache holds null/other → miss → helper arms).
+                    a.mov_rax_at_rcx(layout.off_shape);
+                    a.movabs_r11(s.cache_ptr as i64); // r11 = &PropertyCache
+                    a.cmp_rax_at_r11(layout.cache_shape_off);
+                    a.jne(helper);
+                    // slot = cache.slot (u32, zero-extended); bounds-check vs the
+                    // object's slot-Vec length (defensive — always in range on a
+                    // genuine shape hit).
+                    a.mov_eax_at_r11(layout.cache_slot_off);
+                    a.cmp_rax_at_rcx(layout.off_slots_len);
+                    a.jae(helper);
+                    // result = slots_ptr[slot].
+                    a.mov_r11_at_rcx(layout.off_slots_ptr); // r11 = slot Vec data ptr
+                    a.mov_rax_at_r11_rax8(); // rax = NanBox at slot
+                    // Bump the site IC hit counter (type feedback + the differential
+                    // proof that the inline path — not the helper — served the hit).
+                    a.movabs_r11(s.cache_ptr as i64);
+                    a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                    // ===== helper slow path =====
                     // jit_helper_get_prop(ctx, obj, key_ptr, key_len, cache).
-                    // Helper-only: the shared `vm_get_prop` runs through the site's
-                    // persistent IC, so a same-shape repeat still takes the
-                    // monomorphic shape-compare + slot-load fast path (in the helper).
-                    // A fully-inline shape guard in emitted asm is deferred (it needs
-                    // stable/repr(C) access to the heap arena + `Object` internals).
+                    a.bind(helper);
                     a.mov_rdi_r15(); // rdi = ctx
                     a.load_argreg(1, disp(obj)); // rsi = obj
                     a.movabs_argreg(2, s.key_ptr as i64); // rdx = key_ptr
@@ -4025,6 +4293,7 @@ impl JitFunction {
                     a.cmp_rax_r11();
                     a.je(throw_exit);
                     a.store_rax(disp(dst));
+                    a.bind(done);
                 }
                 GenericOp::SetProp { obj, val, site } => {
                     if !ok(obj) || !ok(val) {

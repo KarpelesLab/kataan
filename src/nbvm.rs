@@ -1567,7 +1567,29 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         truthy: jit_helper_truthy,
         call: jit_helper_call,
         call_native: jit_helper_call_native,
+        arena: jit_arena,
     }
+}
+
+/// The generic-JIT heap-arena accessor for the inline monomorphic property-get
+/// fast path. Reconstructs `&Ctx` from the opaque pointer and returns the object
+/// heap's slot-array base pointer + length. A leaf read: it allocates nothing and
+/// cannot trigger a collection, so the emitted fast path (which chases raw
+/// pointers off the returned base) stays GC-safe, and re-invoking it per entry
+/// keeps it correct across a `slots.push` reallocation.
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the dispatcher passed. The reentrancy is
+/// single-threaded — the native caller holds no live `&mut Ctx` while this runs
+/// (as [`jit_helper_get_prop`]).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_arena(ctx: *mut core::ffi::c_void) -> crate::jit::JitArena {
+    // SAFETY: single-threaded reentrancy — see `jit_helper_get_prop`. A shared
+    // borrow suffices; this reads the heap's slot-array base/len only.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    let (base, len) = ctx.realm.jit_arena_slots();
+    crate::jit::JitArena { base, len }
 }
 
 /// Turns a helper `Result` into a raw generic-JIT return word: the value's `NanBox`
@@ -11675,7 +11697,181 @@ mod generic_jit_tests {
         // fast path — a hit, without re-resolving the name.
         let r2 = call_generic(&mut ctx, &funcs, &jit, &[b]).unwrap().unwrap();
         assert_eq!(r2.to_bits(), interp.to_bits());
+        // The second (same-shape) read was served by the inline fast path: the hit
+        // counter advanced and the helper was not re-entered for it.
         assert_eq!((jit.ic_hits(), jit.ic_misses()), (1, 1));
+    }
+
+    /// The mandatory safety gate for the inline monomorphic property-get fast path:
+    /// for real heap objects built via the normal `Realm` API, resolving a slot
+    /// value by manually walking raw heap pointers at `compute_jit_layout()`'s
+    /// runtime-derived offsets must be **byte-identical** to the safe Rust read.
+    /// Covers a monomorphic hit, a same-shape object, a shape mismatch (must NOT
+    /// match the cached shape), a dictionary-mode object (must miss), and a
+    /// post-reallocation re-read (proving the arena base is reloaded, not cached).
+    /// If any offset/discriminant is wrong this fails loudly.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn jit_layout_matches_safe_reads() {
+        use crate::ic::PropertyCache;
+        let layout = crate::jit::compute_jit_layout();
+
+        // A faithful Rust mirror of the emitted inline fast path: the same raw
+        // reads at the same probed offsets. Returns the slot NanBox bits on a hit.
+        #[allow(unsafe_code)]
+        let raw_get =
+            |base: *const u8, len: usize, obj_bits: u64, cache: &PropertyCache| -> Option<u64> {
+                const HANDLE_TAG: u64 = 0x8000_0000_0000_0000 | 0x7ffc_0000_0000_0000;
+                if obj_bits & HANDLE_TAG != HANDLE_TAG {
+                    return None;
+                }
+                let index = (obj_bits & 0xffff_ffff) as usize;
+                let generation = ((obj_bits >> 32) & 0xffff) as u16;
+                if index >= len {
+                    return None;
+                }
+                // SAFETY: `index < len`, so `base + index*stride` is a live slot; all
+                // further offsets are within that slot / the objects it points to,
+                // exactly as the emitted code reads them.
+                unsafe {
+                    let slot = base.add(index * layout.slot_stride as usize);
+                    if *slot != layout.slot_occupied_disc {
+                        return None;
+                    }
+                    if *(slot.add(layout.off_slot_gen as usize) as *const u16) != generation {
+                        return None;
+                    }
+                    if *slot.add(layout.off_cell_tag as usize) != layout.cell_object_disc {
+                        return None;
+                    }
+                    if *slot.add(layout.off_od_tag as usize) != layout.obj_shaped_disc {
+                        return None;
+                    }
+                    let obj_shape = *(slot.add(layout.off_shape as usize) as *const usize);
+                    let cache_base = (cache as *const PropertyCache).cast::<u8>();
+                    let cache_shape =
+                        *(cache_base.add(layout.cache_shape_off as usize) as *const usize);
+                    if obj_shape != cache_shape {
+                        return None;
+                    }
+                    let sslot =
+                        *(cache_base.add(layout.cache_slot_off as usize) as *const u32) as usize;
+                    let slots_len = *(slot.add(layout.off_slots_len as usize) as *const usize);
+                    if sslot >= slots_len {
+                        return None;
+                    }
+                    let slots_ptr = *(slot.add(layout.off_slots_ptr as usize) as *const *const u64);
+                    Some(*slots_ptr.add(sslot))
+                }
+            };
+
+        let bits = |h: Handle| NanBox::handle(h.to_raw()).to_bits();
+
+        let mut realm = Realm::new();
+        // Two same-shape objects {x, y}, plus a different-shape {x, y, z}.
+        let o1 = realm.new_object();
+        realm.set_property(o1, "x", NanBox::number(10.0));
+        realm.set_property(o1, "y", NanBox::number(20.0));
+        let o2 = realm.new_object();
+        realm.set_property(o2, "x", NanBox::number(30.0));
+        realm.set_property(o2, "y", NanBox::number(40.0));
+        let o3 = realm.new_object();
+        realm.set_property(o3, "x", NanBox::number(1.0));
+        realm.set_property(o3, "y", NanBox::number(2.0));
+        realm.set_property(o3, "z", NanBox::number(3.0));
+
+        // Arm caches on o1's shape for "x" and "y" via the safe path.
+        let mut cx = PropertyCache::new();
+        let safe_x = realm.object_cached_get(o1, "x", &mut cx).unwrap();
+        let mut cy = PropertyCache::new();
+        let safe_y = realm.object_cached_get(o1, "y", &mut cy).unwrap();
+
+        let (base, len) = realm.jit_arena_slots();
+
+        // Monomorphic hit: raw walk == safe read, for both properties.
+        assert_eq!(raw_get(base, len, bits(o1), &cx), Some(safe_x.to_bits()));
+        assert_eq!(raw_get(base, len, bits(o1), &cy), Some(safe_y.to_bits()));
+
+        // Same-shape object resolves through the o1-armed caches to o2's own values.
+        assert_eq!(
+            raw_get(base, len, bits(o2), &cx),
+            realm.get_property(o2, "x").map(|v| v.to_bits())
+        );
+        assert_eq!(
+            raw_get(base, len, bits(o2), &cy),
+            realm.get_property(o2, "y").map(|v| v.to_bits())
+        );
+
+        // Shape mismatch: o3 has a different shape → must NOT match the o1 cache.
+        assert_eq!(raw_get(base, len, bits(o3), &cx), None);
+
+        // Dictionary-mode object: must miss (ObjectData tag != Shaped).
+        let mut dlim = crate::limits::Limits::default();
+        dlim.object_dictionary_threshold = 2;
+        let mut drealm = Realm::with_limits(dlim);
+        let d = drealm.new_object();
+        drealm.set_property(d, "a", NanBox::number(1.0));
+        drealm.set_property(d, "b", NanBox::number(2.0));
+        drealm.set_property(d, "c", NanBox::number(3.0)); // → dictionary mode
+        let mut cd = PropertyCache::new();
+        // The safe path still reads it (via the dict map); the raw walk must miss.
+        assert_eq!(
+            drealm.object_cached_get(d, "a", &mut cd),
+            Some(NanBox::number(1.0))
+        );
+        let (dbase, dlen) = drealm.jit_arena_slots();
+        assert_eq!(raw_get(dbase, dlen, bits(d), &cd), None);
+
+        // Reallocation: grow the arena far past its capacity, re-read the base, and
+        // confirm o1 still resolves — the base MUST be reloaded, never cached.
+        for _ in 0..100_000 {
+            let _ = realm.new_object();
+        }
+        let (base2, len2) = realm.jit_arena_slots();
+        assert!(len2 > len, "arena grew (reallocated)");
+        assert_eq!(raw_get(base2, len2, bits(o1), &cx), Some(safe_x.to_bits()));
+    }
+
+    /// Heap-stress differential: a property-reading hot loop under the JIT while
+    /// heavy allocation churns and reallocates the arena. Every JIT read still
+    /// matches the interpreter because the inline fast path reloads the arena base
+    /// on each entry — a stale/baked base would diverge or crash. The inline path
+    /// (not the helper) serves the reads, so the hit counter climbs.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn generic_get_prop_inline_survives_arena_churn() {
+        let funcs = build_prop();
+        let get_x = id_of(&funcs, "getX");
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[get_x], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let target = mint(&mut ctx, &funcs, "makePoint");
+        // Cold prime: warms (arms) the site IC — one miss, no hit yet.
+        let _ = call_generic(&mut ctx, &funcs, &jit, &[target])
+            .unwrap()
+            .unwrap();
+
+        for i in 0..2000 {
+            // Churn the arena so its backing Vec grows / reallocates mid-run.
+            for _ in 0..8 {
+                let _ = ctx.realm.new_object();
+            }
+            // Read either the original object or a fresh, same-shape one.
+            let t = if i % 3 == 0 {
+                mint(&mut ctx, &funcs, "makePoint")
+            } else {
+                target
+            };
+            let interp = call(&mut ctx, &funcs, get_x, &[t]).unwrap();
+            let jitted = call_generic(&mut ctx, &funcs, &jit, &[t]).unwrap().unwrap();
+            assert_eq!(interp.to_bits(), jitted.to_bits(), "iteration {i}");
+        }
+        // The inline shape-compare + slot-load served the overwhelming majority of
+        // reads (only the cold prime is a miss); the helper was not re-entered.
+        assert!(jit.ic_hits() > 1000, "inline hits: {}", jit.ic_hits());
+        assert_eq!(jit.ic_misses(), 1, "only the cold prime missed");
     }
 
     /// `o.x = v` write then read-back: JIT-forced === interpreter (fresh object per
