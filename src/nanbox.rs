@@ -68,6 +68,15 @@ const TAG_EMPTY: u64 = QNAN | 0x06;
 /// [`is_tdz`](NanBox::is_tdz) to test.
 const TAG_TDZ: u64 = QNAN | 0x07;
 
+/// A reserved out-of-band sentinel a JIT runtime helper returns to signal
+/// "a JS exception is pending in `Ctx::jit_pending` — unwind". It is `QNAN | 0x08`:
+/// outside the immediate-singleton tag range (`0x01..=0x07`) and without the
+/// handle sign bit, so it can never be a legal JS value or collide with any box
+/// the interpreter's `+` (or any other op) can return. The generic JIT tier and
+/// its dispatch (`nbvm::call_generic`) agree on this encoding; the emitted native
+/// code loads [`NanBox::jit_throw_bits`] to test the helper's return.
+const TAG_JIT_THROW: u64 = QNAN | 0x08;
+
 /// The canonical quiet-NaN payload a `f64` NaN is normalized to, chosen so that
 /// `(bits & QNAN) != QNAN` (i.e. it still reads back as a number).
 const CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
@@ -143,6 +152,27 @@ impl NanBox {
     #[must_use]
     pub const fn is_tdz(self) -> bool {
         self.0 == TAG_TDZ
+    }
+
+    /// The reserved JIT throw/deopt sentinel (see `TAG_JIT_THROW`): a runtime
+    /// helper returns this to tell the generic JIT dispatch that it stashed a
+    /// thrown value in `Ctx::jit_pending`. It is never a legal JS value.
+    #[must_use]
+    pub const fn jit_throw_sentinel() -> Self {
+        Self(TAG_JIT_THROW)
+    }
+
+    /// The raw bits of the JIT throw sentinel — the constant the emitted native
+    /// code compares a helper's return value against.
+    #[must_use]
+    pub const fn jit_throw_bits() -> u64 {
+        TAG_JIT_THROW
+    }
+
+    /// Whether this word is the JIT throw/deopt sentinel.
+    #[must_use]
+    pub const fn is_jit_throw_sentinel(self) -> bool {
+        self.0 == TAG_JIT_THROW
     }
 
     /// A boolean.

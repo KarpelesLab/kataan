@@ -411,6 +411,29 @@ struct Ctx<'a> {
     /// `None` means "tried, not JIT-eligible". Present only where the JIT exists.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     jit_cache: alloc::collections::BTreeMap<usize, Option<alloc::rc::Rc<crate::jit::JitProto>>>,
+    /// An in-flight thrown value stashed by a generic-JIT runtime helper (see
+    /// [`jit_helper_add`]). The helper returns the reserved throw sentinel and
+    /// leaves the value here; [`call_generic`] takes it back out as
+    /// `Err(VmError::Thrown(..))`. `None` between helper faults.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    jit_pending: Option<NanBox>,
+    /// The function table the currently-running generic-JIT body belongs to, as a
+    /// raw pointer so a runtime helper (which only receives `ctx`) can reconstruct
+    /// `&[FnProto]` to re-enter the interpreter (e.g. to run a user `valueOf`). Set
+    /// by [`call_generic`] immediately before invoking native code; the whole
+    /// program shares one table, so it is invariant across nested calls.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    jit_funcs: Option<*const [FnProto]>,
+    /// Forward-safety GC root hook (`JIT_DESIGN.md` §5): a helper-call sequence
+    /// would spill live NanBox temps here before re-entering, so an
+    /// allocation-triggered collection could treat them as roots. **Not yet
+    /// load-bearing** — today GC never runs mid-execution, so no JIT frame is ever
+    /// exposed to a moving collection; the field is landed (and mirrored into the
+    /// realm root set via `Realm::jit_shadow_roots`) so the wiring exists ahead of
+    /// an allocation-triggered GC. The emitted code does not populate it yet.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[allow(dead_code)]
+    jit_shadow: alloc::vec::Vec<u64>,
     /// Function-call nesting depth (recursion guard).
     call_depth: usize,
 }
@@ -442,6 +465,12 @@ pub fn run_program(
         tiers: alloc::collections::BTreeMap::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_cache: alloc::collections::BTreeMap::new(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_pending: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_funcs: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_shadow: alloc::vec::Vec::new(),
         call_depth: 0,
     };
     let value = call(&mut ctx, funcs, id, args)?;
@@ -466,6 +495,12 @@ pub fn run_program_capturing(
         tiers: alloc::collections::BTreeMap::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_cache: alloc::collections::BTreeMap::new(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_pending: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_funcs: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_shadow: alloc::vec::Vec::new(),
         call_depth: 0,
     };
     let value = call(&mut ctx, funcs, id, args)?;
@@ -579,10 +614,18 @@ fn call_with_inner(
         {
             let mut stack = alloc::collections::BTreeSet::new();
             let cached = ensure_jit(&mut ctx.jit_cache, funcs, id, &mut stack);
-            if let Some(jit) = cached
-                && let Some(result) = jit.call_guarded(&args)
-            {
-                return Ok(result);
+            if let Some(jit) = cached {
+                if jit.is_generic() {
+                    // The generic (NanBox) tier re-enters the interpreter through
+                    // runtime helpers, so it needs the live context. A `Some`
+                    // outcome (value or thrown) is authoritative; `None` is an
+                    // arity deopt → fall through to the interpreter.
+                    if let Some(outcome) = call_generic(ctx, funcs, &jit, &args) {
+                        return outcome;
+                    }
+                } else if let Some(result) = jit.call_guarded(&args) {
+                    return Ok(result);
+                }
             }
         }
         // An `async` function: its synchronous body runs to completion, and its
@@ -664,8 +707,13 @@ fn ensure_jit(
         }
     }
     stack.remove(&id);
-    let compiled =
-        crate::jit::JitProto::compile_with_registry(&funcs[id], &registry).map(alloc::rc::Rc::new);
+    // Prefer the Int/Float tiers; fall back to the generic (NanBox) tier for a
+    // function they reject but that is generic-eligible (only param/const loads,
+    // `+`, `Move`, `Return`) — e.g. a 7+-parameter add. The generic tier re-enters
+    // the interpreter for non-numeric operands via `jit_helper_add`.
+    let compiled = crate::jit::JitProto::compile_with_registry(&funcs[id], &registry)
+        .or_else(|| crate::jit::JitProto::compile_generic(&funcs[id], jit_helper_add))
+        .map(alloc::rc::Rc::new);
     cache.insert(id, compiled.clone());
     compiled
 }
@@ -717,6 +765,12 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         tiers: alloc::collections::BTreeMap::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_cache: alloc::collections::BTreeMap::new(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_pending: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_funcs: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_shadow: alloc::vec::Vec::new(),
         call_depth: 0,
     };
     match run_frame(&mut ctx, &[], program, &mut regs)? {
@@ -845,6 +899,92 @@ fn to_primitive(ctx: &mut Ctx, funcs: &[FnProto], v: NanBox, number_hint: bool) 
         }
     }
     v
+}
+
+/// The interpreter's real `+` operator (`Op::AddValue`'s semantics), factored
+/// out so the bytecode VM **and** the generic-JIT runtime helper
+/// ([`jit_helper_add`]) share one code path and can never diverge: ToPrimitive
+/// (default hint) on each operand — honoring a user `valueOf`/`toString` — then a
+/// Symbol-coercion guard, then `Realm::add` (which picks string concatenation vs
+/// numeric addition from the resulting primitives). Any observable side effect (a
+/// user `valueOf`) therefore runs exactly once per evaluation.
+fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBox, VmError> {
+    let x = to_primitive(ctx, funcs, a, true);
+    let y = to_primitive(ctx, funcs, b, true);
+    if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_STR_ERR) {
+        return Err(VmError::Thrown(e));
+    }
+    Ok(ctx.realm.add(x, y))
+}
+
+/// The generic-JIT runtime helper for `+`: the slow path the native code calls
+/// when an operand isn't a number. Reconstructs `&mut Ctx` from the opaque
+/// pointer, runs the shared [`vm_add`], and either returns the result's `NanBox`
+/// bits or — on a thrown exception — stashes the value in `ctx.jit_pending` and
+/// returns the reserved throw sentinel ([`NanBox::jit_throw_bits`]).
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` pointer the dispatcher passed to the native
+/// entry, with `ctx.jit_funcs` set to the running function table.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
+    // SAFETY: single-threaded reentrancy — the native caller holds no live
+    // `&mut Ctx` while this runs (it passed a raw pointer), so reborrowing it is
+    // the same pattern as an ordinary recursive interpreter call.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // SAFETY: `jit_funcs` points at the function table for the whole program run,
+    // which outlives this call (it is borrowed down the entire call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let av = NanBox::from_bits(a);
+    let bv = NanBox::from_bits(b);
+    match vm_add(ctx, funcs, av, bv) {
+        Ok(v) => v.to_bits(),
+        Err(VmError::Thrown(val)) => {
+            ctx.jit_pending = Some(val);
+            NanBox::jit_throw_bits()
+        }
+        // `vm_add` only ever yields `Ok` or `Thrown`; a non-throw fault can't be
+        // carried through a NanBox, so surface it as a thrown generic error.
+        Err(_) => {
+            let e = make_error(ctx.realm, "Error", "JIT add fault");
+            ctx.jit_pending = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// Invokes a generic-tier native body and translates its raw return into the
+/// interpreter's `Result`. `None` on a pre-call arity deopt (the caller then
+/// falls through to the interpreter); otherwise `Ok(value)`, or — when the body
+/// returns the throw sentinel — `Err(Thrown(v))` with `v` taken from
+/// `ctx.jit_pending`. Setting `ctx.jit_funcs` here lets the helper re-enter the
+/// interpreter with the correct function table.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn call_generic(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    jit: &crate::jit::JitProto,
+    args: &[NanBox],
+) -> Option<Result<NanBox, VmError>> {
+    ctx.jit_funcs = Some(funcs as *const [FnProto]);
+    let ctx_ptr = ctx as *mut Ctx as *mut core::ffi::c_void;
+    let raw = jit.call_generic_raw(ctx_ptr, args)?;
+    let nb = NanBox::from_bits(raw);
+    if nb.is_jit_throw_sentinel() {
+        let v = ctx
+            .jit_pending
+            .take()
+            .unwrap_or_else(|| make_error(ctx.realm, "Error", "JIT throw without pending value"));
+        Some(Err(VmError::Thrown(v)))
+    } else {
+        Some(Ok(nb))
+    }
 }
 
 /// `regex.lastIndex = v` for the bytecode VM. `lastIndex` is an ordinary data
@@ -1481,15 +1621,13 @@ fn run_frame(
                 regs[*dst as usize] = ctx.realm.less_than(x, y);
             }
             Op::AddValue { dst, a, b } => {
-                // `+` uses ToPrimitive (default hint) on each operand — honoring a
-                // user `valueOf`/`toString` — then `realm.add` picks string
-                // concatenation vs numeric addition from the resulting primitives.
-                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
-                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
-                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_STR_ERR) {
-                    handle_throw!(VmError::Thrown(e));
+                // The general `+`: ToPrimitive each operand then string-concat or
+                // numeric add. Shared with the generic-JIT helper via `vm_add` so
+                // the two tiers can never diverge.
+                match vm_add(ctx, funcs, regs[*a as usize], regs[*b as usize]) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
                 }
-                regs[*dst as usize] = ctx.realm.add(x, y);
             }
             Op::StrictEq { dst, a, b } => {
                 regs[*dst as usize] = NanBox::boolean(
@@ -10549,5 +10687,219 @@ mod tests {
                 a.forEach(function(x) { n = n + 1; a.pop(); }); n"),
             "3"
         );
+    }
+}
+
+/// Differential tests for the generic (NanBox) JIT tier — Pass 1 of the JIT
+/// completion (`JIT_DESIGN.md`). Each drives a `function f(a,b){ return a+b; }`
+/// shaped body through the JIT-forced generic path and asserts it is identical
+/// to the interpreter (same value, or same thrown exception with the
+/// side-effecting `valueOf` run exactly once).
+#[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+mod generic_jit_tests {
+    use super::*;
+    use crate::nanbox::NanBox;
+
+    fn mk_ctx(realm: &mut Realm) -> Ctx<'_> {
+        Ctx {
+            realm,
+            output: String::new(),
+            microtasks: alloc::collections::VecDeque::new(),
+            tiers: alloc::collections::BTreeMap::new(),
+            jit_cache: alloc::collections::BTreeMap::new(),
+            jit_pending: None,
+            jit_funcs: None,
+            jit_shadow: alloc::vec::Vec::new(),
+            call_depth: 0,
+        }
+    }
+
+    /// Builds a function table with helpers that mint objects/symbols, plus a
+    /// hand-built `f(a,b){ return a+b; }` (appended, so its op stream is exactly
+    /// `AddValue; Return` regardless of the compiler). Returns `(funcs, f_id)`.
+    fn build() -> (Vec<FnProto>, usize) {
+        let src = "
+            function makeVal(){ return { c: 0, valueOf: function(){ this.c = this.c + 1; return 42; } }; }
+        ";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let mut funcs = compile_program(&program).expect("compile helpers");
+        let f_id = funcs.len();
+        funcs.push(FnProto {
+            ops: alloc::vec![Op::AddValue { dst: 3, a: 0, b: 1 }, Op::Return { src: 3 },],
+            n_regs: 4,
+            n_params: 2,
+            n_captures: 0,
+            rest_from: None,
+            is_async: false,
+            length: 2,
+            name: alloc::string::String::from("f"),
+        });
+        (funcs, f_id)
+    }
+
+    fn make_val(ctx: &mut Ctx, funcs: &[FnProto]) -> NanBox {
+        let id = funcs.iter().position(|p| p.name == "makeVal").unwrap();
+        call(ctx, funcs, id, &[]).expect("makeVal")
+    }
+
+    /// number + number — exercises the inline both-numbers fast path.
+    #[test]
+    fn generic_add_number_number() {
+        let (funcs, f_id) = build();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add)
+            .expect("f is generic-eligible");
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let args = [NanBox::number(2.0), NanBox::number(3.0)];
+        let interp = call(&mut ctx, &funcs, f_id, &args).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &args)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.realm.to_display_string(interp), "5");
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// string + string — non-number operands take the helper slow path.
+    #[test]
+    fn generic_add_string_string() {
+        let (funcs, f_id) = build();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let s1 = NanBox::handle(ctx.realm.new_string("foo").to_raw());
+        let s2 = NanBox::handle(ctx.realm.new_string("bar").to_raw());
+        let args = [s1, s2];
+        let interp = call(&mut ctx, &funcs, f_id, &args).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &args)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.realm.to_display_string(interp), "foobar");
+        assert_eq!(
+            ctx.realm.to_display_string(interp),
+            ctx.realm.to_display_string(jitted)
+        );
+    }
+
+    /// string + number — mixed operands, slow path, ToString coercion.
+    #[test]
+    fn generic_add_string_number() {
+        let (funcs, f_id) = build();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let s = NanBox::handle(ctx.realm.new_string("x=").to_raw());
+        let args = [s, NanBox::number(7.0)];
+        let interp = call(&mut ctx, &funcs, f_id, &args).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &args)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.realm.to_display_string(interp), "x=7");
+        assert_eq!(
+            ctx.realm.to_display_string(interp),
+            ctx.realm.to_display_string(jitted)
+        );
+    }
+
+    /// number + object-with-valueOf — the object's `valueOf` runs on the slow
+    /// path and must run EXACTLY once (no deopt-and-re-run double execution).
+    #[test]
+    fn generic_add_number_object_valueof_runs_once() {
+        let (funcs, f_id) = build();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        // Fresh object per path so each counter starts at 0.
+        let obj_i = make_val(&mut ctx, &funcs);
+        let obj_j = make_val(&mut ctx, &funcs);
+
+        let interp = call(&mut ctx, &funcs, f_id, &[NanBox::number(1.0), obj_i]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[NanBox::number(1.0), obj_j])
+            .unwrap()
+            .unwrap();
+
+        // 1 + 42 == 43 on both paths.
+        assert_eq!(ctx.realm.to_display_string(interp), "43");
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+
+        // valueOf ran exactly once on each object.
+        let ci = ctx
+            .realm
+            .get_property(obj_i.as_handle().map(Handle::from_raw).unwrap(), "c");
+        let cj = ctx
+            .realm
+            .get_property(obj_j.as_handle().map(Handle::from_raw).unwrap(), "c");
+        assert_eq!(ci.and_then(|v| v.as_number()), Some(1.0));
+        assert_eq!(cj.and_then(|v| v.as_number()), Some(1.0));
+    }
+
+    /// object-with-side-effecting-valueOf + Symbol — a genuine throw
+    /// (`Cannot convert a Symbol value to a string`). Both paths must throw the
+    /// same value, and the side-effecting `valueOf` (evaluated before the Symbol
+    /// operand faults) must run EXACTLY once even on the throwing path.
+    #[test]
+    fn generic_add_throws_identically_valueof_once() {
+        let (funcs, f_id) = build();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let obj_i = make_val(&mut ctx, &funcs);
+        let obj_j = make_val(&mut ctx, &funcs);
+        let sym_i = NanBox::handle(ctx.realm.new_symbol("s").to_raw());
+        let sym_j = NanBox::handle(ctx.realm.new_symbol("s").to_raw());
+
+        let interp = call(&mut ctx, &funcs, f_id, &[obj_i, sym_i]);
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[obj_j, sym_j]).unwrap();
+
+        let (vi, vj) = match (interp, jitted) {
+            (Err(VmError::Thrown(vi)), Err(VmError::Thrown(vj))) => (vi, vj),
+            other => panic!("expected both paths to throw, got {other:?}"),
+        };
+        // Same thrown value (a TypeError with the Symbol-coercion message).
+        let msg_i = ctx
+            .realm
+            .get_property(vi.as_handle().map(Handle::from_raw).unwrap(), "message");
+        let msg_j = ctx
+            .realm
+            .get_property(vj.as_handle().map(Handle::from_raw).unwrap(), "message");
+        assert_eq!(
+            msg_i.map(|m| ctx.realm.to_display_string(m)),
+            msg_j.map(|m| ctx.realm.to_display_string(m))
+        );
+        assert_eq!(
+            msg_i.map(|m| ctx.realm.to_display_string(m)).as_deref(),
+            Some(SYM_STR_ERR)
+        );
+
+        // The counting valueOf ran exactly once on each object, even though `+`
+        // then threw — proving no deopt-and-re-run on the exception path.
+        let ci = ctx
+            .realm
+            .get_property(obj_i.as_handle().map(Handle::from_raw).unwrap(), "c");
+        let cj = ctx
+            .realm
+            .get_property(obj_j.as_handle().map(Handle::from_raw).unwrap(), "c");
+        assert_eq!(ci.and_then(|v| v.as_number()), Some(1.0));
+        assert_eq!(cj.and_then(|v| v.as_number()), Some(1.0));
+    }
+
+    /// A NaN-producing numeric add on the inline fast path reboxes to the
+    /// canonical quiet NaN, bit-identically to the interpreter's `NanBox::number`.
+    #[test]
+    fn generic_add_nan_canonicalizes_like_interpreter() {
+        let (funcs, f_id) = build();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let inf = NanBox::number(f64::INFINITY);
+        let ninf = NanBox::number(f64::NEG_INFINITY);
+        let args = [inf, ninf]; // +Inf + -Inf == NaN
+        let interp = call(&mut ctx, &funcs, f_id, &args).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &args)
+            .unwrap()
+            .unwrap();
+        assert!(interp.as_number().unwrap().is_nan());
+        assert_eq!(interp.to_bits(), jitted.to_bits());
     }
 }

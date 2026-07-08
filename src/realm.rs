@@ -196,6 +196,14 @@ pub struct Realm {
     /// index — never a raw `Handle` that compaction would invalidate. `None` slots
     /// are freed indices, reused by the next `persist`.
     host_persistent: Vec<Option<NanBox>>,
+    /// Forward-safety root hook for the generic JIT tier (`JIT_DESIGN.md` §5).
+    /// A future allocation-triggered GC that fires while a JIT frame is live would
+    /// find its spilled live NanBox temps here (flushed from `nbvm::Ctx::jit_shadow`
+    /// at the helper-call safepoint), so they survive a moving collection. **Not
+    /// yet load-bearing** — GC never runs mid-execution today, so this stays empty;
+    /// it is landed and enumerated in [`gc_side_table_values`](Self::gc_side_table_values)
+    /// so the root wiring exists ahead of that phase.
+    jit_shadow_roots: Vec<NanBox>,
     /// Host-attached **opaque native state** (`ROADMAP.md` §4.0 host-backed exotic
     /// objects): a `Box<dyn Any>` an embedder wraps onto a JS object (à la N-API
     /// `napi_wrap`), keyed by the object's handle. A **weak** table — it does NOT
@@ -299,6 +307,7 @@ impl Realm {
             bigint_proto_intrinsic: None,
             intl_protos: alloc::collections::BTreeMap::new(),
             host_persistent: Vec::new(),
+            jit_shadow_roots: Vec::new(),
             host_native_state: alloc::collections::BTreeMap::new(),
             legacy_regexp: LegacyRegExpState::default(),
             limits,
@@ -3150,6 +3159,12 @@ impl Realm {
             self.host_persistent
                 .iter()
                 .flatten()
+                .filter_map(|nb| nb.as_handle().map(Handle::from_raw)),
+        );
+        // Forward-safety JIT shadow roots (empty today — see `jit_shadow_roots`).
+        r.extend(
+            self.jit_shadow_roots
+                .iter()
                 .filter_map(|nb| nb.as_handle().map(Handle::from_raw)),
         );
         r

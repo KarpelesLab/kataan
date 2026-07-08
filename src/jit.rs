@@ -1643,6 +1643,129 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
     Some(out)
 }
 
+/// A single op in the **generic (NanBox) tier** IR — Pass 1 of the JIT
+/// completion (`JIT_DESIGN.md`). Unlike the Int/Float tiers (which unbox to
+/// machine `i64`/`f64` at the boundary and deopt on any non-numeric argument),
+/// the generic tier operates directly on `NanBox` words (`u64`) and can re-enter
+/// the interpreter through a runtime helper for anything it can't do inline. The
+/// op set is deliberately tiny for now — param/const loads, `Move`, `Return`, and
+/// a single value op, generic `Add`; the later passes extend it.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenericOp {
+    /// `reg[dst] = arg[index]` — load an incoming NanBox argument.
+    Arg {
+        /// Destination register.
+        dst: u8,
+        /// Index into the `args` array.
+        index: u8,
+    },
+    /// `reg[dst] = imm` — load an immediate NanBox word.
+    Const {
+        /// Destination register.
+        dst: u8,
+        /// The raw NanBox bits to load.
+        imm: u64,
+    },
+    /// `reg[dst] = reg[a] + reg[b]` — generic `+` with full ECMAScript semantics.
+    /// Both-number operands take an inline SSE fast path; anything else calls
+    /// `jit_helper_add`.
+    Add {
+        /// Destination register.
+        dst: u8,
+        /// Left operand register.
+        a: u8,
+        /// Right operand register.
+        b: u8,
+    },
+    /// `reg[dst] = reg[src]` — register copy.
+    Move {
+        /// Destination register.
+        dst: u8,
+        /// Source register.
+        src: u8,
+    },
+    /// `return reg[src]`.
+    Ret {
+        /// Register holding the return value.
+        src: u8,
+    },
+}
+
+/// Lowers a `nbvm::FnProto` to the generic-tier IR **iff** every op is one this
+/// tier can currently emit: constant loads, `Move`, `Return`, and the general
+/// `+` (`Op::AddValue`). Any other op — including the numeric-narrowed `Op::Add`,
+/// which the Int/Float tiers already claim and which carries a
+/// throw-on-non-number contract this tier must not silently widen — yields
+/// `None`, so only trivially-generic functions compile here for now. Reuses the
+/// Int/Float tiers' def-use safety check (a register may be read only after it
+/// is written; params count as written) so the native frame can never diverge
+/// from the interpreter by reading an unmodeled slot (`this`, a capture, a TDZ
+/// binding).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[must_use]
+pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<Vec<GenericOp>> {
+    use crate::nbvm::Op;
+    if proto.n_regs > 64 || proto.n_params > 32 || proto.n_captures != 0 {
+        return None;
+    }
+    let reg8 = |r: crate::nbvm::Reg| -> Option<u8> {
+        ((r as usize) < proto.n_regs).then(|| u8::try_from(r).ok())?
+    };
+    let mut written = alloc::vec![false; proto.n_regs];
+    for w in written.iter_mut().take(proto.n_params) {
+        *w = true;
+    }
+    let read = |w: &[bool], r: crate::nbvm::Reg| -> Option<u8> {
+        let r8 = reg8(r)?;
+        if *w.get(r as usize)? { Some(r8) } else { None }
+    };
+    let mut out = Vec::new();
+    // Parameters arrive as the `args` array; seed registers `0..n_params`.
+    for i in 0..proto.n_params {
+        out.push(GenericOp::Arg {
+            dst: u8::try_from(i).ok()?,
+            index: u8::try_from(i).ok()?,
+        });
+    }
+    for op in &proto.ops {
+        let lowered = match op {
+            Op::LoadConst { dst, value } => {
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                GenericOp::Const {
+                    dst: d,
+                    imm: value.to_bits(),
+                }
+            }
+            // Only the general `+`; the numeric `Op::Add` is left to the Int/Float
+            // tiers (see the fn doc).
+            Op::AddValue { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                GenericOp::Add { dst: d, a, b }
+            }
+            Op::Move { dst, src } => {
+                let s = read(&written, *src)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                GenericOp::Move { dst: d, src: s }
+            }
+            Op::Return { src } => GenericOp::Ret {
+                src: read(&written, *src)?,
+            },
+            _ => return None,
+        };
+        out.push(lowered);
+    }
+    // Straight-line only: the last op must be a `Ret` (the op set has no jumps).
+    if !matches!(out.last(), Some(GenericOp::Ret { .. })) {
+        return None;
+    }
+    Some(out)
+}
+
 /// A bytecode-VM function compiled to native code, callable from the VM with
 /// `NanBox` values. This is the end-to-end fast path: it owns the compiled
 /// machine code and performs the unbox→native→rebox round-trip with an integer
@@ -1664,7 +1787,20 @@ enum JitKind {
     Int,
     /// Straight-line `f64` arithmetic (incl. division); guards args to numbers.
     Float,
+    /// The generic (NanBox) tier: operates on boxed values, with an inline
+    /// number fast path and a runtime-helper slow path that re-enters the
+    /// interpreter (`JIT_DESIGN.md` Pass 1). Invoked via
+    /// [`JitProto::call_generic_raw`], not `call_guarded`.
+    Generic,
 }
+
+/// The runtime-helper ABI the generic tier calls into. `ctx` is an opaque
+/// pointer to the live interpreter context (`nbvm::Ctx`), which the helper
+/// reconstructs; the operands and result are raw `NanBox` words. On a thrown
+/// exception the helper stashes the value in the context and returns
+/// [`NanBox::jit_throw_bits`](crate::nanbox::NanBox::jit_throw_bits).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitAddHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u64;
 
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 impl JitProto {
@@ -1755,7 +1891,59 @@ impl JitProto {
                 let r = self.func.call_args_f64(&fs[..self.n_params]);
                 Some(crate::nanbox::NanBox::number(r))
             }
+            // The generic tier is invoked via `call_generic_raw` (it needs the
+            // live context pointer), never through the value-only `call_guarded`.
+            JitKind::Generic => None,
         }
+    }
+
+    /// Compiles `proto` on the **generic (NanBox) tier** if [`lower_nbvm_generic`]
+    /// accepts it, wiring `add_helper` as the runtime slow path for `+`. Returns
+    /// `None` if the function isn't generic-eligible.
+    #[must_use]
+    pub fn compile_generic(proto: &crate::nbvm::FnProto, add_helper: JitAddHelper) -> Option<Self> {
+        let ops = lower_nbvm_generic(proto)?;
+        let func = JitFunction::compile_generic(
+            proto.n_regs,
+            proto.n_params,
+            &ops,
+            add_helper as usize as u64,
+        )?;
+        Some(Self {
+            func,
+            n_params: proto.n_params,
+            kind: JitKind::Generic,
+        })
+    }
+
+    /// Whether this compiled function is a generic-tier body (dispatched via
+    /// [`call_generic_raw`](Self::call_generic_raw)).
+    #[must_use]
+    pub fn is_generic(&self) -> bool {
+        self.kind == JitKind::Generic
+    }
+
+    /// Invokes a generic-tier body with the live context `ctx` (an opaque pointer
+    /// the runtime helpers reconstruct) and `NanBox` arguments. Returns the raw
+    /// result word, or `None` on an arity mismatch (a pre-call deopt). The word is
+    /// either a `NanBox`'s bits or [`NanBox::jit_throw_bits`] — the caller
+    /// interprets the sentinel (see `nbvm::call_generic`).
+    ///
+    /// # Safety
+    /// `ctx` must point to a live `nbvm::Ctx` for the duration of the call (the
+    /// helpers dereference it as `&mut Ctx`). The call is synchronous and
+    /// single-threaded, so this is the ordinary interpreter reentrancy pattern.
+    #[must_use]
+    pub fn call_generic_raw(
+        &self,
+        ctx: *mut core::ffi::c_void,
+        args: &[crate::nanbox::NanBox],
+    ) -> Option<u64> {
+        if args.len() != self.n_params {
+            return None;
+        }
+        let bits: Vec<u64> = args.iter().map(|a| a.to_bits()).collect();
+        Some(self.func.call_generic(ctx, bits.as_ptr(), bits.len()))
     }
 }
 
@@ -2334,6 +2522,64 @@ impl X64Assembler {
     /// `add rsp, imm8`.
     pub fn add_rsp_imm8(&mut self, imm: u8) {
         self.code.extend_from_slice(&[0x48, 0x83, 0xc4, imm]);
+    }
+
+    // --- generic (NanBox) tier: `extern "C" fn(ctx, args, n) -> u64` ---
+    //
+    // The entry pins `ctx` (rdi) in the callee-saved `r15`, homes the NanBox
+    // register file in rbp-relative slots, and calls runtime helpers via the
+    // System V integer ABI. These emit the extra instructions that convention
+    // needs; the value-arithmetic reuses the SSE2/GPR helpers above.
+
+    /// `push rbp; mov rbp, rsp; push r15; sub rsp, frame` — the generic-tier
+    /// prologue. `r15` (callee-saved) is preserved so it can pin `ctx` across the
+    /// body; `frame` must be chosen so `rsp` is 16-byte aligned before any `call`
+    /// (see [`JitFunction::compile_generic`]).
+    pub fn generic_prologue(&mut self, frame: u32) {
+        self.code.push(0x55); // push rbp
+        self.code.extend_from_slice(&[0x48, 0x89, 0xe5]); // mov rbp, rsp
+        self.code.extend_from_slice(&[0x41, 0x57]); // push r15
+        self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
+        self.code.extend_from_slice(&frame.to_le_bytes());
+    }
+
+    /// `lea rsp, [rbp-8]; pop r15; pop rbp; ret` — the generic-tier epilogue
+    /// (restores the pinned `r15` and unwinds; the result is already in `rax`).
+    pub fn generic_epilogue(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x8d, 0x65, 0xf8]); // lea rsp, [rbp-8]
+        self.code.extend_from_slice(&[0x41, 0x5f]); // pop r15
+        self.code.push(0x5d); // pop rbp
+        self.code.push(0xc3); // ret
+    }
+
+    /// `mov r15, rdi` — pin the `ctx` argument in the callee-saved register.
+    pub fn mov_r15_rdi(&mut self) {
+        self.code.extend_from_slice(&[0x49, 0x89, 0xff]);
+    }
+
+    /// `mov rdi, r15` — reload the pinned `ctx` into the first argument register
+    /// ahead of a helper `call`.
+    pub fn mov_rdi_r15(&mut self) {
+        self.code.extend_from_slice(&[0x4c, 0x89, 0xff]);
+    }
+
+    /// `mov rax, [rsi + disp32]` — load an incoming argument from the `args`
+    /// pointer (which arrives in `rsi`), for the generic-tier `Arg` op.
+    pub fn mov_rax_rsi_disp(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x48, 0x8b, 0x86]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `and rax, r11` — mask a NanBox word by the quiet-NaN pattern held in `r11`
+    /// (the generic-tier `is_number` tag test).
+    pub fn and_rax_r11(&mut self) {
+        self.code.extend_from_slice(&[0x4c, 0x21, 0xd8]);
+    }
+
+    /// `ucomisd xmm0, xmm0` — unordered self-compare (sets PF iff `xmm0` is NaN),
+    /// used to canonicalize a NaN sum before reboxing it as a `NanBox`.
+    pub fn ucomisd_xmm0_xmm0(&mut self) {
+        self.code.extend_from_slice(&[0x66, 0x0f, 0x2e, 0xc0]);
     }
 }
 
@@ -2948,11 +3194,164 @@ impl JitFunction {
         Self::from_code(&a.finish())
     }
 
+    /// Compiles a straight-line [`GenericOp`] program (the **generic NanBox
+    /// tier**, `JIT_DESIGN.md` Pass 1) to an
+    /// `extern "C" fn(ctx: *mut c_void, args: *const u64, n: usize) -> u64`.
+    ///
+    /// The entry pins `ctx` in the callee-saved `r15`, homes each of `n_regs`
+    /// NanBox registers in an rbp-relative slot, and for a generic `Add` emits an
+    /// inline both-numbers fast path (tag-test the NaN-box bits, `addsd`, rebox)
+    /// plus a System-V slow-path `call` to `add_helper` (the runtime `+`). A
+    /// helper that throws returns the [`NanBox::jit_throw_bits`] sentinel, on
+    /// which this jumps to an epilogue that returns the sentinel unchanged so the
+    /// caller reads `ctx.jit_pending`. Returns `None` on the unavailable target
+    /// or a malformed program.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub fn compile_generic(
+        n_regs: usize,
+        n_params: usize,
+        ops: &[GenericOp],
+        add_helper: u64,
+    ) -> Option<Self> {
+        use crate::nanbox::NanBox;
+        if n_regs > 64 || n_params > 32 {
+            return None;
+        }
+        // `is_number(bits) == (bits & QNAN) != QNAN`.
+        const QNAN: u64 = 0x7ffc_0000_0000_0000;
+        // The canonical quiet NaN a `NanBox` normalizes every NaN to, so a NaN sum
+        // reboxes bit-identically to the interpreter's `NanBox::number`.
+        let canonical_nan = NanBox::number(f64::NAN).to_bits();
+        // Register slot `r` at `[rbp - (r+2)*8]`: `[rbp-8]` holds the saved r15,
+        // the register file lives below it.
+        let disp = |r: u8| -((i32::from(r) + 2) * 8);
+        // Reserve n_regs NanBox slots; the extra 8 makes `rsp` 16-byte aligned for
+        // calls (after `push rbp; push r15`, rsp ≡ 8 mod 16, so an ≡8-mod-16 frame
+        // restores alignment).
+        let frame = (((n_regs as u32) * 8 + 15) & !15) + 8;
+        let mut a = X64Assembler::new();
+        let throw_exit = a.new_label();
+        a.generic_prologue(frame);
+        a.mov_r15_rdi(); // pin ctx in r15 (args ptr stays in rsi for the Arg loads)
+        // Zero every register slot (defense in depth behind the def-use check).
+        a.zero_rax();
+        for r in 0..n_regs {
+            a.store_rax(disp(u8::try_from(r).ok()?));
+        }
+        let ok = |r: u8| (r as usize) < n_regs;
+        let mut has_ret = false;
+        for op in ops {
+            match *op {
+                GenericOp::Arg { dst, index } => {
+                    if !ok(dst) || index as usize >= n_params {
+                        return None;
+                    }
+                    // args arrive in rsi; load args[index] (a NanBox word).
+                    a.mov_rax_rsi_disp(i32::from(index) * 8);
+                    a.store_rax(disp(dst));
+                }
+                GenericOp::Const { dst, imm } => {
+                    if !ok(dst) {
+                        return None;
+                    }
+                    a.movabs_rax(imm as i64);
+                    a.store_rax(disp(dst));
+                }
+                GenericOp::Move { dst, src } => {
+                    if !ok(dst) || !ok(src) {
+                        return None;
+                    }
+                    a.load_rax(disp(src));
+                    a.store_rax(disp(dst));
+                }
+                GenericOp::Add { dst, a: ra, b: rb } => {
+                    if !ok(dst) || !ok(ra) || !ok(rb) {
+                        return None;
+                    }
+                    let slow = a.new_label();
+                    let nan_fix = a.new_label();
+                    let done = a.new_label();
+                    // Fast path: both operands must be numbers (is_number tag test).
+                    a.movabs_r11(QNAN as i64);
+                    a.load_rax(disp(ra));
+                    a.and_rax_r11();
+                    a.cmp_rax_r11();
+                    a.je(slow); // ra is boxed → slow
+                    a.load_rax(disp(rb));
+                    a.and_rax_r11();
+                    a.cmp_rax_r11();
+                    a.je(slow); // rb is boxed → slow
+                    // Both numbers: a `NanBox` number stores the f64 bits directly.
+                    a.movsd_xmm0_mem(disp(ra));
+                    a.fbin_xmm0_mem(FBinOp::Add, disp(rb)); // addsd xmm0, [rb]
+                    // Canonicalize a NaN result before reboxing.
+                    a.ucomisd_xmm0_xmm0();
+                    a.jp(nan_fix);
+                    a.movsd_mem_xmm0(disp(dst));
+                    a.jmp(done);
+                    a.bind(nan_fix);
+                    a.movabs_rax(canonical_nan as i64);
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                    // Slow path: jit_helper_add(ctx, a, b). The frame is 16-byte
+                    // aligned here, and every live value is in a memory slot (the
+                    // register file), so no caller-saved GPR needs preserving; only
+                    // r15 (ctx) must survive, and it is callee-saved by the helper.
+                    a.bind(slow);
+                    a.mov_rdi_r15(); // rdi = ctx
+                    a.load_argreg(1, disp(ra)); // rsi = a
+                    a.load_argreg(2, disp(rb)); // rdx = b
+                    a.movabs_rax(add_helper as i64);
+                    a.call_rax();
+                    // Throw sentinel → propagate (return it; caller reads jit_pending).
+                    a.movabs_r11(NanBox::jit_throw_bits() as i64);
+                    a.cmp_rax_r11();
+                    a.je(throw_exit);
+                    a.store_rax(disp(dst));
+                    a.bind(done);
+                }
+                GenericOp::Ret { src } => {
+                    if !ok(src) {
+                        return None;
+                    }
+                    a.load_rax(disp(src));
+                    a.generic_epilogue();
+                    has_ret = true;
+                    // Do NOT break: this tier is straight-line, but keep the shape
+                    // uniform with the other compilers (later ops may be targets).
+                }
+            }
+        }
+        if !has_ret {
+            return None;
+        }
+        // Throw/deopt exit: reload the sentinel into rax (a slow-path `je` lands
+        // here) and return it, so the caller sees the pending exception.
+        a.bind(throw_exit);
+        a.movabs_rax(NanBox::jit_throw_bits() as i64);
+        a.generic_epilogue();
+        Self::from_code(&a.finish())
+    }
+
     /// Wraps already-emitted machine `code` into a callable region (the entry
     /// point for hand-assembled functions, e.g. one that calls another).
     #[must_use]
     pub fn from_machine_code(code: &[u8]) -> Option<Self> {
         Self::from_code(code)
+    }
+
+    /// Invokes a generic-tier body: `extern "C" fn(ctx, args, n) -> u64`.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub fn call_generic(&self, ctx: *mut core::ffi::c_void, args: *const u64, n: usize) -> u64 {
+        // SAFETY: `buf` holds verified, self-emitted machine code following the
+        // System V ABI for this signature; `ctx`/`args` are valid for the call
+        // (the caller guarantees a live `Ctx` and an `n`-long args buffer).
+        #[allow(unsafe_code)]
+        let f: extern "C" fn(*mut core::ffi::c_void, *const u64, usize) -> u64 =
+            unsafe { core::mem::transmute(self.buf.ptr()) };
+        f(ctx, args, n)
     }
 
     /// The executable entry address of this function — the target a *caller's*
