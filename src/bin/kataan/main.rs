@@ -79,6 +79,18 @@ fn run_main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Run through the new-representation engine *with the §4.1 host runtime*
+        // (timers / event loop): after the top-level script completes, drive the
+        // event loop so `setTimeout`/`setInterval`/`process.nextTick` work runs
+        // before the process exits.
+        ["hostrun", "-e", source] => run_host(source, "<argv>"),
+        ["hostrun", path] => match std::fs::read_to_string(path) {
+            Ok(source) => run_host(&source, path),
+            Err(e) => {
+                eprintln!("kataan: cannot read {path}: {e}");
+                ExitCode::FAILURE
+            }
+        },
         ["repl"] => run_repl(),
         _ => {
             eprintln!("kataan: unrecognized arguments: {}", args.join(" "));
@@ -225,6 +237,46 @@ fn run_bytecode(bytes: &[u8], origin: &str) -> ExitCode {
 /// Runs a read-eval-print loop on the new-representation tree-walker
 /// (`nbexec::Interp`), which carries its own `console` and persists globals
 /// across lines. Each line's AST is leaked to `&'static` so values the
+/// Evaluates `source` on the new-representation interpreter with the §4.1 host
+/// runtime installed, then drives [`kataan::host::timers::run_event_loop`] so
+/// timer- and `nextTick`-scheduled callbacks run before returning. Prints any
+/// `console` output and a non-empty completion value.
+fn run_host(source: &str, origin: &str) -> ExitCode {
+    let program = match Parser::parse_program(source) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kataan: {origin}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Leak the AST so its `&'static` borrow outlives values kept in globals
+    // (timer callbacks pinned across the event loop).
+    let program: &'static kataan::ast::Program = Box::leak(Box::new(program));
+    let mut interp: kataan::nbexec::Interp<'static> = kataan::nbexec::Interp::new();
+    kataan::host::timers::install(&mut interp);
+
+    let completion = match interp.run(program) {
+        Ok(value) => value,
+        Err(e) => {
+            print!("{}", interp.output());
+            eprintln!("kataan: {origin}: uncaught {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Drain timers / microtasks / nextTick queue to quiescence.
+    if let Err(e) = kataan::host::timers::run_event_loop(&mut interp) {
+        print!("{}", interp.output());
+        eprintln!("kataan: {origin}: uncaught {e:?}");
+        return ExitCode::FAILURE;
+    }
+    print!("{}", interp.output());
+    let disp = interp.display(completion);
+    if !disp.is_empty() && disp != "undefined" {
+        println!("{disp}");
+    }
+    ExitCode::SUCCESS
+}
+
 /// persistent interpreter keeps in its globals can reference it.
 fn run_repl() -> ExitCode {
     use std::io::{self, BufRead, Write};
@@ -297,6 +349,8 @@ fn print_usage() {
          kataan run <FILE.ktbc>    run a compiled bytecode artifact\n    \
          kataan nbrun <FILE>       alias for `run` (the new-representation engine)\n    \
          kataan nbrun -e <SOURCE>  run a source string on the new engine\n    \
+         kataan hostrun <FILE>     run with the host runtime (timers / event loop)\n    \
+         kataan hostrun -e <SRC>   run a source string with the host event loop\n    \
          kataan --version          print the version\n    \
          kataan --help             show this help\n\
          \n\
