@@ -96,3 +96,25 @@ first build-out; leave the x86-64 template assembler in place.
 - `cargo test --lib` green; `KATAAN_TEST262_FILTER` smoke on affected areas green.
 - `cargo build --no-default-features --features alloc` still compiles (JIT is
   `feature="jit"` + linux/x86_64 gated; the generic tier must stay behind those cfgs).
+
+---
+
+## STATUS (Passes 1-5 landed, 2026-07-08)
+
+Generic value tier compiles: `Arg`/`Const`/`Move`/`Return`, `+`/`-`/`*`/`/`/`%`,
+comparisons (`<`/`==`/`===`/`!=`/`!==`/`**`/bitwise/shifts), `Not`, control flow
+(`Jump`/`JumpIfFalse`, forward+backward → loops), `GetProp`/`SetProp`, `Call`/
+`CallNative`, `GetKey`/`SetKey`/`ArrayLen`. Value ops keep an inline both-numbers fast
+path; the rest take a shared `vm_*` interpreter helper (so tiers can't diverge). 36
+differential tests. lib 866 / jit 948 green; no_std compiles; corpus green.
+
+Still bails whole-function: numeric-narrowed `Op::Add` (Int/Float tiers own it), `Neg`/
+`BitNot`/`TypeOf`/`InstanceOf`/`HasProp`/`DeleteProp`, iterator/enum ops, object/array/
+class construction, accessor definition, spread, `CallCtor`/`CallValue`/tail, generators/
+async, closures with captures, `rest_from`, `n_regs>64`/`n_params>32`.
+
+**Pass 6 (the remainder):** inline machine-code shape/dense-element guards (blocked on a
+`repr(C)` heap/`Object` layout — every fast path is helper-routed until then), generalized
+guard-failure deopt + OSR, an ABI-tagged registry for direct generic JIT→JIT calls, and
+the Cranelift-style shared backend + aarch64. These are the "make it fast + portable"
+layer; op-coverage + correctness are done.

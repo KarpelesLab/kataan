@@ -130,7 +130,21 @@ The rest of this document is the gap between that base and "complete."
 These make Kataan more than a fast interpreter. They are *engine* capabilities
 (beyond what Node/Bun expose) and largely independent of the §3 conformance tail.
 
-### 2.1 Complete the machine-code JIT (the *whole* VM, not just numbers)
+### 2.1 Complete the machine-code JIT (the *whole* VM, not just numbers) — **generic tier landed**
+
+> **Status (generic value tier, Passes 1-5):** a NanBox-value JIT tier now compiles
+> non-numeric hot functions — generic `+`/`-`/`*`/`/`/`%`, comparisons (`<`/`==`/`===`/
+> bitwise/shifts), control flow (loops + branches), property access (`GetProp`/`SetProp`),
+> calls (`Call`/`CallNative`), and computed element access (`arr[i]`/`.length`) — by
+> re-entering the interpreter through runtime helpers over a `*mut Ctx` calling
+> convention, with number-fast-paths inline. Exceptions propagate via a `TAG_JIT_THROW`
+> sentinel + `jit_pending`; every op shares one `vm_*` implementation with the interpreter
+> so the tiers cannot diverge, proven by 36 differential tests (JIT-forced === interpreter,
+> incl. exact-once side effects + identical throws). GC-safe by construction today (GC is
+> not mid-execution-triggered); a `jit_shadow` root hook is wired for a future allocation-
+> triggered GC. **Remaining = the optimization/portability layer** (below): inline
+> machine-code shape/element guards (need a `repr(C)` heap layout), generalized deopt/OSR,
+> and the shared backend + aarch64. See `JIT_DESIGN.md`.
 
 Today the JIT compiles integer/float numeric functions and bails to the
 interpreter for everything else. "Complete" means hot functions JIT regardless of
