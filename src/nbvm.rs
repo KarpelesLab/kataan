@@ -417,6 +417,14 @@ struct Ctx<'a> {
     /// `Err(VmError::Thrown(..))`. `None` between helper faults.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     jit_pending: Option<NanBox>,
+    /// An in-flight non-throw fault (or thrown value) stashed by a generic-JIT
+    /// property helper ([`jit_helper_get_prop`]/[`jit_helper_set_prop`]). Unlike
+    /// `jit_pending` (which only carries a thrown `NanBox` for `+`), this carries a
+    /// full [`VmError`], so a `VmError::Unsupported` from `vm_set_prop` (a
+    /// descriptor-aware case the tree-walker owns) propagates out of the JIT
+    /// exactly as it would from the interpreter. `None` between helper faults.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    jit_pending_fault: Option<VmError>,
     /// The function table the currently-running generic-JIT body belongs to, as a
     /// raw pointer so a runtime helper (which only receives `ctx`) can reconstruct
     /// `&[FnProto]` to re-enter the interpreter (e.g. to run a user `valueOf`). Set
@@ -468,6 +476,8 @@ pub fn run_program(
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_pending: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_pending_fault: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_funcs: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_shadow: alloc::vec::Vec::new(),
@@ -497,6 +507,8 @@ pub fn run_program_capturing(
         jit_cache: alloc::collections::BTreeMap::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_pending: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_pending_fault: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_funcs: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -708,11 +720,12 @@ fn ensure_jit(
     }
     stack.remove(&id);
     // Prefer the Int/Float tiers; fall back to the generic (NanBox) tier for a
-    // function they reject but that is generic-eligible (only param/const loads,
-    // `+`, `Move`, `Return`) — e.g. a 7+-parameter add. The generic tier re-enters
-    // the interpreter for non-numeric operands via `jit_helper_add`.
+    // function they reject but that is generic-eligible (param/const loads, `+`,
+    // `Move`, plain property get/set, `Return`) — e.g. a 7+-parameter add or an
+    // `obj.key` accessor. The generic tier re-enters the interpreter for
+    // non-numeric operands and all property access via the runtime helpers.
     let compiled = crate::jit::JitProto::compile_with_registry(&funcs[id], &registry)
-        .or_else(|| crate::jit::JitProto::compile_generic(&funcs[id], jit_helper_add))
+        .or_else(|| crate::jit::JitProto::compile_generic(&funcs[id], &jit_generic_helpers()))
         .map(alloc::rc::Rc::new);
     cache.insert(id, compiled.clone());
     compiled
@@ -767,6 +780,8 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         jit_cache: alloc::collections::BTreeMap::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_pending: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_pending_fault: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_funcs: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -917,6 +932,362 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
     Ok(ctx.realm.add(x, y))
 }
 
+/// The interpreter's real property **get** for a static string key
+/// (`Op::GetProp`'s semantics), factored out so the bytecode VM **and** the
+/// generic-JIT runtime helper ([`jit_helper_get_prop`]) share one code path and
+/// can never diverge: a VM function's synthetic `name`/`prototype`, RegExp
+/// introspection members, the monomorphic inline-cache slot load, an own or
+/// inherited accessor (its getter runs exactly once, with `recv` as `this`), and
+/// the `[[Prototype]]` walk. `cache` is the per-site inline cache: the same
+/// `PropertyCache` fed by the interpreter's per-pc IC and by the JIT's per-site
+/// IC, so a monomorphic site takes the shape-pointer-compare + slot-load fast
+/// path in both tiers.
+fn vm_get_prop(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: &str,
+    cache: &mut PropertyCache,
+) -> Result<NanBox, VmError> {
+    match recv.as_handle().map(Handle::from_raw) {
+        None => {
+            use crate::nanbox::Unpacked;
+            match recv.unpack() {
+                // Property access on null/undefined throws a TypeError.
+                Unpacked::Null | Unpacked::Undefined => {
+                    let what = if matches!(recv.unpack(), Unpacked::Null) {
+                        "null"
+                    } else {
+                        "undefined"
+                    };
+                    let e = make_error(
+                        ctx.realm,
+                        "TypeError",
+                        &alloc::format!("Cannot read properties of {what} (reading '{key}')"),
+                    );
+                    Err(VmError::Thrown(e))
+                }
+                // Other primitives: a missing property reads `undefined`.
+                _ => Ok(NanBox::undefined()),
+            }
+        }
+        Some(handle) => {
+            // A VM function's `.name` comes from its proto (the closure is a tagged
+            // array whose element 0 is the function id).
+            if key == "name"
+                && ctx.realm.is_vm_function(handle)
+                && !ctx.realm.has_own(handle, "name")
+            {
+                let nm = ctx
+                    .realm
+                    .get_element(handle, 0)
+                    .as_number()
+                    .and_then(|f| funcs.get(f as usize))
+                    .map_or("", |p| p.name.as_str());
+                let s = ctx.realm.new_string(nm);
+                return Ok(NanBox::handle(s.to_raw()));
+            }
+            // A VM function's `.prototype` is a lazily-created object (keyed by
+            // function id, with a `constructor` back-link).
+            if key == "prototype"
+                && ctx.realm.is_vm_function(handle)
+                && !ctx.realm.has_own(handle, "prototype")
+                && let Some(func_id) = ctx
+                    .realm
+                    .get_element(handle, 0)
+                    .as_number()
+                    .map(|f| f as u32)
+            {
+                let proto = ctx.realm.function_prototype(func_id);
+                return Ok(NanBox::handle(proto.to_raw()));
+            }
+            // RegExp introspection properties. The (allocating) `regexp_at` probe
+            // is gated on the key first, so a plain `obj.foo` read on a non-regexp
+            // pays nothing here.
+            let mut done = true;
+            let mut result = NanBox::undefined();
+            if is_regexp_introspection_key(key)
+                && let Some((src, flags)) = ctx.realm.regexp_at(handle)
+            {
+                match key {
+                    "source" => {
+                        let s = ctx.realm.new_string(&src);
+                        result = NanBox::handle(s.to_raw());
+                    }
+                    "flags" => {
+                        let s = ctx.realm.new_string(&flags);
+                        result = NanBox::handle(s.to_raw());
+                    }
+                    "global" => result = NanBox::boolean(flags.contains('g')),
+                    "ignoreCase" => result = NanBox::boolean(flags.contains('i')),
+                    "multiline" => result = NanBox::boolean(flags.contains('m')),
+                    "sticky" => result = NanBox::boolean(flags.contains('y')),
+                    "dotAll" => result = NanBox::boolean(flags.contains('s')),
+                    "unicode" => result = NanBox::boolean(flags.contains('u')),
+                    "hasIndices" => result = NanBox::boolean(flags.contains('d')),
+                    "lastIndex" => {
+                        // An aux own slot (a non-canonical value such as an object,
+                        // or a `defineProperty` descriptor) shadows the compact cell.
+                        if ctx.realm.has_own(handle, "lastIndex") {
+                            done = false;
+                        } else {
+                            result = NanBox::number(ctx.realm.regex_last_index(handle) as f64);
+                        }
+                    }
+                    _ => done = false,
+                }
+            } else {
+                done = false;
+            }
+            if done {
+                return Ok(result);
+            }
+            // Inline-cache fast path: a plain own data property on the receiver's
+            // shape resolves via a shape-pointer compare + slot load.
+            if let Some(v) = ctx.realm.object_cached_get(handle, key, cache) {
+                Ok(v)
+            } else if let Some((getter, _)) = ctx.realm.accessor(handle, key)
+                && getter.as_handle().is_some()
+            {
+                // An own getter accessor takes precedence over a data slot.
+                call_closure(ctx, funcs, getter, &[], recv)
+            } else if ctx.realm.has_own(handle, key) {
+                Ok(ctx
+                    .realm
+                    .get_property(handle, key)
+                    .unwrap_or(NanBox::undefined()))
+            } else {
+                // Walk the `[[Prototype]]` chain for an inherited accessor or data
+                // property (receiver stays `recv`).
+                let mut found = NanBox::undefined();
+                let mut cur = ctx.realm.object_proto(handle);
+                while let Some(p) = cur {
+                    if let Some((getter, _)) = ctx.realm.accessor(p, key) {
+                        if getter.as_handle().is_some() {
+                            found = call_closure(ctx, funcs, getter, &[], recv)?;
+                        }
+                        break;
+                    }
+                    if ctx.realm.has_own(p, key) {
+                        found = ctx
+                            .realm
+                            .get_property(p, key)
+                            .unwrap_or(NanBox::undefined());
+                        break;
+                    }
+                    cur = ctx.realm.object_proto(p);
+                }
+                Ok(found)
+            }
+        }
+    }
+}
+
+/// The interpreter's real property **set** for a static string key
+/// (`Op::SetProp`'s semantics), factored out so the bytecode VM **and** the
+/// generic-JIT runtime helper ([`jit_helper_set_prop`]) share one code path and
+/// can never diverge: `regex.lastIndex`, `arr.length` resize, a canonical array
+/// index, an own or inherited setter accessor (its setter runs exactly once, with
+/// `recv` as `this`), and the monomorphic inline-cache in-place write. Returns
+/// `Err(VmError::Unsupported)` for the descriptor-aware cases the tree-walker owns
+/// (a non-writable `length`, a demoted/frozen array index) — the same fault the
+/// interpreter raises to fall back.
+fn vm_set_prop(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: &str,
+    value: NanBox,
+    cache: &mut PropertyCache,
+) -> Result<(), VmError> {
+    let handle = recv
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    // `regex.lastIndex = v` updates the stateful search position.
+    if key == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
+        set_regex_last_index_value(ctx.realm, handle, value);
+        return Ok(());
+    }
+    // `arr.length = n` resizes the array (truncate/pad).
+    if key == "length" && ctx.realm.is_array(handle) {
+        if let Some(n) = ctx.realm.array_length_uint32(value) {
+            if ctx
+                .realm
+                .array_length_set_needs_slow_path(handle, n as usize)
+            {
+                return Err(VmError::Unsupported);
+            }
+            ctx.realm.set_array_length(handle, n as usize);
+        } else {
+            let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+            return Err(VmError::Thrown(e));
+        }
+        return Ok(());
+    }
+    // A canonical numeric string key on an array addresses element storage.
+    if ctx.realm.is_array(handle)
+        && let Ok(i) = key.parse::<usize>()
+        && alloc::format!("{i}") == key
+        && (i as u64) < u64::from(u32::MAX)
+    {
+        if i >= ctx.realm.limits.max_array_len {
+            let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+            return Err(VmError::Thrown(e));
+        }
+        if ctx.realm.array_index_has_override(handle, i) {
+            return Err(VmError::Unsupported);
+        }
+        ctx.realm.set_element(handle, i, value);
+        return Ok(());
+    }
+    // A setter accessor (own or inherited) takes precedence over a data slot. An
+    // inherited accessor only applies when the receiver has no own property of
+    // that name (an own data property shadows).
+    let own_accessor = ctx.realm.accessor(handle, key);
+    let chain_accessor = if own_accessor.is_some() || ctx.realm.has_own(handle, key) {
+        own_accessor
+    } else {
+        let mut acc = None;
+        let mut cur = ctx.realm.object_proto(handle);
+        while let Some(p) = cur {
+            if let Some(a) = ctx.realm.accessor(p, key) {
+                acc = Some(a);
+                break;
+            }
+            if ctx.realm.has_own(p, key) {
+                break; // an inherited data property — ordinary set on receiver
+            }
+            cur = ctx.realm.object_proto(p);
+        }
+        acc
+    };
+    match chain_accessor {
+        Some((getter, setter)) if setter.as_handle().is_some() => {
+            call_closure(ctx, funcs, setter, &[value], recv)?;
+            let _ = getter;
+        }
+        Some((getter, _)) if getter.as_handle().is_some() => {
+            // Accessor with a getter but no setter: the write is a no-op (sloppy).
+        }
+        _ => {
+            // Inline-cache fast path: an in-place write to an existing own data
+            // property on the receiver's shape (no transition). A new property, a
+            // dictionary object, or a frozen/read-only target misses and falls to
+            // `set_property`.
+            if !ctx.realm.object_cached_set(handle, key, value, cache) {
+                ctx.realm.set_property(handle, key, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The generic-JIT runtime helper for a property **get**. Reconstructs `&mut Ctx`
+/// and the running function table from the opaque pointers, runs the shared
+/// [`vm_get_prop`] through the site's persistent inline cache, and returns the
+/// result's `NanBox` bits — or, on any fault, stashes it in `ctx.jit_pending_fault`
+/// and returns the reserved throw/deopt sentinel ([`NanBox::jit_throw_bits`]).
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the dispatcher passed (with `ctx.jit_funcs` set);
+/// `key_ptr`/`key_len` a valid UTF-8 slice owned by the calling `JitProto`; and
+/// `cache` that site's `PropertyCache` (also owned by the `JitProto`), with no
+/// other live borrow of it during the call.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_get_prop(
+    ctx: *mut core::ffi::c_void,
+    obj: u64,
+    key_ptr: *const u8,
+    key_len: usize,
+    cache: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: single-threaded reentrancy — the native caller holds no live
+    // `&mut Ctx` while this runs (see `jit_helper_add`).
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    // SAFETY: the JIT emitted `key_ptr`/`key_len` from a `Box<str>` it owns for the
+    // lifetime of the code; the bytes are valid UTF-8 and live for this call.
+    #[allow(unsafe_code)]
+    let key =
+        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(key_ptr, key_len)) };
+    // SAFETY: `cache` is this site's `PropertyCache`, owned by the `JitProto`; no
+    // other reference to it is live while the native body runs.
+    #[allow(unsafe_code)]
+    let cache = unsafe { &mut *(cache as *mut PropertyCache) };
+    match vm_get_prop(ctx, funcs, NanBox::from_bits(obj), key, cache) {
+        Ok(v) => v.to_bits(),
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// The generic-JIT runtime helper for a property **set**. Mirrors
+/// [`jit_helper_get_prop`], running the shared [`vm_set_prop`]; returns
+/// `undefined`'s bits on success, or the throw/deopt sentinel (with the fault in
+/// `ctx.jit_pending_fault`) otherwise.
+///
+/// # Safety
+/// As [`jit_helper_get_prop`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_set_prop(
+    ctx: *mut core::ffi::c_void,
+    obj: u64,
+    key_ptr: *const u8,
+    key_len: usize,
+    cache: *mut core::ffi::c_void,
+    val: u64,
+) -> u64 {
+    // SAFETY: see `jit_helper_get_prop`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    #[allow(unsafe_code)]
+    let key =
+        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(key_ptr, key_len)) };
+    #[allow(unsafe_code)]
+    let cache = unsafe { &mut *(cache as *mut PropertyCache) };
+    match vm_set_prop(
+        ctx,
+        funcs,
+        NanBox::from_bits(obj),
+        key,
+        NanBox::from_bits(val),
+        cache,
+    ) {
+        Ok(()) => NanBox::undefined().to_bits(),
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// The generic-tier runtime-helper table (`+`, property get/set), passed to
+/// [`crate::jit::JitProto::compile_generic`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn jit_generic_helpers() -> crate::jit::GenericHelpers {
+    crate::jit::GenericHelpers {
+        add: jit_helper_add,
+        get: jit_helper_get_prop,
+        set: jit_helper_set_prop,
+    }
+}
+
 /// The generic-JIT runtime helper for `+`: the slow path the native code calls
 /// when an operand isn't a number. Reconstructs `&mut Ctx` from the opaque
 /// pointer, runs the shared [`vm_add`], and either returns the result's `NanBox`
@@ -962,8 +1333,10 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
 /// Invokes a generic-tier native body and translates its raw return into the
 /// interpreter's `Result`. `None` on a pre-call arity deopt (the caller then
 /// falls through to the interpreter); otherwise `Ok(value)`, or — when the body
-/// returns the throw sentinel — `Err(Thrown(v))` with `v` taken from
-/// `ctx.jit_pending`. Setting `ctx.jit_funcs` here lets the helper re-enter the
+/// returns the throw/deopt sentinel — `Err(..)`. A property helper stashes a full
+/// [`VmError`] in `ctx.jit_pending_fault` (so a non-throw `Unsupported` propagates
+/// as the interpreter would); the `+` helper stashes a thrown `NanBox` in
+/// `ctx.jit_pending`. Setting `ctx.jit_funcs` here lets the helpers re-enter the
 /// interpreter with the correct function table.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 fn call_generic(
@@ -977,11 +1350,18 @@ fn call_generic(
     let raw = jit.call_generic_raw(ctx_ptr, args)?;
     let nb = NanBox::from_bits(raw);
     if nb.is_jit_throw_sentinel() {
-        let v = ctx
-            .jit_pending
+        let err = ctx
+            .jit_pending_fault
             .take()
-            .unwrap_or_else(|| make_error(ctx.realm, "Error", "JIT throw without pending value"));
-        Some(Err(VmError::Thrown(v)))
+            .or_else(|| ctx.jit_pending.take().map(VmError::Thrown))
+            .unwrap_or_else(|| {
+                VmError::Thrown(make_error(
+                    ctx.realm,
+                    "Error",
+                    "JIT throw without pending value",
+                ))
+            });
+        Some(Err(err))
     } else {
         Some(Ok(nb))
     }
@@ -2095,107 +2475,15 @@ fn run_frame(
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::SetProp { obj, key, src } => {
-                let handle = object_handle(regs[*obj as usize])?;
                 let recv = regs[*obj as usize];
-                // `regex.lastIndex = v` updates the stateful search position.
-                // `lastIndex` is an ordinary data property that may hold *any* value
-                // (it is only `ToLength`'d at `exec` time); a canonical non-negative
-                // integer is stored compactly in the cell field, any other value
-                // (an object with a `valueOf`, a non-integer, a string, …) is kept
-                // verbatim in an aux data slot so a later read returns it unchanged.
-                if key.as_str() == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
-                    let v = regs[*src as usize];
-                    set_regex_last_index_value(ctx.realm, handle, v);
-                    continue;
-                }
-                // `arr.length = n` resizes the array (truncate/pad). `ToUint32(v)`
-                // must equal `ToNumber(v)` (so `-1`, `4294967296`, `1.5`, `NaN`
-                // are catchable `RangeError`s).
-                if key.as_str() == "length" && ctx.realm.is_array(handle) {
-                    let v = regs[*src as usize];
-                    if let Some(n) = ctx.realm.array_length_uint32(v) {
-                        // A non-writable `length`, or a shrink that would hit a
-                        // non-configurable index, needs the descriptor-aware /
-                        // strict-aware tree-walker (ArraySetLength). Fault to it.
-                        if ctx
-                            .realm
-                            .array_length_set_needs_slow_path(handle, n as usize)
-                        {
-                            return Err(VmError::Unsupported);
-                        }
-                        ctx.realm.set_array_length(handle, n as usize);
-                    } else {
-                        let e = make_error(ctx.realm, "RangeError", "Invalid array length");
-                        handle_throw!(VmError::Thrown(e));
-                    }
-                    continue;
-                }
-                // A canonical numeric string key on an array (`arr["0"] = v` lowered
-                // to a static SetProp) addresses element storage. A demoted/accessor
-                // index (or frozen/sealed array) faults to the descriptor-aware
-                // tree-walker; a plain index writes the element directly.
-                if ctx.realm.is_array(handle)
-                    && let Ok(i) = key.as_str().parse::<usize>()
-                    && alloc::format!("{i}") == key.as_str()
-                    && (i as u64) < u64::from(u32::MAX)
-                {
-                    if i >= ctx.realm.limits.max_array_len {
-                        let e = make_error(ctx.realm, "RangeError", "Invalid array length");
-                        handle_throw!(VmError::Thrown(e));
-                    }
-                    if ctx.realm.array_index_has_override(handle, i) {
-                        return Err(VmError::Unsupported);
-                    }
-                    ctx.realm.set_element(handle, i, regs[*src as usize]);
-                    continue;
-                }
-                // A setter accessor (own or inherited) takes precedence over a
-                // data slot. An *inherited* accessor only applies when the receiver
-                // has no own property of that name (an own data property shadows).
-                let own_accessor = ctx.realm.accessor(handle, key);
-                let chain_accessor = if own_accessor.is_some() || ctx.realm.has_own(handle, key) {
-                    own_accessor
-                } else {
-                    let mut acc = None;
-                    let mut cur = ctx.realm.object_proto(handle);
-                    while let Some(p) = cur {
-                        if let Some(a) = ctx.realm.accessor(p, key) {
-                            acc = Some(a);
-                            break;
-                        }
-                        if ctx.realm.has_own(p, key) {
-                            break; // an inherited data property — ordinary set on receiver
-                        }
-                        cur = ctx.realm.object_proto(p);
-                    }
-                    acc
-                };
-                match chain_accessor {
-                    Some((getter, setter)) if setter.as_handle().is_some() => {
-                        if let Err(e) =
-                            call_closure(ctx, funcs, setter, &[regs[*src as usize]], recv)
-                        {
-                            handle_throw!(e);
-                        }
-                        // A getter-only accessor (setter present case handled above).
-                        let _ = getter;
-                    }
-                    Some((getter, _)) if getter.as_handle().is_some() => {
-                        // Accessor with a getter but no setter: the write is a no-op
-                        // (sloppy) — do not create a shadowing data property.
-                    }
-                    _ => {
-                        let value = regs[*src as usize];
-                        // Inline-cache fast path: an in-place write to an existing
-                        // own data property on the receiver's shape (no transition,
-                        // so the cache stays valid). A new property, a dictionary
-                        // object, or a frozen/read-only target misses and falls to
-                        // `set_property`, which adds/transitions as needed.
-                        let cache = site_cache!(site);
-                        if !ctx.realm.object_cached_set(handle, key, value, cache) {
-                            ctx.realm.set_property(handle, key, value);
-                        }
-                    }
+                let value = regs[*src as usize];
+                let cache = site_cache!(site);
+                // Shared with the generic-JIT helper via `vm_set_prop` so the two
+                // tiers can never diverge (regex lastIndex, array length/index,
+                // accessor setter, IC in-place write, descriptor-aware fault).
+                match vm_set_prop(ctx, funcs, recv, key, value, cache) {
+                    Ok(()) => {}
+                    Err(e) => handle_throw!(e),
                 }
             }
             Op::SetHidden { obj, key, src } => {
@@ -2212,172 +2500,13 @@ fn run_frame(
             }
             Op::GetProp { dst, obj, key } => {
                 let recv = regs[*obj as usize];
-                match recv.as_handle().map(Handle::from_raw) {
-                    None => {
-                        use crate::nanbox::Unpacked;
-                        match recv.unpack() {
-                            // Property access on null/undefined throws a TypeError.
-                            Unpacked::Null | Unpacked::Undefined => {
-                                let what = if matches!(recv.unpack(), Unpacked::Null) {
-                                    "null"
-                                } else {
-                                    "undefined"
-                                };
-                                let e = make_error(
-                                    ctx.realm,
-                                    "TypeError",
-                                    &alloc::format!(
-                                        "Cannot read properties of {what} (reading '{key}')"
-                                    ),
-                                );
-                                handle_throw!(VmError::Thrown(e));
-                            }
-                            // Other primitives: a missing property reads `undefined`.
-                            _ => regs[*dst as usize] = NanBox::undefined(),
-                        }
-                    }
-                    Some(handle) => {
-                        // A VM function's `.name` comes from its proto (the closure is a
-                        // tagged array whose element 0 is the function id).
-                        if key.as_str() == "name"
-                            && ctx.realm.is_vm_function(handle)
-                            && !ctx.realm.has_own(handle, "name")
-                        {
-                            let nm = ctx
-                                .realm
-                                .get_element(handle, 0)
-                                .as_number()
-                                .and_then(|f| funcs.get(f as usize))
-                                .map_or("", |p| p.name.as_str());
-                            let s = ctx.realm.new_string(nm);
-                            regs[*dst as usize] = NanBox::handle(s.to_raw());
-                            continue;
-                        }
-                        // A VM function's `.prototype` is a lazily-created object
-                        // (keyed by function id, with a `constructor` back-link),
-                        // so `F.prototype`, `F.prototype.m = …`, and `typeof
-                        // F.prototype === "object"` all work.
-                        if key.as_str() == "prototype"
-                            && ctx.realm.is_vm_function(handle)
-                            && !ctx.realm.has_own(handle, "prototype")
-                            && let Some(func_id) = ctx
-                                .realm
-                                .get_element(handle, 0)
-                                .as_number()
-                                .map(|f| f as u32)
-                        {
-                            let proto = ctx.realm.function_prototype(func_id);
-                            regs[*dst as usize] = NanBox::handle(proto.to_raw());
-                            continue;
-                        }
-                        // RegExp introspection properties. The (allocating)
-                        // `regexp_at` probe is gated on the key first, so a plain
-                        // `obj.foo` read on a non-regexp pays nothing here — only
-                        // the handful of regexp member names can take this branch.
-                        let mut done = true;
-                        if is_regexp_introspection_key(key.as_str())
-                            && let Some((src, flags)) = ctx.realm.regexp_at(handle)
-                        {
-                            match key.as_str() {
-                                "source" => {
-                                    let s = ctx.realm.new_string(&src);
-                                    regs[*dst as usize] = NanBox::handle(s.to_raw());
-                                }
-                                "flags" => {
-                                    let s = ctx.realm.new_string(&flags);
-                                    regs[*dst as usize] = NanBox::handle(s.to_raw());
-                                }
-                                "global" => {
-                                    regs[*dst as usize] = NanBox::boolean(flags.contains('g'))
-                                }
-                                "ignoreCase" => {
-                                    regs[*dst as usize] = NanBox::boolean(flags.contains('i'));
-                                }
-                                "multiline" => {
-                                    regs[*dst as usize] = NanBox::boolean(flags.contains('m'));
-                                }
-                                "sticky" => {
-                                    regs[*dst as usize] = NanBox::boolean(flags.contains('y'))
-                                }
-                                "dotAll" => {
-                                    regs[*dst as usize] = NanBox::boolean(flags.contains('s'))
-                                }
-                                "unicode" => {
-                                    regs[*dst as usize] = NanBox::boolean(flags.contains('u'))
-                                }
-                                "hasIndices" => {
-                                    regs[*dst as usize] = NanBox::boolean(flags.contains('d'))
-                                }
-                                "lastIndex" => {
-                                    // An aux own slot (a non-canonical value such as
-                                    // an object, or a `defineProperty` descriptor)
-                                    // shadows the compact cell field.
-                                    if ctx.realm.has_own(handle, "lastIndex") {
-                                        done = false;
-                                    } else {
-                                        regs[*dst as usize] = NanBox::number(
-                                            ctx.realm.regex_last_index(handle) as f64,
-                                        );
-                                    }
-                                }
-                                _ => done = false,
-                            }
-                        } else {
-                            done = false;
-                        }
-                        if !done {
-                            // Inline-cache fast path: a plain own data property on
-                            // the receiver's shape resolves via a shape-pointer
-                            // compare + slot load.
-                            let cache = site_cache!(site);
-                            if let Some(v) = ctx.realm.object_cached_get(handle, key, cache) {
-                                regs[*dst as usize] = v;
-                            } else if let Some((getter, _)) = ctx.realm.accessor(handle, key)
-                                && getter.as_handle().is_some()
-                            {
-                                // An own getter accessor takes precedence over a
-                                // data slot.
-                                match call_closure(ctx, funcs, getter, &[], recv) {
-                                    Ok(v) => regs[*dst as usize] = v,
-                                    Err(e) => handle_throw!(e),
-                                }
-                            } else if ctx.realm.has_own(handle, key) {
-                                regs[*dst as usize] = ctx
-                                    .realm
-                                    .get_property(handle, key)
-                                    .unwrap_or(NanBox::undefined());
-                            } else {
-                                // Walk the `[[Prototype]]` chain for an inherited
-                                // accessor or data property (receiver stays `recv`).
-                                let mut found = NanBox::undefined();
-                                let mut cur = ctx.realm.object_proto(handle);
-                                let mut threw = None;
-                                while let Some(p) = cur {
-                                    if let Some((getter, _)) = ctx.realm.accessor(p, key) {
-                                        if getter.as_handle().is_some() {
-                                            match call_closure(ctx, funcs, getter, &[], recv) {
-                                                Ok(v) => found = v,
-                                                Err(e) => threw = Some(e),
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    if ctx.realm.has_own(p, key) {
-                                        found = ctx
-                                            .realm
-                                            .get_property(p, key)
-                                            .unwrap_or(NanBox::undefined());
-                                        break;
-                                    }
-                                    cur = ctx.realm.object_proto(p);
-                                }
-                                if let Some(e) = threw {
-                                    handle_throw!(e);
-                                }
-                                regs[*dst as usize] = found;
-                            }
-                        }
-                    }
+                let cache = site_cache!(site);
+                // Shared with the generic-JIT helper via `vm_get_prop` so the two
+                // tiers can never diverge (synthetic name/prototype, RegExp members,
+                // IC slot load, accessor getter, prototype walk, throw).
+                match vm_get_prop(ctx, funcs, recv, key, cache) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
                 }
             }
             Op::Call { dst, func, args } => {
@@ -10708,6 +10837,8 @@ mod generic_jit_tests {
             tiers: alloc::collections::BTreeMap::new(),
             jit_cache: alloc::collections::BTreeMap::new(),
             jit_pending: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_pending_fault: None,
             jit_funcs: None,
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
@@ -10746,7 +10877,7 @@ mod generic_jit_tests {
     #[test]
     fn generic_add_number_number() {
         let (funcs, f_id) = build();
-        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add)
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers())
             .expect("f is generic-eligible");
         let mut realm = Realm::new();
         let mut ctx = mk_ctx(&mut realm);
@@ -10763,7 +10894,8 @@ mod generic_jit_tests {
     #[test]
     fn generic_add_string_string() {
         let (funcs, f_id) = build();
-        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add).unwrap();
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers()).unwrap();
         let mut realm = Realm::new();
         let mut ctx = mk_ctx(&mut realm);
         let s1 = NanBox::handle(ctx.realm.new_string("foo").to_raw());
@@ -10784,7 +10916,8 @@ mod generic_jit_tests {
     #[test]
     fn generic_add_string_number() {
         let (funcs, f_id) = build();
-        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add).unwrap();
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers()).unwrap();
         let mut realm = Realm::new();
         let mut ctx = mk_ctx(&mut realm);
         let s = NanBox::handle(ctx.realm.new_string("x=").to_raw());
@@ -10805,7 +10938,8 @@ mod generic_jit_tests {
     #[test]
     fn generic_add_number_object_valueof_runs_once() {
         let (funcs, f_id) = build();
-        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add).unwrap();
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers()).unwrap();
         let mut realm = Realm::new();
         let mut ctx = mk_ctx(&mut realm);
 
@@ -10840,7 +10974,8 @@ mod generic_jit_tests {
     #[test]
     fn generic_add_throws_identically_valueof_once() {
         let (funcs, f_id) = build();
-        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add).unwrap();
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers()).unwrap();
         let mut realm = Realm::new();
         let mut ctx = mk_ctx(&mut realm);
 
@@ -10889,7 +11024,8 @@ mod generic_jit_tests {
     #[test]
     fn generic_add_nan_canonicalizes_like_interpreter() {
         let (funcs, f_id) = build();
-        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], jit_helper_add).unwrap();
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers()).unwrap();
         let mut realm = Realm::new();
         let mut ctx = mk_ctx(&mut realm);
         let inf = NanBox::number(f64::INFINITY);
@@ -10901,5 +11037,303 @@ mod generic_jit_tests {
             .unwrap();
         assert!(interp.as_number().unwrap().is_nan());
         assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    // --- Pass 2: property access (GetProp / SetProp) ---
+
+    /// A hand-built `FnProto` (so its op stream is exactly what we want regardless
+    /// of the compiler), appended to `funcs` with `name`.
+    fn push_proto(
+        funcs: &mut Vec<FnProto>,
+        name: &str,
+        ops: Vec<Op>,
+        n_regs: usize,
+        n_params: usize,
+    ) -> usize {
+        let id = funcs.len();
+        funcs.push(FnProto {
+            ops,
+            n_regs,
+            n_params,
+            n_captures: 0,
+            rest_from: None,
+            is_async: false,
+            length: n_params,
+            name: alloc::string::String::from(name),
+        });
+        id
+    }
+
+    /// Builds a function table with object-minting helpers plus hand-built
+    /// property-access protos: `getX(o){return o.x}`, `setX(o,v){o.x=v; return o.x}`,
+    /// `getG(o){return o.g}`, `setS(o,v){o.s=v; return o}`. Returns `funcs`.
+    fn build_prop() -> Vec<FnProto> {
+        let src = "
+            function makePoint(){ return { x: 10, y: 20 }; }
+            function makeGetter(){ return { c: 0, get g(){ this.c = this.c + 1; return 7; } }; }
+            function makeSetterThrows(){ return { c: 0, set s(v){ this.c = this.c + 1; throw { message: 'nope' }; } }; }
+            function makeEmpty(){ return {}; }
+        ";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let mut funcs = compile_program(&program).expect("compile helpers");
+        push_proto(
+            &mut funcs,
+            "getX",
+            alloc::vec![
+                Op::GetProp {
+                    dst: 1,
+                    obj: 0,
+                    key: String::from("x"),
+                },
+                Op::Return { src: 1 },
+            ],
+            2,
+            1,
+        );
+        push_proto(
+            &mut funcs,
+            "setX",
+            alloc::vec![
+                Op::SetProp {
+                    obj: 0,
+                    key: String::from("x"),
+                    src: 1,
+                },
+                Op::GetProp {
+                    dst: 2,
+                    obj: 0,
+                    key: String::from("x"),
+                },
+                Op::Return { src: 2 },
+            ],
+            3,
+            2,
+        );
+        push_proto(
+            &mut funcs,
+            "getG",
+            alloc::vec![
+                Op::GetProp {
+                    dst: 1,
+                    obj: 0,
+                    key: String::from("g"),
+                },
+                Op::Return { src: 1 },
+            ],
+            2,
+            1,
+        );
+        push_proto(
+            &mut funcs,
+            "setS",
+            alloc::vec![
+                Op::SetProp {
+                    obj: 0,
+                    key: String::from("s"),
+                    src: 1,
+                },
+                Op::Return { src: 0 },
+            ],
+            2,
+            2,
+        );
+        funcs
+    }
+
+    fn mint(ctx: &mut Ctx, funcs: &[FnProto], name: &str) -> NanBox {
+        let id = funcs.iter().position(|p| p.name == name).unwrap();
+        call(ctx, funcs, id, &[]).expect("mint")
+    }
+
+    fn id_of(funcs: &[FnProto], name: &str) -> usize {
+        funcs.iter().position(|p| p.name == name).unwrap()
+    }
+
+    /// Mints an object `{ x: 99 }` whose `[[Prototype]]` carries `x` (so `o.x` is
+    /// resolved by a prototype walk). Built via realm APIs because the minimal
+    /// `compile_program` path rejects the `Object.create` global reference.
+    fn make_inherited(ctx: &mut Ctx) -> NanBox {
+        let base = ctx.realm.new_object();
+        ctx.realm.set_property(base, "x", NanBox::number(99.0));
+        let o = ctx.realm.new_object_with_proto(Some(base));
+        NanBox::handle(o.to_raw())
+    }
+
+    /// `o.x` read: JIT-forced === interpreter, and the monomorphic shape fast path
+    /// is genuinely taken — a repeat access on a same-shape object hits the IC.
+    #[test]
+    fn generic_get_prop_monomorphic_fast_path() {
+        let funcs = build_prop();
+        let get_x = id_of(&funcs, "getX");
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[get_x], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        // Two distinct objects built identically → the same shape.
+        let a = mint(&mut ctx, &funcs, "makePoint");
+        let b = mint(&mut ctx, &funcs, "makePoint");
+
+        let interp = call(&mut ctx, &funcs, get_x, &[a]).unwrap();
+        assert_eq!(ctx.realm.to_display_string(interp), "10");
+
+        // First JIT call warms the site's IC (a miss); no hits yet.
+        let r1 = call_generic(&mut ctx, &funcs, &jit, &[a]).unwrap().unwrap();
+        assert_eq!(r1.to_bits(), interp.to_bits());
+        assert_eq!((jit.ic_hits(), jit.ic_misses()), (0, 1));
+
+        // Second call on a *same-shape* object takes the shape-compare + slot-load
+        // fast path — a hit, without re-resolving the name.
+        let r2 = call_generic(&mut ctx, &funcs, &jit, &[b]).unwrap().unwrap();
+        assert_eq!(r2.to_bits(), interp.to_bits());
+        assert_eq!((jit.ic_hits(), jit.ic_misses()), (1, 1));
+    }
+
+    /// `o.x = v` write then read-back: JIT-forced === interpreter (fresh object per
+    /// path so the write is observable in isolation).
+    #[test]
+    fn generic_set_prop_write() {
+        let funcs = build_prop();
+        let set_x = id_of(&funcs, "setX");
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[set_x], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let oi = mint(&mut ctx, &funcs, "makePoint");
+        let oj = mint(&mut ctx, &funcs, "makePoint");
+        let v = NanBox::number(77.0);
+
+        let interp = call(&mut ctx, &funcs, set_x, &[oi, v]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[oj, v])
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.realm.to_display_string(interp), "77");
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+
+        // The write actually landed on the JIT object.
+        let stored = ctx
+            .realm
+            .get_property(oj.as_handle().map(Handle::from_raw).unwrap(), "x");
+        assert_eq!(stored.and_then(|v| v.as_number()), Some(77.0));
+    }
+
+    /// A prototype-inherited data property read goes through the helper's
+    /// `[[Prototype]]` walk; JIT-forced === interpreter.
+    #[test]
+    fn generic_get_prop_inherited() {
+        let funcs = build_prop();
+        let get_x = id_of(&funcs, "getX");
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[get_x], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let a = make_inherited(&mut ctx);
+        let b = make_inherited(&mut ctx);
+        let interp = call(&mut ctx, &funcs, get_x, &[a]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[b]).unwrap().unwrap();
+        assert_eq!(ctx.realm.to_display_string(interp), "99");
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// An accessor (getter) property: it must go through the helper and match, and
+    /// its side-effecting getter must run EXACTLY once per access.
+    #[test]
+    fn generic_get_prop_getter_side_effect_once() {
+        let funcs = build_prop();
+        let get_g = id_of(&funcs, "getG");
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[get_g], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let oi = mint(&mut ctx, &funcs, "makeGetter");
+        let oj = mint(&mut ctx, &funcs, "makeGetter");
+        let interp = call(&mut ctx, &funcs, get_g, &[oi]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[oj])
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.realm.to_display_string(interp), "7");
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+
+        // The counting getter ran exactly once on each object.
+        let ci = ctx
+            .realm
+            .get_property(oi.as_handle().map(Handle::from_raw).unwrap(), "c");
+        let cj = ctx
+            .realm
+            .get_property(oj.as_handle().map(Handle::from_raw).unwrap(), "c");
+        assert_eq!(ci.and_then(|v| v.as_number()), Some(1.0));
+        assert_eq!(cj.and_then(|v| v.as_number()), Some(1.0));
+    }
+
+    /// A missing property reads `undefined` on both tiers.
+    #[test]
+    fn generic_get_prop_missing_undefined() {
+        let funcs = build_prop();
+        let get_x = id_of(&funcs, "getX");
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[get_x], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let a = mint(&mut ctx, &funcs, "makeEmpty");
+        let b = mint(&mut ctx, &funcs, "makeEmpty");
+        let interp = call(&mut ctx, &funcs, get_x, &[a]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[b]).unwrap().unwrap();
+        assert!(matches!(
+            interp.unpack(),
+            crate::nanbox::Unpacked::Undefined
+        ));
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// A throwing setter: both tiers throw the same error, and the setter's side
+    /// effect runs EXACTLY once (no deopt-and-re-run) on the throwing path.
+    #[test]
+    fn generic_set_prop_throwing_setter_side_effect_once() {
+        let funcs = build_prop();
+        let set_s = id_of(&funcs, "setS");
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[set_s], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let oi = mint(&mut ctx, &funcs, "makeSetterThrows");
+        let oj = mint(&mut ctx, &funcs, "makeSetterThrows");
+        let v = NanBox::number(1.0);
+        let interp = call(&mut ctx, &funcs, set_s, &[oi, v]);
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[oj, v]).unwrap();
+
+        let (vi, vj) = match (interp, jitted) {
+            (Err(VmError::Thrown(vi)), Err(VmError::Thrown(vj))) => (vi, vj),
+            other => panic!("expected both paths to throw, got {other:?}"),
+        };
+        let msg_i = ctx
+            .realm
+            .get_property(vi.as_handle().map(Handle::from_raw).unwrap(), "message");
+        let msg_j = ctx
+            .realm
+            .get_property(vj.as_handle().map(Handle::from_raw).unwrap(), "message");
+        assert_eq!(
+            msg_i.map(|m| ctx.realm.to_display_string(m)),
+            msg_j.map(|m| ctx.realm.to_display_string(m))
+        );
+        assert_eq!(
+            msg_i.map(|m| ctx.realm.to_display_string(m)).as_deref(),
+            Some("nope")
+        );
+
+        // The counting setter ran exactly once on each object, even though the set
+        // then threw — proving no deopt-and-re-run on the exception path.
+        let ci = ctx
+            .realm
+            .get_property(oi.as_handle().map(Handle::from_raw).unwrap(), "c");
+        let cj = ctx
+            .realm
+            .get_property(oj.as_handle().map(Handle::from_raw).unwrap(), "c");
+        assert_eq!(ci.and_then(|v| v.as_number()), Some(1.0));
+        assert_eq!(cj.and_then(|v| v.as_number()), Some(1.0));
     }
 }

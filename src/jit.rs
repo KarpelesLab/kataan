@@ -1685,6 +1685,29 @@ pub enum GenericOp {
         /// Source register.
         src: u8,
     },
+    /// `reg[dst] = reg[obj].key` — a plain (static-string-key) property get.
+    /// Always routed through `jit_helper_get_prop`, which runs the interpreter's
+    /// real `Op::GetProp` semantics (accessor/prototype-walk/throw) through the
+    /// site's persistent inline cache. `site` indexes the compiled proto's per-site
+    /// key + [`PropertyCache`](crate::ic::PropertyCache) table.
+    GetProp {
+        /// Destination register.
+        dst: u8,
+        /// Register holding the receiver object.
+        obj: u8,
+        /// Index into the per-site key/IC table.
+        site: u16,
+    },
+    /// `reg[obj].key = reg[val]` — a plain (static-string-key) property set,
+    /// routed through `jit_helper_set_prop` (interpreter's real `Op::SetProp`).
+    SetProp {
+        /// Register holding the receiver object.
+        obj: u8,
+        /// Register holding the value to store.
+        val: u8,
+        /// Index into the per-site key/IC table.
+        site: u16,
+    },
     /// `return reg[src]`.
     Ret {
         /// Register holding the return value.
@@ -1704,7 +1727,9 @@ pub enum GenericOp {
 /// binding).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 #[must_use]
-pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<Vec<GenericOp>> {
+pub fn lower_nbvm_generic(
+    proto: &crate::nbvm::FnProto,
+) -> Option<(Vec<GenericOp>, Vec<alloc::boxed::Box<str>>)> {
     use crate::nbvm::Op;
     if proto.n_regs > 64 || proto.n_params > 32 || proto.n_captures != 0 {
         return None;
@@ -1721,6 +1746,9 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<Vec<GenericOp>
         if *w.get(r as usize)? { Some(r8) } else { None }
     };
     let mut out = Vec::new();
+    // Per-site key strings for `GetProp`/`SetProp` (the site index into this Vec is
+    // stored in the op); the caller boxes each for a stable pointer + persistent IC.
+    let mut keys: Vec<alloc::boxed::Box<str>> = Vec::new();
     // Parameters arrive as the `args` array; seed registers `0..n_params`.
     for i in 0..proto.n_params {
         out.push(GenericOp::Arg {
@@ -1752,6 +1780,35 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<Vec<GenericOp>
                 written[*dst as usize] = true;
                 GenericOp::Move { dst: d, src: s }
             }
+            // A plain `obj.key` read: the receiver register must already be written
+            // (params count as written), the key a static string. Computed / super /
+            // optional / private property access lowers to *other* ops (`GetElem`,
+            // `GetSuper`, `GetPrivate`, or an `OptChain`-guarded form), none of which
+            // are matched here, so this only ever accepts a static member get.
+            Op::GetProp { dst, obj, key } => {
+                let o = read(&written, *obj)?;
+                let d = reg8(*dst)?;
+                let site = u16::try_from(keys.len()).ok()?;
+                keys.push(alloc::boxed::Box::from(key.as_str()));
+                written[*dst as usize] = true;
+                GenericOp::GetProp {
+                    dst: d,
+                    obj: o,
+                    site,
+                }
+            }
+            // A plain `obj.key = val` write (static string key only, as above).
+            Op::SetProp { obj, key, src } => {
+                let o = read(&written, *obj)?;
+                let v = read(&written, *src)?;
+                let site = u16::try_from(keys.len()).ok()?;
+                keys.push(alloc::boxed::Box::from(key.as_str()));
+                GenericOp::SetProp {
+                    obj: o,
+                    val: v,
+                    site,
+                }
+            }
             Op::Return { src } => GenericOp::Ret {
                 src: read(&written, *src)?,
             },
@@ -1763,7 +1820,7 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<Vec<GenericOp>
     if !matches!(out.last(), Some(GenericOp::Ret { .. })) {
         return None;
     }
-    Some(out)
+    Some((out, keys))
 }
 
 /// A bytecode-VM function compiled to native code, callable from the VM with
@@ -1776,6 +1833,68 @@ pub struct JitProto {
     func: JitFunction,
     n_params: usize,
     kind: JitKind,
+    /// Per-property-access-site storage for the generic tier (`None` for the
+    /// Int/Float tiers). Owns the key strings and inline caches the emitted code
+    /// holds raw pointers into, so those pointers stay valid for the code's life.
+    sites: Option<GenericSites>,
+}
+
+/// Per-site key + inline-cache storage for a generic-tier body, owned by the
+/// [`JitProto`] alongside the compiled code. The emitted machine code holds raw
+/// pointers into `keys` (the UTF-8 bytes) and `caches` (each `PropertyCache`),
+/// baked as immediates at compile time; boxing keeps every address stable across
+/// the move into the `JitProto` (only the owning pointers move; the heap
+/// allocations do not). The caches are interior-mutable because a runtime helper
+/// re-arms them through the raw pointer while the (shared) `JitProto` is borrowed.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+struct GenericSites {
+    /// Stable-address key strings, one per site.
+    #[allow(dead_code)]
+    keys: Vec<alloc::boxed::Box<str>>,
+    /// Persistent monomorphic inline caches, one per site.
+    caches: alloc::boxed::Box<[core::cell::UnsafeCell<crate::ic::PropertyCache>]>,
+}
+
+/// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
+/// code calls for `+`, property get, and property set. Passed to
+/// [`JitProto::compile_generic`].
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub struct GenericHelpers {
+    /// The `+` helper (`jit_helper_add`).
+    pub add: JitAddHelper,
+    /// The property-get helper (`jit_helper_get_prop`).
+    pub get: JitGetPropHelper,
+    /// The property-set helper (`jit_helper_set_prop`).
+    pub set: JitSetPropHelper,
+}
+
+/// The runtime-helper ABI for a property **get** (`JIT_DESIGN.md` Pass 2):
+/// `(ctx, obj, key_ptr, key_len, cache) -> NanBox bits` (or the throw sentinel).
+/// `cache` is an opaque pointer to the site's `PropertyCache`.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitGetPropHelper =
+    extern "C" fn(*mut core::ffi::c_void, u64, *const u8, usize, *mut core::ffi::c_void) -> u64;
+
+/// The runtime-helper ABI for a property **set**: `(ctx, obj, key_ptr, key_len,
+/// cache, val) -> undefined bits` (or the throw sentinel).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitSetPropHelper = extern "C" fn(
+    *mut core::ffi::c_void,
+    u64,
+    *const u8,
+    usize,
+    *mut core::ffi::c_void,
+    u64,
+) -> u64;
+
+/// Resolved per-site call data the emitter bakes into a property-access site: the
+/// key string's raw pointer/length and the site's inline-cache pointer.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub struct SiteInfo {
+    key_ptr: *const u8,
+    key_len: usize,
+    cache_ptr: *mut core::ffi::c_void,
 }
 
 /// Which native fast path a [`JitProto`] holds.
@@ -1838,6 +1957,7 @@ impl JitProto {
                 func,
                 n_params: proto.n_params,
                 kind: JitKind::Int,
+                sites: None,
             });
         }
         let ops = lower_nbvm_float(proto)?;
@@ -1846,6 +1966,7 @@ impl JitProto {
             func,
             n_params: proto.n_params,
             kind: JitKind::Float,
+            sites: None,
         })
     }
 
@@ -1898,21 +2019,77 @@ impl JitProto {
     }
 
     /// Compiles `proto` on the **generic (NanBox) tier** if [`lower_nbvm_generic`]
-    /// accepts it, wiring `add_helper` as the runtime slow path for `+`. Returns
-    /// `None` if the function isn't generic-eligible.
+    /// accepts it, wiring `helpers` as the runtime slow paths (`+`, property
+    /// get/set). Returns `None` if the function isn't generic-eligible.
+    ///
+    /// Per-property-access-site key strings and inline caches are allocated here
+    /// (in [`GenericSites`], owned by the returned `JitProto`) so their addresses
+    /// are stable; the emitted code holds raw pointers into them.
     #[must_use]
-    pub fn compile_generic(proto: &crate::nbvm::FnProto, add_helper: JitAddHelper) -> Option<Self> {
-        let ops = lower_nbvm_generic(proto)?;
-        let func = JitFunction::compile_generic(
-            proto.n_regs,
-            proto.n_params,
-            &ops,
-            add_helper as usize as u64,
-        )?;
+    pub fn compile_generic(proto: &crate::nbvm::FnProto, helpers: &GenericHelpers) -> Option<Self> {
+        let (ops, keys) = lower_nbvm_generic(proto)?;
+        // One persistent inline cache per property-access site.
+        let caches: alloc::boxed::Box<[core::cell::UnsafeCell<crate::ic::PropertyCache>]> = (0
+            ..keys.len())
+            .map(|_| core::cell::UnsafeCell::new(crate::ic::PropertyCache::new()))
+            .collect();
+        // Resolve each site's raw key + cache pointers (stable: `keys`/`caches` heap
+        // allocations do not move when the owners are moved into the `JitProto`).
+        let site_info: Vec<SiteInfo> = keys
+            .iter()
+            .zip(caches.iter())
+            .map(|(k, c)| SiteInfo {
+                key_ptr: k.as_ptr(),
+                key_len: k.len(),
+                cache_ptr: c.get().cast::<core::ffi::c_void>(),
+            })
+            .collect();
+        let func =
+            JitFunction::compile_generic(proto.n_regs, proto.n_params, &ops, helpers, &site_info)?;
         Some(Self {
             func,
             n_params: proto.n_params,
             kind: JitKind::Generic,
+            sites: Some(GenericSites { keys, caches }),
+        })
+    }
+
+    /// The total inline-cache hit count across this generic body's property sites
+    /// (0 for a non-generic body). Type feedback + the differential-test proof that
+    /// the monomorphic shape fast path is being taken: a repeat access on a
+    /// same-shape object hits without a name lookup.
+    #[must_use]
+    pub fn ic_hits(&self) -> u32 {
+        self.sites.as_ref().map_or(0, |s| {
+            s.caches
+                .iter()
+                // SAFETY: no other borrow of any cache is live here — the native
+                // body (the only writer, via the raw pointer) is not running.
+                .map(|c| {
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        (*c.get()).hits()
+                    }
+                })
+                .sum()
+        })
+    }
+
+    /// The total inline-cache miss count across this generic body's property sites
+    /// (0 for a non-generic body).
+    #[must_use]
+    pub fn ic_misses(&self) -> u32 {
+        self.sites.as_ref().map_or(0, |s| {
+            s.caches
+                .iter()
+                // SAFETY: as `ic_hits`.
+                .map(|c| {
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        (*c.get()).misses()
+                    }
+                })
+                .sum()
         })
     }
 
@@ -2515,6 +2692,25 @@ impl X64Assembler {
         self.code.extend_from_slice(&[rex, 0x8b, modrm]);
         self.code.extend_from_slice(&disp.to_le_bytes());
     }
+
+    /// `movabs <argreg[i]>, imm64` — load a 64-bit immediate into System V integer
+    /// argument register `i` (rdi, rsi, rdx, rcx, r8, r9), for a native call (e.g.
+    /// a baked-in key pointer / length / inline-cache pointer).
+    pub fn movabs_argreg(&mut self, i: usize, imm: i64) {
+        // REX.W (+ REX.B for r8/r9) + `B8+rd` opcode per argument register.
+        let (rex, op): (u8, u8) = match i {
+            0 => (0x48, 0xbf), // rdi
+            1 => (0x48, 0xbe), // rsi
+            2 => (0x48, 0xba), // rdx
+            3 => (0x48, 0xb9), // rcx
+            4 => (0x49, 0xb8), // r8
+            5 => (0x49, 0xb9), // r9
+            _ => return,
+        };
+        self.code.extend_from_slice(&[rex, op]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// `sub rsp, imm8`.
     pub fn sub_rsp_imm8(&mut self, imm: u8) {
         self.code.extend_from_slice(&[0x48, 0x83, 0xec, imm]);
@@ -3212,12 +3408,16 @@ impl JitFunction {
         n_regs: usize,
         n_params: usize,
         ops: &[GenericOp],
-        add_helper: u64,
+        helpers: &GenericHelpers,
+        sites: &[SiteInfo],
     ) -> Option<Self> {
         use crate::nanbox::NanBox;
         if n_regs > 64 || n_params > 32 {
             return None;
         }
+        let add_helper = helpers.add as usize as u64;
+        let get_helper = helpers.get as usize as u64;
+        let set_helper = helpers.set as usize as u64;
         // `is_number(bits) == (bits & QNAN) != QNAN`.
         const QNAN: u64 = 0x7ffc_0000_0000_0000;
         // The canonical quiet NaN a `NanBox` normalizes every NaN to, so a NaN sum
@@ -3310,6 +3510,48 @@ impl JitFunction {
                     a.je(throw_exit);
                     a.store_rax(disp(dst));
                     a.bind(done);
+                }
+                GenericOp::GetProp { dst, obj, site } => {
+                    if !ok(dst) || !ok(obj) {
+                        return None;
+                    }
+                    let s = sites.get(site as usize)?;
+                    // jit_helper_get_prop(ctx, obj, key_ptr, key_len, cache).
+                    // Helper-only: the shared `vm_get_prop` runs through the site's
+                    // persistent IC, so a same-shape repeat still takes the
+                    // monomorphic shape-compare + slot-load fast path (in the helper).
+                    // A fully-inline shape guard in emitted asm is deferred (it needs
+                    // stable/repr(C) access to the heap arena + `Object` internals).
+                    a.mov_rdi_r15(); // rdi = ctx
+                    a.load_argreg(1, disp(obj)); // rsi = obj
+                    a.movabs_argreg(2, s.key_ptr as i64); // rdx = key_ptr
+                    a.movabs_argreg(3, s.key_len as i64); // rcx = key_len
+                    a.movabs_argreg(4, s.cache_ptr as i64); // r8 = cache
+                    a.movabs_rax(get_helper as i64);
+                    a.call_rax();
+                    a.movabs_r11(NanBox::jit_throw_bits() as i64);
+                    a.cmp_rax_r11();
+                    a.je(throw_exit);
+                    a.store_rax(disp(dst));
+                }
+                GenericOp::SetProp { obj, val, site } => {
+                    if !ok(obj) || !ok(val) {
+                        return None;
+                    }
+                    let s = sites.get(site as usize)?;
+                    // jit_helper_set_prop(ctx, obj, key_ptr, key_len, cache, val).
+                    a.mov_rdi_r15(); // rdi = ctx
+                    a.load_argreg(1, disp(obj)); // rsi = obj
+                    a.movabs_argreg(2, s.key_ptr as i64); // rdx = key_ptr
+                    a.movabs_argreg(3, s.key_len as i64); // rcx = key_len
+                    a.movabs_argreg(4, s.cache_ptr as i64); // r8 = cache
+                    a.load_argreg(5, disp(val)); // r9 = val
+                    a.movabs_rax(set_helper as i64);
+                    a.call_rax();
+                    // Result (undefined) is discarded; only the throw sentinel matters.
+                    a.movabs_r11(NanBox::jit_throw_bits() as i64);
+                    a.cmp_rax_r11();
+                    a.je(throw_exit);
                 }
                 GenericOp::Ret { src } => {
                     if !ok(src) {
