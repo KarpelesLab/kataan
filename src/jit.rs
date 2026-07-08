@@ -1708,6 +1708,43 @@ pub enum GenericOp {
         /// Index into the per-site key/IC table.
         site: u16,
     },
+    /// `reg[dst] = reg[obj][reg[index]]` — a computed element read (`Op::GetKey`,
+    /// what `arr[i]` / `s[0]` compile to). Always routed through
+    /// `jit_helper_get_elem`, which runs the interpreter's real `vm_get_elem`
+    /// semantics (dense array element / hole → prototype walk / OOB → `undefined`,
+    /// typed arrays, string indexing, `ToPropertyKey` on the index, canonical
+    /// numeric-string keys, accessor getters, throws). A fully-inline dense-array
+    /// fast path is deferred to Pass 6 (it needs `repr(C)` access to the element
+    /// storage, as with the Pass 2 property shape guard).
+    GetElem {
+        /// Destination register.
+        dst: u8,
+        /// Register holding the receiver.
+        obj: u8,
+        /// Register holding the index / key value.
+        index: u8,
+    },
+    /// `reg[obj][reg[index]] = reg[val]` — a computed element write (`Op::SetKey`),
+    /// routed through `jit_helper_set_elem` (interpreter's real `vm_set_elem`:
+    /// dense array store, typed arrays, `arr.length` resize, `RangeError`,
+    /// descriptor-aware fault, throws).
+    SetElem {
+        /// Register holding the receiver.
+        obj: u8,
+        /// Register holding the index / key value.
+        index: u8,
+        /// Register holding the value to store.
+        val: u8,
+    },
+    /// `reg[dst] = reg[arr].length` — a `.length` read (`Op::ArrayLen`), routed
+    /// through `jit_helper_array_len` (array length / string UTF-16 code-unit count
+    /// / VM-function arity / explicit `length` data property).
+    ArrayLen {
+        /// Destination register.
+        dst: u8,
+        /// Register holding the receiver.
+        arr: u8,
+    },
     /// `reg[dst] = reg[a] <op> reg[b]` for `-`/`*`/`/`/`%` (`op` is a `GA_*` code).
     /// `Sub`/`Mul`/`Div` take an inline both-numbers SSE fast path; `Mod` (and any
     /// non-number operand) calls `jit_helper_arith`.
@@ -1978,6 +2015,38 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                     site,
                 }
             }
+            // A computed element read `obj[key]` (what `arr[i]`/`s[0]` compile to).
+            // Both the receiver and the index register must already be written.
+            Op::GetKey { dst, obj, key } => {
+                let o = read(&written, *obj)?;
+                let idx = read(&written, *key)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                GenericOp::GetElem {
+                    dst: d,
+                    obj: o,
+                    index: idx,
+                }
+            }
+            // A computed element write `obj[key] = src`.
+            Op::SetKey { obj, key, src } => {
+                let o = read(&written, *obj)?;
+                let idx = read(&written, *key)?;
+                let v = read(&written, *src)?;
+                GenericOp::SetElem {
+                    obj: o,
+                    index: idx,
+                    val: v,
+                }
+            }
+            // A `.length` read (`arr.length` / `s.length`); the receiver register
+            // must already be written.
+            Op::ArrayLen { dst, arr } => {
+                let a = read(&written, *arr)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                GenericOp::ArrayLen { dst: d, arr: a }
+            }
             // A plain static call `func(args…)` — the callee is a function-table
             // index (never a native builtin: those lower to `Op::CallNative`), and
             // every argument register must already be written. Spread/computed/`new`
@@ -2087,6 +2156,12 @@ pub struct GenericHelpers {
     pub get: JitGetPropHelper,
     /// The property-set helper (`jit_helper_set_prop`).
     pub set: JitSetPropHelper,
+    /// The computed element-get helper (`jit_helper_get_elem`) — `obj[key]`.
+    pub get_elem: JitAddHelper,
+    /// The computed element-set helper (`jit_helper_set_elem`) — `obj[key] = v`.
+    pub set_elem: JitBinHelper,
+    /// The `.length` helper (`jit_helper_array_len`) — `Op::ArrayLen`.
+    pub array_len: JitTruthyHelper,
     /// The `-`/`*`/`/`/`%` helper (`jit_helper_arith`), dispatched by a `GA_*`
     /// discriminant passed as the fourth argument.
     pub arith: JitBinHelper,
@@ -3794,6 +3869,9 @@ impl JitFunction {
         let add_helper = helpers.add as usize as u64;
         let get_helper = helpers.get as usize as u64;
         let set_helper = helpers.set as usize as u64;
+        let get_elem_helper = helpers.get_elem as usize as u64;
+        let set_elem_helper = helpers.set_elem as usize as u64;
+        let array_len_helper = helpers.array_len as usize as u64;
         let arith_helper = helpers.arith as usize as u64;
         let value_bin_helper = helpers.value_bin as usize as u64;
         let lt_helper = helpers.lt as usize as u64;
@@ -3964,6 +4042,49 @@ impl JitFunction {
                     a.call_rax();
                     // Result (undefined) is discarded; only the throw sentinel matters.
                     throw_check!();
+                }
+                GenericOp::GetElem { dst, obj, index } => {
+                    if !ok(dst) || !ok(obj) || !ok(index) {
+                        return None;
+                    }
+                    // jit_helper_get_elem(ctx, recv, key). Helper-only: `vm_get_elem`
+                    // runs the full array/typed-array/string/accessor semantics. A
+                    // fully-inline dense-array load is deferred to Pass 6 (it needs
+                    // stable/repr(C) access to the element storage, as with the
+                    // Pass 2 property shape guard).
+                    a.mov_rdi_r15(); // rdi = ctx
+                    a.load_argreg(1, disp(obj)); // rsi = recv
+                    a.load_argreg(2, disp(index)); // rdx = key
+                    a.movabs_rax(get_elem_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.store_rax(disp(dst));
+                }
+                GenericOp::SetElem { obj, index, val } => {
+                    if !ok(obj) || !ok(index) || !ok(val) {
+                        return None;
+                    }
+                    // jit_helper_set_elem(ctx, recv, key, val).
+                    a.mov_rdi_r15(); // rdi = ctx
+                    a.load_argreg(1, disp(obj)); // rsi = recv
+                    a.load_argreg(2, disp(index)); // rdx = key
+                    a.load_argreg(3, disp(val)); // rcx = val
+                    a.movabs_rax(set_elem_helper as i64);
+                    a.call_rax();
+                    // Result (undefined) is discarded; only the throw sentinel matters.
+                    throw_check!();
+                }
+                GenericOp::ArrayLen { dst, arr } => {
+                    if !ok(dst) || !ok(arr) {
+                        return None;
+                    }
+                    // jit_helper_array_len(ctx, recv).
+                    a.mov_rdi_r15(); // rdi = ctx
+                    a.load_argreg(1, disp(arr)); // rsi = recv
+                    a.movabs_rax(array_len_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.store_rax(disp(dst));
                 }
                 GenericOp::Arith {
                     dst,

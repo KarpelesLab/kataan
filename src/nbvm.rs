@@ -1448,7 +1448,108 @@ pub(crate) extern "C" fn jit_helper_set_prop(
     }
 }
 
-/// The generic-tier runtime-helper table (`+`, property get/set), passed to
+/// The generic-JIT runtime helper for a computed element **get** `obj[key]`.
+/// Reconstructs `&mut Ctx` + the running function table from the opaque pointers,
+/// runs the shared [`vm_get_elem`], and returns the result's `NanBox` bits — or,
+/// on any fault (a getter throw, a non-object receiver), stashes the whole
+/// [`VmError`] in `ctx.jit_pending_fault` and returns the reserved throw/deopt
+/// sentinel ([`NanBox::jit_throw_bits`]). Mirrors [`jit_helper_get_prop`].
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the dispatcher passed (with `ctx.jit_funcs` set);
+/// the reentrancy is single-threaded (the native caller holds no live `&mut Ctx`).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_get_elem(
+    ctx: *mut core::ffi::c_void,
+    recv: u64,
+    key: u64,
+) -> u64 {
+    // SAFETY: single-threaded reentrancy — as `jit_helper_get_prop`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    match vm_get_elem(ctx, funcs, NanBox::from_bits(recv), NanBox::from_bits(key)) {
+        Ok(v) => v.to_bits(),
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// The generic-JIT runtime helper for a computed element **set** `obj[key] = val`.
+/// Mirrors [`jit_helper_get_elem`], running the shared [`vm_set_elem`]; returns
+/// `undefined`'s bits on success, or the throw/deopt sentinel (with the fault in
+/// `ctx.jit_pending_fault`) otherwise.
+///
+/// # Safety
+/// As [`jit_helper_get_elem`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_set_elem(
+    ctx: *mut core::ffi::c_void,
+    recv: u64,
+    key: u64,
+    val: u64,
+) -> u64 {
+    // SAFETY: see `jit_helper_get_elem`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    match vm_set_elem(
+        ctx,
+        funcs,
+        NanBox::from_bits(recv),
+        NanBox::from_bits(key),
+        NanBox::from_bits(val),
+    ) {
+        Ok(()) => NanBox::undefined().to_bits(),
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// The generic-JIT runtime helper for a `.length` read (`Op::ArrayLen`): runs the
+/// shared [`vm_array_len`]. Mirrors [`jit_helper_get_elem`] — the result bits, or
+/// the throw/deopt sentinel with the fault (a non-object receiver) in
+/// `ctx.jit_pending_fault`.
+///
+/// # Safety
+/// As [`jit_helper_get_elem`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_array_len(ctx: *mut core::ffi::c_void, recv: u64) -> u64 {
+    // SAFETY: see `jit_helper_get_elem`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    match vm_array_len(ctx, funcs, NanBox::from_bits(recv)) {
+        Ok(v) => v.to_bits(),
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// The generic-tier runtime-helper table (`+`, property get/set, element get/set,
+/// `.length`, arithmetic, comparisons, calls), passed to
 /// [`crate::jit::JitProto::compile_generic`].
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 fn jit_generic_helpers() -> crate::jit::GenericHelpers {
@@ -1456,6 +1557,9 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         add: jit_helper_add,
         get: jit_helper_get_prop,
         set: jit_helper_set_prop,
+        get_elem: jit_helper_get_elem,
+        set_elem: jit_helper_set_elem,
+        array_len: jit_helper_array_len,
         arith: jit_helper_arith,
         value_bin: jit_helper_value_bin,
         lt: jit_helper_lt,
@@ -2487,154 +2591,29 @@ fn run_frame(
                 }
             }
             Op::GetKey { dst, obj, key } => {
-                let recv_key = regs[*obj as usize];
-                let handle = object_handle(regs[*obj as usize])?;
-                let k = regs[*key as usize];
-                match k.as_number() {
-                    Some(n)
-                        if ctx.realm.is_array(handle)
-                            && n >= 0.0
-                            && n == (n as u64) as f64
-                            && (n as u64) < u64::from(u32::MAX) =>
-                    {
-                        match vm_array_index_get(ctx, funcs, handle, n as usize, recv_key) {
-                            Ok(v) => regs[*dst as usize] = v,
-                            Err(e) => handle_throw!(e),
-                        }
-                    }
-                    _ => {
-                        // ToPropertyKey: an object key uses its `toString`.
-                        let pk = to_primitive(ctx, funcs, k, false);
-                        let ks = ctx.realm.to_display_string(pk);
-                        // A canonical numeric string key on an array (`arr["0"]`)
-                        // reads the element, like `arr[0]` — for a valid array index
-                        // [0, 2**32−1); the boundary value is an ordinary property.
-                        if ctx.realm.is_array(handle)
-                            && let Ok(i) = ks.parse::<usize>()
-                            && alloc::format!("{i}") == ks
-                            && (i as u64) < u64::from(u32::MAX)
-                        {
-                            match vm_array_index_get(ctx, funcs, handle, i, recv_key) {
-                                Ok(v) => regs[*dst as usize] = v,
-                                Err(e) => handle_throw!(e),
-                            }
-                        } else if ks == "length"
-                            && let Some(len) = ctx.realm.array_length(handle).or_else(|| {
-                                // String length counts UTF-16 code units (astral
-                                // chars = 2, a lone surrogate = 1).
-                                ctx.realm
-                                    .string_bytes(handle)
-                                    .map(|b| crate::wtf8::utf16_len(&b))
-                            })
-                        {
-                            // Computed `arr["length"]` / `str["length"]`.
-                            regs[*dst as usize] = NanBox::number(len as f64);
-                        } else if let Some((getter, _)) = ctx.realm.accessor(handle, &ks)
-                            && getter.as_handle().is_some()
-                        {
-                            // A getter accessor under a (possibly numeric) string
-                            // key — invoke it with the receiver as `this`.
-                            match call_closure(ctx, funcs, getter, &[], recv_key) {
-                                Ok(v) => regs[*dst as usize] = v,
-                                Err(e) => handle_throw!(e),
-                            }
-                        } else {
-                            regs[*dst as usize] = ctx
-                                .realm
-                                .get_property(handle, &ks)
-                                .unwrap_or(NanBox::undefined());
-                        }
-                    }
-                };
+                // Shared with the generic-JIT helper via `vm_get_elem` (the computed
+                // `obj[key]` read: array element / typed-array / string index /
+                // canonical numeric-string key / `length` / accessor / ordinary
+                // property), so the two tiers can never diverge.
+                match vm_get_elem(ctx, funcs, regs[*obj as usize], regs[*key as usize]) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
+                }
             }
             Op::SetKey { obj, key, src } => {
-                let handle = object_handle(regs[*obj as usize])?;
-                let k = regs[*key as usize];
-                match k.as_number() {
-                    Some(n) if ctx.realm.typed_len(handle).is_some() => {
-                        // A numeric key on a typed array writes through to its
-                        // bytes; a BigInt element ToBigInt-coerces (Number throws).
-                        let i = n as usize;
-                        match coerce_bigint_typed_write(ctx.realm, handle, regs[*src as usize]) {
-                            Ok(v) => {
-                                ctx.realm.set_element(handle, i, v);
-                            }
-                            Err(e) => handle_throw!(VmError::Thrown(e)),
-                        }
-                    }
-                    // A canonical non-negative integer index in [0, 2**32−1). A
-                    // negative or fractional key (`a[-1]`, `a[1.5]`) is NOT an array
-                    // index — `as u64` would truncate it to a real index — so it
-                    // falls through to the `_` arm and becomes an ordinary property.
-                    Some(n)
-                        if ctx.realm.is_array(handle)
-                            && n >= 0.0
-                            && n == (n as u64) as f64
-                            && (n as u64) < u64::from(u32::MAX) =>
-                    {
-                        // C1: refuse-past-cap surfaces as a catchable RangeError
-                        // (see `Op::SetElem`).
-                        let i = n as usize;
-                        if i >= ctx.realm.limits.max_array_len {
-                            let e = make_error(ctx.realm, "RangeError", "Invalid array length");
-                            handle_throw!(VmError::Thrown(e));
-                        }
-                        // A demoted / accessor index (or frozen/sealed array) needs
-                        // the descriptor-aware tree-walker store. Fault to it.
-                        if ctx.realm.array_index_has_override(handle, i) {
-                            return Err(VmError::Unsupported);
-                        }
-                        ctx.realm.set_element(handle, i, regs[*src as usize]);
-                    }
-                    _ => {
-                        // ToPropertyKey: an object key uses its `toString`.
-                        let pk = to_primitive(ctx, funcs, k, false);
-                        let ks = ctx.realm.to_display_string(pk);
-                        // C1: a computed `arr["length"] = n` (numeric string key) on
-                        // an array resizes; `ToUint32(v)` must equal `ToNumber(v)`
-                        // (else a catchable `RangeError`).
-                        if ctx.realm.is_array(handle) && ks == "length" {
-                            let v = regs[*src as usize];
-                            if let Some(n) = ctx.realm.array_length_uint32(v) {
-                                if ctx
-                                    .realm
-                                    .array_length_set_needs_slow_path(handle, n as usize)
-                                {
-                                    return Err(VmError::Unsupported);
-                                }
-                                ctx.realm.set_array_length(handle, n as usize);
-                            } else {
-                                let e = make_error(ctx.realm, "RangeError", "Invalid array length");
-                                handle_throw!(VmError::Thrown(e));
-                            }
-                            continue;
-                        }
-                        if ks == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
-                            let v = regs[*src as usize];
-                            set_regex_last_index_value(ctx.realm, handle, v);
-                            continue;
-                        }
-                        // A canonical numeric string key on an array (`arr["0"] = v`)
-                        // addresses element storage, like `arr[0] = v` — for a valid
-                        // index in [0, 2**32−1). A demoted/accessor index faults to
-                        // the descriptor-aware tree-walker.
-                        if ctx.realm.is_array(handle)
-                            && let Ok(i) = ks.parse::<usize>()
-                            && alloc::format!("{i}") == ks
-                            && (i as u64) < u64::from(u32::MAX)
-                        {
-                            if i >= ctx.realm.limits.max_array_len {
-                                let e = make_error(ctx.realm, "RangeError", "Invalid array length");
-                                handle_throw!(VmError::Thrown(e));
-                            }
-                            if ctx.realm.array_index_has_override(handle, i) {
-                                return Err(VmError::Unsupported);
-                            }
-                            ctx.realm.set_element(handle, i, regs[*src as usize]);
-                            continue;
-                        }
-                        ctx.realm.set_property(handle, &ks, regs[*src as usize]);
-                    }
+                // Shared with the generic-JIT helper via `vm_set_elem` (the computed
+                // `obj[key] = v` write). A descriptor-aware case (demoted/frozen
+                // index, non-writable `length`) returns `Err(Unsupported)` to fault
+                // to the tree-walker, exactly as before.
+                match vm_set_elem(
+                    ctx,
+                    funcs,
+                    regs[*obj as usize],
+                    regs[*key as usize],
+                    regs[*src as usize],
+                ) {
+                    Ok(()) => {}
+                    Err(e) => handle_throw!(e),
                 }
             }
             Op::EnumKeys { dst, obj } => {
@@ -2700,34 +2679,12 @@ fn run_frame(
                 }
             }
             Op::ArrayLen { dst, arr } => {
-                let handle = object_handle(regs[*arr as usize])?;
-                // A VM function (a tagged closure array) reports its parameter
-                // count from the proto, not the backing array's length.
-                if ctx.realm.is_vm_function(handle) {
-                    let n = ctx
-                        .realm
-                        .get_element(handle, 0)
-                        .as_number()
-                        .and_then(|f| funcs.get(f as usize))
-                        .map_or(0, |p| p.length);
-                    regs[*dst as usize] = NanBox::number(n as f64);
-                } else {
-                    // `.length` on an array, or a string's UTF-16 code-unit count
-                    // (astral chars = 2, a lone surrogate = 1).
-                    let len = ctx.realm.array_length(handle).or_else(|| {
-                        ctx.realm
-                            .string_bytes(handle)
-                            .map(|b| crate::wtf8::utf16_len(&b))
-                    });
-                    regs[*dst as usize] = match len {
-                        Some(n) => NanBox::number(n as f64),
-                        // Otherwise an explicit `length` data property (e.g. a regex
-                        // match result, which is object-shaped here), else undefined.
-                        None => ctx
-                            .realm
-                            .get_property(handle, "length")
-                            .unwrap_or(NanBox::undefined()),
-                    };
+                // Shared with the generic-JIT helper via `vm_array_len` (`.length`
+                // on an array / string / VM function, or an explicit `length` data
+                // property), so the two tiers can never diverge.
+                match vm_array_len(ctx, funcs, regs[*arr as usize]) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
                 }
             }
             Op::CollectionSize { dst, recv } => {
@@ -3430,6 +3387,230 @@ fn vm_array_index_get(
         cur = ctx.realm.object_proto(p);
     }
     Ok(NanBox::undefined())
+}
+
+/// The interpreter's real computed element **get** `obj[key]` (`Op::GetKey`'s
+/// semantics), factored out so the bytecode VM **and** the generic-JIT runtime
+/// helper ([`jit_helper_get_elem`]) share one code path and can never diverge: a
+/// canonical non-negative integer index on a plain array reads element storage
+/// (present element / hole → prototype walk / OOB → `undefined`, via
+/// [`vm_array_index_get`]); otherwise `ToPropertyKey(key)` (an object key runs its
+/// `toString`) then a canonical numeric-string array index, a computed `.length`
+/// (array or string UTF-16 code-unit count), an accessor getter (run once with
+/// `recv` as `this`), or an ordinary property read. `Err(Thrown)` on a getter
+/// throw; `Err(NotAnObject)` when `recv` is not a heap object (the same fault the
+/// interpreter's `?` raised).
+fn vm_get_elem(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: NanBox,
+) -> Result<NanBox, VmError> {
+    let handle = recv
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    match key.as_number() {
+        // A plain Array index in [0, 2**32−1): a present own element wins; a hole
+        // or out-of-range index consults the prototype chain. Typed arrays and the
+        // boundary value 2**32−1 (an ordinary named property) fall to the `_` arm.
+        Some(n)
+            if ctx.realm.typed_len(handle).is_none()
+                && ctx.realm.is_array(handle)
+                && n >= 0.0
+                && n == (n as u64) as f64
+                && (n as u64) < u64::from(u32::MAX) =>
+        {
+            vm_array_index_get(ctx, funcs, handle, n as usize, recv)
+        }
+        _ => {
+            // ToPropertyKey: an object key uses its `toString`.
+            let pk = to_primitive(ctx, funcs, key, false);
+            let ks = ctx.realm.to_display_string(pk);
+            // A canonical numeric string key on an array (`arr["0"]`) reads the
+            // element, like `arr[0]` — for a valid array index [0, 2**32−1); the
+            // boundary value is an ordinary property.
+            if ctx.realm.is_array(handle)
+                && let Ok(i) = ks.parse::<usize>()
+                && alloc::format!("{i}") == ks
+                && (i as u64) < u64::from(u32::MAX)
+            {
+                vm_array_index_get(ctx, funcs, handle, i, recv)
+            } else if ks == "length"
+                && let Some(len) = ctx.realm.array_length(handle).or_else(|| {
+                    // String length counts UTF-16 code units (astral chars = 2, a
+                    // lone surrogate = 1).
+                    ctx.realm
+                        .string_bytes(handle)
+                        .map(|b| crate::wtf8::utf16_len(&b))
+                })
+            {
+                // Computed `arr["length"]` / `str["length"]`.
+                Ok(NanBox::number(len as f64))
+            } else if let Some((getter, _)) = ctx.realm.accessor(handle, &ks)
+                && getter.as_handle().is_some()
+            {
+                // A getter accessor under a (possibly numeric) string key — invoke
+                // it with the receiver as `this`.
+                call_closure(ctx, funcs, getter, &[], recv)
+            } else {
+                Ok(ctx
+                    .realm
+                    .get_property(handle, &ks)
+                    .unwrap_or(NanBox::undefined()))
+            }
+        }
+    }
+}
+
+/// The interpreter's real computed element **set** `obj[key] = value`
+/// (`Op::SetKey`'s semantics), factored out so the bytecode VM **and** the
+/// generic-JIT runtime helper ([`jit_helper_set_elem`]) share one code path: a
+/// typed-array element (ToBigInt-coercing for a BigInt view), a canonical array
+/// index (with the refuse-past-cap → catchable `RangeError`), a computed
+/// `arr.length` resize, `regex.lastIndex`, a canonical numeric-string array index,
+/// else an ordinary property store. Returns `Err(VmError::Unsupported)` for the
+/// descriptor-aware cases the tree-walker owns (a demoted/frozen array index, a
+/// non-writable `length`) — the same fault the interpreter raised to fall back —
+/// and `Err(Thrown)` for a `RangeError` / a BigInt-coercion `TypeError`.
+fn vm_set_elem(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: NanBox,
+    value: NanBox,
+) -> Result<(), VmError> {
+    let handle = recv
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    match key.as_number() {
+        Some(n) if ctx.realm.typed_len(handle).is_some() => {
+            // A numeric key on a typed array writes through to its bytes; a BigInt
+            // element ToBigInt-coerces (Number throws).
+            let i = n as usize;
+            match coerce_bigint_typed_write(ctx.realm, handle, value) {
+                Ok(v) => {
+                    ctx.realm.set_element(handle, i, v);
+                    Ok(())
+                }
+                Err(e) => Err(VmError::Thrown(e)),
+            }
+        }
+        // A canonical non-negative integer index in [0, 2**32−1). A negative or
+        // fractional key (`a[-1]`, `a[1.5]`) is NOT an array index — `as u64` would
+        // truncate it to a real index — so it falls through to the `_` arm and
+        // becomes an ordinary property.
+        Some(n)
+            if ctx.realm.is_array(handle)
+                && n >= 0.0
+                && n == (n as u64) as f64
+                && (n as u64) < u64::from(u32::MAX) =>
+        {
+            // C1: refuse-past-cap surfaces as a catchable RangeError (see
+            // `Op::SetElem`).
+            let i = n as usize;
+            if i >= ctx.realm.limits.max_array_len {
+                let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                return Err(VmError::Thrown(e));
+            }
+            // A demoted / accessor index (or frozen/sealed array) needs the
+            // descriptor-aware tree-walker store. Fault to it.
+            if ctx.realm.array_index_has_override(handle, i) {
+                return Err(VmError::Unsupported);
+            }
+            ctx.realm.set_element(handle, i, value);
+            Ok(())
+        }
+        _ => {
+            // ToPropertyKey: an object key uses its `toString`.
+            let pk = to_primitive(ctx, funcs, key, false);
+            let ks = ctx.realm.to_display_string(pk);
+            // C1: a computed `arr["length"] = n` (numeric string key) on an array
+            // resizes; `ToUint32(v)` must equal `ToNumber(v)` (else a catchable
+            // `RangeError`).
+            if ctx.realm.is_array(handle) && ks == "length" {
+                if let Some(n) = ctx.realm.array_length_uint32(value) {
+                    if ctx
+                        .realm
+                        .array_length_set_needs_slow_path(handle, n as usize)
+                    {
+                        return Err(VmError::Unsupported);
+                    }
+                    ctx.realm.set_array_length(handle, n as usize);
+                } else {
+                    let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                    return Err(VmError::Thrown(e));
+                }
+                return Ok(());
+            }
+            if ks == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
+                set_regex_last_index_value(ctx.realm, handle, value);
+                return Ok(());
+            }
+            // A canonical numeric string key on an array (`arr["0"] = v`) addresses
+            // element storage, like `arr[0] = v` — for a valid index in
+            // [0, 2**32−1). A demoted/accessor index faults to the tree-walker.
+            if ctx.realm.is_array(handle)
+                && let Ok(i) = ks.parse::<usize>()
+                && alloc::format!("{i}") == ks
+                && (i as u64) < u64::from(u32::MAX)
+            {
+                if i >= ctx.realm.limits.max_array_len {
+                    let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                    return Err(VmError::Thrown(e));
+                }
+                if ctx.realm.array_index_has_override(handle, i) {
+                    return Err(VmError::Unsupported);
+                }
+                ctx.realm.set_element(handle, i, value);
+                return Ok(());
+            }
+            ctx.realm.set_property(handle, &ks, value);
+            Ok(())
+        }
+    }
+}
+
+/// The interpreter's real `.length` read (`Op::ArrayLen`'s semantics), factored
+/// out so the bytecode VM **and** the generic-JIT runtime helper
+/// ([`jit_helper_array_len`]) share one code path: a VM function's declared
+/// parameter count (from its proto), an array's length or a string's UTF-16
+/// code-unit count, else an explicit `length` data property (e.g. a regex match
+/// result). `Err(NotAnObject)` when `recv` is not a heap object.
+fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox, VmError> {
+    let handle = recv
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    // A VM function (a tagged closure array) reports its parameter count from the
+    // proto, not the backing array's length.
+    if ctx.realm.is_vm_function(handle) {
+        let n = ctx
+            .realm
+            .get_element(handle, 0)
+            .as_number()
+            .and_then(|f| funcs.get(f as usize))
+            .map_or(0, |p| p.length);
+        Ok(NanBox::number(n as f64))
+    } else {
+        // `.length` on an array, or a string's UTF-16 code-unit count (astral
+        // chars = 2, a lone surrogate = 1).
+        let len = ctx.realm.array_length(handle).or_else(|| {
+            ctx.realm
+                .string_bytes(handle)
+                .map(|b| crate::wtf8::utf16_len(&b))
+        });
+        Ok(match len {
+            Some(n) => NanBox::number(n as f64),
+            // Otherwise an explicit `length` data property (e.g. a regex match
+            // result, which is object-shaped here), else undefined.
+            None => ctx
+                .realm
+                .get_property(handle, "length")
+                .unwrap_or(NanBox::undefined()),
+        })
+    }
 }
 
 fn call_closure(
@@ -12231,5 +12412,396 @@ mod generic_jit_tests {
             "f",
         );
         assert_eq!(diff_ok(&funcs, f, &[]).as_number(), Some(42.0));
+    }
+
+    // --- Pass 5: array element access + string ops ---
+
+    /// A dense number-array built in `ctx`'s realm, returned as a `NanBox`.
+    fn mk_array(ctx: &mut Ctx, elems: &[f64]) -> NanBox {
+        let v: Vec<NanBox> = elems.iter().map(|&n| NanBox::number(n)).collect();
+        NanBox::handle(ctx.realm.new_array(v).to_raw())
+    }
+
+    /// `getElem(a, i){ return a[i]; }` — a single `Op::GetKey`.
+    fn build_get_elem() -> (Vec<FnProto>, usize) {
+        let mut funcs = p3_funcs();
+        let f = push_proto(
+            &mut funcs,
+            "getElem",
+            alloc::vec![
+                Op::GetKey {
+                    dst: 2,
+                    obj: 0,
+                    key: 1,
+                },
+                Op::Return { src: 2 },
+            ],
+            3,
+            2,
+        );
+        (funcs, f)
+    }
+
+    /// `setElem(a, i, v){ a[i] = v; return a[i]; }` — an `Op::SetKey` then a read-back.
+    fn build_set_elem() -> (Vec<FnProto>, usize) {
+        let mut funcs = p3_funcs();
+        let f = push_proto(
+            &mut funcs,
+            "setElem",
+            alloc::vec![
+                Op::SetKey {
+                    obj: 0,
+                    key: 1,
+                    src: 2,
+                },
+                Op::GetKey {
+                    dst: 3,
+                    obj: 0,
+                    key: 1,
+                },
+                Op::Return { src: 3 },
+            ],
+            4,
+            3,
+        );
+        (funcs, f)
+    }
+
+    /// A dense in-bounds `a[i]` read: JIT-forced === interpreter for every index.
+    #[test]
+    fn generic_get_elem_dense_in_bounds() {
+        let (funcs, f) = build_get_elem();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers())
+            .expect("generic-eligible");
+        assert!(jit.is_generic(), "must be the generic tier");
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let a = mk_array(&mut ctx, &[10.0, 20.0, 30.0]);
+        for i in 0..3 {
+            let idx = NanBox::number(i as f64);
+            let interp = call(&mut ctx, &funcs, f, &[a, idx]).unwrap();
+            let jitted = call_generic(&mut ctx, &funcs, &jit, &[a, idx])
+                .unwrap()
+                .unwrap();
+            assert_eq!(interp.to_bits(), jitted.to_bits(), "a[{i}]");
+            assert_eq!(interp.as_number(), Some((i as f64 + 1.0) * 10.0));
+        }
+    }
+
+    /// `a[i] = v` write: JIT-forced === interpreter, and the write lands (separate
+    /// arrays per tier so each write is observed in isolation).
+    #[test]
+    fn generic_set_elem_write() {
+        let (funcs, f) = build_set_elem();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        assert!(jit.is_generic());
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let ai = mk_array(&mut ctx, &[1.0, 2.0, 3.0]);
+        let aj = mk_array(&mut ctx, &[1.0, 2.0, 3.0]);
+        let idx = NanBox::number(1.0);
+        let v = NanBox::number(99.0);
+        let interp = call(&mut ctx, &funcs, f, &[ai, idx, v]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[aj, idx, v])
+            .unwrap()
+            .unwrap();
+        assert_eq!(interp.as_number(), Some(99.0));
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+        // The JIT write actually landed on element 1 of its array.
+        let h = aj.as_handle().map(Handle::from_raw).unwrap();
+        assert_eq!(ctx.realm.get_element(h, 1).as_number(), Some(99.0));
+    }
+
+    /// An out-of-bounds read (`a[5]` on a length-3 array) is `undefined` on both
+    /// tiers (the helper's element-not-present → prototype-walk → `undefined` path).
+    #[test]
+    fn generic_get_elem_out_of_bounds_undefined() {
+        let (funcs, f) = build_get_elem();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let a = mk_array(&mut ctx, &[10.0, 20.0, 30.0]);
+        let idx = NanBox::number(5.0);
+        let interp = call(&mut ctx, &funcs, f, &[a, idx]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[a, idx])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            interp.unpack(),
+            crate::nanbox::Unpacked::Undefined
+        ));
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// A negative (`a[-1]`) and a fractional (`a[1.5]`) index are ordinary named
+    /// properties, not elements — `undefined` here — and match the interpreter.
+    #[test]
+    fn generic_get_elem_negative_and_fractional_index() {
+        let (funcs, f) = build_get_elem();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let a = mk_array(&mut ctx, &[10.0, 20.0, 30.0]);
+        for idx in [NanBox::number(-1.0), NanBox::number(1.5)] {
+            let interp = call(&mut ctx, &funcs, f, &[a, idx]).unwrap();
+            let jitted = call_generic(&mut ctx, &funcs, &jit, &[a, idx])
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                interp.unpack(),
+                crate::nanbox::Unpacked::Undefined
+            ));
+            assert_eq!(interp.to_bits(), jitted.to_bits());
+        }
+    }
+
+    /// A string index `s[0]` and `s.length`: both flow through the element / length
+    /// helpers and match the interpreter exactly.
+    #[test]
+    fn generic_string_index_and_length() {
+        let (funcs, get) = build_get_elem();
+        let jit_get =
+            crate::jit::JitProto::compile_generic(&funcs[get], &jit_generic_helpers()).unwrap();
+        // A separate `lenOf(s){ return s.length; }` proto (Op::ArrayLen).
+        let mut funcs2 = p3_funcs();
+        let len = push_proto(
+            &mut funcs2,
+            "lenOf",
+            alloc::vec![Op::ArrayLen { dst: 1, arr: 0 }, Op::Return { src: 1 }],
+            2,
+            1,
+        );
+        let jit_len =
+            crate::jit::JitProto::compile_generic(&funcs2[len], &jit_generic_helpers()).unwrap();
+        assert!(jit_get.is_generic() && jit_len.is_generic());
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let s = NanBox::handle(ctx.realm.new_string("Hello").to_raw());
+
+        // s[0] — the bytecode `Op::GetKey` path resolves a string index as an
+        // ordinary property (`str["0"]`), which this VM leaves `undefined` (char
+        // indexing is a tree-walker concern); the point is JIT-forced === interp.
+        let idx0 = NanBox::number(0.0);
+        let i_ch = call(&mut ctx, &funcs, get, &[s, idx0]).unwrap();
+        let j_ch = call_generic(&mut ctx, &funcs, &jit_get, &[s, idx0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(i_ch.to_bits(), j_ch.to_bits());
+
+        // s.length
+        let i_len = call(&mut ctx, &funcs2, len, &[s]).unwrap();
+        let j_len = call_generic(&mut ctx, &funcs2, &jit_len, &[s])
+            .unwrap()
+            .unwrap();
+        assert_eq!(i_len.to_bits(), j_len.to_bits());
+        assert_eq!(i_len.as_number(), Some(5.0));
+    }
+
+    /// `a.length` on an array read via `Op::ArrayLen`: JIT-forced === interpreter.
+    #[test]
+    fn generic_array_length() {
+        let mut funcs = p3_funcs();
+        let len = push_proto(
+            &mut funcs,
+            "lenOf",
+            alloc::vec![Op::ArrayLen { dst: 1, arr: 0 }, Op::Return { src: 1 }],
+            2,
+            1,
+        );
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
+        assert!(jit.is_generic());
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let a = mk_array(&mut ctx, &[1.0, 2.0, 3.0, 4.0]);
+        let interp = call(&mut ctx, &funcs, len, &[a]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[a]).unwrap().unwrap();
+        assert_eq!(interp.as_number(), Some(4.0));
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// A throwing element access: a computed read `o[k]` where `k` names a getter
+    /// that throws. Both tiers throw the identical value, and the getter's side
+    /// effect runs EXACTLY once (no deopt-and-re-run on the exception path).
+    #[test]
+    fn generic_get_elem_throwing_getter_side_effect_once() {
+        let src = "function makeThrowGetter(){ return { c: 0, get g(){ this.c = this.c + 1; throw { message: 'boom' }; } }; }";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let mut funcs = compile_program(&program).expect("compile helpers");
+        let f = push_proto(
+            &mut funcs,
+            "getKeyed",
+            alloc::vec![
+                Op::GetKey {
+                    dst: 2,
+                    obj: 0,
+                    key: 1,
+                },
+                Op::Return { src: 2 },
+            ],
+            3,
+            2,
+        );
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        assert!(jit.is_generic());
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let oi = mint(&mut ctx, &funcs, "makeThrowGetter");
+        let oj = mint(&mut ctx, &funcs, "makeThrowGetter");
+        let k = NanBox::handle(ctx.realm.new_string("g").to_raw());
+        let interp = call(&mut ctx, &funcs, f, &[oi, k]);
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[oj, k]).unwrap();
+        let (vi, vj) = match (interp, jitted) {
+            (Err(VmError::Thrown(vi)), Err(VmError::Thrown(vj))) => (vi, vj),
+            other => panic!("expected both paths to throw, got {other:?}"),
+        };
+        let msg_i = ctx
+            .realm
+            .get_property(vi.as_handle().map(Handle::from_raw).unwrap(), "message");
+        let msg_j = ctx
+            .realm
+            .get_property(vj.as_handle().map(Handle::from_raw).unwrap(), "message");
+        assert_eq!(
+            msg_i.map(|m| ctx.realm.to_display_string(m)).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(
+            msg_i.map(|m| ctx.realm.to_display_string(m)),
+            msg_j.map(|m| ctx.realm.to_display_string(m))
+        );
+        // The counting getter ran exactly once per object.
+        let ci = ctx
+            .realm
+            .get_property(oi.as_handle().map(Handle::from_raw).unwrap(), "c");
+        let cj = ctx
+            .realm
+            .get_property(oj.as_handle().map(Handle::from_raw).unwrap(), "c");
+        assert_eq!(ci.and_then(|v| v.as_number()), Some(1.0));
+        assert_eq!(cj.and_then(|v| v.as_number()), Some(1.0));
+    }
+
+    /// An oversized array-index write (`a[2e8] = 1`, past `max_array_len` but below
+    /// 2**32−1) throws a `RangeError` identically on both tiers.
+    #[test]
+    fn generic_set_elem_oversized_throws_identically() {
+        let (funcs, f) = build_set_elem();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let ai = mk_array(&mut ctx, &[1.0]);
+        let aj = mk_array(&mut ctx, &[1.0]);
+        let idx = NanBox::number(200_000_000.0);
+        let v = NanBox::number(1.0);
+        let interp = call(&mut ctx, &funcs, f, &[ai, idx, v]);
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[aj, idx, v]).unwrap();
+        let (vi, vj) = match (interp, jitted) {
+            (Err(VmError::Thrown(vi)), Err(VmError::Thrown(vj))) => (vi, vj),
+            other => panic!("expected both to throw, got {other:?}"),
+        };
+        let name_i = ctx
+            .realm
+            .get_property(vi.as_handle().map(Handle::from_raw).unwrap(), "name");
+        let name_j = ctx
+            .realm
+            .get_property(vj.as_handle().map(Handle::from_raw).unwrap(), "name");
+        assert_eq!(
+            name_i.map(|m| ctx.realm.to_display_string(m)).as_deref(),
+            Some("RangeError")
+        );
+        assert_eq!(
+            name_i.map(|m| ctx.realm.to_display_string(m)),
+            name_j.map(|m| ctx.realm.to_display_string(m))
+        );
+    }
+
+    /// A frozen-array element write faults to the tree-walker on BOTH tiers
+    /// identically (`Err(Unsupported)`) — the descriptor-aware store the JIT helper
+    /// correctly declines, rather than silently mutating a frozen array.
+    #[test]
+    fn generic_set_elem_frozen_faults_identically() {
+        let (funcs, f) = build_set_elem();
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let ai = mk_array(&mut ctx, &[1.0, 2.0, 3.0]);
+        let aj = mk_array(&mut ctx, &[1.0, 2.0, 3.0]);
+        ctx.realm
+            .freeze_object(ai.as_handle().map(Handle::from_raw).unwrap());
+        ctx.realm
+            .freeze_object(aj.as_handle().map(Handle::from_raw).unwrap());
+        let idx = NanBox::number(0.0);
+        let v = NanBox::number(99.0);
+        let interp = call(&mut ctx, &funcs, f, &[ai, idx, v]);
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[aj, idx, v]).unwrap();
+        assert!(
+            matches!(interp, Err(VmError::Unsupported)),
+            "interp should fault: {interp:?}"
+        );
+        assert!(
+            matches!(jitted, Err(VmError::Unsupported)),
+            "jit should fault identically: {jitted:?}"
+        );
+    }
+
+    /// A hot loop summing `a[i]` over an array (`Op::ArrayLen` + `Op::GetKey` +
+    /// `Op::Lt` + `Op::AddValue` + a backward branch): JIT-forced === interpreter,
+    /// exercising the element + length helpers under a real loop.
+    #[test]
+    fn generic_sum_array_loop_matches() {
+        let mut funcs = p3_funcs();
+        // 0=a 1=len 2=i 3=s 4=const1 5=cond 6=elem.
+        let sum = push_proto(
+            &mut funcs,
+            "sumArr",
+            alloc::vec![
+                Op::ArrayLen { dst: 1, arr: 0 }, // 0: len = a.length
+                Op::LoadConst {
+                    dst: 2,
+                    value: NanBox::number(0.0)
+                }, // 1: i = 0
+                Op::LoadConst {
+                    dst: 3,
+                    value: NanBox::number(0.0)
+                }, // 2: s = 0
+                Op::LoadConst {
+                    dst: 4,
+                    value: NanBox::number(1.0)
+                }, // 3: const 1
+                Op::Lt { dst: 5, a: 2, b: 1 },   // 4: cond = i < len
+                Op::JumpIfFalse {
+                    cond: 5,
+                    target: 10
+                }, // 5: exit
+                Op::GetKey {
+                    dst: 6,
+                    obj: 0,
+                    key: 2,
+                }, // 6: elem = a[i]
+                Op::AddValue { dst: 3, a: 3, b: 6 }, // 7: s = s + elem
+                Op::AddValue { dst: 2, a: 2, b: 4 }, // 8: i = i + 1
+                Op::Jump { target: 4 },          // 9: loop
+                Op::Return { src: 3 },           // 10: return s
+            ],
+            7,
+            1,
+        );
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[sum], &jit_generic_helpers()).unwrap();
+        assert!(jit.is_generic(), "must be the generic tier");
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        for elems in [
+            &[][..],
+            &[42.0][..],
+            &[1.0, 2.0, 3.0, 4.0, 5.0][..],
+            &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0][..],
+        ] {
+            let a = mk_array(&mut ctx, elems);
+            let interp = call(&mut ctx, &funcs, sum, &[a]).unwrap();
+            let jitted = call_generic(&mut ctx, &funcs, &jit, &[a]).unwrap().unwrap();
+            let expect: f64 = elems.iter().sum();
+            assert_eq!(interp.as_number(), Some(expect));
+            assert_eq!(interp.to_bits(), jitted.to_bits());
+        }
     }
 }
