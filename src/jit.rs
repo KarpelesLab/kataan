@@ -2186,6 +2186,15 @@ pub struct GenericHelpers {
     /// interpreter. Re-invoked on every fast-path entry so a reallocated arena
     /// (`slots.push`) is always addressed at its current base.
     pub arena: JitArenaHelper,
+    /// The array writability probe (`jit_array_unrestricted`) — returns `1` iff the
+    /// receiver is a plain dense array that is **not** frozen/sealed, carries no
+    /// per-index override (accessor / non-writable / hidden) aux object, and whose
+    /// dense length is within the realm's `max_array_len`. The inline array-element
+    /// SET fast path takes its in-place store only when this returns `1`; otherwise
+    /// it routes to `jit_helper_set_elem` (the descriptor-aware / growing / throwing
+    /// path). A leaf, non-allocating read (`(ctx, recv) -> 0 | 1`), so it is
+    /// GC-safe and cannot realloc the arena mid-fast-path.
+    pub array_unrestricted: JitTruthyHelper,
 }
 
 /// The base pointer + length of the object heap's slot array, returned by the
@@ -2246,6 +2255,20 @@ pub(crate) struct JitLayout {
     pub cache_slot_off: i32,
     /// `PropertyCache`-relative offset of the `hits: u32` counter.
     pub cache_hits_off: i32,
+    /// `Cell::Array` discriminant byte — the inline array-element fast paths guard
+    /// the receiver cell tag against this.
+    pub cell_array_disc: u8,
+    /// Slot-relative offset of a `Cell::Array`'s element `Vec` data pointer.
+    pub off_arr_ptr: i32,
+    /// Slot-relative offset of a `Cell::Array`'s element `Vec` length (the dense
+    /// bound for the inline element GET/SET bounds check).
+    pub off_arr_len: i32,
+    /// Slot-relative offset of the object's `frozen: bool` (inline SET writability
+    /// gate: a non-zero byte routes the store to the helper).
+    pub off_frozen: i32,
+    /// Slot-relative offset of the object's `readonly` Vec length (inline SET
+    /// writability gate: a non-zero length routes the store to the helper).
+    pub off_readonly_len: i32,
 }
 
 /// Assembles the [`JitLayout`] from the four per-type probes, combining the
@@ -2284,6 +2307,14 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             cache_shape_off: to_i32(cache.shape_off),
             cache_slot_off: to_i32(cache.slot_off),
             cache_hits_off: to_i32(cache.hits_off),
+            cell_array_disc: cell.array_disc,
+            // An array's element Vec sits at `cell_base + array_vec_off`; its data
+            // ptr / len are the generic `Vec<NanBox>` offsets within that Vec.
+            off_arr_ptr: to_i32(cell_base + cell.array_vec_off + obj.vec_ptr_off),
+            off_arr_len: to_i32(cell_base + cell.array_vec_off + obj.vec_len_off),
+            // `frozen`/`readonly` are `Object` fields, relative to the Object base.
+            off_frozen: to_i32(obj_base + obj.frozen_off),
+            off_readonly_len: to_i32(obj_base + obj.readonly_len_off),
         }
     })
 }
@@ -3415,6 +3446,53 @@ impl X64Assembler {
         self.code.extend_from_slice(&disp.to_le_bytes());
         self.code.push(imm);
     }
+
+    // --- inline property-SET + array-element GET/SET fast paths (generic tier).
+    // These extend the Pass-6 property-GET primitives with in-place stores and the
+    // array-cell reads at runtime-verified offsets (see `compute_jit_layout`). ---
+
+    /// `mov rdx, [rbp+disp]` — load a register-file slot (the value to store) into
+    /// `rdx`, the source for an in-place slot/element write.
+    pub fn load_rdx(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x48, 0x8b, 0x95]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `mov [r11 + rax*8], rdx` — store `rdx` at index `rax` of the `Vec` data
+    /// pointer in `r11` (the inline slot / element write; mirror of
+    /// [`mov_rax_at_r11_rax8`](Self::mov_rax_at_r11_rax8)).
+    pub fn mov_at_r11_rax8_rdx(&mut self) {
+        self.code.extend_from_slice(&[0x49, 0x89, 0x14, 0xc3]);
+    }
+    /// `cmp qword [rcx+disp32], imm8` — compare an 8-byte field at the slot pointer
+    /// against a small sign-extended immediate (the `readonly` Vec length vs 0).
+    pub fn cmp_qword_at_rcx_imm(&mut self, disp: i32, imm: u8) {
+        self.code.extend_from_slice(&[0x48, 0x83, 0xb9]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.push(imm);
+    }
+    /// `mov r8, [rcx+disp32]` — load an 8-byte field at the slot pointer into `r8`
+    /// (the array element `Vec`'s dense length).
+    pub fn mov_r8_at_rcx(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x4c, 0x8b, 0x81]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+    /// `cmp rax, r8` — compare the (unsigned) element index in `rax` against the
+    /// dense length in `r8`; a following `jae` bails on OOB or a negative index.
+    pub fn cmp_rax_r8(&mut self) {
+        self.code.extend_from_slice(&[0x4c, 0x39, 0xc0]);
+    }
+    /// `cvttsd2si rax, xmm0` — convert `xmm0` (an f64) to a signed i64 in `rax`
+    /// with truncation toward zero (an out-of-range / NaN operand yields the x86
+    /// "integer indefinite" `i64::MIN`, which the subsequent guards reject).
+    pub fn cvttsd2si_rax_xmm0(&mut self) {
+        self.code.extend_from_slice(&[0xf2, 0x48, 0x0f, 0x2c, 0xc0]);
+    }
+    /// `cvtsi2sd xmm1, rax` — convert the i64 in `rax` back to an f64 in `xmm1`, so
+    /// a `ucomisd xmm0, xmm1` can verify the index was an exact integer (a
+    /// fractional index like `a[1.5]` fails the round-trip → helper).
+    pub fn cvtsi2sd_xmm1_rax(&mut self) {
+        self.code.extend_from_slice(&[0xf2, 0x48, 0x0f, 0x2a, 0xc8]);
+    }
 }
 
 /// Whether the JIT can emit and run native code on this target.
@@ -4071,6 +4149,7 @@ impl JitFunction {
         let call_helper = helpers.call as usize as u64;
         let call_native_helper = helpers.call_native as usize as u64;
         let arena_helper = helpers.arena as usize as u64;
+        let array_unrestricted_helper = helpers.array_unrestricted as usize as u64;
         // Runtime-verified heap layout for the inline monomorphic property-get fast
         // path (offsets/discriminants derived by pointer arithmetic on real
         // instances; see `compute_jit_layout` + the `jit_layout_matches_safe_reads`
@@ -4300,7 +4379,82 @@ impl JitFunction {
                         return None;
                     }
                     let s = sites.get(site as usize)?;
+                    let helper = a.new_label();
+                    let done = a.new_label();
+                    // ===== inline monomorphic property-SET fast path =====
+                    // The walk to the object's shape word is IDENTICAL to GetProp; on
+                    // a shape-identity hit this does an in-place `slots[slot] = val`,
+                    // but ONLY when the store is provably sound:
+                    //  * `val` is not a heap handle — a non-pointer value needs no
+                    //    generational write barrier, so skipping it is correct (a
+                    //    handle value falls to the helper, which applies the barrier);
+                    //  * the object is not frozen and has an empty `readonly` list —
+                    //    exactly `Object::cached_set`'s success precondition, so the
+                    //    inline store never diverges from the interpreter (a frozen /
+                    //    read-only target falls to the helper).
+                    // Any guard miss routes to `jit_helper_set_prop`, which arms/updates
+                    // the IC and handles transitions, accessors, dictionaries, frozen /
+                    // read-only targets, and throws.
+                    //
+                    // Write-barrier guard: bail if `val` is a heap handle.
+                    a.load_rax(disp(val));
+                    a.movabs_r11(HANDLE_TAG as i64);
+                    a.and_rax_r11();
+                    a.cmp_rax_r11();
+                    a.je(helper); // val is a handle → helper (applies write barrier)
+                    // arena = jit_arena(ctx): rax = slot-array base, rdx = len.
+                    a.mov_rdi_r15();
+                    a.movabs_rax(arena_helper as i64);
+                    a.call_rax();
+                    a.mov_r10_rax(); // r10 = arena base
+                    a.load_rax(disp(obj)); // rax = obj NanBox bits
+                    a.movabs_r11(HANDLE_TAG as i64);
+                    a.mov_rcx_rax();
+                    a.and_rcx_r11();
+                    a.cmp_rcx_r11();
+                    a.jne(helper); // not a heap handle → helper
+                    a.mov_r8_rax();
+                    a.shr_r8_imm(32); // r8 = generation (low 16)
+                    a.movabs_r11(0xffff_ffff_i64);
+                    a.and_rax_r11(); // rax = handle index
+                    a.cmp_rax_rdx();
+                    a.jae(helper); // index >= arena len → helper
+                    a.imul_rax_imm(layout.slot_stride);
+                    a.add_rax_r10();
+                    a.mov_rcx_rax(); // rcx = &Slot
+                    a.cmp_byte_at_rcx_imm(0, layout.slot_occupied_disc);
+                    a.jne(helper);
+                    a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
+                    a.jne(helper);
+                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
+                    a.jne(helper);
+                    a.cmp_byte_at_rcx_imm(layout.off_od_tag, layout.obj_shaped_disc);
+                    a.jne(helper);
+                    // Writability gate: object.frozen == false AND readonly Vec empty.
+                    a.cmp_byte_at_rcx_imm(layout.off_frozen, 0);
+                    a.jne(helper); // frozen → helper
+                    a.cmp_qword_at_rcx_imm(layout.off_readonly_len, 0);
+                    a.jne(helper); // some own property is non-writable → helper
+                    // shape-Rc word == cache.shape (a cold/mismatched cache misses).
+                    a.mov_rax_at_rcx(layout.off_shape);
+                    a.movabs_r11(s.cache_ptr as i64); // r11 = &PropertyCache
+                    a.cmp_rax_at_r11(layout.cache_shape_off);
+                    a.jne(helper);
+                    // slot = cache.slot (u32); bounds-check vs the slot Vec length.
+                    a.mov_eax_at_r11(layout.cache_slot_off);
+                    a.cmp_rax_at_rcx(layout.off_slots_len);
+                    a.jae(helper);
+                    // slots_ptr[slot] = val.
+                    a.mov_r11_at_rcx(layout.off_slots_ptr); // r11 = slot Vec data ptr
+                    a.load_rdx(disp(val)); // rdx = value to store
+                    a.mov_at_r11_rax8_rdx(); // slots[slot] = val
+                    // Bump the site IC hit counter (proves the inline path served it).
+                    a.movabs_r11(s.cache_ptr as i64);
+                    a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
+                    a.jmp(done);
+                    // ===== helper slow path =====
                     // jit_helper_set_prop(ctx, obj, key_ptr, key_len, cache, val).
+                    a.bind(helper);
                     a.mov_rdi_r15(); // rdi = ctx
                     a.load_argreg(1, disp(obj)); // rsi = obj
                     a.movabs_argreg(2, s.key_ptr as i64); // rdx = key_ptr
@@ -4311,29 +4465,175 @@ impl JitFunction {
                     a.call_rax();
                     // Result (undefined) is discarded; only the throw sentinel matters.
                     throw_check!();
+                    a.bind(done);
                 }
                 GenericOp::GetElem { dst, obj, index } => {
                     if !ok(dst) || !ok(obj) || !ok(index) {
                         return None;
                     }
-                    // jit_helper_get_elem(ctx, recv, key). Helper-only: `vm_get_elem`
-                    // runs the full array/typed-array/string/accessor semantics. A
-                    // fully-inline dense-array load is deferred to Pass 6 (it needs
-                    // stable/repr(C) access to the element storage, as with the
-                    // Pass 2 property shape guard).
+                    let helper = a.new_label();
+                    let done = a.new_label();
+                    // ===== inline dense-array element GET fast path =====
+                    // Walk the arena to the receiver cell (as GetProp), guard the cell
+                    // tag == Array, guard the index is a non-negative integer NanBox
+                    // in `[0, dense_len)`, load `elems[idx]`, and — matching the
+                    // interpreter's `vm_array_index_get` exactly — bail on a hole
+                    // (an in-range hole consults the prototype chain, which the helper
+                    // does). Non-array receivers (typed array / string / object),
+                    // non-integer / negative / OOB indices, and holes all route to
+                    // `jit_helper_get_elem`. No allocation and no call after
+                    // `jit_arena`, so the raw walk stays GC- and realloc-safe.
+                    a.mov_rdi_r15();
+                    a.movabs_rax(arena_helper as i64);
+                    a.call_rax();
+                    a.mov_r10_rax(); // r10 = arena base
+                    a.load_rax(disp(obj)); // rax = recv NanBox bits
+                    a.movabs_r11(HANDLE_TAG as i64);
+                    a.mov_rcx_rax();
+                    a.and_rcx_r11();
+                    a.cmp_rcx_r11();
+                    a.jne(helper); // not a heap handle → helper
+                    a.mov_r8_rax();
+                    a.shr_r8_imm(32); // r8 = generation
+                    a.movabs_r11(0xffff_ffff_i64);
+                    a.and_rax_r11(); // rax = handle index
+                    a.cmp_rax_rdx();
+                    a.jae(helper); // index >= arena len → helper
+                    a.imul_rax_imm(layout.slot_stride);
+                    a.add_rax_r10();
+                    a.mov_rcx_rax(); // rcx = &Slot
+                    a.cmp_byte_at_rcx_imm(0, layout.slot_occupied_disc);
+                    a.jne(helper);
+                    a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
+                    a.jne(helper);
+                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
+                    a.jne(helper); // not a dense array → helper
+                    // Index guard: a number NanBox that is an exact non-negative int.
+                    a.load_rax(disp(index));
+                    a.movabs_r11(QNAN as i64);
+                    a.and_rax_r11();
+                    a.cmp_rax_r11();
+                    a.je(helper); // boxed (non-number) index → helper
+                    a.movsd_xmm0_mem(disp(index)); // xmm0 = index f64
+                    a.cvttsd2si_rax_xmm0(); // rax = trunc(index)
+                    a.cvtsi2sd_xmm1_rax(); // xmm1 = (f64)rax
+                    a.ucomisd_xmm0_xmm1();
+                    a.jne(helper); // not exact (fractional index) → helper
+                    a.jp(helper); // unordered (NaN index) → helper
+                    // Bounds: rax (unsigned) < dense len (a negative index is huge).
+                    a.mov_r8_at_rcx(layout.off_arr_len);
+                    a.cmp_rax_r8();
+                    a.jae(helper); // OOB / negative → helper
+                    // elem = elems[idx].
+                    a.mov_r11_at_rcx(layout.off_arr_ptr); // r11 = elems data ptr
+                    a.mov_rax_at_r11_rax8(); // rax = elems[idx]
+                    // Hole guard: an in-range hole walks the prototype chain (helper).
+                    a.movabs_r11(NanBox::hole().to_bits() as i64);
+                    a.cmp_rax_r11();
+                    a.je(helper);
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                    // ===== helper slow path =====
+                    // jit_helper_get_elem(ctx, recv, key).
+                    a.bind(helper);
                     a.mov_rdi_r15(); // rdi = ctx
                     a.load_argreg(1, disp(obj)); // rsi = recv
                     a.load_argreg(2, disp(index)); // rdx = key
                     a.movabs_rax(get_elem_helper as i64);
                     a.call_rax();
-                    throw_check!();
+                    a.movabs_r11(NanBox::jit_throw_bits() as i64);
+                    a.cmp_rax_r11();
+                    a.je(throw_exit);
                     a.store_rax(disp(dst));
+                    a.bind(done);
                 }
                 GenericOp::SetElem { obj, index, val } => {
                     if !ok(obj) || !ok(index) || !ok(val) {
                         return None;
                     }
+                    let helper = a.new_label();
+                    let done = a.new_label();
+                    // ===== inline dense-array element SET fast path =====
+                    // An in-place `elems[idx] = val` store, taken only when it is
+                    // provably identical to the interpreter's `vm_set_elem`:
+                    //  * `val` is not a heap handle — no generational write barrier is
+                    //    needed (a handle value falls to the helper, which applies it);
+                    //  * `jit_array_unrestricted(ctx, recv)` returns 1 — the receiver
+                    //    is a plain dense array, not frozen/sealed, with no per-index
+                    //    override aux object, and dense-length ≤ `max_array_len`
+                    //    (so an in-bounds index can never trip the refuse-past-cap
+                    //    RangeError, and `array_index_has_override` is false);
+                    //  * the index is an exact non-negative integer strictly inside the
+                    //    dense length (an in-bounds store never grows the array).
+                    // Every other case (a handle value, a frozen / sealed / override
+                    // array, a growing / OOB / non-integer index, a typed-array /
+                    // string / object receiver) routes to `jit_helper_set_elem`. Both
+                    // guard helpers are leaf, non-allocating reads, and there is no
+                    // call after `jit_arena`, so the raw walk stays GC-/realloc-safe.
+                    //
+                    // Write-barrier guard: bail if `val` is a heap handle.
+                    a.load_rax(disp(val));
+                    a.movabs_r11(HANDLE_TAG as i64);
+                    a.and_rax_r11();
+                    a.cmp_rax_r11();
+                    a.je(helper); // handle value → helper (applies write barrier)
+                    // Restriction guard: jit_array_unrestricted(ctx, recv) → rax.
+                    a.mov_rdi_r15();
+                    a.load_argreg(1, disp(obj)); // rsi = recv
+                    a.movabs_rax(array_unrestricted_helper as i64);
+                    a.call_rax();
+                    a.test_rax_rax();
+                    a.je(helper); // restricted / not a plain array → helper
+                    // arena = jit_arena(ctx): rax = base, rdx = len. No call after this.
+                    a.mov_rdi_r15();
+                    a.movabs_rax(arena_helper as i64);
+                    a.call_rax();
+                    a.mov_r10_rax(); // r10 = arena base
+                    a.load_rax(disp(obj)); // rax = recv bits
+                    a.movabs_r11(HANDLE_TAG as i64);
+                    a.mov_rcx_rax();
+                    a.and_rcx_r11();
+                    a.cmp_rcx_r11();
+                    a.jne(helper);
+                    a.mov_r8_rax();
+                    a.shr_r8_imm(32); // r8 = generation
+                    a.movabs_r11(0xffff_ffff_i64);
+                    a.and_rax_r11(); // rax = handle index
+                    a.cmp_rax_rdx();
+                    a.jae(helper);
+                    a.imul_rax_imm(layout.slot_stride);
+                    a.add_rax_r10();
+                    a.mov_rcx_rax(); // rcx = &Slot
+                    a.cmp_byte_at_rcx_imm(0, layout.slot_occupied_disc);
+                    a.jne(helper);
+                    a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
+                    a.jne(helper);
+                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
+                    a.jne(helper); // not a dense array → helper
+                    // Index guard: exact non-negative integer NanBox.
+                    a.load_rax(disp(index));
+                    a.movabs_r11(QNAN as i64);
+                    a.and_rax_r11();
+                    a.cmp_rax_r11();
+                    a.je(helper);
+                    a.movsd_xmm0_mem(disp(index));
+                    a.cvttsd2si_rax_xmm0();
+                    a.cvtsi2sd_xmm1_rax();
+                    a.ucomisd_xmm0_xmm1();
+                    a.jne(helper);
+                    a.jp(helper);
+                    // Bounds: idx strictly < dense len (an in-bounds store never grows).
+                    a.mov_r8_at_rcx(layout.off_arr_len);
+                    a.cmp_rax_r8();
+                    a.jae(helper);
+                    // elems[idx] = val.
+                    a.mov_r11_at_rcx(layout.off_arr_ptr); // r11 = elems data ptr
+                    a.load_rdx(disp(val)); // rdx = value
+                    a.mov_at_r11_rax8_rdx(); // elems[idx] = val
+                    a.jmp(done);
+                    // ===== helper slow path =====
                     // jit_helper_set_elem(ctx, recv, key, val).
+                    a.bind(helper);
                     a.mov_rdi_r15(); // rdi = ctx
                     a.load_argreg(1, disp(obj)); // rsi = recv
                     a.load_argreg(2, disp(index)); // rdx = key
@@ -4342,6 +4642,7 @@ impl JitFunction {
                     a.call_rax();
                     // Result (undefined) is discarded; only the throw sentinel matters.
                     throw_check!();
+                    a.bind(done);
                 }
                 GenericOp::ArrayLen { dst, arr } => {
                     if !ok(dst) || !ok(arr) {

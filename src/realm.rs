@@ -2440,6 +2440,29 @@ impl Realm {
         self.heap.slots_raw()
     }
 
+    /// Whether `handle` is a plain dense array on which the generic-JIT inline
+    /// element-SET fast path may store in place at any in-bounds index — i.e. it is
+    /// a [`Cell::Array`] that is **not** frozen/sealed, carries **no** per-index
+    /// override aux object (which could demote an index to an accessor /
+    /// non-writable / hidden property), and whose dense length is within
+    /// `max_array_len` (so an in-bounds index can never trip the refuse-past-cap
+    /// `RangeError`). This is exactly the negation of what
+    /// [`array_index_has_override`](Realm::array_index_has_override) consults plus
+    /// the length bound, evaluated once per store (a leaf, non-allocating read, so
+    /// it never reallocates the arena). Returns `false` for any non-array receiver.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_array_unrestricted(&self, handle: Handle) -> bool {
+        let raw = handle.to_raw();
+        let Some(a) = self.heap.get(handle).and_then(Cell::as_array) else {
+            return false;
+        };
+        !self.frozen_arrays.contains(&raw)
+            && !self.sealed_arrays.contains(&raw)
+            && !self.aux_props.contains_key(&raw)
+            && a.len() <= self.limits.max_array_len
+    }
+
     /// The inline-cache fast path for a plain object's `SetProp`: writes `value`
     /// to an *existing* own data property `key` on the object at `handle`,
     /// consulting `cache`, and reports whether the in-place write happened.

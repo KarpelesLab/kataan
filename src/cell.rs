@@ -293,9 +293,14 @@ pub(crate) struct CellLayout {
     pub object_disc: u8,
     /// Byte offset of the inner [`Object`] payload within the `Cell`.
     pub object_off: usize,
+    /// The `Cell::Array` discriminant byte value (tag at offset 0) — for the
+    /// inline array-element GET/SET fast paths.
+    pub array_disc: u8,
+    /// Byte offset of the inner `Vec<NanBox>` element store within a `Cell::Array`.
+    pub array_vec_off: usize,
 }
 
-/// Derives [`CellLayout`] from a real `Cell::Object`.
+/// Derives [`CellLayout`] from real `Cell::Object` and `Cell::Array` instances.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn jit_cell_layout() -> CellLayout {
     let cell = Cell::Object(Object::new(crate::shape::Shape::root()));
@@ -308,9 +313,27 @@ pub(crate) fn jit_cell_layout() -> CellLayout {
         Cell::Object(o) => core::ptr::addr_of!(*o) as usize - base,
         _ => unreachable!("just built a Cell::Object"),
     };
+    // A populated `Cell::Array` (a few elements so the inner `Vec` is a real,
+    // heap-backed allocation) to probe the Array discriminant + payload offset.
+    let arr = Cell::Array(alloc::vec![
+        NanBox::number(1.0),
+        NanBox::number(2.0),
+        NanBox::number(3.0)
+    ]);
+    let arr_base = core::ptr::addr_of!(arr) as usize;
+    // SAFETY: `arr` is a live, initialized `Cell`; its repr(u8) tag byte is in
+    // bounds and always a valid `u8`.
+    #[allow(unsafe_code)]
+    let array_disc = unsafe { *(arr_base as *const u8) };
+    let array_vec_off = match &arr {
+        Cell::Array(v) => core::ptr::addr_of!(*v) as usize - arr_base,
+        _ => unreachable!("just built a Cell::Array"),
+    };
     CellLayout {
         object_disc,
         object_off,
+        array_disc,
+        array_vec_off,
     }
 }
 

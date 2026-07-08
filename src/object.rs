@@ -768,6 +768,14 @@ pub(crate) struct ObjectLayout {
     pub vec_ptr_off: usize,
     /// Byte offset of the length within a `Vec<NanBox>`.
     pub vec_len_off: usize,
+    /// Byte offset of the `frozen: bool` field within `Object` (relative to the
+    /// `Object` base) — the inline property-SET fast path bails to the helper when
+    /// this byte is non-zero (a frozen object rejects writes).
+    pub frozen_off: usize,
+    /// Byte offset of the `readonly: Vec<..>`'s **length** word within `Object`
+    /// (relative to the `Object` base) — the inline property-SET fast path bails to
+    /// the helper whenever this is non-zero (some own property may be non-writable).
+    pub readonly_len_off: usize,
 }
 
 /// Derives [`ObjectLayout`] from a real shaped object with several own data
@@ -820,6 +828,14 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         "could not derive Vec ptr/len offsets"
     );
 
+    // The writability gate fields for the inline property-SET fast path, derived
+    // from the same live object (repr(C) → stable offsets, but probed not assumed).
+    let frozen_off = core::ptr::addr_of!(obj.frozen) as usize - obj_base;
+    // `readonly`'s length word: the field offset plus the (generic) Vec length
+    // offset. A `Vec<T>`'s length lives at the same byte offset regardless of `T`,
+    // and this is cross-checked against a safe read by the JIT layout test.
+    let readonly_len_off = (core::ptr::addr_of!(obj.readonly) as usize - obj_base) + vec_len_off;
+
     ObjectLayout {
         data_off,
         shaped_disc,
@@ -827,6 +843,8 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         slots_off,
         vec_ptr_off,
         vec_len_off,
+        frozen_off,
+        readonly_len_off,
     }
 }
 

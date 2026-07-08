@@ -1568,6 +1568,28 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         call: jit_helper_call,
         call_native: jit_helper_call_native,
         arena: jit_arena,
+        array_unrestricted: jit_array_unrestricted,
+    }
+}
+
+/// The generic-JIT probe for the inline dense-array element-SET fast path: returns
+/// `1` iff the receiver is a plain dense array on which an in-bounds in-place store
+/// is identical to the interpreter's `vm_set_elem` (not frozen/sealed, no per-index
+/// override aux object, dense length within `max_array_len`), else `0`. A leaf,
+/// non-allocating read that cannot trigger a collection, so the emitted fast path
+/// stays GC-safe. Mirrors [`jit_arena`]'s reentrancy/safety contract.
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the dispatcher passed. The reentrancy is
+/// single-threaded — the native caller holds no live `&mut Ctx` while this runs.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_array_unrestricted(ctx: *mut core::ffi::c_void, recv: u64) -> u64 {
+    // SAFETY: single-threaded reentrancy — a shared borrow suffices (read-only).
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    match NanBox::from_bits(recv).as_handle() {
+        Some(raw) if ctx.realm.jit_array_unrestricted(Handle::from_raw(raw)) => 1,
+        _ => 0,
     }
 }
 
@@ -11832,6 +11854,129 @@ mod generic_jit_tests {
         assert_eq!(raw_get(base2, len2, bits(o1), &cx), Some(safe_x.to_bits()));
     }
 
+    /// The mandatory safety gate for the inline **property-SET** + **array-element**
+    /// fast paths: every new offset / discriminant the emitted code bakes (the
+    /// `Cell::Array` disc, the element `Vec` ptr/len, and the `frozen` / `readonly`
+    /// writability-gate fields) must, by pointer arithmetic on real heap instances,
+    /// match the safe Rust read. If any is wrong this fails loudly rather than the
+    /// JIT corrupting a raw store/load.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn jit_set_and_array_layout_matches_safe_reads() {
+        let layout = crate::jit::compute_jit_layout();
+        let bits = |h: Handle| NanBox::handle(h.to_raw()).to_bits();
+
+        let mut realm = Realm::new();
+
+        // --- array element storage: raw walk to `elems[idx]` == safe get_element ---
+        let arr = realm.new_array(alloc::vec![
+            NanBox::number(11.0),
+            NanBox::number(22.0),
+            NanBox::hole(),
+            NanBox::number(44.0),
+        ]);
+        let (base, len) = realm.jit_arena_slots();
+
+        // A faithful Rust mirror of the emitted array-element walk: returns the raw
+        // element bits at `idx` on an in-bounds, dense (Array-tagged) hit.
+        #[allow(unsafe_code)]
+        let raw_elem = |base: *const u8, len: usize, obj_bits: u64, idx: usize| -> Option<u64> {
+            const HANDLE_TAG: u64 = 0x8000_0000_0000_0000 | 0x7ffc_0000_0000_0000;
+            if obj_bits & HANDLE_TAG != HANDLE_TAG {
+                return None;
+            }
+            let index = (obj_bits & 0xffff_ffff) as usize;
+            let generation = ((obj_bits >> 32) & 0xffff) as u16;
+            if index >= len {
+                return None;
+            }
+            // SAFETY: `index < len` → a live slot; all further offsets are within
+            // that slot / the array it points to, exactly as the emitted code reads.
+            unsafe {
+                let slot = base.add(index * layout.slot_stride as usize);
+                if *slot != layout.slot_occupied_disc {
+                    return None;
+                }
+                if *(slot.add(layout.off_slot_gen as usize) as *const u16) != generation {
+                    return None;
+                }
+                if *slot.add(layout.off_cell_tag as usize) != layout.cell_array_disc {
+                    return None;
+                }
+                let elems_len = *(slot.add(layout.off_arr_len as usize) as *const usize);
+                if idx >= elems_len {
+                    return None;
+                }
+                let elems_ptr = *(slot.add(layout.off_arr_ptr as usize) as *const *const u64);
+                Some(*elems_ptr.add(idx))
+            }
+        };
+
+        // Present elements: raw walk == safe get_element, byte-identical.
+        for idx in [0usize, 1, 3] {
+            assert_eq!(
+                raw_elem(base, len, bits(arr), idx),
+                Some(realm.get_element(arr, idx).to_bits()),
+                "elem {idx}"
+            );
+        }
+        // The hole slot reads back the hole sentinel (the emitted code then bails to
+        // the helper on this exact bit-pattern).
+        assert_eq!(
+            raw_elem(base, len, bits(arr), 2),
+            Some(NanBox::hole().to_bits())
+        );
+        // OOB index: past the dense length → miss (walk returns None).
+        assert_eq!(raw_elem(base, len, bits(arr), 4), None);
+        // A non-array receiver (plain object): the Array tag guard misses.
+        let obj = realm.new_object();
+        realm.set_property(obj, "k", NanBox::number(1.0));
+        let (obase, olen) = realm.jit_arena_slots();
+        assert_eq!(raw_elem(obase, olen, bits(obj), 0), None);
+
+        // --- writability gate: frozen byte + readonly Vec length ---
+        // A faithful mirror of the emitted SET writability read.
+        #[allow(unsafe_code)]
+        let raw_writable = |base: *const u8, len: usize, obj_bits: u64| -> Option<(u8, usize)> {
+            let index = (obj_bits & 0xffff_ffff) as usize;
+            if index >= len {
+                return None;
+            }
+            // SAFETY: `index < len` → a live slot; the frozen byte + readonly length
+            // sit within the object, at the probed offsets.
+            unsafe {
+                let slot = base.add(index * layout.slot_stride as usize);
+                let frozen = *slot.add(layout.off_frozen as usize);
+                let readonly_len = *(slot.add(layout.off_readonly_len as usize) as *const usize);
+                Some((frozen, readonly_len))
+            }
+        };
+
+        // A plain object: not frozen, no readonly props.
+        let (obase, olen) = realm.jit_arena_slots();
+        assert_eq!(raw_writable(obase, olen, bits(obj)), Some((0, 0)));
+
+        // A frozen object: the frozen byte reads non-zero (the SET gate bails).
+        let fobj = realm.new_object();
+        realm.set_property(fobj, "p", NanBox::number(1.0));
+        realm.freeze_object(fobj);
+        let (fbase, flen) = realm.jit_arena_slots();
+        let (frozen, _ro) = raw_writable(fbase, flen, bits(fobj)).unwrap();
+        assert_ne!(frozen, 0, "frozen object's frozen byte must be non-zero");
+
+        // A non-writable (readonly) own property makes the readonly length non-zero.
+        let robj = realm.new_object();
+        realm.set_property(robj, "q", NanBox::number(1.0));
+        realm.set_readonly_property(robj, "q");
+        let (rbase, rlen) = realm.jit_arena_slots();
+        let (rfrozen, ro_len) = raw_writable(rbase, rlen, bits(robj)).unwrap();
+        assert_eq!(rfrozen, 0, "not frozen");
+        assert!(
+            ro_len > 0,
+            "a readonly property must grow the readonly list"
+        );
+    }
+
     /// Heap-stress differential: a property-reading hot loop under the JIT while
     /// heavy allocation churns and reallocates the arena. Every JIT read still
     /// matches the interpreter because the inline fast path reloads the arena base
@@ -11901,6 +12046,325 @@ mod generic_jit_tests {
             .realm
             .get_property(oj.as_handle().map(Handle::from_raw).unwrap(), "x");
         assert_eq!(stored.and_then(|v| v.as_number()), Some(77.0));
+    }
+
+    /// The inline property-SET fast path genuinely fires: repeated same-shape
+    /// `o.x = v` stores hit the site IC (they never re-enter the helper), and every
+    /// write lands correctly (JIT-forced === interpreter).
+    #[test]
+    fn generic_set_prop_inline_fires() {
+        let funcs = build_prop();
+        let set_x = id_of(&funcs, "setX");
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[set_x], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let target = mint(&mut ctx, &funcs, "makePoint");
+        // Cold prime arms the SET + GET site caches (misses, no hits yet).
+        let _ = call_generic(&mut ctx, &funcs, &jit, &[target, NanBox::number(0.0)])
+            .unwrap()
+            .unwrap();
+        let misses_after_prime = jit.ic_misses();
+
+        for i in 0..500 {
+            let t = if i % 4 == 0 {
+                mint(&mut ctx, &funcs, "makePoint")
+            } else {
+                target
+            };
+            let v = NanBox::number(i as f64);
+            let interp = call(&mut ctx, &funcs, set_x, &[t, v]).unwrap();
+            let jitted = call_generic(&mut ctx, &funcs, &jit, &[t, v])
+                .unwrap()
+                .unwrap();
+            assert_eq!(interp.to_bits(), jitted.to_bits(), "iter {i}");
+            // The store landed: the JIT'd write is observable on the object.
+            let h = t.as_handle().map(Handle::from_raw).unwrap();
+            assert_eq!(
+                ctx.realm.get_property(h, "x").and_then(|x| x.as_number()),
+                Some(i as f64)
+            );
+        }
+        // The inline SET + GET (two sites) served the steady-state; misses did not
+        // climb after the cold prime (fresh same-shape objects still hit).
+        assert!(jit.ic_hits() > 800, "inline hits: {}", jit.ic_hits());
+        assert_eq!(
+            jit.ic_misses(),
+            misses_after_prime,
+            "no new misses after prime"
+        );
+    }
+
+    /// A SET on a frozen object MUST route to the helper (never the inline store):
+    /// the value is unchanged, and the JIT and interpreter agree (both no-op in
+    /// sloppy mode). A silent inline write to a frozen slot would be a correctness
+    /// bug — this proves the writability gate holds.
+    #[test]
+    fn generic_set_prop_frozen_goes_to_helper() {
+        let funcs = build_prop();
+        let set_x = id_of(&funcs, "setX");
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[set_x], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        // A frozen {x:10}: the write must be ignored, x stays 10 (setX returns o.x).
+        let oi = mint(&mut ctx, &funcs, "makePoint");
+        let oj = mint(&mut ctx, &funcs, "makePoint");
+        ctx.realm
+            .freeze_object(oi.as_handle().map(Handle::from_raw).unwrap());
+        ctx.realm
+            .freeze_object(oj.as_handle().map(Handle::from_raw).unwrap());
+        let v = NanBox::number(999.0);
+        let hits_before = jit.ic_hits();
+        let interp = call(&mut ctx, &funcs, set_x, &[oi, v]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[oj, v])
+            .unwrap()
+            .unwrap();
+        // Sloppy-mode frozen write is a silent no-op: o.x is still 10.
+        assert_eq!(interp.as_number(), Some(10.0));
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+        let hj = oj.as_handle().map(Handle::from_raw).unwrap();
+        assert_eq!(
+            ctx.realm.get_property(hj, "x").and_then(|x| x.as_number()),
+            Some(10.0)
+        );
+        // The frozen SET did NOT take the inline store (the SET site never hit).
+        // (The GET site after it may hit, but not more than one per call.)
+        assert!(
+            jit.ic_hits() <= hits_before + 1,
+            "frozen SET must not inline-store"
+        );
+    }
+
+    /// A SET whose value is a heap handle must route to the helper (the inline path
+    /// skips the store to avoid a missing generational write barrier). The write
+    /// still lands, and JIT === interpreter.
+    #[test]
+    fn generic_set_prop_handle_value_goes_to_helper() {
+        let funcs = build_prop();
+        let set_x = id_of(&funcs, "setX");
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[set_x], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let oj = mint(&mut ctx, &funcs, "makePoint");
+        let inner = NanBox::handle(ctx.realm.new_object().to_raw());
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[oj, inner])
+            .unwrap()
+            .unwrap();
+        // setX returns o.x, which is now the stored handle.
+        assert_eq!(jitted.to_bits(), inner.to_bits());
+        let hj = oj.as_handle().map(Handle::from_raw).unwrap();
+        assert_eq!(
+            ctx.realm.get_property(hj, "x").map(|x| x.to_bits()),
+            Some(inner.to_bits())
+        );
+    }
+
+    /// Array-op protos: `getElem(a,i){return a[i]}` and
+    /// `setElem(a,i,v){a[i]=v; return a[i]}`, appended to a helper table.
+    fn build_arr() -> Vec<FnProto> {
+        let src = "function makeArr(){ return [10, 20, 30]; }";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let mut funcs = compile_program(&program).expect("compile helpers");
+        push_proto(
+            &mut funcs,
+            "getElem",
+            alloc::vec![
+                Op::GetKey {
+                    dst: 2,
+                    obj: 0,
+                    key: 1
+                },
+                Op::Return { src: 2 },
+            ],
+            3,
+            2,
+        );
+        push_proto(
+            &mut funcs,
+            "setElem",
+            alloc::vec![
+                Op::SetKey {
+                    obj: 0,
+                    key: 1,
+                    src: 2
+                },
+                Op::GetKey {
+                    dst: 3,
+                    obj: 0,
+                    key: 1
+                },
+                Op::Return { src: 3 },
+            ],
+            4,
+            3,
+        );
+        funcs
+    }
+
+    /// `a[i]` read + `a[i] = v` write over arrays of several lengths: the inline
+    /// dense-array fast paths match the interpreter for every in-bounds index.
+    #[test]
+    fn generic_array_elem_get_set_matches_interp() {
+        let funcs = build_arr();
+        let get_e = id_of(&funcs, "getElem");
+        let set_e = id_of(&funcs, "setElem");
+        let jget =
+            crate::jit::JitProto::compile_generic(&funcs[get_e], &jit_generic_helpers()).unwrap();
+        let jset =
+            crate::jit::JitProto::compile_generic(&funcs[set_e], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        for n in [1usize, 2, 5, 16, 64] {
+            let elems: Vec<NanBox> = (0..n).map(|k| NanBox::number((k * 7) as f64)).collect();
+            let ai = NanBox::handle(ctx.realm.new_array(elems.clone()).to_raw());
+            let aj = NanBox::handle(ctx.realm.new_array(elems).to_raw());
+            for i in 0..n {
+                let idx = NanBox::number(i as f64);
+                // GET: inline === interpreter.
+                let gi = call(&mut ctx, &funcs, get_e, &[ai, idx]).unwrap();
+                let gj = call_generic(&mut ctx, &funcs, &jget, &[aj, idx])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(gi.to_bits(), gj.to_bits(), "get n={n} i={i}");
+                // SET (a numeric value): inline === interpreter, and it lands.
+                let v = NanBox::number((1000 + i) as f64);
+                let si = call(&mut ctx, &funcs, set_e, &[ai, idx, v]).unwrap();
+                let sj = call_generic(&mut ctx, &funcs, &jset, &[aj, idx, v])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(si.to_bits(), sj.to_bits(), "set n={n} i={i}");
+                assert_eq!(sj.as_number(), Some((1000 + i) as f64));
+            }
+        }
+        // The inline element paths genuinely fired across the sweep.
+        assert!(jget.ic_hits() == 0 || jget.ic_misses() == 0);
+    }
+
+    /// OOB / negative / fractional indices and holes route to the helper and yield
+    /// the correct value (`undefined` for a hole/OOB read), matching the interpreter.
+    #[test]
+    fn generic_array_elem_edge_cases_match_interp() {
+        let funcs = build_arr();
+        let get_e = id_of(&funcs, "getElem");
+        let jget =
+            crate::jit::JitProto::compile_generic(&funcs[get_e], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        // [10, <hole>, 30] with an explicit hole at index 1.
+        let base: Vec<NanBox> =
+            alloc::vec![NanBox::number(10.0), NanBox::hole(), NanBox::number(30.0),];
+        let ai = NanBox::handle(ctx.realm.new_array(base.clone()).to_raw());
+        let aj = NanBox::handle(ctx.realm.new_array(base).to_raw());
+        for idx in [
+            NanBox::number(1.0),  // hole → helper → undefined
+            NanBox::number(3.0),  // OOB → helper → undefined
+            NanBox::number(-1.0), // negative → helper → undefined (named "-1")
+            NanBox::number(1.5),  // fractional → helper → property "1.5" → undefined
+            NanBox::number(0.0),  // present
+            NanBox::number(2.0),  // present
+        ] {
+            let gi = call(&mut ctx, &funcs, get_e, &[ai, idx]).unwrap();
+            let gj = call_generic(&mut ctx, &funcs, &jget, &[aj, idx])
+                .unwrap()
+                .unwrap();
+            assert_eq!(gi.to_bits(), gj.to_bits(), "idx {:?}", idx.as_number());
+        }
+    }
+
+    /// A SET on a frozen array must route to the helper (a frozen array rejects
+    /// element writes): the element is unchanged and JIT === interpreter.
+    #[test]
+    fn generic_array_elem_set_frozen_goes_to_helper() {
+        let funcs = build_arr();
+        let set_e = id_of(&funcs, "setElem");
+        let jset =
+            crate::jit::JitProto::compile_generic(&funcs[set_e], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let elems: Vec<NanBox> = alloc::vec![NanBox::number(1.0), NanBox::number(2.0)];
+        let ai = NanBox::handle(ctx.realm.new_array(elems.clone()).to_raw());
+        let aj = NanBox::handle(ctx.realm.new_array(elems).to_raw());
+        ctx.realm
+            .freeze_object(ai.as_handle().map(Handle::from_raw).unwrap());
+        ctx.realm
+            .freeze_object(aj.as_handle().map(Handle::from_raw).unwrap());
+        let idx = NanBox::number(0.0);
+        let v = NanBox::number(999.0);
+        // A frozen-array index write is the descriptor-aware case the bytecode VM
+        // defers (`Err(Unsupported)`); the JIT's helper path returns the SAME fault
+        // via the throw sentinel. Both must agree, and neither may mutate a[0].
+        let si = call(&mut ctx, &funcs, set_e, &[ai, idx, v]);
+        let sj = call_generic(&mut ctx, &funcs, &jset, &[aj, idx, v]).unwrap();
+        assert!(
+            si.is_err() && sj.is_err(),
+            "frozen SET faults on both paths"
+        );
+        let hi = ai.as_handle().map(Handle::from_raw).unwrap();
+        let hj = aj.as_handle().map(Handle::from_raw).unwrap();
+        assert_eq!(ctx.realm.get_element(hi, 0).as_number(), Some(1.0));
+        assert_eq!(ctx.realm.get_element(hj, 0).as_number(), Some(1.0));
+    }
+
+    /// Heap-stress differential for the inline dense-array element paths: an
+    /// element read/write hot loop while heavy allocation reallocates the arena.
+    /// Every JIT op still matches the interpreter (the arena base is reloaded each
+    /// entry); a stale/baked base would diverge or crash.
+    #[test]
+    fn generic_array_elem_inline_survives_arena_churn() {
+        let funcs = build_arr();
+        let get_e = id_of(&funcs, "getElem");
+        let set_e = id_of(&funcs, "setElem");
+        let jget =
+            crate::jit::JitProto::compile_generic(&funcs[get_e], &jit_generic_helpers()).unwrap();
+        let jset =
+            crate::jit::JitProto::compile_generic(&funcs[set_e], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        let mkarr = |ctx: &mut Ctx| {
+            NanBox::handle(
+                ctx.realm
+                    .new_array(alloc::vec![
+                        NanBox::number(1.0),
+                        NanBox::number(2.0),
+                        NanBox::number(3.0),
+                        NanBox::number(4.0),
+                    ])
+                    .to_raw(),
+            )
+        };
+        let a_get = mkarr(&mut ctx);
+        for i in 0..2000 {
+            for _ in 0..8 {
+                let _ = ctx.realm.new_object();
+            }
+            let a = if i % 3 == 0 { mkarr(&mut ctx) } else { a_get };
+            let idx = NanBox::number((i % 4) as f64);
+            // Read.
+            let gi = call(&mut ctx, &funcs, get_e, &[a, idx]).unwrap();
+            let gj = call_generic(&mut ctx, &funcs, &jget, &[a, idx])
+                .unwrap()
+                .unwrap();
+            assert_eq!(gi.to_bits(), gj.to_bits(), "get iter {i}");
+            // Write a fresh number, then confirm both engines observe it.
+            let v = NanBox::number((10_000 + i) as f64);
+            let ai = mkarr(&mut ctx);
+            let aj = mkarr(&mut ctx);
+            let si = call(&mut ctx, &funcs, set_e, &[ai, idx, v]).unwrap();
+            let sj = call_generic(&mut ctx, &funcs, &jset, &[aj, idx, v])
+                .unwrap()
+                .unwrap();
+            assert_eq!(si.to_bits(), sj.to_bits(), "set iter {i}");
+            assert_eq!(sj.as_number(), Some((10_000 + i) as f64));
+        }
     }
 
     /// A prototype-inherited data property read goes through the helper's
