@@ -468,7 +468,7 @@ mirror (a full N-API-shaped FFI surface), `nbvm` host-native fault-through (only
 reachable once the VM is the primary path), and migrating a sentinel builtin onto
 the registry. The Rust embedding API is otherwise feature-complete.
 
-### 4.1 Event loop & scheduling
+### 4.1 Event loop & scheduling — **landed** (cooperative)
 
 A complete in-house loop (readiness-based I/O or std threads): `setTimeout`/
 `setInterval`/`setImmediate` + `clear*`, `queueMicrotask`, `process.nextTick`,
@@ -485,7 +485,7 @@ exports, `.mjs`/`.cjs`), the `node:` builtin prefix, JSON/`.wasm` imports, impor
 maps. This is the gateway to running **real npm packages** — the practical bar for
 Node/Bun parity.
 
-### 4.3 Web platform globals
+### 4.3 Web platform globals — **largely landed**
 
 `console` (full formatting), `TextEncoder`/`TextDecoder`, `atob`/`btoa`,
 `URL`/`URLSearchParams`, `structuredClone`, `performance.now`/marks/measures,
@@ -500,7 +500,7 @@ streaming bodies) over `rsurl` with `purecrypto` TLS; **`crypto`**
 (`getRandomValues`/`randomUUID` done; `subtle` digest/HMAC/AES/RSA/ECDSA/keys)
 over `purecrypto`.
 
-### 4.5 Node-compat builtins
+### 4.5 Node-compat builtins — **pure subset landed** (Buffer/path/os/util/querystring/process)
 
 A useful, documented subset, `node:`-prefixed: `fs` (sync + promises),
 `path`, `os`, `url`, `util` (`inspect`/`promisify`/`TextEncoder`), `events`
