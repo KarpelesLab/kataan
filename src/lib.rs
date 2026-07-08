@@ -166,6 +166,9 @@ pub mod nbeval;
 #[cfg(feature = "alloc")]
 pub mod nbexec;
 
+/// Host runtime — Node/Bun/Deno-parity globals (ROADMAP §4).
+pub mod host;
+
 /// Pure-logic ISO-8601 calendar/time/duration core shared by the `Temporal.*`
 /// native types (no engine coupling — plain structs + functions, unit-testable).
 pub mod temporal_iso;
