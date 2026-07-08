@@ -143,7 +143,11 @@ These make Kataan more than a fast interpreter. They are *engine* capabilities
 > incl. exact-once side effects + identical throws). GC-safe by construction today (GC is
 > not mid-execution-triggered); a `jit_shadow` root hook is wired for a future allocation-
 > triggered GC. **Remaining = the optimization/portability layer** (below): inline
-> machine-code shape/element guards (need a `repr(C)` heap layout), generalized deopt/OSR,
+> machine-code shape/element guards **LANDED** (property GET/SET + array element GET/SET
+> now emit real inline reads/writes over `repr(C)` heap types, offsets runtime-verified
+> by a probe harness that caught a real `Vec`-ptr-offset trap; guard misses + frozen/
+> readonly/handle-value/hole/OOB route to the correct helper; heap-churn differential
+> proven). Remaining: inline `Call`/`ArrayLen`, generalized deopt/OSR,
 > and the shared backend + aarch64. See `JIT_DESIGN.md`.
 
 Today the JIT compiles integer/float numeric functions and bails to the

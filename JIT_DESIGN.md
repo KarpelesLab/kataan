@@ -118,3 +118,21 @@ async, closures with captures, `rest_from`, `n_regs>64`/`n_params>32`.
 guard-failure deopt + OSR, an ABI-tagged registry for direct generic JIT→JIT calls, and
 the Cranelift-style shared backend + aarch64. These are the "make it fast + portable"
 layer; op-coverage + correctness are done.
+
+## STATUS UPDATE — Pass 6 inline fast paths landed (2026-07-09)
+
+Inline machine-code fast paths now emitted for `GetProp`/`SetProp`/`GetElem`/`SetElem`
+(commits ac1de8e repr → 4807a67 GET → ba3e12d SET+element). Safety bedrock: a
+`compute_jit_layout()` probe harness derives every offset/discriminant by pointer
+arithmetic on real instances (NEVER hand-baked) + gate tests (`jit_layout_matches_safe_reads`,
+`jit_set_and_array_layout_matches_safe_reads`) prove them against safe reads incl.
+post-arena-realloc. The harness caught a real trap: `Vec`'s data ptr is at +8 (cap at +0)
+on this toolchain. Verified offsets (this build): slot_stride=200, slot_gen@2, cell_tag@8,
+od_tag@16, shape_rc@24, slots_ptr@40, slots_len@48, array_ptr@24, array_len@32,
+Object.frozen@176, readonly_len@144, PropertyCache shape/slot@0/8.
+Soundness: SET inline only when val is non-handle (skips the generational write barrier
+safely) AND frozen=0 AND readonly empty (== cached_set precondition); array store only when
+unrestricted (not frozen/sealed, no per-index override, dense). Any miss → the existing
+correct helper. Heap-churn differentials (2000 iters, arena reallocating) JIT===interpreter.
+lib 866 / jit 958 green. Remaining helper-only: `ArrayLen`, `Call`, `CallNative`; plus
+generalized deopt/OSR + shared backend + aarch64.
